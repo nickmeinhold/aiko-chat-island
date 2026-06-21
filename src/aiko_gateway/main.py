@@ -18,8 +18,9 @@ from .aiko.client import AikoBusClient
 from .aiko.payload import InboundMessage
 from .config import settings
 from .db import SessionLocal, init_models
-from .domain import messages_service
+from .domain import echo, messages_service
 from .domain.models import Channel
+from .realtime.hub import Hub
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("aiko_gateway")
@@ -30,24 +31,32 @@ settings.export_aiko_env()  # aiko_services reads AIKO_MQTT_* from os.environ
 class GatewayState:
     def __init__(self) -> None:
         self.bus: AikoBusClient | None = None
+        self.hub: Hub = Hub()
         self.loop: asyncio.AbstractEventLoop | None = None
 
     def on_bus_message(self, msg: InboundMessage) -> None:
-        """AIKO thread -> hop to the asyncio loop, then persist."""
+        """AIKO thread -> hop to the asyncio loop, then ingest."""
         if self.loop is None:
             return
         self.loop.call_soon_threadsafe(
-            lambda: asyncio.create_task(self._persist(msg))
+            lambda: asyncio.create_task(self._ingest(msg))
         )
 
-    async def _persist(self, msg: InboundMessage) -> None:
+    async def _ingest(self, msg: InboundMessage) -> None:
+        # Drop our own echo — it was already persisted + fanned out at send-time.
+        if msg.channel and echo.is_own_echo(msg.channel, msg.username, msg.message):
+            return
         try:
             async with SessionLocal() as session:
                 row = await messages_service.persist_inbound(session, msg)
             if row:
-                log.info("persisted %s in %s: %s", row.id, msg.channel, msg.message)
+                log.info("ingest %s in %s: %s", row.id, msg.channel, msg.message)
+                # External message (LLM/robot/REPL/other) -> fan out live.
+                await self.hub.fanout(
+                    row.channel_id, {"type": "message", "msg": messages_service.message_view(row)}
+                )
         except Exception:
-            log.exception("persist failed for bus message")
+            log.exception("ingest failed for bus message")
 
 
 state = GatewayState()
@@ -81,10 +90,13 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Aiko Chat Gateway", version="0.0.1", lifespan=lifespan)
+app.state.gw = state  # the WS endpoint reaches bus + hub via websocket.app.state.gw
 
 from .rest import auth as auth_routes  # noqa: E402
+from .realtime import ws as ws_routes  # noqa: E402
 app.include_router(auth_routes.router)
 app.include_router(auth_routes.me_router)
+app.include_router(ws_routes.router)
 
 
 def _msg_view(m) -> dict:

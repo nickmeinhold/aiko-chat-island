@@ -17,6 +17,49 @@ from .ids import new_ulid
 from .models import Channel, Message, User
 
 
+def message_view(m: Message) -> dict:
+    """The stable MessageView the client contract exposes (plan §A1)."""
+    return {
+        "msg_id": m.id,
+        "channel_id": m.channel_id,
+        "sender": {"user_id": m.sender_user_id, "kind": m.sender_kind, "label": m.sender_label},
+        "body": m.body,
+        "created_at": m.created_at.isoformat(),
+        "reply_to": m.reply_to,
+    }
+
+
+async def create_outbound(
+    session: AsyncSession, *, user: User, channel: Channel,
+    body: str, client_msg_id: str, reply_to: str | None = None,
+) -> tuple[Message, bool]:
+    """Persist a user's outgoing message (server ULID, server-derived sender —
+    invariant I5). Idempotent on (channel, client_msg_id): a resend returns the
+    existing row. Returns (row, created)."""
+    existing = (await session.execute(
+        select(Message).where(
+            Message.channel_id == channel.id,
+            Message.client_msg_id == client_msg_id,
+        )
+    )).scalar_one_or_none()
+    if existing is not None:
+        return existing, False
+    row = Message(
+        id=new_ulid(),
+        channel_id=channel.id,
+        sender_user_id=user.id,
+        sender_kind="human",
+        sender_label=user.display_name,
+        body=body,
+        reply_to=reply_to,
+        client_msg_id=client_msg_id,
+        aiko_origin=False,
+    )
+    session.add(row)
+    await session.commit()
+    return row, True
+
+
 def _kind_for(channel: Channel, sender_user: User | None) -> str:
     if sender_user is not None:
         return "human"
