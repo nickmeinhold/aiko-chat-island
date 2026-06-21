@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+spike/work/
+spike/logs/
+spike/devwork/
+spike/devlogs/
+*.db
+*.sqlite3
+.pytest_cache/
+.ruff_cache/
