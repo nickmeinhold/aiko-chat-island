@@ -1,0 +1,77 @@
+"""Message persistence (Phase 1 subset).
+
+Right now the gateway persists messages it observes ON the bus (the canonical
+timeline; the gateway's ULID at ingest is the ordering key — plan §A5). The
+authenticated send-then-persist path + echo suppression land in the next slice;
+until then there is a single writer (ingest), so no double-write to dedupe.
+"""
+from __future__ import annotations
+
+import datetime as dt
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from ..aiko.payload import InboundMessage
+from .ids import new_ulid
+from .models import Channel, Message, User
+
+
+def _kind_for(channel: Channel, sender_user: User | None) -> str:
+    if sender_user is not None:
+        return "human"
+    if channel.kind in ("llm", "robot"):
+        return channel.kind
+    return "actor"  # external REPL / unknown bus participant
+
+
+async def persist_inbound(session: AsyncSession, msg: InboundMessage) -> Message | None:
+    """Persist a bus message into its channel. Returns the row, or None if the
+    channel isn't mapped (we don't auto-create channels from bus traffic)."""
+    if not msg.channel:
+        return None
+    channel = (await session.execute(
+        select(Channel).where(Channel.aiko_channel == msg.channel)
+    )).scalar_one_or_none()
+    if channel is None:
+        return None
+
+    sender_user = None
+    if msg.username:
+        sender_user = (await session.execute(
+            select(User).where(User.aiko_username == msg.username)
+        )).scalar_one_or_none()
+
+    created = (
+        dt.datetime.fromtimestamp(msg.timestamp, dt.timezone.utc)
+        if msg.timestamp else dt.datetime.now(dt.timezone.utc)
+    )
+    row = Message(
+        id=new_ulid(),
+        channel_id=channel.id,
+        sender_user_id=sender_user.id if sender_user else None,
+        sender_kind=_kind_for(channel, sender_user),
+        sender_label=msg.username,
+        body=msg.message,
+        aiko_origin=True,
+        created_at=created,
+    )
+    session.add(row)
+    await session.commit()
+    return row
+
+
+async def get_history(
+    session: AsyncSession, channel_id: str, *, before: str | None, limit: int
+) -> list[Message]:
+    """Page of messages in a channel, newest-first below `before` (a ULID
+    cursor). Returned ascending for display."""
+    stmt = select(Message).where(
+        Message.channel_id == channel_id, Message.deleted_at.is_(None)
+    )
+    if before:
+        stmt = stmt.where(Message.id < before)
+    stmt = stmt.order_by(Message.id.desc()).limit(limit)
+    rows = list((await session.execute(stmt)).scalars())
+    rows.reverse()
+    return rows

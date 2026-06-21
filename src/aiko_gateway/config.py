@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     # --- which aiko channel(s) the gateway bridges (Phase 1: just "general") ---
     aiko_channels: list[str] = ["general"]
 
+    # --- database ---
+    db_url: str = "postgresql+asyncpg://aiko:dev@localhost:5433/aiko_chat"
+
     # --- HTTP server ---
     host: str = "127.0.0.1"
     port: int = 8095
