@@ -24,6 +24,12 @@ class Settings(BaseSettings):
     # --- database ---
     db_url: str = "postgresql+asyncpg://aiko:dev@localhost:5433/aiko_chat"
 
+    # --- auth (JWT) ---  dev default; deploy supplies via SOPS.
+    jwt_secret: str = "dev-insecure-change-me"
+    jwt_algorithm: str = "HS256"
+    jwt_access_ttl_seconds: int = 15 * 60        # 15 min
+    jwt_refresh_ttl_seconds: int = 30 * 24 * 3600  # 30 days
+
     # --- HTTP server ---
     host: str = "127.0.0.1"
     port: int = 8095

@@ -82,6 +82,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Aiko Chat Gateway", version="0.0.1", lifespan=lifespan)
 
+from .rest import auth as auth_routes  # noqa: E402
+app.include_router(auth_routes.router)
+app.include_router(auth_routes.me_router)
+
 
 def _msg_view(m) -> dict:
     return {
