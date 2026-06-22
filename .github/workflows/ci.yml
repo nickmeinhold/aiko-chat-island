@@ -1,0 +1,28 @@
+name: CI
+
+# Minimal CI floor for aiko_chat_gateway (task #22). Runs the pytest suite on
+# every PR and on push to main.
+#
+# The suite is deliberately isolated from aiko_services / aiko_chat (those install
+# editable from local checkouts and are NOT declared deps): the test-reachable
+# modules (db, domain.models, domain.messages_service, realtime.{ws,hub,envelopes})
+# import only stdlib + sqlalchemy + the stdlib-only aiko.payload codec — never
+# aiko_services. So `pip install -e ".[dev]"` on a clean checkout is sufficient.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12' # requires-python = >=3.12,<3.13 (aiko_services 0.6 cap)
+
+      - run: pip install -e ".[dev]"
+
+      - run: pytest

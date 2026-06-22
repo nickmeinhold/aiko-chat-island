@@ -11,6 +11,11 @@ dependencies = [
   "fastapi>=0.115",
   "uvicorn[standard]>=0.32",
   "pydantic-settings>=2.6",
+  # The persistence/ORM layer (db.py, domain.models, realtime.ws, main.py). The
+  # [asyncio] extra pulls greenlet for the async engine the tests drive over
+  # aiosqlite. Was installed transitively in local venvs but never declared —
+  # CI on a clean checkout needs it explicit.
+  "sqlalchemy[asyncio]>=2.0",
 ]
 
 [project.optional-dependencies]
