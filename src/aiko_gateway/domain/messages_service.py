@@ -105,13 +105,32 @@ async def persist_inbound(session: AsyncSession, msg: InboundMessage) -> Message
 
 
 async def get_history(
-    session: AsyncSession, channel_id: str, *, before: str | None, limit: int
+    session: AsyncSession,
+    channel_id: str,
+    *,
+    before: str | None = None,
+    after: str | None = None,
+    limit: int,
 ) -> list[Message]:
-    """Page of messages in a channel, newest-first below `before` (a ULID
-    cursor). Returned ascending for display."""
+    """A page of messages in a channel, **always returned ascending** (oldest
+    first) for display. Two cursor directions, mutually exclusive — a ULID is a
+    total order, so both walk the same axis:
+
+    * ``before`` (backward, the default — UI scroll-up): the ``limit`` newest
+      messages with ``id < before``. Used to load older history a page at a time.
+    * ``after`` (forward — B4 reconnect catch-up): the ``limit`` oldest messages
+      with ``id > after``. Forward paging fills the oldest gap first, which is
+      what makes ``MAX(serverUlid)`` a crash-resumable watermark on the client
+      (design 04 §Gap 2). ``after`` wins if both are passed.
+    """
     stmt = select(Message).where(
         Message.channel_id == channel_id, Message.deleted_at.is_(None)
     )
+    if after is not None:
+        # Forward: oldest-above-cursor first; already ascending, no reverse.
+        stmt = stmt.where(Message.id > after).order_by(Message.id.asc()).limit(limit)
+        return list((await session.execute(stmt)).scalars())
+    # Backward (default): newest-below-cursor first, then flip to ascending.
     if before:
         stmt = stmt.where(Message.id < before)
     stmt = stmt.order_by(Message.id.desc()).limit(limit)

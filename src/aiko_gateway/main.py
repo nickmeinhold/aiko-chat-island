@@ -131,19 +131,24 @@ async def list_channels() -> dict:
 async def history(
     channel_id: str,
     before: str | None = Query(default=None),
+    after: str | None = Query(default=None),
     limit: int = Query(default=50, le=200),
 ) -> dict:
+    """Channel history, ascending. `before` = scroll-up (older); `after` =
+    forward catch-up (B4 reconnect). Both cursors returned so either direction
+    can page: `next_before` = oldest in batch, `next_after` = newest in batch."""
     async with SessionLocal() as session:
         channel = await session.get(Channel, channel_id)
         if channel is None:
             raise HTTPException(404, "channel not found")
         rows = await messages_service.get_history(
-            session, channel_id, before=before, limit=limit
+            session, channel_id, before=before, after=after, limit=limit
         )
     return {
         "channel_id": channel_id,
         "messages": [_msg_view(m) for m in rows],
         "next_before": rows[0].id if rows else None,
+        "next_after": rows[-1].id if rows else None,
     }
 
 
