@@ -20,6 +20,14 @@ def message_frame(msg_view: dict) -> dict:
     return {"type": "message", "msg": msg_view}
 
 
+def suback(channel_fences: dict[str, str]) -> dict:
+    """Subscription-ack: confirms a `subscribe` and carries each channel's live/
+    history *fence* — the newest persisted id at subscribe time (``""`` if the
+    channel is empty). The client partitions on it: ``id <= fence`` is fetched
+    from history (REST), ``id > fence`` arrives live (WS). See design 04 §Gap 2."""
+    return {"type": "suback", "channel_fences": channel_fences}
+
+
 def error(code: str, detail: str, ref_client_msg_id: str | None = None) -> dict:
     return {"type": "error", "code": code, "detail": detail,
             "ref_client_msg_id": ref_client_msg_id}
