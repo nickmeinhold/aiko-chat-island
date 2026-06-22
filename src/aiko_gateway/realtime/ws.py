@@ -53,7 +53,8 @@ async def ws_endpoint(websocket: WebSocket) -> None:
                                                 raw.get("client_msg_id") if isinstance(raw, dict) else None))
                 continue
             if frame["type"] == "subscribe":
-                conn.subscribed |= set(frame["channel_ids"])
+                async with SessionLocal() as session:
+                    await _handle_subscribe(conn, frame, session)
             elif frame["type"] == "send":
                 await _handle_send(gw, conn, user, frame)
     except WebSocketDisconnect:
@@ -61,6 +62,27 @@ async def ws_endpoint(websocket: WebSocket) -> None:
     finally:
         gw.hub.unregister(conn)
         log.info("ws disconnected user=%s", user.username)
+
+
+async def _handle_subscribe(conn: Connection, frame: dict, session) -> None:
+    """Subscribe to channels and reply with the live/history fence per channel.
+
+    ORDERING INVARIANT (design 04 §Gap 2 — the whole point of Change B):
+    add the channels to ``conn.subscribed`` BEFORE reading the fence. A message
+    that persists + fanouts in the window between these two steps is then either
+    delivered live (the connection is already subscribed) or already counted in
+    the fence — never both missed. Reverse the order and that window leaks: the
+    message is ``> fence`` (client won't fetch it from history) AND not delivered
+    live (not yet subscribed) -> lost forever on a then-quiet channel. The cost
+    of subscribing first is at worst a duplicate (``<= fence`` AND live), which
+    the client's drift cache dedups on the UNIQUE serverUlid.
+    """
+    conn.subscribed |= set(frame["channel_ids"])  # (1) subscribed FIRST
+    fences = {  # (2) fence AFTER — every gap message is now live or <= fence
+        cid: await messages_service.latest_ulid(session, cid)
+        for cid in frame["channel_ids"]
+    }
+    await conn.send(envelopes.suback(fences))
 
 
 async def _handle_send(gw, conn: Connection, user, frame: dict) -> None:

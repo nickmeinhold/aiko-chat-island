@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import datetime as dt
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..aiko.payload import InboundMessage
@@ -102,6 +102,24 @@ async def persist_inbound(session: AsyncSession, msg: InboundMessage) -> Message
     session.add(row)
     await session.commit()
     return row
+
+
+async def latest_ulid(session: AsyncSession, channel_id: str) -> str:
+    """The newest persisted message id in a channel — the live/history *fence*
+    a `suback` carries (design 04 §Gap 2). Returns ``""`` for a channel with no
+    messages: an empty fence means "no history boundary, everything is
+    forward/live".
+
+    Soft-deleted rows are *included*: a deleted tail still advanced the timeline,
+    so the fence reflects true ULID position. (``get_history`` excludes deleted
+    rows from its pages, but the fence is a boundary on the id axis, not a
+    visibility filter — keeping them counted means ``> fence`` / ``<= fence``
+    stays a clean partition of every id the client could ever observe.)
+    """
+    result = await session.execute(
+        select(func.max(Message.id)).where(Message.channel_id == channel_id)
+    )
+    return result.scalar_one() or ""
 
 
 async def get_history(
