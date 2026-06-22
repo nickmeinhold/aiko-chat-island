@@ -109,6 +109,26 @@ async def test_multiple_channels_each_get_their_own_fence(session):
     assert _suback_fences(conn) == {cid: _ulid(3), other.id: _ulid(60)}
 
 
+async def test_fence_excludes_soft_deleted_tail_matching_get_history(session):
+    """The fence predicate MUST match get_history's `deleted_at IS NULL`. If the
+    newest row is soft-deleted, the fence is the newest VISIBLE row — otherwise
+    B4's pager (history until cursor >= fence) could never reach a deleted-tail
+    fence by visible rows, false-positiving its empty-page-before-fence check."""
+    channel = Channel(id=_ulid(0), name="general", kind="standard", aiko_channel="general")
+    session.add(channel)
+    session.add(Message(id=_ulid(1), channel_id=channel.id, sender_kind="human",
+                        body="visible", created_at=_now()))
+    session.add(Message(id=_ulid(2), channel_id=channel.id, sender_kind="human",
+                        body="deleted tail", created_at=_now() + dt.timedelta(seconds=2),
+                        deleted_at=_now()))
+    await session.commit()
+    conn = _RecordingConn()
+    await _handle_subscribe(
+        conn, {"type": "subscribe", "channel_ids": [channel.id]}, session)
+    # fence is _ulid(1) (newest visible), NOT _ulid(2) (the soft-deleted tail).
+    assert _suback_fences(conn) == {channel.id: _ulid(1)}
+
+
 async def test_no_message_lost_in_the_subscribe_effectiveness_gap(session, monkeypatch):
     """THE invariant (design 04 §Gap2). A message arriving in the window AFTER the
     fence is read must still reach the client — delivered live because the

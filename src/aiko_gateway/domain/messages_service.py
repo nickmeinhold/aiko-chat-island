@@ -105,19 +105,24 @@ async def persist_inbound(session: AsyncSession, msg: InboundMessage) -> Message
 
 
 async def latest_ulid(session: AsyncSession, channel_id: str) -> str:
-    """The newest persisted message id in a channel — the live/history *fence*
+    """The newest *visible* message id in a channel — the live/history *fence*
     a `suback` carries (design 04 §Gap 2). Returns ``""`` for a channel with no
-    messages: an empty fence means "no history boundary, everything is
+    visible messages: an empty fence means "no history boundary, everything is
     forward/live".
 
-    Soft-deleted rows are *included*: a deleted tail still advanced the timeline,
-    so the fence reflects true ULID position. (``get_history`` excludes deleted
-    rows from its pages, but the fence is a boundary on the id axis, not a
-    visibility filter — keeping them counted means ``> fence`` / ``<= fence``
-    stays a clean partition of every id the client could ever observe.)
+    The ``deleted_at IS NULL`` filter MUST match ``get_history`` exactly: the
+    fence and the history pager are two reads of the same id axis, and B4's
+    reconnect loop pages history "until cursor >= fence", treating an empty page
+    while ``cursor < fence`` as an invariant violation (design 04 round 5). If the
+    fence could point past the newest visible row (a soft-deleted tail), that
+    termination condition would be unreachable by visible rows and the violation
+    check would false-positive. One predicate, both reads — the partition stays
+    clean and the invariant stays assertable.
     """
     result = await session.execute(
-        select(func.max(Message.id)).where(Message.channel_id == channel_id)
+        select(func.max(Message.id)).where(
+            Message.channel_id == channel_id, Message.deleted_at.is_(None)
+        )
     )
     return result.scalar_one() or ""
 
