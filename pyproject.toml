@@ -11,6 +11,23 @@ dependencies = [
   "fastapi>=0.115",
   "uvicorn[standard]>=0.32",
   "pydantic-settings>=2.6",
+  # The persistence/ORM layer (db.py, domain.models, realtime.ws, main.py). The
+  # [asyncio] extra pulls greenlet for the async engine the tests drive over
+  # aiosqlite. Was installed transitively in local venvs but never declared —
+  # CI on a clean checkout needs it explicit.
+  "sqlalchemy[asyncio]>=2.0",
+  # The production Postgres driver. db.py builds the module-level async engine
+  # at import time from the default `postgresql+asyncpg://` URL, so importing the
+  # package (which the tests do, for Base) requires the asyncpg dialect — even
+  # though the tests themselves run over aiosqlite. Also transitively-installed-
+  # but-undeclared until now.
+  "asyncpg>=0.30",
+  # JWT auth (domain.security / rest.auth issue + verify access tokens). The
+  # `jwt` module is PyJWT. Same transitively-installed-but-undeclared gap.
+  "pyjwt>=2.0",
+  # argon2id password hashing (domain.security). The `argon2` module is provided
+  # by argon2-cffi. Last of the transitively-installed-but-undeclared core deps.
+  "argon2-cffi>=23.0",
 ]
 
 [project.optional-dependencies]
