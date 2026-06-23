@@ -1,16 +1,16 @@
 """Channel-history endpoint.
 
 I1 (read requires auth): the `CurrentUser` dependency rejects unauthenticated
-callers before any history is read. I2 (membership: a user may only read
-channels they belong to) is deferred to Phase 2's ACL suite (plan §A3) — until
-then any authenticated user can read any channel's history. See the I2 follow-up.
+callers before any history is read. I2 (membership, #36): a user may only read
+channels they may see — public channels, or private channels they belong to. A
+private channel the user is not a member of is collapsed into the SAME 404 as a
+non-existent channel (`acl.can_read`), so the boundary never confirms it exists.
 """
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Query
 
-from ..domain import messages_service
-from ..domain.models import Channel
+from ..domain import acl, messages_service
 from .deps import CurrentUser, DbSession
 
 router = APIRouter(prefix="/v1", tags=["messages"])
@@ -28,7 +28,10 @@ async def history(
     """Channel history, ascending. `before` = scroll-up (older); `after` =
     forward catch-up (B4 reconnect). Both cursors returned so either direction
     can page: `next_before` = oldest in batch, `next_after` = newest in batch."""
-    channel = await session.get(Channel, channel_id)
+    # One query resolves existence AND access: a missing channel and a private
+    # channel the user is not in both return None with identical DB work, so the
+    # 404 leaks neither existence nor timing (existence-hiding, #36).
+    channel = await acl.readable_channel(session, user.id, channel_id)
     if channel is None:
         raise HTTPException(404, "channel not found")
     rows = await messages_service.get_history(
