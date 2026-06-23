@@ -14,8 +14,11 @@ VENV_BIN="$GW_DIR/.venv/bin"
 WORK="$SPIKE_DIR/devwork"
 LOGS="$SPIKE_DIR/devlogs"
 PIDFILE="$WORK/devstack.pids"
-MOSQUITTO_BIN="/opt/homebrew/sbin/mosquitto"
+# Prefer an explicit override, then PATH (CI/Linux), then the macOS Homebrew path.
+MOSQUITTO_BIN="${MOSQUITTO_BIN:-$(command -v mosquitto || echo /opt/homebrew/sbin/mosquitto)}"
 
+# Prepend the local venv if present (dev); on CI the aiko_* console scripts are
+# installed onto PATH directly, so the bare names below resolve either way.
 export PATH="$VENV_BIN:$PATH"
 export AIKO_MQTT_HOST="localhost" AIKO_MQTT_PORT="1884" AIKO_NAMESPACE="aiko"
 
@@ -34,19 +37,19 @@ up() {
   until nc -z localhost 1884 2>/dev/null; do sleep 0.3; done
 
   echo "[devstack] aiko_registrar"
-  "$VENV_BIN/aiko_registrar" >"$LOGS/registrar.log" 2>&1 &
+  aiko_registrar >"$LOGS/registrar.log" 2>&1 &
   echo $! >> "$PIDFILE"
   sleep 2
 
   echo "[devstack] bootstrap HyperSpace + aiko_chat run"
   cd "$WORK"; mkdir -p _chat_server_; cd _chat_server_
-  "$VENV_BIN/aiko_storage_file" initialize             >"$LOGS/bootstrap.log" 2>&1
-  "$VENV_BIN/aiko_storage_file" create --bootstrap channels >>"$LOGS/bootstrap.log" 2>&1
+  aiko_storage_file initialize             >"$LOGS/bootstrap.log" 2>&1
+  aiko_storage_file create --bootstrap channels >>"$LOGS/bootstrap.log" 2>&1
   for ch in general random llm robot yolo; do
-    "$VENV_BIN/aiko_storage_file" add --bootstrap "channels/$ch" >>"$LOGS/bootstrap.log" 2>&1
+    aiko_storage_file add --bootstrap "channels/$ch" >>"$LOGS/bootstrap.log" 2>&1
   done
-  "$VENV_BIN/aiko_storage_file" create --bootstrap users >>"$LOGS/bootstrap.log" 2>&1
-  "$VENV_BIN/aiko_chat" run >"$LOGS/chatserver.log" 2>&1 &
+  aiko_storage_file create --bootstrap users >>"$LOGS/bootstrap.log" 2>&1
+  aiko_chat run >"$LOGS/chatserver.log" 2>&1 &
   echo $! >> "$PIDFILE"
   echo "[devstack] up. pids: $(tr '\n' ' ' < "$PIDFILE"). logs: $LOGS/"
 }
