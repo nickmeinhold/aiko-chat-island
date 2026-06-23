@@ -11,7 +11,7 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI
 from sqlalchemy import select
 
 from .aiko.client import AikoBusClient
@@ -93,19 +93,14 @@ app = FastAPI(title="Aiko Chat Gateway", version="0.0.1", lifespan=lifespan)
 app.state.gw = state  # the WS endpoint reaches bus + hub via websocket.app.state.gw
 
 from .rest import auth as auth_routes  # noqa: E402
+from .rest import channels as channel_routes  # noqa: E402
+from .rest import messages as message_routes  # noqa: E402
 from .realtime import ws as ws_routes  # noqa: E402
 app.include_router(auth_routes.router)
 app.include_router(auth_routes.me_router)
+app.include_router(channel_routes.router)
+app.include_router(message_routes.router)
 app.include_router(ws_routes.router)
-
-
-def _msg_view(m) -> dict:
-    return {
-        "msg_id": m.id, "channel_id": m.channel_id,
-        "sender": {"user_id": m.sender_user_id, "kind": m.sender_kind, "label": m.sender_label},
-        "body": m.body, "created_at": m.created_at.isoformat(),
-        "reply_to": m.reply_to,
-    }
 
 
 @app.get("/health")
@@ -114,41 +109,6 @@ def health() -> dict:
         "status": "ok",
         "aiko_connected": bool(state.bus and state.bus.connected),
         "channels": settings.aiko_channels,
-    }
-
-
-@app.get("/v1/channels")
-async def list_channels() -> dict:
-    async with SessionLocal() as session:
-        rows = list((await session.execute(select(Channel))).scalars())
-    return {"channels": [
-        {"id": c.id, "name": c.name, "kind": c.kind, "aiko_channel": c.aiko_channel}
-        for c in rows
-    ]}
-
-
-@app.get("/v1/channels/{channel_id}/messages")
-async def history(
-    channel_id: str,
-    before: str | None = Query(default=None),
-    after: str | None = Query(default=None),
-    limit: int = Query(default=50, le=200),
-) -> dict:
-    """Channel history, ascending. `before` = scroll-up (older); `after` =
-    forward catch-up (B4 reconnect). Both cursors returned so either direction
-    can page: `next_before` = oldest in batch, `next_after` = newest in batch."""
-    async with SessionLocal() as session:
-        channel = await session.get(Channel, channel_id)
-        if channel is None:
-            raise HTTPException(404, "channel not found")
-        rows = await messages_service.get_history(
-            session, channel_id, before=before, after=after, limit=limit
-        )
-    return {
-        "channel_id": channel_id,
-        "messages": [_msg_view(m) for m in rows],
-        "next_before": rows[0].id if rows else None,
-        "next_after": rows[-1].id if rows else None,
     }
 
 
