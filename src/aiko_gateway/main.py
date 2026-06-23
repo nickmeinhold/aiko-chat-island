@@ -11,7 +11,7 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, status
 from sqlalchemy import select
 
 from .aiko.client import AikoBusClient
@@ -114,6 +114,12 @@ def health() -> dict:
 
 @app.post("/v1/_debug/send")
 def debug_send(channel: str, username: str, message: str) -> dict:
-    """Temporary (pre-auth): publish onto the bus. The echo is what gets persisted."""
+    """Dev-only (pre-auth): publish onto the bus. The echo is what gets persisted.
+
+    Gated to non-production: this endpoint has NO auth and would let anyone
+    inject bus messages, so it 404s in production (fail-closed alongside the
+    jwt_secret + registration guards)."""
+    if settings.is_production:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "not found")
     ok = bool(state.bus and state.bus.send(username, channel, message))
     return {"sent": ok}

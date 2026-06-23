@@ -7,6 +7,8 @@ present in os.environ before any aiko import composes a process.
 """
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -14,18 +16,21 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # guard below can never disagree (a prod boot with THIS value is rejected).
 _DEV_JWT_SECRET = "dev-insecure-change-me"
 
-# Environments treated as non-production. Anything else (incl. unknown values)
-# is production-like — fail-closed: an unrecognized env hardens rather than
-# relaxes the guards.
+# Environments treated as non-production. Anything else (incl. unknown values
+# AND the absence of ENVIRONMENT, which defaults to "production" below) is
+# production-like — fail-closed: forgetting to declare the environment hardens
+# rather than relaxes the guards.
 _NON_PROD_ENVIRONMENTS = frozenset({"dev", "development", "test", "local"})
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    # Deployment environment. "dev" (default) keeps local frictionless; deploy
-    # sets ENVIRONMENT=production, which arms the fail-closed guards below.
-    environment: str = "dev"
+    # Deployment environment. Defaults to "production" so a deploy that FORGETS
+    # to set ENVIRONMENT still arms the fail-closed guards (absence = unsafe ⇒
+    # treat as prod). Local dev / CI must EXPLICITLY declare a non-prod value
+    # (ENVIRONMENT=dev in .env; ENVIRONMENT=test in the test harness).
+    environment: str = "production"
 
     # --- aiko bus connection (consumed by aiko_services via os.environ) ---
     aiko_mqtt_host: str = "localhost"
@@ -40,7 +45,9 @@ class Settings(BaseSettings):
 
     # --- auth (JWT) ---  dev default; deploy supplies via SOPS.
     jwt_secret: str = _DEV_JWT_SECRET
-    jwt_algorithm: str = "HS256"
+    # Symmetric HMAC only — constrained so an env override can't introduce an
+    # asymmetric/none-alg downgrade on an auth-critical setting.
+    jwt_algorithm: Literal["HS256"] = "HS256"
     jwt_access_ttl_seconds: int = 15 * 60        # 15 min
     jwt_refresh_ttl_seconds: int = 30 * 24 * 3600  # 30 days
 
@@ -54,8 +61,10 @@ class Settings(BaseSettings):
 
     @property
     def is_production(self) -> bool:
-        """Anything outside the known non-prod allowlist is production-like."""
-        return self.environment.lower() not in _NON_PROD_ENVIRONMENTS
+        """Anything outside the known non-prod allowlist is production-like.
+        `.strip()` so accidental whitespace padding (ENVIRONMENT=' dev ') is
+        still recognized as the intended env rather than mis-hardening."""
+        return self.environment.strip().lower() not in _NON_PROD_ENVIRONMENTS
 
     @model_validator(mode="after")
     def _harden_for_production(self) -> "Settings":

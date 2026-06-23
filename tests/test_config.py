@@ -43,6 +43,23 @@ def test_unknown_environment_is_treated_as_production():
         Settings(_env_file=None, environment="staging", jwt_secret=_DEV_JWT_SECRET)
 
 
+def test_missing_environment_defaults_to_production(monkeypatch):
+    # THE fail-closed invariant: forgetting ENVIRONMENT entirely must NOT boot
+    # with the dev secret. Absence resolves to "production" (the default), so a
+    # deploy that supplies real config but forgets ENVIRONMENT still crashes
+    # rather than serving forgeable tokens. (conftest sets ENVIRONMENT=test for
+    # the suite; clear it here to exercise true absence.)
+    monkeypatch.delenv("ENVIRONMENT", raising=False)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, jwt_secret=_DEV_JWT_SECRET)
+
+
+def test_whitespace_padded_environment_still_recognized():
+    # ENVIRONMENT=" dev " must be read as dev, not mis-hardened to production.
+    s = Settings(_env_file=None, environment="  dev  ", jwt_secret=_DEV_JWT_SECRET)
+    assert s.is_production is False
+
+
 # --- invariant 2: registration gating ---------------------------------------
 
 def test_open_registration_defaults_on_in_dev():
