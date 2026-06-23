@@ -14,7 +14,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
 from sqlalchemy import select
 
 from ..db import SessionLocal
-from ..domain import echo, messages_service, security, users_service
+from ..domain import acl, echo, messages_service, security, users_service
 from ..domain.models import Channel
 from . import envelopes
 from .hub import Connection
@@ -76,11 +76,20 @@ async def _handle_subscribe(conn: Connection, frame: dict, session) -> None:
     live (not yet subscribed) -> lost forever on a then-quiet channel. The cost
     of subscribing first is at worst a duplicate (``<= fence`` AND live), which
     the client's drift cache dedups on the UNIQUE serverUlid.
+
+    ACL (I2, #36): filter the requested ids to the channels the user may read
+    FIRST — public channels, or private channels they belong to. Inaccessible /
+    unknown ids are silently dropped from both ``conn.subscribed`` and the suback
+    (existence-hiding). This runs BEFORE the subscribe-then-fence steps so it
+    never disturbs that ordering invariant; ``hub.fanout`` only reaches the
+    ``subscribed`` set, so gating it here also gates live delivery (defence in
+    depth — a non-member can be neither backfilled nor pushed to).
     """
-    conn.subscribed |= set(frame["channel_ids"])  # (1) subscribed FIRST
+    accessible = await acl.filter_readable_ids(session, conn.user_id, frame["channel_ids"])
+    conn.subscribed |= set(accessible)  # (1) subscribed FIRST (accessible only)
     fences = {  # (2) fence AFTER — every gap message is now live or <= fence
         cid: await messages_service.latest_ulid(session, cid)
-        for cid in frame["channel_ids"]
+        for cid in accessible
     }
     await conn.send(envelopes.suback(fences))
 
@@ -88,11 +97,19 @@ async def _handle_subscribe(conn: Connection, frame: dict, session) -> None:
 async def _handle_send(gw, conn: Connection, user, frame: dict) -> None:
     async with SessionLocal() as session:
         channel = await session.get(Channel, frame["channel_id"])
-        if channel is None:
+        # Existence-hiding (#36): a non-member of a private channel gets the same
+        # "no_channel" as a missing one — never confirm it exists. can_read
+        # collapses both cases.
+        if channel is None or not await acl.can_read(session, user.id, channel):
             await conn.send(envelopes.error("no_channel", "channel not found",
                                             frame["client_msg_id"]))
             return
-        # (ACL can_post lands with the membership slice; Phase 1 allows members.)
+        # A member who exists but lacks can_post already knows the channel is real,
+        # so this is an honest 'forbidden' (no existence leak) rather than collapse.
+        if not await acl.can_post(session, user.id, channel):
+            await conn.send(envelopes.error("forbidden", "cannot post to this channel",
+                                            frame["client_msg_id"]))
+            return
         row, created = await messages_service.create_outbound(
             session, user=user, channel=channel,
             body=frame["body"], client_msg_id=frame["client_msg_id"],
