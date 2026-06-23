@@ -7,6 +7,13 @@ unauthenticated caller could list channels and read history (I1 violation, plan
 §A3). The endpoints now route through `CurrentUser`, so an unauthenticated
 request is rejected before any row is read.
 
+The app under test is assembled from JUST the two read routers — NOT
+`aiko_gateway.main`. Importing `main` would transitively load the aiko bus
+client (`aiko.client` → `import aiko_services`), an undeclared, locally-editable
+dependency absent on clean CI. The whole suite's isolation invariant is "never
+import aiko_services"; the router chain (rest/* + domain/* + db) is clean, so we
+build a minimal FastAPI app from the routers and keep that invariant.
+
 The app is driven via httpx's ASGITransport (no lifespan → no aiko bus). The DB
 `get_session` dependency is overridden to the in-memory test session so the
 endpoints (and the user-loading auth dependency) share one DB.
@@ -16,12 +23,22 @@ from __future__ import annotations
 import datetime as dt
 
 import pytest_asyncio
+from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from aiko_gateway.domain import security, users_service
 from aiko_gateway.domain.models import Channel, Message
-from aiko_gateway.main import app
+from aiko_gateway.rest import channels as channel_routes
+from aiko_gateway.rest import messages as message_routes
 from aiko_gateway.rest.deps import get_session
+
+
+def _build_app() -> FastAPI:
+    """A minimal app with only the read routers — no `main`, no aiko bus."""
+    app = FastAPI()
+    app.include_router(channel_routes.router)
+    app.include_router(message_routes.router)
+    return app
 
 
 def _ulid(n: int) -> str:
@@ -48,6 +65,7 @@ async def client(session):
     async def _override_session():
         yield session
 
+    app = _build_app()
     app.dependency_overrides[get_session] = _override_session
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as c:
