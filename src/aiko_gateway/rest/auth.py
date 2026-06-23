@@ -1,7 +1,9 @@
-"""Auth endpoints: register (dev-open), login, refresh, me.
+"""Auth endpoints: register (gated), login, refresh, me.
 
-NOTE: /register is open in Phase 1 for dev/testing. Production must gate it
-(invite token or admin-created accounts) — tracked as a follow-up.
+/register is open in dev for testing and closed by default in production
+(settings.open_registration, resolved by environment). With open registration a
+self-created account can read everything until I2 membership lands (#36), so
+prod fails closed; an explicit OPEN_REGISTRATION override re-opens it.
 """
 from __future__ import annotations
 
@@ -10,6 +12,7 @@ from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy.exc import IntegrityError
 
+from ..config import settings
 from ..domain import security, users_service
 from ..domain.models import User
 from .deps import CurrentUser, DbSession
@@ -44,6 +47,8 @@ def _tokens(user_id: str) -> dict:
 
 @router.post("/register")
 async def register(req: RegisterReq, session: DbSession) -> dict:
+    if not settings.open_registration:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "registration is closed")
     try:
         user = await users_service.create_user(
             session, username=req.username,
