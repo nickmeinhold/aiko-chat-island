@@ -7,13 +7,22 @@ own engine + session so they never touch a real DB. `Base.metadata` is shared, s
 """
 from __future__ import annotations
 
-import pytest_asyncio
-from sqlalchemy.ext.asyncio import (
+import os
+
+# Declare the test environment BEFORE any aiko_gateway import. The module-level
+# `settings = Settings()` (reached via aiko_gateway.db below) now defaults to
+# "production" and fail-closed-raises on the dev jwt_secret; the test harness is
+# an explicitly-declared non-prod environment. setdefault so a real ENVIRONMENT
+# (e.g. set by a future CI matrix) still wins.
+os.environ.setdefault("ENVIRONMENT", "test")
+
+import pytest_asyncio  # noqa: E402
+from sqlalchemy.ext.asyncio import (  # noqa: E402
     AsyncSession, async_sessionmaker, create_async_engine,
 )
 
-from aiko_gateway.db import Base
-from aiko_gateway.domain import models  # noqa: F401 — register tables on Base.metadata
+from aiko_gateway.db import Base  # noqa: E402
+from aiko_gateway.domain import models  # noqa: E402,F401 — register tables on Base.metadata
 
 
 @pytest_asyncio.fixture
