@@ -1,0 +1,73 @@
+name: bus e2e round-trip
+
+# Regression net for the gateway<->aiko-bus hop (task #45). Stands up a REAL
+# stack (mosquitto + aiko_registrar + aiko_chat ChatServer) and drives the real
+# AikoBusClient through discover -> subscribe -> send -> receive
+# (e2e/test_bus_roundtrip.py). Every check in ci.yml points at a DEAD broker and
+# only exercises graceful-degrade; this is the one job that proves the live
+# round-trip actually works, so a regression in aiko/client.py or aiko/payload.py
+# (or an upstream geekscape change) turns red here instead of silently no-op'ing.
+#
+# SEPARATE from the ci.yml floor (fast `pytest tests/` over aiosqlite). This job
+# is heavier (three checkouts + editable installs + a broker), so it lives apart.
+#
+# aiko_services/aiko_chat are NOT PyPI deps of the gateway (not 3.12-pinned on
+# PyPI) — they're installed editable from their public checkouts, exactly as the
+# gateway really boots. They track their default branch on purpose: an upstream
+# change that breaks the bus contract SHOULD turn this red.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: bus-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bus-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout gateway (this repo)
+        uses: actions/checkout@v4
+        with:
+          path: gateway
+
+      - name: Checkout aiko_services (public)
+        uses: actions/checkout@v4
+        with:
+          repository: geekscape/aiko_services
+          path: aiko_services
+
+      - name: Checkout aiko_chat (public)
+        uses: actions/checkout@v4
+        with:
+          repository: geekscape/aiko_chat
+          path: aiko_chat
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12' # aiko_services 0.6 caps at <3.13
+
+      - name: Install mosquitto broker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mosquitto
+          mosquitto -h | head -1 || true
+
+      # Order: the two libs the gateway imports first, then the gateway[dev].
+      # Not declared deps (not on PyPI), so installed explicitly from checkouts.
+      - name: Install gateway + bus libs (editable)
+        run: |
+          pip install -e ./aiko_services
+          pip install -e ./aiko_chat
+          pip install -e "./gateway[dev]"
+
+      # devstack.sh auto-detects mosquitto via `command -v`; pass it explicitly
+      # in case /usr/sbin is off PATH for the runner.
+      - name: Run bus round-trip e2e
+        working-directory: gateway
+        env:
+          MOSQUITTO_BIN: /usr/sbin/mosquitto
+        run: pytest e2e/test_bus_roundtrip.py -v
