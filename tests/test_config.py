@@ -24,10 +24,24 @@ def test_prod_with_default_secret_raises():
         Settings(_env_file=None, environment="production", jwt_secret=_DEV_JWT_SECRET)
 
 
+_STRONG_SECRET = "a-real-32-byte-minimum-secret-value"  # 35 chars >= 32
+
+
 def test_prod_with_real_secret_boots():
-    s = Settings(_env_file=None, environment="production",
-                 jwt_secret="a-real-32-byte-minimum-secret-value")
+    s = Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET)
     assert s.is_production is True
+
+
+def test_prod_with_empty_secret_raises():
+    # A denylist on the dev default alone is a sieve — an empty secret must also
+    # be rejected in prod (it would sign trivially-forgeable tokens).
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, environment="production", jwt_secret="   ")
+
+
+def test_prod_with_short_secret_raises():
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, environment="production", jwt_secret="too-short")
 
 
 def test_dev_with_default_secret_boots():
@@ -68,13 +82,19 @@ def test_open_registration_defaults_on_in_dev():
 
 
 def test_open_registration_defaults_off_in_prod():
-    s = Settings(_env_file=None, environment="production",
-                 jwt_secret="a-real-32-byte-minimum-secret-value")
+    s = Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET)
     assert s.open_registration is False
 
 
-def test_open_registration_explicit_override_in_prod():
-    s = Settings(_env_file=None, environment="production",
-                 jwt_secret="a-real-32-byte-minimum-secret-value",
-                 open_registration=True)
-    assert s.open_registration is True
+def test_open_registration_override_rejected_in_prod():
+    # No break-glass while I2 (#36) is unenforced: an explicit OPEN_REGISTRATION
+    # in prod fails closed rather than reopening the endpoint.
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, environment="production",
+                 jwt_secret=_STRONG_SECRET, open_registration=True)
+
+
+def test_open_registration_override_allowed_in_dev():
+    # Dev can still flip it either way.
+    s = Settings(_env_file=None, environment="dev", open_registration=False)
+    assert s.open_registration is False
