@@ -15,7 +15,6 @@ from sqlalchemy import select
 
 from ..db import SessionLocal
 from ..domain import acl, echo, messages_service, security, users_service
-from ..domain.models import Channel
 from . import envelopes
 from .hub import Connection
 
@@ -96,11 +95,11 @@ async def _handle_subscribe(conn: Connection, frame: dict, session) -> None:
 
 async def _handle_send(gw, conn: Connection, user, frame: dict) -> None:
     async with SessionLocal() as session:
-        channel = await session.get(Channel, frame["channel_id"])
-        # Existence-hiding (#36): a non-member of a private channel gets the same
-        # "no_channel" as a missing one — never confirm it exists. can_read
-        # collapses both cases.
-        if channel is None or not await acl.can_read(session, user.id, channel):
+        # Existence-hiding (#36): one query resolves existence AND access, so a
+        # non-member of a private channel gets the same "no_channel" as a missing
+        # one — identical DB work, no timing leak.
+        channel = await acl.readable_channel(session, user.id, frame["channel_id"])
+        if channel is None:
             await conn.send(envelopes.error("no_channel", "channel not found",
                                             frame["client_msg_id"]))
             return

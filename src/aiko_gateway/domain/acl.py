@@ -20,10 +20,20 @@ WS call sites delegate here so the rule can never drift between them.
 """
 from __future__ import annotations
 
-from sqlalchemy import select
+from sqlalchemy import exists, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .models import Channel, Membership
+
+
+def _readable_predicate(user_id: str):
+    """SQL predicate for "this Channel is readable by user_id": public, OR a
+    membership row for this user exists. A correlated EXISTS so it composes into
+    a single statement (no per-channel membership round-trip)."""
+    member = exists().where(
+        (Membership.channel_id == Channel.id) & (Membership.user_id == user_id)
+    )
+    return Channel.is_private.is_(False) | member
 
 
 async def _membership(
@@ -39,15 +49,32 @@ async def _membership(
     ).scalar_one_or_none()
 
 
-async def can_read(session: AsyncSession, user_id: str, channel: Channel) -> bool:
-    """Read/subscribe access: public channels open to all; private need membership."""
-    if not channel.is_private:
-        return True
-    return await _membership(session, channel.id, user_id) is not None
+async def readable_channel(
+    session: AsyncSession, user_id: str, channel_id: str
+) -> Channel | None:
+    """The channel iff the user may read/subscribe to it, else None — in ONE query.
+
+    Existence AND access are resolved in a single statement, so "no such channel"
+    and "private channel you're not a member of" do IDENTICAL database work and
+    both collapse to ``None``. That closes the timing/query-shape oracle a
+    two-step (lookup-then-membership) check leaks: an attacker probing ids cannot
+    distinguish "missing" from "exists but private" by latency. Callers map the
+    single ``None`` to their existence-hiding response (REST 404 / WS no_channel).
+    """
+    return (
+        await session.execute(
+            select(Channel).where(
+                Channel.id == channel_id, _readable_predicate(user_id)
+            )
+        )
+    ).scalar_one_or_none()
 
 
 async def can_post(session: AsyncSession, user_id: str, channel: Channel) -> bool:
-    """Post access: public open to all; private needs a membership with can_post."""
+    """Post access: public open to all; private needs a membership with can_post.
+
+    Only called AFTER ``readable_channel`` has confirmed access, so it never
+    leaks existence (the caller already knows the channel is real)."""
     if not channel.is_private:
         return True
     m = await _membership(session, channel.id, user_id)
@@ -56,12 +83,9 @@ async def can_post(session: AsyncSession, user_id: str, channel: Channel) -> boo
 
 async def visible_channels(session: AsyncSession, user_id: str) -> list[Channel]:
     """Every public channel + every private channel the user belongs to, id asc."""
-    member_cids = select(Membership.channel_id).where(Membership.user_id == user_id)
     rows = (
         await session.execute(
-            select(Channel)
-            .where(Channel.is_private.is_(False) | Channel.id.in_(member_cids))
-            .order_by(Channel.id)
+            select(Channel).where(_readable_predicate(user_id)).order_by(Channel.id)
         )
     ).scalars()
     return list(rows)
@@ -73,20 +97,19 @@ async def filter_readable_ids(
     """The subset of ``channel_ids`` the user may read/subscribe to, order preserved.
 
     Unknown ids and private channels the user is not a member of are silently
-    dropped (existence-hiding: the WS suback simply omits them). Public channels
-    short-circuit without a membership query.
+    dropped (existence-hiding: the WS suback simply omits them). Resolved in ONE
+    query — subscribe is attacker-controlled input, so a per-channel membership
+    loop would be avoidable DB amplification (and another timing oracle).
     """
     if not channel_ids:
         return []
-    found = {
-        c.id: c
-        for c in (
-            await session.execute(select(Channel).where(Channel.id.in_(channel_ids)))
+    readable = set(
+        (
+            await session.execute(
+                select(Channel.id).where(
+                    Channel.id.in_(channel_ids), _readable_predicate(user_id)
+                )
+            )
         ).scalars()
-    }
-    out: list[str] = []
-    for cid in channel_ids:
-        channel = found.get(cid)
-        if channel is not None and await can_read(session, user_id, channel):
-            out.append(cid)
-    return out
+    )
+    return [cid for cid in channel_ids if cid in readable]  # preserve request order

@@ -68,19 +68,30 @@ async def _join(session, channel: Channel, user, *, can_post: bool = True) -> No
 # ACL unit layer — the single source of truth the call sites delegate to
 # =========================================================================
 
-async def test_can_read_public_open_to_any_user(session):
+async def test_readable_channel_public_open_to_any_user(session):
     ch = await _public_channel(session)
     alice = await _user(session, "alice")
-    assert await acl.can_read(session, alice.id, ch) is True
+    got = await acl.readable_channel(session, alice.id, ch.id)
+    assert got is not None and got.id == ch.id
 
 
-async def test_can_read_private_requires_membership(session):
+async def test_readable_channel_private_requires_membership(session):
     ch = await _private_channel(session)
     alice = await _user(session, "alice")
     bob = await _user(session, "bob")
     await _join(session, ch, alice)
-    assert await acl.can_read(session, alice.id, ch) is True
-    assert await acl.can_read(session, bob.id, ch) is False
+    assert (await acl.readable_channel(session, alice.id, ch.id)) is not None
+    assert (await acl.readable_channel(session, bob.id, ch.id)) is None
+
+
+async def test_readable_channel_missing_and_private_denied_both_none(session):
+    """Existence-hiding at the query level: a missing channel and a private one
+    the user is not in both return None — the SAME single-query result, so no
+    timing/query-shape oracle distinguishes them (Carnot, cage-match PR #8)."""
+    priv = await _private_channel(session, cid=10, name="secret")
+    bob = await _user(session, "bob")
+    assert (await acl.readable_channel(session, bob.id, priv.id)) is None
+    assert (await acl.readable_channel(session, bob.id, "does-not-exist")) is None
 
 
 async def test_can_post_honours_can_post_flag_on_private(session):

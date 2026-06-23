@@ -5,9 +5,11 @@ deploy, fanout publishes to a redis channel and each worker delivers to its own
 local connections (plan §A1 realtime/fanout) — the Hub interface stays the same.
 
 Membership-at-delivery (invariant I2) is enforced here: fanout only reaches a
-connection whose `subscribed` set includes the channel. The ACL check that
-populates `subscribed` lands with the channels/membership slice; for now a
-connection subscribes to what it asks for.
+connection whose `subscribed` set includes the channel. As of #36 that set is
+ACL-gated at subscribe time (`ws._handle_subscribe` -> `acl.filter_readable_ids`
+drops channels the user may not read), so a non-member can never appear in
+`subscribed` and therefore can never be reached by fanout — this delivery gate
+and the subscribe gate enforce the same boundary from two sides.
 """
 from __future__ import annotations
 

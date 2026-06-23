@@ -11,7 +11,6 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException, Query
 
 from ..domain import acl, messages_service
-from ..domain.models import Channel
 from .deps import CurrentUser, DbSession
 
 router = APIRouter(prefix="/v1", tags=["messages"])
@@ -29,10 +28,11 @@ async def history(
     """Channel history, ascending. `before` = scroll-up (older); `after` =
     forward catch-up (B4 reconnect). Both cursors returned so either direction
     can page: `next_before` = oldest in batch, `next_after` = newest in batch."""
-    channel = await session.get(Channel, channel_id)
-    # Collapse "private channel you're not in" into "not found" — never confirm
-    # a private channel exists to a non-member (existence-hiding, #36).
-    if channel is None or not await acl.can_read(session, user.id, channel):
+    # One query resolves existence AND access: a missing channel and a private
+    # channel the user is not in both return None with identical DB work, so the
+    # 404 leaks neither existence nor timing (existence-hiding, #36).
+    channel = await acl.readable_channel(session, user.id, channel_id)
+    if channel is None:
         raise HTTPException(404, "channel not found")
     rows = await messages_service.get_history(
         session, channel_id, before=before, after=after, limit=limit
