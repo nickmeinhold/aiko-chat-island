@@ -95,11 +95,20 @@ async def test_history_requires_auth(client, session):
     assert resp.status_code == 401
 
 
-async def test_invalid_token_is_rejected(client, session):
+async def test_invalid_token_is_rejected_on_channels(client, session):
     await _seed_channel_with_history(session)
     resp = await client.get(
         "/v1/channels", headers={"Authorization": "Bearer not-a-real-jwt"})
     # Present-but-invalid token → 401 (get_current_user).
+    assert resp.status_code == 401
+
+
+async def test_invalid_token_is_rejected_on_history(client, session):
+    cid = await _seed_channel_with_history(session)
+    resp = await client.get(
+        f"/v1/channels/{cid}/messages",
+        headers={"Authorization": "Bearer not-a-real-jwt"})
+    # Both read endpoints reject a present-but-invalid token symmetrically.
     assert resp.status_code == 401
 
 

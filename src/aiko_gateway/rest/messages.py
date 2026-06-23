@@ -16,15 +16,6 @@ from .deps import CurrentUser, DbSession
 router = APIRouter(prefix="/v1", tags=["messages"])
 
 
-def _msg_view(m) -> dict:
-    return {
-        "msg_id": m.id, "channel_id": m.channel_id,
-        "sender": {"user_id": m.sender_user_id, "kind": m.sender_kind, "label": m.sender_label},
-        "body": m.body, "created_at": m.created_at.isoformat(),
-        "reply_to": m.reply_to,
-    }
-
-
 @router.get("/channels/{channel_id}/messages")
 async def history(
     channel_id: str,
@@ -32,7 +23,7 @@ async def history(
     session: DbSession,
     before: str | None = Query(default=None),
     after: str | None = Query(default=None),
-    limit: int = Query(default=50, le=200),
+    limit: int = Query(default=50, ge=1, le=200),
 ) -> dict:
     """Channel history, ascending. `before` = scroll-up (older); `after` =
     forward catch-up (B4 reconnect). Both cursors returned so either direction
@@ -45,7 +36,9 @@ async def history(
     )
     return {
         "channel_id": channel_id,
-        "messages": [_msg_view(m) for m in rows],
+        # Single source for the MessageView wire shape — shared with the WS
+        # fanout path so REST and live frames can never drift (plan §A1).
+        "messages": [messages_service.message_view(m) for m in rows],
         "next_before": rows[0].id if rows else None,
         "next_after": rows[-1].id if rows else None,
     }
