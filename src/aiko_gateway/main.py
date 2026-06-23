@@ -10,12 +10,21 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import asynccontextmanager
+from typing import TYPE_CHECKING
 
 from fastapi import FastAPI, HTTPException, status
 from sqlalchemy import select
 
-from .aiko.client import AikoBusClient
+# NOTE: `AikoBusClient` is imported lazily inside `lifespan` (not at module
+# scope) so that `import aiko_gateway.main` does NOT transitively pull in
+# `aiko_services` (an undeclared dependency absent on clean CI). This keeps the
+# production app importable under the test suite's "never import aiko_services"
+# isolation invariant, which lets a test introspect the real route table +
+# auth dependency tree without the bus. See tests/test_main_routes.py.
 from .aiko.payload import InboundMessage
+
+if TYPE_CHECKING:
+    from .aiko.client import AikoBusClient
 from .config import settings
 from .db import SessionLocal, init_models
 from .domain import echo, messages_service
@@ -30,7 +39,7 @@ settings.export_aiko_env()  # aiko_services reads AIKO_MQTT_* from os.environ
 
 class GatewayState:
     def __init__(self) -> None:
-        self.bus: AikoBusClient | None = None
+        self.bus: "AikoBusClient | None" = None
         self.hub: Hub = Hub()
         self.loop: asyncio.AbstractEventLoop | None = None
 
@@ -79,6 +88,9 @@ async def lifespan(app: FastAPI):
     state.loop = asyncio.get_running_loop()
     await init_models()
     await _seed_channels()
+    # Lazy import: pulling aiko_services happens only at startup, never at
+    # module import time (see the import-block note above).
+    from .aiko.client import AikoBusClient
     state.bus = AikoBusClient(settings.aiko_channels, state.on_bus_message)
     state.bus.start()
     log.info("Gateway started; channels=%s", settings.aiko_channels)
