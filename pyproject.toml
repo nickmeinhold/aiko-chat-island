@@ -28,6 +28,12 @@ dependencies = [
   # argon2id password hashing (domain.security). The `argon2` module is provided
   # by argon2-cffi. Last of the transitively-installed-but-undeclared core deps.
   "argon2-cffi>=23.0",
+  # Async SQLite driver. As of the HyperSpace-source-of-truth redesign (#1281),
+  # the gateway's LOCAL store (messages/auth/ACL — the data HyperSpace cannot
+  # hold) is file-backed SQLite, not Postgres, so aiosqlite is a PRODUCTION
+  # dependency, not merely the test driver. db.py builds the async engine from
+  # DB_URL at import time; a `sqlite+aiosqlite://` URL needs this dialect present.
+  "aiosqlite>=0.20",
 ]
 
 [project.optional-dependencies]
@@ -36,7 +42,7 @@ dev = [
   # pytest-asyncio 0.24.x is the line compatible with that (1.x needs pytest>=8.4).
   "pytest~=8.3.4",
   "pytest-asyncio~=0.24.0",
-  "aiosqlite>=0.20",  # in-memory async SQLite for fast, Postgres-free unit tests
+  # aiosqlite is now a MAIN dependency (the prod local store) — see above.
   "httpx>=0.27",
 ]
 
