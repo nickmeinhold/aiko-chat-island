@@ -50,14 +50,32 @@ from aiko_gateway.domain import security, users_service
 from aiko_gateway.main import app
 from aiko_gateway.rest.deps import get_session
 
-# The two read paths this test guards (I1, plan §A3), as concrete request paths.
+# The read paths this test guards (I1, plan §A3), as concrete request paths.
 # The `{channel_id}` template is filled with an id that does NOT exist: auth is
 # checked before any row is read, so an unauthenticated request is rejected
 # regardless, and an authenticated request reaches the handler and 404s on the
 # absent channel — both observable proofs that the real route is wired.
 CHANNELS_PATH = "/v1/channels"
 HISTORY_PATH = "/v1/channels/no-such-channel/messages"
-GUARDED_PATHS = (CHANNELS_PATH, HISTORY_PATH)
+
+# The membership-management WRITE paths (#46) — the trust-boundary mutations.
+# Same guard: an unmounted route would 404 here, so a 401 proves it is mounted
+# AND auth-gated. The GET (list members) is exercised below for the authed leg;
+# the write verbs (POST/DELETE) are auth-gated identically — covered by the
+# unauthenticated parametrization via _unauthed_request per method.
+MEMBERS_LIST_PATH = "/v1/channels/no-such-channel/members"
+GUARDED_PATHS = (CHANNELS_PATH, HISTORY_PATH, MEMBERS_LIST_PATH)
+
+# (method, path) pairs for the write membership routes — each must reject an
+# unauthenticated caller. A missing mount answers 404/405; only a mounted,
+# auth-gated route answers 401.
+GUARDED_WRITE_ROUTES = (
+    ("POST", "/v1/channels"),
+    ("POST", "/v1/channels/no-such-channel/members"),
+    ("DELETE", "/v1/channels/no-such-channel/members/no-such-user"),
+    ("POST", "/v1/channels/no-such-channel/join"),
+    ("DELETE", "/v1/channels/no-such-channel/leave"),
+)
 
 
 @pytest_asyncio.fixture
@@ -96,6 +114,19 @@ async def test_guarded_paths_reject_unauthenticated(client, path):
     assert resp.status_code == 401, (
         f"{path} answered {resp.status_code} without credentials — expected 401 "
         f"(missing route ⇒ 404, or inline/unauthenticated handler ⇒ 200/404?)"
+    )
+
+
+@pytest.mark.parametrize("method,path", GUARDED_WRITE_ROUTES)
+async def test_guarded_write_routes_reject_unauthenticated(client, method, path):
+    """Each membership-management WRITE route, on the REAL app, rejects an
+    unauthenticated request (#46). An unmounted route answers 404/405 here, so a
+    401 proves the production router is mounted AND auth-gated past the I1 dep —
+    the same faithful-proxy guard #37 established for the read routes."""
+    resp = await client.request(method, path)
+    assert resp.status_code == 401, (
+        f"{method} {path} answered {resp.status_code} without credentials — "
+        f"expected 401 (unmounted ⇒ 404/405, or inline/unauthenticated ⇒ 2xx?)"
     )
 
 

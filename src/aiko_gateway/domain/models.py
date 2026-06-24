@@ -40,6 +40,13 @@ class Channel(Base):
     kind: Mapped[str] = mapped_column(String(16), nullable=False, default="standard")
     aiko_channel: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     is_private: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Self-join policy for PRIVATE channels (#46). 'invite_only' (default) = a
+    # user may only be added by a channel admin; 'open' = any authenticated user
+    # may self-join via /join. Public channels (is_private=False) ignore this —
+    # they are open to everyone and need no membership at all. Default is the
+    # safe one: a private channel is invite_only until explicitly opened, so a
+    # channel created without thinking about policy can never be self-joined.
+    join_policy: Mapped[str] = mapped_column(String(16), nullable=False, default="invite_only")
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
