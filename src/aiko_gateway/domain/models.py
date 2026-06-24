@@ -46,7 +46,10 @@ class Channel(Base):
     # they are open to everyone and need no membership at all. Default is the
     # safe one: a private channel is invite_only until explicitly opened, so a
     # channel created without thinking about policy can never be self-joined.
-    join_policy: Mapped[str] = mapped_column(String(16), nullable=False, default="invite_only")
+    # The closed set is the JoinPolicy StrEnum (memberships_service); stored as
+    # its string value so the column type is a plain VARCHAR.
+    join_policy: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="invite_only")
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 

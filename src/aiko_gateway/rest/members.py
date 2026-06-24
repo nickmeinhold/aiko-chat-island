@@ -27,13 +27,16 @@ router = APIRouter(prefix="/v1", tags=["members"])
 class CreateChannelReq(BaseModel):
     name: str
     is_private: bool = False
-    # Self-join policy for a private channel: 'invite_only' (default) | 'open'.
-    join_policy: str = svc.JOIN_INVITE_ONLY
+    # Self-join policy for a private channel. Typed as the JoinPolicy enum so an
+    # invalid value is rejected with 422 at the API boundary, not silently
+    # coerced (Carnot, PR#10).
+    join_policy: svc.JoinPolicy = svc.JoinPolicy.INVITE_ONLY
 
 
 class AddMemberReq(BaseModel):
     user_id: str
-    role: str = svc.ROLE_MEMBER
+    # Role enum — an invalid role is a 422, not a silent fallback to 'member'.
+    role: svc.Role = svc.Role.MEMBER
     can_post: bool = True
 
 
@@ -94,6 +97,9 @@ async def add_member(
         # A member who is not an admin already knows the channel exists, so an
         # honest 403 leaks nothing.
         raise HTTPException(403, "only a channel admin may add members")
+    except svc.NotAMember:
+        # Target user does not exist — controlled 404, not an FK 500 at commit.
+        raise HTTPException(404, "user not found")
     return _member_view(m)
 
 

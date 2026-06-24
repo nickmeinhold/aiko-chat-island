@@ -24,18 +24,42 @@ hiding can't drift from the read path.
 """
 from __future__ import annotations
 
-from sqlalchemy import func, select
+import enum
+
+from sqlalchemy import exists, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from . import acl
 from .ids import new_ulid
-from .models import Channel, Membership
+from .models import Channel, Membership, User
 
-ROLE_ADMIN = "admin"
-ROLE_MEMBER = "member"
 
-JOIN_OPEN = "open"
-JOIN_INVITE_ONLY = "invite_only"
+class Role(enum.StrEnum):
+    """Closed set of membership roles. StrEnum (3.12) so the value IS the string
+    stored in the DB column — the persistence layer is unchanged, but the type
+    is now closed at the boundary instead of a free String (cage-match PR#10:
+    Kelvin + Carnot both flagged the stringly-typed closed set)."""
+
+    ADMIN = "admin"
+    MEMBER = "member"
+
+
+class JoinPolicy(enum.StrEnum):
+    """Closed set of private-channel self-join policies (see Channel.join_policy).
+    'invite_only' = admin-add only; 'open' = any authed user may self-join."""
+
+    INVITE_ONLY = "invite_only"
+    OPEN = "open"
+
+
+# Back-compat string aliases — the model defaults and existing call sites use
+# these. StrEnum members compare equal to their string value, so == checks keep
+# working whether a Role/JoinPolicy or a bare string is passed.
+ROLE_ADMIN = Role.ADMIN
+ROLE_MEMBER = Role.MEMBER
+JOIN_OPEN = JoinPolicy.OPEN
+JOIN_INVITE_ONLY = JoinPolicy.INVITE_ONLY
 
 
 class MembershipError(Exception):
@@ -56,12 +80,6 @@ class NotAMember(MembershipError):
     """The target user is not a member (e.g. leaving/removing a non-member)."""
 
 
-class SelfJoinNotAllowed(MembershipError):
-    """Self-join attempted on a channel whose policy forbids it. NOTE: callers
-    must NOT surface this for a channel the user cannot see — that path raises
-    ChannelNotFound instead, so invite_only is hidden behind a 404."""
-
-
 class LastAdmin(MembershipError):
     """Refused: the operation would remove the channel's last admin, orphaning
     it (no one could ever manage membership again)."""
@@ -80,17 +98,71 @@ async def _membership(
     ).scalar_one_or_none()
 
 
-async def _admin_count(session: AsyncSession, channel_id: str) -> int:
-    return (
+async def _lock_admin_count(session: AsyncSession, channel_id: str) -> int:
+    """Count the channel's admins, ROW-LOCKING those admin rows for the rest of
+    the transaction (``SELECT ... FOR UPDATE``).
+
+    This closes the last-admin TOCTOU race (cage-match PR#10: Maxwell + Kelvin +
+    Carnot consensus). Without the lock, two concurrent admin-removals on a
+    2-admin channel both read count==2, both pass the ``<= 1`` guard, and both
+    delete — orphaning the channel with zero admins. Holding a write lock on the
+    admin rows serializes the second transaction behind the first, so it re-reads
+    count==1 and is correctly refused.
+
+    SQLite (the test engine) has no row locks and silently ignores
+    ``with_for_update`` — harmless there because the test session is serial
+    anyway; the lock matters only on Postgres, where the race is real."""
+    rows = (
         await session.execute(
-            select(func.count())
-            .select_from(Membership)
+            select(Membership.user_id)
             .where(
                 Membership.channel_id == channel_id,
-                Membership.role == ROLE_ADMIN,
+                Membership.role == Role.ADMIN,
             )
+            .with_for_update()
         )
-    ).scalar_one()
+    ).scalars().all()
+    return len(rows)
+
+
+async def _insert_idempotent(
+    session: AsyncSession, membership: Membership, channel_id: str, user_id: str
+) -> Membership:
+    """Insert a membership, treating a concurrent duplicate as a no-op (case (e)).
+
+    The composite PK (channel_id, user_id) is the real idempotency guarantee: a
+    pre-insert existence check has a TOCTOU window where two concurrent joins
+    both see "not a member" and both insert. Rather than letting the loser raise
+    an IntegrityError (500), we catch it, roll back, and return the row the
+    winner committed — so a racing double-join/double-add is genuinely idempotent
+    (cage-match PR#10: Carnot). The DB constraint, not the check, is the
+    authority."""
+    # Insert inside a SAVEPOINT so a unique-constraint violation rolls back ONLY
+    # the failed insert, leaving the outer transaction (and its async/greenlet
+    # context) intact. A plain commit-then-rollback would unwind the connection
+    # state and, on aiosqlite, break the subsequent re-fetch with MissingGreenlet.
+    try:
+        async with session.begin_nested():
+            session.add(membership)
+        await session.commit()
+        return membership
+    except IntegrityError:
+        # The duplicate's SAVEPOINT is already rolled back; the outer txn is
+        # still live. Re-fetch the winner's row, eagerly populating it so a
+        # later sync attribute access can't trigger a lazy refresh.
+        existing = (
+            await session.execute(
+                select(Membership)
+                .where(
+                    Membership.channel_id == channel_id,
+                    Membership.user_id == user_id,
+                )
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            return existing
+        raise  # a different integrity violation (e.g. bad FK) — surface it
 
 
 async def _require_admin(
@@ -119,26 +191,32 @@ async def add_member(
     channel_id: str,
     actor_id: str,
     target_user_id: str,
-    role: str = ROLE_MEMBER,
+    role: str = Role.MEMBER,
     can_post: bool = True,
 ) -> Membership:
     """Admin adds ``target_user_id`` to a channel. Idempotent: re-adding an
-    existing member returns the existing row unchanged (case (e)).
+    existing member returns the existing row unchanged (case (e)), including
+    under a concurrent double-add (the composite PK is the authority).
 
-    Rejects: non-admin actor (a, via _require_admin), unseeable channel (404)."""
+    Rejects: non-admin actor (a, via _require_admin), unseeable channel (404),
+    and an unknown target user (controlled NotAMember rather than an FK
+    IntegrityError at commit — cage-match PR#10: Carnot)."""
     await _require_admin(session, channel_id, actor_id)
     existing = await _membership(session, channel_id, target_user_id)
     if existing is not None:
         return existing  # idempotent — do not silently flip role/can_post
+    # Validate the target user up front so a nonexistent user is a controlled
+    # rejection, not an FK violation surfacing as a 500 at commit time.
+    if await session.get(User, target_user_id) is None:
+        raise NotAMember(target_user_id)
+    role = role if role in (Role.ADMIN, Role.MEMBER) else Role.MEMBER
     m = Membership(
         channel_id=channel_id,
         user_id=target_user_id,
-        role=role if role in (ROLE_ADMIN, ROLE_MEMBER) else ROLE_MEMBER,
+        role=role,
         can_post=can_post,
     )
-    session.add(m)
-    await session.commit()
-    return m
+    return await _insert_idempotent(session, m, channel_id, target_user_id)
 
 
 async def self_join(
@@ -153,36 +231,47 @@ async def self_join(
     BEFORE consulting the policy: if the channel is private and they have no
     membership, it is invisible, so 404 regardless of policy.
 
-    Idempotent (case (e)): already a member -> returns the existing row."""
-    # Load the raw channel directly (not via readable_channel) because for a
-    # private channel a non-member's readable_channel is None — but we need to
-    # branch on the policy. We reconstruct the hiding explicitly below.
-    channel = await session.get(Channel, channel_id)
+    Idempotent (case (e)): already a member -> returns the existing row,
+    including under a concurrent double-join (the composite PK is the authority).
+
+    EXISTENCE-HIDING — single-query resolution (cage-match PR#10: Carnot). The
+    earlier version did a bare ``session.get(Channel, id)`` PK lookup, which is a
+    query-SHAPE / timing oracle: a nonexistent id is a PK miss, an invite_only
+    private channel is a PK HIT then a policy read — distinguishable by latency
+    even though both return 404. That reintroduces exactly the oracle #36's
+    single-query design closed. We instead resolve "joinable-or-already-visible"
+    in ONE statement: the channel comes back iff it is PUBLIC, or PRIVATE+OPEN,
+    or the actor is already a member. A nonexistent channel and an invite_only
+    private one both yield None with identical DB work — no oracle."""
+    joinable = exists().where(
+        (Membership.channel_id == Channel.id) & (Membership.user_id == actor_id)
+    )
+    channel = (
+        await session.execute(
+            select(Channel).where(
+                Channel.id == channel_id,
+                Channel.is_private.is_(False)
+                | (Channel.join_policy == JoinPolicy.OPEN)
+                | joinable,
+            )
+        )
+    ).scalar_one_or_none()
+    if channel is None:
+        # Not found, OR private+invite_only and the actor is not already in it —
+        # indistinguishable by design (same single-None as the read path).
+        raise ChannelNotFound(channel_id)
+
     existing = await _membership(session, channel_id, actor_id)
     if existing is not None:
         return existing  # already in — idempotent self-join
 
-    if channel is None:
-        raise ChannelNotFound(channel_id)
-
-    if channel.is_private:
-        # A non-member of a private channel must not learn it exists. An OPEN
-        # private channel is the one case a non-member is *allowed* to join, so
-        # only that policy escapes the 404; invite_only collapses to not-found.
-        if channel.join_policy != JOIN_OPEN:
-            raise ChannelNotFound(channel_id)
-    # Public channels: joining is harmless (reads are open anyway) and lets a
-    # user opt into an explicit membership row; allowed for any policy.
-
     m = Membership(
         channel_id=channel_id,
         user_id=actor_id,
-        role=ROLE_MEMBER,
+        role=Role.MEMBER,
         can_post=True,
     )
-    session.add(m)
-    await session.commit()
-    return m
+    return await _insert_idempotent(session, m, channel_id, actor_id)
 
 
 async def remove_member(
@@ -194,7 +283,9 @@ async def remove_member(
     target = await _membership(session, channel_id, target_user_id)
     if target is None:
         raise NotAMember(target_user_id)
-    if target.role == ROLE_ADMIN and await _admin_count(session, channel_id) <= 1:
+    # Row-lock the admin set BEFORE the count, so a concurrent admin-removal is
+    # serialized behind us and the last-admin guard can't be raced (PR#10).
+    if target.role == Role.ADMIN and await _lock_admin_count(session, channel_id) <= 1:
         raise LastAdmin(channel_id)
     await session.delete(target)
     await session.commit()
@@ -213,7 +304,9 @@ async def leave(
     mine = await _membership(session, channel_id, actor_id)
     if mine is None:
         raise NotAMember(actor_id)
-    if mine.role == ROLE_ADMIN and await _admin_count(session, channel_id) <= 1:
+    # Same row-locked last-admin guard as remove_member — serializes a racing
+    # concurrent leave so the channel can't be orphaned (PR#10).
+    if mine.role == Role.ADMIN and await _lock_admin_count(session, channel_id) <= 1:
         raise LastAdmin(channel_id)
     await session.delete(mine)
     await session.commit()
@@ -259,23 +352,32 @@ async def create_channel(
     paths protect (no channel is born adminless). ``aiko_channel`` defaults to a
     unique generated token so two channels with the same display name don't
     collide on the unique aiko_channel constraint."""
-    policy = join_policy if join_policy in (JOIN_OPEN, JOIN_INVITE_ONLY) else JOIN_INVITE_ONLY
+    policy = (
+        join_policy if join_policy in (JoinPolicy.OPEN, JoinPolicy.INVITE_ONLY)
+        else JoinPolicy.INVITE_ONLY
+    )
+    channel_id = new_ulid()
     channel = Channel(
-        id=new_ulid(),
+        id=channel_id,
         name=name,
         kind=kind,
         # aiko_channel is wire-unique; for a user-created channel default to a
-        # namespaced token derived from its id rather than the display name.
-        aiko_channel=aiko_channel or f"ch_{new_ulid()}",
+        # namespaced token DERIVED FROM the channel id (not the display name, and
+        # not a second independent ULID — Kelvin, PR#10), so the wire name maps
+        # 1:1 to the row and is reproducible from the id.
+        aiko_channel=aiko_channel or f"ch_{channel_id}",
         is_private=is_private,
-        join_policy=policy if is_private else JOIN_OPEN,
+        join_policy=policy if is_private else JoinPolicy.OPEN,
     )
     session.add(channel)
+    # Channel + creator-admin are added before a SINGLE commit, so the auto-admin
+    # seed is atomic with channel creation (no window where a channel exists with
+    # zero admins). Carnot confirmed this atomicity in PR#10.
     session.add(
         Membership(
             channel_id=channel.id,
             user_id=creator_id,
-            role=ROLE_ADMIN,
+            role=Role.ADMIN,
             can_post=True,
         )
     )

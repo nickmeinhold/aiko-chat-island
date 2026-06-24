@@ -365,6 +365,101 @@ async def test_remove_non_member_is_404(client, session):
     assert resp.status_code == 404
 
 
+# =========================================================================
+# Cage-match PR#10 hardening — fixes for the adversarial findings
+# =========================================================================
+
+async def test_add_nonexistent_user_is_controlled_404_not_500(client, session):
+    """Carnot, PR#10: adding a user that doesn't exist must be a controlled
+    rejection (NotAMember -> 404), NOT an FK IntegrityError surfacing as a 500
+    at commit time."""
+    admin = await _user(session, "admin")
+    ch = await _channel(session, cid=10, name="secret", is_private=True)
+    await _member(session, ch, admin, role="admin")
+    resp = await client.post(f"/v1/channels/{ch.id}/members",
+                             headers=await _headers(admin),
+                             json={"user_id": "00000000000000000000nouser"})
+    assert resp.status_code == 404
+    assert await _count_members(session, ch.id) == 1  # nothing added
+
+
+async def test_idempotent_insert_recovers_from_integrity_error(session):
+    """Carnot, PR#10: the composite-PK constraint is the real idempotency
+    authority. Simulate the race loser: a row already exists, a second insert of
+    the same (channel,user) hits the unique constraint — _insert_idempotent must
+    catch it, roll back, and return the existing row rather than raising 500."""
+    from aiko_gateway.domain.models import Membership
+    admin = await _user(session, "admin")
+    target = await _user(session, "target")
+    ch = await _channel(session, cid=10, name="secret", is_private=True)
+    await _member(session, ch, admin, role="admin")
+    await _member(session, ch, target)  # winner's row already committed
+    # The "loser" payload: same PK, different attrs. Must NOT raise; returns the
+    # already-present row (idempotent).
+    dup = Membership(channel_id=ch.id, user_id=target.id, role="admin",
+                     can_post=False)
+    got = await svc._insert_idempotent(session, dup, ch.id, target.id)
+    assert got.user_id == target.id and got.role == "member"  # existing, not the dup
+    assert await _count_members(session, ch.id) == 2
+
+
+async def test_self_join_resolver_single_query_no_pk_lookup(session):
+    """Carnot, PR#10: self_join must resolve existence+joinability in ONE query
+    (no bare PK lookup that distinguishes invite_only from nonexistent by query
+    shape). Functional proof: invite_only-private and nonexistent both raise
+    ChannelNotFound; open-private and public both succeed for a non-member."""
+    bob = await _user(session, "bob")
+    invite_only = await _channel(session, cid=10, name="io", is_private=True,
+                                 join_policy="invite_only")
+    open_priv = await _channel(session, cid=11, name="op", is_private=True,
+                               join_policy="open")
+    public = await _channel(session, cid=12, name="pub", is_private=False)
+
+    import pytest
+    with pytest.raises(svc.ChannelNotFound):
+        await svc.self_join(session, channel_id=invite_only.id, actor_id=bob.id)
+    with pytest.raises(svc.ChannelNotFound):
+        await svc.self_join(session, channel_id="00000000000000000000nochan",
+                            actor_id=bob.id)
+    # Open-private and public both joinable by a non-member.
+    assert (await svc.self_join(session, channel_id=open_priv.id,
+                                actor_id=bob.id)).user_id == bob.id
+    assert (await svc.self_join(session, channel_id=public.id,
+                                actor_id=bob.id)).user_id == bob.id
+
+
+async def test_existing_member_of_invite_only_can_rejoin_idempotently(session):
+    """A member of an invite_only private channel self-joining again must NOT be
+    404'd — the single-query resolver includes the 'already a member' branch, so
+    an existing member resolves the channel and gets an idempotent no-op."""
+    alice = await _user(session, "alice")
+    ch = await _channel(session, cid=10, name="io", is_private=True,
+                        join_policy="invite_only")
+    await _member(session, ch, alice)
+    got = await svc.self_join(session, channel_id=ch.id, actor_id=alice.id)
+    assert got.user_id == alice.id
+    assert await _count_members(session, ch.id) == 1
+
+
+async def test_invalid_join_policy_rejected_at_api_boundary(client, session):
+    """Carnot, PR#10: join_policy is a JoinPolicy enum on the request model, so a
+    bogus value is a 422 at the boundary, not a silent coercion to invite_only."""
+    creator = await _user(session, "creator")
+    resp = await client.post("/v1/channels", headers=await _headers(creator),
+                             json={"name": "x", "is_private": True,
+                                   "join_policy": "everyone-welcome"})
+    assert resp.status_code == 422
+
+
+async def test_created_channel_aiko_channel_derived_from_id(session):
+    """Kelvin, PR#10: aiko_channel must be derived from the channel id (one ULID),
+    not a second independent ULID — so the wire name maps 1:1 to the row."""
+    creator = await _user(session, "creator")
+    ch = await svc.create_channel(session, creator_id=creator.id, name="x",
+                                  is_private=True)
+    assert ch.aiko_channel == f"ch_{ch.id}"
+
+
 # --- existence-hiding: admin ops on an unseeable channel are 404, not 403 --
 
 async def test_add_member_to_unseeable_private_channel_is_404(client, session):
