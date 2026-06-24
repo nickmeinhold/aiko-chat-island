@@ -16,6 +16,17 @@ import os
 # (e.g. set by a future CI matrix) still wins.
 os.environ.setdefault("ENVIRONMENT", "test")
 
+# Give the test harness a >= 32-byte JWT secret. The dev default
+# ("dev-insecure-change-me", 22 bytes) is below PyJWT's HS256 floor, so every
+# token issued/verified in the suite triggers an `InsecureKeyLengthWarning`.
+# That warning is dev/test-only noise: production already fail-closed-rejects a
+# sub-32-byte secret in config.py's `_harden_for_production`, so PyJWT never
+# sees a short key there. We silence the warning at its SOURCE (a compliant key)
+# rather than filtering it — keeping PyJWT's machinery armed to flag a genuinely
+# short key if one ever leaks into a test. setdefault so a CI-supplied secret
+# still wins, mirroring the ENVIRONMENT handling above.
+os.environ.setdefault("JWT_SECRET", "test-secret-at-least-32-bytes-long!!")
+
 import pytest_asyncio  # noqa: E402
 from sqlalchemy.ext.asyncio import (  # noqa: E402
     AsyncSession, async_sessionmaker, create_async_engine,
