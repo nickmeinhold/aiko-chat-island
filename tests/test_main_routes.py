@@ -1,4 +1,4 @@
-"""Production-app wiring guard (task #37).
+"""Production-app wiring guard (task #37, hardened in #41).
 
 The HTTP auth tests in `test_rest_auth.py` build a minimal FastAPI app from JUST
 the read routers — they deliberately do NOT import `aiko_gateway.main`, to keep
@@ -9,85 +9,115 @@ isolation: those tests can't catch a regression in the PRODUCTION wiring — if
 production silently regressed (no auth on a read endpoint = the exact I1
 violation §A3 closed).
 
-This module closes that gap by introspecting the REAL app object
-(`aiko_gateway.main.app`). It is only importable because `main.py` imports
-`AikoBusClient` lazily (inside `lifespan`), so `import aiko_gateway.main` no
-longer pulls aiko_services at module scope. We assert here that this isolation
-holds (the import itself would fail on clean CI otherwise) AND that both read
-routes are mounted with `get_current_user` in their dependency tree.
+This module closes that gap by driving the REAL app object
+(`aiko_gateway.main.app`) over its public ASGI surface. It is only importable
+because `main.py` imports `AikoBusClient` lazily (inside `lifespan`), so
+`import aiko_gateway.main` no longer pulls aiko_services at module scope — the
+import itself would fail on clean CI otherwise.
+
+#41 hardening — observable contract, not internals
+--------------------------------------------------
+The original version introspected FastAPI's private route graph
+(`route.dependant`, recursive dependency walks, and `_IncludedRouter`
+`.original_router` lazy-mount wrappers) to prove `get_current_user` sat in each
+route's dependency tree. That coupled the guard to FastAPI internals that churn
+across versions — the `_IncludedRouter` lazy-mount wrapper (path=None, real
+routes nested under `.original_router`) landed in 0.116 and had already forced a
+recursive-flattening workaround in the original test. Reading `route.path` off
+`app.routes` is *also* not version-stable for the same reason (included routes
+don't surface their template on the parent under the lazy-mount layout).
+
+So we assert the *observable* contract over the real production app instead,
+through the public ASGI surface, which FastAPI keeps stable:
+
+  * unauthenticated request → 401  (route is mounted AND auth-gated; an
+    UNMOUNTED path returns 404 here, and an inline UNAUTHENTICATED handler
+    returns 200/404 — only a mounted, auth-gated route answers 401);
+  * authenticated request   → 200 / 404-for-missing-row  (the route genuinely
+    reaches its handler past auth — proving the 401 above was the auth gate, not
+    a coincidental catch-all).
+
+Same guarantee as #37 — production read routers are mounted and auth-gated —
+expressed via behaviour, robust to FastAPI internal refactors.
 """
 from __future__ import annotations
 
+import pytest
+import pytest_asyncio
+from httpx import ASGITransport, AsyncClient
+
+from aiko_gateway.domain import security, users_service
 from aiko_gateway.main import app
-from aiko_gateway.rest.deps import get_current_user
+from aiko_gateway.rest.deps import get_session
 
-# The two read paths whose auth wiring this test guards (I1, plan §A3).
-GUARDED_PATHS = {
-    "/v1/channels",
-    "/v1/channels/{channel_id}/messages",
-}
+# The two read paths this test guards (I1, plan §A3), as concrete request paths.
+# The `{channel_id}` template is filled with an id that does NOT exist: auth is
+# checked before any row is read, so an unauthenticated request is rejected
+# regardless, and an authenticated request reaches the handler and 404s on the
+# absent channel — both observable proofs that the real route is wired.
+CHANNELS_PATH = "/v1/channels"
+HISTORY_PATH = "/v1/channels/no-such-channel/messages"
+GUARDED_PATHS = (CHANNELS_PATH, HISTORY_PATH)
 
 
-def _iter_api_routes(routes):
-    """Yield every APIRoute reachable from `routes`, flattening nested routers.
+@pytest_asyncio.fixture
+async def client(session):
+    """An httpx client bound to the REAL production app, with only the DB
+    session overridden to the in-memory test session. Lifespan is NOT run
+    (ASGITransport doesn't trigger it), so the aiko bus never starts — the auth
+    dependency is exercised over the genuine production wiring."""
+    async def _override_session():
+        yield session
 
-    FastAPI >= 0.116 mounts `include_router`ed routers lazily as `_IncludedRouter`
-    wrappers (path=None) rather than copying their routes into `app.routes`; the
-    real APIRoutes live under `wrapper.original_router.routes`. Older versions
-    flatten directly. We recurse through any wrapper exposing `original_router`
-    (or a nested `routes` list) so this guard is robust across both layouts.
+    app.dependency_overrides[get_session] = _override_session
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as c:
+        yield c
+    app.dependency_overrides.clear()
+
+
+async def _auth_header(session) -> dict:
+    """Create a real user and mint a real access token for it."""
+    user = await users_service.create_user(
+        session, username="alice", display_name="Alice", password="pw")
+    return {"Authorization": f"Bearer {security.issue_access(user.id)}"}
+
+
+@pytest.mark.parametrize("path", GUARDED_PATHS)
+async def test_guarded_paths_reject_unauthenticated(client, path):
+    """Each read route, on the REAL app, rejects an unauthenticated request.
+
+    Observable-contract replacement for the old dependency-graph introspection:
+    an UNMOUNTED route would answer 404 here, and a route served by an inline,
+    UNAUTHENTICATED handler (the pre-§A3 I1 violation) would answer 200/404 —
+    only a mounted, auth-gated route answers 401.
     """
-    for route in routes:
-        if hasattr(route, "dependant") and getattr(route, "path", None) is not None:
-            yield route
-        nested = getattr(route, "original_router", None)
-        nested_routes = getattr(nested, "routes", None)
-        if nested_routes is None:
-            nested_routes = getattr(route, "routes", None)
-        # Guard against self-recursion: only recurse into a *different* route list.
-        if nested_routes is not None and nested_routes is not routes:
-            yield from _iter_api_routes(nested_routes)
+    resp = await client.get(path)
+    assert resp.status_code == 401, (
+        f"{path} answered {resp.status_code} without credentials — expected 401 "
+        f"(missing route ⇒ 404, or inline/unauthenticated handler ⇒ 200/404?)"
+    )
 
 
-def _route_for(path: str):
-    """Return the mounted APIRoute for `path`, or None if it isn't mounted."""
-    for route in _iter_api_routes(app.routes):
-        if getattr(route, "path", None) == path:
-            return route
-    return None
+async def test_guarded_paths_reach_handler_when_authed(client, session):
+    """With a valid token the read routes pass auth and reach their handler.
 
-
-def _dependency_calls(dependant) -> set:
-    """Every callable in a route's full (recursive) dependency tree."""
-    calls = set()
-    stack = [dependant]
-    while stack:
-        dep = stack.pop()
-        if dep.call is not None:
-            calls.add(dep.call)
-        stack.extend(dep.dependencies)
-    return calls
-
-
-def test_production_app_mounts_guarded_paths():
-    """main.py must mount both read endpoints — not drop the include_router."""
-    mounted = {r.path for r in _iter_api_routes(app.routes)}
-    missing = GUARDED_PATHS - mounted
-    assert not missing, f"production app is missing routes: {missing}"
-
-
-def test_guarded_paths_require_auth_dependency():
-    """Each read route's dependency tree must include `get_current_user`.
-
-    Catches a regression where a path is served by an inline, unauthenticated
-    handler (the pre-§A3 I1 violation) — the route would be mounted but its
-    dependant tree would NOT contain the auth dependency.
+    Confirms the 401s above came from the auth gate, not from the routes being
+    absent (an unmounted path would 404 even with a token). `/v1/channels` lists
+    (200, empty) and the history path 404s on the non-existent channel — both
+    are handler responses, reached only because the production routers are
+    mounted past the auth dependency.
     """
-    for path in GUARDED_PATHS:
-        route = _route_for(path)
-        assert route is not None, f"{path} is not mounted as an APIRoute"
-        calls = _dependency_calls(route.dependant)
-        assert get_current_user in calls, (
-            f"{path} does not require auth: get_current_user is not in its "
-            f"dependency tree (inline/unauthenticated handler regression?)"
-        )
+    headers = await _auth_header(session)
+
+    channels = await client.get(CHANNELS_PATH, headers=headers)
+    assert channels.status_code == 200, (
+        f"{CHANNELS_PATH} did not reach its handler with a valid token "
+        f"(got {channels.status_code}) — is the router mounted?"
+    )
+
+    history = await client.get(HISTORY_PATH, headers=headers)
+    assert history.status_code == 404, (
+        f"{HISTORY_PATH} did not reach its handler with a valid token "
+        f"(got {history.status_code}; expected 404 for the absent channel)"
+    )
