@@ -1,0 +1,6 @@
+.git
+tests
+e2e
+spike
+__pycache__
+*.pyc
