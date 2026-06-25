@@ -1,0 +1,59 @@
+# Aiko Chat Gateway — production compose (#1281 incr 3 deploy).
+#
+# Runs the gateway alongside the matrix stack on Nick's imagineering host,
+# fronted by Caddy at chat.imagineering.cc. Two non-obvious wiring choices,
+# both forced by the deployed topology (mapped 2026-06-25, not assumed):
+#
+#  1. NETWORK — we attach to the matrix stack's EXISTING `matrix_default`
+#     network (external) rather than minting our own. aiko-mosquitto publishes
+#     NO host port (deliberate; broker stays inside the compose network), so the
+#     ONLY way to reach it is by service name on its own network. We therefore
+#     join matrix_default and address it as `aiko-mosquitto:1883`.
+#
+#  2. STORE — DB_URL points at file-backed SQLite on a named volume, NOT
+#     Postgres. Per the #1281 redesign HyperSpace is the topology source of
+#     truth and the gateway's local store is file-backed SQLite (aiosqlite is a
+#     declared PROD dep). The config.py default is Postgres for DEV convenience
+#     (docker PG on :5433); deploy overrides it here.
+#
+# The port publish binds 127.0.0.1 only — Caddy reverse-proxies localhost:8095
+# and terminates TLS. Nothing on 8095 is reachable off-host directly.
+
+services:
+  aiko-chat-gateway:
+    build: .
+    image: aiko-chat-gateway:latest
+    restart: always
+    # Reachable by Caddy on the host loopback; never exposed off-host directly.
+    ports:
+      - "127.0.0.1:8095:8095"
+    environment:
+      # Explicit prod declaration arms config.py's fail-closed JWT guard
+      # (a weak/dev secret crashes the boot — see config.py:74-101).
+      ENVIRONMENT: production
+      # Compose-level fail-closed: refuse to even render without a JWT_SECRET in
+      # the env (the deploy script writes it from SOPS). Belt-and-suspenders with
+      # the app-level >=32-char guard.
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET required (SOPS-managed, >=32 chars)}
+      # File-backed SQLite on the persistent volume below (4 slashes = absolute
+      # path /data/aiko.db). aiosqlite dialect ships in the image (prod dep).
+      DB_URL: sqlite+aiosqlite:////data/aiko.db
+      # aiko bus — reach the matrix stack's broker by service name on matrix_default.
+      AIKO_MQTT_HOST: aiko-mosquitto
+      AIKO_MQTT_PORT: "1883"
+      AIKO_NAMESPACE: aiko
+    volumes:
+      # Persist the SQLite store across container recreates.
+      - aiko_gateway_data:/data
+    networks:
+      - matrix_default
+
+networks:
+  # Pre-existing network owned by the matrix compose project — we attach, we do
+  # not create it. (External so a `docker compose down` here never tears down
+  # the matrix stack's network.)
+  matrix_default:
+    external: true
+
+volumes:
+  aiko_gateway_data:
