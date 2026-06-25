@@ -8,6 +8,7 @@ next (plan §A1-A5).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING
@@ -152,6 +153,8 @@ async def lifespan(app: FastAPI):
             state.bus.stop()
         if state._channel_worker is not None:
             state._channel_worker.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await state._channel_worker  # clean task ownership (Carnot r2)
 
 
 app = FastAPI(title="Aiko Chat Gateway", version="0.0.1", lifespan=lifespan)
