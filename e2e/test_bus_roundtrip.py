@@ -35,10 +35,17 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEVSTACK = REPO_ROOT / "spike" / "devstack.sh"
 
 # The devstack broker lives on :1884 (clear of any stale default-port stack).
+# ENVIRONMENT/JWT_SECRET mirror tests/conftest.py: importing the real client now
+# transitively loads config.Settings (via domain.channels_service -> models ->
+# db -> config), which fail-closed-crashes on the dev jwt_secret in a production
+# environment. This is an integration test of the persistence-adjacent client,
+# so a loadable test config is legitimate (not the prod fail-closed path).
 BUS_ENV = {
     "AIKO_MQTT_HOST": "localhost",
     "AIKO_MQTT_PORT": "1884",
     "AIKO_NAMESPACE": "aiko",
+    "ENVIRONMENT": "test",
+    "JWT_SECRET": "test-secret-at-least-32-bytes-long!!",
 }
 
 CHANNEL = "general"
@@ -79,7 +86,16 @@ def test_gateway_bus_roundtrip(aiko_stack):
     from aiko_gateway.aiko.client import AikoBusClient
 
     received: list = []
-    client = AikoBusClient([CHANNEL], received.append)
+    # Channel topology reconcile (#1281 incr 2) rides the SAME discovery event as
+    # the message roundtrip, and aiko.process is a process-global singleton (only
+    # one client can run per pytest process), so both are verified through this
+    # one client — mirroring the real gateway, which runs exactly one.
+    added: list[str] = []
+    removed: list[str] = []
+    client = AikoBusClient(
+        [CHANNEL], received.append,
+        on_channel_add=added.append, on_channel_remove=removed.append,
+    )
     client.start()
 
     # 1) Discovery: the gateway must find the ChatServer on the bus (the seam the
@@ -110,5 +126,22 @@ def test_gateway_bus_roundtrip(aiko_stack):
         assert msg.username == "testbot", f"username not preserved: {msg.username!r}"
         assert msg.channel == CHANNEL, f"channel not preserved: {msg.channel!r}"
         assert msg.message == body, f"body not byte-exact: {msg.message!r}"
+
+        # 4) Channel topology reconcile (#1281 incr 2): the PRODUCTION wiring
+        #    (GatewayChatActor -> ECConsumer(channel_list) -> on_channel_add)
+        #    must receive aiko's canonical channel set, not the hardcoded
+        #    ["general"]. devstack bootstraps these 5 into the HyperSpace
+        #    `channels` category (spike/devstack.sh).
+        bootstrapped = {"general", "random", "llm", "robot", "yolo"}
+        deadline = time.time() + 15
+        while time.time() < deadline and not bootstrapped <= set(added):
+            time.sleep(0.2)
+        assert bootstrapped <= set(added), (
+            f"channel_list reconcile incomplete: got {sorted(set(added))}, "
+            f"expected superset of {sorted(bootstrapped)}"
+        )
+        # Steady-state discovery must NOT emit removes (Decision B): no
+        # hard-delete trigger absent a genuine upstream removal.
+        assert removed == [], f"unexpected channel removes: {removed}"
     finally:
         client.stop()

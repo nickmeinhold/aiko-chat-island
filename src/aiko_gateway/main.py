@@ -13,7 +13,6 @@ from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING
 
 from fastapi import FastAPI, HTTPException, status
-from sqlalchemy import select
 
 # NOTE: `AikoBusClient` is imported lazily inside `lifespan` (not at module
 # scope) so that `import aiko_gateway.main` does NOT transitively pull in
@@ -27,8 +26,7 @@ if TYPE_CHECKING:
     from .aiko.client import AikoBusClient
 from .config import settings
 from .db import SessionLocal, init_models
-from .domain import echo, messages_service
-from .domain.models import Channel
+from .domain import channels_service, echo, messages_service
 from .realtime.hub import Hub
 
 logging.basicConfig(level=logging.INFO)
@@ -67,33 +65,72 @@ class GatewayState:
         except Exception:
             log.exception("ingest failed for bus message")
 
+    # -- channel topology reconcile (#1281 incr 2) --------------------------- #
+    # The aiko ChatServer's `channel_list` EC share is the canonical source of
+    # channel existence. These callbacks fire on the AIKO thread; each hops to
+    # the asyncio loop (same bridge as on_bus_message) and reconciles into the
+    # local Channel rows. Replaces the old independent `_seed_channels`.
+
+    def on_channel_add(self, aiko_channel: str) -> None:
+        """AIKO thread -> asyncio loop -> idempotent channel upsert."""
+        if self.loop is None:
+            return
+        self.loop.call_soon_threadsafe(
+            lambda: asyncio.create_task(self._reconcile_channel_add(aiko_channel))
+        )
+
+    async def _reconcile_channel_add(self, aiko_channel: str) -> None:
+        try:
+            async with SessionLocal() as session:
+                await channels_service.upsert_channel(session, aiko_channel)
+            log.info("channel reconcile: + %s", aiko_channel)
+        except Exception:
+            log.exception("channel add reconcile failed: %s", aiko_channel)
+
+    def on_channel_remove(self, aiko_channel: str) -> None:
+        """AIKO thread -> asyncio loop -> IRREVERSIBLE hard-delete (Decision B:
+        only ever called on a live-producer EC remove, never on disconnect)."""
+        if self.loop is None:
+            return
+        self.loop.call_soon_threadsafe(
+            lambda: asyncio.create_task(self._reconcile_channel_remove(aiko_channel))
+        )
+
+    async def _reconcile_channel_remove(self, aiko_channel: str) -> None:
+        try:
+            async with SessionLocal() as session:
+                deleted = await channels_service.hard_delete_channel(session, aiko_channel)
+            if deleted:
+                log.warning(
+                    "channel reconcile: HARD-DELETED %s (+ its messages + memberships)",
+                    aiko_channel,
+                )
+        except Exception:
+            log.exception("channel remove reconcile failed: %s", aiko_channel)
+
 
 state = GatewayState()
-
-
-async def _seed_channels() -> None:
-    """Ensure each configured aiko channel has a gateway Channel row (Phase 1)."""
-    async with SessionLocal() as session:
-        for ch in settings.aiko_channels:
-            exists = (await session.execute(
-                select(Channel).where(Channel.aiko_channel == ch)
-            )).scalar_one_or_none()
-            if exists is None:
-                session.add(Channel(name=ch, kind="standard", aiko_channel=ch, is_private=False))
-        await session.commit()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     state.loop = asyncio.get_running_loop()
     await init_models()
-    await _seed_channels()
+    # No independent seeding: channels are reconciled from the ChatServer
+    # `channel_list` EC share once the bus client discovers it. An inbound
+    # message for a not-yet-reconciled channel is upserted by persist_inbound
+    # (closes the startup window). See #1281 incr 2.
     # Lazy import: pulling aiko_services happens only at startup, never at
     # module import time (see the import-block note above).
     from .aiko.client import AikoBusClient
-    state.bus = AikoBusClient(settings.aiko_channels, state.on_bus_message)
+    state.bus = AikoBusClient(
+        settings.aiko_channels, state.on_bus_message,
+        on_channel_add=state.on_channel_add,
+        on_channel_remove=state.on_channel_remove,
+    )
     state.bus.start()
-    log.info("Gateway started; channels=%s", settings.aiko_channels)
+    log.info("Gateway started; subscribed channels=%s (topology via channel_list share)",
+             settings.aiko_channels)
     try:
         yield
     finally:
