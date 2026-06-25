@@ -1,9 +1,11 @@
 """Async SQLAlchemy engine + session factory.
 
-Dev uses a docker Postgres on :5433 (see spike/devstack notes); deploy uses the
-imagineering Postgres via DB_URL from SOPS. Phase 1 creates tables with
-``create_all``; alembic migrations (one revision per phase) land before deploy
-(tracked task).
+Dev uses a docker Postgres on :5433 (see spike/devstack notes); deploy uses
+file-backed SQLite via DB_URL (the #1281 redesign makes HyperSpace the topology
+source of truth and the gateway's local store file-backed SQLite — aiosqlite is
+a declared prod dep). The engine is DB_URL-driven, so the dialect follows the
+URL. Phase 1 creates tables with ``create_all``; alembic migrations (one
+revision per phase) land before deploy (tracked task).
 """
 from __future__ import annotations
 
