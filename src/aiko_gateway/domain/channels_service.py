@@ -8,18 +8,22 @@ their mutations — so the topology rules can't drift between call sites.
 
 Design: docs/design/01-channel-topology-reconcile.html (#1281 incr 2).
 
-Two operations, both invoked single-writer (the aiko thread bridges every event
-onto the one asyncio loop in main.GatewayState, so there is no concurrent
-reconcile to race against — unlike memberships_service, no SAVEPOINT needed):
+Two operations. **Transaction ownership: these FLUSH, they do not COMMIT** — the
+caller owns the transaction boundary (cage-match PR#12, Carnot P1b: a service
+that commits internally breaks the caller's atomicity and would commit a broader
+in-flight transaction behind its back). So `persist_inbound` can upsert a channel
++ insert the message in ONE atomic commit, and the reconcile worker owns its own
+commit per event.
 
-  * `upsert_channel`  — idempotent existence (add/update events, snapshot fill)
-  * `hard_delete_channel` — Decision A: application-level cascade in ONE
-        transaction (memberships -> messages -> channel). Backend-agnostic: it
-        does NOT rely on `ondelete=CASCADE` or SQLite's `foreign_keys` pragma
-        (the schema has neither), so a raw `DELETE channels` would either
-        IntegrityError on Postgres or orphan messages on SQLite. IRREVERSIBLE —
-        callers MUST only invoke it on a live-producer EC `remove` (Decision B),
-        never on ChatServer disconnect.
+  * `upsert_channel`  — idempotent existence (add/update events)
+  * `hard_delete_channel` — Decision A: application-level cascade
+        (memberships -> messages -> channel) within the CALLER's transaction.
+        Backend-agnostic: it does NOT rely on `ondelete=CASCADE` or SQLite's
+        `foreign_keys` pragma (the schema has neither), so a raw `DELETE channels`
+        would either IntegrityError on Postgres or orphan messages on SQLite.
+        IRREVERSIBLE — callers MUST only invoke it on a live-producer EC `remove`
+        (Decision B), never on ChatServer disconnect, and the reconcile worker
+        serializes events so an add/remove pair can't race (Carnot P1a).
 
 Name -> Channel fields matches the retired `_seed_channels` exactly: HyperSpace
 channels are public existence; private/ACL stays a gateway-local overlay.
@@ -80,7 +84,7 @@ async def upsert_channel(session: AsyncSession, aiko_channel: str) -> Channel:
         aiko_channel=aiko_channel, is_private=False,
     )
     session.add(channel)
-    await session.commit()
+    await session.flush()  # caller owns commit (see module docstring)
     return channel
 
 
@@ -100,29 +104,5 @@ async def hard_delete_channel(session: AsyncSession, aiko_channel: str) -> bool:
     await session.execute(delete(Membership).where(Membership.channel_id == channel.id))
     await session.execute(delete(Message).where(Message.channel_id == channel.id))
     await session.execute(delete(Channel).where(Channel.id == channel.id))
-    await session.commit()
+    await session.flush()  # caller owns commit (see module docstring)
     return True
-
-
-async def reconcile_snapshot(session: AsyncSession, names: set[str]) -> int:
-    """Additive bulk reconcile from a full `channel_list` cache: upsert every name
-    in `names`. Returns the count of channels newly created.
-
-    Additive ONLY — a channel absent from this snapshot is NOT removed here.
-    Removal is strictly event-driven (a live EC `remove`, see Decision B), so a
-    snapshot that happens to omit a channel (partial sync, filter quirk) can
-    never trigger a destructive delete.
-    """
-    existing = set((await session.execute(
-        select(Channel.aiko_channel)
-    )).scalars().all())
-    added = 0
-    for name in names:
-        if name not in existing:
-            session.add(Channel(
-                name=name, kind="standard", aiko_channel=name, is_private=False,
-            ))
-            added += 1
-    if added:
-        await session.commit()
-    return added

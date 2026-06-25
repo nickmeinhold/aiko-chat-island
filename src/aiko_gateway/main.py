@@ -40,6 +40,11 @@ class GatewayState:
         self.bus: "AikoBusClient | None" = None
         self.hub: Hub = Hub()
         self.loop: asyncio.AbstractEventLoop | None = None
+        # Single ordered lane for channel topology events (set up in lifespan
+        # once the loop exists). One worker drains it FIFO so an add/remove pair
+        # for the same channel can never interleave (cage-match PR#12, P1a).
+        self._channel_events: "asyncio.Queue[tuple[str, str]] | None" = None
+        self._channel_worker: "asyncio.Task | None" = None
 
     def on_bus_message(self, msg: InboundMessage) -> None:
         """AIKO thread -> hop to the asyncio loop, then ingest."""
@@ -67,46 +72,53 @@ class GatewayState:
 
     # -- channel topology reconcile (#1281 incr 2) --------------------------- #
     # The aiko ChatServer's `channel_list` EC share is the canonical source of
-    # channel existence. These callbacks fire on the AIKO thread; each hops to
-    # the asyncio loop (same bridge as on_bus_message) and reconciles into the
-    # local Channel rows. Replaces the old independent `_seed_channels`.
+    # channel existence. Callbacks fire on the AIKO thread and enqueue onto a
+    # SINGLE ordered asyncio queue; one worker drains it FIFO and reconciles
+    # into the local Channel rows. The queue is what makes ordering safe — a bare
+    # `create_task` per event let an add/remove pair for the same channel
+    # interleave at the DB await and finish out of order, which for an
+    # irreversible hard-delete is unacceptable (cage-match PR#12, Carnot P1a).
+    # Replaces the old independent `_seed_channels`.
 
     def on_channel_add(self, aiko_channel: str) -> None:
-        """AIKO thread -> asyncio loop -> idempotent channel upsert."""
-        if self.loop is None:
-            return
-        self.loop.call_soon_threadsafe(
-            lambda: asyncio.create_task(self._reconcile_channel_add(aiko_channel))
-        )
-
-    async def _reconcile_channel_add(self, aiko_channel: str) -> None:
-        try:
-            async with SessionLocal() as session:
-                await channels_service.upsert_channel(session, aiko_channel)
-            log.info("channel reconcile: + %s", aiko_channel)
-        except Exception:
-            log.exception("channel add reconcile failed: %s", aiko_channel)
+        self._enqueue_channel_event("add", aiko_channel)
 
     def on_channel_remove(self, aiko_channel: str) -> None:
-        """AIKO thread -> asyncio loop -> IRREVERSIBLE hard-delete (Decision B:
-        only ever called on a live-producer EC remove, never on disconnect)."""
-        if self.loop is None:
+        self._enqueue_channel_event("remove", aiko_channel)
+
+    def _enqueue_channel_event(self, action: str, aiko_channel: str) -> None:
+        """AIKO thread -> the one ordered topology queue (thread-safe handoff)."""
+        if self.loop is None or self._channel_events is None:
             return
         self.loop.call_soon_threadsafe(
-            lambda: asyncio.create_task(self._reconcile_channel_remove(aiko_channel))
+            self._channel_events.put_nowait, (action, aiko_channel)
         )
 
-    async def _reconcile_channel_remove(self, aiko_channel: str) -> None:
-        try:
-            async with SessionLocal() as session:
-                deleted = await channels_service.hard_delete_channel(session, aiko_channel)
-            if deleted:
-                log.warning(
-                    "channel reconcile: HARD-DELETED %s (+ its messages + memberships)",
-                    aiko_channel,
-                )
-        except Exception:
-            log.exception("channel remove reconcile failed: %s", aiko_channel)
+    async def _run_channel_worker(self) -> None:
+        """Single consumer of the topology queue — serializes every add/remove so
+        they apply in arrival order. Owns the transaction boundary (the services
+        only flush)."""
+        assert self._channel_events is not None
+        while True:
+            action, aiko_channel = await self._channel_events.get()
+            try:
+                async with SessionLocal() as session:
+                    if action == "add":
+                        await channels_service.upsert_channel(session, aiko_channel)
+                        await session.commit()
+                        log.info("channel reconcile: + %s", aiko_channel)
+                    elif action == "remove":
+                        deleted = await channels_service.hard_delete_channel(
+                            session, aiko_channel)
+                        await session.commit()
+                        if deleted:
+                            log.warning(
+                                "channel reconcile: HARD-DELETED %s "
+                                "(+ its messages + memberships)", aiko_channel)
+            except Exception:
+                log.exception("channel reconcile failed: %s %s", action, aiko_channel)
+            finally:
+                self._channel_events.task_done()
 
 
 state = GatewayState()
@@ -120,6 +132,8 @@ async def lifespan(app: FastAPI):
     # `channel_list` EC share once the bus client discovers it. An inbound
     # message for a not-yet-reconciled channel is upserted by persist_inbound
     # (closes the startup window). See #1281 incr 2.
+    state._channel_events = asyncio.Queue()
+    state._channel_worker = asyncio.create_task(state._run_channel_worker())
     # Lazy import: pulling aiko_services happens only at startup, never at
     # module import time (see the import-block note above).
     from .aiko.client import AikoBusClient
@@ -136,6 +150,8 @@ async def lifespan(app: FastAPI):
     finally:
         if state.bus is not None:
             state.bus.stop()
+        if state._channel_worker is not None:
+            state._channel_worker.cancel()
 
 
 app = FastAPI(title="Aiko Chat Gateway", version="0.0.1", lifespan=lifespan)

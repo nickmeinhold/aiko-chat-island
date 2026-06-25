@@ -119,7 +119,15 @@ Hard-delete + cascade is <strong>irreversible mass deletion</strong>. If a trans
 <tr><td>Hard-delete branch</td><td>Deferred to a task, gated on aiko_chat emitting channel removals</td><td>Built now, unit-tested with a synthetic remove (no e2e coverage possible)</td></tr>
 <tr><td>Complexity / blast radius</td><td>Low — additive, no destructive path</td><td>Higher — irreversible cascade behind a branch that can't fire e2e yet</td></tr>
 </table>
-<p><strong>Recommendation: Scope A.</strong> Deliver the live drift-kill (5 channels), keep the discovery-remove safety behaviour, and defer the destructive cascade until upstream can actually emit a removal to test against — building an irreversible path we can't exercise e2e is the kind of untested destructive code best deferred until it's reachable. Hard-delete decision (cascade mechanism) is preserved in this doc for when it lands.</p>
+<p><strong>Recommendation was Scope A; Nick chose Scope B (2026-06-25)</strong> — build the defensive hard-delete now, unit-tested with a synthetic remove. Shipped in PR#12.</p>
+
+<h3>10.1 Cage-match hardening (PR#12 round 2)</h3>
+<p>Carnot (REQUEST_CHANGES) caught two structural issues around the destructive path that a same-family review missed; both fixed inline:</p>
+<ul>
+<li><strong>P1a — event ordering.</strong> A bare <code>create_task</code> per topology event let an add/remove pair for the same channel interleave at the DB await and finish out of order (resurrecting a deleted channel). Fixed: a <em>single ordered asyncio queue + one worker</em> (<code>GatewayState._run_channel_worker</code>) drains FIFO. Regression test forces the interleave.</li>
+<li><strong>P1b — transaction ownership.</strong> <code>upsert_channel</code> committed internally, breaking <code>persist_inbound</code> atomicity and able to commit a caller's broader transaction behind its back. Fixed: the services <em>flush</em>; the caller (worker / <code>persist_inbound</code>) owns the commit — so channel-upsert + message-insert are now one atomic commit.</li>
+<li><strong>P2a/P2b — attachment lifecycle.</strong> <code>_discovery_add</code> now tears down any prior consumer first (idempotent re-add), and <code>_discovery_remove</code> symmetrically detaches the payload handlers (pre-PR they leaked).</li>
+</ul>
 
 <h2>9. Review regime</h2>
 <p>State-lifecycle + destructive persistence ⇒ <strong>3-way cage-match</strong> (Maxwell + Kelvin + Carnot) before merge, per the project's per-component regime and the "trust boundaries are cage-match by law" rule. Decisions A and B are the adversarial focus.</p>

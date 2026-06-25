@@ -170,23 +170,51 @@ def test_channel_name_from_item_ignores_parent_and_unrelated():
     assert channels_service.channel_name_from_item(None) is None
 
 
-# --- reconcile_snapshot: bulk add from a full share cache ------------------ #
+# --- topology worker serializes events in arrival order (Carnot P1a) ------- #
 
 @pytest.mark.asyncio
-async def test_reconcile_snapshot_adds_all_missing(session):
-    names = {"general", "random", "llm", "robot", "yolo"}
-    added = await channels_service.reconcile_snapshot(session, names)
-    assert added == 5
-    got = set((await session.execute(select(Channel.aiko_channel))).scalars().all())
-    assert got == names
+async def test_channel_worker_applies_events_in_fifo_order(monkeypatch):
+    """The single worker must drain the queue FIFO so an add/remove pair for the
+    same channel can never interleave across the aiko->asyncio bridge. A bare
+    create_task-per-event let the remove run before the add and resurrect a
+    deleted channel — the exact irreversible-path hazard the queue dissolves."""
+    import asyncio
 
+    from aiko_gateway import main
 
-@pytest.mark.asyncio
-async def test_reconcile_snapshot_is_additive_only(session):
-    """Snapshot reconcile never deletes — removal is event-driven (live EC remove
-    only), so a channel absent from this particular snapshot is left alone."""
-    session.add(Channel(id="C1", name="legacy", kind="standard", aiko_channel="legacy"))
-    await session.commit()
-    await channels_service.reconcile_snapshot(session, {"general"})
-    got = set((await session.execute(select(Channel.aiko_channel))).scalars().all())
-    assert got == {"legacy", "general"}  # legacy NOT removed by a snapshot
+    calls: list[tuple[str, str]] = []
+
+    async def fake_upsert(_session, name):
+        await asyncio.sleep(0)  # force a scheduler yield mid-op
+        calls.append(("add", name))
+
+    async def fake_delete(_session, name):
+        calls.append(("remove", name))
+        return True
+
+    class _NoSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def commit(self):
+            pass
+
+    monkeypatch.setattr(main.channels_service, "upsert_channel", fake_upsert)
+    monkeypatch.setattr(main.channels_service, "hard_delete_channel", fake_delete)
+    monkeypatch.setattr(main, "SessionLocal", lambda: _NoSession())
+
+    st = main.GatewayState()
+    st.loop = asyncio.get_running_loop()
+    st._channel_events = asyncio.Queue()
+    st._channel_events.put_nowait(("add", "random"))
+    st._channel_events.put_nowait(("remove", "random"))
+
+    worker = asyncio.create_task(st._run_channel_worker())
+    await asyncio.wait_for(st._channel_events.join(), timeout=2)
+    worker.cancel()
+
+    # add MUST land before remove despite the yield inside upsert.
+    assert calls == [("add", "random"), ("remove", "random")]

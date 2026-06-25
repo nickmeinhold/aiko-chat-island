@@ -62,6 +62,11 @@ class GatewayChatActor(aiko.Actor):
 
     # -- discovery ---------------------------------------------------------
     def _discovery_add(self, service_details, service):
+        # aiko gives no contract that `add` is always preceded by `remove`; a
+        # re-add without an intervening remove would overwrite _ec_consumer and
+        # leak the old one's handler + lease (cage-match PR#12, Carnot P2a).
+        # Tear down any prior attachment first so _discovery_add is idempotent.
+        self._teardown_attachments()
         self.server_topic_path = service_details[0]
         self.chat_server = service
         for channel in self.channels:
@@ -86,9 +91,21 @@ class GatewayChatActor(aiko.Actor):
         log.warning("ChatServer %s disconnected", service_details[1])
         self.chat_server = None
         self.server_topic_path = None
+        # Tear down attachments but DO NOT signal a channel removal: a disconnect
+        # is transient, not a real upstream removal (Decision B).
+        self._teardown_attachments()
+
+    def _teardown_attachments(self) -> None:
+        """Symmetric detach for everything _discovery_add wires up: the payload
+        message handlers AND the channel_list EC consumer. Pre-PR the payload
+        handlers were never removed (Carnot P2b) — now that a second
+        lifecycle-managed attachment exists, both are cleaned up together."""
+        for topic in self._subscribed.values():
+            try:
+                self.remove_message_handler(self._on_payload, topic)
+            except Exception:
+                log.exception("Error removing payload handler for %s", topic)
         self._subscribed.clear()
-        # Tear down the topology consumer but DO NOT signal a channel removal:
-        # a disconnect is transient, not a real upstream removal (Decision B).
         if self._ec_consumer is not None:
             try:
                 self._ec_consumer.terminate()

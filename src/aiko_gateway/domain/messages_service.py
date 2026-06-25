@@ -80,7 +80,9 @@ async def persist_inbound(session: AsyncSession, msg: InboundMessage) -> Message
     `channel_list` EC reconcile event, now that `_seed_channels` is retired
     (#1281 incr 2). It is NOT independent seeding/drift — the channel set seen on
     the bus is a subset of HyperSpace's canonical set. Single creation path:
-    `channels_service.upsert_channel`."""
+    `channels_service.upsert_channel` (which flushes, not commits), so the
+    channel upsert + message insert land in this function's ONE final commit —
+    atomic, no orphan-channel-on-message-failure (cage-match PR#12, Carnot P1b)."""
     if not msg.channel:
         return None
     channel = await channels_service.upsert_channel(session, msg.channel)
