@@ -13,6 +13,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..aiko.payload import InboundMessage
+from . import channels_service
 from .ids import new_ulid
 from .models import Channel, Message, User
 
@@ -70,14 +71,21 @@ def _kind_for(channel: Channel, sender_user: User | None) -> str:
 
 async def persist_inbound(session: AsyncSession, msg: InboundMessage) -> Message | None:
     """Persist a bus message into its channel. Returns the row, or None if the
-    channel isn't mapped (we don't auto-create channels from bus traffic)."""
+    message carries no channel.
+
+    Channel resolution: an inbound bus message is HyperSpace-confirmed evidence
+    that its channel exists canonically (ChatServer only relays channels it
+    hosts), so a not-yet-reconciled channel is upserted here rather than dropped.
+    This closes the startup window between bus discovery and the first
+    `channel_list` EC reconcile event, now that `_seed_channels` is retired
+    (#1281 incr 2). It is NOT independent seeding/drift — the channel set seen on
+    the bus is a subset of HyperSpace's canonical set. Single creation path:
+    `channels_service.upsert_channel` (which flushes, not commits), so the
+    channel upsert + message insert land in this function's ONE final commit —
+    atomic, no orphan-channel-on-message-failure (cage-match PR#12, Carnot P1b)."""
     if not msg.channel:
         return None
-    channel = (await session.execute(
-        select(Channel).where(Channel.aiko_channel == msg.channel)
-    )).scalar_one_or_none()
-    if channel is None:
-        return None
+    channel = await channels_service.upsert_channel(session, msg.channel)
 
     sender_user = None
     if msg.username:
