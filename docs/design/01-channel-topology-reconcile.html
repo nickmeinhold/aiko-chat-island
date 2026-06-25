@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Design 01 — Channel Topology Reconcile (#1281 incr 2)</title>
+<style>
+  :root { --fg:#1a1a1a; --muted:#666; --accent:#0b5; --warn:#c0392b; --rule:#e2e2e2; --code:#f4f4f6; }
+  body { font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--fg); max-width:820px; margin:2.5rem auto; padding:0 1.2rem; }
+  h1 { font-size:1.7rem; margin-bottom:0.2rem; }
+  h2 { font-size:1.25rem; margin-top:2.2rem; border-bottom:2px solid var(--rule); padding-bottom:0.3rem; }
+  h3 { font-size:1.05rem; margin-top:1.5rem; }
+  code { background:var(--code); padding:0.1rem 0.35rem; border-radius:4px; font-size:0.88em; }
+  pre { background:var(--code); padding:0.9rem 1.1rem; border-radius:8px; overflow-x:auto; font-size:0.85rem; }
+  .sub { color:var(--muted); font-size:0.95rem; margin-top:0; }
+  .decision { background:#f0f9f4; border-left:4px solid var(--accent); padding:0.7rem 1rem; border-radius:0 6px 6px 0; margin:1rem 0; }
+  .warn { background:#fdf2f0; border-left:4px solid var(--warn); padding:0.7rem 1rem; border-radius:0 6px 6px 0; margin:1rem 0; }
+  table { border-collapse:collapse; width:100%; margin:1rem 0; font-size:0.9rem; }
+  th,td { border:1px solid var(--rule); padding:0.45rem 0.6rem; text-align:left; vertical-align:top; }
+  th { background:#fafafa; }
+  details { margin:0.8rem 0; }
+  summary { cursor:pointer; font-weight:600; }
+  .tag { display:inline-block; background:#eef; color:#449; font-size:0.72rem; padding:0.1rem 0.45rem; border-radius:10px; vertical-align:middle; }
+</style>
+</head>
+<body>
+
+<h1>Channel Topology Reconcile <span class="tag">#1281 incr 2</span></h1>
+<p class="sub">Gateway reads canonical channel topology from aiko's HyperSpace and reconciles it into local <code>Channel</code> rows — killing the hardcoded <code>["general"]</code> drift. Channels only; users deferred (task&nbsp;#9). Status: <strong>design, awaiting sign-off</strong>.</p>
+
+<h2>1. The headline (read this first)</h2>
+<div class="decision">
+<strong>What changes:</strong> the gateway stops independently seeding channels (<code>main.py:74-83</code>) and instead <em>mirrors</em> aiko's canonical channel set, received as a live push-stream.<br><br>
+<strong>How:</strong> attach an <code>ECConsumer(filter="channel_list")</code> to the ChatServer the gateway already discovers. <em>Zero edits to Andy's <code>aiko_chat</code> repo.</em> Runtime-proven 2026-06-25 (see §3).<br><br>
+<strong>The two decisions that needed making</strong> (both resolved below): (a) how a hard-delete actually deletes given the FK schema, and (b) how to tell a <em>real</em> channel removal from a transient ChatServer blip so we never nuke history by accident.
+</div>
+
+<h2>2. Why this exists — the drift, made concrete</h2>
+<p>This is a live instance of the project's signature bug, <code>concept_two_representations_drift</code>. Two representations of "which channels exist" disagree:</p>
+<table>
+<tr><th>Representation</th><th>Holds</th><th>Source</th></tr>
+<tr><td>Gateway (hardcoded)</td><td><code>["general"]</code></td><td><code>client.py:43</code>, <code>config.py:46</code></td></tr>
+<tr><td>aiko HyperSpace (canonical)</td><td><code>general, random, llm, robot, yolo</code></td><td><code>spike/devstack.sh:44-52</code></td></tr>
+</table>
+<p>The gateway is structurally blind to 4 of 5 channels. The #1281 decomposition makes HyperSpace the <strong>single source of truth for channel/user existence</strong>; this increment delivers the channel half.</p>
+
+<h2>3. Mechanism (proven, not proposed)</h2>
+<p>aiko's "event-change" (EC) share system: an actor publishes a <code>share</code> dict; remote actors consume it via <code>ECConsumer</code>, which keeps a live local mirror updated by <code>add</code>/<code>remove</code>/<code>update</code> commands. ChatServer publishes <code>self.share["channel_list"]</code> (<code>aiko_chat/chat.py:274</code>), tagged <code>ec=true</code>.</p>
+<ul>
+<li>The gateway's existing <code>_discovery_add(service_details, service)</code> already receives <code>service_details[0]</code> = ChatServer's <code>topic_path</code> — the exact input <code>ECConsumer</code> needs.</li>
+<li><code>filter="channel_list"</code> ⇒ the producer's <code>_filter_compare</code> (<code>share.py:245</code>) returns only <code>channel_list</code> + <code>channel_list.*</code>.</li>
+<li>Breadcrumb: a commented-out <code># filter="channel_list"</code> at <code>aiko_chat/chat.py:215</code> — the aiko authors anticipated this consumer.</li>
+</ul>
+<details>
+<summary>Runtime proof (2026-06-25, <code>spike/probe_channel_list.py</code>)</summary>
+<pre>[probe] discovered ChatServer at aiko/MacBookPro.lan/91011/1; attached ECConsumer(filter='channel_list')
+[probe] share event: add channel_list.general = [['*', 'general', '*', '*', '*', []], 'None', 'None']
+[probe] share event: add channel_list.llm     = ...
+[probe] share event: add channel_list.random  = ...
+[probe] share event: add channel_list.robot   = ...
+[probe] share event: add channel_list.yolo    = ...
+[probe] PASS: all 5 bootstrapped channels arrived via the EC share.</pre>
+<p><strong>Payload shape</strong> (drives the parse): each cache entry under <code>channel_list.&lt;name&gt;</code> is
+<code>[['*', '&lt;name&gt;', '*', '*', '*', []], 'None', 'None']</code> — a ServiceFilter-shaped tuple. Channel name = <code>entry[0][1]</code>, redundantly the cache-key suffix. Consumer cache = <code>{"channel_list": {"&lt;name&gt;": &lt;tuple&gt;, ...}}</code>.</p>
+</details>
+
+<h2>4. Reconcile semantics</h2>
+<table>
+<tr><th>Signal</th><th>Meaning</th><th>Action</th></tr>
+<tr><td>EC <code>add channel_list.X</code></td><td>Channel X exists upstream</td><td><strong>Upsert</strong> a <code>Channel</code> row (by <code>aiko_channel=X</code>)</td></tr>
+<tr><td>EC <code>remove channel_list.X</code> <em>(producer live)</em></td><td>Channel X genuinely removed upstream</td><td><strong>Hard-delete</strong> channel X + its messages/memberships (§5)</td></tr>
+<tr><td><code>_discovery_remove</code> (ChatServer gone)</td><td>Transient: ChatServer disconnected</td><td><strong>Nothing to the DB.</strong> Tear down the consumer only; rows persist</td></tr>
+</table>
+
+<h3>4.1 Name → Channel fields</h3>
+<p>The share carries only a bare name. Mapping for an upserted row: <code>name=X</code>, <code>aiko_channel=X</code>, <code>kind="standard"</code> (the <code>llm</code>/<code>robot</code> channels could later map to richer kinds — out of scope here), <code>is_private=False</code> (HyperSpace channels are public existence; private/ACL stays a gateway-local overlay per #1281). This matches today's <code>_seed_channels</code> mapping exactly, so the upsert is behaviour-preserving for <code>general</code>.</p>
+
+<h2>5. Decision A — how hard-delete actually deletes <span class="tag">resolved</span></h2>
+<div class="warn">
+<strong>"Hard-delete the channel row" is not one behaviour with the current schema.</strong> <code>Message.channel_id</code> and <code>Membership.channel_id</code> are <code>ForeignKey("channels.id")</code> with <strong>no <code>ondelete</code> clause</strong> (<code>domain/models.py</code>), and <code>db.py</code> sets <strong>no SQLite <code>foreign_keys</code> pragma</strong>. So a naive <code>DELETE channels WHERE id=…</code> gives:
+<ul>
+<li><strong>Postgres</strong> (FK enforced, no cascade) → <code>IntegrityError</code>, delete <em>blocked</em> while messages exist.</li>
+<li><strong>SQLite</strong> (pragma off by default) → delete <em>succeeds</em>, messages <em>orphaned</em> with a dangling <code>channel_id</code>; channel-joined queries break.</li>
+</ul>
+Neither is what was chosen.
+</div>
+<div class="decision">
+<strong>Resolution: application-level explicit cascade in one transaction</strong> — <code>DELETE memberships WHERE channel_id=…</code>, <code>DELETE messages WHERE channel_id=…</code>, then <code>DELETE channels WHERE id=…</code>. Backend-agnostic (doesn't depend on FK enforcement differing between SQLite/Postgres), explicit, and testable. This honours the chosen semantics: a channel absent upstream ceases to exist, history included. (Alternative — <code>ondelete="CASCADE"</code> + enabling the SQLite pragma — is rejected: it couples correctness to a per-connection pragma and a migration, and hides the destruction inside the FK engine.)
+</div>
+
+<h2>6. Decision B — real removal vs transient blip <span class="tag">resolved</span></h2>
+<div class="warn">
+Hard-delete + cascade is <strong>irreversible mass deletion</strong>. If a transient event (ChatServer restart, registrar hiccup) emitted a spurious <code>remove</code>, a momentary network blip would wipe a channel's entire history. This is the destructive analogue of the transient-vs-terminal auth distinction (<code>feedback_auth_error_boundary</code>).
+</div>
+<div class="decision">
+<strong>Resolution: delete ONLY on a live-producer EC <code>remove</code> event; NEVER on <code>_discovery_remove</code>.</strong> Reading the consumer resync path (<code>share.py</code>): a producer restart re-issues <code>add</code> commands (it does not clear-then-remove), so a restart does not synthesise spurious removes — it re-adds. The genuine <code>remove</code> only fires on real category removal while ChatServer is live. Tying destruction to that signal alone — and explicitly <em>not</em> to ChatServer disconnect — bounds the blast radius to genuine upstream removals.
+</div>
+<div class="warn"><strong>Validation gate (before merge):</strong> a spike that restarts ChatServer mid-session and asserts the consumer emits <em>zero</em> spurious <code>remove</code> events (only re-<code>add</code>s). This is a <code>concept_verify_by_running_beats_reasoning</code> claim — it must be run, not reasoned. If restarts <em>do</em> emit removes, Decision B escalates (debounce / require N-stable-absence before deleting).</div>
+
+<h2>7. Scope boundary</h2>
+<p><strong>Channels only.</strong> ChatServer publishes <code>channel_list</code> but no <code>user_list</code> share. User topology read-through needs an upstream change to Andy's <code>aiko_chat</code> (task&nbsp;#9). Gateway-local concerns are untouched: auth/credentials, message persistence, and ACL/membership remain gateway-owned overlays per the #1281 decomposition.</p>
+
+<h2>8. Test plan (ATDD)</h2>
+<ol>
+<li><strong>Parse</strong>: <code>channel_list</code> payload tuple → channel name (<code>entry[0][1]</code>); tolerate the redundant key-suffix form.</li>
+<li><strong>Add reconcile</strong>: add events for 5 channels ⇒ 5 <code>Channel</code> rows, idempotent on repeat (upsert, no dupes).</li>
+<li><strong>Remove reconcile (live)</strong>: a live EC remove for <code>X</code> ⇒ channel + its messages + memberships gone (application-cascade), in one transaction.</li>
+<li><strong>Transient safety</strong>: <code>_discovery_remove</code> ⇒ rows untouched; consumer torn down.</li>
+<li><strong>Seed removal</strong>: with reconcile active, the hardcoded <code>_seed_channels</code> path is deleted; <code>general</code> still present (now via reconcile, not seeding).</li>
+<li><strong>Live e2e</strong> (extends <code>e2e/test_bus_roundtrip.py</code>): real devstack, assert all 5 bootstrapped channels reconcile into the DB; the §6 restart validation gate.</li>
+</ol>
+
+<h2>9. Review regime</h2>
+<p>State-lifecycle + destructive persistence ⇒ <strong>3-way cage-match</strong> (Maxwell + Kelvin + Carnot) before merge, per the project's per-component regime and the "trust boundaries are cage-match by law" rule. Decisions A and B are the adversarial focus.</p>
+
+</body>
+</html>
