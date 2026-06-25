@@ -95,7 +95,8 @@ Hard-delete + cascade is <strong>irreversible mass deletion</strong>. If a trans
 <div class="decision">
 <strong>Resolution: delete ONLY on a live-producer EC <code>remove</code> event; NEVER on <code>_discovery_remove</code>.</strong> Reading the consumer resync path (<code>share.py</code>): a producer restart re-issues <code>add</code> commands (it does not clear-then-remove), so a restart does not synthesise spurious removes — it re-adds. The genuine <code>remove</code> only fires on real category removal while ChatServer is live. Tying destruction to that signal alone — and explicitly <em>not</em> to ChatServer disconnect — bounds the blast radius to genuine upstream removals.
 </div>
-<div class="warn"><strong>Validation gate (before merge):</strong> a spike that restarts ChatServer mid-session and asserts the consumer emits <em>zero</em> spurious <code>remove</code> events (only re-<code>add</code>s). This is a <code>concept_verify_by_running_beats_reasoning</code> claim — it must be run, not reasoned. If restarts <em>do</em> emit removes, Decision B escalates (debounce / require N-stable-absence before deleting).</div>
+<div class="decision"><strong>Validation gate — RUN &amp; PASSED (2026-06-25, <code>spike/probe_restart_removes.py</code>).</strong> A ChatServer restart under a live consumer produced: <code>discovery_remove</code> (no db-remove) → <code>discovery_add</code> with a <em>new</em> topic_path (new PID) → 5 re-<code>add</code>s. <strong>Zero reconcile <code>remove</code> events.</strong> Mechanism: restart ⇒ new PID ⇒ new topic_path; the old consumer goes silent against its dead producer, the new consumer gets fresh adds. A restart cannot trigger a hard-delete.</div>
+<div class="warn"><strong>Stronger finding — the EC <code>remove</code> signal cannot fire e2e with current aiko_chat.</strong> ChatServer reads <code>channels_list</code> once at init (<code>chat.py:272-274</code>) and never mutates it; there is no runtime <code>add_channel</code>/<code>remove_channel</code> path (dynamic channels are an aiko_chat TODO, <code>chat.py:45-50</code>). So the channel set is fixed at ChatServer startup. <strong>Consequence:</strong> the hard-delete branch (§5) is <em>defensive / forward-facing</em> — correct for when upstream gains channel removal, but exercisable today only by a synthetic <code>remove</code> in a unit test, never end-to-end. The live value of this increment is the <strong>add-reconcile</strong> (gateway learns all 5 channels, not 1). See §10 for the resulting build-scope decision.</div>
 
 <h2>7. Scope boundary</h2>
 <p><strong>Channels only.</strong> ChatServer publishes <code>channel_list</code> but no <code>user_list</code> share. User topology read-through needs an upstream change to Andy's <code>aiko_chat</code> (task&nbsp;#9). Gateway-local concerns are untouched: auth/credentials, message persistence, and ACL/membership remain gateway-owned overlays per the #1281 decomposition.</p>
@@ -109,6 +110,16 @@ Hard-delete + cascade is <strong>irreversible mass deletion</strong>. If a trans
 <li><strong>Seed removal</strong>: with reconcile active, the hardcoded <code>_seed_channels</code> path is deleted; <code>general</code> still present (now via reconcile, not seeding).</li>
 <li><strong>Live e2e</strong> (extends <code>e2e/test_bus_roundtrip.py</code>): real devstack, assert all 5 bootstrapped channels reconcile into the DB; the §6 restart validation gate.</li>
 </ol>
+
+<h2>10. Build-scope decision (post-spike) <span class="tag">awaiting sign-off</span></h2>
+<p>The spikes proved the add-reconcile works and that EC removes cannot fire e2e with current aiko_chat. Two viable build scopes:</p>
+<table>
+<tr><th></th><th>Scope A — add-reconcile only</th><th>Scope B — add + defensive hard-delete</th></tr>
+<tr><td>Ships now</td><td>Gateway learns all 5 channels; delete <code>_seed_channels</code>; ignore discovery-remove (the safety scaffolding stays)</td><td>Scope A + the application-cascade hard-delete on live EC remove</td></tr>
+<tr><td>Hard-delete branch</td><td>Deferred to a task, gated on aiko_chat emitting channel removals</td><td>Built now, unit-tested with a synthetic remove (no e2e coverage possible)</td></tr>
+<tr><td>Complexity / blast radius</td><td>Low — additive, no destructive path</td><td>Higher — irreversible cascade behind a branch that can't fire e2e yet</td></tr>
+</table>
+<p><strong>Recommendation: Scope A.</strong> Deliver the live drift-kill (5 channels), keep the discovery-remove safety behaviour, and defer the destructive cascade until upstream can actually emit a removal to test against — building an irreversible path we can't exercise e2e is the kind of untested destructive code best deferred until it's reachable. Hard-delete decision (cascade mechanism) is preserved in this doc for when it lands.</p>
 
 <h2>9. Review regime</h2>
 <p>State-lifecycle + destructive persistence ⇒ <strong>3-way cage-match</strong> (Maxwell + Kelvin + Carnot) before merge, per the project's per-component regime and the "trust boundaries are cage-match by law" rule. Decisions A and B are the adversarial focus.</p>
