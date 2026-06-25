@@ -112,6 +112,30 @@ async def test_can_post_public_open_to_all(session):
     assert await acl.can_post(session, anyone.id, ch) is True
 
 
+async def test_can_post_public_non_member_still_open(session):
+    """Absence of a Membership row on a public channel preserves the open default."""
+    ch = await _public_channel(session)
+    stranger = await _user(session, "stranger")
+    # No _join — no Membership row at all.
+    assert await acl.can_post(session, stranger.id, ch) is True
+
+
+async def test_can_post_public_member_with_can_post_true_is_allowed(session):
+    """An explicit Membership row with can_post=True does not accidentally mute."""
+    ch = await _public_channel(session)
+    alice = await _user(session, "alice")
+    await _join(session, ch, alice, can_post=True)
+    assert await acl.can_post(session, alice.id, ch) is True
+
+
+async def test_can_post_public_member_with_can_post_false_is_forbidden(session):
+    """An explicit Membership row with can_post=False mutes a user on a public channel."""
+    ch = await _public_channel(session)
+    muted = await _user(session, "muted")
+    await _join(session, ch, muted, can_post=False)
+    assert await acl.can_post(session, muted.id, ch) is False
+
+
 async def test_visible_channels_is_public_plus_member_private_ordered(session):
     pub = await _public_channel(session, cid=0, name="general")
     priv_in = await _private_channel(session, cid=10, name="club")
