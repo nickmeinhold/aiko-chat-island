@@ -2,10 +2,13 @@
 
 The read/subscribe/post trust boundary. Access semantics (Phase 2):
 
-  * PUBLIC channels (``is_private=False``): open to every authenticated user.
-  * PRIVATE channels (``is_private=True``): require an explicit ``Membership`` row.
-
-Posting additionally honours ``Membership.can_post`` on private channels.
+  * PUBLIC channels (``is_private=False``): open to every authenticated user for
+    reading/subscribing. Posting is also open by default, BUT an explicit
+    ``Membership`` row with ``can_post=False`` mutes that user on the channel
+    (absence of a row = open; presence with ``can_post=True`` = open;
+    presence with ``can_post=False`` = muted).
+  * PRIVATE channels (``is_private=True``): require an explicit ``Membership``
+    row to read/subscribe; posting additionally needs ``Membership.can_post``.
 
 EXISTENCE-HIDING (explicit design call, #36): callers collapse "private channel
 you are not a member of" into the SAME response as "no such channel" (REST 404 /
@@ -71,14 +74,18 @@ async def readable_channel(
 
 
 async def can_post(session: AsyncSession, user_id: str, channel: Channel) -> bool:
-    """Post access: public open to all; private needs a membership with can_post.
+    """Post access: honouring ``Membership.can_post`` on both public and private channels.
+
+    * PUBLIC: open by default; an explicit ``Membership`` row with ``can_post=False``
+      mutes the user.  Absence of a row means open (public default preserved).
+    * PRIVATE: requires a ``Membership`` row with ``can_post=True``.
 
     Only called AFTER ``readable_channel`` has confirmed access, so it never
     leaks existence (the caller already knows the channel is real)."""
-    if not channel.is_private:
-        return True
     m = await _membership(session, channel.id, user_id)
-    return m is not None and m.can_post
+    if not channel.is_private:
+        return m is None or m.can_post  # public: open by default, explicit row can mute
+    return m is not None and m.can_post  # private: needs a row with can_post
 
 
 async def visible_channels(session: AsyncSession, user_id: str) -> list[Channel]:
