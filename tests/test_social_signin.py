@@ -130,11 +130,39 @@ async def test_provider_outage_returns_503(client, monkeypatch):
     assert r.status_code == 503
 
 
-async def test_unknown_provider_returns_400(client, monkeypatch):
-    _mock_verify(monkeypatch, exc=oauth.UnknownProvider("facebook"))
+async def test_unknown_provider_rejected_at_boundary_422(client, monkeypatch):
+    # provider is a Provider StrEnum on the request model now, so an unsupported
+    # provider is a 422 at validation — it never reaches verify_id_token. (The
+    # UnknownProvider -> 400 path remains as defense-in-depth, unit-tested in
+    # test_oauth_verify.test_unknown_provider_rejected.)
+    _mock_verify(monkeypatch, identity=_IDENTITY)
     r = await client.post("/v1/auth/social",
                           json={"provider": "facebook", "id_token": "x"})
-    assert r.status_code == 400
+    assert r.status_code == 422
+
+
+@pytest.mark.parametrize("handle", ["", "   ", "x" * 65])
+async def test_claim_rejects_bad_handle_422(client, monkeypatch, handle):
+    # Empty, whitespace-only, and overlong handles are rejected at the boundary
+    # (422), not deferred to DB behaviour. Validation precedes the endpoint, so a
+    # bogus provisioning_token is irrelevant here.
+    _mock_verify(monkeypatch, identity=_IDENTITY)
+    r = await client.post("/v1/auth/social/claim", json={
+        "provisioning_token": "irrelevant", "handle": handle})
+    assert r.status_code == 422
+
+
+async def test_claim_strips_handle_whitespace(client, monkeypatch):
+    # A handle with surrounding whitespace is stripped before becoming the
+    # username (not stored verbatim).
+    _mock_verify(monkeypatch, identity=_IDENTITY)
+    r1 = await client.post("/v1/auth/social",
+                           json={"provider": "google", "id_token": "x"})
+    prov = r1.json()["provisioning_token"]
+    r2 = await client.post("/v1/auth/social/claim", json={
+        "provisioning_token": prov, "handle": "  nick  ", "display_name": "  Nick  "})
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["user"]["username"] == "nick"
 
 
 async def test_claim_rejects_forged_provisioning_token(client, monkeypatch):

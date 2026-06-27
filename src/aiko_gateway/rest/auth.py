@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import jwt
 from fastapi import APIRouter, HTTPException, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.exc import IntegrityError
 
 from ..config import settings
 from ..domain import oauth, security, users_service
 from ..domain.models import User
+from ..domain.oauth import Provider
 from .deps import CurrentUser, DbSession
 
 router = APIRouter(prefix="/v1/auth", tags=["auth"])
@@ -55,6 +56,9 @@ async def register(req: RegisterReq, session: DbSession) -> dict:
             display_name=req.display_name, password=req.password,
         )
     except IntegrityError:
+        # Roll back the failed transaction before reusing/closing the session
+        # (a failed commit leaves it needing rollback).
+        await session.rollback()
         raise HTTPException(status.HTTP_409_CONFLICT, "username already taken")
     return {**_tokens(user.id), "user": _user_view(user)}
 
@@ -68,14 +72,29 @@ async def login(req: LoginReq, session: DbSession) -> dict:
 
 
 class SocialReq(BaseModel):
-    provider: str          # "apple" | "google"
+    provider: Provider     # closed set → a bad value is a 422 at the boundary
     id_token: str          # the provider ID token obtained on-device
 
 
 class SocialClaimReq(BaseModel):
     provisioning_token: str
-    handle: str
-    display_name: str = ""
+    # Bounded at the public front door (cage-match PR#15): a handle becomes the
+    # username + aiko_username (both String(64)); reject empty/whitespace/overlong
+    # here with a 422 rather than deferring to DB behaviour and 409/500 ambiguity.
+    handle: str = Field(min_length=1, max_length=64)
+    display_name: str = Field(default="", max_length=128)
+
+    @field_validator("handle", "display_name")
+    @classmethod
+    def _strip(cls, v: str) -> str:
+        return v.strip()
+
+    @field_validator("handle")
+    @classmethod
+    def _handle_nonempty_after_strip(cls, v: str) -> str:
+        if not v:
+            raise ValueError("handle must not be blank")
+        return v
 
 
 @router.post("/social")
@@ -137,6 +156,7 @@ async def social_claim(req: SocialClaimReq, session: DbSession) -> dict:
         )
     except IntegrityError:
         # Handle already taken OR this identity was already claimed (race).
+        await session.rollback()
         raise HTTPException(
             status.HTTP_409_CONFLICT, "handle already taken or identity already claimed")
     return {**_tokens(user.id), "user": _user_view(user)}

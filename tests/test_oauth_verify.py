@@ -13,6 +13,7 @@ import datetime as dt
 import hashlib
 import hmac
 import json
+import time
 
 import jwt
 import pytest
@@ -35,10 +36,14 @@ def rsa_key():
 @pytest.fixture
 def wired_google(rsa_key, monkeypatch):
     """Allowlist our google client id + inject the test public key into the
-    google JWKS cache (keyed by _KID) so get_key resolves without network."""
+    google JWKS cache (keyed by _KID) so get_key resolves without network.
+    _fetched_at is set to NOW so the freshly-injected key isn't seen as stale by
+    the max_age ceiling (which would otherwise force a real network refresh and
+    wipe the test key)."""
     monkeypatch.setattr(settings, "google_client_ids", [_GOOGLE_AUD])
     cache = oauth._PROVIDERS["google"].jwks
     monkeypatch.setattr(cache, "_keys", {_KID: rsa_key.public_key()})
+    monkeypatch.setattr(cache, "_fetched_at", time.monotonic())
     return rsa_key
 
 
@@ -169,6 +174,7 @@ async def test_unknown_kid_rejected_after_single_refresh(wired_google, monkeypat
         refreshes["n"] += 1  # refresh runs but doesn't add the bogus kid
 
     monkeypatch.setattr(cache, "_keys", {})  # force a miss
+    monkeypatch.setattr(cache, "_fetched_at", 0.0)  # ensure the floor permits a refresh
     monkeypatch.setattr(cache, "_refresh", fake_refresh)
     token = _make_token(wired_google, kid="bogus-kid")
     with pytest.raises(oauth.InvalidProviderToken):
@@ -186,7 +192,24 @@ async def test_provider_outage_maps_to_unavailable(wired_google, monkeypatch):
         raise httpx.ConnectError("jwks endpoint down")
 
     monkeypatch.setattr(cache, "_keys", {})
+    monkeypatch.setattr(cache, "_fetched_at", 0.0)
     monkeypatch.setattr(cache, "_refresh", boom)
+    token = _make_token(wired_google, kid="any-kid")
+    with pytest.raises(oauth.ProviderUnavailable):
+        await oauth.verify_id_token("google", token)
+
+
+async def test_malformed_jwks_body_maps_to_unavailable(wired_google, monkeypatch):
+    """A JWKS endpoint returning a non-JSON body makes resp.json() raise
+    ValueError — a provider-side failure (503), not a bad credential (401)."""
+    cache = oauth._PROVIDERS["google"].jwks
+
+    async def bad_json():
+        raise ValueError("Expecting value: line 1 column 1 (char 0)")
+
+    monkeypatch.setattr(cache, "_keys", {})
+    monkeypatch.setattr(cache, "_fetched_at", 0.0)
+    monkeypatch.setattr(cache, "_refresh", bad_json)
     token = _make_token(wired_google, kid="any-kid")
     with pytest.raises(oauth.ProviderUnavailable):
         await oauth.verify_id_token("google", token)
@@ -196,3 +219,41 @@ async def test_unknown_provider_rejected(wired_google):
     token = _make_token(wired_google)
     with pytest.raises(oauth.UnknownProvider):
         await oauth.verify_id_token("facebook", token)
+
+
+# --- JWKS cache time-policy (cage-match PR#15: floor + ceiling) ------------- #
+
+async def test_jwks_cache_floor_bounds_bogus_kid_amplification():
+    """The FLOOR: a storm of bogus kids must trigger at most ONE refresh per
+    window, not one fetch per request (the unauthenticated amplification DoS)."""
+    cache = oauth._JwksCache("http://x", min_refresh_interval=1000.0, max_age=10000.0)
+    calls = {"n": 0}
+
+    async def fake_refresh():
+        calls["n"] += 1
+        cache._fetched_at = time.monotonic()  # a successful (empty) refresh
+
+    cache._refresh = fake_refresh
+    for i in range(6):
+        assert await cache.get_key(f"bogus-{i}") is None
+    assert calls["n"] == 1  # first miss refreshed; floor blocked the next five
+
+
+async def test_jwks_cache_ceiling_forces_refresh_when_stale():
+    """The CEILING: once the cached set is older than max_age, even a kid HIT
+    forces a refresh so a revoked/rotated key stops being trusted."""
+    cache = oauth._JwksCache("http://x", min_refresh_interval=0.0, max_age=100.0)
+    calls = {"n": 0}
+
+    async def fake_refresh():
+        calls["n"] += 1
+        cache._keys = {"k1": object()}
+        cache._fetched_at = time.monotonic()
+
+    cache._refresh = fake_refresh
+    assert await cache.get_key("k1") is not None and calls["n"] == 1  # miss → refresh
+    await cache.get_key("k1")
+    assert calls["n"] == 1                                            # fresh hit → no refresh
+    cache._fetched_at = time.monotonic() - 200                       # now stale (> max_age)
+    await cache.get_key("k1")
+    assert calls["n"] == 2                                            # stale hit → refresh
