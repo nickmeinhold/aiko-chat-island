@@ -98,3 +98,30 @@ def test_open_registration_override_allowed_in_dev():
     # Dev can still flip it either way.
     s = Settings(_env_file=None, environment="dev", open_registration=False)
     assert s.open_registration is False
+
+
+# --- invariant 3: social sign-in client-ID allowlist (#13) ------------------
+
+def test_prod_social_enabled_without_client_ids_raises():
+    # Enabling social in prod with NO client IDs is a guaranteed-broken config:
+    # the verifier's empty audience allowlist would reject every token. Fail LOUD
+    # at boot rather than silently 401 every real login.
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, environment="production",
+                 jwt_secret=_STRONG_SECRET, social_signin_enabled=True)
+
+
+def test_prod_social_enabled_with_client_ids_boots():
+    # Unlike open_registration, social sign-in IS permitted in prod (the I2
+    # tradeoff is accepted) — as long as at least one provider client ID is set.
+    s = Settings(_env_file=None, environment="production",
+                 jwt_secret=_STRONG_SECRET, social_signin_enabled=True,
+                 google_client_ids=["my-client-id.apps.googleusercontent.com"])
+    assert s.social_signin_enabled is True
+
+
+def test_dev_social_enabled_without_client_ids_boots():
+    # Dev stays frictionless — the boot guard is prod-only (an empty allowlist
+    # still rejects tokens at runtime, but dev isn't blocked from booting).
+    s = Settings(_env_file=None, environment="dev", social_signin_enabled=True)
+    assert s.social_signin_enabled is True

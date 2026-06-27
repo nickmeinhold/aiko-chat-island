@@ -60,6 +60,28 @@ class Settings(BaseSettings):
     # (open in dev, closed in prod); set OPEN_REGISTRATION to override either way.
     open_registration: bool | None = None
 
+    # --- social sign-in (#13: Apple + Google native ID-token flow) ---
+    # Explicit on/off, default False, LOUD in prod (mirror open_registration's
+    # explicit-default posture). Unlike open_registration, social sign-in MAY be
+    # enabled in production (Nick's decision 2026-06-27): the SAME I2 risk applies
+    # — until #36 membership lands, any signed-in user can read every channel —
+    # but that tradeoff is ACCEPTED for the current early-users phase so the live
+    # gateway is reachable at all. The risk is named here and in the PR, not
+    # silently absorbed.
+    social_signin_enabled: bool = False
+    # The audience allowlist: OUR provider client IDs. A provider ID token's `aud`
+    # must be one of these. PUBLIC values (native ID-token flow needs no client
+    # secret), so plain config — NOT SOPS. EMPTY ⇒ the verifier rejects every
+    # token (fail-closed): a token minted for any OTHER Apple/Google app must
+    # never authenticate here.
+    apple_client_ids: list[str] = []
+    google_client_ids: list[str] = []
+    # Provisioning token TTL: a brand-new social user gets a short-lived signed
+    # token (NOT a DB row) to carry (provider, sub, suggested name/email) from the
+    # verify step to the handle-claim step. Short window — it's a one-step
+    # handoff, not a session.
+    provisioning_ttl_seconds: int = 10 * 60  # 10 min
+
     # --- HTTP server ---
     host: str = "127.0.0.1"
     port: int = 8095
@@ -98,6 +120,21 @@ class Settings(BaseSettings):
                     "open_registration must not be enabled in production until "
                     "I2 membership is enforced (an open /register would expose "
                     "all channels to any self-registered user)."
+                )
+            # Social sign-in IS permitted in prod (unlike open_registration), but
+            # enabling it with NO client-ID allowlist is a guaranteed-broken
+            # config: the verifier would reject every token (empty aud allowlist
+            # = reject-all). Fail LOUD at boot rather than silently 401 every
+            # real login — a prose "must configure client IDs" is not a guard.
+            if self.social_signin_enabled and not (
+                self.apple_client_ids or self.google_client_ids
+            ):
+                raise ValueError(
+                    "social_signin_enabled is True in production but no "
+                    "apple_client_ids / google_client_ids are configured. The "
+                    "verifier would reject every token (empty audience allowlist "
+                    "= reject-all). Refusing to boot — supply at least one "
+                    "provider client ID."
                 )
         # Resolve registration default by environment when not explicitly set:
         # open in dev, closed in prod.

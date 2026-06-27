@@ -26,9 +26,37 @@ class User(Base):
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=new_ulid)
     username: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     display_name: Mapped[str] = mapped_column(String(128), nullable=False)
-    password_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    # NULLABLE as of social sign-in (#13): a social-only account has no password.
+    # The authenticate() path MUST guard `password_hash is None` BEFORE argon2 so
+    # a null hash can never become a password-auth shortcut (the social bypass).
+    password_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Wire-attribution identity on the aiko bus (defaults to username).
     aiko_username: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    # Informational ONLY (#13). Identity authority is the (provider, sub) pair in
+    # social_identities, NEVER email — with no email-verification step an
+    # email-match would be account takeover. Nullable: Apple only returns email on
+    # first consent (and may be a private-relay address).
+    email: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class SocialIdentity(Base):
+    """A verified federated identity → local user link (#13).
+
+    The (provider, provider_sub) pair is the SOLE identity authority for social
+    sign-in. UNIQUE on that pair so a provider subject maps to exactly one local
+    user. Multi-provider linking (one user, several identities) is DEFERRED and
+    must require re-auth — never email equality.
+    """
+    __tablename__ = "social_identities"
+    __table_args__ = (
+        UniqueConstraint("provider", "provider_sub", name="uq_social_provider_sub"),
+    )
+    id: Mapped[str] = mapped_column(String(26), primary_key=True, default=new_ulid)
+    provider: Mapped[str] = mapped_column(String(16), nullable=False)  # apple|google
+    provider_sub: Mapped[str] = mapped_column(String(255), nullable=False)
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id"), nullable=False, index=True)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
