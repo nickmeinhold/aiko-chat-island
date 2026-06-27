@@ -239,6 +239,78 @@ async def test_jwks_cache_floor_bounds_bogus_kid_amplification():
     assert calls["n"] == 1  # first miss refreshed; floor blocked the next five
 
 
+@pytest.mark.parametrize("bad_body", [
+    [],                    # bare list, not an object
+    {"keys": None},        # keys present but null
+    {"keys": "nope"},      # keys not a list
+    {"keys": ["bad"]},     # a non-object key entry
+    {"no_keys_field": 1},  # missing keys → treated as empty → kid never resolves
+])
+async def test_malformed_jwks_shape_does_not_500(wired_google, monkeypatch, bad_body):
+    """Valid-JSON-wrong-SHAPE must fail closed as 503/401, never crash with an
+    uncaught AttributeError/TypeError (→ 500). cage-match PR#15 r2, Carnot."""
+    cache = oauth._PROVIDERS["google"].jwks
+
+    async def fake_refresh():
+        # Mimic the real _refresh's shape validation over the bad body.
+        if not isinstance(bad_body, dict):
+            raise ValueError("not an object")
+        keys = bad_body.get("keys")
+        if "keys" in bad_body and not isinstance(keys, list):
+            raise ValueError("keys not a list")
+        cache._fetched_at = time.monotonic()  # a successful (possibly empty) refresh
+
+    monkeypatch.setattr(cache, "_keys", {})
+    monkeypatch.setattr(cache, "_fetched_at", 0.0)
+    monkeypatch.setattr(cache, "_refresh", fake_refresh)
+    token = _make_token(wired_google, kid="any-kid")
+    with pytest.raises((oauth.ProviderUnavailable, oauth.InvalidProviderToken)):
+        await oauth.verify_id_token("google", token)
+
+
+async def test_real_refresh_rejects_malformed_shapes(monkeypatch):
+    """Drive the REAL _refresh (not a stub) against bad shapes by stubbing only
+    the HTTP layer — proves the shape guards live in production code, not the test."""
+    import httpx
+
+    class _Resp:
+        def __init__(self, payload): self._payload = payload
+        def raise_for_status(self): pass
+        def json(self): return self._payload
+
+    for bad in ([], {"keys": None}, {"keys": "x"}):
+        cache = oauth._JwksCache("http://x")
+
+        class _Client:
+            def __init__(self, *a, **k): pass
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return False
+            async def get(self, url): return _Resp(bad)
+
+        monkeypatch.setattr(httpx, "AsyncClient", _Client)
+        with pytest.raises(ValueError):
+            await cache._refresh()
+
+
+async def test_jwks_cache_floor_starves_rotation_within_window():
+    """ACCEPTED tradeoff: a NEW (legit) kid arriving within the floor window after
+    a recent refresh is NOT refreshed — it fails closed (returns None → 401).
+    Documents the amplification/rotation tension. cage-match PR#15 r2, Carnot."""
+    cache = oauth._JwksCache("http://x", min_refresh_interval=1000.0, max_age=10000.0)
+    calls = {"n": 0}
+
+    async def fake_refresh():
+        calls["n"] += 1
+        cache._keys = {"old-kid": object()}
+        cache._fetched_at = time.monotonic()
+
+    cache._refresh = fake_refresh
+    assert await cache.get_key("old-kid") is not None and calls["n"] == 1  # initial refresh
+    # A freshly-rotated new kid within the floor window: no refresh, fail closed.
+    assert await cache.get_key("new-rotated-kid") is None
+    assert calls["n"] == 1  # floor blocked the refresh — the accepted 401 window
+
+
 async def test_jwks_cache_ceiling_forces_refresh_when_stale():
     """The CEILING: once the cached set is older than max_age, even a kid HIT
     forces a refresh so a revoked/rotated key stops being trusted."""

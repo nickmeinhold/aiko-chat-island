@@ -104,6 +104,16 @@ class _JwksCache:
     is necessarily older than the (much smaller) floor, so the refresh is always
     permitted. The floor only bites when the cache is FRESH — exactly the
     bogus-kid-spam case.
+
+    ACCEPTED TRADEOFF (cage-match PR#15 r2, Carnot): a LEGITIMATE provider key
+    rotation whose new kid arrives within the floor window is reported as a 401
+    (unknown kid, fail-closed) rather than triggering an immediate refresh. This
+    is inherent — any amplification bound must cap refreshes regardless of kid,
+    so a real new kid is indistinguishable from a bogus one inside the window.
+    Bounded to ≤ min_refresh_interval, rare (providers overlap old+new keys for
+    hours during rotation, so the old kid keeps verifying), and self-healing on
+    the client's retry once the window passes. Tested in
+    test_oauth_verify.test_jwks_cache_floor_starves_rotation_within_window.
     """
 
     def __init__(self, jwks_uri: str, *,
@@ -155,8 +165,20 @@ class _JwksCache:
             resp = await client.get(self._uri)
             resp.raise_for_status()
             jwks = resp.json()  # ValueError on a malformed body → ProviderUnavailable
+        # Validate the SHAPE, not just that the body parsed (cage-match PR#15 r2,
+        # Carnot): valid-JSON-wrong-shape (a bare list, `{"keys": null}`, a
+        # non-object key entry) would otherwise raise AttributeError/TypeError
+        # that the caller's (HTTPError, ValueError) catch misses → a 500 instead
+        # of a 503. Funnel every shape deviation to ValueError (→ ProviderUnavailable).
+        if not isinstance(jwks, dict):
+            raise ValueError("JWKS response is not a JSON object")
+        keys = jwks.get("keys")
+        if not isinstance(keys, list):
+            raise ValueError("JWKS 'keys' is missing or not a list")
         new_keys: dict[str, object] = {}
-        for jwk in jwks.get("keys", []):
+        for jwk in keys:
+            if not isinstance(jwk, dict):
+                continue  # skip a non-object key entry rather than crashing
             kid = jwk.get("kid")
             if not kid:
                 continue
