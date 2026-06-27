@@ -42,6 +42,15 @@ services:
       AIKO_MQTT_HOST: aiko-mosquitto
       AIKO_MQTT_PORT: "1883"
       AIKO_NAMESPACE: aiko
+      # --- social sign-in (#13). Supplied from the host .env; OFF by default so
+      # deploying this passthrough changes nothing until the env sets values. The
+      # client IDs are PUBLIC (native ID-token flow has no client secret), so they
+      # live in plain .env, not SOPS. The *_CLIENT_IDS values MUST be JSON arrays
+      # (pydantic-settings json-decodes list fields; a bare string crashes boot).
+      # config.py refuses to boot if enabled in prod with an empty allowlist.
+      SOCIAL_SIGNIN_ENABLED: ${SOCIAL_SIGNIN_ENABLED:-false}
+      APPLE_CLIENT_IDS: ${APPLE_CLIENT_IDS:-[]}
+      GOOGLE_CLIENT_IDS: ${GOOGLE_CLIENT_IDS:-[]}
     volumes:
       # Persist the SQLite store across container recreates.
       - aiko_gateway_data:/data
