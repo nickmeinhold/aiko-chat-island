@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import jwt
 from fastapi import APIRouter, HTTPException, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.exc import IntegrityError
 
 from ..config import settings
-from ..domain import security, users_service
+from ..domain import oauth, security, users_service
 from ..domain.models import User
+from ..domain.oauth import Provider
 from .deps import CurrentUser, DbSession
 
 router = APIRouter(prefix="/v1/auth", tags=["auth"])
@@ -55,6 +56,9 @@ async def register(req: RegisterReq, session: DbSession) -> dict:
             display_name=req.display_name, password=req.password,
         )
     except IntegrityError:
+        # Roll back the failed transaction before reusing/closing the session
+        # (a failed commit leaves it needing rollback).
+        await session.rollback()
         raise HTTPException(status.HTTP_409_CONFLICT, "username already taken")
     return {**_tokens(user.id), "user": _user_view(user)}
 
@@ -64,6 +68,97 @@ async def login(req: LoginReq, session: DbSession) -> dict:
     user = await users_service.authenticate(session, req.username, req.password)
     if user is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid credentials")
+    return {**_tokens(user.id), "user": _user_view(user)}
+
+
+class SocialReq(BaseModel):
+    provider: Provider     # closed set → a bad value is a 422 at the boundary
+    id_token: str          # the provider ID token obtained on-device
+
+
+class SocialClaimReq(BaseModel):
+    provisioning_token: str
+    # Bounded at the public front door (cage-match PR#15): a handle becomes the
+    # username + aiko_username (both String(64)); reject empty/whitespace/overlong
+    # here with a 422 rather than deferring to DB behaviour and 409/500 ambiguity.
+    handle: str = Field(min_length=1, max_length=64)
+    display_name: str = Field(default="", max_length=128)
+
+    @field_validator("handle", "display_name")
+    @classmethod
+    def _strip(cls, v: str) -> str:
+        return v.strip()
+
+    @field_validator("handle")
+    @classmethod
+    def _handle_nonempty_after_strip(cls, v: str) -> str:
+        if not v:
+            raise ValueError("handle must not be blank")
+        return v
+
+
+@router.post("/social")
+async def social(req: SocialReq, session: DbSession) -> dict:
+    """Verify a provider ID token. Known identity → real tokens. Brand-new
+    identity → a short-lived provisioning token to carry the verified identity
+    into /social/claim (no DB row until the user picks a handle)."""
+    if not settings.social_signin_enabled:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "social sign-in is disabled")
+    try:
+        identity = await oauth.verify_id_token(req.provider, req.id_token)
+    except oauth.UnknownProvider:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "unknown provider")
+    except oauth.ProviderUnavailable:
+        # Provider/JWKS outage — transient, not a bad credential. 503 so clients
+        # back off rather than treating it as an auth failure (401) and retrying.
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "provider temporarily unavailable")
+    except oauth.InvalidProviderToken:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid provider token")
+
+    user = await users_service.get_user_by_social(
+        session, identity.provider, identity.sub)
+    if user is not None:
+        return {**_tokens(user.id), "user": _user_view(user)}
+
+    # New federated identity → hand back a signed provisioning token (the pending
+    # state). The client then POSTs /social/claim with a chosen handle.
+    provisioning_token = security.issue_provisioning(
+        identity.provider, identity.sub,
+        suggested_name=identity.suggested_name, email=identity.email,
+    )
+    return {
+        "status": "provisioning",
+        "provisioning_token": provisioning_token,
+        "suggested_name": identity.suggested_name,
+        "email": identity.email,
+    }
+
+
+@router.post("/social/claim")
+async def social_claim(req: SocialClaimReq, session: DbSession) -> dict:
+    """Complete provisioning: verify the provisioning token (OUR token, so the
+    (provider, sub) it carries cannot be forged), create the user + social link
+    atomically, and return real tokens."""
+    if not settings.social_signin_enabled:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "social sign-in is disabled")
+    try:
+        pending = security.decode_provisioning(req.provisioning_token)
+    except jwt.InvalidTokenError:
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED, "invalid or expired provisioning token")
+    try:
+        user = await users_service.create_social_user(
+            session,
+            provider=pending["provider"], provider_sub=pending["provider_sub"],
+            handle=req.handle, display_name=req.display_name,
+            email=pending["email"],
+        )
+    except IntegrityError:
+        # Handle already taken OR this identity was already claimed (race).
+        await session.rollback()
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "handle already taken or identity already claimed")
     return {**_tokens(user.id), "user": _user_view(user)}
 
 

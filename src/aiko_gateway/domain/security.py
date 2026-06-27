@@ -59,3 +59,52 @@ def decode_token(token: str, *, expected_type: str) -> str:
     if not sub:
         raise jwt.InvalidTokenError("missing sub")
     return sub
+
+
+# --- social sign-in provisioning token (#13) ------------------------------- #
+# A brand-new social user has no local account yet, so the "pending" state can't
+# be a User row (username + aiko_username are NOT NULL UNIQUE). Instead the verify
+# step mints this short-lived token — signed by US with the SAME HS256 secret, so
+# the client cannot forge the (provider, provider_sub) it carries — and the claim
+# step verifies it and creates the user atomically. No DB row, no TTL sweeper.
+_PROVISIONING_TYPE = "provisioning"
+
+
+def issue_provisioning(
+    provider: str, provider_sub: str, *,
+    suggested_name: str | None = None, email: str | None = None,
+) -> str:
+    now = dt.datetime.now(dt.timezone.utc)
+    payload = {
+        "type": _PROVISIONING_TYPE,
+        "provider": provider,
+        "provider_sub": provider_sub,
+        "suggested_name": suggested_name,
+        "email": email,
+        "iat": int(now.timestamp()),
+        "exp": int((now + dt.timedelta(
+            seconds=settings.provisioning_ttl_seconds)).timestamp()),
+    }
+    return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm)
+
+
+def decode_provisioning(token: str) -> dict:
+    """Return {provider, provider_sub, suggested_name, email} from a valid
+    provisioning token, else raise jwt.InvalidTokenError. Verified with OUR
+    secret + algorithm — never RS256, never JWKS (this is our token, not a
+    provider's)."""
+    payload = jwt.decode(
+        token, settings.jwt_secret, algorithms=[settings.jwt_algorithm]
+    )
+    if payload.get("type") != _PROVISIONING_TYPE:
+        raise jwt.InvalidTokenError("expected provisioning token")
+    provider = payload.get("provider")
+    provider_sub = payload.get("provider_sub")
+    if not provider or not provider_sub:
+        raise jwt.InvalidTokenError("missing provider identity")
+    return {
+        "provider": provider,
+        "provider_sub": provider_sub,
+        "suggested_name": payload.get("suggested_name"),
+        "email": payload.get("email"),
+    }
