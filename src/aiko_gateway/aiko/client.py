@@ -69,10 +69,13 @@ class GatewayChatActor(aiko.Actor):
         self._teardown_attachments()
         self.server_topic_path = service_details[0]
         self.chat_server = service
+        # Bootstrap floor: always relay the configured channel(s) immediately so
+        # there's no gap before the channel_list share replays. The share's add
+        # for these is then a no-op (idempotent). Every OTHER channel is
+        # subscribed dynamically from the channel_list share (#1281 incr 2 →
+        # #8): see _on_share_event.
         for channel in self.channels:
-            topic = f"{self.server_topic_path}/{channel}"
-            self.add_message_handler(self._on_payload, topic)
-            self._subscribed[channel] = topic
+            self._subscribe_channel(channel)
         # Channel topology read-through (#1281 incr 2): mirror the ChatServer's
         # canonical `channel_list` EC share. A fresh consumer per producer
         # instance — on a ChatServer restart this rebinds to the new topic_path
@@ -114,20 +117,59 @@ class GatewayChatActor(aiko.Actor):
             self._ec_consumer = None
         self._channel_cache = {}
 
+    # -- dynamic per-channel subscription (aiko thread only) ---------------
+    # add_message_handler / remove_message_handler are aiko Actor operations and
+    # MUST run on the aiko thread. Every caller below (_discovery_add,
+    # _on_share_event, _teardown_attachments) is on that thread, so `_subscribed`
+    # is single-threaded state — no lock needed. The DB reconcile is the separate
+    # asyncio-side concern (main.py's ordered worker); subscription is purely the
+    # bus-side concern and lives here.
+    def _subscribe_channel(self, channel: str) -> None:
+        """Idempotently relay messages for `channel`. No-op if already subscribed
+        or the server isn't attached yet."""
+        if channel in self._subscribed or self.server_topic_path is None:
+            return
+        topic = f"{self.server_topic_path}/{channel}"
+        self.add_message_handler(self._on_payload, topic)
+        self._subscribed[channel] = topic
+        log.info("subscribed channel relay: %s", channel)
+
+    def _unsubscribe_channel(self, channel: str) -> None:
+        """Stop relaying `channel`. No-op if not subscribed."""
+        topic = self._subscribed.pop(channel, None)
+        if topic is None:
+            return
+        try:
+            self.remove_message_handler(self._on_payload, topic)
+        except Exception:
+            log.exception("Error removing payload handler for %s", topic)
+        log.info("unsubscribed channel relay: %s", channel)
+
     # -- channel topology (bus share -> reconcile) ------------------------
     def _on_share_event(self, _consumer_id, command, item_name, _item_value):
         """ECConsumer handler (aiko thread). Translate a channel_list add/remove
-        into the topology callbacks. `add`/`update` => existence (idempotent
-        upsert); `remove` => the ONLY hard-delete trigger. Non-channel items
-        (the bare `channel_list` parent, other keys) are ignored."""
+        into (1) the bus subscription for message relay AND (2) the DB topology
+        callback. `add`/`update` => existence (idempotent upsert + subscribe);
+        `remove` => the ONLY hard-delete trigger (+ unsubscribe). Non-channel
+        items (the bare `channel_list` parent, other keys) are ignored.
+
+        Ordering matters per direction:
+          * add: SUBSCRIBE first, then signal the DB upsert. A message arriving
+            in the gap is caught by persist_inbound's upsert (the existing
+            safety net) — no relay lost.
+          * remove: UNSUBSCRIBE first, then signal the DB delete. Stops new
+            messages BEFORE the row is deleted, so none can re-mint the channel
+            via persist_inbound after the delete (the #6 drift vector)."""
         name = channels_service.channel_name_from_item(item_name)
         if name is None:
             return
         try:
             if command in ("add", "update"):
+                self._subscribe_channel(name)
                 if self.on_channel_add is not None:
                     self.on_channel_add(name)
             elif command == "remove":
+                self._unsubscribe_channel(name)
                 if self.on_channel_remove is not None:
                     self.on_channel_remove(name)
         except Exception:  # never let a handler kill the aiko loop
