@@ -119,6 +119,14 @@ class _JwksCache:
     def __init__(self, jwks_uri: str, *,
                  min_refresh_interval: float = 30.0,
                  max_age: float = 3600.0) -> None:
+        # The floor-never-blocks-ceiling guarantee (see docstring) holds only if
+        # the ceiling sits above the floor. Enforce the invariant rather than
+        # documenting it (cage-match PR#15 r3, Carnot residual).
+        if not max_age > min_refresh_interval:
+            raise ValueError(
+                f"max_age ({max_age}) must exceed min_refresh_interval "
+                f"({min_refresh_interval}) — else a stale set could be starved "
+                "of the ceiling-driven refresh.")
         self._uri = jwks_uri
         self._keys: dict[str, object] = {}
         self._fetched_at = 0.0  # monotonic time of last successful refresh (0 = never)
