@@ -79,7 +79,20 @@ async def persist_inbound(session: AsyncSession, msg: InboundMessage) -> Message
     This closes the startup window between bus discovery and the first
     `channel_list` EC reconcile event, now that `_seed_channels` is retired
     (#1281 incr 2). It is NOT independent seeding/drift — the channel set seen on
-    the bus is a subset of HyperSpace's canonical set. Single creation path:
+    the bus is a subset of HyperSpace's canonical set.
+
+    Why that subset claim holds (drift-vector check, #6, verified post-#8): the
+    ONLY runtime caller is main._ingest, reached via the actor's `_on_payload`,
+    which fires ONLY for SUBSCRIBED topics. Since #8 subscriptions are gated to
+    {bootstrap "general"} ∪ the `channel_list` EC share, every channel that can
+    reach here is canonical — the upsert can never MINT a non-HyperSpace channel.
+    The gate is structural (you cannot receive a message for an unsubscribed
+    topic), not a prose check. On removal the actor unsubscribes BEFORE the DB
+    delete, so no message can re-mint a just-removed channel. Residual: the
+    hardcoded "general" bootstrap floor is not itself channel_list-gated — a
+    negligible risk, as "general" is permanent; a DB-layer guard would re-couple
+    the asyncio side to the aiko-thread channel_list cache (against #7) for no
+    real gain. Single creation path:
     `channels_service.upsert_channel` (which flushes, not commits), so the
     channel upsert + message insert land in this function's ONE final commit —
     atomic, no orphan-channel-on-message-failure (cage-match PR#12, Carnot P1b)."""
