@@ -32,10 +32,22 @@ COPY pyproject.toml ./
 COPY src ./src
 RUN pip install --no-cache-dir -e .
 
+# Migration assets (#14). alembic.ini + the alembic/ tree are read at boot by the
+# entrypoint (`python -m aiko_gateway.migrate` -> alembic upgrade head). They are
+# NOT part of the installed wheel (hatch packages only src/aiko_gateway), so copy
+# them explicitly. entrypoint.sh sequences migrate-before-serve.
+COPY alembic.ini ./
+COPY alembic ./alembic
+COPY entrypoint.sh ./
+RUN chmod +x entrypoint.sh
+
 # Bind on all interfaces inside the container; the compose port publish keeps it
 # private (127.0.0.1:8095 on the host). ENVIRONMENT is unset → defaults to
 # "production" → the config.py fail-closed JWT guard is armed.
 EXPOSE 8095
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD curl -fsS http://127.0.0.1:8095/health || exit 1
-CMD ["uvicorn", "aiko_gateway.main:app", "--host", "0.0.0.0", "--port", "8095"]
+# Entrypoint migrates to head (fail-closed), THEN execs uvicorn. The deploy is a
+# manual `docker compose up -d` with no host orchestrator (#19), so the
+# migrate-before-boot ordering must live in the image.
+CMD ["./entrypoint.sh"]
