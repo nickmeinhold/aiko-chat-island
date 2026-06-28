@@ -16,6 +16,7 @@ from __future__ import annotations
 import pytest
 from sqlalchemy import func, select
 
+from aiko_gateway.aiko import topology
 from aiko_gateway.aiko.payload import InboundMessage
 from aiko_gateway.domain import channels_service, messages_service
 from aiko_gateway.domain.models import Channel, Membership, Message, User
@@ -29,18 +30,18 @@ def test_parse_extracts_names_from_servicefilter_tuple():
         "general": [["*", "general", "*", "*", "*", []], "None", "None"],
         "llm": [["*", "llm", "*", "*", "*", []], "None", "None"],
     }
-    assert channels_service.parse_channel_names(channel_list) == {"general", "llm"}
+    assert topology.parse_channel_names(channel_list) == {"general", "llm"}
 
 
 def test_parse_falls_back_to_key_when_value_unstructured():
     # If the value isn't the expected tuple, the dict KEY is the name.
     channel_list = {"random": "None", "robot": None}
-    assert channels_service.parse_channel_names(channel_list) == {"random", "robot"}
+    assert topology.parse_channel_names(channel_list) == {"random", "robot"}
 
 
 def test_parse_empty_or_missing_is_empty_set():
-    assert channels_service.parse_channel_names({}) == set()
-    assert channels_service.parse_channel_names(None) == set()
+    assert topology.parse_channel_names({}) == set()
+    assert topology.parse_channel_names(None) == set()
 
 
 # --- upsert_channel -------------------------------------------------------- #
@@ -156,18 +157,18 @@ async def test_persist_inbound_no_channel_returns_none(session):
 # --- channel_name_from_item: EC event name -> channel name ----------------- #
 
 def test_channel_name_from_item_strips_prefix():
-    assert channels_service.channel_name_from_item("channel_list.general") == "general"
+    assert topology.channel_name_from_item("channel_list.general") == "general"
 
 
 def test_channel_name_from_item_keeps_dotted_name():
-    assert channels_service.channel_name_from_item("channel_list.a.b") == "a.b"
+    assert topology.channel_name_from_item("channel_list.a.b") == "a.b"
 
 
 def test_channel_name_from_item_ignores_parent_and_unrelated():
-    assert channels_service.channel_name_from_item("channel_list") is None
-    assert channels_service.channel_name_from_item("source_file") is None
-    assert channels_service.channel_name_from_item("") is None
-    assert channels_service.channel_name_from_item(None) is None
+    assert topology.channel_name_from_item("channel_list") is None
+    assert topology.channel_name_from_item("source_file") is None
+    assert topology.channel_name_from_item("") is None
+    assert topology.channel_name_from_item(None) is None
 
 
 # --- topology worker serializes events in arrival order (Carnot P1a) ------- #

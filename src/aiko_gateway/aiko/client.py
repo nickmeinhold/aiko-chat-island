@@ -21,10 +21,8 @@ from typing import Callable
 import aiko_services as aiko
 from aiko_chat.chat import ChatServer, get_server_service_filter
 
-# channels_service imports only models/sqlalchemy (no aiko_services), so pulling
-# it here does not break this module's lazy-import isolation.
-from ..domain import channels_service
 from .payload import InboundMessage, parse_payload
+from .topology import channel_name_from_item
 
 log = logging.getLogger("aiko_gateway.aiko")
 
@@ -160,7 +158,7 @@ class GatewayChatActor(aiko.Actor):
           * remove: UNSUBSCRIBE first, then signal the DB delete. Stops new
             messages BEFORE the row is deleted, so none can re-mint the channel
             via persist_inbound after the delete (the #6 drift vector)."""
-        name = channels_service.channel_name_from_item(item_name)
+        name = channel_name_from_item(item_name)
         if name is None:
             return
         try:
