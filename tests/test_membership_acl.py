@@ -329,7 +329,7 @@ async def test_send_to_private_non_member_is_no_channel_and_not_persisted(sessio
     errors = [f for f in conn.sent if f["type"] == "error"]
     assert errors and errors[0]["code"] == "no_channel"
     # Nothing persisted: the boundary rejected before create_outbound.
-    rows = await messages_service.get_history(session, priv.id, limit=10)
+    rows = await messages_service.get_history(session, priv.id, bob.id, limit=10)
     assert rows == []
 
 
@@ -347,5 +347,5 @@ async def test_send_to_private_member_without_can_post_is_forbidden(session, mon
     errors = [f for f in conn.sent if f["type"] == "error"]
     # A member knows the channel exists, so this is an honest 'forbidden' (no leak).
     assert errors and errors[0]["code"] == "forbidden"
-    rows = await messages_service.get_history(session, priv.id, limit=10)
+    rows = await messages_service.get_history(session, priv.id, muted.id, limit=10)
     assert rows == []

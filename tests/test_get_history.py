@@ -18,6 +18,13 @@ def _ulid(n: int) -> str:
     return f"{n:026d}"
 
 
+# A viewer id for the paging tests. These seed messages with sender_user_id=None
+# and no UserBlock rows, so the block-visibility filter is a no-op here (NULL
+# sender is never blocked) — block-specific visibility is covered in
+# test_moderation.py. This just satisfies the required viewer_id parameter.
+_VIEWER = _ulid(99)
+
+
 async def _seed(session, *, count: int = 5, deleted_at_ids: set[int] | None = None) -> str:
     """Seed one channel + `count` messages with ULIDs _ulid(1).._ulid(count)."""
     deleted_at_ids = deleted_at_ids or set()
@@ -36,21 +43,21 @@ async def _seed(session, *, count: int = 5, deleted_at_ids: set[int] | None = No
 
 async def test_default_returns_newest_page_ascending(session):
     cid = await _seed(session, count=5)
-    rows = await messages_service.get_history(session, cid, limit=3)
+    rows = await messages_service.get_history(session, cid, _VIEWER, limit=3)
     # newest 3 (3,4,5), returned ASCENDING
     assert [r.id for r in rows] == [_ulid(3), _ulid(4), _ulid(5)]
 
 
 async def test_before_is_exclusive_and_pages_older(session):
     cid = await _seed(session, count=5)
-    rows = await messages_service.get_history(session, cid, before=_ulid(3), limit=10)
+    rows = await messages_service.get_history(session, cid, _VIEWER, before=_ulid(3), limit=10)
     # strictly older than 3 → 1,2 (NOT 3), ascending
     assert [r.id for r in rows] == [_ulid(1), _ulid(2)]
 
 
 async def test_after_forward_fills_oldest_gap_first(session):
     cid = await _seed(session, count=5)
-    rows = await messages_service.get_history(session, cid, after=_ulid(2), limit=2)
+    rows = await messages_service.get_history(session, cid, _VIEWER, after=_ulid(2), limit=2)
     # strictly newer than 2, OLDEST first (forward fill) → 3,4 (not 5 yet), ascending
     assert [r.id for r in rows] == [_ulid(3), _ulid(4)]
 
@@ -58,13 +65,13 @@ async def test_after_forward_fills_oldest_gap_first(session):
 async def test_after_is_exclusive_at_the_edge(session):
     cid = await _seed(session, count=3)
     # after = newest → nothing newer (boundary is strict `>`)
-    rows = await messages_service.get_history(session, cid, after=_ulid(3), limit=10)
+    rows = await messages_service.get_history(session, cid, _VIEWER, after=_ulid(3), limit=10)
     assert rows == []
 
 
 async def test_after_null_pages_from_start(session):
     cid = await _seed(session, count=4)
-    rows = await messages_service.get_history(session, cid, after=None, before=None, limit=2)
+    rows = await messages_service.get_history(session, cid, _VIEWER, after=None, before=None, limit=2)
     # no cursor → backward default: newest 2 (3,4) ascending
     assert [r.id for r in rows] == [_ulid(3), _ulid(4)]
 
@@ -73,13 +80,13 @@ async def test_after_wins_when_both_passed(session):
     cid = await _seed(session, count=5)
     # both given → `after` direction wins (forward), per the documented contract
     rows = await messages_service.get_history(
-        session, cid, before=_ulid(2), after=_ulid(2), limit=10)
+        session, cid, _VIEWER, before=_ulid(2), after=_ulid(2), limit=10)
     assert [r.id for r in rows] == [_ulid(3), _ulid(4), _ulid(5)]
 
 
 async def test_deleted_rows_excluded_both_directions(session):
     cid = await _seed(session, count=5, deleted_at_ids={3})
-    fwd = await messages_service.get_history(session, cid, after=_ulid(1), limit=10)
+    fwd = await messages_service.get_history(session, cid, _VIEWER, after=_ulid(1), limit=10)
     assert [r.id for r in fwd] == [_ulid(2), _ulid(4), _ulid(5)]  # 3 skipped
-    back = await messages_service.get_history(session, cid, before=None, limit=10)
+    back = await messages_service.get_history(session, cid, _VIEWER, before=None, limit=10)
     assert _ulid(3) not in [r.id for r in back]

@@ -35,7 +35,7 @@ async def history(
     if channel is None:
         raise HTTPException(404, "channel not found")
     rows = await messages_service.get_history(
-        session, channel_id, before=before, after=after, limit=limit
+        session, channel_id, user.id, before=before, after=after, limit=limit
     )
     return {
         "channel_id": channel_id,

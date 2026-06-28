@@ -147,8 +147,8 @@ async def test_no_message_lost_in_the_subscribe_effectiveness_gap(session, monke
 
     real_latest = messages_service.latest_ulid
 
-    async def latest_then_inject(sess, channel_id):
-        fence = await real_latest(sess, channel_id)  # fence read (..3)
+    async def latest_then_inject(sess, channel_id, viewer_id):
+        fence = await real_latest(sess, channel_id, viewer_id)  # fence read (..3)
         # A brand-new message arrives AFTER the fence read — the racy window.
         row = Message(id=_ulid(4), channel_id=channel_id, sender_kind="human",
                       body="msg 4", created_at=_now() + dt.timedelta(seconds=4))

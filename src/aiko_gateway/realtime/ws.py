@@ -14,7 +14,9 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
 from sqlalchemy import select
 
 from ..db import SessionLocal
-from ..domain import acl, echo, messages_service, security, users_service
+from ..domain import (
+    acl, echo, messages_service, moderation_service, security, users_service,
+)
 from . import envelopes
 from .hub import Connection
 
@@ -87,7 +89,10 @@ async def _handle_subscribe(conn: Connection, frame: dict, session) -> None:
     accessible = await acl.filter_readable_ids(session, conn.user_id, frame["channel_ids"])
     conn.subscribed |= set(accessible)  # (1) subscribed FIRST (accessible only)
     fences = {  # (2) fence AFTER — every gap message is now live or <= fence
-        cid: await messages_service.latest_ulid(session, cid)
+        # Per-viewer fence: latest_ulid applies the same block-visibility filter
+        # get_history does, so the fence never points at a message blocked from
+        # this viewer (which history would never return → reconnect-loop hang).
+        cid: await messages_service.latest_ulid(session, cid, conn.user_id)
         for cid in accessible
     }
     await conn.send(envelopes.suback(fences))
@@ -109,12 +114,43 @@ async def _handle_send(gw, conn: Connection, user, frame: dict) -> None:
             await conn.send(envelopes.error("forbidden", "cannot post to this channel",
                                             frame["client_msg_id"]))
             return
+        # reply_to integrity + NO-INTERACTION across a block (#7, cage-match Carnot).
+        # The reply target must EXIST and live in THIS channel: a missing id would
+        # FK-500 at insert (messages.reply_to is an FK), and a cross-channel id
+        # would mint a reference to a message the sender may not be able to read in
+        # context. Both collapse to the same "no_reply_target" (don't confirm which
+        # — a bad/foreign id is indistinguishable). THEN the block gate: a reply to
+        # a message authored by a user in a block relationship is refused. The
+        # single door future interaction surfaces (DMs, mentions) must also pass is
+        # `moderation_service.is_blocked_between`. A reply to an external-actor
+        # message (sender_user_id NULL) or a soft-deleted same-channel target is
+        # allowed (the replier saw it before it went).
+        reply_to = frame.get("reply_to")
+        if reply_to is not None:
+            target = await messages_service.get_message(session, reply_to)
+            if target is None or target.channel_id != channel.id:
+                await conn.send(envelopes.error(
+                    "no_reply_target", "reply target not found in this channel",
+                    frame["client_msg_id"]))
+                return
+            if (target.sender_user_id is not None
+                    and await moderation_service.is_blocked_between(
+                        session, user.id, target.sender_user_id)):
+                await conn.send(envelopes.error(
+                    "blocked", "cannot reply to a blocked user",
+                    frame["client_msg_id"]))
+                return
         row, created = await messages_service.create_outbound(
             session, user=user, channel=channel,
             body=frame["body"], client_msg_id=frame["client_msg_id"],
-            reply_to=frame.get("reply_to"),
+            reply_to=reply_to,
         )
         view = messages_service.message_view(row)
+        # Block exclusion for live fanout: everyone in a block relationship with
+        # the sender must NOT receive this frame (the live twin of the history
+        # visibility filter). Computed inside the session; applied in-memory by
+        # the hub so fanout stays one query, not one-per-connection.
+        exclude = await moderation_service.blocked_pair_user_ids(session, user.id)
 
     # Ack the sender (optimistic-send reconciliation: client_msg_id -> server id).
     await conn.send(envelopes.ack(frame["client_msg_id"], row.id, view["created_at"]))
@@ -124,4 +160,5 @@ async def _handle_send(gw, conn: Connection, user, frame: dict) -> None:
         echo.mark_sent(channel.aiko_channel, user.aiko_username, frame["body"])
         gw.bus.send(user.aiko_username, channel.aiko_channel, frame["body"])
         # Fan the persisted message out to channel subscribers.
-        await gw.hub.fanout(channel.id, envelopes.message_frame(view))
+        await gw.hub.fanout(channel.id, envelopes.message_frame(view),
+                            exclude_user_ids=exclude)

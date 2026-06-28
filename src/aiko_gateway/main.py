@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     from .aiko.client import AikoBusClient
 from .config import settings
 from .db import SessionLocal, init_models
-from .domain import channels_service, echo, messages_service
+from .domain import channels_service, echo, messages_service, moderation_service
 from .realtime.hub import Hub
 
 logging.basicConfig(level=logging.INFO)
@@ -62,11 +62,21 @@ class GatewayState:
         try:
             async with SessionLocal() as session:
                 row = await messages_service.persist_inbound(session, msg)
+                # Block exclusion (#7): a bus message can map to a real gateway
+                # user (sender_user_id set) — that human's blocks apply to live
+                # delivery just as on the send path. An external actor (NULL
+                # sender) has no block relationships, so the set is empty.
+                exclude = (
+                    await moderation_service.blocked_pair_user_ids(session, row.sender_user_id)
+                    if row and row.sender_user_id else set()
+                )
             if row:
                 log.info("ingest %s in %s: %s", row.id, msg.channel, msg.message)
                 # External message (LLM/robot/REPL/other) -> fan out live.
                 await self.hub.fanout(
-                    row.channel_id, {"type": "message", "msg": messages_service.message_view(row)}
+                    row.channel_id,
+                    {"type": "message", "msg": messages_service.message_view(row)},
+                    exclude_user_ids=exclude,
                 )
         except Exception:
             log.exception("ingest failed for bus message")
@@ -164,12 +174,14 @@ from .rest import auth as auth_routes  # noqa: E402
 from .rest import channels as channel_routes  # noqa: E402
 from .rest import members as member_routes  # noqa: E402
 from .rest import messages as message_routes  # noqa: E402
+from .rest import moderation as moderation_routes  # noqa: E402
 from .realtime import ws as ws_routes  # noqa: E402
 app.include_router(auth_routes.router)
 app.include_router(auth_routes.me_router)
 app.include_router(channel_routes.router)
 app.include_router(member_routes.router)
 app.include_router(message_routes.router)
+app.include_router(moderation_routes.router)
 app.include_router(ws_routes.router)
 
 

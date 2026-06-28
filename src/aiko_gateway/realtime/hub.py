@@ -41,9 +41,26 @@ class Hub:
     def unregister(self, conn: Connection) -> None:
         self._conns.discard(conn)
 
-    async def fanout(self, channel_id: str, frame: dict) -> None:
-        """Deliver `frame` to every connection subscribed to `channel_id`."""
-        targets = [c for c in self._conns if channel_id in c.subscribed]
+    async def fanout(
+        self, channel_id: str, frame: dict, *, exclude_user_ids: set[str] | None = None
+    ) -> None:
+        """Deliver `frame` to every connection subscribed to `channel_id`, except
+        connections owned by a user in `exclude_user_ids`.
+
+        The exclusion set carries the moderation block boundary into live
+        delivery (#7): the caller passes every user in a block relationship with
+        the message's sender AS OF SEND TIME, so a blocked party's open connection
+        is skipped for this frame — the live twin of the history/fence visibility
+        filter. It is point-in-time, not transactional: a block committed in the
+        window between the caller computing the set and this fanout is not reflected
+        for the in-flight frame (cage-match Carnot LOW); the next send recomputes,
+        and the history path hides it on reload. Empty / None means "no exclusions"
+        (the common case)."""
+        excluded = exclude_user_ids or frozenset()
+        targets = [
+            c for c in self._conns
+            if channel_id in c.subscribed and c.user_id not in excluded
+        ]
         if not targets:
             return
         results = await asyncio.gather(
