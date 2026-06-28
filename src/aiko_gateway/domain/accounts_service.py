@@ -27,6 +27,7 @@ from __future__ import annotations
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from . import moderation_service
 from .memberships_service import ROLE_ADMIN
 from .models import Membership, Message, SocialIdentity, User
 
@@ -91,6 +92,14 @@ async def delete_user_account(session: AsyncSession, user_id: str) -> None:
         update(Message)
         .where(Message.sender_user_id == user_id)
         .values(sender_user_id=None, sender_label=DELETED_USER_LABEL))
+    # Moderation footprint (#7): delete this user's blocks (either direction) and
+    # anonymize their reports (reporter → NULL, audit trail kept). Both are FK
+    # children of `users`, so they must go before the user row — the SAME
+    # children-before-parent discipline as memberships/identities. Without this
+    # the final User delete would FK-violate on the user_blocks / message_reports
+    # rows (verify-the-neighbor: the just-shipped deletion cascade must learn
+    # about every new table that references users).
+    await moderation_service.purge_user_moderation_rows(session, user_id)
     # Remove federated-identity links and channel memberships (children first).
     await session.execute(
         delete(SocialIdentity).where(SocialIdentity.user_id == user_id))

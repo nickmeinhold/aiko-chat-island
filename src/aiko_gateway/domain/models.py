@@ -110,3 +110,52 @@ class Message(Base):
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     edited_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     deleted_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class UserBlock(Base):
+    """A user-to-user block (UGC moderation, Apple 1.2 / Google UGC, #7).
+
+    DIRECTIONAL storage, MUTUAL effect. The row records who initiated
+    (``blocker_user_id``) so the blocker can later unblock exactly the people
+    they blocked, but the *visibility* it produces is symmetric: neither party
+    sees the other's messages once a row exists in either direction (see
+    ``moderation_service.blocked_pair_user_ids`` / the history+fence predicate).
+    Composite PK makes a re-block idempotent (one row per ordered pair), mirroring
+    ``Membership``. No ``ON DELETE CASCADE``: account deletion tears these down
+    explicitly in ``accounts_service`` (children-before-parent), like every other
+    child of ``users``.
+    """
+    __tablename__ = "user_blocks"
+    blocker_user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id"), primary_key=True)
+    blocked_user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id"), primary_key=True, index=True)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class MessageReport(Base):
+    """A user's report of an objectionable message (UGC moderation, #7).
+
+    Write-mostly: reports never affect any read path — they feed the ops queue
+    that backs the EULA's "act within 24h" commitment. Acting on a report reuses
+    the EXISTING soft-delete (``Message.deleted_at``) — there is no separate
+    takedown table. UNIQUE(message_id, reporter_user_id) makes a double-report a
+    no-op (one standing report per reporter per message). ``reporter_user_id`` is
+    NULLABLE so account deletion can ANONYMIZE a reporter (mirroring how authored
+    messages anonymize) and keep the report for ops rather than destroying the
+    audit trail. ``resolved_at`` is stamped when ops actions the report.
+    """
+    __tablename__ = "message_reports"
+    __table_args__ = (
+        UniqueConstraint(
+            "message_id", "reporter_user_id", name="uq_report_message_reporter"),
+    )
+    id: Mapped[str] = mapped_column(String(26), primary_key=True, default=new_ulid)
+    message_id: Mapped[str] = mapped_column(
+        ForeignKey("messages.id"), nullable=False, index=True)
+    reporter_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id"), nullable=True)
+    reason: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    resolved_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True)

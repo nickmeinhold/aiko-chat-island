@@ -13,7 +13,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..aiko.payload import InboundMessage
-from . import channels_service
+from . import channels_service, moderation_service
 from .ids import new_ulid
 from .models import Channel, Message, User
 
@@ -125,24 +125,39 @@ async def persist_inbound(session: AsyncSession, msg: InboundMessage) -> Message
     return row
 
 
-async def latest_ulid(session: AsyncSession, channel_id: str) -> str:
-    """The newest *visible* message id in a channel — the live/history *fence*
-    a `suback` carries (design 04 §Gap 2). Returns ``""`` for a channel with no
-    visible messages: an empty fence means "no history boundary, everything is
-    forward/live".
+async def get_message(session: AsyncSession, message_id: str) -> Message | None:
+    """Fetch a single message row by id, or None. Used by the send path's
+    reply-to interaction gate (#7) to resolve the author of the replied-to
+    message. Does NOT filter on visibility — the caller decides what to do with
+    a soft-deleted or otherwise-hidden target."""
+    return await session.get(Message, message_id)
 
-    The ``deleted_at IS NULL`` filter MUST match ``get_history`` exactly: the
-    fence and the history pager are two reads of the same id axis, and B4's
-    reconnect loop pages history "until cursor >= fence", treating an empty page
-    while ``cursor < fence`` as an invariant violation (design 04 round 5). If the
-    fence could point past the newest visible row (a soft-deleted tail), that
-    termination condition would be unreachable by visible rows and the violation
-    check would false-positive. One predicate, both reads — the partition stays
-    clean and the invariant stays assertable.
+
+async def latest_ulid(session: AsyncSession, channel_id: str, viewer_id: str) -> str:
+    """The newest *visible* message id in a channel FOR `viewer_id` — the
+    live/history *fence* a `suback` carries (design 04 §Gap 2). Returns ``""`` for
+    a channel with no visible messages: an empty fence means "no history boundary,
+    everything is forward/live".
+
+    The visibility filter MUST match ``get_history`` exactly: the fence and the
+    history pager are two reads of the same id axis, and B4's reconnect loop pages
+    history "until cursor >= fence", treating an empty page while ``cursor < fence``
+    as an invariant violation (design 04 round 5). If the fence could point past
+    the newest visible row, that termination condition would be unreachable by
+    visible rows and the violation check would false-positive. One predicate, both
+    reads — the partition stays clean and the invariant stays assertable.
+
+    Visibility has TWO dimensions, both viewer-INdependent EXCEPT blocks: a
+    soft-deleted row (``deleted_at IS NULL``) is hidden from everyone, while a
+    BLOCKED author's row is hidden only from the viewer in the block relationship
+    (#7). That is why the fence is now per-viewer: blocker and non-blocker can see
+    a different newest-visible message in the same channel.
     """
     result = await session.execute(
         select(func.max(Message.id)).where(
-            Message.channel_id == channel_id, Message.deleted_at.is_(None)
+            Message.channel_id == channel_id,
+            Message.deleted_at.is_(None),
+            moderation_service.not_blocked_predicate(viewer_id),
         )
     )
     return result.scalar_one() or ""
@@ -151,14 +166,15 @@ async def latest_ulid(session: AsyncSession, channel_id: str) -> str:
 async def get_history(
     session: AsyncSession,
     channel_id: str,
+    viewer_id: str,
     *,
     before: str | None = None,
     after: str | None = None,
     limit: int,
 ) -> list[Message]:
-    """A page of messages in a channel, **always returned ascending** (oldest
-    first) for display. Two cursor directions, mutually exclusive — a ULID is a
-    total order, so both walk the same axis:
+    """A page of messages in a channel visible to `viewer_id`, **always returned
+    ascending** (oldest first) for display. Two cursor directions, mutually
+    exclusive — a ULID is a total order, so both walk the same axis:
 
     * ``before`` (backward, the default — UI scroll-up): the ``limit`` newest
       messages with ``id < before``. Used to load older history a page at a time.
@@ -166,9 +182,15 @@ async def get_history(
       with ``id > after``. Forward paging fills the oldest gap first, which is
       what makes ``MAX(serverUlid)`` a crash-resumable watermark on the client
       (design 04 §Gap 2). ``after`` wins if both are passed.
+
+    Visibility filter: soft-deleted rows are hidden from all; a blocked author's
+    rows are hidden from the viewer in the block relationship (#7). This MUST be
+    the same predicate ``latest_ulid`` (the fence) uses — see its docstring.
     """
     stmt = select(Message).where(
-        Message.channel_id == channel_id, Message.deleted_at.is_(None)
+        Message.channel_id == channel_id,
+        Message.deleted_at.is_(None),
+        moderation_service.not_blocked_predicate(viewer_id),
     )
     if after is not None:
         # Forward: oldest-above-cursor first; already ascending, no reverse.
