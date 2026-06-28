@@ -35,39 +35,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .models import Channel, Membership, Message
 
-CHANNEL_LIST_KEY = "channel_list"
-
-
-def parse_channel_names(channel_list: dict | None) -> set[str]:
-    """Extract channel names from the `channel_list` EC share subtree.
-
-    Observed value shape (spike/probe_channel_list.py): each entry is a
-    ServiceFilter-shaped tuple ``[['*', name, '*', '*', '*', []], 'None', 'None']``
-    and the dict KEY is the name too. Prefer the structured name (robust to a
-    channel name containing the EC path separator '.'), fall back to the key.
-    """
-    names: set[str] = set()
-    for key, value in (channel_list or {}).items():
-        name: str | None = None
-        try:
-            candidate = value[0][1]
-            if isinstance(candidate, str) and candidate:
-                name = candidate
-        except (TypeError, IndexError, KeyError):
-            name = None
-        names.add(name or key)
-    return names
-
-
-def channel_name_from_item(item_name: str | None) -> str | None:
-    """Map an EC share `item_name` to a channel name, or None if it is not a
-    `channel_list` leaf. ``channel_list.general`` -> ``general``; a bare
-    ``channel_list`` (the parent node) or any unrelated key -> None. Only the
-    first prefix is stripped, so a channel name containing '.' survives."""
-    prefix = f"{CHANNEL_LIST_KEY}."
-    if item_name and item_name.startswith(prefix):
-        return item_name[len(prefix):] or None
-    return None
+# Pure `channel_list` EC-share parsing (CHANNEL_LIST_KEY, parse_channel_names,
+# channel_name_from_item) moved to aiko/topology.py (#7) so the bus client can
+# reach it without importing this DB-bound module.
 
 
 async def upsert_channel(session: AsyncSession, aiko_channel: str) -> Channel:
