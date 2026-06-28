@@ -61,7 +61,19 @@ async def block_user(session: AsyncSession, blocker_id: str, blocked_id: str) ->
 
     Raises `CannotBlockSelf` for a self-block and `UserNotFound` if the target
     account does not exist (a controlled 404, not an FK 500 at commit). A repeat
-    block is a no-op (the composite PK already exists)."""
+    block is a no-op (the composite PK already exists).
+
+    CONCURRENCY (named MVP tradeoff, cage-match Carnot): idempotency is
+    check-then-insert, not conflict-safe. Under the current single-writer SQLite
+    deployment there is no race. On the public-scale Postgres path two concurrent
+    identical blocks could both pass the `session.get` check and the second insert
+    would raise IntegrityError (a 500) instead of the promised no-op. Accepted for
+    the MVP — same precondition-rarity / recoverable-blast-radius call as the
+    sole-admin TOCTOU (claude-tasks #14); the robust fix is a dialect upsert
+    (`ON CONFLICT DO NOTHING`), tracked with that Postgres-migration cluster. A
+    rollback-and-reread here is deliberately NOT used: rollback on the shared async
+    test session raises MissingGreenlet (the trap the account-deletion PR already
+    hit and rejected)."""
     if blocker_id == blocked_id:
         raise CannotBlockSelf()
     target = await session.get(User, blocked_id)
@@ -180,11 +192,17 @@ async def is_blocked_between(session: AsyncSession, a_id: str, b_id: str) -> boo
 async def get_reportable_message(
     session: AsyncSession, viewer_id: str, message_id: str
 ) -> Message | None:
-    """The message iff `viewer_id` may report it, else None. A reporter must be
-    able to READ the message's channel (public, or private-where-member) — so a
-    message in a channel they cannot see is existence-hidden behind the same None
-    as a missing message (the route maps both to 404). Resolves message → channel
-    → ACL; returns None if the message is missing OR its channel is unreadable."""
+    """The message iff `viewer_id` may report it, else None. The gate is CHANNEL
+    readability (public, or private-where-member): a message in a channel the
+    reporter cannot see is existence-hidden behind the same None as a missing
+    message (the route maps both to 404). Resolves message → channel → ACL.
+
+    NOT gated on per-message visibility (soft-delete / block), and deliberately so
+    (cage-match Carnot MEDIUM): reporting is for ops, and the legitimate flows
+    "report a user then block them" and "report a message that was just deleted"
+    both need to reach a message the *current* read path would hide. The route
+    returns only an opaque report id, never message content, so this leaks nothing
+    beyond what channel-ACL already governs."""
     msg = await session.get(Message, message_id)
     if msg is None:
         return None
@@ -248,7 +266,6 @@ async def purge_user_moderation_rows(session: AsyncSession, user_id: str) -> Non
             )
         )
     )
-    from sqlalchemy import update
     await session.execute(
         update(MessageReport)
         .where(MessageReport.reporter_user_id == user_id)

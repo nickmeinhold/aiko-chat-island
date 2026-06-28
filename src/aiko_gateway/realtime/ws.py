@@ -114,15 +114,26 @@ async def _handle_send(gw, conn: Connection, user, frame: dict) -> None:
             await conn.send(envelopes.error("forbidden", "cannot post to this channel",
                                             frame["client_msg_id"]))
             return
-        # NO-INTERACTION across a block (#7): a reply to a message authored by a
-        # user in a block relationship with the sender is refused. The single door
-        # any future interaction surface (DMs, mentions) must also pass through is
+        # reply_to integrity + NO-INTERACTION across a block (#7, cage-match Carnot).
+        # The reply target must EXIST and live in THIS channel: a missing id would
+        # FK-500 at insert (messages.reply_to is an FK), and a cross-channel id
+        # would mint a reference to a message the sender may not be able to read in
+        # context. Both collapse to the same "no_reply_target" (don't confirm which
+        # — a bad/foreign id is indistinguishable). THEN the block gate: a reply to
+        # a message authored by a user in a block relationship is refused. The
+        # single door future interaction surfaces (DMs, mentions) must also pass is
         # `moderation_service.is_blocked_between`. A reply to an external-actor
-        # message (sender_user_id NULL) or a now-deleted target is unaffected.
+        # message (sender_user_id NULL) or a soft-deleted same-channel target is
+        # allowed (the replier saw it before it went).
         reply_to = frame.get("reply_to")
         if reply_to is not None:
             target = await messages_service.get_message(session, reply_to)
-            if (target is not None and target.sender_user_id is not None
+            if target is None or target.channel_id != channel.id:
+                await conn.send(envelopes.error(
+                    "no_reply_target", "reply target not found in this channel",
+                    frame["client_msg_id"]))
+                return
+            if (target.sender_user_id is not None
                     and await moderation_service.is_blocked_between(
                         session, user.id, target.sender_user_id)):
                 await conn.send(envelopes.error(

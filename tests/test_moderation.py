@@ -336,6 +336,91 @@ async def test_reply_to_blocked_user_is_refused(session, monkeypatch):
         .where(Message.client_msg_id == "c1"))).scalar_one() == 0
 
 
+async def test_reply_to_missing_target_rejected(session, monkeypatch):
+    """A reply_to pointing at a non-existent message id is refused (would FK-500
+    at insert otherwise) — cage-match Carnot MEDIUM."""
+    import aiko_gateway.realtime.ws as ws_mod
+    monkeypatch.setattr(ws_mod, "SessionLocal", lambda: _StubSessionLocal(session))
+    ch = await _public_channel(session)
+    a = await _user(session, "alice")
+    gw = _FakeGw()
+    conn = _RecordingConn(a.id)
+    await _handle_send(gw, conn, a, {
+        "type": "send", "channel_id": ch.id, "body": "re: ghost",
+        "client_msg_id": "c1", "reply_to": _ulid(777),  # no such message
+    })
+    errors = [f for f in conn.sent if f["type"] == "error"]
+    assert errors and errors[0]["code"] == "no_reply_target"
+    assert gw.hub.fanned == []
+
+
+async def test_reply_to_cross_channel_rejected(session, monkeypatch):
+    """A reply_to referencing a message in ANOTHER channel is refused — no minting
+    a reference to a message outside this channel's context."""
+    import aiko_gateway.realtime.ws as ws_mod
+    monkeypatch.setattr(ws_mod, "SessionLocal", lambda: _StubSessionLocal(session))
+    here = await _public_channel(session, cid=0, name="here")
+    there = await _public_channel(session, cid=1, name="there")
+    a = await _user(session, "alice")
+    b = await _user(session, "bob")
+    foreign = await _msg(session, mid=1, channel=there, sender=b)
+    gw = _FakeGw()
+    conn = _RecordingConn(a.id)
+    await _handle_send(gw, conn, a, {
+        "type": "send", "channel_id": here.id, "body": "cross",
+        "client_msg_id": "c1", "reply_to": foreign.id,
+    })
+    errors = [f for f in conn.sent if f["type"] == "error"]
+    assert errors and errors[0]["code"] == "no_reply_target"
+
+
+async def test_reply_to_same_channel_unblocked_is_allowed(session, monkeypatch):
+    """The happy path still works: a reply to a same-channel, non-blocked message
+    goes through (the new integrity check doesn't over-reject)."""
+    import aiko_gateway.realtime.ws as ws_mod
+    monkeypatch.setattr(ws_mod, "SessionLocal", lambda: _StubSessionLocal(session))
+    ch = await _public_channel(session)
+    a = await _user(session, "alice")
+    b = await _user(session, "bob")
+    target = await _msg(session, mid=1, channel=ch, sender=b)  # not blocked
+    gw = _FakeGw()
+    conn = _RecordingConn(a.id)
+    await _handle_send(gw, conn, a, {
+        "type": "send", "channel_id": ch.id, "body": "good reply",
+        "client_msg_id": "c1", "reply_to": target.id,
+    })
+    assert [f["type"] for f in conn.sent] == ["ack"]
+    assert len(gw.hub.fanned) == 1
+
+
+async def test_fence_stranding_across_block_self_heals_on_recompute(session):
+    """Documents cage-match Carnot HIGH: the fence/history coupling is within one
+    DB instant. A fence captured BEFORE a block can point at a row the viewer's
+    post-block history will never return (the stranding). The durable fix is
+    client-side (B4 treats empty-before-fence as a benign re-sync), but the server
+    property that makes that safe is SELF-HEALING: recomputing the fence (the next
+    subscribe) yields a value the current history actually reaches."""
+    ch = await _public_channel(session)
+    a = await _user(session, "alice")
+    b = await _user(session, "bob")
+    await _msg(session, mid=1, channel=ch, sender=a)
+    await _msg(session, mid=2, channel=ch, sender=b)  # bob's, newest overall
+
+    # Fence read at subscribe, BEFORE any block: includes bob's newest.
+    stale_fence = await messages_service.latest_ulid(session, ch.id, a.id)
+    assert stale_fence == _ulid(2)
+
+    await moderation_service.block_user(session, a.id, b.id)
+
+    # The stale fence now strands: alice's history will never return _ulid(2).
+    a_hist = await messages_service.get_history(session, ch.id, a.id, limit=50)
+    assert stale_fence not in [r.id for r in a_hist]
+
+    # SELF-HEAL: recompute the fence (next subscribe) → reachable by current history.
+    fresh_fence = await messages_service.latest_ulid(session, ch.id, a.id)
+    assert fresh_fence == _ulid(1) == a_hist[-1].id
+
+
 async def test_normal_send_carries_block_exclusion_to_fanout(session, monkeypatch):
     """A non-reply send still goes through, and fanout receives the sender's
     block-exclusion set (so blocked parties' live connections are skipped)."""

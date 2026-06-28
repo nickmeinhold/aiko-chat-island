@@ -68,12 +68,15 @@ async def report_message(
 ) -> dict:
     """Report ``message_id`` as objectionable. Idempotent per (message, reporter):
     a re-report returns the existing report id. 404 if the message does not exist
-    OR sits in a channel the reporter cannot read (existence-hiding — you can only
-    report what you can see)."""
+    OR sits in a channel the reporter cannot READ (existence-hiding for private
+    channels the caller isn't in). NOTE: the gate is channel readability, not
+    per-message visibility — a soft-deleted or block-hidden message in a readable
+    channel is still reportable on purpose (report-then-block / report-a-tombstone
+    are valid ops flows); see get_reportable_message."""
     # Resolve the message THROUGH the channel ACL first: a reporter must be able
     # to read the channel, else the message is existence-hidden (same 404 as a
-    # missing one). This also prevents reporting messages in private channels the
-    # caller isn't in.
+    # missing one). This prevents reporting into private channels the caller isn't
+    # in — the meaningful existence boundary.
     msg = await moderation_service.get_reportable_message(session, user.id, message_id)
     if msg is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "message not found")

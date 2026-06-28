@@ -152,6 +152,19 @@ async def latest_ulid(session: AsyncSession, channel_id: str, viewer_id: str) ->
     BLOCKED author's row is hidden only from the viewer in the block relationship
     (#7). That is why the fence is now per-viewer: blocker and non-blocker can see
     a different newest-visible message in the same channel.
+
+    COUPLING IS WITHIN-INSTANT, NOT TIME-REVERSIBLE (cage-match Carnot HIGH). The
+    fence and the history pager share this predicate, so at any single DB instant
+    they agree. They do NOT agree across a *visibility shrink between* the fence
+    read (at subscribe) and the client's later history paging: if a message that
+    was visible at fence-time becomes hidden before paging — a new block here, OR a
+    soft-delete (this race PRE-DATES blocks; #7 only widens its likelihood) — the
+    already-issued fence can point at a row history now refuses to return, and B4's
+    pager hits its empty-page-before-fence guard. In RELEASE this self-heals: the
+    next reconnect's subscribe recomputes the fence with the now-current visibility,
+    so blocker and history agree and the loop converges. The durable fix is making
+    B4 treat empty-page-before-fence as a benign re-sync (refetch the fence) rather
+    than an assert — a CLIENT/protocol change tracked in the app repo, not here.
     """
     result = await session.execute(
         select(func.max(Message.id)).where(

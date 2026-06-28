@@ -49,9 +49,13 @@ class Hub:
 
         The exclusion set carries the moderation block boundary into live
         delivery (#7): the caller passes every user in a block relationship with
-        the message's sender, so a blocked party's open connection never receives
-        the frame — the live twin of the history/fence visibility filter. Empty /
-        None means "no exclusions" (the common case)."""
+        the message's sender AS OF SEND TIME, so a blocked party's open connection
+        is skipped for this frame — the live twin of the history/fence visibility
+        filter. It is point-in-time, not transactional: a block committed in the
+        window between the caller computing the set and this fanout is not reflected
+        for the in-flight frame (cage-match Carnot LOW); the next send recomputes,
+        and the history path hides it on reload. Empty / None means "no exclusions"
+        (the common case)."""
         excluded = exclude_user_ids or frozenset()
         targets = [
             c for c in self._conns
