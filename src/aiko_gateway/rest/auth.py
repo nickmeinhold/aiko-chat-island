@@ -7,6 +7,8 @@ prod fails closed; an explicit OPEN_REGISTRATION override re-opens it.
 """
 from __future__ import annotations
 
+import logging
+
 import jwt
 from fastapi import APIRouter, HTTPException, Response, status
 from pydantic import BaseModel, Field, field_validator
@@ -19,6 +21,8 @@ from ..domain.oauth import Provider
 from .deps import CurrentUser, DbSession
 
 router = APIRouter(prefix="/v1/auth", tags=["auth"])
+
+log = logging.getLogger(__name__)
 
 
 class RegisterReq(BaseModel):
@@ -190,10 +194,19 @@ async def delete_account(user: CurrentUser, session: DbSession) -> Response:
     try:
         await accounts_service.delete_user_account(session, user.id)
     except accounts_service.CannotDeleteSoleAdmin as e:
-        # The guard runs before any write, so there is nothing to roll back.
+        # No rollback: the guard raises before delete_user_account performs ANY
+        # write (only SELECTs precede it), so there is nothing to undo. (Carnot
+        # suggested a defensive rollback here; rejected — on the shared async test
+        # session it raises MissingGreenlet, and in prod it is a no-op on a fresh
+        # per-request session. The guard-before-writes invariant is what keeps this
+        # safe; if future guard code writes before raising, roll back THEN.)
+        # The channel ids are ULIDs — useless in a user-facing string — so log them
+        # server-side and return a generic, actionable message (cage-match, Carnot).
+        log.info("account deletion blocked: user=%s sole admin of channels=%s",
+                 user.id, e.channel_ids)
         raise HTTPException(
             status.HTTP_409_CONFLICT,
-            "cannot delete account while sole admin of channel(s) "
-            f"{', '.join(e.channel_ids)}; transfer or leave them first",
+            "You are the sole admin of one or more channels. Transfer them to "
+            "another member or leave them before deleting your account.",
         )
     return Response(status_code=status.HTTP_204_NO_CONTENT)

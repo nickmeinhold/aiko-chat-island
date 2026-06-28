@@ -27,10 +27,8 @@ from __future__ import annotations
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .memberships_service import ROLE_ADMIN
 from .models import Membership, Message, SocialIdentity, User
-
-# Wire value of an admin membership role (models.py: role is `member|admin`).
-_ROLE_ADMIN = "admin"
 
 # What an anonymized message's author label becomes once the account is gone.
 DELETED_USER_LABEL = "[deleted user]"
@@ -49,20 +47,27 @@ class CannotDeleteSoleAdmin(Exception):
 async def _sole_admin_channel_ids(session: AsyncSession, user_id: str) -> list[str]:
     """Channel ids where `user_id` is an admin AND the only admin.
 
-    Note (MVP tradeoff): the check-then-delete is not wrapped in row locks, so a
-    concurrent admin change could in principle race it. SQLite serialises writers
-    so the window is closed in practice; revisit with `SELECT … FOR UPDATE` when
-    the store moves to Postgres.
+    CONCURRENCY (flagged by all three cage-match reviewers): this is a
+    read-then-write business invariant with NO row lock, so it is not atomic.
+    Under the current single-writer SQLite deployment the race window is small,
+    but two co-admins of the same channel deleting concurrently can each observe
+    the other as the "second admin" and both proceed — orphaning the channel.
+    Moving to Postgres (planned on the public-scale / external-testers path)
+    widens the window. The proper fix is `SELECT … FOR UPDATE` on the channel's
+    admin memberships before the guard (or a DB-level invariant); tracked
+    separately. Accepted for the MVP because the precondition (two simultaneous
+    sole-co-admin deletes) is rare and the blast radius is a recoverable
+    admin-less channel, not data loss.
     """
     admin_channels = (await session.execute(
         select(Membership.channel_id).where(
-            Membership.user_id == user_id, Membership.role == _ROLE_ADMIN)
+            Membership.user_id == user_id, Membership.role == ROLE_ADMIN)
     )).scalars().all()
     sole: list[str] = []
     for cid in admin_channels:
         admin_count = (await session.execute(
             select(func.count()).select_from(Membership).where(
-                Membership.channel_id == cid, Membership.role == _ROLE_ADMIN)
+                Membership.channel_id == cid, Membership.role == ROLE_ADMIN)
         )).scalar_one()
         if admin_count <= 1:
             sole.append(cid)

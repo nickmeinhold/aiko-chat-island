@@ -159,5 +159,8 @@ async def test_delete_account_sole_admin_is_409(client, session):
 
     resp = await client.delete("/v1/account", headers=_auth(user))
     assert resp.status_code == 409
+    # The cross-repo contract: the app is load-bearing on the `detail` field, so
+    # assert its shape here (not just the status code) — cage-match (Carnot).
+    assert "sole admin" in resp.json()["detail"].lower()
     # Rejected → the account still exists.
     assert await users_service.get_by_id(session, user.id) is not None
