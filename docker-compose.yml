@@ -42,15 +42,24 @@ services:
       AIKO_MQTT_HOST: aiko-mosquitto
       AIKO_MQTT_PORT: "1883"
       AIKO_NAMESPACE: aiko
-      # --- social sign-in (#13). Supplied from the host .env; OFF by default so
-      # deploying this passthrough changes nothing until the env sets values. The
-      # client IDs are PUBLIC (native ID-token flow has no client secret), so they
-      # live in plain .env, not SOPS. The *_CLIENT_IDS values MUST be JSON arrays
-      # (pydantic-settings json-decodes list fields; a bare string crashes boot).
-      # config.py refuses to boot if enabled in prod with an empty allowlist.
-      SOCIAL_SIGNIN_ENABLED: ${SOCIAL_SIGNIN_ENABLED:-false}
-      APPLE_CLIENT_IDS: ${APPLE_CLIENT_IDS:-[]}
-      GOOGLE_CLIENT_IDS: ${GOOGLE_CLIENT_IDS:-[]}
+      # --- social sign-in (#13). The client IDs are PUBLIC (native ID-token flow
+      # has no client secret), so the LIVE prod allowlist is baked here as the
+      # default rather than living only in the hand-managed host .env (#1415). The
+      # footgun this closes: a manual redeploy that re-renders .env from SOPS
+      # (which holds only JWT_SECRET) would otherwise drop these → social silently
+      # OFF, or — if SOCIAL_SIGNIN_ENABLED survived without the IDs — a fail-closed
+      # BOOT CRASH (config.py refuses prod-enabled with an empty allowlist). With
+      # repo-defaults a re-render can't silently change the aud allowlist; the host
+      # .env override stays optional. These values were verified byte-equal to the
+      # live host .env on 2026-06-28 and must stay in sync with the GCP 588100172166
+      # iOS/Web/Android clients + the Apple App ID.
+      #
+      # The *_CLIENT_IDS values MUST be JSON arrays (pydantic-settings json-decodes
+      # list fields; a bare string crashes boot). JWT_SECRET is the ONE secret here
+      # and stays in SOPS — public client IDs are not secrets.
+      SOCIAL_SIGNIN_ENABLED: ${SOCIAL_SIGNIN_ENABLED:-true}
+      APPLE_CLIENT_IDS: ${APPLE_CLIENT_IDS:-["cc.imagineering.aikoChatApp"]}
+      GOOGLE_CLIENT_IDS: ${GOOGLE_CLIENT_IDS:-["588100172166-a0r6ipvpju5rd6fh8lv85qqohpdosp33.apps.googleusercontent.com","588100172166-23ppgk6jdb3et2ehc1qj584c6rgs0c9j.apps.googleusercontent.com","588100172166-bagrmvftp3fcer2j2lvnh33j65g58elk.apps.googleusercontent.com"]}
     volumes:
       # Persist the SQLite store across container recreates.
       - aiko_gateway_data:/data
