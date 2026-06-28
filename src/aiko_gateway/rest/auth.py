@@ -8,12 +8,12 @@ prod fails closed; an explicit OPEN_REGISTRATION override re-opens it.
 from __future__ import annotations
 
 import jwt
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Response, status
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.exc import IntegrityError
 
 from ..config import settings
-from ..domain import oauth, security, users_service
+from ..domain import accounts_service, oauth, security, users_service
 from ..domain.models import User
 from ..domain.oauth import Provider
 from .deps import CurrentUser, DbSession
@@ -177,3 +177,23 @@ me_router = APIRouter(prefix="/v1", tags=["auth"])
 @me_router.get("/me")
 async def me(user: CurrentUser) -> dict:
     return _user_view(user)
+
+
+@me_router.delete("/account", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_account(user: CurrentUser, session: DbSession) -> Response:
+    """Permanently delete the authenticated user's account (Apple 5.1.1(v)).
+
+    Hard-deletes the user row + federated identities + channel memberships and
+    anonymizes the user's authored messages (the conversation survives, the
+    account link does not). 409 if the user is the sole admin of any channel —
+    they must hand those over or leave them first."""
+    try:
+        await accounts_service.delete_user_account(session, user.id)
+    except accounts_service.CannotDeleteSoleAdmin as e:
+        # The guard runs before any write, so there is nothing to roll back.
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "cannot delete account while sole admin of channel(s) "
+            f"{', '.join(e.channel_ids)}; transfer or leave them first",
+        )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
