@@ -7,18 +7,22 @@ prod fails closed; an explicit OPEN_REGISTRATION override re-opens it.
 """
 from __future__ import annotations
 
+import logging
+
 import jwt
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Response, status
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.exc import IntegrityError
 
 from ..config import settings
-from ..domain import oauth, security, users_service
+from ..domain import accounts_service, oauth, security, users_service
 from ..domain.models import User
 from ..domain.oauth import Provider
 from .deps import CurrentUser, DbSession
 
 router = APIRouter(prefix="/v1/auth", tags=["auth"])
+
+log = logging.getLogger(__name__)
 
 
 class RegisterReq(BaseModel):
@@ -177,3 +181,32 @@ me_router = APIRouter(prefix="/v1", tags=["auth"])
 @me_router.get("/me")
 async def me(user: CurrentUser) -> dict:
     return _user_view(user)
+
+
+@me_router.delete("/account", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_account(user: CurrentUser, session: DbSession) -> Response:
+    """Permanently delete the authenticated user's account (Apple 5.1.1(v)).
+
+    Hard-deletes the user row + federated identities + channel memberships and
+    anonymizes the user's authored messages (the conversation survives, the
+    account link does not). 409 if the user is the sole admin of any channel —
+    they must hand those over or leave them first."""
+    try:
+        await accounts_service.delete_user_account(session, user.id)
+    except accounts_service.CannotDeleteSoleAdmin as e:
+        # No rollback: the guard raises before delete_user_account performs ANY
+        # write (only SELECTs precede it), so there is nothing to undo. (Carnot
+        # suggested a defensive rollback here; rejected — on the shared async test
+        # session it raises MissingGreenlet, and in prod it is a no-op on a fresh
+        # per-request session. The guard-before-writes invariant is what keeps this
+        # safe; if future guard code writes before raising, roll back THEN.)
+        # The channel ids are ULIDs — useless in a user-facing string — so log them
+        # server-side and return a generic, actionable message (cage-match, Carnot).
+        log.info("account deletion blocked: user=%s sole admin of channels=%s",
+                 user.id, e.channel_ids)
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "You are the sole admin of one or more channels. Transfer them to "
+            "another member or leave them before deleting your account.",
+        )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
