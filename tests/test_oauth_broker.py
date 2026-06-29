@@ -89,9 +89,13 @@ _APP_CHALLENGE = app_challenge_for(_APP_VERIFIER)
 
 
 async def _mint_state(session, provider="github", code_verifier=None,
-                      app_challenge=None) -> str:
+                      app_challenge=_APP_CHALLENGE) -> str:
     """Create a SERVER-SIDE single-use state nonce (replaces the old signed-JWT
-    state). Returns the opaque nonce to send as the callback `state` param."""
+    state). Returns the opaque nonce to send as the callback `state` param.
+
+    Defaults to a VALID app_challenge (cage-match #37 r2): /callback now fails
+    closed without one, so the realistic state always carries a binding. Pass
+    app_challenge=None explicitly to exercise the legacy challenge-less path."""
     return await state_service.create_state(
         session, provider=provider, code_verifier=code_verifier,
         app_challenge=app_challenge)
@@ -850,6 +854,40 @@ async def test_start_requires_app_challenge_400(client):
 async def test_start_short_app_challenge_400(client):
     r = await client.get("/v1/auth/oauth/github/start?app_challenge=tooshort")
     assert r.status_code == 400
+
+
+async def test_start_malformed_app_challenge_400(client):
+    """Ingress shape validation (cage-match #37 r2): a 43-char but non-base64url
+    challenge is rejected at /start, not stored to fail later. RED-proof: revert
+    the check to `len < 43` and this 43-char '!' string is accepted (302)."""
+    r = await client.get(
+        f"/v1/auth/oauth/github/start?app_challenge={'!' * 43}")
+    assert r.status_code == 400
+
+
+async def test_callback_null_challenge_state_fails_closed(client, monkeypatch, session):
+    """Fail-closed on a challenge-less state (cage-match #37 r2, Carnot MEDIUM): a
+    state minted without an app_challenge (a pre-binding/legacy row) must NOT mint a
+    verifierless handoff — /callback redirects with an error instead. RED-proof:
+    remove the `if not st.get("app_challenge")` guard and this mints a handoff
+    (location carries ?code= instead of ?error=)."""
+    _mock_exchange(monkeypatch, identity=_IDENTITY)
+    state = await _mint_state(session, app_challenge=None)  # legacy, no binding
+    r = await client.get(
+        f"/v1/auth/oauth/github/callback?code=authcode&state={state}")
+    assert r.status_code == 302
+    loc = r.headers["location"]
+    assert "error=" in loc and "code=" not in loc, loc
+
+
+async def test_exchange_oversized_app_verifier_422(client):
+    """The app_verifier is bounded at the boundary (cage-match #37 r2): a verifier
+    longer than the RFC 7636 ceiling (128) is rejected as 422 before it is hashed,
+    not accepted into app_challenge_for. RED-proof: drop max_length and this becomes
+    a 401 (parses, then fails the handoff lookup)."""
+    r = await client.post("/v1/auth/oauth/exchange",
+                          json={"code": "x", "app_verifier": "z" * 129})
+    assert r.status_code == 422, r.text
 
 
 async def test_exchange_bound_handoff_correct_verifier_succeeds(client, session):

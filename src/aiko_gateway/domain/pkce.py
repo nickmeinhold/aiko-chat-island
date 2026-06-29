@@ -13,11 +13,26 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import re
 import secrets
+
+# A base64url-nopad SHA-256 digest is EXACTLY 43 url-safe chars. Validating the
+# app_challenge against this at ingress (cage-match #37 r2, Carnot LOW) rejects
+# wrong-length / non-b64url / non-ASCII before it is ever stored, so the binding
+# store only ever holds well-formed challenges (defence-in-depth on top of the
+# fail-closed verify_app_challenge below).
+_S256_CHALLENGE_RE = re.compile(r"[A-Za-z0-9_-]{43}\Z")
 
 
 def _b64url_nopad(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).rstrip(b"=").decode("ascii")
+
+
+def is_valid_app_challenge(challenge: str) -> bool:
+    """True iff `challenge` has the exact shape of a base64url-nopad SHA-256 digest
+    (43 url-safe chars). Used to fail-closed-reject a malformed app_challenge at
+    /start ingress rather than storing it for a later 401."""
+    return bool(_S256_CHALLENGE_RE.match(challenge))
 
 
 def app_challenge_for(verifier: str) -> str:
