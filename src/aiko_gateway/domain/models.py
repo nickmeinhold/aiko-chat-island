@@ -333,3 +333,33 @@ class OAuthState(Base):
         Boolean, nullable=False, default=False)
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow)
+
+
+class SocialNonce(Base):
+    """A one-time, server-ISSUED nonce for the NATIVE social sign-in flow (#13,
+    option (a)). Distinct from OAuthState: that is broker (server-side code-flow)
+    state carrying PKCE/provider routing; this is a bare single-use token whose
+    only job is to make the sign-in nonce INDEPENDENT SERVER STATE.
+
+    Why this closes the replay window PR#32 (option (b)) left open: there the APP
+    generated the nonce and sent it beside the id_token, so the 'expected' value
+    was attacker-replayable (capture the body, replay both — and for Google the raw
+    nonce is even readable out of the token). Here the GATEWAY issues the nonce,
+    stores it, and CONSUMES it exactly once at /social. A captured request can't be
+    replayed because the nonce is already burned — the defense no longer depends on
+    the attacker never seeing the nonce.
+
+    Shape mirrors OAuthState's single-use guarantee (consumed + expires_at, atomic
+    guarded UPDATE) but carries NO provider/verifier — a native nonce is
+    provider-agnostic at issue time (the app picks Apple or Google afterwards).
+    Rows are short-lived (the social_nonce TTL) and self-expire; no sweeper at this
+    scale (a follow-up if the table ever grows).
+    """
+    __tablename__ = "social_nonces"
+    nonce: Mapped[str] = mapped_column(String(64), primary_key=True)
+    expires_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False)
+    consumed: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow)

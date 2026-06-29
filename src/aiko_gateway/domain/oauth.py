@@ -41,10 +41,14 @@ server state. Therefore:
     ceremony freshness but adds NO defense against id_token capture.
   - NEITHER closes the broken-TLS / full-request-capture window (the ORIGINAL #13
     named-accepted risk): an attacker who captures the POST body replays the raw
-    nonce beside the token. Fully closing that needs option (a) — a gateway-ISSUED,
-    server-stored, SINGLE-USE nonce, so a replayed nonce is already burned. That is
-    the follow-up; THIS change is the shared foundation (option (a) needs the app to
-    send a nonce too) plus genuine Apple side-channel defense.
+    nonce beside the token. Closing THAT is option (a) — a gateway-ISSUED,
+    server-stored, SINGLE-USE nonce, so a replayed nonce is already burned. Option
+    (a) is now IMPLEMENTED, but NOT here: it lives at the handler layer
+    (rest/auth.py POST /v1/auth/nonce issues it; /v1/auth/social atomically CONSUMES
+    it via domain.nonce_service before this verify runs). verify_id_token stays
+    purely the provider-claim check — the two layers compose: the consume proves the
+    nonce was server-issued + single-use, this match proves the provider bound it to
+    THIS token.
 
 The rollout is STAGED across two repos so it never breaks the live app:
   - presence is GATED by settings.social_nonce_required (default False). Off ⇒ a

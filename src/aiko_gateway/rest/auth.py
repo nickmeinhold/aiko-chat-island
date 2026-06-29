@@ -18,8 +18,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import settings
 from ..domain import (
-    accounts_service, handoff_service, oauth, oauth_broker, security,
-    state_service, users_service,
+    accounts_service, handoff_service, nonce_service, oauth, oauth_broker,
+    security, state_service, users_service,
 )
 from ..domain.models import User
 from ..domain.oauth import Provider, VerifiedIdentity
@@ -92,7 +92,10 @@ class SocialReq(BaseModel):
     # min_length=1: a BLANK nonce is malformed, not "supplied" — reject it at the
     # boundary (422) so an empty string can never become a downgrade channel that
     # slips past presence-enforcement (Carnot, cage-match PR#32). None = absent.
-    nonce: str | None = Field(default=None, min_length=1)
+    # min_length=1 rejects a blank nonce at the boundary; max_length=64 caps it to
+    # the issued size (token_urlsafe(32) -> 43 chars, stored String(64)) so an
+    # oversized attacker string never reaches the DB comparison (cage-match PR#33).
+    nonce: str | None = Field(default=None, min_length=1, max_length=64)
 
 
 class SocialClaimReq(BaseModel):
@@ -150,6 +153,28 @@ async def _resolve_identity(
     }
 
 
+class NonceResp(BaseModel):
+    nonce: str
+
+
+@router.post("/nonce")
+async def issue_nonce(session: DbSession) -> NonceResp:
+    """Mint a server-ISSUED single-use nonce for the native social sign-in flow
+    (#13 option (a)). The app calls this FIRST, feeds the nonce (hashed, for Apple)
+    into the Sign-in-with-Apple/Google request, then echoes it to /social with the
+    id_token, where the gateway redeems it exactly once — so a captured /social
+    request can't be replayed (the nonce is already burned). Pre-auth (the user
+    isn't signed in yet), gated only by the social-sign-in kill switch.
+
+    NAMED TRADEOFF: issuance is unauthenticated and unthrottled. Nonces are tiny
+    and self-expire on a short TTL (same posture as the broker /start), so a flood
+    is bounded by the TTL; a sweeper / rate-limit is a follow-up if the table grows.
+    """
+    if not settings.social_signin_enabled:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "social sign-in is disabled")
+    return NonceResp(nonce=await nonce_service.issue_nonce(session))
+
+
 @router.post("/social")
 async def social(req: SocialReq, session: DbSession) -> dict:
     """Verify a provider ID token. Known identity → real tokens. Brand-new
@@ -176,6 +201,28 @@ async def social(req: SocialReq, session: DbSession) -> dict:
     except oauth.InvalidProviderToken:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid provider token")
 
+    # Server-issuance + single-use (#13 option (a)): a supplied nonce must be one
+    # the gateway ISSUED (POST /v1/auth/nonce) and not yet redeemed. Consumed AFTER
+    # the token verifies — so a transient JWKS 503 or a bad token does NOT burn the
+    # nonce (the user retries with the same one; cage-match PR#33, Carnot MEDIUM) —
+    # but BEFORE any session is issued. Replay still collapses here: a replayed
+    # valid token verifies, then the already-burned nonce fails this consume; the
+    # atomic guard also arbitrates concurrent replays to a single winner. With the
+    # provider-claim match (inside verify above) both properties hold: the nonce is
+    # server-issued + single-use AND provider-bound to THIS token.
+    #
+    # NAMED TRADEOFF (cage-match PR#33, Carnot MEDIUM): consume_nonce commits the
+    # redemption, then _resolve_identity runs. If _resolve_identity fails (it does
+    # NO writes/commits — only a user lookup + JWT mint, so the only failure is a
+    # transient DB-read outage), the nonce is burned though no session issued. This
+    # FAILS CLOSED (no auth granted) and costs the user one /nonce re-fetch. It is
+    # accepted because it is IDENTICAL to the deployed broker /callback (consume_
+    # state then _resolve_identity) — making the two consume paths atomic-with-
+    # outcome is a separate refactor that must touch BOTH together (tracked).
+    if req.nonce is not None and not await nonce_service.consume_nonce(
+            session, req.nonce):
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED, "invalid or expired nonce")
     # Single door: verified identity → session/provisioning outcome.
     return await _resolve_identity(session, identity)
 

@@ -77,6 +77,11 @@ class Settings(BaseSettings):
     # this only governs whether a MISSING nonce is tolerated. Flip to True as the
     # final step of the staged rollout, once the app ships nonce generation.
     social_nonce_required: bool = False
+    # TTL for a server-ISSUED single-use nonce (#13 option (a)): the window between
+    # the app calling POST /v1/auth/nonce and POSTing /v1/auth/social with the
+    # provider id_token bound to it. Short — a human completing a Sign-in-with-Apple
+    # / Google sheet, no longer.
+    social_nonce_ttl_seconds: int = 10 * 60  # 10 min
     # The audience allowlist: OUR provider client IDs. A provider ID token's `aud`
     # must be one of these. PUBLIC values (native ID-token flow needs no client
     # secret), so plain config — NOT SOPS. EMPTY ⇒ the verifier rejects every

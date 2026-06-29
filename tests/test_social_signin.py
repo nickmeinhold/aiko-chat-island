@@ -215,18 +215,22 @@ async def test_nonce_required_rejects_missing(client, monkeypatch):
     assert r.status_code == 401, r.text
 
 
-async def test_nonce_required_accepts_with_nonce(client, monkeypatch):
+async def test_nonce_required_accepts_server_issued_nonce(client, monkeypatch):
+    """Flag on + a SERVER-ISSUED nonce → 200. Option (a): the nonce must be one the
+    gateway minted at /v1/auth/nonce (an arbitrary app-chosen value is rejected by
+    the consume step)."""
     monkeypatch.setattr(settings, "social_nonce_required", True)
     _mock_verify(monkeypatch, identity=_IDENTITY)
+    nonce = (await client.post("/v1/auth/nonce")).json()["nonce"]
     r = await client.post("/v1/auth/social",
                           json={"provider": "google", "id_token": "x",
-                                "nonce": "n-123"})
+                                "nonce": nonce})
     assert r.status_code == 200, r.text
 
 
 async def test_nonce_forwarded_to_verifier(client, monkeypatch):
     """The supplied nonce must reach verify_id_token as expected_nonce — otherwise
-    the verifier can't bind it (the gate alone is theatre)."""
+    the verifier can't bind it to the token (the gate alone is theatre)."""
     seen = {}
 
     async def _capture(provider, id_token, *, expected_nonce=None):
@@ -234,11 +238,12 @@ async def test_nonce_forwarded_to_verifier(client, monkeypatch):
         return _IDENTITY
 
     monkeypatch.setattr(oauth, "verify_id_token", _capture)
+    nonce = (await client.post("/v1/auth/nonce")).json()["nonce"]
     r = await client.post("/v1/auth/social",
                           json={"provider": "google", "id_token": "x",
-                                "nonce": "carried-through"})
+                                "nonce": nonce})
     assert r.status_code == 200, r.text
-    assert seen["nonce"] == "carried-through"
+    assert seen["nonce"] == nonce
 
 
 async def test_blank_nonce_rejected_at_boundary_422(client, monkeypatch):
@@ -248,4 +253,60 @@ async def test_blank_nonce_rejected_at_boundary_422(client, monkeypatch):
     _mock_verify(monkeypatch, identity=_IDENTITY)
     r = await client.post("/v1/auth/social",
                           json={"provider": "google", "id_token": "x", "nonce": ""})
+    assert r.status_code == 422, r.text
+
+
+# --- option (a): server-issued single-use nonce (#13, the real replay closure) -- #
+
+async def test_issued_nonce_single_use_replay_rejected(client, monkeypatch):
+    """THE replay defense: a server-issued nonce works ONCE; replaying the same
+    /social request (same nonce) fails closed because the nonce is already burned.
+    This is what option (b) — an app-supplied nonce — could not provide."""
+    _mock_verify(monkeypatch, identity=_IDENTITY)
+    nonce = (await client.post("/v1/auth/nonce")).json()["nonce"]
+    body = {"provider": "google", "id_token": "x", "nonce": nonce}
+    first = await client.post("/v1/auth/social", json=body)
+    assert first.status_code == 200, first.text
+    replay = await client.post("/v1/auth/social", json=body)
+    assert replay.status_code == 401, replay.text  # nonce already consumed
+
+
+async def test_unissued_nonce_rejected(client, monkeypatch):
+    """A nonce the gateway never issued (forged / app-generated) is refused — the
+    consume step requires it to be present + unconsumed in the server store."""
+    _mock_verify(monkeypatch, identity=_IDENTITY)
+    r = await client.post("/v1/auth/social",
+                          json={"provider": "google", "id_token": "x",
+                                "nonce": "forged-never-issued"})
+    assert r.status_code == 401, r.text
+
+
+async def test_nonce_endpoint_gated_by_killswitch(client, monkeypatch):
+    """Issuance is off when social sign-in is administratively disabled."""
+    monkeypatch.setattr(settings, "social_signin_enabled", False)
+    r = await client.post("/v1/auth/nonce")
+    assert r.status_code == 403, r.text
+
+
+async def test_transient_verify_failure_does_not_burn_nonce(client, monkeypatch):
+    """Consume-AFTER-verify (Carnot PR#33): a 503 provider/JWKS outage must NOT burn
+    the nonce — the user retries the SAME nonce and succeeds once the provider
+    recovers. (Consume-before-verify would have stranded them.)"""
+    nonce = (await client.post("/v1/auth/nonce")).json()["nonce"]
+    body = {"provider": "google", "id_token": "x", "nonce": nonce}
+    _mock_verify(monkeypatch, exc=oauth.ProviderUnavailable("down"))
+    r1 = await client.post("/v1/auth/social", json=body)
+    assert r1.status_code == 503, r1.text          # outage — nonce must survive
+    _mock_verify(monkeypatch, identity=_IDENTITY)
+    r2 = await client.post("/v1/auth/social", json=body)
+    assert r2.status_code == 200, r2.text          # same nonce still works
+
+
+async def test_oversized_nonce_rejected_at_boundary_422(client, monkeypatch):
+    """A nonce longer than the issued size (max_length=64) is rejected at the
+    boundary, never reaching the DB comparison (Carnot PR#33)."""
+    _mock_verify(monkeypatch, identity=_IDENTITY)
+    r = await client.post("/v1/auth/social",
+                          json={"provider": "google", "id_token": "x",
+                                "nonce": "z" * 65})
     assert r.status_code == 422, r.text
