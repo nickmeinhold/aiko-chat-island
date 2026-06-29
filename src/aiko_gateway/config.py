@@ -161,6 +161,21 @@ class Settings(BaseSettings):
     # App Links won't verify yet; the iOS AASA is unaffected). Configure when known.
     passkey_android_cert_sha256: list[str] = []
 
+    # --- abuse limits (#28) ---
+    # Per-client rate limit on the public auth ceremonies (passkey/social/oauth/
+    # register/login/nonce). A blast-radius cap on unauthenticated, sometimes
+    # crypto-expensive or account-creating endpoints — NOT an authn control. Keyed
+    # by client IP (X-Forwarded-For rightmost, behind Caddy; see rate_limit.py),
+    # per endpoint-bucket. Generous enough that a real client doing a full ceremony
+    # + retries never trips it. In-process fixed window (single worker; see module).
+    rate_limit_enabled: bool = True
+    auth_rate_limit: int = 20  # requests per window, per IP, per bucket
+    auth_rate_limit_window_seconds: int = 60
+    # Reject request bodies larger than this with 413 (app-wide middleware). Auth
+    # payloads (WebAuthn, id_token JWTs) are a few KB and chat messages small text;
+    # there is no upload endpoint, so this never trips a legitimate request.
+    max_request_bytes: int = 64 * 1024  # 64 KiB
+
     # --- HTTP server ---
     host: str = "127.0.0.1"
     port: int = 8095

@@ -46,3 +46,18 @@ async def session() -> AsyncSession:
     async with maker() as s:
         yield s
     await engine.dispose()
+
+
+import pytest  # noqa: E402
+from aiko_gateway.domain.rate_limit import limiter as _rate_limiter  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _reset_rate_limiter():
+    """The rate limiter (#28) is a module-global counter shared across the whole
+    process. Reset it around every test so one test's requests can't consume
+    another's per-IP budget (all tests share the same client key) — and so a
+    rate-limit test starts from a clean window."""
+    _rate_limiter.reset()
+    yield
+    _rate_limiter.reset()

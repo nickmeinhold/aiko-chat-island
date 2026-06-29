@@ -30,6 +30,7 @@ from ..domain.oauth import Provider, VerifiedIdentity
 from ..domain.pkce import (
     is_valid_app_challenge, make_pkce_pair, verify_app_challenge,
 )
+from ..domain.rate_limit import rate_limit
 from .deps import CurrentUser, DbSession
 
 router = APIRouter(prefix="/v1/auth", tags=["auth"])
@@ -62,7 +63,7 @@ def _tokens(user_id: str) -> dict:
             "refresh_token": security.issue_refresh(user_id)}
 
 
-@router.post("/register")
+@router.post("/register", dependencies=[rate_limit("account")])
 async def register(req: RegisterReq, session: DbSession) -> dict:
     if not settings.open_registration:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "registration is closed")
@@ -79,7 +80,7 @@ async def register(req: RegisterReq, session: DbSession) -> dict:
     return {**_tokens(user.id), "user": _user_view(user)}
 
 
-@router.post("/login")
+@router.post("/login", dependencies=[rate_limit("account")])
 async def login(req: LoginReq, session: DbSession) -> dict:
     user = await users_service.authenticate(session, req.username, req.password)
     if user is None:
@@ -175,7 +176,7 @@ class NonceResp(BaseModel):
     nonce: str
 
 
-@router.post("/nonce")
+@router.post("/nonce", dependencies=[rate_limit("nonce")])
 async def issue_nonce(session: DbSession) -> NonceResp:
     """Mint a server-ISSUED single-use nonce for the native social sign-in flow
     (#13 option (a)). The app calls this FIRST, feeds the nonce (hashed, for Apple)
@@ -193,7 +194,7 @@ async def issue_nonce(session: DbSession) -> NonceResp:
     return NonceResp(nonce=await nonce_service.issue_nonce(session))
 
 
-@router.post("/social")
+@router.post("/social", dependencies=[rate_limit("social")])
 async def social(req: SocialReq, session: DbSession) -> dict:
     """Verify a provider ID token. Known identity → real tokens. Brand-new
     identity → a short-lived provisioning token to carry the verified identity
@@ -260,7 +261,7 @@ async def social(req: SocialReq, session: DbSession) -> dict:
     return outcome
 
 
-@router.post("/social/claim")
+@router.post("/social/claim", dependencies=[rate_limit("social")])
 async def social_claim(req: SocialClaimReq, session: DbSession) -> dict:
     """Complete provisioning: verify the provisioning token (OUR token, so the
     identity it carries cannot be forged), create the user atomically, and return
@@ -330,7 +331,7 @@ class PasskeyFinishReq(BaseModel):
     credential: dict
 
 
-@router.post("/passkey/register/start")
+@router.post("/passkey/register/start", dependencies=[rate_limit("passkey")])
 async def passkey_register_start(session: DbSession) -> dict:
     """Begin registration for an ANONYMOUS caller (first-passkey-creates-account).
     Returns {state, options} — the raw WebAuthn-JSON the platform authenticator
@@ -338,7 +339,7 @@ async def passkey_register_start(session: DbSession) -> dict:
     return await passkey_service.start_registration(session)
 
 
-@router.post("/passkey/register/finish")
+@router.post("/passkey/register/finish", dependencies=[rate_limit("passkey")])
 async def passkey_register_finish(req: PasskeyFinishReq, session: DbSession) -> dict:
     """Verify the attestation and return a PROVISIONING outcome (new identity must
     claim a handle). The verified credential rides in the provisioning token and is
@@ -371,14 +372,14 @@ async def passkey_register_finish(req: PasskeyFinishReq, session: DbSession) -> 
     }
 
 
-@router.post("/passkey/authenticate/start")
+@router.post("/passkey/authenticate/start", dependencies=[rate_limit("passkey")])
 async def passkey_authenticate_start(session: DbSession) -> dict:
     """Begin usernameless/discoverable authentication (empty allowCredentials).
     Returns {state, options}."""
     return await passkey_service.start_authentication(session)
 
 
-@router.post("/passkey/authenticate/finish")
+@router.post("/passkey/authenticate/finish", dependencies=[rate_limit("passkey")])
 async def passkey_authenticate_finish(
     req: PasskeyFinishReq, session: DbSession,
 ) -> dict:
@@ -423,7 +424,7 @@ async def passkey_authenticate_finish(
     return outcome
 
 
-@router.post("/refresh")
+@router.post("/refresh", dependencies=[rate_limit("account")])
 async def refresh(req: RefreshReq) -> dict:
     try:
         user_id = security.decode_token(req.refresh_token, expected_type="refresh")
@@ -462,7 +463,7 @@ def _provider_or_404(slug: str) -> oauth_broker.BrokerProvider:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown provider")
 
 
-@router.get("/oauth/{provider}/start")
+@router.get("/oauth/{provider}/start", dependencies=[rate_limit("oauth")])
 async def oauth_start(
     provider: str, session: DbSession, app_challenge: str | None = None,
 ) -> RedirectResponse:
@@ -503,7 +504,7 @@ async def oauth_start(
     return RedirectResponse(url, status_code=302)
 
 
-@router.get("/oauth/{provider}/callback")
+@router.get("/oauth/{provider}/callback", dependencies=[rate_limit("oauth")])
 async def oauth_callback(
     provider: str, session: DbSession,
     code: str | None = None, state: str | None = None, error: str | None = None,
@@ -619,7 +620,7 @@ class OAuthExchangeReq(BaseModel):
     app_verifier: str | None = Field(default=None, max_length=128)
 
 
-@router.post("/oauth/exchange")
+@router.post("/oauth/exchange", dependencies=[rate_limit("oauth")])
 async def oauth_exchange(req: OAuthExchangeReq, session: DbSession) -> dict:
     """Redeem a single-use handoff code for the final session JSON. Missing /
     expired / already-consumed → 401. The redemption is atomic (single-use, the

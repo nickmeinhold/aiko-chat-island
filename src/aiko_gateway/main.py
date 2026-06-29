@@ -173,6 +173,11 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Aiko Chat Gateway", version="0.0.1", lifespan=lifespan)
 app.state.gw = state  # the WS endpoint reaches bus + hub via websocket.app.state.gw
 
+# Cap request body size app-wide (#28) — rejects oversized bodies with 413 before
+# they reach a route. Generous cap (no upload endpoint); see middleware + config.
+from .middleware import ContentSizeLimitMiddleware  # noqa: E402
+app.add_middleware(ContentSizeLimitMiddleware, max_bytes=settings.max_request_bytes)
+
 from .rest import auth as auth_routes  # noqa: E402
 from .rest import channels as channel_routes  # noqa: E402
 from .rest import devices as device_routes  # noqa: E402
