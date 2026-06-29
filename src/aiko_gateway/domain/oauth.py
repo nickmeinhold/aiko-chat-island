@@ -229,7 +229,6 @@ class _JwksCache:
 
 @dataclass(frozen=True)
 class _ProviderConfig:
-    slug: str
     jwks_uri: str
     issuers: frozenset[str]
     jwks: _JwksCache
@@ -242,16 +241,20 @@ class _ProviderConfig:
     nonce_hashed: bool
 
 
-_PROVIDERS: dict[str, _ProviderConfig] = {
-    "apple": _ProviderConfig(
-        slug="apple",
+# Keyed by the Provider enum, not raw strings: the closed set of providers is a
+# type, so a typo can't silently mint a new registry key, and the dispatch below
+# compares enum members rather than stringly-typed literals. (Lookups by the raw
+# request string still resolve transparently — Provider is a StrEnum, so
+# `hash(Provider.google) == hash("google")` — but `verify_id_token` coerces to the
+# enum once at the boundary so everything downstream is enum-typed.)
+_PROVIDERS: dict[Provider, _ProviderConfig] = {
+    Provider.apple: _ProviderConfig(
         jwks_uri="https://appleid.apple.com/auth/keys",
         issuers=frozenset({"https://appleid.apple.com"}),
         jwks=_JwksCache("https://appleid.apple.com/auth/keys"),
         nonce_hashed=True,   # Apple stores SHA-256(nonce) hex in the claim.
     ),
-    "google": _ProviderConfig(
-        slug="google",
+    Provider.google: _ProviderConfig(
         jwks_uri="https://www.googleapis.com/oauth2/v3/certs",
         # Google legitimately uses both spellings — accept either, pin to these.
         issuers=frozenset({"https://accounts.google.com", "accounts.google.com"}),
@@ -261,12 +264,29 @@ _PROVIDERS: dict[str, _ProviderConfig] = {
 }
 
 
-def _allowed_audiences(provider: str) -> list[str]:
-    if provider == "apple":
+def _as_provider(provider: Provider | str) -> Provider:
+    """Coerce the request-supplied provider to the Provider enum, failing CLOSED.
+
+    Now that the registry is enum-keyed, this is the ONE gate that rejects a slug
+    outside the closed set: a bad value raises UnknownProvider (→ a 4xx the caller
+    maps), NOT the bare ValueError that `Provider("facebook")` would otherwise
+    surface as a 500. Idempotent on a value that's already a Provider."""
+    if isinstance(provider, Provider):
+        return provider
+    try:
+        return Provider(provider)
+    except ValueError as e:
+        raise UnknownProvider(str(provider)) from e
+
+
+def _allowed_audiences(provider: Provider) -> list[str]:
+    # Read settings at call time (not import time) so a test/env that sets the
+    # client-ID allowlist after import is honoured. Enum identity, not string ==.
+    if provider is Provider.apple:
         return list(settings.apple_client_ids)
-    if provider == "google":
+    if provider is Provider.google:
         return list(settings.google_client_ids)
-    return []
+    return []  # fail-closed: an unhandled provider has NO audiences ⇒ reject all
 
 
 async def verify_id_token(
@@ -274,9 +294,14 @@ async def verify_id_token(
 ) -> VerifiedIdentity:
     """Verify a provider ID token and return the federated identity, or raise an
     OAuthError subclass. Every check fails CLOSED."""
+    # Coerce to the enum ONCE at the boundary (raises UnknownProvider on a slug
+    # outside the closed set); everything below is enum-typed, incl. the identity
+    # we return. The registry has a config for every Provider member, so a missing
+    # entry would be an internal drift bug — guard it as fail-closed all the same.
+    provider = _as_provider(provider)
     cfg = _PROVIDERS.get(provider)
     if cfg is None:
-        raise UnknownProvider(provider)
+        raise UnknownProvider(str(provider))
 
     # aud allowlist FIRST, before any work: empty ⇒ reject all (fail-closed).
     audiences = _allowed_audiences(provider)
