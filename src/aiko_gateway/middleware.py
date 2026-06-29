@@ -70,6 +70,12 @@ class ContentSizeLimitMiddleware:
         replayed = False
 
         async def replay_receive() -> Message:
+            # Replay the buffered body once, then report end-of-stream. Returning
+            # http.disconnect on subsequent calls is the standard body-replay idiom;
+            # it would only surprise a handler that POLLS receive()/is_disconnected
+            # AFTER consuming the body (cage-match #39, Carnot P2) — none of this
+            # app's routes do (they read the body once via pydantic/`await body()`
+            # then return). WebSocket scopes never reach here (passed through above).
             nonlocal replayed
             if not replayed:
                 replayed = True

@@ -17,14 +17,22 @@ blast-radius cap, NOT an authn control.
 from __future__ import annotations
 
 import time
+from collections import OrderedDict
 
 from fastapi import Depends, HTTPException, Request, status
 
 from ..config import settings
 
-# Bound the key dict so a spray of distinct client IPs can't grow it without limit.
-# Far above any real concurrent-client count for this gateway; eviction of expired
-# windows (below) keeps the live set near the active-client count in practice.
+# HARD upper bound on the number of (bucket, ip) windows held at once. The store is
+# an LRU (OrderedDict): when a hit would exceed this, the least-recently-used key is
+# evicted in O(1) — NO scan. This makes the cap a genuine bound under a distributed
+# spray of source IPs (cage-match #39, Carnot+Kelvin: the prior expired-only sweep
+# was not a hard bound and its O(N) scan-that-freed-nothing was itself a CPU/event-
+# loop DoS). Far above any real concurrent-client count for this gateway. An evicted
+# key simply gets a fresh window on its next hit — fail-safe (marginally more lenient
+# under memory pressure, never a crash). A key being actively hit is always moved to
+# most-recently-used, so an attacker hammering one IP can never evict their own
+# counter to reset it.
 _MAX_KEYS = 100_000
 
 
@@ -43,6 +51,16 @@ def client_ip(request: Request) -> str:
     local dev, tests, or a future non-Caddy ingress). If the proxy topology ever
     changes (more than one hop, or Caddy gains ``trusted_proxies``), revisit which
     index is trustworthy — this is the security hinge of the whole module.
+
+    Why the trust precondition ("there really is one Caddy in front") is NOT
+    enforced here in code (cage-match #39, Carnot P2): it is enforced one layer
+    down, at the network boundary. The compose binds the gateway to
+    ``127.0.0.1:8095`` only, so it is unreachable off-host except through Caddy —
+    a client can never reach uvicorn directly to supply its own XFF. An app-level
+    "trust XFF only from a loopback peer" gate would be WRONG for this topology
+    anyway: behind the docker port-forward the in-container peer is the docker
+    bridge gateway IP, not loopback, so such a gate would discard XFF in prod and
+    collapse every client onto one shared key (a self-inflicted throttle).
     """
     xff = request.headers.get("x-forwarded-for")
     if xff:
@@ -56,8 +74,9 @@ class RateLimiter:
     """Fixed-window request counter keyed by (bucket, client-ip)."""
 
     def __init__(self) -> None:
-        # (bucket, ip) -> (window_start_monotonic, count)
-        self._windows: dict[tuple[str, str], tuple[float, int]] = {}
+        # (bucket, ip) -> (window_start_monotonic, count), in LRU order (oldest
+        # first). OrderedDict gives O(1) move-to-end + popitem(last=False).
+        self._windows: "OrderedDict[tuple[str, str], tuple[float, int]]" = OrderedDict()
 
     def reset(self) -> None:
         """Drop all state. Used by tests for per-test isolation."""
@@ -77,19 +96,15 @@ class RateLimiter:
             start, count = now, 0  # window elapsed — reset
         count += 1
         self._windows[key] = (start, count)
+        self._windows.move_to_end(key)  # mark most-recently-used
+        # Hard cap via O(1) LRU eviction — no scan. The active key was just moved to
+        # most-recently-used, so it is never the one evicted here.
+        while len(self._windows) > _MAX_KEYS:
+            self._windows.popitem(last=False)
         if count > limit:
             retry = int(window - (now - start)) + 1
             return False, max(retry, 1)
-        if len(self._windows) > _MAX_KEYS:
-            self._evict(now, window)
         return True, 0
-
-    def _evict(self, now: float, window: float) -> None:
-        """Drop windows that have fully elapsed (their next hit would reset anyway).
-        Opportunistic — only runs when the dict grows past the cap."""
-        stale = [k for k, (start, _) in self._windows.items() if now - start >= window]
-        for k in stale:
-            del self._windows[k]
 
 
 # Module-global limiter — one population per worker process.

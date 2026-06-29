@@ -46,16 +46,29 @@ def test_limiter_buckets_and_ips_are_independent():
     assert rl.hit("a", "ip2", 1, 1000)[0] is True   # different ip — own budget
 
 
-def test_limiter_evicts_expired_windows(monkeypatch):
+def test_limiter_hard_caps_keys_via_lru(monkeypatch):
+    # cage-match #39: the cap must be a HARD bound (O(1) LRU eviction), not an
+    # expired-only sweep that can grow without limit within a window.
+    monkeypatch.setattr("aiko_gateway.domain.rate_limit._MAX_KEYS", 3)
     rl = RateLimiter()
-    t = {"now": 0.0}
-    monkeypatch.setattr("aiko_gateway.domain.rate_limit.time.monotonic", lambda: t["now"])
-    monkeypatch.setattr("aiko_gateway.domain.rate_limit._MAX_KEYS", 2)
-    rl.hit("b", "ip1", 100, 60)
-    rl.hit("b", "ip2", 100, 60)
-    t["now"] += 61  # both windows now expired
-    rl.hit("b", "ip3", 100, 60)  # trips eviction (len > 2)
-    assert ("b", "ip1") not in rl._windows and ("b", "ip2") not in rl._windows
+    for i in range(10):
+        rl.hit("b", f"ip{i}", 100, 1000)  # all windows fresh — none "expired"
+    assert len(rl._windows) == 3  # never exceeds the cap
+    assert ("b", "ip9") in rl._windows  # most-recently-used survives
+    assert ("b", "ip0") not in rl._windows  # oldest evicted
+
+
+def test_active_key_never_evicted_under_spray(monkeypatch):
+    # An attacker spraying distinct IPs must not be able to evict (and thus reset)
+    # a key that is being actively hit — the active key is always most-recently-used.
+    monkeypatch.setattr("aiko_gateway.domain.rate_limit._MAX_KEYS", 3)
+    rl = RateLimiter()
+    rl.hit("b", "victim", 100, 1000)
+    for i in range(20):
+        rl.hit("b", f"spray{i}", 100, 1000)
+        rl.hit("b", "victim", 100, 1000)  # keep it warm
+    assert ("b", "victim") in rl._windows
+    assert len(rl._windows) == 3
 
 
 # ---- unit: client_ip (the security hinge) --------------------------------- #
