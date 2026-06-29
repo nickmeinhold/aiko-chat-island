@@ -327,6 +327,12 @@ class OAuthState(Base):
     nonce: Mapped[str] = mapped_column(String(64), primary_key=True)
     provider: Mapped[str] = mapped_column(String(64), nullable=False)
     code_verifier: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The APP's S256 challenge (cage-match #37): base64url(sha256(app_verifier)),
+    # supplied by the app at /start and carried into the handoff so /exchange can
+    # require the matching verifier. Binds the handoff to the originating app, so a
+    # custom-scheme-intercepted handoff code is unredeemable. Distinct from
+    # code_verifier (the gateway↔provider PKCE secret).
+    app_challenge: Mapped[str | None] = mapped_column(Text, nullable=True)
     expires_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False)
     consumed: Mapped[bool] = mapped_column(

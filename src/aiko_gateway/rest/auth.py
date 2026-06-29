@@ -23,7 +23,9 @@ from ..domain import (
 )
 from ..domain.models import User
 from ..domain.oauth import Provider, VerifiedIdentity
-from ..domain.pkce import make_pkce_pair
+from ..domain.pkce import (
+    is_valid_app_challenge, make_pkce_pair, verify_app_challenge,
+)
 from .deps import CurrentUser, DbSession
 
 router = APIRouter(prefix="/v1/auth", tags=["auth"])
@@ -309,7 +311,9 @@ def _provider_or_404(slug: str) -> oauth_broker.BrokerProvider:
 
 
 @router.get("/oauth/{provider}/start")
-async def oauth_start(provider: str, session: DbSession) -> RedirectResponse:
+async def oauth_start(
+    provider: str, session: DbSession, app_challenge: str | None = None,
+) -> RedirectResponse:
     """Begin the broker flow: mint a SERVER-SIDE single-use state nonce (storing
     the PKCE code_verifier server-side when supported), and 302 to the provider's
     authorize URL with ONLY the opaque nonce as `state`. 404 if the provider isn't
@@ -318,15 +322,30 @@ async def oauth_start(provider: str, session: DbSession) -> RedirectResponse:
     The `state` sent to the provider is the opaque nonce — NOT a signed token —
     so it carries no secret. For PKCE providers the code_verifier stays in the
     state row and ONLY the code_challenge crosses the wire; the verifier never
-    leaves the server (cage-match #30, Finding 1)."""
+    leaves the server (cage-match #30, Finding 1).
+
+    `app_challenge` is the APP's S256 challenge base64url(sha256(app_verifier))
+    (cage-match #37). REQUIRED and fail-closed: it binds the eventual handoff to
+    the originating app so a handoff code intercepted via a hijacked custom scheme
+    cannot be redeemed without the app-held verifier. The only legitimate caller
+    is the app, which always sends it; a missing/short value is a misuse → 400."""
     if not settings.social_signin_enabled:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "social sign-in is disabled")
     prov = _provider_or_404(provider)
+    # The app_challenge MUST be the exact shape of an S256 base64url digest (43
+    # url-safe chars). Validate at ingress (cage-match #37 r2, Carnot LOW) so a
+    # malformed / wrong-length / non-ASCII / non-b64url value is rejected here as a
+    # 400 rather than stored to fail as a later 401 (and so the store only ever
+    # holds well-formed challenges).
+    if not app_challenge or not is_valid_app_challenge(app_challenge):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, "missing or malformed app_challenge")
     code_verifier = code_challenge = None
     if prov.supports_pkce:
         code_verifier, code_challenge = make_pkce_pair()
     nonce = await state_service.create_state(
-        session, provider=prov.slug, code_verifier=code_verifier)
+        session, provider=prov.slug, code_verifier=code_verifier,
+        app_challenge=app_challenge)
     url = oauth_broker.build_authorize_url(
         prov, state=nonce, code_challenge=code_challenge)
     return RedirectResponse(url, status_code=302)
@@ -388,6 +407,16 @@ async def oauth_callback(
         return _app_callback_redirect(error="bad_state")
     if st["provider"] != prov.slug:
         return _app_callback_redirect(error="state_provider_mismatch")
+    # Fail CLOSED on a state with no app_challenge (cage-match #37 r2, Carnot
+    # MEDIUM). consume_state returns provider/code_verifier but the binding lives in
+    # the row's app_challenge; a missing one would mint a handoff redeemable WITHOUT
+    # a verifier (the verifierless legacy path at /exchange). /start now requires a
+    # valid challenge, so the only way to reach here challenge-less is a pre-binding
+    # in-flight state straddling the deploy — and GitHub sign-in is not live yet, so
+    # there are none to protect. Refusing here makes the binding invariant ABSOLUTE:
+    # no verifierless handoff is ever created.
+    if not st.get("app_challenge"):
+        return _app_callback_redirect(error="bad_state")
 
     # Exchange the code for a verified identity. Both failure classes resolve to a
     # graceful redirect-with-error for the BROWSER (never a raw status leak). The
@@ -418,12 +447,24 @@ async def oauth_callback(
             "suggested_name": identity.suggested_name,
             "email": identity.email,
         }
+    # Bind the handoff to the originating app (cage-match #37): carry the app's
+    # S256 challenge from the state row so /exchange can require the matching
+    # verifier. A handoff intercepted via a hijacked custom scheme is then
+    # unredeemable without the verifier (which never left the app).
+    payload["app_challenge"] = st.get("app_challenge")
     handoff_code = await handoff_service.create_handoff(session, payload)
     return _app_callback_redirect(code=handoff_code)
 
 
 class OAuthExchangeReq(BaseModel):
     code: str = Field(min_length=1)
+    # The app-held verifier whose S256 hash must match the handoff's app_challenge
+    # (cage-match #37). Optional in the type so a legacy/no-binding handoff still
+    # parses, but ENFORCED below whenever the handoff carries a challenge.
+    # max_length bounds the input that gets SHA-256'd at the boundary (cage-match
+    # #37 r2): a legit verifier is ~43 chars (b64url of 32 bytes); 128 is RFC 7636's
+    # PKCE verifier ceiling. Caps the hash-input DoS surface to a constant.
+    app_verifier: str | None = Field(default=None, max_length=128)
 
 
 @router.post("/oauth/exchange")
@@ -437,6 +478,29 @@ async def oauth_exchange(req: OAuthExchangeReq, session: DbSession) -> dict:
     if payload is None:
         raise HTTPException(
             status.HTTP_401_UNAUTHORIZED, "invalid or expired handoff code")
+    # App-binding gate (cage-match #37): the handoff is bound to an app challenge
+    # (every handoff is — /callback now fails closed without one), and the caller
+    # MUST present the matching verifier. A handoff code intercepted via a hijacked
+    # Android custom scheme is unredeemable here — the thief never had the verifier.
+    # The handoff is already consumed above (single-use), so a failed verify also
+    # burns the code, foreclosing a second guess. Same opaque 401 — never leak which
+    # check failed.
+    #
+    # SCOPE / known limitation (cage-match #37 r2, Carnot HIGH): this closes PASSIVE
+    # interception of a legitimately-app-started flow. It does NOT prove the handoff
+    # belongs to a trusted app — a MALICIOUS app that runs its OWN /start (its own
+    # challenge+verifier) and drives the user through the provider can redeem its own
+    # handoff. That is the app-AUTHENTICITY problem (the OS letting two apps claim
+    # aikochat://), addressed by verified app links / universal links / platform
+    # attestation — NOT by handoff binding, and not regressed by this PR. Tracked
+    # separately. The `if challenge:` guard stays as defense-in-depth even though
+    # /callback no longer mints a challenge-less handoff.
+    challenge = payload.get("app_challenge")
+    if challenge:
+        if not req.app_verifier or not verify_app_challenge(
+                req.app_verifier, challenge):
+            raise HTTPException(
+                status.HTTP_401_UNAUTHORIZED, "invalid or expired handoff code")
     # Kind-guard fails CLOSED (cage-match #30, Finding 4): a payload whose `kind`
     # isn't one we wrote is treated as invalid (401), never falling through to a
     # KeyError/500. We only ever write "authenticated"/"provisioning" server-side,

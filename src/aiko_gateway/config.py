@@ -113,7 +113,7 @@ class Settings(BaseSettings):
     # broker completes (carrying the handoff code, or an error indicator). This is
     # a FIXED config value — open-redirect defense: the final redirect target is
     # NEVER read from a request parameter, only from here.
-    app_oauth_callback_url: str = "https://chat.imagineering.cc/applink/auth"
+    app_oauth_callback_url: str = "aikochat://auth"
     # OAuth state token TTL (CSRF/integrity, the round-trip from /start to
     # /callback). Short — a human completing a provider consent screen.
     oauth_state_ttl_seconds: int = 10 * 60  # 10 min

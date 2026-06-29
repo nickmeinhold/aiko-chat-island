@@ -77,4 +77,11 @@ async def consume_handoff(session: AsyncSession, code: str) -> dict | None:
     await session.commit()
     if row is None:  # pragma: no cover — defensive; the UPDATE just matched it
         return None
-    return json.loads(row.payload)
+    # Fail CLOSED on a corrupted payload (cage-match #37 r2, Carnot LOW): we only
+    # ever write valid JSON server-side, so a JSONDecodeError means a corrupted row
+    # — treat it as an invalid handoff (caller -> 401) rather than a raw 500 on the
+    # auth surface. The code is already consumed above, so the bad row is spent.
+    try:
+        return json.loads(row.payload)
+    except json.JSONDecodeError:
+        return None
