@@ -962,8 +962,10 @@ async def test_exchange_non_ascii_verifier_fails_closed_401(client, session):
 
 
 async def test_exchange_non_ascii_stored_challenge_fails_closed_401(client, session):
-    """A non-ASCII stored app_challenge (an attacker can set it at /start, which only
-    length-gates) must 401, NOT 500 via TypeError in hmac.compare_digest."""
+    """A non-ASCII stored app_challenge must 401, NOT 500 via TypeError in
+    hmac.compare_digest. /start now SHAPE-gates (rejects non-b64url at ingress), so
+    this drives the handoff directly to prove verify_app_challenge's defense-in-depth
+    holds even if a malformed challenge reaches the row by any other path."""
     code = await handoff_service.create_handoff(session, {
         "kind": "provisioning", "provider": "github", "provider_sub": "gh-bound",
         "app_challenge": "café-" + "x" * 40})  # non-ASCII stored challenge
