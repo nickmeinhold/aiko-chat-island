@@ -41,6 +41,10 @@ from httpx import ASGITransport, AsyncClient
 @pytest_asyncio.fixture
 async def client(session, monkeypatch):
     """Router-only ASGI app with github configured + the test DB session."""
+    # Broker endpoints share the social-signin kill-switch (cage-match #30 r2):
+    # they 403 / list nothing when social_signin_enabled is False. The success
+    # paths below all require it ON.
+    monkeypatch.setattr(settings, "social_signin_enabled", True)
     monkeypatch.setattr(settings, "github_client_id", "gh-client-id")
     monkeypatch.setattr(settings, "github_client_secret", "gh-secret")
     monkeypatch.setattr(settings, "app_oauth_callback_url",
@@ -372,6 +376,24 @@ async def test_exchange_missing_kind_fails_closed_401(client, session):
     assert r.status_code == 401
 
 
+async def test_exchange_authenticated_missing_user_id_fails_closed_401(
+        client, session):
+    """COMPLETE KIND-GUARD (cage-match #30 r2): an 'authenticated' payload with no
+    user_id must 401, NOT KeyError/500 when indexing payload['user_id']."""
+    code = await handoff_service.create_handoff(session, {"kind": "authenticated"})
+    r = await client.post("/v1/auth/oauth/exchange", json={"code": code})
+    assert r.status_code == 401
+
+
+async def test_exchange_provisioning_missing_fields_fails_closed_401(
+        client, session):
+    """COMPLETE KIND-GUARD (cage-match #30 r2): a 'provisioning' payload missing
+    provider / provider_sub must 401, NOT fall through to indexing them."""
+    code = await handoff_service.create_handoff(session, {"kind": "provisioning"})
+    r = await client.post("/v1/auth/oauth/exchange", json={"code": code})
+    assert r.status_code == 401
+
+
 async def test_concurrent_handoff_redemption_exactly_one_wins(session):
     """SINGLE-USE under concurrency (cage-match #30, Finding 5): two SIMULTANEOUS
     redemptions of the same handoff code yield exactly one non-None payload.
@@ -428,6 +450,44 @@ async def test_providers_omits_unconfigured_broker(client, monkeypatch):
     monkeypatch.setattr(settings, "apple_client_ids", [])
     monkeypatch.setattr(settings, "google_client_ids", [])
     r = await client.get("/v1/auth/providers")
+    assert r.json()["providers"] == []
+
+
+# --------------------------------------------------------------------------- #
+# Kill-switch: broker endpoints honour settings.social_signin_enabled
+# (cage-match #30 r2 — uniform with the native /social gate)
+# --------------------------------------------------------------------------- #
+async def test_start_disabled_social_signin_403(client, monkeypatch):
+    monkeypatch.setattr(settings, "social_signin_enabled", False)
+    r = await client.get("/v1/auth/oauth/github/start")
+    assert r.status_code == 403
+
+
+async def test_callback_disabled_social_signin_403(client, monkeypatch, session):
+    """A disabled-flag callback is not a normal user path → a plain 403 (NOT a
+    redirect)."""
+    _mock_exchange(monkeypatch, identity=_IDENTITY)
+    state = await _mint_state(session)
+    monkeypatch.setattr(settings, "social_signin_enabled", False)
+    r = await client.get(
+        f"/v1/auth/oauth/github/callback?code=authcode&state={state}")
+    assert r.status_code == 403
+
+
+async def test_exchange_disabled_social_signin_403(client, monkeypatch, session):
+    code = await handoff_service.create_handoff(session, {
+        "kind": "provisioning", "provider": "github", "provider_sub": "gh-1",
+        "suggested_name": None, "email": None})
+    monkeypatch.setattr(settings, "social_signin_enabled", False)
+    r = await client.post("/v1/auth/oauth/exchange", json={"code": code})
+    assert r.status_code == 403
+
+
+async def test_providers_disabled_social_signin_empty(client, monkeypatch):
+    monkeypatch.setattr(settings, "apple_client_ids", ["apple-id"])
+    monkeypatch.setattr(settings, "social_signin_enabled", False)
+    r = await client.get("/v1/auth/providers")
+    assert r.status_code == 200
     assert r.json()["providers"] == []
 
 

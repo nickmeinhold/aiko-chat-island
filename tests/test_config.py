@@ -127,6 +127,25 @@ def test_dev_social_enabled_without_client_ids_boots():
     assert s.social_signin_enabled is True
 
 
+def test_prod_social_enabled_with_only_broker_boots():
+    # A broker-only deployment (cage-match #30 r2): social sign-in enabled in prod
+    # with NO native client IDs but a fully-configured broker provider (github id +
+    # secret) satisfies "at least one usable provider" — the broker IS the usable
+    # provider, so it must boot.
+    s = Settings(_env_file=None, environment="production",
+                 jwt_secret=_STRONG_SECRET, social_signin_enabled=True,
+                 github_client_id="gh-id", github_client_secret="gh-secret")
+    assert s.social_signin_enabled is True
+
+
+def test_prod_social_enabled_with_nothing_configured_raises():
+    # Social enabled in prod with NOTHING (no native IDs, no broker) is still a
+    # guaranteed-broken config — fail LOUD at boot (cage-match #30 r2).
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, environment="production",
+                 jwt_secret=_STRONG_SECRET, social_signin_enabled=True)
+
+
 # --- invariant 4: OAuth broker provider XOR config (#21) --------------------
 
 def test_prod_broker_id_without_secret_raises():

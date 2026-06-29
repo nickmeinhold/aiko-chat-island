@@ -152,15 +152,21 @@ class Settings(BaseSettings):
             # config: the verifier would reject every token (empty aud allowlist
             # = reject-all). Fail LOUD at boot rather than silently 401 every
             # real login — a prose "must configure client IDs" is not a guard.
+            broker_configured = bool(
+                self.github_client_id and self.github_client_secret)
             if self.social_signin_enabled and not (
                 self.apple_client_ids or self.google_client_ids
+                or broker_configured
             ):
                 raise ValueError(
-                    "social_signin_enabled is True in production but no "
-                    "apple_client_ids / google_client_ids are configured. The "
-                    "verifier would reject every token (empty audience allowlist "
-                    "= reject-all). Refusing to boot — supply at least one "
-                    "provider client ID."
+                    "social_signin_enabled is True in production but no usable "
+                    "provider is configured. Supply at least one of: "
+                    "apple_client_ids / google_client_ids (native ID-token flow), "
+                    "or a fully-configured broker provider (e.g. both "
+                    "GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET). With none, the "
+                    "native verifier would reject every token (empty audience "
+                    "allowlist = reject-all) and no broker provider would be "
+                    "offered. Refusing to boot."
                 )
             # Broker providers: a partial (XOR) config — only ONE of id/secret —
             # is a latent footgun. The provider would appear "almost configured"

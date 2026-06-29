@@ -241,6 +241,8 @@ async def oauth_start(provider: str, session: DbSession) -> RedirectResponse:
     so it carries no secret. For PKCE providers the code_verifier stays in the
     state row and ONLY the code_challenge crosses the wire; the verifier never
     leaves the server (cage-match #30, Finding 1)."""
+    if not settings.social_signin_enabled:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "social sign-in is disabled")
     prov = _provider_or_404(provider)
     code_verifier = code_challenge = None
     if prov.supports_pkce:
@@ -265,6 +267,11 @@ async def oauth_callback(
     settings.app_oauth_callback_url (a fixed config value). No request parameter
     — not `state`, not anything — influences WHERE we redirect; params only carry
     the handoff code or an error class."""
+    # Kill-switch: when social sign-in is administratively disabled the broker is
+    # off too (uniform with the native /social gate). A disabled-flag callback is
+    # not a normal user path, so a plain 403 is fine here (NOT a redirect).
+    if not settings.social_signin_enabled:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "social sign-in is disabled")
     # The provider/path is validated first so even an error-callback for an
     # unknown provider 404s rather than redirecting (a probe shouldn't bounce).
     prov = _provider_or_404(provider)
@@ -281,6 +288,13 @@ async def oauth_callback(
     # forged → bad_state. The provider stored in the row MUST match the path
     # provider (a nonce minted for provider A must not be used on provider B's
     # callback).
+    # At-most-once (cage-match #30 r2, DELIBERATE — not an atomicity bug): state is
+    # consumed before the external exchange (security: never exchange on an
+    # unvalidated state); a transient failure AFTER consume burns this one nonce —
+    # the user simply re-initiates /start for a fresh nonce. This is intentional
+    # at-most-once, not an atomicity bug. Service-commit convention (get_session
+    # does not commit); a single request txn would hold the state row-lock across
+    # the provider network call.
     st = await state_service.consume_state(session, state)
     if st is None:
         return _app_callback_redirect(error="bad_state")
@@ -329,6 +343,8 @@ async def oauth_exchange(req: OAuthExchangeReq, session: DbSession) -> dict:
     """Redeem a single-use handoff code for the final session JSON. Missing /
     expired / already-consumed → 401. The redemption is atomic (single-use, the
     double-spend guard lives in handoff_service.consume_handoff)."""
+    if not settings.social_signin_enabled:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "social sign-in is disabled")
     payload = await handoff_service.consume_handoff(session, req.code)
     if payload is None:
         raise HTTPException(
@@ -337,10 +353,23 @@ async def oauth_exchange(req: OAuthExchangeReq, session: DbSession) -> dict:
     # isn't one we wrote is treated as invalid (401), never falling through to a
     # KeyError/500. We only ever write "authenticated"/"provisioning" server-side,
     # so anything else is a corrupted/unexpected row.
-    if payload.get("kind") not in {"authenticated", "provisioning"}:
+    kind = payload.get("kind")
+    if kind not in {"authenticated", "provisioning"}:
         raise HTTPException(
             status.HTTP_401_UNAUTHORIZED, "invalid or expired handoff code")
-    if payload.get("kind") == "authenticated":
+    # Complete the kind-guard (cage-match #30 r2): validate the REQUIRED fields per
+    # kind BEFORE indexing, failing closed with 401 (not a KeyError/500) if absent.
+    # We only ever write complete payloads server-side, so a missing field is a
+    # corrupted/unexpected row — treat it like any other invalid handoff.
+    if kind == "authenticated":
+        if not payload.get("user_id"):
+            raise HTTPException(
+                status.HTTP_401_UNAUTHORIZED, "invalid or expired handoff code")
+    else:  # provisioning
+        if not payload.get("provider") or not payload.get("provider_sub"):
+            raise HTTPException(
+                status.HTTP_401_UNAUTHORIZED, "invalid or expired handoff code")
+    if kind == "authenticated":
         user_id = payload["user_id"]
         user = await users_service.get_by_id(session, user_id)
         if user is None:
@@ -370,7 +399,12 @@ async def list_providers() -> dict:
     Native providers (apple/google — kind:"native") are included when their
     client_ids are configured (the native flow needs no client secret). Broker
     providers (kind:"broker") are the configured server-side ones (both id +
-    secret set). Fail-closed: an unconfigured provider is simply absent."""
+    secret set). Fail-closed: an unconfigured provider is simply absent.
+
+    When social sign-in is administratively disabled, discovery shows nothing
+    (consistent with the native + broker gates returning 403 in that state)."""
+    if not settings.social_signin_enabled:
+        return {"providers": []}
     providers: list[dict] = []
     if settings.apple_client_ids:
         providers.append(
