@@ -67,6 +67,12 @@ services:
       # ('' when unset) keeps the config.py XOR boot-guard happy on a SOPS re-render.
       GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
       GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
+      # --- WebAuthn passkeys (#1471 / #29). The endpoints + .well-known deploy DARK
+      # (config.py passkey_enabled=False default); this passthrough is the knob that
+      # flips ADVERTISEMENT on (/providers lists passkey) AFTER device e2e. Default
+      # false here so a deploy without the override stays dark — set PASSKEY_ENABLED=true
+      # in the host .env to advertise. Public, not a secret (mirrors SOCIAL_SIGNIN_ENABLED).
+      PASSKEY_ENABLED: ${PASSKEY_ENABLED:-false}
     volumes:
       # Persist the SQLite store across container recreates.
       - aiko_gateway_data:/data
