@@ -60,6 +60,13 @@ services:
       SOCIAL_SIGNIN_ENABLED: ${SOCIAL_SIGNIN_ENABLED:-true}
       APPLE_CLIENT_IDS: ${APPLE_CLIENT_IDS:-["cc.imagineering.aikoChatApp"]}
       GOOGLE_CLIENT_IDS: ${GOOGLE_CLIENT_IDS:-["588100172166-a0r6ipvpju5rd6fh8lv85qqohpdosp33.apps.googleusercontent.com","588100172166-23ppgk6jdb3et2ehc1qj584c6rgs0c9j.apps.googleusercontent.com","588100172166-bagrmvftp3fcer2j2lvnh33j65g58elk.apps.googleusercontent.com"]}
+      # --- OAuth broker (#21). Unlike the native client IDs above, the broker does
+      # a CONFIDENTIAL authorization-code exchange, so GITHUB_CLIENT_SECRET is a REAL
+      # secret — NOT baked here. Both live ONLY in the host .env; absent → the broker
+      # provider is simply not listed (fail-closed), and the both-or-neither default
+      # ('' when unset) keeps the config.py XOR boot-guard happy on a SOPS re-render.
+      GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
+      GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
     volumes:
       # Persist the SQLite store across container recreates.
       - aiko_gateway_data:/data
