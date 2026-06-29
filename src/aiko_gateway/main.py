@@ -26,7 +26,7 @@ from .aiko.payload import InboundMessage
 if TYPE_CHECKING:
     from .aiko.client import AikoBusClient
 from .config import settings
-from .db import SessionLocal, init_models
+from .db import SessionLocal, verify_schema
 from .domain import channels_service, echo, messages_service, moderation_service
 from .realtime.hub import Hub
 
@@ -138,7 +138,10 @@ state = GatewayState()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     state.loop = asyncio.get_running_loop()
-    await init_models()
+    # Alembic (run by the container entrypoint before uvicorn) owns schema
+    # creation/evolution; here we only VERIFY the live schema is migrated +
+    # current, failing closed if not (#14).
+    await verify_schema()
     # No independent seeding: channels are reconciled from the ChatServer
     # `channel_list` EC share once the bus client discovers it. An inbound
     # message for a not-yet-reconciled channel is upserted by persist_inbound

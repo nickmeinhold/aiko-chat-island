@@ -43,6 +43,11 @@ dependencies = [
   # publish their signing keys at a well-known URL). Was DEV-only (the test ASGI
   # client) — promoted to MAIN because the OAuth verifier fetches JWKS at runtime.
   "httpx>=0.27",
+  # Schema migrations (#14). Alembic is the SOLE schema authority for real DBs:
+  # the container entrypoint runs `aiko_gateway.migrate` (upgrade head) before
+  # uvicorn. A MAIN (not dev) dep because it runs at every prod boot, not just
+  # in tests. env.py drives it over the async engine (aiosqlite/asyncpg).
+  "alembic>=1.13",
 ]
 
 [project.optional-dependencies]
