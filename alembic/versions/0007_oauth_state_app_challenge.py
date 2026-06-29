@@ -14,8 +14,8 @@ domain/models.py.
 Nullable: existing in-flight rows (if any) predate the column; the broker treats
 a row without a challenge as the legacy un-bound path. New flows always set it.
 
-Revision ID: 0006
-Revises: 0005
+Revision ID: 0007
+Revises: 0006
 Create Date: 2026-06-29
 """
 from __future__ import annotations
@@ -26,8 +26,8 @@ import sqlalchemy as sa
 from alembic import op
 
 # revision identifiers, used by Alembic.
-revision: str = "0006"
-down_revision: Union[str, None] = "0005"
+revision: str = "0007"
+down_revision: Union[str, None] = "0006"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

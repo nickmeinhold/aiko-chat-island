@@ -894,3 +894,41 @@ async def test_exchange_bound_handoff_wrong_verifier_burns_code(client, session)
     r2 = await client.post("/v1/auth/oauth/exchange",
                            json={"code": code, "app_verifier": _APP_VERIFIER})
     assert r2.status_code == 401
+
+
+def test_verify_app_challenge_total_on_non_ascii():
+    """verify_app_challenge must be TOTAL + fail-closed on non-ASCII either side
+    (cage-match #37 / the PR#32 hmac.compare_digest-on-str precedent): a non-ASCII
+    verifier (UnicodeEncodeError in .encode('ascii')) and a non-ASCII stored
+    challenge (TypeError in hmac.compare_digest) both return False, never raise.
+
+    RED-proof: revert verify_app_challenge to the bare `compare_digest(
+    app_challenge_for(verifier), challenge)` and the first assert raises
+    UnicodeEncodeError, the second raises TypeError."""
+    from aiko_gateway.domain.pkce import verify_app_challenge
+    assert verify_app_challenge("café-not-ascii-verifier", _APP_CHALLENGE) is False
+    assert verify_app_challenge(_APP_VERIFIER, "café-" + "x" * 40) is False
+    assert verify_app_challenge(_APP_VERIFIER, _APP_CHALLENGE) is True  # happy path intact
+
+
+async def test_exchange_non_ascii_verifier_fails_closed_401(client, session):
+    """A non-ASCII app_verifier on the wire must 401, NOT 500 via UnicodeEncodeError
+    in app_challenge_for (cage-match #37). The handoff is consumed first, so it also
+    fails closed — no token issued."""
+    code = await handoff_service.create_handoff(session, {
+        "kind": "provisioning", "provider": "github", "provider_sub": "gh-bound",
+        "app_challenge": _APP_CHALLENGE})
+    r = await client.post("/v1/auth/oauth/exchange",
+                          json={"code": code, "app_verifier": "café-verifier-not-ascii"})
+    assert r.status_code == 401, r.text
+
+
+async def test_exchange_non_ascii_stored_challenge_fails_closed_401(client, session):
+    """A non-ASCII stored app_challenge (an attacker can set it at /start, which only
+    length-gates) must 401, NOT 500 via TypeError in hmac.compare_digest."""
+    code = await handoff_service.create_handoff(session, {
+        "kind": "provisioning", "provider": "github", "provider_sub": "gh-bound",
+        "app_challenge": "café-" + "x" * 40})  # non-ASCII stored challenge
+    r = await client.post("/v1/auth/oauth/exchange",
+                          json={"code": code, "app_verifier": _APP_VERIFIER})
+    assert r.status_code == 401, r.text

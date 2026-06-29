@@ -33,8 +33,23 @@ def app_challenge_for(verifier: str) -> str:
 
 
 def verify_app_challenge(verifier: str, challenge: str) -> bool:
-    """Constant-time check that `verifier` hashes to the stored `challenge`."""
-    return hmac.compare_digest(app_challenge_for(verifier), challenge)
+    """Constant-time check that `verifier` hashes to the stored `challenge`.
+
+    TOTAL + fail-closed on malformed input (cage-match #37 / the PR#32 precedent):
+    both `verifier` (from the /exchange body) and `challenge` (stored from /start)
+    are attacker-influenced. A non-ASCII `verifier` would blow up `.encode("ascii")`
+    inside app_challenge_for, and a non-ASCII `challenge` would make hmac.compare_
+    digest raise TypeError — either an unhandled 500 on the auth path. Neither can
+    ever be a legitimate S256 base64url value, so we reject them as a non-match
+    rather than letting them raise. compare_digest then only ever sees two ASCII
+    strings (the secret comparison itself stays constant-time)."""
+    try:
+        computed = app_challenge_for(verifier)
+    except UnicodeEncodeError:
+        return False  # a non-ASCII verifier can't hash to an ASCII b64url challenge
+    if not challenge.isascii():
+        return False  # a non-ASCII challenge is not a valid S256 b64url digest
+    return hmac.compare_digest(computed, challenge)
 
 
 def make_pkce_pair() -> tuple[str, str]:
