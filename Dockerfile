@@ -9,7 +9,19 @@
 # nickmeinhold fork commit that puts username+timestamp on the wire (Change B,
 # == the contract #34 verified). It MUST match the bridge's AIKO_CHAT_REF
 # (matrix/aiko-bridge/Dockerfile). Bump both together, never one alone.
-FROM python:3.12-slim
+
+# Base image pinned by DIGEST, not just the floating `3.12-slim` tag (#3). The
+# deploy is a manual `docker compose up` that REBUILDS on the host (no registry/CI
+# to consume an immutable app artifact — #18), so the one floating upstream input
+# left was the base image: a rebuild months apart would otherwise pull a different
+# base silently. The digest makes every rebuild byte-reproducible. The tag is kept
+# alongside for human readability; the digest is what's resolved.
+#
+# TRADEOFF: this freezes base-OS security patches until a manual bump. Periodically
+# (or on a base CVE) re-resolve and bump BOTH the tag and digest together:
+#   docker buildx imagetools inspect python:3.12-slim   # -> Digest: sha256:...
+# Resolved 2026-06-29 (manifest-list digest, multi-arch).
+FROM python:3.12-slim@sha256:423ed6ab25b1921a477529254bfeeabf5855151dc2c3141699a1bfc852199fbf
 
 ARG AIKO_SERVICES_REF=a66424db76c5bf8f11adfed456cf3a135baf7494
 ARG AIKO_CHAT_REPO=https://github.com/nickmeinhold/aiko_chat.git
