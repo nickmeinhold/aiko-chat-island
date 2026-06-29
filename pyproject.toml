@@ -38,7 +38,9 @@ dependencies = [
   # RS256 token's structure on its own, but verifying the asymmetric signature
   # needs the `cryptography` backend (RSAAlgorithm.from_jwk + RS256 verify).
   # Was transitively present in local venvs (PyJWT[crypto]) but never declared.
-  "cryptography>=43.0",
+  # Floor raised to 46 by py_webauthn (#1471), which requires cryptography>=46;
+  # the JWKS RS256 path (RSAAlgorithm.from_jwk) is stable across the bump.
+  "cryptography>=46.0",
   # Social sign-in (#13): runtime async fetch of the provider JWKS (Apple/Google
   # publish their signing keys at a well-known URL). Was DEV-only (the test ASGI
   # client) — promoted to MAIN because the OAuth verifier fetches JWKS at runtime.

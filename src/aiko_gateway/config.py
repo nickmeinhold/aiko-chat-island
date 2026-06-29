@@ -121,6 +121,27 @@ class Settings(BaseSettings):
     # the app POSTing /exchange. Very short — a single immediate redemption.
     oauth_handoff_ttl_seconds: int = 2 * 60  # 2 min
 
+    # --- WebAuthn passkeys (#1471) ---
+    # Passwordless credential sign-in. Endpoints can deploy DARK; the feature stays
+    # invisible to the app until passkey_enabled flips the /providers advertisement
+    # on (the handoff's "deploy endpoints first, advertise last" rollout).
+    passkey_enabled: bool = False
+    # The Relying Party ID — the registrable domain the credential is scoped to.
+    # MUST equal the host the app presents; a credential is bound to this rp_id and
+    # unusable elsewhere. The web expected-origin is DERIVED from it (https://<id>).
+    passkey_rp_id: str = "chat.imagineering.cc"
+    passkey_rp_name: str = "Aiko Chat"
+    # EXTRA expected origins beyond the derived web origin. A native app does NOT
+    # present a single browser origin: iOS presents the web origin https://<rp_id>
+    # (derived, always allowed); Android (Credential Manager) presents an
+    # android:apk-key-hash:<base64url-sha256-of-Play-signing-cert> origin, which is
+    # unknown until Play App Signing is registered (app task #20) — so it is
+    # supplied HERE when known. Empty until then (iOS still works; Android blocked).
+    passkey_extra_origins: list[str] = []
+    # WebAuthn ceremony challenge TTL — the round-trip from start to finish (a user
+    # tapping their authenticator). Short, single-use.
+    passkey_challenge_ttl_seconds: int = 5 * 60  # 5 min
+
     # --- HTTP server ---
     host: str = "127.0.0.1"
     port: int = 8095
