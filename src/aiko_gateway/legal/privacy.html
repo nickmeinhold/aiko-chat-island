@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aiko Chat — Privacy Policy</title>
+<style>
+  :root { --fg:#1a1a1a; --muted:#666; --accent:#0b5; --rule:#e6e6e6; --bg:#fff; --code-bg:#f6f8fa; }
+  @media (prefers-color-scheme: dark) {
+    :root { --fg:#e8e8e8; --muted:#9aa; --accent:#3db886; --rule:#2a2a2a; --bg:#16181c; --code-bg:#1f2329; }
+  }
+  * { box-sizing:border-box; }
+  body { font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+         color:var(--fg); background:var(--bg); max-width:760px; margin:0 auto; padding:2.5rem 1.4rem 5rem; }
+  h1 { font-size:1.8rem; line-height:1.2; margin:0 0 .2rem; }
+  h2 { font-size:1.2rem; margin:2.2rem 0 .5rem; padding-top:1rem; border-top:1px solid var(--rule); }
+  .sub { color:var(--muted); font-size:.95rem; margin:0 0 1.4rem; }
+  .tldr { background:var(--code-bg); border-left:3px solid var(--accent); border-radius:0 8px 8px 0;
+          padding:1rem 1.1rem; margin:1.4rem 0; }
+  .tldr strong { display:block; margin-bottom:.3rem; }
+  nav.toc { font-size:.95rem; margin:1.2rem 0 2rem; }
+  nav.toc a { color:var(--accent); text-decoration:none; }
+  nav.toc a:hover { text-decoration:underline; }
+  ul { padding-left:1.3rem; } li { margin:.3rem 0; }
+  table { border-collapse:collapse; width:100%; margin:1rem 0; font-size:.92rem; }
+  th,td { text-align:left; padding:.5rem .6rem; border-bottom:1px solid var(--rule); vertical-align:top; }
+  th { font-weight:600; }
+  code { font:13px ui-monospace,SFMono-Regular,Menlo,monospace; background:var(--code-bg); padding:.1em .35em; border-radius:4px; }
+  .note { color:var(--muted); font-size:.9rem; }
+  a { color:var(--accent); }
+</style>
+</head>
+<body>
+
+<h1>Aiko Chat — Privacy Policy</h1>
+<p class="sub">Last updated: 29 June 2026</p>
+
+<div class="tldr">
+<strong>The short version</strong>
+Aiko Chat stores your account (a username and display name, optionally an email) and the messages you send, so we can deliver them to the people you chat with. We do <em>not</em> use analytics or advertising SDKs, do <em>not</em> track your location, contacts, or device, and do <em>not</em> sell or share your data. Messages are <em>not</em> end-to-end encrypted. You can delete your account from the app at any time.
+</div>
+
+<nav class="toc">
+<strong>Contents</strong><br>
+<a href="#who">1. Who we are</a> ·
+<a href="#collect">2. What we collect</a> ·
+<a href="#dontcollect">3. What we do not collect</a> ·
+<a href="#use">4. How we use it</a> ·
+<a href="#sharing">5. Sharing &amp; third parties</a> ·
+<a href="#security">6. Security &amp; encryption</a> ·
+<a href="#retention">7. Retention &amp; deletion</a> ·
+<a href="#rights">8. Your choices</a> ·
+<a href="#children">9. Children</a> ·
+<a href="#changes">10. Changes</a> ·
+<a href="#contact">11. Contact</a>
+</nav>
+
+<h2 id="who">1. Who we are</h2>
+<p>Aiko Chat is a text messaging app. This policy explains what information the app and its server (the "gateway", hosted at <code>chat.imagineering.cc</code>) collect when you use Aiko Chat, and what we do with it.</p>
+
+<h2 id="collect">2. What we collect</h2>
+<p>We collect only what we need to run a chat service:</p>
+<table>
+<thead><tr><th>Data</th><th>When</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td><strong>Username</strong> and <strong>display name</strong></td><td>When you create an account</td><td>To identify you to the people you chat with</td></tr>
+<tr><td><strong>Password</strong> (stored only as a salted <code>argon2id</code> hash, never in plain text)</td><td>If you sign up with a username and password</td><td>To sign you in securely</td></tr>
+<tr><td><strong>Email address</strong> (optional)</td><td>If you sign in with Apple or Google and the provider shares it</td><td>Account recovery and identification; it is optional and may be blank</td></tr>
+<tr><td><strong>Apple / Google account identifier</strong> (the provider's subject ID)</td><td>If you use social sign-in</td><td>To recognise you on return without storing a password</td></tr>
+<tr><td><strong>Messages you send</strong> (the text, plus who sent it, which channel, timestamp, and reply links)</td><td>Whenever you send a message</td><td>To deliver and display your conversations</td></tr>
+<tr><td><strong>Blocks and reports</strong> (who you blocked; messages you reported and the reason)</td><td>When you block a user or report a message</td><td>To enforce our Community Guidelines and act on objectionable content</td></tr>
+</tbody>
+</table>
+<p class="note">Your acceptance of our Terms is recorded on your device only (it is not sent to our server).</p>
+
+<h2 id="dontcollect">3. What we do not collect</h2>
+<p>For clarity, Aiko Chat does <strong>not</strong> collect any of the following:</p>
+<ul>
+<li>No advertising identifiers (IDFA / GAID) and no advertising or marketing SDKs</li>
+<li>No analytics, crash-reporting, or behavioural-tracking SDKs (e.g. no Firebase, Sentry, Google Analytics)</li>
+<li>No location data</li>
+<li>No access to your contacts or address book</li>
+<li>No access to your camera, microphone, or photos (Aiko Chat is text only)</li>
+<li>No device fingerprinting or hardware identifiers</li>
+<li>No IP-address logging for tracking purposes</li>
+<li>No push-notification device tokens (the app does not yet send push notifications)</li>
+</ul>
+
+<h2 id="use">4. How we use your information</h2>
+<p>We use the information above only to:</p>
+<ul>
+<li>Operate the service — sign you in, deliver your messages, and show your conversations;</li>
+<li>Keep the service safe — enforce our <a href="/terms">Terms of Use &amp; Community Guidelines</a>, act on reports of objectionable content, and honour blocks;</li>
+<li>Maintain and debug the service.</li>
+</ul>
+<p>We do not use your messages or account for advertising, profiling, or sale to third parties.</p>
+
+<h2 id="sharing">5. Sharing &amp; third parties</h2>
+<p>We do not sell or share your personal data. The only external interaction is sign-in verification: when you use Apple or Google sign-in, we fetch Apple's and Google's public verification keys to confirm your sign-in token is genuine. This is a read-only key check — <strong>no personal data is sent to Apple or Google by us</strong> in that step. Your messages are shared only with the other participants of the channels you post in.</p>
+
+<h2 id="security">6. Security &amp; encryption</h2>
+<ul>
+<li>All traffic between the app and our server is encrypted in transit using HTTPS / secure WebSockets (TLS).</li>
+<li>Passwords are stored only as salted <code>argon2id</code> hashes; we never store or see your plain-text password.</li>
+<li>Sign-in tokens are stored in your device's secure storage (Keychain on iOS, Keystore on Android).</li>
+<li><strong>Messages are not end-to-end encrypted.</strong> They are stored on our server and cached on your device in unencrypted form, so we are technically able to access message content (for example, to act on a report). Please keep this in mind and do not send highly sensitive information.</li>
+</ul>
+
+<h2 id="retention">7. Retention &amp; deletion</h2>
+<p>We keep your account and messages until you delete them. We do not run automatic expiry. You can delete your account at any time from <strong>Settings → Delete account</strong> in the app. When you delete your account:</p>
+<ul>
+<li>Your account identity (username, display name, email, password hash, and linked Apple/Google identifiers) is permanently deleted;</li>
+<li>The messages you sent are <strong>kept but anonymised</strong> — your name is removed and they are relabelled "[deleted user]" so the conversation other people saw stays intact, but the messages no longer link to you;</li>
+<li>Blocks you created are deleted; reports you filed are kept but anonymised so our safety records remain auditable.</li>
+</ul>
+
+<h2 id="rights">8. Your choices</h2>
+<ul>
+<li><strong>Access &amp; deletion</strong> — you can delete your account and its identity from the app at any time (see above).</li>
+<li><strong>Blocking &amp; reporting</strong> — you can block any user and report any message from within the app.</li>
+<li>If you have questions about your data, contact us (below).</li>
+</ul>
+
+<h2 id="children">9. Children</h2>
+<p>Aiko Chat is not directed to children under 13 (or the minimum age of digital consent in your country, if higher). We do not knowingly collect personal information from children under that age.</p>
+
+<h2 id="changes">10. Changes to this policy</h2>
+<p>We may update this policy from time to time. When we make a material change, we will update the "Last updated" date above and, where appropriate, notify you in the app.</p>
+
+<h2 id="contact">11. Contact</h2>
+<p>Questions about this policy or your data can be sent to the support contact listed on the app's App Store / Google Play listing.</p>
+
+<p class="note" style="margin-top:2.5rem">See also: <a href="/terms">Terms of Use &amp; Community Guidelines</a>.</p>
+
+</body>
+</html>

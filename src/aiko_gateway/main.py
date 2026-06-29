@@ -175,6 +175,7 @@ app.state.gw = state  # the WS endpoint reaches bus + hub via websocket.app.stat
 
 from .rest import auth as auth_routes  # noqa: E402
 from .rest import channels as channel_routes  # noqa: E402
+from .rest import legal as legal_routes  # noqa: E402
 from .rest import members as member_routes  # noqa: E402
 from .rest import messages as message_routes  # noqa: E402
 from .rest import moderation as moderation_routes  # noqa: E402
@@ -182,6 +183,7 @@ from .realtime import ws as ws_routes  # noqa: E402
 app.include_router(auth_routes.router)
 app.include_router(auth_routes.me_router)
 app.include_router(channel_routes.router)
+app.include_router(legal_routes.router)
 app.include_router(member_routes.router)
 app.include_router(message_routes.router)
 app.include_router(moderation_routes.router)
