@@ -24,33 +24,17 @@ hiding can't drift from the read path.
 """
 from __future__ import annotations
 
-import enum
-
 from sqlalchemy import exists, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from . import acl
 from .ids import new_ulid
-from .models import Channel, Membership, User
-
-
-class Role(enum.StrEnum):
-    """Closed set of membership roles. StrEnum (3.12) so the value IS the string
-    stored in the DB column — the persistence layer is unchanged, but the type
-    is now closed at the boundary instead of a free String (cage-match PR#10:
-    Kelvin + Carnot both flagged the stringly-typed closed set)."""
-
-    ADMIN = "admin"
-    MEMBER = "member"
-
-
-class JoinPolicy(enum.StrEnum):
-    """Closed set of private-channel self-join policies (see Channel.join_policy).
-    'invite_only' = admin-add only; 'open' = any authed user may self-join."""
-
-    INVITE_ONLY = "invite_only"
-    OPEN = "open"
+# Role / JoinPolicy are defined in models.py (the persistence layer) so the closed
+# set is the single source of truth for the column default AND the DB CHECK
+# constraint (#11). Re-exported here so the long-standing `memberships_service.Role`
+# / `.JoinPolicy` call sites (rest/members.py, tests) are unchanged.
+from .models import Channel, JoinPolicy, Membership, Role, User  # noqa: F401
 
 
 # Back-compat string aliases — the model defaults and existing call sites use

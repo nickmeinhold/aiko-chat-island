@@ -121,7 +121,11 @@ def test_adopt_pre_alembic_db_stamps_baseline(tmp_path, monkeypatch) -> None:
 
     assert "alembic_version" in tables
     assert _MODEL_TABLES <= tables
-    assert version == migrate.BASELINE_REVISION
+    # Adoption stamps the baseline THEN upgrades, so an adopted DB ends at HEAD
+    # (not merely baseline) — it is both claimed-as-managed and brought current.
+    from alembic.script import ScriptDirectory
+    head = ScriptDirectory.from_config(migrate._alembic_config()).get_current_head()
+    assert version == head
 
 
 def test_adopt_refuses_to_stamp_a_mismatched_db(tmp_path, monkeypatch) -> None:

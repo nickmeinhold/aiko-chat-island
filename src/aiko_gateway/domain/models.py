@@ -9,8 +9,11 @@ alembic revision).
 from __future__ import annotations
 
 import datetime as dt
+import enum
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text, UniqueConstraint
+from sqlalchemy import (
+    Boolean, CheckConstraint, DateTime, ForeignKey, String, Text, UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from ..db import Base
@@ -19,6 +22,32 @@ from .ids import new_ulid
 
 def _utcnow() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
+
+
+class Role(enum.StrEnum):
+    """Closed set of membership roles. StrEnum (3.12) so the value IS the string
+    stored in the column. Defined here (the persistence layer) so it is the single
+    source of truth for BOTH the column default and the DB CHECK constraint below;
+    re-exported from memberships_service for the call sites (cage-match PR#10/#23)."""
+
+    ADMIN = "admin"
+    MEMBER = "member"
+
+
+class JoinPolicy(enum.StrEnum):
+    """Closed set of private-channel self-join policies (see Channel.join_policy).
+    'invite_only' = admin-add only; 'open' = any authed user may self-join."""
+
+    INVITE_ONLY = "invite_only"
+    OPEN = "open"
+
+
+def _in_check(column: str, values: type[enum.StrEnum]) -> str:
+    """SQL `column IN ('a', 'b')` derived FROM the enum members, so the DB CHECK
+    can never drift from the Python closed set — change the enum, the constraint
+    follows (#11)."""
+    rendered = ", ".join(f"'{m.value}'" for m in values)
+    return f"{column} IN ({rendered})"
 
 
 class User(Base):
@@ -62,6 +91,13 @@ class SocialIdentity(Base):
 
 class Channel(Base):
     __tablename__ = "channels"
+    # DB-level closed-set enforcement beyond the API boundary (#11): even a direct
+    # SQL write (a migration, a repl, a future bug bypassing the service clamp)
+    # cannot store an out-of-set join_policy.
+    __table_args__ = (
+        CheckConstraint(_in_check("join_policy", JoinPolicy),
+                        name="ck_channels_join_policy"),
+    )
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=new_ulid)
     name: Mapped[str] = mapped_column(String(128), nullable=False)
     # 'standard' | 'llm' | 'robot' | 'dm' — maps to an aiko recipient string.
@@ -83,6 +119,10 @@ class Channel(Base):
 
 class Membership(Base):
     __tablename__ = "memberships"
+    # DB-level role closed-set enforcement beyond the API boundary (#11).
+    __table_args__ = (
+        CheckConstraint(_in_check("role", Role), name="ck_memberships_role"),
+    )
     channel_id: Mapped[str] = mapped_column(ForeignKey("channels.id"), primary_key=True)
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), primary_key=True)
     role: Mapped[str] = mapped_column(String(16), nullable=False, default="member")  # member|admin
