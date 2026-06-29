@@ -267,7 +267,7 @@ class _FakeBus:
 
 
 class _FakeHub:
-    async def fanout(self, channel_id, frame) -> None:
+    async def fanout(self, channel_id, frame, exclude_user_ids=frozenset()) -> None:
         pass
 
 
@@ -349,3 +349,53 @@ async def test_send_to_private_member_without_can_post_is_forbidden(session, mon
     assert errors and errors[0]["code"] == "forbidden"
     rows = await messages_service.get_history(session, priv.id, muted.id, limit=10)
     assert rows == []
+
+
+async def test_send_to_public_member_without_can_post_is_forbidden(session, monkeypatch):
+    """A public-channel mute (Membership.can_post=False) is enforced through the
+    REAL WS send path, not just acl.can_post() in isolation.
+
+    This is the PUBLIC branch of can_post (`m is None or m.can_post`) — distinct
+    from the private branch already covered by the test above. The unit test
+    (test_can_post_public_member_with_can_post_false_is_forbidden) asserts the
+    predicate; this asserts the wired effect: the `forbidden` envelope fires and
+    nothing is persisted.
+    """
+    import aiko_gateway.realtime.ws as ws_mod
+    monkeypatch.setattr(ws_mod, "SessionLocal", lambda: _StubSessionLocal(session))
+    pub = await _public_channel(session, cid=0, name="general")
+    muted = await _user(session, "muted")
+    await _join(session, pub, muted, can_post=False)
+    conn = _RecordingConn(muted.id)
+    await _handle_send(_FakeGw(), conn, muted, {
+        "type": "send", "channel_id": pub.id, "body": "muted on public",
+        "client_msg_id": "c1", "reply_to": None,
+    })
+    errors = [f for f in conn.sent if f["type"] == "error"]
+    assert errors and errors[0]["code"] == "forbidden"
+    rows = await messages_service.get_history(session, pub.id, muted.id, limit=10)
+    assert rows == []
+
+
+async def test_send_to_public_member_with_can_post_is_persisted(session, monkeypatch):
+    """Positive control for the mute test above: a public member with
+    can_post=True is NOT muted — the send acks and persists.
+
+    Without this, the forbidden test could pass for the wrong reason (the public
+    post path broken-closed for everyone). The pair proves the gate discriminates
+    on the can_post flag, not that it blanket-denies.
+    """
+    import aiko_gateway.realtime.ws as ws_mod
+    monkeypatch.setattr(ws_mod, "SessionLocal", lambda: _StubSessionLocal(session))
+    pub = await _public_channel(session, cid=0, name="general")
+    speaker = await _user(session, "speaker")
+    await _join(session, pub, speaker, can_post=True)
+    conn = _RecordingConn(speaker.id)
+    await _handle_send(_FakeGw(), conn, speaker, {
+        "type": "send", "channel_id": pub.id, "body": "hello world",
+        "client_msg_id": "c1", "reply_to": None,
+    })
+    assert not [f for f in conn.sent if f["type"] == "error"]
+    assert [f for f in conn.sent if f["type"] == "ack"]
+    rows = await messages_service.get_history(session, pub.id, speaker.id, limit=10)
+    assert [r.body for r in rows] == ["hello world"]
