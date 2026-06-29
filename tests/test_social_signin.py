@@ -310,3 +310,59 @@ async def test_oversized_nonce_rejected_at_boundary_422(client, monkeypatch):
                           json={"provider": "google", "id_token": "x",
                                 "nonce": "z" * 65})
     assert r.status_code == 422, r.text
+
+
+# --- #24: nonce consume is atomic with the sign-in outcome ------------------- #
+
+async def test_resolve_failure_after_consume_does_not_burn_nonce(
+        client, monkeypatch, session):
+    """#24: a transient failure in the OUTCOME (_resolve_identity) AFTER the nonce
+    is claimed must NOT burn it. The claim commits only once the outcome succeeds,
+    so the failed request rolls back the claim and the app retries the SAME nonce.
+    Pre-#24 consume committed eagerly and a post-consume failure stranded the user.
+
+    RED-proof: restore the eager commit in consume_nonce and the retry gets 401."""
+    monkeypatch.setattr(settings, "social_nonce_required", True)
+    _mock_verify(monkeypatch, identity=_IDENTITY)
+    nonce = (await client.post("/v1/auth/nonce")).json()["nonce"]
+    body = {"provider": "google", "id_token": "x", "nonce": nonce}
+
+    calls = {"n": 0}
+    real = users_service.get_user_by_social
+
+    async def _flaky(sess, provider, sub):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("transient DB-read outage during sign-in")
+        return await real(sess, provider, sub)
+
+    monkeypatch.setattr(auth_routes.users_service, "get_user_by_social", _flaky)
+
+    with pytest.raises(RuntimeError):
+        await client.post("/v1/auth/social", json=body)
+    # The failed request's session rolls back on the unhandled exception (prod uses
+    # a fresh `async with SessionLocal()` per request). The test shares one session,
+    # so model that request-end rollback explicitly.
+    await session.rollback()
+
+    r2 = await client.post("/v1/auth/social", json=body)
+    assert r2.status_code == 200, r2.text          # same nonce still works → not burned
+
+
+async def test_successful_signin_commits_nonce_burn(client, monkeypatch, session):
+    """The success path must COMMIT the burn, not just claim it: otherwise prod's
+    per-request session would roll the burn back at request end and a replay would
+    succeed. We model request-end by rolling back AFTER a successful sign-in; the
+    committed burn must survive it, so the replay still fails.
+
+    RED-proof: drop the handler's `await session.commit()` and the replay gets 200
+    (the un-committed burn is undone by the rollback)."""
+    monkeypatch.setattr(settings, "social_nonce_required", True)
+    _mock_verify(monkeypatch, identity=_IDENTITY)
+    nonce = (await client.post("/v1/auth/nonce")).json()["nonce"]
+    body = {"provider": "google", "id_token": "x", "nonce": nonce}
+    first = await client.post("/v1/auth/social", json=body)
+    assert first.status_code == 200, first.text
+    await session.rollback()                       # un-burns ONLY if it wasn't committed
+    replay = await client.post("/v1/auth/social", json=body)
+    assert replay.status_code == 401, replay.text  # committed burn survives → replay closed
