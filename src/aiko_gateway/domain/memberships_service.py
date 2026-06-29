@@ -86,22 +86,34 @@ async def _delete_membership_unless_last_admin(
     session: AsyncSession, *, channel_id: str, user_id: str, is_admin: bool
 ) -> bool:
     """Delete (channel_id, user_id)'s membership, REFUSING to remove the channel's
-    last admin — the count check and the delete are ONE atomic statement, so there
-    is no TOCTOU window. Returns True if the row was deleted, False if the delete
-    was refused (the row was the last admin).
+    last admin. Returns True if the membership is now GONE (deleted here, OR already
+    removed by a concurrent caller — idempotent), False ONLY if refused because it
+    is the last admin (still present).
 
-    This replaces the earlier ``SELECT ... FOR UPDATE`` last-admin guard (PR#10),
-    which was correct on Postgres but a NO-OP on the PROD engine — file-backed
-    SQLite has no row locks, so two concurrent admin-leaves both read count==2 and
-    both delete, orphaning the channel with ZERO admins (measured, #12). A
-    conditional DELETE re-evaluates the admin count *inside the same atomic
-    statement* under SQLite's write lock, so a concurrent leave sees the
-    post-commit count and is refused. Dialect-agnostic — correct on SQLite AND
-    Postgres, no FOR UPDATE / BEGIN IMMEDIATE needed.
+    Correct on BOTH engines, by TWO complementary mechanisms — each covers the
+    other's blind spot, so neither alone is enough:
 
-    (busy_timeout on the SQLite engine, see db.py, makes the concurrent writer
-    WAIT for the lock rather than getting SQLITE_BUSY, so the loser gets a clean
-    LastAdmin instead of a 500.)"""
+    * **Postgres**: ``SELECT ... FOR UPDATE`` locks the admin SET, serialising two
+      concurrent admin-removals — the second blocks, then re-reads the post-commit
+      count. A conditional DELETE alone does NOT suffice under READ COMMITTED: two
+      DELETEs of DIFFERENT admin rows don't conflict, each subquery sees count==2,
+      both commit -> 0 admins (Carnot cage-match, PR#29).
+    * **SQLite** (the prod engine, #1281): FOR UPDATE is a NO-OP (no row locks), so
+      the single-writer lock serialises the writes and the conditional
+      ``admins_remaining > 1`` predicate re-evaluates the count INSIDE the atomic
+      statement under that lock — the second leave sees count==1, deletes 0 rows.
+      FOR UPDATE alone was inert here — the measured orphan bug #12 fixed.
+
+    busy_timeout (db.py) makes the SQLite loser WAIT for the lock rather than
+    SQLITE_BUSY, so it gets a clean LastAdmin instead of a 500."""
+    if is_admin:
+        # Lock the admin set so a concurrent admin-removal serialises on Postgres
+        # (no-op on SQLite, where the single-writer lock + conditional DELETE do it).
+        await session.execute(
+            select(Membership.user_id)
+            .where(Membership.channel_id == channel_id, Membership.role == Role.ADMIN)
+            .with_for_update()
+        )
     stmt = delete(Membership).where(
         Membership.channel_id == channel_id, Membership.user_id == user_id
     )
@@ -112,12 +124,21 @@ async def _delete_membership_unless_last_admin(
             .where(Membership.channel_id == channel_id, Membership.role == Role.ADMIN)
             .scalar_subquery()
         )
-        # Delete an admin row only while MORE THAN ONE admin exists. Evaluated
-        # atomically with the delete — the closed TOCTOU.
+        # Delete an admin row only while MORE THAN ONE admin exists — re-evaluated
+        # atomically with the delete (the closed TOCTOU on SQLite).
         stmt = stmt.where(admins_remaining > 1)
     result = await session.execute(stmt)
+    if result.rowcount > 0:
+        await session.commit()
+        return True
+    # 0 rows: EITHER the last-admin clause blocked it, OR the row was concurrently
+    # removed by another caller (e.g. an admin removing the same target we're
+    # leaving). Disambiguate — a row that's simply already gone must NOT be reported
+    # as a spurious LastAdmin (Kelvin + Carnot cage-match, PR#29). Only a row still
+    # present (blocked by the count clause) is a genuine last-admin refusal.
+    gone = (await _membership(session, channel_id, user_id)) is None
     await session.commit()
-    return result.rowcount > 0
+    return gone
 
 
 async def _insert_idempotent(

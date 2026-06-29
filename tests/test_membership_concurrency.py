@@ -42,8 +42,8 @@ pytestmark = pytest.mark.asyncio
 @pytest_asyncio.fixture
 async def file_sessionmaker(tmp_path):
     """A sessionmaker over a real file-backed SQLite engine built by the PROD path
-    (db.make_engine -> busy_timeout + WAL). Each session() is a SEPARATE connection
-    from the pool, so two of them genuinely contend — unlike the in-memory
+    (db.make_engine -> busy_timeout). Each session() is a SEPARATE connection from
+    the pool, so two of them genuinely contend — unlike the in-memory
     single-connection conftest engine."""
     engine = make_engine(f"sqlite+aiosqlite:///{tmp_path}/concurrency.db")
     async with engine.begin() as conn:
@@ -150,6 +150,59 @@ async def test_concurrent_admin_removals_keep_exactly_one_admin(file_sessionmake
     results = sorted(await asyncio.gather(remove(aid, bid), remove(bid, aid)))
     assert await _admin_count(sm, cid) == 1, "channel must never be orphaned"
     assert results == ["LastAdmin", "removed"]
+
+
+async def test_concurrent_removal_of_same_admin_is_idempotent_not_lastadmin(
+    file_sessionmaker, monkeypatch
+):
+    """When two admins concurrently remove the SAME third admin (3-admin channel),
+    one delete wins and the other matches 0 rows — but that 0 means "already gone",
+    NOT "last admin". The loser must get idempotent SUCCESS, never a spurious
+    LastAdmin (Kelvin + Carnot cage-match, PR#29: rowcount==0 was ambiguous).
+
+    The target (carnot) is removed exactly once, TWO admins remain, and neither
+    caller sees LastAdmin — there were always >=2 other admins, so 'last admin'
+    would be a lie."""
+    sm = file_sessionmaker
+    async with sm() as s:
+        ch = Channel(id="0" * 26, name="c", kind="standard", aiko_channel="c",
+                     is_private=True)
+        s.add(ch)
+        alice = await users_service.create_user(s, username="alice", display_name="A", password="pw")
+        bob = await users_service.create_user(s, username="bob", display_name="B", password="pw")
+        carnot = await users_service.create_user(s, username="carnot", display_name="C", password="pw")
+        for u in (alice, bob, carnot):
+            s.add(Membership(channel_id=ch.id, user_id=u.id, role=Role.ADMIN))
+        await s.commit()
+        cid, aid, bid, carid = ch.id, alice.id, bob.id, carnot.id
+
+    real = ms._delete_membership_unless_last_admin
+    barrier = asyncio.Barrier(2)
+
+    async def patched(session, **kw):
+        try:
+            await asyncio.wait_for(barrier.wait(), timeout=5)
+        except (asyncio.TimeoutError, asyncio.BrokenBarrierError):
+            pass
+        return await real(session, **kw)
+
+    monkeypatch.setattr(ms, "_delete_membership_unless_last_admin", patched)
+
+    async def remove_carnot(actor):
+        try:
+            async with sm() as s:
+                await ms.remove_member(s, channel_id=cid, actor_id=actor, target_user_id=carid)
+            return "removed"
+        except ms.LastAdmin:
+            return "LastAdmin"
+        except ms.NotAMember:
+            return "NotAMember"
+
+    results = sorted(await asyncio.gather(remove_carnot(aid), remove_carnot(bid)))
+    # carnot gone, alice+bob remain; the loser saw "already gone" -> idempotent success.
+    assert await _admin_count(sm, cid) == 2
+    assert "LastAdmin" not in results, (
+        f"removing a non-last admin must never report LastAdmin — got {results}")
 
 
 async def test_sqlite_engine_applies_busy_timeout(tmp_path):
