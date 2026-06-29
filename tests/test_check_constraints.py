@@ -79,6 +79,34 @@ def test_join_policy_check_rejects_out_of_set(tmp_path, monkeypatch):
         engine.dispose()
 
 
+_INSERT_CHALLENGE = (
+    "INSERT INTO passkey_challenges (state, operation, expires_at, consumed, "
+    "created_at) VALUES (:state, :op, '" + _TS + "', 0, '" + _TS + "')"
+)
+
+
+def test_passkey_operation_check_rejects_out_of_set(tmp_path, monkeypatch):
+    """passkey_challenges.operation is a closed set (register|authenticate) enforced
+    by a DB CHECK (#1471) — the same defense-beyond-the-API pattern as role/
+    join_policy. A DISTINCT `state` PK per insert so a failure can ONLY be the
+    operation CHECK, never a PK collision (the test-green-for-the-wrong-reason
+    trap, Carnot PR#24)."""
+    engine = _fresh_at_head(tmp_path, monkeypatch)
+    try:
+        with engine.begin() as c:
+            c.execute(text(_INSERT_CHALLENGE), {"state": "s1", "op": "register"})  # valid
+            c.execute(text(_INSERT_CHALLENGE),
+                      {"state": "s2", "op": "authenticate"})  # valid
+        with pytest.raises(IntegrityError) as exc:
+            with engine.begin() as c:
+                c.execute(text(_INSERT_CHALLENGE), {"state": "s3", "op": "bogus"})
+        # Named-constraint assertion: prove it was the operation CHECK that fired,
+        # not some incidental violation.
+        assert "ck_passkey_challenges_operation" in str(exc.value)
+    finally:
+        engine.dispose()
+
+
 def test_upgrade_0001_to_0002_preserves_data_structure_and_applies_check(
         tmp_path, monkeypatch):
     """The evolution path: a DB at 0001 with data, upgraded one step to 0002.

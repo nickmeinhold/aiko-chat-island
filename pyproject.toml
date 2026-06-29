@@ -43,6 +43,12 @@ dependencies = [
   # publish their signing keys at a well-known URL). Was DEV-only (the test ASGI
   # client) — promoted to MAIN because the OAuth verifier fetches JWKS at runtime.
   "httpx>=0.27",
+  # WebAuthn passkeys (#1471): py_webauthn (Duo) generates registration/
+  # authentication options and verifies attestation/assertion responses against
+  # the stored COSE public key + sign_count. A MAIN dep — the verify runs in the
+  # /v1/auth/passkey/*/finish request path (pure local crypto, no network). We do
+  # NOT hand-roll attestation/assertion verification (the security boundary).
+  "webauthn>=2.0",
   # Schema migrations (#14). Alembic is the SOLE schema authority for real DBs:
   # the container entrypoint runs `aiko_gateway.migrate` (upgrade head) before
   # uvicorn. A MAIN (not dev) dep because it runs at every prod boot, not just
