@@ -16,8 +16,9 @@ the schema, so ``create_all`` can never silently paper over a missing revision.
 """
 from __future__ import annotations
 
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import (
-    AsyncSession, async_sessionmaker, create_async_engine,
+    AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine,
 )
 from sqlalchemy.orm import DeclarativeBase
 
@@ -28,7 +29,46 @@ class Base(DeclarativeBase):
     pass
 
 
-engine = create_async_engine(settings.db_url, echo=False, pool_pre_ping=True)
+def _tune_sqlite_concurrency(engine: AsyncEngine) -> None:
+    """Make file-backed SQLite — the PROD store (#1281) — behave correctly under
+    the async connection pool's concurrent connections (#12). One PRAGMA, set on
+    every new connection:
+
+    * ``busy_timeout=5000`` — the default is 0, so a second concurrent writer gets
+      ``SQLITE_BUSY`` ("database is locked") IMMEDIATELY rather than waiting. That
+      surfaces as 500s under contention; with a timeout the writer waits (up to 5s)
+      for the lock and serializes cleanly. (The last-admin guard is made correct
+      separately, by an atomic conditional DELETE — see
+      memberships_service._delete_membership_unless_last_admin — since SQLite has
+      no row locks for a FOR UPDATE to take.)
+
+    busy_timeout is per-connection and does NOT change the on-disk format, so it
+    has zero interaction with the backup/restore tooling. WAL mode (better
+    read/write concurrency) is DELIBERATELY NOT enabled here: it adds -wal/-shm
+    sidecars and changes the on-disk format, which would invalidate the #17 restore
+    drill until the imagineering-infra backup tooling is verified to checkpoint /
+    capture WAL. Measured: busy_timeout alone fixes the concurrency bug; WAL is a
+    separate, must-be-verified durability decision (tracked).
+
+    SQLite only — a guard in make_engine keeps this off Postgres (the dev engine)."""
+    @event.listens_for(engine.sync_engine, "connect")
+    def _set_sqlite_pragmas(dbapi_conn, _record):  # noqa: ANN001
+        cur = dbapi_conn.cursor()
+        cur.execute("PRAGMA busy_timeout=5000")
+        cur.close()
+
+
+def make_engine(url: str) -> AsyncEngine:
+    """Build the async engine for ``url``, applying the SQLite concurrency tuning
+    when the URL is SQLite. Factored out (not inlined) so tests can build a
+    prod-equivalent file-backed engine and exercise the real tuning (#12)."""
+    engine = create_async_engine(url, echo=False, pool_pre_ping=True)
+    if url.startswith("sqlite"):
+        _tune_sqlite_concurrency(engine)
+    return engine
+
+
+engine = make_engine(settings.db_url)
 SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 
