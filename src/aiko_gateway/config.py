@@ -96,11 +96,14 @@ class Settings(BaseSettings):
     # broker hands to the authorize endpoint (so the host is configured in ONE
     # place, not hardcoded across the start/callback handlers).
     gateway_base_url: str = "https://chat.imagineering.cc"
-    # The app's Universal/App Link the browser is redirected back to after the
-    # broker completes (carrying the handoff code, or an error indicator). This is
-    # a FIXED config value — open-redirect defense: the final redirect target is
-    # NEVER read from a request parameter, only from here.
-    app_oauth_callback_url: str = "https://chat.imagineering.cc/applink/auth"
+    # The app's custom-scheme deep link the browser is redirected back to after
+    # the broker completes (carrying the handoff code, or an error indicator).
+    # The app captures `aikochat://auth?code=…` via flutter_web_auth_2
+    # (ASWebAuthenticationSession / Custom Tabs); the scheme MUST match the app's
+    # kAikoCallbackScheme + Android manifest callback activity. This is a FIXED
+    # config value — open-redirect defense: the final redirect target is NEVER
+    # read from a request parameter, only from here.
+    app_oauth_callback_url: str = "aikochat://auth"
     # OAuth state token TTL (CSRF/integrity, the round-trip from /start to
     # /callback). Short — a human completing a provider consent screen.
     oauth_state_ttl_seconds: int = 10 * 60  # 10 min

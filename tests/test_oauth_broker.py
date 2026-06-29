@@ -47,8 +47,7 @@ async def client(session, monkeypatch):
     monkeypatch.setattr(settings, "social_signin_enabled", True)
     monkeypatch.setattr(settings, "github_client_id", "gh-client-id")
     monkeypatch.setattr(settings, "github_client_secret", "gh-secret")
-    monkeypatch.setattr(settings, "app_oauth_callback_url",
-                        "https://chat.imagineering.cc/applink/auth")
+    monkeypatch.setattr(settings, "app_oauth_callback_url", "aikochat://auth")
     monkeypatch.setattr(settings, "gateway_base_url",
                         "https://chat.imagineering.cc")
 
@@ -136,7 +135,7 @@ async def test_callback_new_identity_stores_provisioning_handoff(
         f"/v1/auth/oauth/github/callback?code=authcode&state={state}")
     assert r.status_code == 302
     loc = r.headers["location"]
-    assert loc.startswith("https://chat.imagineering.cc/applink/auth?code=")
+    assert loc.startswith("aikochat://auth?code=")
     handoff_code = httpx.QueryParams(loc.split("?", 1)[1])["code"]
     # The stored payload is MINIMAL provisioning data — NO minted tokens.
     row = await session.get(OAuthHandoff, handoff_code)
@@ -174,7 +173,7 @@ async def test_callback_provider_error_param_redirects_with_error(client, sessio
         f"/v1/auth/oauth/github/callback?error=access_denied&state={state}")
     assert r.status_code == 302
     loc = r.headers["location"]
-    assert loc.startswith("https://chat.imagineering.cc/applink/auth?error=")
+    assert loc.startswith("aikochat://auth?error=")
     assert "code=" not in loc
 
 
@@ -281,7 +280,7 @@ async def test_callback_open_redirect_target_is_fixed(
         "&next=https://evil.example.com")
     assert r.status_code == 302
     loc = r.headers["location"]
-    assert loc.startswith("https://chat.imagineering.cc/applink/auth?")
+    assert loc.startswith("aikochat://auth?")
     assert "evil.example.com" not in loc
 
 
