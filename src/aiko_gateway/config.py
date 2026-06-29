@@ -69,6 +69,14 @@ class Settings(BaseSettings):
     # gateway is reachable at all. The risk is named here and in the PR, not
     # silently absorbed.
     social_signin_enabled: bool = False
+    # Replay defense (#13): when True, /v1/auth/social REFUSES a request that
+    # carries no nonce (presence enforcement). Default False because the live app
+    # does not send a nonce yet — flipping this on before the app (separate repo)
+    # generates+sends one would lock every user out. Independent of verification:
+    # a WRONG nonce is always rejected by verify_id_token regardless of this flag;
+    # this only governs whether a MISSING nonce is tolerated. Flip to True as the
+    # final step of the staged rollout, once the app ships nonce generation.
+    social_nonce_required: bool = False
     # The audience allowlist: OUR provider client IDs. A provider ID token's `aud`
     # must be one of these. PUBLIC values (native ID-token flow needs no client
     # secret), so plain config — NOT SOPS. EMPTY ⇒ the verifier rejects every

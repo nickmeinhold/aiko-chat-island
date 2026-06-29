@@ -190,3 +190,62 @@ async def test_social_only_user_cannot_password_login(session):
         handle="socialonly", display_name="S", email=None)
     assert await users_service.authenticate(session, "socialonly", "") is None
     assert await users_service.authenticate(session, "socialonly", "anything") is None
+
+
+# --- nonce presence enforcement (#13, the flag gate) ------------------------ #
+# The verifier-level provider-aware comparison is proven in test_oauth_verify.py.
+# Here we prove the HANDLER policy: social_nonce_required governs whether a
+# MISSING nonce is tolerated, and a supplied nonce is forwarded to the verifier.
+
+async def test_nonce_not_required_by_default(client, monkeypatch):
+    """Default (flag off): a nonce-less request is accepted — today's live app."""
+    _mock_verify(monkeypatch, identity=_IDENTITY)
+    r = await client.post("/v1/auth/social",
+                          json={"provider": "google", "id_token": "x"})
+    assert r.status_code == 200, r.text
+
+
+async def test_nonce_required_rejects_missing(client, monkeypatch):
+    """Flag on + no nonce → 401, refused BEFORE the verifier runs (the staged
+    breaking flip, safe only once the app sends a nonce)."""
+    monkeypatch.setattr(settings, "social_nonce_required", True)
+    _mock_verify(monkeypatch, identity=_IDENTITY)
+    r = await client.post("/v1/auth/social",
+                          json={"provider": "google", "id_token": "x"})
+    assert r.status_code == 401, r.text
+
+
+async def test_nonce_required_accepts_with_nonce(client, monkeypatch):
+    monkeypatch.setattr(settings, "social_nonce_required", True)
+    _mock_verify(monkeypatch, identity=_IDENTITY)
+    r = await client.post("/v1/auth/social",
+                          json={"provider": "google", "id_token": "x",
+                                "nonce": "n-123"})
+    assert r.status_code == 200, r.text
+
+
+async def test_nonce_forwarded_to_verifier(client, monkeypatch):
+    """The supplied nonce must reach verify_id_token as expected_nonce — otherwise
+    the verifier can't bind it (the gate alone is theatre)."""
+    seen = {}
+
+    async def _capture(provider, id_token, *, expected_nonce=None):
+        seen["nonce"] = expected_nonce
+        return _IDENTITY
+
+    monkeypatch.setattr(oauth, "verify_id_token", _capture)
+    r = await client.post("/v1/auth/social",
+                          json={"provider": "google", "id_token": "x",
+                                "nonce": "carried-through"})
+    assert r.status_code == 200, r.text
+    assert seen["nonce"] == "carried-through"
+
+
+async def test_blank_nonce_rejected_at_boundary_422(client, monkeypatch):
+    """A blank nonce is malformed, not 'supplied' — rejected at the schema boundary
+    (422) regardless of the flag, so '' can't slip past presence-enforcement as a
+    zero-entropy downgrade channel (Carnot, cage-match PR#32)."""
+    _mock_verify(monkeypatch, identity=_IDENTITY)
+    r = await client.post("/v1/auth/social",
+                          json={"provider": "google", "id_token": "x", "nonce": ""})
+    assert r.status_code == 422, r.text

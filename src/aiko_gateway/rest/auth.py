@@ -84,6 +84,15 @@ async def login(req: LoginReq, session: DbSession) -> dict:
 class SocialReq(BaseModel):
     provider: Provider     # closed set → a bad value is a 422 at the boundary
     id_token: str          # the provider ID token obtained on-device
+    # Replay defense (#13): the RAW app-generated nonce that was fed (hashed, for
+    # Apple) into the provider sign-in request and is echoed in the id_token. The
+    # gateway applies the provider-specific transform; the app sends it raw.
+    # Optional on the wire today (the live app omits it); becomes mandatory once
+    # settings.social_nonce_required is flipped on after the app ships nonces.
+    # min_length=1: a BLANK nonce is malformed, not "supplied" — reject it at the
+    # boundary (422) so an empty string can never become a downgrade channel that
+    # slips past presence-enforcement (Carnot, cage-match PR#32). None = absent.
+    nonce: str | None = Field(default=None, min_length=1)
 
 
 class SocialClaimReq(BaseModel):
@@ -148,8 +157,15 @@ async def social(req: SocialReq, session: DbSession) -> dict:
     into /social/claim (no DB row until the user picks a handle)."""
     if not settings.social_signin_enabled:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "social sign-in is disabled")
+    # Presence enforcement (#13): refuse a nonce-less request only when policy
+    # requires it. Verification of a SUPPLIED nonce happens unconditionally inside
+    # verify_id_token — this gate only governs whether MISSING is tolerated, so the
+    # breaking flip is one config flag once the app ships nonce generation.
+    if settings.social_nonce_required and not req.nonce:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "nonce required")
     try:
-        identity = await oauth.verify_id_token(req.provider, req.id_token)
+        identity = await oauth.verify_id_token(
+            req.provider, req.id_token, expected_nonce=req.nonce)
     except oauth.UnknownProvider:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "unknown provider")
     except oauth.ProviderUnavailable:

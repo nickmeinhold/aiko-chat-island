@@ -24,16 +24,39 @@ tokens with OUR secret. This module ONLY verifies SOMEONE ELSE'S asymmetric
 RS256 tokens against their published keys. The two never share a code path — the
 isolation is the alg-confusion defense by construction.
 
-NONCE / replay: native ID-token flows support an app-generated nonce echoed in
-the token; verifying it requires a server-issued nonce round-trip the app must
-cooperate with (separate repo). DEFERRED — named tradeoff: a token captured
-within its (short) exp window could be replayed over a compromised transport.
-Mitigated by TLS + short provider exp; full mitigation needs nonce (follow-up
-task). `verify_id_token` accepts `expected_nonce` so wiring it later is a no-op
-to callers.
+NONCE / replay (#13): native ID-token flows support an app-generated nonce echoed
+in the token. `verify_id_token` enforces it WHEN SUPPLIED — provider-aware (Apple
+echoes SHA-256(nonce), Google echoes it raw).
+
+WHAT THIS BINDS — AND ITS LIMITS (cage-match PR#32, Carnot HIGH — do NOT overstate):
+This is option (b) from #13 — an APP-supplied nonce compared to the token claim. The
+"expected" value rides in the SAME request as the token, so it is NOT independent
+server state. Therefore:
+  - Apple (hashed): an id_token leaked WITHOUT its request body cannot be replayed —
+    the claim holds only SHA-256(nonce), and preimage resistance hides the raw nonce
+    the gateway requires. Real defense against side-channel id_token leakage (a log,
+    a crash report, a different API surface).
+  - Google (raw): the nonce sits in the token in clear, so anyone holding the
+    id_token reads it and reconstructs a matching request. For Google this binds
+    ceremony freshness but adds NO defense against id_token capture.
+  - NEITHER closes the broken-TLS / full-request-capture window (the ORIGINAL #13
+    named-accepted risk): an attacker who captures the POST body replays the raw
+    nonce beside the token. Fully closing that needs option (a) — a gateway-ISSUED,
+    server-stored, SINGLE-USE nonce, so a replayed nonce is already burned. That is
+    the follow-up; THIS change is the shared foundation (option (a) needs the app to
+    send a nonce too) plus genuine Apple side-channel defense.
+
+The rollout is STAGED across two repos so it never breaks the live app:
+  - presence is GATED by settings.social_nonce_required (default False). Off ⇒ a
+    request without a nonce is accepted (today's app); the verifier still rejects
+    a WRONG nonce if one is sent. On ⇒ a missing nonce is refused at the handler.
+  - the breaking flip to required=True happens only AFTER the app (separate repo)
+    starts generating + sending the raw nonce.
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import time
 from dataclasses import dataclass
@@ -206,6 +229,13 @@ class _ProviderConfig:
     jwks_uri: str
     issuers: frozenset[str]
     jwks: _JwksCache
+    # Provider asymmetry for nonce binding: Apple echoes the SHA-256 HEX digest of
+    # the app-supplied nonce in the token's `nonce` claim; Google echoes it RAW.
+    # The caller always passes the RAW nonce — we apply this transform — so the app
+    # stays provider-agnostic (generate one raw nonce, send it as-is). A naive
+    # equality check (the pre-wiring placeholder) would silently reject every Apple
+    # login once enforcement is on; this flag is what makes the comparison correct.
+    nonce_hashed: bool
 
 
 _PROVIDERS: dict[str, _ProviderConfig] = {
@@ -214,6 +244,7 @@ _PROVIDERS: dict[str, _ProviderConfig] = {
         jwks_uri="https://appleid.apple.com/auth/keys",
         issuers=frozenset({"https://appleid.apple.com"}),
         jwks=_JwksCache("https://appleid.apple.com/auth/keys"),
+        nonce_hashed=True,   # Apple stores SHA-256(nonce) hex in the claim.
     ),
     "google": _ProviderConfig(
         slug="google",
@@ -221,6 +252,7 @@ _PROVIDERS: dict[str, _ProviderConfig] = {
         # Google legitimately uses both spellings — accept either, pin to these.
         issuers=frozenset({"https://accounts.google.com", "accounts.google.com"}),
         jwks=_JwksCache("https://www.googleapis.com/oauth2/v3/certs"),
+        nonce_hashed=False,  # Google echoes the nonce raw.
     ),
 }
 
@@ -288,9 +320,27 @@ async def verify_id_token(
     if claims.get("iss") not in cfg.issuers:
         raise InvalidProviderToken(f"untrusted issuer {claims.get('iss')!r}")
 
-    # (5) Optional nonce (deferred wiring — see module docstring).
-    if expected_nonce is not None and claims.get("nonce") != expected_nonce:
-        raise InvalidProviderToken("nonce mismatch")
+    # (5) Nonce binding (replay defense, #13). When the caller supplies the RAW
+    # app-generated nonce we require the token to echo it — provider-aware, since
+    # Apple echoes SHA-256(nonce) hex while Google echoes it raw (cfg.nonce_hashed).
+    # A token carrying NO nonce claim can never satisfy a supplied expectation, so
+    # an attacker replaying a non-nonce token under enforcement is rejected here.
+    # Verifying-when-present is unconditional; whether a nonce is REQUIRED is the
+    # caller's policy (settings.social_nonce_required) — the two concerns are
+    # deliberately separate so the app/gateway rollout can be staged.
+    if expected_nonce is not None:
+        token_nonce = claims.get("nonce")
+        expected = (
+            hashlib.sha256(expected_nonce.encode()).hexdigest()
+            if cfg.nonce_hashed else expected_nonce
+        )
+        # Compare as BYTES, not str: hmac.compare_digest on str requires ASCII and
+        # raises TypeError on any non-ASCII codepoint — a crafted token nonce would
+        # then 500 instead of failing closed. utf-8 encoding lifts the restriction
+        # and keeps the comparison constant-time (Kelvin, cage-match PR#32).
+        if not isinstance(token_nonce, str) or not hmac.compare_digest(
+                token_nonce.encode("utf-8"), expected.encode("utf-8")):
+            raise InvalidProviderToken("nonce mismatch")
 
     sub = claims.get("sub")
     if not sub:
