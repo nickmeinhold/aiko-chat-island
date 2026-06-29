@@ -22,11 +22,13 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 
+import asyncio
+
 from aiko_gateway.config import settings
 from aiko_gateway.domain import (
-    handoff_service, oauth_broker, security, users_service,
+    handoff_service, oauth_broker, security, state_service, users_service,
 )
-from aiko_gateway.domain.models import OAuthHandoff
+from aiko_gateway.domain.models import OAuthHandoff, OAuthState
 from aiko_gateway.domain.oauth import VerifiedIdentity
 from aiko_gateway.rest import auth as auth_routes
 from aiko_gateway.rest.deps import get_session
@@ -64,18 +66,27 @@ _IDENTITY = VerifiedIdentity(
     suggested_name="Dev Eloper")
 
 
-def _mock_exchange(monkeypatch, identity=None, exc=None):
+def _mock_exchange(monkeypatch, identity=None, exc=None, capture=None):
     async def _fake(provider, *, code, code_verifier=None):
+        if capture is not None:
+            capture["code_verifier"] = code_verifier
         if exc is not None:
             raise exc
         return identity
     monkeypatch.setattr(oauth_broker, "exchange_code", _fake)
 
 
+async def _mint_state(session, provider="github", code_verifier=None) -> str:
+    """Create a SERVER-SIDE single-use state nonce (replaces the old signed-JWT
+    state). Returns the opaque nonce to send as the callback `state` param."""
+    return await state_service.create_state(
+        session, provider=provider, code_verifier=code_verifier)
+
+
 # --------------------------------------------------------------------------- #
 # /start
 # --------------------------------------------------------------------------- #
-async def test_start_redirects_to_provider_with_signed_state(client):
+async def test_start_redirects_to_provider_with_stored_state_nonce(client, session):
     r = await client.get("/v1/auth/oauth/github/start")
     assert r.status_code == 302
     loc = r.headers["location"]
@@ -88,9 +99,14 @@ async def test_start_redirects_to_provider_with_signed_state(client):
     assert q["response_type"] == "code"
     # GitHub: PKCE OFF — no challenge in the URL.
     assert "code_challenge" not in q
-    # state decodes as our oauth_state token, carrying the provider.
-    st = security.decode_oauth_state(q["state"])
-    assert st["provider"] == "github"
+    # `state` is now an OPAQUE server-side nonce (NOT a signed JWT) — it must NOT
+    # decode as a JWT, and a matching row must exist in the state store carrying
+    # the provider.
+    nonce = q["state"]
+    with pytest.raises(jwt.InvalidTokenError):
+        jwt.decode(nonce, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
+    row = await session.get(OAuthState, nonce)
+    assert row is not None and row.provider == "github" and row.consumed is False
 
 
 async def test_start_unknown_provider_404(client):
@@ -111,7 +127,7 @@ async def test_start_unconfigured_provider_404(client, monkeypatch):
 async def test_callback_new_identity_stores_provisioning_handoff(
         client, monkeypatch, session):
     _mock_exchange(monkeypatch, identity=_IDENTITY)
-    state = security.issue_oauth_state("github")
+    state = await _mint_state(session)
     r = await client.get(
         f"/v1/auth/oauth/github/callback?code=authcode&state={state}")
     assert r.status_code == 302
@@ -132,7 +148,7 @@ async def test_callback_known_identity_stores_authenticated_handoff(
         session, provider="github", provider_sub="gh-123",
         handle="dev", display_name="Dev", email=None)
     _mock_exchange(monkeypatch, identity=_IDENTITY)
-    state = security.issue_oauth_state("github")
+    state = await _mint_state(session)
     r = await client.get(
         f"/v1/auth/oauth/github/callback?code=authcode&state={state}")
     assert r.status_code == 302
@@ -148,8 +164,8 @@ async def test_callback_known_identity_stores_authenticated_handoff(
 # --------------------------------------------------------------------------- #
 # /callback — failure → graceful redirect-with-error (never a 500)
 # --------------------------------------------------------------------------- #
-async def test_callback_provider_error_param_redirects_with_error(client):
-    state = security.issue_oauth_state("github")
+async def test_callback_provider_error_param_redirects_with_error(client, session):
+    state = await _mint_state(session)
     r = await client.get(
         f"/v1/auth/oauth/github/callback?error=access_denied&state={state}")
     assert r.status_code == 302
@@ -166,52 +182,72 @@ async def test_callback_bad_state_redirects_with_error(client, monkeypatch):
     assert "error=bad_state" in r.headers["location"]
 
 
-async def test_callback_expired_state_redirects_with_error(client, monkeypatch):
+async def test_callback_expired_state_redirects_with_error(
+        client, monkeypatch, session):
+    """An EXPIRED state row (expires_at in the past) is not consumable -> bad_state
+    (the store's expires_at predicate)."""
     _mock_exchange(monkeypatch, identity=_IDENTITY)
-    # Hand-mint an EXPIRED oauth_state token (exp in the past).
-    now = dt.datetime.now(dt.timezone.utc)
-    expired = jwt.encode(
-        {"type": "oauth_state", "provider": "github",
-         "iat": int((now - dt.timedelta(minutes=20)).timestamp()),
-         "exp": int((now - dt.timedelta(minutes=10)).timestamp())},
-        settings.jwt_secret, algorithm=settings.jwt_algorithm)
+    expired = OAuthState(
+        nonce="expired-state-nonce", provider="github", code_verifier=None,
+        expires_at=dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=5),
+        consumed=False)
+    session.add(expired)
+    await session.commit()
     r = await client.get(
-        f"/v1/auth/oauth/github/callback?code=authcode&state={expired}")
+        "/v1/auth/oauth/github/callback?code=authcode&state=expired-state-nonce")
     assert r.status_code == 302
     assert "error=bad_state" in r.headers["location"]
 
 
-async def test_callback_tampered_state_signature_redirects_with_error(
+async def test_callback_unknown_state_nonce_redirects_with_error(
         client, monkeypatch):
-    """A state signed with the WRONG secret (forged) is rejected."""
+    """An opaque nonce that was NEVER issued (forged / guessed) has no row -> the
+    store can't consume it -> bad_state. Replaces the old 'tampered JWT signature'
+    case: state is no longer a signed token, so unguessable-nonce-not-in-store IS
+    the forgery defense."""
     _mock_exchange(monkeypatch, identity=_IDENTITY)
-    now = dt.datetime.now(dt.timezone.utc)
-    forged = jwt.encode(
-        {"type": "oauth_state", "provider": "github",
-         "iat": int(now.timestamp()),
-         "exp": int((now + dt.timedelta(minutes=10)).timestamp())},
-        "attacker-secret-not-ours-but-long-enough-32b", algorithm="HS256")
     r = await client.get(
-        f"/v1/auth/oauth/github/callback?code=authcode&state={forged}")
+        "/v1/auth/oauth/github/callback?code=authcode&state=never-issued-nonce")
     assert r.status_code == 302
     assert "error=bad_state" in r.headers["location"]
 
 
-async def test_callback_state_provider_mismatch_rejected(client, monkeypatch):
-    """A state minted for a DIFFERENT provider than the path provider is rejected
-    (provider-in-state must equal path provider)."""
+async def test_callback_state_single_use_replay_rejected(
+        client, monkeypatch, session):
+    """REPLAY / single-use (cage-match #30, Finding 1): a captured callback URL
+    replayed with the SAME state nonce fails the second time — the nonce is
+    consumed on first use. This is the property the old signed-stateless state
+    LACKED (its NAMED TRADEOFF, now retired)."""
     _mock_exchange(monkeypatch, identity=_IDENTITY)
-    # Valid signature, but provider=apple while the path is /github/.
-    state = security.issue_oauth_state("apple")
+    state = await _mint_state(session)
+    r1 = await client.get(
+        f"/v1/auth/oauth/github/callback?code=authcode&state={state}")
+    assert r1.status_code == 302
+    assert "code=" in r1.headers["location"]  # first use succeeds
+    # Replay the EXACT same nonce -> rejected (already consumed).
+    r2 = await client.get(
+        f"/v1/auth/oauth/github/callback?code=authcode&state={state}")
+    assert r2.status_code == 302
+    assert "error=bad_state" in r2.headers["location"]
+
+
+async def test_callback_state_provider_mismatch_rejected(
+        client, monkeypatch, session):
+    """A state minted for a DIFFERENT provider than the path provider is rejected
+    (provider stored in the state row must equal the path provider)."""
+    _mock_exchange(monkeypatch, identity=_IDENTITY)
+    # Stored for provider=apple while the path is /github/.
+    state = await _mint_state(session, provider="apple")
     r = await client.get(
         f"/v1/auth/oauth/github/callback?code=authcode&state={state}")
     assert r.status_code == 302
     assert "error=state_provider_mismatch" in r.headers["location"]
 
 
-async def test_callback_exchange_invalid_redirects_with_error(client, monkeypatch):
+async def test_callback_exchange_invalid_redirects_with_error(
+        client, monkeypatch, session):
     _mock_exchange(monkeypatch, exc=oauth_broker.BrokerInvalidExchange("bad code"))
-    state = security.issue_oauth_state("github")
+    state = await _mint_state(session)
     r = await client.get(
         f"/v1/auth/oauth/github/callback?code=authcode&state={state}")
     assert r.status_code == 302
@@ -219,21 +255,22 @@ async def test_callback_exchange_invalid_redirects_with_error(client, monkeypatc
 
 
 async def test_callback_exchange_unavailable_redirects_with_error(
-        client, monkeypatch):
+        client, monkeypatch, session):
     _mock_exchange(monkeypatch, exc=oauth_broker.BrokerUnavailable("down"))
-    state = security.issue_oauth_state("github")
+    state = await _mint_state(session)
     r = await client.get(
         f"/v1/auth/oauth/github/callback?code=authcode&state={state}")
     assert r.status_code == 302
     assert "error=provider_unavailable" in r.headers["location"]
 
 
-async def test_callback_open_redirect_target_is_fixed(client, monkeypatch):
+async def test_callback_open_redirect_target_is_fixed(
+        client, monkeypatch, session):
     """OPEN-REDIRECT defense: no request parameter can change WHERE we redirect.
     Even with an attacker-supplied redirect_uri/next param, the target stays the
     configured app callback host."""
     _mock_exchange(monkeypatch, identity=_IDENTITY)
-    state = security.issue_oauth_state("github")
+    state = await _mint_state(session)
     r = await client.get(
         f"/v1/auth/oauth/github/callback?code=authcode&state={state}"
         "&redirect_uri=https://evil.example.com"
@@ -318,6 +355,59 @@ async def test_exchange_user_deleted_between_callback_and_exchange_401(
     assert r.status_code == 401
 
 
+async def test_exchange_bogus_kind_fails_closed_401(client, session):
+    """KIND-GUARD (cage-match #30, Finding 4): a handoff row whose `kind` is not
+    one we write ('authenticated'/'provisioning') is rejected with 401 — it must
+    NOT fall through to a KeyError/500."""
+    code = await handoff_service.create_handoff(
+        session, {"kind": "totally-bogus", "user_id": "x"})
+    r = await client.post("/v1/auth/oauth/exchange", json={"code": code})
+    assert r.status_code == 401
+
+
+async def test_exchange_missing_kind_fails_closed_401(client, session):
+    """A payload with NO `kind` at all is also rejected (fail-closed)."""
+    code = await handoff_service.create_handoff(session, {"user_id": "x"})
+    r = await client.post("/v1/auth/oauth/exchange", json={"code": code})
+    assert r.status_code == 401
+
+
+async def test_concurrent_handoff_redemption_exactly_one_wins(session):
+    """SINGLE-USE under concurrency (cage-match #30, Finding 5): two SIMULTANEOUS
+    redemptions of the same handoff code yield exactly one non-None payload.
+
+    NOTE: the aiosqlite test backend serializes writes on a single connection, so
+    this may not exercise true wall-clock concurrency. But the assertion holds
+    regardless: the rowcount-arbitrated conditional UPDATE in consume_handoff means
+    at most one call can flip consumed False->True, so exactly one of the two
+    gather'd calls returns the payload and the other returns None. (On Postgres
+    with row-level locking the same invariant holds under real concurrency.)"""
+    code = await handoff_service.create_handoff(session, {
+        "kind": "provisioning", "provider": "github", "provider_sub": "gh-conc",
+        "suggested_name": None, "email": None})
+    r1, r2 = await asyncio.gather(
+        handoff_service.consume_handoff(session, code),
+        handoff_service.consume_handoff(session, code),
+    )
+    winners = [r for r in (r1, r2) if r is not None]
+    assert len(winners) == 1
+
+
+async def test_concurrent_state_consume_exactly_one_wins(session):
+    """SINGLE-USE under concurrency for the state nonce (cage-match #30, Finding 5,
+    applied to consume_state): two SIMULTANEOUS consumes of the same nonce yield
+    exactly one non-None result. Same rowcount-arbitration invariant as the handoff
+    store; same aiosqlite-serialization caveat."""
+    nonce = await state_service.create_state(
+        session, provider="github", code_verifier=None)
+    r1, r2 = await asyncio.gather(
+        state_service.consume_state(session, nonce),
+        state_service.consume_state(session, nonce),
+    )
+    winners = [r for r in (r1, r2) if r is not None]
+    assert len(winners) == 1
+
+
 # --------------------------------------------------------------------------- #
 # /providers
 # --------------------------------------------------------------------------- #
@@ -345,10 +435,11 @@ async def test_providers_omits_unconfigured_broker(client, monkeypatch):
 # UNIT: exchange_code against a faked httpx layer (no network)
 # --------------------------------------------------------------------------- #
 class _FakeResp:
-    def __init__(self, payload, status_code=200, raw=None):
+    def __init__(self, payload, status_code=200, raw=None, headers=None):
         self._payload = payload
         self.status_code = status_code
         self._raw = raw
+        self.headers = headers or {}
 
     def json(self):
         if self._raw is not None:
@@ -478,6 +569,107 @@ async def test_exchange_code_profile_network_failure_is_unavailable(monkeypatch)
         await oauth_broker.exchange_code(prov, code="abc")
 
 
+# --- Finding 2: secret-bearing exception chain is BROKEN (`from None`) ------- #
+async def test_token_network_failure_breaks_exception_chain(monkeypatch):
+    """The token POST's httpx exception holds the request body (client_secret) on
+    its `.request`. Raising `from None` must break the chain so __cause__ is None —
+    otherwise the secret is reachable through the exception (cage-match #30,
+    Finding 2)."""
+    prov = _gh_provider(monkeypatch)
+    _fake_client_factory(
+        monkeypatch, token_resp=_FakeResp({}), raise_on="token")
+    with pytest.raises(oauth_broker.BrokerUnavailable) as ei:
+        await oauth_broker.exchange_code(prov, code="abc")
+    assert ei.value.__cause__ is None
+    # And belt-and-braces: __context__ is suppressed too.
+    assert ei.value.__suppress_context__ is True
+
+
+async def test_profile_network_failure_breaks_exception_chain(monkeypatch):
+    """The profile GET's httpx exception holds the Authorization header (the access
+    token). `from None` must break the chain so __cause__ is None (Finding 2)."""
+    prov = _gh_provider(monkeypatch)
+    _fake_client_factory(
+        monkeypatch,
+        token_resp=_FakeResp({"access_token": "gho_abc"}),
+        raise_on="user")
+    with pytest.raises(oauth_broker.BrokerUnavailable) as ei:
+        await oauth_broker.exchange_code(prov, code="abc")
+    assert ei.value.__cause__ is None
+    assert ei.value.__suppress_context__ is True
+
+
+# --- Finding 3: rate-limit (429 / 403+remaining:0) is an OUTAGE (503) -------- #
+async def test_token_429_is_unavailable(monkeypatch):
+    """A 429 from the token endpoint is rate-limiting -> BrokerUnavailable (503),
+    NOT a bad credential (cage-match #30, Finding 3)."""
+    prov = _gh_provider(monkeypatch)
+    _fake_client_factory(
+        monkeypatch, token_resp=_FakeResp({}, status_code=429))
+    with pytest.raises(oauth_broker.BrokerUnavailable):
+        await oauth_broker.exchange_code(prov, code="abc")
+
+
+async def test_token_403_ratelimited_is_unavailable(monkeypatch):
+    """A 403 with X-RateLimit-Remaining: 0 from the token endpoint is rate-limiting
+    -> BrokerUnavailable (Finding 3)."""
+    prov = _gh_provider(monkeypatch)
+    _fake_client_factory(
+        monkeypatch,
+        token_resp=_FakeResp({}, status_code=403,
+                             headers={"X-RateLimit-Remaining": "0"}))
+    with pytest.raises(oauth_broker.BrokerUnavailable):
+        await oauth_broker.exchange_code(prov, code="abc")
+
+
+async def test_token_403_not_ratelimited_is_invalid(monkeypatch):
+    """A PLAIN 403 (no X-RateLimit-Remaining: 0) from the token endpoint is a real
+    authorization failure -> BrokerInvalidExchange (Finding 3 — only rate-limit
+    403s become outages)."""
+    prov = _gh_provider(monkeypatch)
+    _fake_client_factory(
+        monkeypatch, token_resp=_FakeResp({}, status_code=403))
+    with pytest.raises(oauth_broker.BrokerInvalidExchange):
+        await oauth_broker.exchange_code(prov, code="abc")
+
+
+async def test_profile_429_is_unavailable(monkeypatch):
+    """A 429 from the profile endpoint is rate-limiting -> BrokerUnavailable
+    (Finding 3)."""
+    prov = _gh_provider(monkeypatch)
+    _fake_client_factory(
+        monkeypatch,
+        token_resp=_FakeResp({"access_token": "gho_abc"}),
+        user_resp=_FakeResp({}, status_code=429))
+    with pytest.raises(oauth_broker.BrokerUnavailable):
+        await oauth_broker.exchange_code(prov, code="abc")
+
+
+async def test_profile_403_ratelimited_is_unavailable(monkeypatch):
+    """A 403 with X-RateLimit-Remaining: 0 from the profile endpoint is
+    rate-limiting -> BrokerUnavailable (Finding 3)."""
+    prov = _gh_provider(monkeypatch)
+    _fake_client_factory(
+        monkeypatch,
+        token_resp=_FakeResp({"access_token": "gho_abc"}),
+        user_resp=_FakeResp({}, status_code=403,
+                            headers={"X-RateLimit-Remaining": "0"}))
+    with pytest.raises(oauth_broker.BrokerUnavailable):
+        await oauth_broker.exchange_code(prov, code="abc")
+
+
+async def test_profile_403_not_ratelimited_is_invalid(monkeypatch):
+    """A PLAIN 403 from the profile endpoint stays a bad credential
+    (BrokerInvalidExchange) — only rate-limit 403s become outages (Finding 3)."""
+    prov = _gh_provider(monkeypatch)
+    _fake_client_factory(
+        monkeypatch,
+        token_resp=_FakeResp({"access_token": "gho_abc"}),
+        user_resp=_FakeResp({}, status_code=403))
+    with pytest.raises(oauth_broker.BrokerInvalidExchange):
+        await oauth_broker.exchange_code(prov, code="abc")
+
+
 async def test_exchange_code_profile_5xx_is_unavailable(monkeypatch):
     prov = _gh_provider(monkeypatch)
     _fake_client_factory(
@@ -522,3 +714,47 @@ def test_build_authorize_url_includes_pkce_when_supported(monkeypatch):
     q = httpx.QueryParams(url.split("?", 1)[1])
     assert q["code_challenge"] == "CHAL"
     assert q["code_challenge_method"] == "S256"
+
+
+# --------------------------------------------------------------------------- #
+# Finding 1 RED-PROOF (ii): PKCE code_verifier NEVER leaves the server.
+# --------------------------------------------------------------------------- #
+async def test_pkce_verifier_never_in_authorize_url_or_state(
+        client, monkeypatch, session):
+    """For a SYNTHETIC PKCE-enabled provider, /start must store the code_verifier
+    in the SERVER-SIDE state row and put NEITHER the verifier NOR a base64-readable
+    token into the authorize URL or the `state` param. Only the code_challenge
+    crosses the wire (cage-match #30, Finding 1).
+
+    Under the OLD signed-JWT state this FAILED: the verifier rode inside the
+    base64-decodable state token. Now the verifier lives only in the DB."""
+    import dataclasses
+
+    pkce_prov = dataclasses.replace(
+        oauth_broker._GITHUB, slug="pkcetest", supports_pkce=True)
+    # Make slug 'pkcetest' resolve via the github creds so it is_configured().
+    monkeypatch.setitem(oauth_broker._REGISTRY, "pkcetest", pkce_prov)
+    monkeypatch.setattr(
+        oauth_broker, "_provider_client_id", lambda s: "pkce-client-id")
+    monkeypatch.setattr(
+        oauth_broker, "_provider_client_secret", lambda s: "pkce-secret")
+
+    r = await client.get("/v1/auth/oauth/pkcetest/start")
+    assert r.status_code == 302
+    loc = r.headers["location"]
+    q = httpx.QueryParams(loc.split("?", 1)[1])
+
+    # The challenge IS present (PKCE provider)...
+    assert "code_challenge" in q
+    nonce = q["state"]
+    # ...but the verifier is stored server-side and is NOT the state, NOT in the
+    # URL, and the state is NOT a decodable JWT carrying it.
+    row = await session.get(OAuthState, nonce)
+    assert row is not None and row.code_verifier  # stored server-side
+    verifier = row.code_verifier
+    assert verifier != nonce
+    assert verifier not in loc            # verifier nowhere in the redirect URL
+    assert verifier != q["code_challenge"]  # challenge is the S256 hash, not the verifier
+    with pytest.raises(jwt.InvalidTokenError):
+        # state is an opaque nonce, not a JWT we can crack open for the verifier.
+        jwt.decode(nonce, settings.jwt_secret, algorithms=[settings.jwt_algorithm])

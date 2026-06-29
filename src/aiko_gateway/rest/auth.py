@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..config import settings
 from ..domain import (
     accounts_service, handoff_service, oauth, oauth_broker, security,
-    users_service,
+    state_service, users_service,
 )
 from ..domain.models import User
 from ..domain.oauth import Provider, VerifiedIdentity
@@ -231,17 +231,24 @@ def _provider_or_404(slug: str) -> oauth_broker.BrokerProvider:
 
 
 @router.get("/oauth/{provider}/start")
-async def oauth_start(provider: str) -> RedirectResponse:
-    """Begin the broker flow: sign a state token, (PKCE if supported), and 302 to
-    the provider's authorize URL. 404 if the provider isn't a configured broker
-    provider."""
+async def oauth_start(provider: str, session: DbSession) -> RedirectResponse:
+    """Begin the broker flow: mint a SERVER-SIDE single-use state nonce (storing
+    the PKCE code_verifier server-side when supported), and 302 to the provider's
+    authorize URL with ONLY the opaque nonce as `state`. 404 if the provider isn't
+    a configured broker provider.
+
+    The `state` sent to the provider is the opaque nonce — NOT a signed token —
+    so it carries no secret. For PKCE providers the code_verifier stays in the
+    state row and ONLY the code_challenge crosses the wire; the verifier never
+    leaves the server (cage-match #30, Finding 1)."""
     prov = _provider_or_404(provider)
     code_verifier = code_challenge = None
     if prov.supports_pkce:
         code_verifier, code_challenge = make_pkce_pair()
-    state = security.issue_oauth_state(prov.slug, code_verifier=code_verifier)
+    nonce = await state_service.create_state(
+        session, provider=prov.slug, code_verifier=code_verifier)
     url = oauth_broker.build_authorize_url(
-        prov, state=state, code_challenge=code_challenge)
+        prov, state=nonce, code_challenge=code_challenge)
     return RedirectResponse(url, status_code=302)
 
 
@@ -268,18 +275,22 @@ async def oauth_callback(
     if not code or not state:
         return _app_callback_redirect(error="missing_code")
 
-    # Verify state: signature + exp + type, and the provider in the state MUST
-    # match the path provider (a state minted for provider A must not be replayed
-    # on provider B's callback).
-    try:
-        st = security.decode_oauth_state(state)
-    except jwt.InvalidTokenError:
+    # Consume the state nonce ATOMICALLY (single-use): the same nonce can never be
+    # redeemed twice, so a captured callback URL can't be replayed at this layer
+    # (cage-match #30, Finding 1). None = missing / expired / already-consumed /
+    # forged → bad_state. The provider stored in the row MUST match the path
+    # provider (a nonce minted for provider A must not be used on provider B's
+    # callback).
+    st = await state_service.consume_state(session, state)
+    if st is None:
         return _app_callback_redirect(error="bad_state")
     if st["provider"] != prov.slug:
         return _app_callback_redirect(error="state_provider_mismatch")
 
     # Exchange the code for a verified identity. Both failure classes resolve to a
-    # graceful redirect-with-error for the BROWSER (never a raw status leak).
+    # graceful redirect-with-error for the BROWSER (never a raw status leak). The
+    # PKCE code_verifier comes from the SERVER-SIDE state row — it never crossed
+    # the wire.
     try:
         identity = await oauth_broker.exchange_code(
             prov, code=code, code_verifier=st.get("code_verifier"))
@@ -320,6 +331,13 @@ async def oauth_exchange(req: OAuthExchangeReq, session: DbSession) -> dict:
     double-spend guard lives in handoff_service.consume_handoff)."""
     payload = await handoff_service.consume_handoff(session, req.code)
     if payload is None:
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED, "invalid or expired handoff code")
+    # Kind-guard fails CLOSED (cage-match #30, Finding 4): a payload whose `kind`
+    # isn't one we wrote is treated as invalid (401), never falling through to a
+    # KeyError/500. We only ever write "authenticated"/"provisioning" server-side,
+    # so anything else is a corrupted/unexpected row.
+    if payload.get("kind") not in {"authenticated", "provisioning"}:
         raise HTTPException(
             status.HTTP_401_UNAUTHORIZED, "invalid or expired handoff code")
     if payload.get("kind") == "authenticated":

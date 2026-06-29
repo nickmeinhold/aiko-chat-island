@@ -291,3 +291,45 @@ class OAuthHandoff(Base):
         Boolean, nullable=False, default=False)
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow)
+
+
+class OAuthState(Base):
+    """A one-time CSRF/PKCE state nonce for the server-side OAuth broker (#21).
+
+    Replaces the earlier self-contained signed-JWT ``state`` (cage-match #30,
+    Finding 1). Two reasons the JWT had to go:
+
+      * PKCE LEAK — the JWT carried the PKCE ``code_verifier`` through the browser
+        and the provider (it is base64-readable in the URL), which defeats the
+        whole point of PKCE for any future PKCE-enabled provider. Now the verifier
+        is stored SERVER-SIDE in this row and ONLY the ``code_challenge`` ever
+        leaves us — the verifier never crosses the wire.
+      * REPLAY / login-CSRF — a signed-but-stateless state is replayable within
+        its exp window and is not bound to a single use. This row makes ``state``
+        an opaque, single-use nonce: ``consumed`` + ``expires_at`` mean a captured
+        callback URL cannot be replayed at the state layer (the prior design
+        leaned on the provider code's single-use property as the only backstop —
+        that NAMED TRADEOFF is now RETIRED).
+
+    SECURITY shape (mirrors OAuthHandoff):
+      * ``nonce`` is the PK and is ``secrets.token_urlsafe(32)`` — 256 bits,
+        unguessable, single-use.
+      * ``code_verifier`` is nullable (only PKCE providers store one) and NEVER
+        leaves the server.
+      * ``consumed`` + ``expires_at`` enforce single-use within a short TTL; the
+        callback marks consumed ATOMICALLY (a guarded UPDATE) to close the
+        double-spend / replay race.
+
+    Rows are short-lived (the oauth_state TTL) and self-expire; no sweeper at this
+    scale (a follow-up if the table ever grows).
+    """
+    __tablename__ = "oauth_states"
+    nonce: Mapped[str] = mapped_column(String(64), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    code_verifier: Mapped[str | None] = mapped_column(Text, nullable=True)
+    expires_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False)
+    consumed: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow)

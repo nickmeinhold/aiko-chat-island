@@ -110,59 +110,20 @@ def decode_provisioning(token: str) -> dict:
     }
 
 
-# --- OAuth broker state token (#21) ---------------------------------------- #
-# The broker's authorization-code flow has a /start -> provider -> /callback
-# round-trip. The `state` parameter carries integrity across it. We make state a
-# short-lived HS256 token signed by US (the SAME secret as everything else):
+# --- OAuth broker state (#21) ---------------------------------------------- #
+# The broker's authorization-code flow `state` parameter is NO LONGER a signed
+# self-contained token (cage-match #30, Finding 1). It is now a SERVER-SIDE
+# single-use nonce (domain/state_service.py + the OAuthState model). Two reasons
+# the JWT was removed:
 #
-#   * CSRF — a forged callback can't fabricate a state we'd accept (no valid
-#     signature), so an attacker can't stitch a victim's session to an
-#     attacker-controlled provider code without first owning our secret.
-#   * Integrity — it carries the provider slug (the callback asserts it matches
-#     the path provider) and, for PKCE providers, the code_verifier (kept
-#     server-side via the signed state rather than client-held).
+#   * PKCE — a stateless JWT had to carry the PKCE code_verifier through the
+#     browser/provider (base64-readable in the URL), defeating PKCE. The verifier
+#     now lives only in the server-side state row; only the code_challenge crosses
+#     the wire.
+#   * REPLAY / login-CSRF — a signed-stateless state is replayable within its exp
+#     window. The nonce is single-use (consumed + expires_at, atomic redemption),
+#     so a captured callback URL can't be replayed at the state layer.
 #
-# NAMED TRADEOFF (v1): there is NO server-side single-use state store. CSRF /
-# integrity rest on the signature + a short exp ALONE. A captured full callback
-# URL replayed within the exp window is NOT blocked at the state layer — but it
-# fails anyway because the provider authorization `code` it carries is single-use
-# at the provider's token endpoint (the second exchange returns an error → our
-# exchange_code raises → graceful redirect-with-error, no session minted). A
-# server-side single-use state nonce store is a deliberate follow-up; for v1 the
-# code's single-use property at the provider is the backstop and is sufficient.
-_OAUTH_STATE_TYPE = "oauth_state"
-
-
-def issue_oauth_state(
-    provider: str, *, code_verifier: str | None = None, nonce: str | None = None,
-) -> str:
-    now = dt.datetime.now(dt.timezone.utc)
-    payload = {
-        "type": _OAUTH_STATE_TYPE,
-        "provider": provider,
-        "code_verifier": code_verifier,
-        "nonce": nonce,
-        "iat": int(now.timestamp()),
-        "exp": int((now + dt.timedelta(
-            seconds=settings.oauth_state_ttl_seconds)).timestamp()),
-    }
-    return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm)
-
-
-def decode_oauth_state(token: str) -> dict:
-    """Return {provider, code_verifier, nonce} from a valid state token, else
-    raise jwt.InvalidTokenError (bad type/sig/exp). Verified with OUR secret +
-    algorithm — this is our token, never a provider's."""
-    payload = jwt.decode(
-        token, settings.jwt_secret, algorithms=[settings.jwt_algorithm]
-    )
-    if payload.get("type") != _OAUTH_STATE_TYPE:
-        raise jwt.InvalidTokenError("expected oauth_state token")
-    provider = payload.get("provider")
-    if not provider:
-        raise jwt.InvalidTokenError("oauth_state missing provider")
-    return {
-        "provider": provider,
-        "code_verifier": payload.get("code_verifier"),
-        "nonce": payload.get("nonce"),
-    }
+# The earlier NAMED TRADEOFF ("no server-side single-use state store; the
+# provider code's single-use property is the only backstop") is therefore
+# RETIRED — the store now exists and IS the single-use guard.

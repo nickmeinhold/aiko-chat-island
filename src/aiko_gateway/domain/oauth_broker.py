@@ -66,6 +66,20 @@ class BrokerUnavailable(BrokerError):
 ProfileFetch = Callable[[httpx.AsyncClient, str], Awaitable[VerifiedIdentity]]
 
 
+def _is_rate_limited(resp: httpx.Response) -> bool:
+    """True when the response is a rate-limit signal (cage-match #30, Finding 3).
+
+    GitHub signals rate-limiting two ways: a 429, OR a 403 with the header
+    ``X-RateLimit-Remaining: 0``. A plain 403 (no remaining==0 header) is a real
+    authorization failure, NOT rate-limiting. Rate-limiting is an OUTAGE (503),
+    not a bad credential (401)."""
+    if resp.status_code == 429:
+        return True
+    if resp.status_code == 403:
+        return resp.headers.get("X-RateLimit-Remaining") == "0"
+    return False
+
+
 @dataclass(frozen=True)
 class BrokerProvider:
     slug: str
@@ -122,12 +136,21 @@ async def _github_fetch_profile(
     }
     try:
         u = await client.get("https://api.github.com/user", headers=headers)
-    except httpx.HTTPError as e:
-        raise BrokerUnavailable("github profile fetch failed") from e
+    except httpx.HTTPError:
+        # `from None` breaks the exception chain (cage-match #30, Finding 2): the
+        # httpx exception's `.request` holds the Authorization header (our access
+        # token); keeping it reachable via __cause__ would leak the token. We carry
+        # only the generic message.
+        raise BrokerUnavailable("github profile fetch failed") from None
     if u.status_code == 401:
         # The token we just minted is rejected — treat as a bad exchange, not an
         # outage. (Shouldn't happen on a fresh token, but fail closed.)
         raise BrokerInvalidExchange("github rejected the access token")
+    if _is_rate_limited(u):
+        # 429, or a 403 with X-RateLimit-Remaining: 0, is rate-limiting — an
+        # OUTAGE, not a bad credential (cage-match #30, Finding 3). A 401 here would
+        # teach clients to retry-storm an auth failure that isn't theirs.
+        raise BrokerUnavailable(f"github profile rate-limited {u.status_code}")
     if u.status_code >= 500:
         raise BrokerUnavailable(f"github profile endpoint {u.status_code}")
     if u.status_code != 200:
@@ -261,8 +284,16 @@ async def exchange_code(
         try:
             resp = await client.post(
                 provider.token_url, data=data, headers=headers)
-        except httpx.HTTPError as e:
-            raise BrokerUnavailable("token endpoint unreachable") from e
+        except httpx.HTTPError:
+            # `from None` breaks the exception chain (cage-match #30, Finding 2):
+            # the httpx exception's `.request` holds the POST body, which carries
+            # the client_secret; keeping it reachable via __cause__ would leak the
+            # secret. We carry only the generic message.
+            raise BrokerUnavailable("token endpoint unreachable") from None
+        if _is_rate_limited(resp):
+            # 429, or a 403 with X-RateLimit-Remaining: 0, is rate-limiting — an
+            # OUTAGE, not a bad credential (cage-match #30, Finding 3).
+            raise BrokerUnavailable(f"token endpoint rate-limited {resp.status_code}")
         if resp.status_code >= 500:
             raise BrokerUnavailable(f"token endpoint {resp.status_code}")
         if resp.status_code != 200:
