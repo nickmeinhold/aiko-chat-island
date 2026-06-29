@@ -1,7 +1,9 @@
 # Passkeys (#1471) — deploy runbook
 
-**Status as of 2026-06-30:** merged to `main` (`45d4e5a`), cage-matched, **NOT deployed**.
-Three gates remain. This runbook crosses gates 1 and 2; gate 3 needs a real device.
+**Status as of 2026-06-30:** **Gate 1 CROSSED** — endpoints deployed DARK to prod
+(alembic at `0008`, AASA serving via Caddy, `/providers` still hides passkey). Gate 2
+(`passkey_enabled` flip) and gate 3 (device e2e) remain. This runbook records the
+procedure that crossed gate 1 and the steps for 2 + 3.
 
 Grounded against the live host on 2026-06-30 (all reads non-destructive). Re-verify
 the "before" facts before running — a liveness claim has a shelf life.
@@ -116,11 +118,15 @@ size, and the `.sql` dump ends with `COMMIT;`. A backup that didn't land = STOP
 
 ```bash
 cd /Users/nick/git/orgs/aiko/aiko_chat_gateway
-# rsync the source tree to the host (exclude VCS + local cruft; --delete keeps host clean).
-rsync -av --delete \
+# rsync the source tree to the host. NO --delete and EXCLUDE .env: the host .env is
+# gitignored (absent locally) and holds JWT_SECRET + GITHUB_CLIENT_SECRET — --delete
+# would erase it and crash the boot. The image is built from explicit Dockerfile
+# COPY dirs, so leftover host files can't pollute it; --delete buys nothing here.
+# DRY-RUN first (-avn) and eyeball the file list before the real run.
+rsync -avn \
   --exclude '.git' --exclude '__pycache__' --exclude '.venv' --exclude '.pytest_cache' \
-  --exclude 'node_modules' \
-  ./ imagineering:~/apps/aiko-chat-gateway/
+  --exclude 'node_modules' --exclude '.env' --exclude '*.bak*' --exclude '.claude' \
+  ./ imagineering:~/apps/aiko-chat-gateway/          # add real run by dropping the n in -avn
 
 # rebuild + recreate. --build is MANDATORY (no registry; image built from this tree).
 ssh imagineering 'cd ~/apps/aiko-chat-gateway && docker compose up -d --build'
