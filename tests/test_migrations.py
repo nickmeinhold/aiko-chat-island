@@ -94,21 +94,33 @@ def test_fresh_db_upgrades_to_head(tmp_path, monkeypatch) -> None:
 
 
 def test_adopt_pre_alembic_db_stamps_baseline(tmp_path, monkeypatch) -> None:
-    """A DB built by the old create_all path (all tables, no alembic_version) is
-    adopted via stamp — migrate.run must NOT try to re-create existing tables."""
+    """A real pre-alembic DB (the BASELINE schema, no alembic_version — exactly the
+    live prod DB before #14 shipped) is adopted by stamping baseline, then brought
+    to head. migrate.run must NOT re-create existing tables.
+
+    We build the pre-alembic DB by upgrading to 0001 then dropping alembic_version
+    — that is the true 0001 schema WITHOUT the later 0002 CHECK constraints. Using
+    create_all here would instead bake in the current models' CHECKs (a DB that
+    never existed in prod) and make 0002's batch rebuild add a duplicate same-named
+    CHECK (Carnot cage-match, PR#24)."""
+    from alembic import command
+    from sqlalchemy import text
+
     async_url, sync_url = _point_app_at(tmp_path, monkeypatch)
 
-    # 1. Simulate the live pre-alembic DB: full schema, but unmanaged.
+    # 1. Build a genuine pre-alembic DB AT the baseline schema, then un-manage it.
+    command.upgrade(migrate._alembic_config(), "0001")
     seed = create_engine(sync_url)
     try:
-        Base.metadata.create_all(seed)
+        with seed.begin() as conn:
+            conn.execute(text("DROP TABLE alembic_version"))
     finally:
         seed.dispose()
 
     # 2. Run the real entrypoint migrator against it.
-    migrate.run()  # must adopt (stamp 0001), not CREATE TABLE -> abort
+    migrate.run()  # must adopt (stamp 0001) then upgrade head, not CREATE-existing
 
-    # 3. It is now managed at the baseline, with the schema intact.
+    # 3. Managed, brought to head, schema intact, each CHECK present exactly once.
     engine = create_engine(sync_url)
     try:
         insp = inspect(engine)
@@ -116,12 +128,19 @@ def test_adopt_pre_alembic_db_stamps_baseline(tmp_path, monkeypatch) -> None:
         with engine.connect() as conn:
             version = conn.exec_driver_sql(
                 "SELECT version_num FROM alembic_version").scalar()
+            channels_sql = conn.exec_driver_sql(
+                "SELECT sql FROM sqlite_master WHERE name='channels'").scalar()
     finally:
         engine.dispose()
 
     assert "alembic_version" in tables
     assert _MODEL_TABLES <= tables
-    assert version == migrate.BASELINE_REVISION
+    # Adoption stamps the baseline THEN upgrades, so an adopted DB ends at HEAD.
+    from alembic.script import ScriptDirectory
+    head = ScriptDirectory.from_config(migrate._alembic_config()).get_current_head()
+    assert version == head
+    # 0002's CHECK was applied exactly once (no duplicate from a double-stamp path).
+    assert channels_sql.count("ck_channels_join_policy") == 1
 
 
 def test_adopt_refuses_to_stamp_a_mismatched_db(tmp_path, monkeypatch) -> None:
