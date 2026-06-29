@@ -48,7 +48,7 @@ async def client(session, monkeypatch):
     monkeypatch.setattr(settings, "github_client_id", "gh-client-id")
     monkeypatch.setattr(settings, "github_client_secret", "gh-secret")
     monkeypatch.setattr(settings, "app_oauth_callback_url",
-                        "https://chat.imagineering.cc/applink/auth")
+                        "aikochat://auth")
     monkeypatch.setattr(settings, "gateway_base_url",
                         "https://chat.imagineering.cc")
 
@@ -80,18 +80,29 @@ def _mock_exchange(monkeypatch, identity=None, exc=None, capture=None):
     monkeypatch.setattr(oauth_broker, "exchange_code", _fake)
 
 
-async def _mint_state(session, provider="github", code_verifier=None) -> str:
+# App-binding (cage-match #37): a known verifier + its S256 challenge, reused
+# across the binding tests below.
+from aiko_gateway.domain.pkce import app_challenge_for
+
+_APP_VERIFIER = "kQ7nFw3xL9pR2sT5vY8bN1cE4gH6jM0aD3fK7lP9qS2u"
+_APP_CHALLENGE = app_challenge_for(_APP_VERIFIER)
+
+
+async def _mint_state(session, provider="github", code_verifier=None,
+                      app_challenge=None) -> str:
     """Create a SERVER-SIDE single-use state nonce (replaces the old signed-JWT
     state). Returns the opaque nonce to send as the callback `state` param."""
     return await state_service.create_state(
-        session, provider=provider, code_verifier=code_verifier)
+        session, provider=provider, code_verifier=code_verifier,
+        app_challenge=app_challenge)
 
 
 # --------------------------------------------------------------------------- #
 # /start
 # --------------------------------------------------------------------------- #
 async def test_start_redirects_to_provider_with_stored_state_nonce(client, session):
-    r = await client.get("/v1/auth/oauth/github/start")
+    r = await client.get(
+        f"/v1/auth/oauth/github/start?app_challenge={_APP_CHALLENGE}")
     assert r.status_code == 302
     loc = r.headers["location"]
     assert loc.startswith("https://github.com/login/oauth/authorize?")
@@ -136,7 +147,7 @@ async def test_callback_new_identity_stores_provisioning_handoff(
         f"/v1/auth/oauth/github/callback?code=authcode&state={state}")
     assert r.status_code == 302
     loc = r.headers["location"]
-    assert loc.startswith("https://chat.imagineering.cc/applink/auth?code=")
+    assert loc.startswith("aikochat://auth?code=")
     handoff_code = httpx.QueryParams(loc.split("?", 1)[1])["code"]
     # The stored payload is MINIMAL provisioning data — NO minted tokens.
     row = await session.get(OAuthHandoff, handoff_code)
@@ -152,7 +163,7 @@ async def test_callback_known_identity_stores_authenticated_handoff(
         session, provider="github", provider_sub="gh-123",
         handle="dev", display_name="Dev", email=None)
     _mock_exchange(monkeypatch, identity=_IDENTITY)
-    state = await _mint_state(session)
+    state = await _mint_state(session, app_challenge=_APP_CHALLENGE)
     r = await client.get(
         f"/v1/auth/oauth/github/callback?code=authcode&state={state}")
     assert r.status_code == 302
@@ -160,7 +171,11 @@ async def test_callback_known_identity_stores_authenticated_handoff(
         r.headers["location"].split("?", 1)[1])["code"]
     row = await session.get(OAuthHandoff, handoff_code)
     payload = json.loads(row.payload)
-    assert payload == {"kind": "authenticated", "user_id": user.id}
+    # The handoff carries the app_challenge from the state (cage-match #37 binding).
+    assert payload == {
+        "kind": "authenticated", "user_id": user.id,
+        "app_challenge": _APP_CHALLENGE,
+    }
     # No minted tokens at rest.
     assert "access_token" not in row.payload
 
@@ -174,7 +189,7 @@ async def test_callback_provider_error_param_redirects_with_error(client, sessio
         f"/v1/auth/oauth/github/callback?error=access_denied&state={state}")
     assert r.status_code == 302
     loc = r.headers["location"]
-    assert loc.startswith("https://chat.imagineering.cc/applink/auth?error=")
+    assert loc.startswith("aikochat://auth?error=")
     assert "code=" not in loc
 
 
@@ -281,7 +296,7 @@ async def test_callback_open_redirect_target_is_fixed(
         "&next=https://evil.example.com")
     assert r.status_code == 302
     loc = r.headers["location"]
-    assert loc.startswith("https://chat.imagineering.cc/applink/auth?")
+    assert loc.startswith("aikochat://auth?")
     assert "evil.example.com" not in loc
 
 
@@ -799,7 +814,8 @@ async def test_pkce_verifier_never_in_authorize_url_or_state(
     monkeypatch.setattr(
         oauth_broker, "_provider_client_secret", lambda s: "pkce-secret")
 
-    r = await client.get("/v1/auth/oauth/pkcetest/start")
+    r = await client.get(
+        f"/v1/auth/oauth/pkcetest/start?app_challenge={_APP_CHALLENGE}")
     assert r.status_code == 302
     loc = r.headers["location"]
     q = httpx.QueryParams(loc.split("?", 1)[1])
@@ -818,3 +834,63 @@ async def test_pkce_verifier_never_in_authorize_url_or_state(
     with pytest.raises(jwt.InvalidTokenError):
         # state is an opaque nonce, not a JWT we can crack open for the verifier.
         jwt.decode(nonce, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
+
+
+# --------------------------------------------------------------------------- #
+# App-bound handoff (cage-match #37) — a handoff code intercepted via a hijacked
+# Android custom scheme is unredeemable without the app-held verifier.
+# --------------------------------------------------------------------------- #
+async def test_start_requires_app_challenge_400(client):
+    # A configured provider but no app_challenge → fail-closed 400 (the binding is
+    # mandatory; the only legitimate caller is the app, which always sends it).
+    r = await client.get("/v1/auth/oauth/github/start")
+    assert r.status_code == 400
+
+
+async def test_start_short_app_challenge_400(client):
+    r = await client.get("/v1/auth/oauth/github/start?app_challenge=tooshort")
+    assert r.status_code == 400
+
+
+async def test_exchange_bound_handoff_correct_verifier_succeeds(client, session):
+    # A handoff bound to _APP_CHALLENGE is redeemable with the matching verifier.
+    code = await handoff_service.create_handoff(session, {
+        "kind": "provisioning", "provider": "github", "provider_sub": "gh-bound",
+        "app_challenge": _APP_CHALLENGE})
+    r = await client.post("/v1/auth/oauth/exchange",
+                          json={"code": code, "app_verifier": _APP_VERIFIER})
+    assert r.status_code == 200
+    assert r.json()["status"] == "provisioning"
+
+
+async def test_exchange_bound_handoff_wrong_verifier_401(client, session):
+    code = await handoff_service.create_handoff(session, {
+        "kind": "provisioning", "provider": "github", "provider_sub": "gh-bound",
+        "app_challenge": _APP_CHALLENGE})
+    r = await client.post("/v1/auth/oauth/exchange",
+                          json={"code": code, "app_verifier": "not-the-verifier"})
+    assert r.status_code == 401
+
+
+async def test_exchange_bound_handoff_missing_verifier_401(client, session):
+    # The interception threat: a thief has the code but never had the verifier.
+    code = await handoff_service.create_handoff(session, {
+        "kind": "provisioning", "provider": "github", "provider_sub": "gh-bound",
+        "app_challenge": _APP_CHALLENGE})
+    r = await client.post("/v1/auth/oauth/exchange", json={"code": code})
+    assert r.status_code == 401
+
+
+async def test_exchange_bound_handoff_wrong_verifier_burns_code(client, session):
+    # The handoff is single-use: a failed verify still consumes it, so a thief
+    # gets exactly one wrong guess, not unlimited retries.
+    code = await handoff_service.create_handoff(session, {
+        "kind": "provisioning", "provider": "github", "provider_sub": "gh-bound",
+        "app_challenge": _APP_CHALLENGE})
+    r1 = await client.post("/v1/auth/oauth/exchange",
+                           json={"code": code, "app_verifier": "wrong"})
+    assert r1.status_code == 401
+    # Even the CORRECT verifier now fails — the code was burned by the first try.
+    r2 = await client.post("/v1/auth/oauth/exchange",
+                           json={"code": code, "app_verifier": _APP_VERIFIER})
+    assert r2.status_code == 401

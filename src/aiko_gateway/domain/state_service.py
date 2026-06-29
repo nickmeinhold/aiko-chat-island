@@ -39,15 +39,19 @@ def _utcnow() -> dt.datetime:
 
 async def create_state(
     session: AsyncSession, *, provider: str, code_verifier: str | None,
+    app_challenge: str | None = None,
 ) -> str:
-    """Store the provider (+ optional PKCE code_verifier) and return its single-use
-    nonce. The nonce is secrets.token_urlsafe(32) — 256 bits of entropy,
-    unguessable. The code_verifier (if any) NEVER leaves the server."""
+    """Store the provider (+ optional PKCE code_verifier, + optional app_challenge)
+    and return its single-use nonce. The nonce is secrets.token_urlsafe(32) — 256
+    bits of entropy, unguessable. The code_verifier (if any) NEVER leaves the
+    server; the app_challenge is the app's S256 challenge that binds the eventual
+    handoff to the originating app (cage-match #37)."""
     nonce = secrets.token_urlsafe(32)
     row = OAuthState(
         nonce=nonce,
         provider=provider,
         code_verifier=code_verifier,
+        app_challenge=app_challenge,
         expires_at=_utcnow() + dt.timedelta(
             seconds=settings.oauth_state_ttl_seconds),
         consumed=False,
@@ -96,4 +100,8 @@ async def consume_state(session: AsyncSession, nonce: str) -> dict | None:
     await session.commit()
     if row is None:  # pragma: no cover — defensive; the UPDATE just matched it
         return None
-    return {"provider": row.provider, "code_verifier": row.code_verifier}
+    return {
+        "provider": row.provider,
+        "code_verifier": row.code_verifier,
+        "app_challenge": row.app_challenge,
+    }
