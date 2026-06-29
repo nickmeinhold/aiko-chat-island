@@ -30,10 +30,10 @@ from aiko_gateway.config import settings
 from aiko_gateway.db import Base
 from aiko_gateway.domain import models  # noqa: F401 — register tables on Base.metadata
 
-# The seven tables the Phase-1 models define (+ alembic_version once managed).
+# The tables the models define (+ alembic_version once managed).
 _MODEL_TABLES = {
     "users", "social_identities", "channels", "memberships",
-    "messages", "user_blocks", "message_reports",
+    "messages", "user_blocks", "message_reports", "device_tokens",
 }
 
 
@@ -147,17 +147,25 @@ def test_adopt_refuses_to_stamp_a_mismatched_db(tmp_path, monkeypatch) -> None:
     """A pre-alembic DB whose schema does NOT match the baseline (here: a table
     dropped) must be REFUSED, not falsely stamped current (Carnot cage-match,
     PR#23). Stamping it would mark the DB managed while a table stays missing
-    forever (create_all is gone)."""
+    forever (create_all is gone).
+
+    Build a GENUINE baseline DB (upgrade 0001 → drop alembic_version) and then
+    introduce the drift, so the only diff is the dropped table — green for the
+    RIGHT reason. (Using create_all here would build HEAD models, whose extra
+    post-baseline tables like device_tokens already differ from baseline, so the
+    refusal would fire regardless of the drop — proving nothing about it.)"""
     import pytest
+    from alembic import command
     from sqlalchemy import text
 
     async_url, sync_url = _point_app_at(tmp_path, monkeypatch)
 
+    command.upgrade(migrate._alembic_config(), "0001")  # genuine baseline schema
     seed = create_engine(sync_url)
     try:
-        Base.metadata.create_all(seed)
-        # Drift: drop a table so the live schema no longer equals baseline 0001.
         with seed.begin() as conn:
+            conn.execute(text("DROP TABLE alembic_version"))  # un-manage (pre-alembic)
+            # Drift: a baseline table goes missing — the ONLY difference vs baseline.
             conn.execute(text("DROP TABLE message_reports"))
     finally:
         seed.dispose()

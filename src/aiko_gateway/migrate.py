@@ -39,17 +39,17 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import tempfile
 
 from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.config import Config
 from alembic.runtime.migration import MigrationContext
-from sqlalchemy import inspect
+from sqlalchemy import MetaData, create_engine, inspect
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
 from .config import settings
-from .db import Base
 from .domain import models  # noqa: F401 — register tables on Base.metadata
 
 log = logging.getLogger("aiko_gateway.migrate")
@@ -77,45 +77,93 @@ def _alembic_config() -> Config:
     return cfg
 
 
-def _inspect(sync_conn) -> tuple[set[str], list]:
-    """Return (table names, baseline-vs-ORM diff) from one sync connection.
+def _baseline_metadata() -> MetaData:
+    """The schema of the BASELINE revision (0001), reflected from a throwaway DB.
 
-    The diff is alembic's own ``compare_metadata`` against the ORM metadata — an
-    empty list means the live schema already equals the models (== baseline 0001,
-    which the parity test pins to the models). Used to decide whether a
-    pre-alembic DB is safe to adopt by stamping."""
-    tables = set(inspect(sync_conn).get_table_names())
-    ctx = MigrationContext.configure(
-        sync_conn,
-        opts={"compare_type": True, "compare_server_default": True,
-              "target_metadata": Base.metadata},
-    )
-    diff = compare_metadata(ctx, Base.metadata)
-    return tables, diff
+    A pre-alembic DB is — by definition — at whatever schema ``create_all``
+    produced when alembic was adopted, which is frozen as baseline 0001. It must
+    be diffed against THAT, not against the live ORM models (``Base.metadata``):
+    the models track HEAD, so every post-baseline migration that adds something
+    ``compare_metadata`` can see (e.g. 0003's ``device_tokens`` table) would make a
+    genuine baseline-era DB falsely look "drifted" and be wrongly refused. (0002's
+    CHECK-only revision masked this because compare_metadata is blind to CHECKs on
+    SQLite — a table addition is the first post-baseline change it can detect.)
+
+    We materialise 0001 once in a temp SQLite file by pointing the app's DB_URL at
+    it for the single ``upgrade`` call (env.py derives the target from
+    settings.db_url; restored in ``finally``), then reflect it. Reflecting BOTH
+    sides from SQLite keeps the later comparison apples-to-apples (no
+    declared-vs-reflected type-normalisation noise). Only built on the adopt path,
+    which is rare (a one-time event per DB)."""
+    with tempfile.TemporaryDirectory() as td:
+        ref_path = os.path.join(td, "baseline.db")
+        original_url = settings.db_url
+        settings.db_url = f"sqlite+aiosqlite:///{ref_path}"
+        try:
+            command.upgrade(_alembic_config(), BASELINE_REVISION)
+        finally:
+            settings.db_url = original_url
+        ref_engine = create_engine(f"sqlite:///{ref_path}")
+        try:
+            meta = MetaData()
+            meta.reflect(bind=ref_engine)
+        finally:
+            ref_engine.dispose()
+    # alembic_version is bookkeeping, not part of the schema being compared.
+    if "alembic_version" in meta.tables:
+        meta.remove(meta.tables["alembic_version"])
+    return meta
 
 
-async def _probe() -> tuple[set[str], list]:
-    """Inspect over the app's async driver so no sync DB driver is needed (the
-    deploy has only aiosqlite; dev has asyncpg). Short-lived NullPool engine."""
+def _compare_to(target: MetaData):
+    """Return a function that diffs a sync connection's live schema against
+    ``target`` via alembic's own ``compare_metadata`` (same opts as env.py)."""
+    def _inner(sync_conn) -> list:
+        ctx = MigrationContext.configure(
+            sync_conn,
+            opts={"compare_type": True, "compare_server_default": True,
+                  "target_metadata": target},
+        )
+        return compare_metadata(ctx, target)
+    return _inner
+
+
+async def _table_names() -> set[str]:
+    """Live table names over the app's async driver (no sync driver needed: the
+    deploy has only aiosqlite, dev has asyncpg). Short-lived NullPool engine."""
     engine = create_async_engine(settings.db_url, poolclass=NullPool)
     try:
         async with engine.connect() as conn:
-            return await conn.run_sync(_inspect)
+            return await conn.run_sync(lambda c: set(inspect(c).get_table_names()))
+    finally:
+        await engine.dispose()
+
+
+async def _diff_against(target: MetaData) -> list:
+    """Diff the live DB against ``target`` over the async driver."""
+    engine = create_async_engine(settings.db_url, poolclass=NullPool)
+    try:
+        async with engine.connect() as conn:
+            return await conn.run_sync(_compare_to(target))
     finally:
         await engine.dispose()
 
 
 def run() -> None:
-    tables, diff = asyncio.run(_probe())
+    tables = asyncio.run(_table_names())
     cfg = _alembic_config()
     adopting = "alembic_version" not in tables and "users" in tables
     if adopting:
+        # Fail-closed (Carnot cage-match, PR#23): only stamp a pre-alembic DB as
+        # baseline if its schema ACTUALLY equals baseline 0001 — diffed against the
+        # baseline schema, not HEAD models (see _baseline_metadata).
+        diff = asyncio.run(_diff_against(_baseline_metadata()))
         if diff:
             raise RuntimeError(
                 "Refusing to adopt a pre-alembic database: its schema does not "
                 f"match baseline {BASELINE_REVISION}. Stamping would falsely mark "
                 "it current and (with create_all gone) the difference would never "
-                "be repaired. Resolve manually. Drift vs the ORM models:\n  "
+                "be repaired. Resolve manually. Drift vs the baseline schema:\n  "
                 + "\n  ".join(str(d) for d in diff)
             )
         log.warning(

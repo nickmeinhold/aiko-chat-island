@@ -42,6 +42,17 @@ class JoinPolicy(enum.StrEnum):
     OPEN = "open"
 
 
+class Platform(enum.StrEnum):
+    """Closed set of push-notification platforms (#16). 'apns' = Apple Push
+    Notification service; 'fcm' = Firebase Cloud Messaging (Android). Same
+    single-source-of-truth pattern as Role/JoinPolicy: the enum drives the DB
+    CHECK on device_tokens.platform via _in_check, so the constraint can't drift
+    from the Python closed set."""
+
+    APNS = "apns"
+    FCM = "fcm"
+
+
 def _in_check(column: str, values: type[enum.StrEnum]) -> str:
     """SQL `column IN ('a', 'b')` derived FROM the enum members, so the DB CHECK
     can never drift from the Python closed set — change the enum, the constraint
@@ -199,3 +210,49 @@ class MessageReport(Base):
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     resolved_at: Mapped[dt.datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True)
+
+
+class DeviceToken(Base):
+    """A user's registered push-notification device token (#16, increment 1).
+
+    The token is issued by APNs/FCM per app INSTALL and routes a push to exactly
+    one physical device. It is GLOBALLY UNIQUE, not unique-per-user: the same
+    device (same token) can change hands between accounts (logout A → login B on
+    the same phone), and a push must always reach the CURRENT owner. So
+    registration is an UPSERT KEYED ON THE TOKEN that reassigns ``user_id`` —
+    never a second row (see ``devices_service.register_device``). A stale row for
+    a previous owner would misroute that device's notifications; UNIQUE(token)
+    makes a duplicate impossible.
+
+    No ON DELETE CASCADE: this codebase never relies on it (cf. accounts_service /
+    channels_service.hard_delete_channel). Account deletion tears these down
+    explicitly, children-before-parent.
+
+    SECURITY NOTE for increment 2 (actual sending): reassign-on-conflict means an
+    actor who somehow obtains another device's token could redirect that device's
+    push routing (a DoS / misdirected-spam vector — NOT a data leak, since pushes
+    are looked up by the recipient's user_id). The token is a device-held secret
+    not exposed by any read path; treat token confidentiality as the boundary and
+    revisit at the send-path cage-match.
+    """
+    __tablename__ = "device_tokens"
+    # Named constraints (not column-level unique=True) so the ORM metadata matches
+    # the hand-written 0003 migration EXACTLY — the parity gate (test_migrations
+    # .test_migrations_match_models) diffs reflected unique constraints, and an
+    # unnamed column-unique would not match the named one in the migration.
+    __table_args__ = (
+        UniqueConstraint("token", name="uq_device_tokens_token"),
+        CheckConstraint(_in_check("platform", Platform),
+                        name="ck_device_tokens_platform"),
+    )
+    id: Mapped[str] = mapped_column(String(26), primary_key=True, default=new_ulid)
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id"), nullable=False, index=True)
+    platform: Mapped[str] = mapped_column(String(8), nullable=False)
+    # APNs tokens are 64 hex chars; FCM registration tokens are ~160+ and grow —
+    # 512 is comfortable headroom. UNIQUE (named, above): one row per device token.
+    token: Mapped[str] = mapped_column(String(512), nullable=False)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
