@@ -78,22 +78,37 @@ Do not proceed past a red suite. There is no CI backstop.
 
 ## Step 1 — Back up the sole-copy prod DB (FIRST, foreground)
 
-The SQLite file is the ONLY copy of message history + auth + ACL. Online-safe copy
-via `.backup` (brief read lock, no downtime), then pull it off-host. Mirrors the
+The SQLite file is the ONLY copy of message history + auth + ACL. Online-safe hot
+copy via Python's `sqlite3.Connection.backup()`, then pull it off-host. Mirrors the
 existing `~/aiko-db-backups/aiko.db.predeploy-*` pattern.
 
+> The container is `python:3.12-slim` — **no `sqlite3` CLI**. Use the stdlib
+> `sqlite3` module's `.backup()` (a proper online hot backup), NOT a `sqlite3
+> /data/aiko.db ".backup"` shell call (that errors `executable not found`).
+
 ```bash
-TS=$(date +%Y%m%d-%H%M%S)
-C=aiko-chat-gateway-aiko-chat-gateway-1
-ssh imagineering "docker exec $C sqlite3 /data/aiko.db \".backup '/data/predeploy-$TS.db'\" \
-  && docker exec $C sqlite3 /data/aiko.db .dump > ~/aiko-db-backups/aiko.db.predeploy-$TS.sql \
-  && docker cp $C:/data/predeploy-$TS.db ~/aiko-db-backups/aiko.db.predeploy-$TS \
-  && docker exec $C rm /data/predeploy-$TS.db \
-  && ls -la ~/aiko-db-backups/aiko.db.predeploy-$TS*"
+TS=$(date +%Y%m%d-%H%M%S); C=aiko-chat-gateway-aiko-chat-gateway-1
+ssh imagineering "
+set -e
+docker exec $C python -c \"
+import sqlite3
+src=sqlite3.connect('/data/aiko.db'); dst=sqlite3.connect('/data/predeploy-$TS.db')
+with dst: src.backup(dst)
+print('integrity_check:', dst.execute('PRAGMA integrity_check').fetchone()[0],
+      '| users:', dst.execute('select count(*) from users').fetchone()[0],
+      '| channels:', dst.execute('select count(*) from channels').fetchone()[0],
+      '| alembic:', dst.execute('select version_num from alembic_version').fetchone()[0])
+\"
+docker exec $C python -c \"import sqlite3,sys; sys.stdout.write('\n'.join(sqlite3.connect('/data/aiko.db').iterdump()))\" \
+  > ~/aiko-db-backups/aiko.db.predeploy-$TS.sql
+docker cp $C:/data/predeploy-$TS.db ~/aiko-db-backups/aiko.db.predeploy-$TS
+docker exec $C rm /data/predeploy-$TS.db
+ls -la ~/aiko-db-backups/aiko.db.predeploy-$TS*; tail -1 ~/aiko-db-backups/aiko.db.predeploy-$TS.sql"
 ```
 
-Confirm the binary is non-trivial in size and the `.sql` dump ends with `COMMIT;`.
-A backup that didn't land = STOP (restore correctness is the product, not a dump that ran).
+Confirm `integrity_check: ok`, the expected row counts, the binary is non-trivial in
+size, and the `.sql` dump ends with `COMMIT;`. A backup that didn't land = STOP
+(restore correctness is the product, not a dump that ran).
 
 ---
 
