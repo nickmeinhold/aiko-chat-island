@@ -24,7 +24,7 @@ hiding can't drift from the read path.
 """
 from __future__ import annotations
 
-from sqlalchemy import exists, select
+from sqlalchemy import delete, exists, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -82,31 +82,63 @@ async def _membership(
     ).scalar_one_or_none()
 
 
-async def _lock_admin_count(session: AsyncSession, channel_id: str) -> int:
-    """Count the channel's admins, ROW-LOCKING those admin rows for the rest of
-    the transaction (``SELECT ... FOR UPDATE``).
+async def _delete_membership_unless_last_admin(
+    session: AsyncSession, *, channel_id: str, user_id: str, is_admin: bool
+) -> bool:
+    """Delete (channel_id, user_id)'s membership, REFUSING to remove the channel's
+    last admin. Returns True if the membership is now GONE (deleted here, OR already
+    removed by a concurrent caller — idempotent), False ONLY if refused because it
+    is the last admin (still present).
 
-    This closes the last-admin TOCTOU race (cage-match PR#10: Maxwell + Kelvin +
-    Carnot consensus). Without the lock, two concurrent admin-removals on a
-    2-admin channel both read count==2, both pass the ``<= 1`` guard, and both
-    delete — orphaning the channel with zero admins. Holding a write lock on the
-    admin rows serializes the second transaction behind the first, so it re-reads
-    count==1 and is correctly refused.
+    Correct on BOTH engines, by TWO complementary mechanisms — each covers the
+    other's blind spot, so neither alone is enough:
 
-    SQLite (the test engine) has no row locks and silently ignores
-    ``with_for_update`` — harmless there because the test session is serial
-    anyway; the lock matters only on Postgres, where the race is real."""
-    rows = (
+    * **Postgres**: ``SELECT ... FOR UPDATE`` locks the admin SET, serialising two
+      concurrent admin-removals — the second blocks, then re-reads the post-commit
+      count. A conditional DELETE alone does NOT suffice under READ COMMITTED: two
+      DELETEs of DIFFERENT admin rows don't conflict, each subquery sees count==2,
+      both commit -> 0 admins (Carnot cage-match, PR#29).
+    * **SQLite** (the prod engine, #1281): FOR UPDATE is a NO-OP (no row locks), so
+      the single-writer lock serialises the writes and the conditional
+      ``admins_remaining > 1`` predicate re-evaluates the count INSIDE the atomic
+      statement under that lock — the second leave sees count==1, deletes 0 rows.
+      FOR UPDATE alone was inert here — the measured orphan bug #12 fixed.
+
+    busy_timeout (db.py) makes the SQLite loser WAIT for the lock rather than
+    SQLITE_BUSY, so it gets a clean LastAdmin instead of a 500."""
+    if is_admin:
+        # Lock the admin set so a concurrent admin-removal serialises on Postgres
+        # (no-op on SQLite, where the single-writer lock + conditional DELETE do it).
         await session.execute(
             select(Membership.user_id)
-            .where(
-                Membership.channel_id == channel_id,
-                Membership.role == Role.ADMIN,
-            )
+            .where(Membership.channel_id == channel_id, Membership.role == Role.ADMIN)
             .with_for_update()
         )
-    ).scalars().all()
-    return len(rows)
+    stmt = delete(Membership).where(
+        Membership.channel_id == channel_id, Membership.user_id == user_id
+    )
+    if is_admin:
+        admins_remaining = (
+            select(func.count())
+            .select_from(Membership)
+            .where(Membership.channel_id == channel_id, Membership.role == Role.ADMIN)
+            .scalar_subquery()
+        )
+        # Delete an admin row only while MORE THAN ONE admin exists — re-evaluated
+        # atomically with the delete (the closed TOCTOU on SQLite).
+        stmt = stmt.where(admins_remaining > 1)
+    result = await session.execute(stmt)
+    if result.rowcount > 0:
+        await session.commit()
+        return True
+    # 0 rows: EITHER the last-admin clause blocked it, OR the row was concurrently
+    # removed by another caller (e.g. an admin removing the same target we're
+    # leaving). Disambiguate — a row that's simply already gone must NOT be reported
+    # as a spurious LastAdmin (Kelvin + Carnot cage-match, PR#29). Only a row still
+    # present (blocked by the count clause) is a genuine last-admin refusal.
+    gone = (await _membership(session, channel_id, user_id)) is None
+    await session.commit()
+    return gone
 
 
 async def _insert_idempotent(
@@ -267,12 +299,13 @@ async def remove_member(
     target = await _membership(session, channel_id, target_user_id)
     if target is None:
         raise NotAMember(target_user_id)
-    # Row-lock the admin set BEFORE the count, so a concurrent admin-removal is
-    # serialized behind us and the last-admin guard can't be raced (PR#10).
-    if target.role == Role.ADMIN and await _lock_admin_count(session, channel_id) <= 1:
+    # Atomic last-admin guard (check+delete in one statement; #12) — a concurrent
+    # admin-removal can't race the count because each DELETE re-evaluates it.
+    deleted = await _delete_membership_unless_last_admin(
+        session, channel_id=channel_id, user_id=target_user_id,
+        is_admin=(target.role == Role.ADMIN))
+    if not deleted:
         raise LastAdmin(channel_id)
-    await session.delete(target)
-    await session.commit()
 
 
 async def leave(
@@ -288,12 +321,13 @@ async def leave(
     mine = await _membership(session, channel_id, actor_id)
     if mine is None:
         raise NotAMember(actor_id)
-    # Same row-locked last-admin guard as remove_member — serializes a racing
-    # concurrent leave so the channel can't be orphaned (PR#10).
-    if mine.role == Role.ADMIN and await _lock_admin_count(session, channel_id) <= 1:
+    # Same atomic last-admin guard as remove_member — a concurrent leave can't
+    # orphan the channel because the count is re-checked inside the DELETE (#12).
+    deleted = await _delete_membership_unless_last_admin(
+        session, channel_id=channel_id, user_id=actor_id,
+        is_admin=(mine.role == Role.ADMIN))
+    if not deleted:
         raise LastAdmin(channel_id)
-    await session.delete(mine)
-    await session.commit()
 
 
 async def list_members(
