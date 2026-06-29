@@ -34,13 +34,13 @@ from aiko_gateway.db import Base
 from aiko_gateway.domain import models  # noqa: F401  (registers tables on Base)
 
 config = context.config
-# URL precedence: an explicitly-provided sqlalchemy.url (a caller did
-# `config.set_main_option("sqlalchemy.url", ...)` — e.g. the parity test pointing
-# at a throwaway DB) wins; otherwise fall back to the app settings so normal
-# runs target the real database off DB_URL. alembic.ini intentionally leaves the
-# url unset, so absent an override this always resolves to settings.db_url.
-if not config.get_main_option("sqlalchemy.url"):
-    config.set_main_option("sqlalchemy.url", settings.db_url)
+# settings.db_url is THE source of truth for which database — one DB_URL, no
+# second knob. We overwrite unconditionally (rather than honouring a pre-existing
+# sqlalchemy.url) so a stray url in alembic.ini, or one left on the config by a
+# caller, can never silently shadow the app's real target (Carnot cage-match,
+# PR#23). Tests point alembic at a throwaway DB by monkeypatching settings.db_url,
+# which flows through here — not by setting a competing url.
+config.set_main_option("sqlalchemy.url", settings.db_url)
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)

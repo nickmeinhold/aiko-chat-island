@@ -85,6 +85,28 @@ def _assert_schema_current(conn) -> None:
         )
 
 
+def _assert_at_head(conn) -> None:
+    """Fail LOUD if the DB's alembic revision is not the script head (Carnot
+    cage-match, PR#23). ``_assert_schema_current`` only checks that the DB is
+    *managed* (alembic_version present); this checks it is *current*. Without it, a
+    DB left at 0001 after a later 0002 ships — e.g. uvicorn started directly,
+    bypassing the entrypoint migration — would boot and serve a stale schema."""
+    from alembic.runtime.migration import MigrationContext
+    from alembic.script import ScriptDirectory
+
+    from .migrate import _alembic_config  # lazy: migrate imports db.Base (cycle)
+
+    head = ScriptDirectory.from_config(_alembic_config()).get_current_head()
+    current = MigrationContext.configure(conn).get_current_revision()
+    if current != head:
+        raise RuntimeError(
+            f"DB is at alembic revision {current!r} but the code's head is "
+            f"{head!r}. The entrypoint runs `python -m aiko_gateway.migrate` "
+            "before serving; if running uvicorn directly (dev), run "
+            "`alembic upgrade head` first. Refusing to serve a stale schema."
+        )
+
+
 async def verify_schema() -> None:
     """Boot-time assertion that the (already-migrated) schema is current. Alembic
     owns creation/evolution via the entrypoint (`aiko_gateway.migrate`); this only
@@ -92,3 +114,4 @@ async def verify_schema() -> None:
     truth rationale."""
     async with engine.connect() as conn:
         await conn.run_sync(_assert_schema_current)
+        await conn.run_sync(_assert_at_head)

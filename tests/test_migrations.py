@@ -58,8 +58,17 @@ def test_migrations_match_models(tmp_path, monkeypatch) -> None:
     engine = create_engine(sync_url)
     try:
         with engine.connect() as conn:
+            # Match env.py's comparison opts (compare_type + compare_server_default)
+            # so the gate sees what a real autogenerate would. NOTE the known
+            # SQLite blind spots in alembic's reflection: CHECK constraints,
+            # partial/expression indexes, and some dialect-normalised types are not
+            # reliably diffed. This is a drift SMOKE TEST, strong for tables /
+            # columns / nullability / uniques / plain indexes; when #11 adds CHECK
+            # constraints (revision 0002) add a targeted assertion for them rather
+            # than trusting compare_metadata alone (Carnot cage-match, PR#23).
             ctx = MigrationContext.configure(
-                conn, opts={"compare_type": True, "target_metadata": Base.metadata})
+                conn, opts={"compare_type": True, "compare_server_default": True,
+                            "target_metadata": Base.metadata})
             diffs = compare_metadata(ctx, Base.metadata)
     finally:
         engine.dispose()
@@ -113,3 +122,34 @@ def test_adopt_pre_alembic_db_stamps_baseline(tmp_path, monkeypatch) -> None:
     assert "alembic_version" in tables
     assert _MODEL_TABLES <= tables
     assert version == migrate.BASELINE_REVISION
+
+
+def test_adopt_refuses_to_stamp_a_mismatched_db(tmp_path, monkeypatch) -> None:
+    """A pre-alembic DB whose schema does NOT match the baseline (here: a table
+    dropped) must be REFUSED, not falsely stamped current (Carnot cage-match,
+    PR#23). Stamping it would mark the DB managed while a table stays missing
+    forever (create_all is gone)."""
+    import pytest
+    from sqlalchemy import text
+
+    async_url, sync_url = _point_app_at(tmp_path, monkeypatch)
+
+    seed = create_engine(sync_url)
+    try:
+        Base.metadata.create_all(seed)
+        # Drift: drop a table so the live schema no longer equals baseline 0001.
+        with seed.begin() as conn:
+            conn.execute(text("DROP TABLE message_reports"))
+    finally:
+        seed.dispose()
+
+    with pytest.raises(RuntimeError, match="does not match baseline"):
+        migrate.run()
+
+    # And it must NOT have stamped/created anything — still no alembic_version.
+    engine = create_engine(sync_url)
+    try:
+        tables = set(inspect(engine).get_table_names())
+    finally:
+        engine.dispose()
+    assert "alembic_version" not in tables
