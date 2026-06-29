@@ -27,7 +27,7 @@ from __future__ import annotations
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from . import moderation_service
+from . import devices_service, moderation_service
 from .memberships_service import ROLE_ADMIN
 from .models import Membership, Message, SocialIdentity, User
 
@@ -100,6 +100,10 @@ async def delete_user_account(session: AsyncSession, user_id: str) -> None:
     # rows (verify-the-neighbor: the just-shipped deletion cascade must learn
     # about every new table that references users).
     await moderation_service.purge_user_moderation_rows(session, user_id)
+    # Push-notification tokens (#16) are another FK child of `users` — they must
+    # go before the user row too (verify-the-neighbor: every new users-referencing
+    # table must join this cascade, exactly as the moderation rows above did).
+    await devices_service.purge_user_devices(session, user_id)
     # Remove federated-identity links and channel memberships (children first).
     await session.execute(
         delete(SocialIdentity).where(SocialIdentity.user_id == user_id))

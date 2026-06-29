@@ -30,10 +30,10 @@ from aiko_gateway.config import settings
 from aiko_gateway.db import Base
 from aiko_gateway.domain import models  # noqa: F401 — register tables on Base.metadata
 
-# The seven tables the Phase-1 models define (+ alembic_version once managed).
+# The tables the models define (+ alembic_version once managed).
 _MODEL_TABLES = {
     "users", "social_identities", "channels", "memberships",
-    "messages", "user_blocks", "message_reports",
+    "messages", "user_blocks", "message_reports", "device_tokens",
 }
 
 
@@ -87,10 +87,21 @@ def test_fresh_db_upgrades_to_head(tmp_path, monkeypatch) -> None:
     engine = create_engine(sync_url)
     try:
         tables = set(inspect(engine).get_table_names())
+        with engine.connect() as conn:
+            device_sql = conn.exec_driver_sql(
+                "SELECT sql FROM sqlite_master WHERE name='device_tokens'").scalar()
     finally:
         engine.dispose()
     assert _MODEL_TABLES <= tables
     assert "alembic_version" in tables
+    # Structural assertion for the platform CHECK (cage-match Carnot, PR#28). The
+    # parity gate's compare_metadata is CHECK-BLIND on SQLite, so a migration that
+    # silently allowed an out-of-set platform would pass it — assert the constraint
+    # is actually in the migrated DDL, not just the model (the same targeted check
+    # 0002's CHECKs got). This is what proves the MIGRATION enforces the closed set,
+    # not only the ORM.
+    assert "ck_device_tokens_platform" in device_sql
+    assert "'apns'" in device_sql and "'fcm'" in device_sql
 
 
 def test_adopt_pre_alembic_db_stamps_baseline(tmp_path, monkeypatch) -> None:
@@ -147,17 +158,25 @@ def test_adopt_refuses_to_stamp_a_mismatched_db(tmp_path, monkeypatch) -> None:
     """A pre-alembic DB whose schema does NOT match the baseline (here: a table
     dropped) must be REFUSED, not falsely stamped current (Carnot cage-match,
     PR#23). Stamping it would mark the DB managed while a table stays missing
-    forever (create_all is gone)."""
+    forever (create_all is gone).
+
+    Build a GENUINE baseline DB (upgrade 0001 → drop alembic_version) and then
+    introduce the drift, so the only diff is the dropped table — green for the
+    RIGHT reason. (Using create_all here would build HEAD models, whose extra
+    post-baseline tables like device_tokens already differ from baseline, so the
+    refusal would fire regardless of the drop — proving nothing about it.)"""
     import pytest
+    from alembic import command
     from sqlalchemy import text
 
     async_url, sync_url = _point_app_at(tmp_path, monkeypatch)
 
+    command.upgrade(migrate._alembic_config(), "0001")  # genuine baseline schema
     seed = create_engine(sync_url)
     try:
-        Base.metadata.create_all(seed)
-        # Drift: drop a table so the live schema no longer equals baseline 0001.
         with seed.begin() as conn:
+            conn.execute(text("DROP TABLE alembic_version"))  # un-manage (pre-alembic)
+            # Drift: a baseline table goes missing — the ONLY difference vs baseline.
             conn.execute(text("DROP TABLE message_reports"))
     finally:
         seed.dispose()
