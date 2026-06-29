@@ -12,7 +12,8 @@ import datetime as dt
 import enum
 
 from sqlalchemy import (
-    Boolean, CheckConstraint, DateTime, ForeignKey, String, Text, UniqueConstraint,
+    BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, String, Text,
+    UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -51,6 +52,17 @@ class Platform(enum.StrEnum):
 
     APNS = "apns"
     FCM = "fcm"
+
+
+class PasskeyOperation(enum.StrEnum):
+    """Closed set of WebAuthn ceremony types (#1471). Same single-source-of-truth
+    pattern as Role/JoinPolicy/Platform: drives the DB CHECK on
+    passkey_challenges.operation via _in_check, so the constraint can't drift from
+    the Python closed set. Pinning the operation stops a register challenge from
+    completing an authenticate ceremony (or vice versa)."""
+
+    REGISTER = "register"
+    AUTHENTICATE = "authenticate"
 
 
 def _in_check(column: str, values: type[enum.StrEnum]) -> str:
@@ -363,6 +375,68 @@ class SocialNonce(Base):
     """
     __tablename__ = "social_nonces"
     nonce: Mapped[str] = mapped_column(String(64), primary_key=True)
+    expires_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False)
+    consumed: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow)
+
+
+class PasskeyCredential(Base):
+    """A registered WebAuthn passkey (#1471). A passkey is a CREDENTIAL — an
+    authenticator-held keypair — not a federated identity, so it gets its own table
+    rather than a SocialIdentity row. authenticate/finish looks a credential up by
+    credential_id, verifies the assertion against public_key, applies the spec
+    sign_count clone-detection rule (a non-increase is clone evidence ONLY when the
+    counts are nonzero — platform authenticators report 0 and never increment, so
+    0/0 is permitted; delegated to py_webauthn), persists the returned count, then
+    issues a session for user_id.
+
+    Why this is the security win of the passkey pivot: a leaked DB yields only
+    PUBLIC keys, which are worthless — the private key never leaves the
+    authenticator. There is no shared secret to steal (contrast password_hash).
+    """
+    __tablename__ = "passkey_credentials"
+    # credential_id is the authenticator's globally-unique handle (base64url) and is
+    # the lookup key in authenticate/finish, hence UNIQUE. We keep a ULID surrogate
+    # PK to match the table convention and avoid a long-string primary-key index.
+    id: Mapped[str] = mapped_column(String(26), primary_key=True, default=new_ulid)
+    credential_id: Mapped[str] = mapped_column(
+        String(512), unique=True, nullable=False)
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id"), nullable=False, index=True)
+    public_key: Mapped[str] = mapped_column(Text, nullable=False)  # base64url(COSE)
+    # uint32 per the WebAuthn spec; BigInteger leaves headroom and never overflows
+    # the monotonic clone-detection comparison.
+    sign_count: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    transports: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON array
+    aaguid: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow)
+    last_used_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True)
+
+
+class PasskeyChallenge(Base):
+    """A single-use WebAuthn ceremony challenge (#1471). Mirrors OAuthState's
+    single-use guarantee (consumed + expires_at, atomic guarded UPDATE — see
+    passkey_service.consume_challenge). `state` is the opaque handle the app
+    round-trips start -> finish; its decoded bytes ARE the WebAuthn challenge the
+    authenticator signs over, so the row is both the DB key and the
+    expected_challenge (no separate column). `operation` pins a challenge to the
+    ceremony that minted it. No user_id: register is anonymous
+    (first-passkey-creates-account) and authenticate is usernameless/discoverable,
+    so neither flow knows the user at start.
+    """
+    __tablename__ = "passkey_challenges"
+    __table_args__ = (
+        CheckConstraint(
+            _in_check("operation", PasskeyOperation),
+            name="ck_passkey_challenges_operation"),
+    )
+    state: Mapped[str] = mapped_column(String(64), primary_key=True)
+    operation: Mapped[str] = mapped_column(String(16), nullable=False)
     expires_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False)
     consumed: Mapped[bool] = mapped_column(

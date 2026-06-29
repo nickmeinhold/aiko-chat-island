@@ -121,6 +121,46 @@ class Settings(BaseSettings):
     # the app POSTing /exchange. Very short — a single immediate redemption.
     oauth_handoff_ttl_seconds: int = 2 * 60  # 2 min
 
+    # --- WebAuthn passkeys (#1471) ---
+    # Passwordless credential sign-in. Endpoints can deploy DARK; the feature stays
+    # invisible to the app until passkey_enabled flips the /providers advertisement
+    # on (the handoff's "deploy endpoints first, advertise last" rollout).
+    passkey_enabled: bool = False
+    # The Relying Party ID — the registrable domain the credential is scoped to.
+    # MUST equal the host the app presents; a credential is bound to this rp_id and
+    # unusable elsewhere. The web expected-origin is DERIVED from it (https://<id>).
+    passkey_rp_id: str = "chat.imagineering.cc"
+    passkey_rp_name: str = "Aiko Chat"
+    # EXTRA expected origins beyond the derived web origin. A native app does NOT
+    # present a single browser origin: iOS presents the web origin https://<rp_id>
+    # (derived, always allowed); Android (Credential Manager) presents an
+    # android:apk-key-hash:<base64url-sha256-of-Play-signing-cert> origin, which is
+    # unknown until Play App Signing is registered (app task #20) — so it is
+    # supplied HERE when known. Empty until then (iOS still works; Android blocked).
+    passkey_extra_origins: list[str] = []
+    # WebAuthn ceremony challenge TTL — the round-trip from start to finish (a user
+    # tapping their authenticator). Short, single-use.
+    passkey_challenge_ttl_seconds: int = 5 * 60  # 5 min
+    # Require USER VERIFICATION (biometric/PIN), not just user presence. A passkey
+    # is a PASSWORDLESS PRIMARY factor, so the default is True (cage-match #38,
+    # Carnot HIGH): without it a stolen UNLOCKED device could authenticate on
+    # possession alone. Drives both the ceremony request (REQUIRED vs PREFERRED) and
+    # the finish-time assertion check. Platform authenticators (iOS/Android) always
+    # do UV, so REQUIRED does not lock them out; flip to False only if a target
+    # authenticator class genuinely can't do UV and possession-only is accepted.
+    passkey_require_user_verification: bool = True
+    # Domain-association files served at /.well-known/* so iOS/Android trust the app
+    # to use passkeys on this domain. App identifiers from the merged app config
+    # (PR#38) — public, not secrets. Served always (the app verifies association
+    # BEFORE passkey_enabled flips advertisement on).
+    passkey_ios_app_id: str = "SPL85G447K.cc.imagineering.aikoChatApp"
+    passkey_android_package: str = "cc.imagineering.aiko_chat_app"
+    # Android Digital Asset Links needs the PLAY APP SIGNING SHA-256 (the cert
+    # Google re-signs with) — unknown until Play signing is registered (app task
+    # #20). Empty until then: assetlinks serves an empty fingerprint list (Android
+    # App Links won't verify yet; the iOS AASA is unaffected). Configure when known.
+    passkey_android_cert_sha256: list[str] = []
+
     # --- HTTP server ---
     host: str = "127.0.0.1"
     port: int = 8095
