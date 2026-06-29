@@ -13,7 +13,7 @@ import logging
 import jwt
 from fastapi import APIRouter, HTTPException, Response, status
 from fastapi.responses import RedirectResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from webauthn.helpers.exceptions import (
@@ -102,6 +102,18 @@ class SocialReq(BaseModel):
     # the issued size (token_urlsafe(32) -> 43 chars, stored String(64)) so an
     # oversized attacker string never reaches the DB comparison (cage-match PR#33).
     nonce: str | None = Field(default=None, min_length=1, max_length=64)
+
+
+class _PasskeyMaterial(BaseModel):
+    """Shape of the verified passkey credential carried in the provisioning token
+    (#1471). Validated at /social/claim before persistence — a TYPED boundary on
+    gateway-signed material so a confused caller / future issuer reuse can't write
+    an unchecked credential row (cage-match #38, Carnot)."""
+    credential_id: str = Field(min_length=1, max_length=512)
+    public_key: str = Field(min_length=1)
+    sign_count: int = Field(ge=0)
+    transports: str | None = None
+    aaguid: str | None = Field(default=None, max_length=64)
 
 
 class SocialClaimReq(BaseModel):
@@ -264,10 +276,22 @@ async def social_claim(req: SocialClaimReq, session: DbSession) -> dict:
     if pending.get("passkey_credential") is not None:
         # Passkey claim: ungated like the passkey endpoints (deploy-dark). Atomic +
         # replay-safe via the credential_id UNIQUE constraint (see create_passkey_user).
+        # Defense-in-depth (cage-match #38, Carnot): branch on an EXPLICIT token
+        # purpose, not just field presence, and validate the material's SHAPE before
+        # persisting — the token is gateway-signed (unforgeable), but a confused
+        # caller / future issuer reuse must not become an unchecked credential write.
+        if pending.get("provider") != "passkey":
+            raise HTTPException(
+                status.HTTP_401_UNAUTHORIZED, "invalid passkey provisioning token")
+        try:
+            material = _PasskeyMaterial.model_validate(pending["passkey_credential"])
+        except ValidationError:
+            raise HTTPException(
+                status.HTTP_401_UNAUTHORIZED, "malformed passkey credential material")
         try:
             user = await users_service.create_passkey_user(
                 session, handle=req.handle, display_name=req.display_name,
-                email=pending["email"], material=pending["passkey_credential"],
+                email=pending["email"], material=material.model_dump(),
             )
         except IntegrityError:
             await session.rollback()

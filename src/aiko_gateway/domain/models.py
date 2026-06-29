@@ -387,9 +387,11 @@ class PasskeyCredential(Base):
     """A registered WebAuthn passkey (#1471). A passkey is a CREDENTIAL — an
     authenticator-held keypair — not a federated identity, so it gets its own table
     rather than a SocialIdentity row. authenticate/finish looks a credential up by
-    credential_id, verifies the assertion against public_key, enforces a strictly
-    increasing sign_count (authenticator-clone detection), then issues a session
-    for user_id.
+    credential_id, verifies the assertion against public_key, applies the spec
+    sign_count clone-detection rule (a non-increase is clone evidence ONLY when the
+    counts are nonzero — platform authenticators report 0 and never increment, so
+    0/0 is permitted; delegated to py_webauthn), persists the returned count, then
+    issues a session for user_id.
 
     Why this is the security win of the passkey pivot: a leaked DB yields only
     PUBLIC keys, which are worthless — the private key never leaves the

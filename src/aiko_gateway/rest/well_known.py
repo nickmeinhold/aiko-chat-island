@@ -26,8 +26,13 @@ def apple_app_site_association() -> dict:
 @router.get("/.well-known/assetlinks.json")
 def android_asset_links() -> list[dict]:
     """Android Digital Asset Links (get_login_creds). The sha256 fingerprint is the
-    Play App Signing cert (app task #20) — empty until registered, so Android App
-    Link verification is pending while iOS works."""
+    Play App Signing cert (app task #20). Until it is configured we serve an EMPTY
+    document rather than a target with no fingerprints — a fingerprint-less target
+    can never verify, so publishing it is a negative/malformed association artifact
+    that a client might cache (cage-match #38, Carnot). Once configured, the target
+    appears."""
+    if not settings.passkey_android_cert_sha256:
+        return []
     return [{
         "relation": ["delegate_permission/common.get_login_creds"],
         "target": {

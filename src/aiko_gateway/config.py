@@ -141,6 +141,14 @@ class Settings(BaseSettings):
     # WebAuthn ceremony challenge TTL — the round-trip from start to finish (a user
     # tapping their authenticator). Short, single-use.
     passkey_challenge_ttl_seconds: int = 5 * 60  # 5 min
+    # Require USER VERIFICATION (biometric/PIN), not just user presence. A passkey
+    # is a PASSWORDLESS PRIMARY factor, so the default is True (cage-match #38,
+    # Carnot HIGH): without it a stolen UNLOCKED device could authenticate on
+    # possession alone. Drives both the ceremony request (REQUIRED vs PREFERRED) and
+    # the finish-time assertion check. Platform authenticators (iOS/Android) always
+    # do UV, so REQUIRED does not lock them out; flip to False only if a target
+    # authenticator class genuinely can't do UV and possession-only is accepted.
+    passkey_require_user_verification: bool = True
     # Domain-association files served at /.well-known/* so iOS/Android trust the app
     # to use passkeys on this domain. App identifiers from the merged app config
     # (PR#38) — public, not secrets. Served always (the app verifies association

@@ -54,10 +54,20 @@ class SoftAuthenticator:
     """A throwaway WebAuthn platform-authenticator: an EC P-256 keypair that builds
     a fmt:'none' attestation and signs assertions exactly as a real device would."""
 
-    def __init__(self, credential_id: bytes = b"test-credential-0001"):
+    def __init__(self, credential_id: bytes = b"test-credential-0001",
+                 user_verified: bool = True):
         self._key = ec.generate_private_key(ec.SECP256R1())
         self.credential_id = credential_id
         self.sign_count = 0  # platform passkeys report 0 and never increment
+        self.user_verified = user_verified  # whether the UV flag is set in authData
+
+    def _flags(self, *, include_cred: bool) -> int:
+        flags = 0x01  # UP (user present) always
+        if self.user_verified:
+            flags |= 0x04  # UV (user verified)
+        if include_cred:
+            flags |= 0x40  # AT (attested credential data)
+        return flags
 
     def _cose_public_key(self) -> bytes:
         nums = self._key.public_key().public_numbers()
@@ -82,8 +92,8 @@ class SoftAuthenticator:
         }).encode()
 
     def register(self, challenge_b64: str) -> dict:
-        # UP | UV | AT (attested credential data present)
-        auth_data = self._auth_data(flags=0x01 | 0x04 | 0x40, include_cred=True)
+        auth_data = self._auth_data(
+            flags=self._flags(include_cred=True), include_cred=True)
         client_data = self._client_data(
             ceremony="webauthn.create", challenge_b64=challenge_b64)
         att_obj = cbor2.dumps({"fmt": "none", "attStmt": {}, "authData": auth_data})
@@ -100,7 +110,8 @@ class SoftAuthenticator:
         }
 
     def authenticate(self, challenge_b64: str) -> dict:
-        auth_data = self._auth_data(flags=0x01 | 0x04, include_cred=False)  # UP | UV
+        auth_data = self._auth_data(
+            flags=self._flags(include_cred=False), include_cred=False)
         client_data = self._client_data(
             ceremony="webauthn.get", challenge_b64=challenge_b64)
         signed = auth_data + hashlib.sha256(client_data).digest()
@@ -219,6 +230,42 @@ async def test_replayed_provisioning_token_conflicts(client):
     assert r2.status_code == 409
 
 
+# --- cage-match #38 hardening (Carnot findings) ---------------------------- #
+
+async def test_register_rejects_unverified_user(client):
+    """UV is REQUIRED by default — a passwordless PRIMARY factor (Carnot HIGH). An
+    authenticator that proves only user PRESENCE (no UV bit) is refused at register."""
+    auth = SoftAuthenticator(user_verified=False)
+    start = (await client.post("/v1/auth/passkey/register/start")).json()
+    finish = await client.post("/v1/auth/passkey/register/finish", json={
+        "state": start["state"], "credential": auth.register(start["options"]["challenge"])})
+    assert finish.status_code == 401
+
+
+async def test_claim_rejects_non_passkey_token_with_injected_material(client):
+    """Confused-deputy guard (Carnot MEDIUM): a token whose provider is NOT 'passkey'
+    but which carries passkey_credential must NOT create a passkey — the branch keys
+    on an explicit purpose, not mere field presence."""
+    from aiko_gateway.domain import security
+    tok = security.issue_provisioning("google", "sub-x", passkey_credential={
+        "credential_id": "Y2lk", "public_key": "cGs", "sign_count": 0})
+    r = await client.post("/v1/auth/social/claim", json={
+        "provisioning_token": tok, "handle": "x", "display_name": ""})
+    assert r.status_code == 401
+
+
+async def test_claim_rejects_malformed_passkey_material(client):
+    """Typed-boundary guard (Carnot MEDIUM): a passkey token whose material fails
+    shape validation (missing public_key) is refused with 401, not persisted (and
+    NOT a 500 from a KeyError deep in create_passkey_user)."""
+    from aiko_gateway.domain import security
+    tok = security.issue_provisioning("passkey", "Y2lk", passkey_credential={
+        "credential_id": "Y2lk"})  # missing public_key / sign_count
+    r = await client.post("/v1/auth/social/claim", json={
+        "provisioning_token": tok, "handle": "x", "display_name": ""})
+    assert r.status_code == 401
+
+
 # --- advertisement + domain association ------------------------------------ #
 
 async def test_providers_advertises_passkey_only_when_enabled(client, monkeypatch):
@@ -239,11 +286,16 @@ async def test_well_known_apple_app_site_association(client):
     assert r.json() == {"webcredentials": {"apps": [settings.passkey_ios_app_id]}}
 
 
-async def test_well_known_assetlinks(client):
+async def test_well_known_assetlinks_empty_until_fingerprints_configured(
+        client, monkeypatch):
+    # Default (no Play-signing SHA yet, app #20): serve [] — NOT a fingerprint-less
+    # target that can never verify (cage-match #38, Carnot).
+    monkeypatch.setattr(settings, "passkey_android_cert_sha256", [])
     r = await client.get("/.well-known/assetlinks.json")
-    assert r.status_code == 200
-    entry = r.json()[0]
+    assert r.status_code == 200 and r.json() == []
+    # Once configured, the target appears with the fingerprint.
+    monkeypatch.setattr(settings, "passkey_android_cert_sha256", ["AB:CD:EF"])
+    entry = (await client.get("/.well-known/assetlinks.json")).json()[0]
     assert entry["relation"] == ["delegate_permission/common.get_login_creds"]
     assert entry["target"]["package_name"] == settings.passkey_android_package
-    # Fingerprints empty until Play signing is registered (app #20).
-    assert entry["target"]["sha256_cert_fingerprints"] == settings.passkey_android_cert_sha256
+    assert entry["target"]["sha256_cert_fingerprints"] == ["AB:CD:EF"]

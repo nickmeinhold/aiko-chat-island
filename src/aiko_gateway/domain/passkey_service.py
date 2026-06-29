@@ -73,6 +73,14 @@ def _expected_origins() -> list[str]:
     return [f"https://{settings.passkey_rp_id}", *settings.passkey_extra_origins]
 
 
+def _uv_requirement() -> UserVerificationRequirement:
+    """REQUIRED vs PREFERRED for the ceremony request, from config (default
+    REQUIRED — a passwordless primary factor demands user verification)."""
+    return (UserVerificationRequirement.REQUIRED
+            if settings.passkey_require_user_verification
+            else UserVerificationRequirement.PREFERRED)
+
+
 # --- challenge store (single-use, TTL'd, atomic consume) ------------------- #
 
 async def _store_challenge(
@@ -144,7 +152,7 @@ async def start_registration(session: AsyncSession) -> dict:
         challenge=raw,
         authenticator_selection=AuthenticatorSelectionCriteria(
             resident_key=ResidentKeyRequirement.REQUIRED,
-            user_verification=UserVerificationRequirement.PREFERRED,
+            user_verification=_uv_requirement(),
         ),
     )
     state = await _store_challenge(
@@ -160,7 +168,7 @@ async def start_authentication(session: AsyncSession) -> dict:
     options = webauthn.generate_authentication_options(
         rp_id=settings.passkey_rp_id,
         challenge=raw,
-        user_verification=UserVerificationRequirement.PREFERRED,
+        user_verification=_uv_requirement(),
     )
     state = await _store_challenge(
         session, raw=raw, operation=PasskeyOperation.AUTHENTICATE)
@@ -180,7 +188,7 @@ def verify_registration(*, raw_challenge: bytes, credential: dict) -> dict:
         expected_challenge=raw_challenge,
         expected_rp_id=settings.passkey_rp_id,
         expected_origin=_expected_origins(),
-        require_user_verification=False,
+        require_user_verification=settings.passkey_require_user_verification,
     )
     # Transports are reported by the authenticator in the RESPONSE (not on the
     # verified result) — a hint for future allowCredentials. Best-effort: store
@@ -214,7 +222,7 @@ def verify_authentication(
         expected_origin=_expected_origins(),
         credential_public_key=base64url_to_bytes(public_key_b64),
         credential_current_sign_count=current_sign_count,
-        require_user_verification=False,
+        require_user_verification=settings.passkey_require_user_verification,
     )
     return verified.new_sign_count
 
