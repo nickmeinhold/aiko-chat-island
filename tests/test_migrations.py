@@ -87,10 +87,21 @@ def test_fresh_db_upgrades_to_head(tmp_path, monkeypatch) -> None:
     engine = create_engine(sync_url)
     try:
         tables = set(inspect(engine).get_table_names())
+        with engine.connect() as conn:
+            device_sql = conn.exec_driver_sql(
+                "SELECT sql FROM sqlite_master WHERE name='device_tokens'").scalar()
     finally:
         engine.dispose()
     assert _MODEL_TABLES <= tables
     assert "alembic_version" in tables
+    # Structural assertion for the platform CHECK (cage-match Carnot, PR#28). The
+    # parity gate's compare_metadata is CHECK-BLIND on SQLite, so a migration that
+    # silently allowed an out-of-set platform would pass it — assert the constraint
+    # is actually in the migrated DDL, not just the model (the same targeted check
+    # 0002's CHECKs got). This is what proves the MIGRATION enforces the closed set,
+    # not only the ORM.
+    assert "ck_device_tokens_platform" in device_sql
+    assert "'apns'" in device_sql and "'fcm'" in device_sql
 
 
 def test_adopt_pre_alembic_db_stamps_baseline(tmp_path, monkeypatch) -> None:

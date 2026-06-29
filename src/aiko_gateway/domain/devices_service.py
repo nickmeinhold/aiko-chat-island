@@ -51,7 +51,15 @@ async def register_device(
                 .where(DeviceToken.token == token)
                 .execution_options(populate_existing=True)
             )
-        ).scalar_one()
+        ).scalar_one_or_none()
+        if existing is None:
+            # Either the conflicting row vanished between the failed insert and
+            # this re-fetch (a register racing an unregister of the same token),
+            # or the IntegrityError was NOT the token-unique violation (a bad FK /
+            # CHECK). Both are non-recoverable here: re-raise the real error rather
+            # than masking it as a NoResultFound (cage-match Carnot, PR#28; mirrors
+            # memberships_service._insert_idempotent).
+            raise
         existing.user_id = user_id
         existing.platform = platform
         existing.updated_at = _utcnow()  # explicit: onupdate fires only on a changed-col flush
@@ -59,16 +67,24 @@ async def register_device(
         return existing
 
 
-async def unregister_device(session: AsyncSession, *, token: str) -> bool:
-    """Remove a device token (app logout / token invalidation). Returns True if a
-    row was deleted, False if the token was not registered.
+async def unregister_device(
+    session: AsyncSession, *, user_id: str, token: str
+) -> bool:
+    """Remove the caller's device token (app logout). Returns True if a row was
+    deleted, False otherwise.
 
-    Deliberately keyed on the TOKEN alone, not (user_id, token): the caller proves
-    possession of the token, and a token maps to exactly one current owner, so
-    there is no cross-user delete risk. This lets a freshly-logged-out device
-    clear its registration even if the row was already reassigned."""
+    Scoped to (user_id, token), NOT token alone (cage-match Maxwell+Carnot, PR#28).
+    Unregistering is purely "clear MY registration" — it never legitimately crosses
+    users — so scoping to the authenticated user closes a cross-user delete vector
+    (an authed caller who learns another user's token could otherwise push-DoS
+    them) at zero cost: if the token was already reassigned to someone else, this
+    correctly no-ops (it's no longer the caller's). Note the asymmetry with
+    register, whose reassign-on-conflict MUST cross users for the device-changes-
+    hands case."""
     result = await session.execute(
-        delete(DeviceToken).where(DeviceToken.token == token)
+        delete(DeviceToken).where(
+            DeviceToken.token == token, DeviceToken.user_id == user_id
+        )
     )
     await session.commit()
     return result.rowcount > 0

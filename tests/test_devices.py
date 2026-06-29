@@ -103,6 +103,22 @@ async def test_unregister_removes_token(client, session):
     assert await devices_service.tokens_for_user(session, alice.id) == []
 
 
+async def test_unregister_cannot_remove_another_users_token(client, session):
+    """The DELETE is scoped to the authenticated user (cage-match PR#28): an authed
+    caller who knows another user's token cannot unregister it (a push-DoS vector).
+    Bob tries to delete Alice's token — 204 (no existence oracle), but Alice's row
+    survives."""
+    alice = await _user(session, "alice")
+    bob = await _user(session, "bob")
+    await client.post("/v1/devices", json={"platform": "apns", "token": "alice-tok"},
+                      headers=_headers(alice))
+    resp = await client.request(
+        "DELETE", "/v1/devices", json={"token": "alice-tok"}, headers=_headers(bob))
+    assert resp.status_code == 204  # no leak that the token exists / belongs to alice
+    survivors = await devices_service.tokens_for_user(session, alice.id)
+    assert [r.token for r in survivors] == ["alice-tok"], "cross-user delete must not strip Alice's token"
+
+
 async def test_unregister_unknown_token_is_still_204(client, session):
     """Idempotent + no existence oracle: unregistering a token that was never
     registered is a no-op success, not a 404 (which would confirm registration)."""

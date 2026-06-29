@@ -9,7 +9,7 @@ messages.sender_user_id / invariant I5).
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, status
 from pydantic import BaseModel, Field
 
 from ..domain import devices_service as svc
@@ -48,4 +48,4 @@ async def unregister_device(
     """Unregister a device token (app logout). 204 whether or not the token was
     present — unregistering an unknown token is not an error (idempotent), and a
     404 would leak whether a given token is registered."""
-    await svc.unregister_device(session, token=req.token)
+    await svc.unregister_device(session, user_id=user.id, token=req.token)
