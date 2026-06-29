@@ -41,6 +41,31 @@ async def test_expired_nonce_rejected(session, monkeypatch):
     assert await nonce_service.consume_nonce(session, nonce) is False
 
 
+async def test_consume_does_not_commit_so_rollback_un_burns(session):
+    """#24 atomic-with-outcome: consume_nonce CLAIMS the nonce but does NOT commit,
+    so if the caller's request rolls back (a downstream sign-in failure) the burn is
+    undone and the SAME nonce works again. Pre-#24 consume committed eagerly, so a
+    rollback could not un-burn it and the user was stranded with a spent nonce.
+
+    RED-proof: re-add `await session.commit()` to consume_nonce and the second
+    consume returns False (the burn was made durable before the rollback)."""
+    nonce = await nonce_service.issue_nonce(session)            # commits the issued row
+    assert await nonce_service.consume_nonce(session, nonce) is True   # claim (uncommitted)
+    await session.rollback()                                   # models per-request session
+    # The claim was never made durable → the nonce is consumable again.
+    assert await nonce_service.consume_nonce(session, nonce) is True
+
+
+async def test_caller_commit_makes_burn_durable(session):
+    """Mirror image: once the caller COMMITS the claim, a later rollback cannot
+    revive the nonce — the burn is durable (cross-request replay stays closed)."""
+    nonce = await nonce_service.issue_nonce(session)
+    assert await nonce_service.consume_nonce(session, nonce) is True
+    await session.commit()                                     # the handler's success commit
+    await session.rollback()                                   # a later rollback must not revive it
+    assert await nonce_service.consume_nonce(session, nonce) is False
+
+
 async def test_issue_prunes_expired_rows(session, monkeypatch):
     """Opportunistic cleanup (Carnot PR#33): issuing prunes already-expired rows so
     an unauthenticated flood can't grow the table without bound."""

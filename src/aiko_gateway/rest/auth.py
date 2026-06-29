@@ -211,20 +211,29 @@ async def social(req: SocialReq, session: DbSession) -> dict:
     # provider-claim match (inside verify above) both properties hold: the nonce is
     # server-issued + single-use AND provider-bound to THIS token.
     #
-    # NAMED TRADEOFF (cage-match PR#33, Carnot MEDIUM): consume_nonce commits the
-    # redemption, then _resolve_identity runs. If _resolve_identity fails (it does
-    # NO writes/commits — only a user lookup + JWT mint, so the only failure is a
-    # transient DB-read outage), the nonce is burned though no session issued. This
-    # FAILS CLOSED (no auth granted) and costs the user one /nonce re-fetch. It is
-    # accepted because it is IDENTICAL to the deployed broker /callback (consume_
-    # state then _resolve_identity) — making the two consume paths atomic-with-
-    # outcome is a separate refactor that must touch BOTH together (tracked).
+    # ATOMIC-WITH-OUTCOME (#24): consume_nonce CLAIMS the nonce (conditional UPDATE,
+    # row locked, concurrent replays still collapse) but does NOT commit. We commit
+    # only AFTER _resolve_identity succeeds, so a transient failure in the OUTCOME
+    # (a DB-read outage during the user lookup) rolls back the claim via the
+    # request session and the app retries the SAME nonce — no stranded sign-in.
+    # Deferring the commit is safe here ONLY because there is no network IO between
+    # the claim and the commit (just a local read + JWT mint), so the SQLite write
+    # lock is held momentarily. The broker /callback is DELIBERATELY not symmetric:
+    # it has the provider code-exchange in that gap (holding the lock across a
+    # network call would stall every gateway write) AND it is a one-shot browser
+    # redirect with no retry channel, so atomicity there is all cost and no benefit
+    # — it commits its state burn eagerly (see oauth_callback / consume_state).
     if req.nonce is not None and not await nonce_service.consume_nonce(
             session, req.nonce):
+        await session.rollback()
         raise HTTPException(
             status.HTTP_401_UNAUTHORIZED, "invalid or expired nonce")
     # Single door: verified identity → session/provisioning outcome.
-    return await _resolve_identity(session, identity)
+    outcome = await _resolve_identity(session, identity)
+    if req.nonce is not None:
+        # Outcome succeeded — make the burn durable, atomic with the sign-in.
+        await session.commit()
+    return outcome
 
 
 @router.post("/social/claim")
@@ -358,6 +367,16 @@ async def oauth_callback(
     # at-most-once, not an atomicity bug. Service-commit convention (get_session
     # does not commit); a single request txn would hold the state row-lock across
     # the provider network call.
+    #
+    # NOT atomic-with-outcome, DELIBERATELY asymmetric to /social (#24). Two
+    # channel-rooted reasons make eager consume correct HERE where it was a bug
+    # there: (1) deferring the commit would hold the SQLite write lock across the
+    # exchange_code network call below, stalling every other gateway writer up to
+    # busy_timeout; (2) this is a ONE-SHOT browser redirect — on any failure we 302
+    # to the app with ?error and the user restarts from /start with a fresh state,
+    # so an un-burned state has no retry channel to be reused on and atomicity buys
+    # nothing observable. /social is a retryable API call, so deferring its commit
+    # is a real win; here it is all cost and no benefit.
     st = await state_service.consume_state(session, state)
     if st is None:
         return _app_callback_redirect(error="bad_state")

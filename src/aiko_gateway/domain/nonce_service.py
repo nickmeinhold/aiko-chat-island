@@ -57,15 +57,27 @@ async def issue_nonce(session: AsyncSession) -> str:
 
 
 async def consume_nonce(session: AsyncSession, nonce: str) -> bool:
-    """Atomically consume a nonce exactly once. True iff the nonce exists, is
-    unexpired, and was not already consumed; otherwise False (missing / expired /
-    already-consumed / forged → caller fails closed).
+    """Atomically claim a nonce exactly once, WITHOUT committing. True iff the
+    nonce exists, is unexpired, and was not already consumed; otherwise False
+    (missing / expired / already-consumed / forged → caller fails closed).
 
     The single-use guarantee is the conditional UPDATE: it flips consumed False ->
     True only for an unexpired, unconsumed row, and rowcount tells us whether THIS
     call won. Two concurrent redemptions race on that UPDATE; at most one gets
     rowcount==1. No read-then-write (which would TOCTOU) — the DB arbitrates. This
     is the property that makes a captured-and-replayed sign-in request fail.
+
+    ATOMIC-WITH-OUTCOME (#24): this does NOT commit. The conditional UPDATE leaves
+    the row locked for the rest of the request, so concurrent replays still
+    collapse to one winner, but the burn is not made DURABLE until the caller
+    commits — which it does only after the sign-in OUTCOME succeeds. So a transient
+    failure AFTER the claim (e.g. _resolve_identity) rolls back the burn and the
+    app may retry the SAME nonce. The caller MUST commit on success (and let the
+    request session roll back on failure). Safe to defer the commit here ONLY
+    because the native /social path does no network IO between this claim and the
+    commit; the broker /callback path is DELIBERATELY not symmetric (it has the
+    provider code-exchange in that gap) and commits its state burn eagerly — see
+    state_service.consume_state.
     """
     now = _utcnow()
     result = await session.execute(
@@ -77,5 +89,4 @@ async def consume_nonce(session: AsyncSession, nonce: str) -> bool:
         )
         .values(consumed=True)
     )
-    await session.commit()
     return result.rowcount == 1

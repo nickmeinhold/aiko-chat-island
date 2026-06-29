@@ -68,6 +68,14 @@ async def consume_state(session: AsyncSession, nonce: str) -> dict | None:
     rowcount==1. This is the single-use + double-spend + replay guard — we never
     read-then-write (which would TOCTOU), we let the DB arbitrate via the
     conditional update.
+
+    Commits EAGERLY (unlike nonce_service.consume_nonce, which defers its commit to
+    be atomic-with-outcome, #24). This is the deliberate asymmetry: the broker
+    /callback does a provider code-exchange (network) AFTER consuming state, so
+    deferring the commit would hold the SQLite write lock across that network call;
+    and the callback is a one-shot browser redirect with no retry channel, so an
+    un-burned state could never be reused anyway. Eager at-most-once is correct
+    here; deferred atomicity is correct on the retryable /social path.
     """
     now = _utcnow()
     result = await session.execute(
