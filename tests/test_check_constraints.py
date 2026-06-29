@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pytest
 from alembic import command
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.exc import IntegrityError
 
 from aiko_gateway import migrate
@@ -26,14 +26,18 @@ _INSERT_CHANNEL = (
     "join_policy, created_at) VALUES "
     "('c1', 'c', 'standard', 'aiko/c', 0, :jp, '" + _TS + "')"
 )
-_INSERT_USER = (
-    "INSERT INTO users (id, username, display_name, aiko_username, created_at) "
-    "VALUES ('u1', 'u', 'U', 'u', '" + _TS + "')"
-)
-_INSERT_MEMBERSHIP = (
-    "INSERT INTO memberships (channel_id, user_id, role, can_post, joined_at) "
-    "VALUES ('c1', 'u1', :role, 1, '" + _TS + "')"
-)
+def _insert_user(uid: str) -> str:
+    return (
+        "INSERT INTO users (id, username, display_name, aiko_username, created_at) "
+        f"VALUES ('{uid}', '{uid}', '{uid}', '{uid}', '{_TS}')"
+    )
+
+
+def _insert_membership(uid: str) -> str:
+    return (
+        "INSERT INTO memberships (channel_id, user_id, role, can_post, joined_at) "
+        f"VALUES ('c1', '{uid}', :role, 1, '{_TS}')"
+    )
 
 
 def _fresh_at_head(tmp_path, monkeypatch):
@@ -48,12 +52,15 @@ def test_role_check_rejects_out_of_set(tmp_path, monkeypatch):
     try:
         with engine.begin() as c:
             c.execute(text(_INSERT_CHANNEL), {"jp": "invite_only"})
-            c.execute(text(_INSERT_USER))
-            c.execute(text(_INSERT_MEMBERSHIP), {"role": "member"})  # valid -> ok
-        with pytest.raises(IntegrityError):
+            c.execute(text(_insert_user("u1")))
+            c.execute(text(_insert_user("u2")))
+            c.execute(text(_insert_membership("u1")), {"role": "member"})  # valid
+        # DISTINCT user (u2) so a failure can ONLY be the role CHECK, never the
+        # composite-PK collision that masked it before (Carnot cage-match, PR#24).
+        with pytest.raises(IntegrityError) as exc:
             with engine.begin() as c:
-                c.execute(text(_INSERT_MEMBERSHIP.replace("'u1'", "'u1'")),
-                          {"role": "superadmin"})  # out of set -> CHECK rejects
+                c.execute(text(_insert_membership("u2")), {"role": "superadmin"})
+        assert "ck_memberships_role" in str(exc.value) or "CHECK" in str(exc.value)
     finally:
         engine.dispose()
 
@@ -72,9 +79,11 @@ def test_join_policy_check_rejects_out_of_set(tmp_path, monkeypatch):
         engine.dispose()
 
 
-def test_upgrade_0001_to_0002_preserves_data_and_applies_check(tmp_path, monkeypatch):
-    """The evolution path: a DB at 0001 with data, upgraded one step to 0002,
-    keeps its rows (batch table-rebuild copied them) AND now enforces the CHECK."""
+def test_upgrade_0001_to_0002_preserves_data_structure_and_applies_check(
+        tmp_path, monkeypatch):
+    """The evolution path: a DB at 0001 with data, upgraded one step to 0002.
+    The batch table-rebuild must keep the rows AND the structure (memberships'
+    composite PK + both FKs) AND turn the CHECKs on (Carnot cage-match, PR#24)."""
     db = tmp_path / "evolve.db"
     monkeypatch.setattr(settings, "db_url", f"sqlite+aiosqlite:///{db}")
     cfg = migrate._alembic_config()
@@ -85,23 +94,37 @@ def test_upgrade_0001_to_0002_preserves_data_and_applies_check(tmp_path, monkeyp
     try:
         with engine.begin() as c:
             c.execute(text(_INSERT_CHANNEL), {"jp": "invite_only"})
-        # At 0001 the CHECK does not exist yet — an out-of-set value is accepted.
-        with engine.begin() as c:
-            c.execute(text(_INSERT_CHANNEL.replace("'c1'", "'cBAD'")
-                           .replace("'aiko/c'", "'aiko/bad'")), {"jp": "bogus"})
-            c.execute(text("DELETE FROM channels WHERE id='cBAD'"))  # clean before upgrade
+            c.execute(text(_insert_user("u1")))
+            c.execute(text(_insert_membership("u1")), {"role": "admin"})
     finally:
         engine.dispose()
 
-    command.upgrade(cfg, "head")  # apply 0002 (batch rebuild)
+    command.upgrade(cfg, "head")  # apply 0002 (batch rebuild of channels + memberships)
 
     engine = create_engine(sync_url)
     try:
+        insp = inspect(engine)
+        # Rows survived the rebuild.
         with engine.connect() as c:
-            # Data survived the table rebuild.
-            assert c.execute(text("SELECT join_policy FROM channels WHERE id='c1'"
-                                  )).scalar() == "invite_only"
-        # And the CHECK is now live.
+            assert c.execute(text(
+                "SELECT join_policy FROM channels WHERE id='c1'")).scalar() == "invite_only"
+            assert c.execute(text(
+                "SELECT role FROM memberships WHERE channel_id='c1' AND user_id='u1'"
+            )).scalar() == "admin"
+        # Structure survived: memberships composite PK + both FKs.
+        assert set(insp.get_pk_constraint("memberships")["constrained_columns"]) == {
+            "channel_id", "user_id"}
+        fk_targets = {fk["referred_table"] for fk in insp.get_foreign_keys("memberships")}
+        assert fk_targets == {"channels", "users"}
+        # Composite PK still rejects a duplicate membership.
+        with pytest.raises(IntegrityError):
+            with engine.begin() as c:
+                c.execute(text(_insert_membership("u1")), {"role": "member"})
+        # And both CHECKs are now live.
+        with pytest.raises(IntegrityError):
+            with engine.begin() as c:
+                c.execute(text(_insert_user("u3")))
+                c.execute(text(_insert_membership("u3")), {"role": "bogus"})
         with pytest.raises(IntegrityError):
             with engine.begin() as c:
                 c.execute(text(_INSERT_CHANNEL.replace("'c1'", "'c3'")

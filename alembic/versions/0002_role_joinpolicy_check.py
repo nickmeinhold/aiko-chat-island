@@ -13,6 +13,14 @@ each table (create new + copy + swap) with the constraint applied — the first
 real schema *evolution* on top of the alembic adoption (#14). The literals here
 must stay in sync with the Role / JoinPolicy enums in domain/models.py.
 
+FK-enforcement dependency (Carnot cage-match, PR#24): rebuilding ``channels`` (a
+parent of ``memberships.channel_id``) drops+recreates the table. This is safe
+because the gateway does NOT enable SQLite ``PRAGMA foreign_keys`` (it relies on
+application-level explicit cascades, see db.py / accounts_service) — so the
+parent-table swap cannot trip a child FK violation mid-rebuild. Were FK
+enforcement ever turned on, this migration would need to toggle the pragma around
+the batch window.
+
 Revision ID: 0002
 Revises: 0001
 Create Date: 2026-06-29
