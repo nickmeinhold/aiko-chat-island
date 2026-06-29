@@ -329,3 +329,89 @@ async def test_jwks_cache_ceiling_forces_refresh_when_stale():
     cache._fetched_at = time.monotonic() - 200                       # now stale (> max_age)
     await cache.get_key("k1")
     assert calls["n"] == 2                                            # stale hit → refresh
+
+
+# --- nonce binding / replay defense (#13) ----------------------------------- #
+# These exercise the REAL provider-aware comparison: Google echoes the nonce raw,
+# Apple echoes SHA-256(nonce) hex. The app always supplies the RAW nonce.
+
+_APPLE_ISS = "https://appleid.apple.com"
+_APPLE_AUD = "cc.imagineering.aikoChatApp"
+
+
+@pytest.fixture
+def wired_apple(rsa_key, monkeypatch):
+    """Mirror of wired_google for the Apple provider (hashed-nonce path)."""
+    monkeypatch.setattr(settings, "apple_client_ids", [_APPLE_AUD])
+    cache = oauth._PROVIDERS["apple"].jwks
+    monkeypatch.setattr(cache, "_keys", {_KID: rsa_key.public_key()})
+    monkeypatch.setattr(cache, "_fetched_at", time.monotonic())
+    return rsa_key
+
+
+async def test_nonce_not_supplied_skips_check(wired_google):
+    """Back-compat: no expected_nonce ⇒ the claim is never inspected (today's app
+    path). A token WITHOUT a nonce claim still verifies."""
+    token = _make_token(wired_google)  # no nonce claim
+    identity = await oauth.verify_id_token("google", token)
+    assert identity.sub == "google-sub-123"
+
+
+async def test_google_raw_nonce_matches(wired_google):
+    token = _make_token(wired_google, nonce="nonce-abc")
+    identity = await oauth.verify_id_token(
+        "google", token, expected_nonce="nonce-abc")
+    assert identity.sub == "google-sub-123"
+
+
+async def test_google_nonce_mismatch_rejected(wired_google):
+    token = _make_token(wired_google, nonce="nonce-abc")
+    with pytest.raises(oauth.InvalidProviderToken):
+        await oauth.verify_id_token("google", token, expected_nonce="WRONG")
+
+
+async def test_apple_hashed_nonce_matches(wired_apple):
+    """Apple echoes SHA-256(raw) hex; the app supplies the RAW nonce and the
+    verifier must hash before comparing. A naive equality check would reject this."""
+    raw = "device-random-xyz"
+    hashed = hashlib.sha256(raw.encode()).hexdigest()
+    token = _make_token(wired_apple, iss=_APPLE_ISS, aud=_APPLE_AUD,
+                        sub="apple-sub-1", nonce=hashed)
+    identity = await oauth.verify_id_token(
+        "apple", token, expected_nonce=raw)
+    assert identity.sub == "apple-sub-1"
+
+
+async def test_apple_raw_nonce_in_claim_rejected(wired_apple):
+    """Defends the asymmetry: if an Apple token carried the RAW nonce (wrong shape,
+    or a downgrade attempt), the hashed comparison rejects it."""
+    raw = "device-random-xyz"
+    token = _make_token(wired_apple, iss=_APPLE_ISS, aud=_APPLE_AUD,
+                        sub="apple-sub-1", nonce=raw)  # raw, not hashed
+    with pytest.raises(oauth.InvalidProviderToken):
+        await oauth.verify_id_token("apple", token, expected_nonce=raw)
+
+
+async def test_expected_nonce_but_token_has_none_rejected(wired_google):
+    """The replay case: an attacker replays a token that carries NO nonce while
+    enforcement expects one. A missing claim can never satisfy the expectation."""
+    token = _make_token(wired_google)  # no nonce claim
+    with pytest.raises(oauth.InvalidProviderToken):
+        await oauth.verify_id_token("google", token, expected_nonce="nonce-abc")
+
+
+async def test_non_ascii_nonce_fails_closed_not_typeerror(wired_google):
+    """Kelvin (cage-match PR#32): hmac.compare_digest on str raises TypeError for
+    non-ASCII — a crafted token nonce would 500 instead of 401. Byte comparison
+    must fail CLOSED (InvalidProviderToken), never TypeError."""
+    token = _make_token(wired_google, nonce="café-über")  # non-ASCII claim
+    with pytest.raises(oauth.InvalidProviderToken):
+        await oauth.verify_id_token("google", token, expected_nonce="mismatch")
+
+
+async def test_non_ascii_nonce_matches_on_bytes(wired_google):
+    """The same non-ASCII value compares equal once both sides are utf-8 bytes."""
+    raw = "café-über"
+    token = _make_token(wired_google, nonce=raw)
+    identity = await oauth.verify_id_token("google", token, expected_nonce=raw)
+    assert identity.sub == "google-sub-123"
