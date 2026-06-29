@@ -212,7 +212,10 @@ async def social(req: SocialReq, session: DbSession) -> dict:
     # server-issued + single-use AND provider-bound to THIS token.
     #
     # ATOMIC-WITH-OUTCOME (#24): consume_nonce CLAIMS the nonce (conditional UPDATE,
-    # row locked, concurrent replays still collapse) but does NOT commit. We commit
+    # row locked) but does NOT commit. Concurrent replays collapse to at most one
+    # COMMITTED winner — a claim whose request then fails rolls back and correctly
+    # leaves the nonce usable for the retry (cage-match #35, Carnot: the guarantee
+    # is one committed outcome per nonce, not one attempted request). We commit
     # only AFTER _resolve_identity succeeds, so a transient failure in the OUTCOME
     # (a DB-read outage during the user lookup) rolls back the claim via the
     # request session and the app retries the SAME nonce — no stranded sign-in.
@@ -230,9 +233,12 @@ async def social(req: SocialReq, session: DbSession) -> dict:
             status.HTTP_401_UNAUTHORIZED, "invalid or expired nonce")
     # Single door: verified identity → session/provisioning outcome.
     outcome = await _resolve_identity(session, identity)
-    if req.nonce is not None:
-        # Outcome succeeded — make the burn durable, atomic with the sign-in.
-        await session.commit()
+    # Commit AFTER the outcome succeeds — this makes the nonce burn durable, atomic
+    # with the sign-in. UNCONDITIONAL (not gated on req.nonce) so the commit
+    # boundary holds even if _resolve_identity ever grows a write path, and so the
+    # optional-nonce mode can't hide it; when there is no nonce and nothing pending
+    # it is a harmless no-op (cage-match #35, Carnot + Maxwell).
+    await session.commit()
     return outcome
 
 

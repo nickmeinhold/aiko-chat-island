@@ -68,9 +68,10 @@ async def consume_nonce(session: AsyncSession, nonce: str) -> bool:
     is the property that makes a captured-and-replayed sign-in request fail.
 
     ATOMIC-WITH-OUTCOME (#24): this does NOT commit. The conditional UPDATE leaves
-    the row locked for the rest of the request, so concurrent replays still
-    collapse to one winner, but the burn is not made DURABLE until the caller
-    commits — which it does only after the sign-in OUTCOME succeeds. So a transient
+    the row locked for the rest of the request, so concurrent replays collapse to
+    at most one COMMITTED winner (a claim whose request rolls back leaves the nonce
+    usable — the intended retry path), but the burn is not made DURABLE until the
+    caller commits — which it does only after the sign-in OUTCOME succeeds. So a transient
     failure AFTER the claim (e.g. _resolve_identity) rolls back the burn and the
     app may retry the SAME nonce. The caller MUST commit on success (and let the
     request session roll back on failure). Safe to defer the commit here ONLY
