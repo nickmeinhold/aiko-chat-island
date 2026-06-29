@@ -125,3 +125,58 @@ def test_dev_social_enabled_without_client_ids_boots():
     # still rejects tokens at runtime, but dev isn't blocked from booting).
     s = Settings(_env_file=None, environment="dev", social_signin_enabled=True)
     assert s.social_signin_enabled is True
+
+
+def test_prod_social_enabled_with_only_broker_boots():
+    # A broker-only deployment (cage-match #30 r2): social sign-in enabled in prod
+    # with NO native client IDs but a fully-configured broker provider (github id +
+    # secret) satisfies "at least one usable provider" — the broker IS the usable
+    # provider, so it must boot.
+    s = Settings(_env_file=None, environment="production",
+                 jwt_secret=_STRONG_SECRET, social_signin_enabled=True,
+                 github_client_id="gh-id", github_client_secret="gh-secret")
+    assert s.social_signin_enabled is True
+
+
+def test_prod_social_enabled_with_nothing_configured_raises():
+    # Social enabled in prod with NOTHING (no native IDs, no broker) is still a
+    # guaranteed-broken config — fail LOUD at boot (cage-match #30 r2).
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, environment="production",
+                 jwt_secret=_STRONG_SECRET, social_signin_enabled=True)
+
+
+# --- invariant 4: OAuth broker provider XOR config (#21) --------------------
+
+def test_prod_broker_id_without_secret_raises():
+    # A half-configured broker provider (id but no secret) is a latent footgun —
+    # it would fail mid-login with an opaque 4xx. Fail LOUD at boot.
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, environment="production",
+                 jwt_secret=_STRONG_SECRET, github_client_id="gh-id")
+
+
+def test_prod_broker_secret_without_id_raises():
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, environment="production",
+                 jwt_secret=_STRONG_SECRET, github_client_secret="gh-secret")
+
+
+def test_prod_broker_both_set_boots():
+    s = Settings(_env_file=None, environment="production",
+                 jwt_secret=_STRONG_SECRET,
+                 github_client_id="gh-id", github_client_secret="gh-secret")
+    assert s.github_client_id == "gh-id"
+
+
+def test_prod_broker_neither_set_boots():
+    # No broker provider configured at all is fine — the provider is simply absent.
+    s = Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET)
+    assert s.github_client_id == ""
+
+
+def test_dev_broker_half_config_boots():
+    # Dev stays frictionless — the XOR guard is prod-only (a half-config dev
+    # provider simply lists/behaves as not-configured at runtime, fail-closed).
+    s = Settings(_env_file=None, environment="dev", github_client_id="gh-id")
+    assert s.github_client_id == "gh-id"

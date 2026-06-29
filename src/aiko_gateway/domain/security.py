@@ -108,3 +108,22 @@ def decode_provisioning(token: str) -> dict:
         "suggested_name": payload.get("suggested_name"),
         "email": payload.get("email"),
     }
+
+
+# --- OAuth broker state (#21) ---------------------------------------------- #
+# The broker's authorization-code flow `state` parameter is NO LONGER a signed
+# self-contained token (cage-match #30, Finding 1). It is now a SERVER-SIDE
+# single-use nonce (domain/state_service.py + the OAuthState model). Two reasons
+# the JWT was removed:
+#
+#   * PKCE — a stateless JWT had to carry the PKCE code_verifier through the
+#     browser/provider (base64-readable in the URL), defeating PKCE. The verifier
+#     now lives only in the server-side state row; only the code_challenge crosses
+#     the wire.
+#   * REPLAY / login-CSRF — a signed-stateless state is replayable within its exp
+#     window. The nonce is single-use (consumed + expires_at, atomic redemption),
+#     so a captured callback URL can't be replayed at the state layer.
+#
+# The earlier NAMED TRADEOFF ("no server-side single-use state store; the
+# provider code's single-use property is the only backstop") is therefore
+# RETIRED — the store now exists and IS the single-use guard.

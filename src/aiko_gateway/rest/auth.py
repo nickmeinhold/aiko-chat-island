@@ -11,13 +11,19 @@ import logging
 
 import jwt
 from fastapi import APIRouter, HTTPException, Response, status
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import settings
-from ..domain import accounts_service, oauth, security, users_service
+from ..domain import (
+    accounts_service, handoff_service, oauth, oauth_broker, security,
+    state_service, users_service,
+)
 from ..domain.models import User
-from ..domain.oauth import Provider
+from ..domain.oauth import Provider, VerifiedIdentity
+from ..domain.pkce import make_pkce_pair
 from .deps import CurrentUser, DbSession
 
 router = APIRouter(prefix="/v1/auth", tags=["auth"])
@@ -101,6 +107,40 @@ class SocialClaimReq(BaseModel):
         return v
 
 
+async def _resolve_identity(
+    session: AsyncSession, identity: VerifiedIdentity,
+) -> dict:
+    """THE SINGLE DOOR (#21): turn a VERIFIED federated identity into a session
+    outcome. There is exactly ONE place that does this — both the native
+    /social path and the broker /callback path call it, so a verified identity
+    behaves identically whichever flow produced it.
+
+      * KNOWN (provider, sub) → authenticated dict: real access+refresh tokens +
+        the user view.
+      * NEW identity → provisioning dict: a short-lived signed provisioning token
+        carrying (provider, sub, suggested_name, email) + the suggested fields.
+        No DB row until the user claims a handle at /social/claim.
+
+    The caller is responsible for having VERIFIED the identity (id-token
+    signature or authorization-code exchange) before calling — this door trusts
+    its `identity` argument absolutely."""
+    user = await users_service.get_user_by_social(
+        session, identity.provider, identity.sub)
+    if user is not None:
+        return {**_tokens(user.id), "user": _user_view(user)}
+
+    provisioning_token = security.issue_provisioning(
+        identity.provider, identity.sub,
+        suggested_name=identity.suggested_name, email=identity.email,
+    )
+    return {
+        "status": "provisioning",
+        "provisioning_token": provisioning_token,
+        "suggested_name": identity.suggested_name,
+        "email": identity.email,
+    }
+
+
 @router.post("/social")
 async def social(req: SocialReq, session: DbSession) -> dict:
     """Verify a provider ID token. Known identity → real tokens. Brand-new
@@ -120,23 +160,8 @@ async def social(req: SocialReq, session: DbSession) -> dict:
     except oauth.InvalidProviderToken:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid provider token")
 
-    user = await users_service.get_user_by_social(
-        session, identity.provider, identity.sub)
-    if user is not None:
-        return {**_tokens(user.id), "user": _user_view(user)}
-
-    # New federated identity → hand back a signed provisioning token (the pending
-    # state). The client then POSTs /social/claim with a chosen handle.
-    provisioning_token = security.issue_provisioning(
-        identity.provider, identity.sub,
-        suggested_name=identity.suggested_name, email=identity.email,
-    )
-    return {
-        "status": "provisioning",
-        "provisioning_token": provisioning_token,
-        "suggested_name": identity.suggested_name,
-        "email": identity.email,
-    }
+    # Single door: verified identity → session/provisioning outcome.
+    return await _resolve_identity(session, identity)
 
 
 @router.post("/social/claim")
@@ -173,6 +198,224 @@ async def refresh(req: RefreshReq) -> dict:
     except jwt.InvalidTokenError:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid refresh token")
     return {"access_token": security.issue_access(user_id)}
+
+
+# --- OAuth broker (server-side authorization-code flow, #21) ---------------- #
+# A SEPARATE concern from the native /social path but the SAME prefix and the
+# SAME single door (_resolve_identity). The browser drives /start -> provider ->
+# /callback; the app then redeems the handoff via /exchange. Tokens are NEVER put
+# in a redirect URL and NEVER stored at rest — minted only at /exchange time.
+
+def _app_callback_redirect(*, code: str | None = None, error: str | None = None
+                           ) -> RedirectResponse:
+    """Build the 302 back to the APP'S callback. The target is settings
+    .app_oauth_callback_url — a FIXED config value, NEVER read from any request
+    parameter (open-redirect defense). Only `code` (a handoff code) or `error`
+    (a coarse, non-sensitive indicator) is appended."""
+    base = settings.app_oauth_callback_url
+    sep = "&" if "?" in base else "?"
+    if code is not None:
+        return RedirectResponse(f"{base}{sep}code={code}", status_code=302)
+    # A coarse, non-sensitive error class only — never the provider's raw error
+    # string (which could carry attacker-influenced content into the browser).
+    return RedirectResponse(f"{base}{sep}error={error or 'oauth_failed'}",
+                            status_code=302)
+
+
+def _provider_or_404(slug: str) -> oauth_broker.BrokerProvider:
+    try:
+        return oauth_broker.get_provider(slug)
+    except oauth_broker.BrokerUnknownProvider:
+        # An unknown OR unconfigured provider — fail-closed, 404 (don't leak which).
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown provider")
+
+
+@router.get("/oauth/{provider}/start")
+async def oauth_start(provider: str, session: DbSession) -> RedirectResponse:
+    """Begin the broker flow: mint a SERVER-SIDE single-use state nonce (storing
+    the PKCE code_verifier server-side when supported), and 302 to the provider's
+    authorize URL with ONLY the opaque nonce as `state`. 404 if the provider isn't
+    a configured broker provider.
+
+    The `state` sent to the provider is the opaque nonce — NOT a signed token —
+    so it carries no secret. For PKCE providers the code_verifier stays in the
+    state row and ONLY the code_challenge crosses the wire; the verifier never
+    leaves the server (cage-match #30, Finding 1)."""
+    if not settings.social_signin_enabled:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "social sign-in is disabled")
+    prov = _provider_or_404(provider)
+    code_verifier = code_challenge = None
+    if prov.supports_pkce:
+        code_verifier, code_challenge = make_pkce_pair()
+    nonce = await state_service.create_state(
+        session, provider=prov.slug, code_verifier=code_verifier)
+    url = oauth_broker.build_authorize_url(
+        prov, state=nonce, code_challenge=code_challenge)
+    return RedirectResponse(url, status_code=302)
+
+
+@router.get("/oauth/{provider}/callback")
+async def oauth_callback(
+    provider: str, session: DbSession,
+    code: str | None = None, state: str | None = None, error: str | None = None,
+) -> RedirectResponse:
+    """The provider redirects here. ANY failure → 302 to the app callback with an
+    error indicator (never a raw 500 to a browser). Success → store a minimal
+    handoff payload and 302 to the app callback with ?code=<handoff_code>.
+
+    NOTE on open-redirect: the redirect target is ALWAYS
+    settings.app_oauth_callback_url (a fixed config value). No request parameter
+    — not `state`, not anything — influences WHERE we redirect; params only carry
+    the handoff code or an error class."""
+    # Kill-switch: when social sign-in is administratively disabled the broker is
+    # off too (uniform with the native /social gate). A disabled-flag callback is
+    # not a normal user path, so a plain 403 is fine here (NOT a redirect).
+    if not settings.social_signin_enabled:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "social sign-in is disabled")
+    # The provider/path is validated first so even an error-callback for an
+    # unknown provider 404s rather than redirecting (a probe shouldn't bounce).
+    prov = _provider_or_404(provider)
+
+    # User denied / provider-side error → graceful redirect, not a 500.
+    if error:
+        return _app_callback_redirect(error="provider_denied")
+    if not code or not state:
+        return _app_callback_redirect(error="missing_code")
+
+    # Consume the state nonce ATOMICALLY (single-use): the same nonce can never be
+    # redeemed twice, so a captured callback URL can't be replayed at this layer
+    # (cage-match #30, Finding 1). None = missing / expired / already-consumed /
+    # forged → bad_state. The provider stored in the row MUST match the path
+    # provider (a nonce minted for provider A must not be used on provider B's
+    # callback).
+    # At-most-once (cage-match #30 r2, DELIBERATE — not an atomicity bug): state is
+    # consumed before the external exchange (security: never exchange on an
+    # unvalidated state); a transient failure AFTER consume burns this one nonce —
+    # the user simply re-initiates /start for a fresh nonce. This is intentional
+    # at-most-once, not an atomicity bug. Service-commit convention (get_session
+    # does not commit); a single request txn would hold the state row-lock across
+    # the provider network call.
+    st = await state_service.consume_state(session, state)
+    if st is None:
+        return _app_callback_redirect(error="bad_state")
+    if st["provider"] != prov.slug:
+        return _app_callback_redirect(error="state_provider_mismatch")
+
+    # Exchange the code for a verified identity. Both failure classes resolve to a
+    # graceful redirect-with-error for the BROWSER (never a raw status leak). The
+    # PKCE code_verifier comes from the SERVER-SIDE state row — it never crossed
+    # the wire.
+    try:
+        identity = await oauth_broker.exchange_code(
+            prov, code=code, code_verifier=st.get("code_verifier"))
+    except oauth_broker.BrokerInvalidExchange:
+        return _app_callback_redirect(error="exchange_failed")
+    except oauth_broker.BrokerUnavailable:
+        return _app_callback_redirect(error="provider_unavailable")
+    except oauth_broker.BrokerError:
+        return _app_callback_redirect(error="oauth_failed")
+
+    # Single door → known/new outcome. Reduce to a MINIMAL handoff payload (NEVER
+    # minted tokens — those are minted at /exchange time).
+    outcome = await _resolve_identity(session, identity)
+    if "access_token" in outcome:
+        # Known user: the outcome carries a freshly-minted pair, but we store ONLY
+        # the user_id and re-mint at exchange (tokens never live at rest).
+        payload = {"kind": "authenticated", "user_id": outcome["user"]["user_id"]}
+    else:
+        payload = {
+            "kind": "provisioning",
+            "provider": identity.provider,
+            "provider_sub": identity.sub,
+            "suggested_name": identity.suggested_name,
+            "email": identity.email,
+        }
+    handoff_code = await handoff_service.create_handoff(session, payload)
+    return _app_callback_redirect(code=handoff_code)
+
+
+class OAuthExchangeReq(BaseModel):
+    code: str = Field(min_length=1)
+
+
+@router.post("/oauth/exchange")
+async def oauth_exchange(req: OAuthExchangeReq, session: DbSession) -> dict:
+    """Redeem a single-use handoff code for the final session JSON. Missing /
+    expired / already-consumed → 401. The redemption is atomic (single-use, the
+    double-spend guard lives in handoff_service.consume_handoff)."""
+    if not settings.social_signin_enabled:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "social sign-in is disabled")
+    payload = await handoff_service.consume_handoff(session, req.code)
+    if payload is None:
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED, "invalid or expired handoff code")
+    # Kind-guard fails CLOSED (cage-match #30, Finding 4): a payload whose `kind`
+    # isn't one we wrote is treated as invalid (401), never falling through to a
+    # KeyError/500. We only ever write "authenticated"/"provisioning" server-side,
+    # so anything else is a corrupted/unexpected row.
+    kind = payload.get("kind")
+    if kind not in {"authenticated", "provisioning"}:
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED, "invalid or expired handoff code")
+    # Complete the kind-guard (cage-match #30 r2): validate the REQUIRED fields per
+    # kind BEFORE indexing, failing closed with 401 (not a KeyError/500) if absent.
+    # We only ever write complete payloads server-side, so a missing field is a
+    # corrupted/unexpected row — treat it like any other invalid handoff.
+    if kind == "authenticated":
+        if not payload.get("user_id"):
+            raise HTTPException(
+                status.HTTP_401_UNAUTHORIZED, "invalid or expired handoff code")
+    else:  # provisioning
+        if not payload.get("provider") or not payload.get("provider_sub"):
+            raise HTTPException(
+                status.HTTP_401_UNAUTHORIZED, "invalid or expired handoff code")
+    if kind == "authenticated":
+        user_id = payload["user_id"]
+        user = await users_service.get_by_id(session, user_id)
+        if user is None:
+            # The user vanished between callback and exchange (deleted account).
+            raise HTTPException(
+                status.HTTP_401_UNAUTHORIZED, "invalid or expired handoff code")
+        return {**_tokens(user.id), "user": _user_view(user)}
+    # provisioning — mint the provisioning token now (the verified identity was
+    # carried in the handoff payload; it cannot be forged because the payload was
+    # written server-side under an unguessable code).
+    provisioning_token = security.issue_provisioning(
+        payload["provider"], payload["provider_sub"],
+        suggested_name=payload.get("suggested_name"), email=payload.get("email"),
+    )
+    return {
+        "status": "provisioning",
+        "provisioning_token": provisioning_token,
+        "suggested_name": payload.get("suggested_name"),
+        "email": payload.get("email"),
+    }
+
+
+@router.get("/providers")
+async def list_providers() -> dict:
+    """List the sign-in providers the client may offer.
+
+    Native providers (apple/google — kind:"native") are included when their
+    client_ids are configured (the native flow needs no client secret). Broker
+    providers (kind:"broker") are the configured server-side ones (both id +
+    secret set). Fail-closed: an unconfigured provider is simply absent.
+
+    When social sign-in is administratively disabled, discovery shows nothing
+    (consistent with the native + broker gates returning 403 in that state)."""
+    if not settings.social_signin_enabled:
+        return {"providers": []}
+    providers: list[dict] = []
+    if settings.apple_client_ids:
+        providers.append(
+            {"slug": "apple", "display_name": "Apple", "kind": "native"})
+    if settings.google_client_ids:
+        providers.append(
+            {"slug": "google", "display_name": "Google", "kind": "native"})
+    for p in oauth_broker.configured_providers():
+        providers.append(
+            {"slug": p.slug, "display_name": p.display_name, "kind": "broker"})
+    return {"providers": providers}
 
 
 me_router = APIRouter(prefix="/v1", tags=["auth"])

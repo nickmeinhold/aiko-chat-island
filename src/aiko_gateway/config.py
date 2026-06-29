@@ -82,6 +82,32 @@ class Settings(BaseSettings):
     # handoff, not a session.
     provisioning_ttl_seconds: int = 10 * 60  # 10 min
 
+    # --- OAuth broker (#21: server-side authorization-code flow) ---
+    # Increment 2 scope: the CORE broker flow + GitHub as the first provider.
+    # Unlike the native ID-token flow (apple/google above), the broker performs
+    # the authorization-code exchange SERVER-side, so it needs a confidential
+    # client secret. These are SECRETS — supplied via the host .env (SOPS in
+    # deploy), NEVER committed. A provider counts as "configured" only when BOTH
+    # its id AND secret are set; either alone is a half-config that XOR-fails at
+    # boot in prod (see _harden_for_production).
+    github_client_id: str = ""
+    github_client_secret: str = ""
+    # The base URL of THIS gateway — used to derive the provider redirect_uri the
+    # broker hands to the authorize endpoint (so the host is configured in ONE
+    # place, not hardcoded across the start/callback handlers).
+    gateway_base_url: str = "https://chat.imagineering.cc"
+    # The app's Universal/App Link the browser is redirected back to after the
+    # broker completes (carrying the handoff code, or an error indicator). This is
+    # a FIXED config value — open-redirect defense: the final redirect target is
+    # NEVER read from a request parameter, only from here.
+    app_oauth_callback_url: str = "https://chat.imagineering.cc/applink/auth"
+    # OAuth state token TTL (CSRF/integrity, the round-trip from /start to
+    # /callback). Short — a human completing a provider consent screen.
+    oauth_state_ttl_seconds: int = 10 * 60  # 10 min
+    # Handoff code TTL: the window between the browser landing back on the app and
+    # the app POSTing /exchange. Very short — a single immediate redemption.
+    oauth_handoff_ttl_seconds: int = 2 * 60  # 2 min
+
     # --- HTTP server ---
     host: str = "127.0.0.1"
     port: int = 8095
@@ -126,16 +152,42 @@ class Settings(BaseSettings):
             # config: the verifier would reject every token (empty aud allowlist
             # = reject-all). Fail LOUD at boot rather than silently 401 every
             # real login — a prose "must configure client IDs" is not a guard.
+            broker_configured = bool(
+                self.github_client_id and self.github_client_secret)
             if self.social_signin_enabled and not (
                 self.apple_client_ids or self.google_client_ids
+                or broker_configured
             ):
                 raise ValueError(
-                    "social_signin_enabled is True in production but no "
-                    "apple_client_ids / google_client_ids are configured. The "
-                    "verifier would reject every token (empty audience allowlist "
-                    "= reject-all). Refusing to boot — supply at least one "
-                    "provider client ID."
+                    "social_signin_enabled is True in production but no usable "
+                    "provider is configured. Supply at least one of: "
+                    "apple_client_ids / google_client_ids (native ID-token flow), "
+                    "or a fully-configured broker provider (e.g. both "
+                    "GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET). With none, the "
+                    "native verifier would reject every token (empty audience "
+                    "allowlist = reject-all) and no broker provider would be "
+                    "offered. Refusing to boot."
                 )
+            # Broker providers: a partial (XOR) config — only ONE of id/secret —
+            # is a latent footgun. The provider would appear "almost configured"
+            # but the confidential token exchange needs BOTH, so it would fail at
+            # the worst time (mid-login) with an opaque 4xx. Fail LOUD at boot
+            # instead, naming the half that's missing. (Listing-as-configured
+            # requires both, so a XOR provider is invisible AND broken — exactly
+            # the silent-misconfig class config hardening exists to kill.)
+            for slug, cid, secret in (
+                ("github", self.github_client_id, self.github_client_secret),
+            ):
+                if bool(cid) != bool(secret):
+                    missing = "client_secret" if cid else "client_id"
+                    raise ValueError(
+                        f"oauth broker provider {slug!r} is half-configured: "
+                        f"{missing} is missing (the other half is set). The "
+                        "confidential authorization-code exchange needs BOTH a "
+                        "client_id and a client_secret. Refusing to boot — supply "
+                        f"the missing {slug.upper()}_{missing.upper()} or unset "
+                        "both to disable the provider."
+                    )
         # Resolve registration default by environment when not explicitly set:
         # open in dev, closed in prod.
         if self.open_registration is None:

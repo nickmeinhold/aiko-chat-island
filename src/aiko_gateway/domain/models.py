@@ -256,3 +256,80 @@ class DeviceToken(Base):
         DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
+
+
+class OAuthHandoff(Base):
+    """A one-time handoff for the server-side OAuth broker flow (#21).
+
+    The broker completes the authorization-code exchange SERVER-side and must
+    return the result to the app WITHOUT putting minted tokens in a redirect URL
+    (a redirect URL leaks into browser history / referrer / server logs). So the
+    callback stores a MINIMAL outcome payload here under a fresh random code and
+    redirects the browser to the app with only that opaque ``?code=``; the app
+    then POSTs ``/v1/auth/oauth/exchange`` to redeem it for the real tokens.
+
+    SECURITY shape:
+      * ``code`` is the PK and is ``secrets.token_urlsafe(32)`` — cryptographically
+        random, unguessable, single-use.
+      * ``payload`` stores ONLY the minimal outcome (a user_id for a known user, or
+        the verified-identity fields for provisioning) — NEVER minted access/refresh
+        tokens. Tokens are minted at redemption time, so a stolen-but-unredeemed
+        row yields no usable credential and an expired/consumed one yields nothing.
+      * ``consumed`` + ``expires_at`` enforce single-use within a short TTL. The
+        redemption marks consumed ATOMICALLY (a guarded UPDATE) to close the
+        double-spend race.
+
+    No ON DELETE anything — rows are short-lived (≈2 min TTL) and self-expire; a
+    sweeper is unnecessary at this scale (a follow-up if the table ever grows).
+    """
+    __tablename__ = "oauth_handoffs"
+    code: Mapped[str] = mapped_column(String(64), primary_key=True)
+    payload: Mapped[str] = mapped_column(Text, nullable=False)
+    expires_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False)
+    consumed: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow)
+
+
+class OAuthState(Base):
+    """A one-time CSRF/PKCE state nonce for the server-side OAuth broker (#21).
+
+    Replaces the earlier self-contained signed-JWT ``state`` (cage-match #30,
+    Finding 1). Two reasons the JWT had to go:
+
+      * PKCE LEAK — the JWT carried the PKCE ``code_verifier`` through the browser
+        and the provider (it is base64-readable in the URL), which defeats the
+        whole point of PKCE for any future PKCE-enabled provider. Now the verifier
+        is stored SERVER-SIDE in this row and ONLY the ``code_challenge`` ever
+        leaves us — the verifier never crosses the wire.
+      * REPLAY / login-CSRF — a signed-but-stateless state is replayable within
+        its exp window and is not bound to a single use. This row makes ``state``
+        an opaque, single-use nonce: ``consumed`` + ``expires_at`` mean a captured
+        callback URL cannot be replayed at the state layer (the prior design
+        leaned on the provider code's single-use property as the only backstop —
+        that NAMED TRADEOFF is now RETIRED).
+
+    SECURITY shape (mirrors OAuthHandoff):
+      * ``nonce`` is the PK and is ``secrets.token_urlsafe(32)`` — 256 bits,
+        unguessable, single-use.
+      * ``code_verifier`` is nullable (only PKCE providers store one) and NEVER
+        leaves the server.
+      * ``consumed`` + ``expires_at`` enforce single-use within a short TTL; the
+        callback marks consumed ATOMICALLY (a guarded UPDATE) to close the
+        double-spend / replay race.
+
+    Rows are short-lived (the oauth_state TTL) and self-expire; no sweeper at this
+    scale (a follow-up if the table ever grows).
+    """
+    __tablename__ = "oauth_states"
+    nonce: Mapped[str] = mapped_column(String(64), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    code_verifier: Mapped[str | None] = mapped_column(Text, nullable=True)
+    expires_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False)
+    consumed: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow)
