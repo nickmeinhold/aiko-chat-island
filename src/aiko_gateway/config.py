@@ -141,6 +141,17 @@ class Settings(BaseSettings):
     # WebAuthn ceremony challenge TTL — the round-trip from start to finish (a user
     # tapping their authenticator). Short, single-use.
     passkey_challenge_ttl_seconds: int = 5 * 60  # 5 min
+    # Domain-association files served at /.well-known/* so iOS/Android trust the app
+    # to use passkeys on this domain. App identifiers from the merged app config
+    # (PR#38) — public, not secrets. Served always (the app verifies association
+    # BEFORE passkey_enabled flips advertisement on).
+    passkey_ios_app_id: str = "SPL85G447K.cc.imagineering.aikoChatApp"
+    passkey_android_package: str = "cc.imagineering.aiko_chat_app"
+    # Android Digital Asset Links needs the PLAY APP SIGNING SHA-256 (the cert
+    # Google re-signs with) — unknown until Play signing is registered (app task
+    # #20). Empty until then: assetlinks serves an empty fingerprint list (Android
+    # App Links won't verify yet; the iOS AASA is unaffected). Configure when known.
+    passkey_android_cert_sha256: list[str] = []
 
     # --- HTTP server ---
     host: str = "127.0.0.1"

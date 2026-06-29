@@ -235,22 +235,3 @@ async def get_credential(
         select(PasskeyCredential).where(
             PasskeyCredential.credential_id == credential_id_b64)
     )).scalar_one_or_none()
-
-
-async def persist_credential(
-    session: AsyncSession, *, user_id: str, material: dict,
-) -> PasskeyCredential:
-    """Create the PasskeyCredential row from the verified material carried in the
-    provisioning token. Called at /social/claim AFTER the user is created, so the
-    credential is bound to a real user_id (no orphan rows on abandoned claims). Does
-    NOT commit — the claim handler commits the user + credential together."""
-    row = PasskeyCredential(
-        credential_id=material["credential_id"],
-        user_id=user_id,
-        public_key=material["public_key"],
-        sign_count=material["sign_count"],
-        transports=material.get("transports"),
-        aaguid=material.get("aaguid"),
-    )
-    session.add(row)
-    return row

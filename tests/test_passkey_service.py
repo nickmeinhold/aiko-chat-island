@@ -13,9 +13,7 @@ from sqlalchemy import func, select
 
 from aiko_gateway.config import settings
 from aiko_gateway.domain import passkey_service
-from aiko_gateway.domain.models import (
-    PasskeyChallenge, PasskeyCredential, PasskeyOperation, User,
-)
+from aiko_gateway.domain.models import PasskeyChallenge, PasskeyOperation
 from webauthn.helpers import base64url_to_bytes
 
 
@@ -95,10 +93,9 @@ async def test_start_prunes_expired_challenges(session, monkeypatch):
     assert count == 1
 
 
-async def test_persist_and_get_credential(session):
-    user = User(username="pk_user", display_name="PK", aiko_username="pk_user")
-    session.add(user)
-    await session.commit()
+async def test_create_passkey_user_then_get_credential(session):
+    from aiko_gateway.domain import users_service
+
     material = {
         "credential_id": "Y3JlZC1pZC1iNjR1cmw",
         "public_key": "cHVibGljLWtleS1jb3Nl",
@@ -106,8 +103,8 @@ async def test_persist_and_get_credential(session):
         "transports": '["internal"]',
         "aaguid": "00000000-0000-0000-0000-000000000000",
     }
-    await passkey_service.persist_credential(session, user_id=user.id, material=material)
-    await session.commit()
+    user = await users_service.create_passkey_user(
+        session, handle="pk_user", display_name="PK", email=None, material=material)
     row = await passkey_service.get_credential(session, "Y3JlZC1pZC1iNjR1cmw")
     assert row is not None
     assert row.user_id == user.id

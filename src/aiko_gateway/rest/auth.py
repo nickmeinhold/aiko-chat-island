@@ -7,6 +7,7 @@ prod fails closed; an explicit OPEN_REGISTRATION override re-opens it.
 """
 from __future__ import annotations
 
+import datetime as dt
 import logging
 
 import jwt
@@ -15,13 +16,16 @@ from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from webauthn.helpers.exceptions import (
+    InvalidAuthenticationResponse, InvalidRegistrationResponse,
+)
 
 from ..config import settings
 from ..domain import (
     accounts_service, handoff_service, nonce_service, oauth, oauth_broker,
-    security, state_service, users_service,
+    passkey_service, security, state_service, users_service,
 )
-from ..domain.models import User
+from ..domain.models import PasskeyOperation, User
 from ..domain.oauth import Provider, VerifiedIdentity
 from ..domain.pkce import (
     is_valid_app_challenge, make_pkce_pair, verify_app_challenge,
@@ -247,15 +251,33 @@ async def social(req: SocialReq, session: DbSession) -> dict:
 @router.post("/social/claim")
 async def social_claim(req: SocialClaimReq, session: DbSession) -> dict:
     """Complete provisioning: verify the provisioning token (OUR token, so the
-    (provider, sub) it carries cannot be forged), create the user + social link
-    atomically, and return real tokens."""
-    if not settings.social_signin_enabled:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "social sign-in is disabled")
+    identity it carries cannot be forged), create the user atomically, and return
+    real tokens. Serves BOTH the social flow (creates a SocialIdentity) and the
+    passkey flow (#1471 — creates a PasskeyCredential from the verified material the
+    token carries); the token's shape selects the path. ONE claim endpoint, as the
+    app contract requires."""
     try:
         pending = security.decode_provisioning(req.provisioning_token)
     except jwt.InvalidTokenError:
         raise HTTPException(
             status.HTTP_401_UNAUTHORIZED, "invalid or expired provisioning token")
+    if pending.get("passkey_credential") is not None:
+        # Passkey claim: ungated like the passkey endpoints (deploy-dark). Atomic +
+        # replay-safe via the credential_id UNIQUE constraint (see create_passkey_user).
+        try:
+            user = await users_service.create_passkey_user(
+                session, handle=req.handle, display_name=req.display_name,
+                email=pending["email"], material=pending["passkey_credential"],
+            )
+        except IntegrityError:
+            await session.rollback()
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "handle already taken or passkey already claimed")
+        return {**_tokens(user.id), "user": _user_view(user)}
+    # Social claim — gated on social sign-in being enabled (unchanged).
+    if not settings.social_signin_enabled:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "social sign-in is disabled")
     try:
         user = await users_service.create_social_user(
             session,
@@ -269,6 +291,112 @@ async def social_claim(req: SocialClaimReq, session: DbSession) -> dict:
         raise HTTPException(
             status.HTTP_409_CONFLICT, "handle already taken or identity already claimed")
     return {**_tokens(user.id), "user": _user_view(user)}
+
+
+# --- WebAuthn passkeys (#1471) --------------------------------------------- #
+# Passwordless credential sign-in. `start` mints a single-use challenge; `finish`
+# verifies the device's attestation/assertion (py_webauthn) and routes into the
+# SAME outcome shape as /social + the broker (the app's one _resolveOutcome door).
+# Endpoints are UNGATED (deploy-dark) — only the /providers advertisement is gated
+# on settings.passkey_enabled, so the flow can be exercised on a real device before
+# the app surfaces the buttons (the handoff's "deploy endpoints, advertise last").
+
+class PasskeyFinishReq(BaseModel):
+    state: str
+    credential: dict
+
+
+@router.post("/passkey/register/start")
+async def passkey_register_start(session: DbSession) -> dict:
+    """Begin registration for an ANONYMOUS caller (first-passkey-creates-account).
+    Returns {state, options} — the raw WebAuthn-JSON the platform authenticator
+    parses. No body, no prior session."""
+    return await passkey_service.start_registration(session)
+
+
+@router.post("/passkey/register/finish")
+async def passkey_register_finish(req: PasskeyFinishReq, session: DbSession) -> dict:
+    """Verify the attestation and return a PROVISIONING outcome (new identity must
+    claim a handle). The verified credential rides in the provisioning token and is
+    persisted at /social/claim — byte-identical shape to the social provisioning
+    outcome so the app's single resolver accepts it."""
+    raw = await passkey_service.consume_challenge(
+        session, req.state, PasskeyOperation.REGISTER)
+    if raw is None:
+        await session.rollback()
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, "invalid or expired passkey challenge")
+    try:
+        material = passkey_service.verify_registration(
+            raw_challenge=raw, credential=req.credential)
+    except InvalidRegistrationResponse:
+        # Covers both a malformed credential and a failed attestation (py_webauthn
+        # wraps parse failures too). Fail closed; the deferred challenge burn rolls
+        # back so an honest retry of the SAME ceremony is possible.
+        await session.rollback()
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED, "passkey registration verification failed")
+    token = security.issue_provisioning(
+        "passkey", material["credential_id"], passkey_credential=material)
+    await session.commit()  # burn the challenge durably — the ceremony completed
+    return {
+        "status": "provisioning",
+        "provisioning_token": token,
+        "suggested_name": None,
+        "email": None,
+    }
+
+
+@router.post("/passkey/authenticate/start")
+async def passkey_authenticate_start(session: DbSession) -> dict:
+    """Begin usernameless/discoverable authentication (empty allowCredentials).
+    Returns {state, options}."""
+    return await passkey_service.start_authentication(session)
+
+
+@router.post("/passkey/authenticate/finish")
+async def passkey_authenticate_finish(
+    req: PasskeyFinishReq, session: DbSession,
+) -> dict:
+    """Verify the assertion against the STORED public key and issue a session
+    (authenticated outcome — a known credential is never provisioning)."""
+    raw = await passkey_service.consume_challenge(
+        session, req.state, PasskeyOperation.AUTHENTICATE)
+    if raw is None:
+        await session.rollback()
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, "invalid or expired passkey challenge")
+    try:
+        cred_id = passkey_service.credential_id_of(req.credential)
+    except (KeyError, TypeError, ValueError):
+        await session.rollback()
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, "malformed passkey credential")
+    cred = await passkey_service.get_credential(session, cred_id)
+    if cred is None:
+        await session.rollback()
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED, "unknown passkey credential")
+    try:
+        new_count = passkey_service.verify_authentication(
+            raw_challenge=raw, credential=req.credential,
+            public_key_b64=cred.public_key, current_sign_count=cred.sign_count)
+    except InvalidAuthenticationResponse:
+        await session.rollback()
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED, "passkey authentication verification failed")
+    user = await users_service.get_by_id(session, cred.user_id)
+    if user is None:  # defensive — the FK guarantees it; fail closed regardless
+        await session.rollback()
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED, "unknown passkey credential")
+    cred.sign_count = new_count
+    cred.last_used_at = dt.datetime.now(dt.timezone.utc)
+    outcome = {**_tokens(user.id), "user": _user_view(user)}
+    # Durable AFTER the outcome: the challenge burn + sign_count bump commit atomic
+    # with the sign-in (a downstream failure rolls both back — the #24 contract).
+    await session.commit()
+    return outcome
 
 
 @router.post("/refresh")
@@ -553,20 +681,25 @@ async def list_providers() -> dict:
     providers (kind:"broker") are the configured server-side ones (both id +
     secret set). Fail-closed: an unconfigured provider is simply absent.
 
-    When social sign-in is administratively disabled, discovery shows nothing
-    (consistent with the native + broker gates returning 403 in that state)."""
-    if not settings.social_signin_enabled:
-        return {"providers": []}
+    When social sign-in is administratively disabled, the social providers show
+    nothing (consistent with the native + broker gates returning 403 in that
+    state). Passkey (#1471) is an INDEPENDENT feature gated on its own
+    passkey_enabled flag — flipped on LAST, after the endpoints + .well-known are
+    live, so it can deploy dark."""
     providers: list[dict] = []
-    if settings.apple_client_ids:
+    if settings.passkey_enabled:
         providers.append(
-            {"slug": "apple", "display_name": "Apple", "kind": "native"})
-    if settings.google_client_ids:
-        providers.append(
-            {"slug": "google", "display_name": "Google", "kind": "native"})
-    for p in oauth_broker.configured_providers():
-        providers.append(
-            {"slug": p.slug, "display_name": p.display_name, "kind": "broker"})
+            {"slug": "passkey", "display_name": "Passkey", "kind": "passkey"})
+    if settings.social_signin_enabled:
+        if settings.apple_client_ids:
+            providers.append(
+                {"slug": "apple", "display_name": "Apple", "kind": "native"})
+        if settings.google_client_ids:
+            providers.append(
+                {"slug": "google", "display_name": "Google", "kind": "native"})
+        for p in oauth_broker.configured_providers():
+            providers.append(
+                {"slug": p.slug, "display_name": p.display_name, "kind": "broker"})
     return {"providers": providers}
 
 

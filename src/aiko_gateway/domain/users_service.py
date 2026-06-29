@@ -7,7 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .ids import new_ulid
-from .models import SocialIdentity, User
+from .models import PasskeyCredential, SocialIdentity, User
 from .security import hash_password, verify_password
 
 _AIKO_USERNAME_RE = re.compile(r"[^A-Za-z0-9_]")
@@ -90,6 +90,40 @@ async def create_social_user(
         provider=provider,
         provider_sub=provider_sub,
         user_id=user.id,
+    ))
+    await session.commit()
+    return user
+
+
+async def create_passkey_user(
+    session: AsyncSession, *, handle: str, display_name: str,
+    email: str | None, material: dict,
+) -> User:
+    """Create a passkey-only user + its first credential in ONE transaction (#1471).
+
+    A passkey is a CREDENTIAL, not a federated identity, so there is NO
+    SocialIdentity row and NO password — the user is identified solely by their
+    passkey(s). `material` is the verified credential carried in the provisioning
+    token. Atomic + replay-safe: a replayed claim re-inserts the same credential_id,
+    trips the UNIQUE constraint, and the WHOLE transaction (the new user included)
+    rolls back → IntegrityError, which the caller maps to 409. There is therefore no
+    window where a user exists without their credential."""
+    user = User(
+        id=new_ulid(),
+        username=handle,
+        display_name=display_name or handle,
+        password_hash=None,
+        aiko_username=_sanitize_aiko_username(handle),
+        email=email,
+    )
+    session.add(user)
+    session.add(PasskeyCredential(
+        credential_id=material["credential_id"],
+        user_id=user.id,
+        public_key=material["public_key"],
+        sign_count=material["sign_count"],
+        transports=material.get("transports"),
+        aaguid=material.get("aaguid"),
     ))
     await session.commit()
     return user
