@@ -34,6 +34,7 @@ from aiko_gateway.domain import models  # noqa: F401 — register tables on Base
 _MODEL_TABLES = {
     "users", "social_identities", "channels", "memberships",
     "messages", "user_blocks", "message_reports", "device_tokens",
+    "oauth_handoffs",
 }
 
 

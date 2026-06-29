@@ -256,3 +256,38 @@ class DeviceToken(Base):
         DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
+
+
+class OAuthHandoff(Base):
+    """A one-time handoff for the server-side OAuth broker flow (#21).
+
+    The broker completes the authorization-code exchange SERVER-side and must
+    return the result to the app WITHOUT putting minted tokens in a redirect URL
+    (a redirect URL leaks into browser history / referrer / server logs). So the
+    callback stores a MINIMAL outcome payload here under a fresh random code and
+    redirects the browser to the app with only that opaque ``?code=``; the app
+    then POSTs ``/v1/auth/oauth/exchange`` to redeem it for the real tokens.
+
+    SECURITY shape:
+      * ``code`` is the PK and is ``secrets.token_urlsafe(32)`` — cryptographically
+        random, unguessable, single-use.
+      * ``payload`` stores ONLY the minimal outcome (a user_id for a known user, or
+        the verified-identity fields for provisioning) — NEVER minted access/refresh
+        tokens. Tokens are minted at redemption time, so a stolen-but-unredeemed
+        row yields no usable credential and an expired/consumed one yields nothing.
+      * ``consumed`` + ``expires_at`` enforce single-use within a short TTL. The
+        redemption marks consumed ATOMICALLY (a guarded UPDATE) to close the
+        double-spend race.
+
+    No ON DELETE anything — rows are short-lived (≈2 min TTL) and self-expire; a
+    sweeper is unnecessary at this scale (a follow-up if the table ever grows).
+    """
+    __tablename__ = "oauth_handoffs"
+    code: Mapped[str] = mapped_column(String(64), primary_key=True)
+    payload: Mapped[str] = mapped_column(Text, nullable=False)
+    expires_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False)
+    consumed: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow)
