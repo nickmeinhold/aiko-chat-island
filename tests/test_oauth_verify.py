@@ -221,6 +221,35 @@ async def test_unknown_provider_rejected(wired_google):
         await oauth.verify_id_token("facebook", token)
 
 
+def test_registry_keyed_by_provider_enum():
+    # The refactor's structural invariant (RED on the old string-keyed registry,
+    # GREEN now): every _PROVIDERS key is a Provider member, and both members are
+    # present. This is what actually proves the rekey — passing the enum or a junk
+    # value already behaved correctly under the old StrEnum string keys.
+    assert set(oauth._PROVIDERS) == set(oauth.Provider)
+    assert all(isinstance(k, oauth.Provider) for k in oauth._PROVIDERS)
+
+
+async def test_enum_provider_accepted(wired_google):
+    # Contract lock: passing the Provider enum (as rest/auth.py does — req.provider
+    # is already coerced by Pydantic) verifies identically to the raw string.
+    token = _make_token(wired_google)
+    identity = await oauth.verify_id_token(oauth.Provider.google, token)
+    assert identity.provider == "google"
+    assert identity.sub == "google-sub-123"
+
+
+async def test_unknown_provider_coercion_fails_closed(wired_google):
+    # Contract lock: a value outside the closed set must surface as UnknownProvider
+    # (a clean 4xx), never the bare ValueError that Provider("...") raises — which
+    # would otherwise escape as a 500. Covers a non-string junk value too.
+    token = _make_token(wired_google)
+    with pytest.raises(oauth.UnknownProvider):
+        await oauth.verify_id_token("microsoft", token)
+    with pytest.raises(oauth.UnknownProvider):
+        await oauth.verify_id_token(123, token)  # type: ignore[arg-type]
+
+
 # --- JWKS cache time-policy (cage-match PR#15: floor + ceiling) ------------- #
 
 async def test_jwks_cache_floor_bounds_bogus_kid_amplification():
