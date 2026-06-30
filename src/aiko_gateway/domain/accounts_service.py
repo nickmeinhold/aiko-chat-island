@@ -89,8 +89,10 @@ async def _sole_admin_channel_ids(session: AsyncSession, user_id: str) -> list[s
 
 async def delete_user_account(session: AsyncSession, user_id: str) -> None:
     """IRREVERSIBLE: tombstone the user's messages (wipe body + client_msg_id,
-    sever the account link), delete their social identities + memberships + user
-    row, and commit — all in one transaction.
+    sever the account link), tear down every other child of `users` —
+    moderation rows (blocks deleted, reports anonymized), device tokens, passkey
+    credentials, social identities, memberships — then delete the user row, and
+    commit — all in one transaction (children-before-parent; no ON DELETE CASCADE).
 
     Raises `CannotDeleteSoleAdmin` (before performing ANY write) if the user is
     the only admin of any channel.
