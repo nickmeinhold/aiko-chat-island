@@ -62,6 +62,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import time
 from dataclasses import dataclass
 from enum import StrEnum
@@ -70,6 +71,41 @@ import httpx
 import jwt
 
 from ..config import settings
+
+log = logging.getLogger(__name__)
+
+
+def _short(value: object, n: int = 10) -> str:
+    """A short prefix of a PUBLIC identifier, for social-verify tracing (#1491).
+
+    Used ONLY for the `kid` — Google/Apple's JWKS key id, which is public (it names
+    a signing key, carries no secret) and whose prefix is genuinely useful to
+    cross-reference against the provider's published certs. NOT safe for secret- or
+    PII-shaped values: for any input <= n chars this returns the WHOLE value (the
+    truncation marker only appears past n). For nonces / sub use _fingerprint, which
+    never emits plaintext at any length (cage-match PR#42, Carnot)."""
+    if value is None:
+        return "?"
+    if isinstance(value, bytes):
+        value = value.hex()
+    s = str(value)
+    return s[:n] + ("…" if len(s) > n else "")
+
+
+def _fingerprint(value: object, n: int = 12) -> str:
+    """A NON-REVERSIBLE, length-safe fingerprint of a secret- or PII-shaped value,
+    for social-verify tracing (#1491).
+
+    The diagnostic question a nonce/sub trace must answer is "are these two values
+    the same, and how long are they" — NOT "what are they". A sha256 prefix answers
+    exactly that: distinct values get distinct fingerprints (comparison-preserving)
+    while ZERO plaintext lands in logs, for inputs of ANY length. This is the fix
+    for _short's short-input disclosure: a prefix of a <=10-char nonce leaked the
+    whole nonce; a fingerprint never does (cage-match PR#42, Carnot HIGH)."""
+    if value is None:
+        return "?"
+    data = value if isinstance(value, bytes) else str(value).encode("utf-8")
+    return hashlib.sha256(data).hexdigest()[:n]
 
 
 class Provider(StrEnum):
@@ -306,6 +342,8 @@ async def verify_id_token(
     # aud allowlist FIRST, before any work: empty ⇒ reject all (fail-closed).
     audiences = _allowed_audiences(provider)
     if not audiences:
+        log.warning("social.verify: REJECT provider=%s no audience allowlist configured",
+                    provider)
         raise InvalidProviderToken(
             f"no audience allowlist configured for {provider}")
 
@@ -314,11 +352,16 @@ async def verify_id_token(
     try:
         header = jwt.get_unverified_header(id_token)
     except jwt.InvalidTokenError as e:
+        log.warning("social.verify: REJECT provider=%s malformed token header: %s",
+                    provider, e)
         raise InvalidProviderToken(f"malformed token header: {e}") from e
     if header.get("alg") != "RS256":
+        log.warning("social.verify: REJECT provider=%s unexpected alg %r",
+                    provider, header.get("alg"))
         raise InvalidProviderToken(f"unexpected alg {header.get('alg')!r}")
     kid = header.get("kid")
     if not kid:
+        log.warning("social.verify: REJECT provider=%s token header missing kid", provider)
         raise InvalidProviderToken("token header missing kid")
 
     # (2) Resolve the signing key. A network failure here is an OUTAGE (503),
@@ -328,8 +371,12 @@ async def verify_id_token(
     except (httpx.HTTPError, ValueError) as e:
         # Network/HTTP failure OR a malformed JWKS body (resp.json() raises
         # ValueError) — both are provider-side outages, not a bad credential.
+        log.warning("social.verify: OUTAGE provider=%s could not fetch JWKS: %s",
+                    provider, e)
         raise ProviderUnavailable(f"could not fetch {provider} JWKS: {e}") from e
     if key is None:
+        log.warning("social.verify: REJECT provider=%s unknown signing key kid=%s",
+                    provider, _short(kid))
         raise InvalidProviderToken("unknown signing key (kid)")
 
     # (3) Verify signature + aud + exp/iat. alg is HARD-PINNED here too — the
@@ -343,10 +390,15 @@ async def verify_id_token(
             options={"require": ["exp", "iat", "sub", "aud", "iss"]},
         )
     except jwt.InvalidTokenError as e:
+        # PyJWT's own message names which claim failed (signature/aud/exp/iat) and
+        # carries no token or key material — safe to log verbatim.
+        log.warning("social.verify: REJECT provider=%s jwt.decode failed: %s", provider, e)
         raise InvalidProviderToken(str(e)) from e
 
     # (4) Issuer pinned manually (version-robust; supports Google's two spellings).
     if claims.get("iss") not in cfg.issuers:
+        log.warning("social.verify: REJECT provider=%s untrusted issuer %r",
+                    provider, claims.get("iss"))
         raise InvalidProviderToken(f"untrusted issuer {claims.get('iss')!r}")
 
     # (5) Nonce binding (replay defense, #13). When the caller supplies the RAW
@@ -369,12 +421,35 @@ async def verify_id_token(
         # and keeps the comparison constant-time (Kelvin, cage-match PR#32).
         if not isinstance(token_nonce, str) or not hmac.compare_digest(
                 token_nonce.encode("utf-8"), expected.encode("utf-8")):
+            # The single most diagnostic line for #1491: log the SHAPE of both
+            # sides, never the values. A length gap (e.g. expected 64 hex when hashed
+            # vs a 22-char raw token claim) reveals a hashed-vs-raw transform
+            # disagreement; equal lengths with differing FINGERPRINTS reveal a genuine
+            # value mismatch; a missing token claim shows as token=absent. Both sides
+            # are rendered through _fingerprint (sha256 prefix), so no nonce plaintext
+            # is logged at ANY length — a server-issued nonce is replay-relevant
+            # (cage-match PR#42, Carnot: a prefix leaks a short nonce in full).
+            log.warning(
+                "social.verify: REJECT provider=%s nonce mismatch nonce_hashed=%s "
+                "expected(len=%d fp=%s) token(%s)",
+                provider, cfg.nonce_hashed, len(expected), _fingerprint(expected),
+                f"len={len(token_nonce)} fp={_fingerprint(token_nonce)}"
+                if isinstance(token_nonce, str) else "absent")
             raise InvalidProviderToken("nonce mismatch")
 
     sub = claims.get("sub")
     if not sub:
+        log.warning("social.verify: REJECT provider=%s token missing sub", provider)
         raise InvalidProviderToken("token missing sub")
 
+    # OK path: provider + a NON-REVERSIBLE sub fingerprint (sub is a stable
+    # pseudonymous account id, not a secret — but a prefix of a short sub would
+    # disclose it whole, and the fingerprint correlates the same user across log
+    # lines without logging the id; cage-match PR#42, Carnot MEDIUM). A SUCCESSFUL
+    # verify is visible in the same trace as the rejects — the device test reads one
+    # of these two lines per attempt.
+    log.info("social.verify: OK provider=%s sub=%s nonce_checked=%s",
+             provider, _fingerprint(sub), expected_nonce is not None)
     return VerifiedIdentity(
         provider=provider,
         sub=sub,
