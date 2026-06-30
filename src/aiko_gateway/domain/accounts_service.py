@@ -36,7 +36,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from . import devices_service, moderation_service, passkey_service
 from .memberships_service import ROLE_ADMIN
-from .models import Membership, Message, SocialIdentity, User
+from .models import (
+    Community, CommunityMembership, Membership, Message, SocialIdentity, User)
 
 # What a tombstoned message's author label becomes once the account is gone.
 DELETED_USER_LABEL = "[deleted user]"
@@ -132,6 +133,32 @@ async def delete_user_account(session: AsyncSession, user_id: str) -> None:
     # passkey holder's deletion leaves an orphaned credential row (FK off) / FK-
     # violates the final User delete (FK on / Postgres). Same verify-the-neighbor.
     await passkey_service.purge_user_credentials(session, user_id)
+    # Community footprint (#32). TWO FK children of `users`, handled differently —
+    # the same verify-the-neighbor discipline, and BOTH are now required by the
+    # cascade guard:
+    #   * community_memberships.user_id — DELETE the user's community memberships
+    #     (a child row, like channel memberships below).
+    #   * communities.owner_id — ANONYMIZE (owner_id -> NULL), do NOT delete the
+    #     community. A community is shared infrastructure like a channel; deleting
+    #     it on the owner's departure would strip every other member (the same
+    #     tombstone-not-shred reasoning as the message body above). The seeded Aiko
+    #     community is already system-owned (NULL) and is untouched.
+    # Decrement the denormalized member_count of every community the user belongs
+    # to BEFORE removing their membership rows — otherwise the count drifts on
+    # account deletion (invisible in B1 since nothing reads it yet, but account
+    # deletion is live, so keep the projection honest rather than ship a knowingly
+    # stale counter; B2's join/leave own the increment side).
+    await session.execute(
+        update(Community)
+        .where(Community.id.in_(
+            select(CommunityMembership.community_id)
+            .where(CommunityMembership.user_id == user_id)))
+        .values(member_count=Community.member_count - 1))
+    await session.execute(
+        delete(CommunityMembership).where(CommunityMembership.user_id == user_id))
+    await session.execute(
+        update(Community).where(Community.owner_id == user_id)
+        .values(owner_id=None))
     # Remove federated-identity links and channel memberships (children first).
     await session.execute(
         delete(SocialIdentity).where(SocialIdentity.user_id == user_id))

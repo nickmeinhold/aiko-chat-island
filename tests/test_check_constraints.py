@@ -21,7 +21,22 @@ from aiko_gateway.config import settings
 # Minimal valid rows (all NOT NULL columns supplied). created_at/joined_at are
 # NOT NULL with python-side defaults the ORM fills — raw SQL must supply them.
 _TS = "2026-01-01T00:00:00+00:00"
+# Point-in-time copy of models.DEFAULT_COMMUNITY_ID / 0009's seeded community.
+_DEFAULT_COMMUNITY_ID = "0" * 26
+# Channel insert AT HEAD: the ck_channels_community_required CHECK (#32) is live, so
+# a non-DM channel MUST carry a community_id. Supplying the (seeded) default means a
+# failure here can ONLY be the constraint under test — never the community CHECK
+# masking it (the test-green-for-the-wrong-reason trap, Carnot PR#24).
 _INSERT_CHANNEL = (
+    "INSERT INTO channels (id, name, kind, aiko_channel, is_private, "
+    "join_policy, community_id, created_at) VALUES "
+    "('c1', 'c', 'standard', 'aiko/c', 0, :jp, '" + _DEFAULT_COMMUNITY_ID
+    + "', '" + _TS + "')"
+)
+# Channel insert AT REVISION 0001 ONLY (before 0009 added community_id). Used by the
+# 0001->0002 evolution test, which inserts the row pre-community then upgrades; 0009's
+# backfill fills community_id before its CHECK is applied.
+_INSERT_CHANNEL_0001 = (
     "INSERT INTO channels (id, name, kind, aiko_channel, is_private, "
     "join_policy, created_at) VALUES "
     "('c1', 'c', 'standard', 'aiko/c', 0, :jp, '" + _TS + "')"
@@ -107,6 +122,61 @@ def test_passkey_operation_check_rejects_out_of_set(tmp_path, monkeypatch):
         engine.dispose()
 
 
+def test_community_required_check_rejects_non_dm_null_community(tmp_path, monkeypatch):
+    """ck_channels_community_required (#32): a NON-DM channel may not have a NULL
+    community_id. Distinct id/aiko_channel so the failure can only be this CHECK,
+    not a PK/unique collision. Named-constraint assertion proves WHICH fired."""
+    engine = _fresh_at_head(tmp_path, monkeypatch)
+    try:
+        with pytest.raises(IntegrityError) as exc:
+            with engine.begin() as c:
+                c.execute(text(
+                    "INSERT INTO channels (id, name, kind, aiko_channel, is_private, "
+                    "join_policy, created_at) VALUES "
+                    "('cx', 'cx', 'standard', 'aiko/cx', 0, 'open', '" + _TS + "')"))
+        assert "ck_channels_community_required" in str(exc.value)
+    finally:
+        engine.dispose()
+
+
+def test_community_required_check_allows_dm_null_community(tmp_path, monkeypatch):
+    """The other half of the same CHECK: a DM channel (kind='dm') IS allowed to be
+    community-less (community_id NULL) — DMs live outside the community hierarchy.
+    This is the near-term-DM accommodation the partial CHECK was chosen for; if it
+    regressed to a blanket NOT NULL this insert would fail."""
+    engine = _fresh_at_head(tmp_path, monkeypatch)
+    try:
+        with engine.begin() as c:
+            c.execute(text(
+                "INSERT INTO channels (id, name, kind, aiko_channel, is_private, "
+                "join_policy, created_at) VALUES "
+                "('dm1', 'dm', 'dm', 'aiko/dm1', 0, 'invite_only', '" + _TS + "')"))
+            kind = c.execute(text(
+                "SELECT kind FROM channels WHERE id='dm1'")).scalar()
+        assert kind == "dm"
+    finally:
+        engine.dispose()
+
+
+def test_0009_rebuild_preserves_join_policy_check(tmp_path, monkeypatch):
+    """0009 rebuilds `channels` (batch) to add the community FK + CHECK. The parity
+    gate's compare_metadata is CHECK-BLIND on SQLite, so it cannot prove the
+    pre-existing ck_channels_join_policy survived the rebuild — assert directly that
+    BOTH CHECKs are present in the migrated channels DDL (the Carnot PR#28 pattern:
+    a structural assertion where compare_metadata is blind)."""
+    engine = _fresh_at_head(tmp_path, monkeypatch)
+    try:
+        with engine.connect() as c:
+            ddl = c.execute(text(
+                "SELECT sql FROM sqlite_master WHERE name='channels'")).scalar()
+    finally:
+        engine.dispose()
+    assert "ck_channels_join_policy" in ddl, (
+        "0009's batch rebuild of channels DROPPED the pre-existing join_policy "
+        "CHECK — alembic batch reflection lost it; re-declare it in the rebuild.")
+    assert "ck_channels_community_required" in ddl
+
+
 def test_upgrade_0001_to_0002_preserves_data_structure_and_applies_check(
         tmp_path, monkeypatch):
     """The evolution path: a DB at 0001 with data, upgraded one step to 0002.
@@ -121,13 +191,13 @@ def test_upgrade_0001_to_0002_preserves_data_structure_and_applies_check(
     engine = create_engine(sync_url)
     try:
         with engine.begin() as c:
-            c.execute(text(_INSERT_CHANNEL), {"jp": "invite_only"})
+            c.execute(text(_INSERT_CHANNEL_0001), {"jp": "invite_only"})
             c.execute(text(_insert_user("u1")))
             c.execute(text(_insert_membership("u1")), {"role": "admin"})
     finally:
         engine.dispose()
 
-    command.upgrade(cfg, "head")  # apply 0002 (batch rebuild of channels + memberships)
+    command.upgrade(cfg, "head")  # apply 0002..0009 (batch rebuilds of channels + memberships)
 
     engine = create_engine(sync_url)
     try:
