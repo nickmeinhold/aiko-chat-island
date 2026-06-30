@@ -119,8 +119,16 @@ async def test_list_channels_with_valid_token(client, session):
     headers = await _auth_header(session)
     resp = await client.get("/v1/channels", headers=headers)
     assert resp.status_code == 200
-    names = [c["name"] for c in resp.json()["channels"]]
+    chans = resp.json()["channels"]
+    names = [c["name"] for c in chans]
     assert "general" in names
+    # B1 (#32) is an additive API contract change, NOT invisible: the channel-list
+    # response now carries community_id. Pin it so the change is deliberate and
+    # tested rather than incidental (Carnot cage-match, PR#47). An ORM-created
+    # non-DM channel inherits the default community.
+    general = next(c for c in chans if c["name"] == "general")
+    assert "community_id" in general
+    assert general["community_id"] == "0" * 26
 
 
 async def test_history_with_valid_token(client, session):

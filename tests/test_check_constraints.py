@@ -177,6 +177,25 @@ def test_0009_rebuild_preserves_join_policy_check(tmp_path, monkeypatch):
     assert "ck_channels_community_required" in ddl
 
 
+def test_0009_rebuild_preserves_aiko_channel_unique(tmp_path, monkeypatch):
+    """0009's batch rebuild of `channels` must preserve the (unnamed) aiko_channel
+    UNIQUE from 0001. compare_metadata's unique-reflection on SQLite is exactly the
+    kind of thing that can silently leak through a rebuild, so prove it directly
+    (verify by RUNNING, not by trusting the parity gate): a duplicate aiko_channel
+    insert at head must be rejected (Carnot cage-match, PR#47)."""
+    engine = _fresh_at_head(tmp_path, monkeypatch)
+    try:
+        with engine.begin() as c:
+            c.execute(text(_INSERT_CHANNEL), {"jp": "open"})  # 'aiko/c'
+        with pytest.raises(IntegrityError) as exc:
+            with engine.begin() as c:
+                # Distinct PK, SAME aiko_channel — only the UNIQUE can fire.
+                c.execute(text(_INSERT_CHANNEL.replace("'c1'", "'c2'")), {"jp": "open"})
+        assert "UNIQUE" in str(exc.value) or "unique" in str(exc.value)
+    finally:
+        engine.dispose()
+
+
 def test_upgrade_0001_to_0002_preserves_data_structure_and_applies_check(
         tmp_path, monkeypatch):
     """The evolution path: a DB at 0001 with data, upgraded one step to 0002.
