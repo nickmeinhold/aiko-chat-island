@@ -35,6 +35,7 @@ _MODEL_TABLES = {
     "users", "social_identities", "channels", "memberships",
     "messages", "user_blocks", "message_reports", "device_tokens",
     "oauth_handoffs", "oauth_states", "social_nonces",
+    "communities", "community_memberships",
 }
 
 

@@ -49,6 +49,10 @@ async def upsert_channel(session: AsyncSession, aiko_channel: str) -> Channel:
     )).scalar_one_or_none()
     if existing is not None:
         return existing
+    # community_id is left to the model default (DEFAULT_COMMUNITY_ID, the seeded
+    # "Aiko" community) — a bus-born channel lands in Aiko with no lookup, so the
+    # "which community?" state is never contested (#32, Phase B1). The partial
+    # CHECK requires non-DM channels to carry a community; this default satisfies it.
     channel = Channel(
         name=aiko_channel, kind="standard",
         aiko_channel=aiko_channel, is_private=False,

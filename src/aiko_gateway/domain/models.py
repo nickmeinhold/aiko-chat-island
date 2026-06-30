@@ -12,8 +12,8 @@ import datetime as dt
 import enum
 
 from sqlalchemy import (
-    BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, String, Text,
-    UniqueConstraint,
+    BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Integer, String,
+    Text, UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -23,6 +23,16 @@ from .ids import new_ulid
 
 def _utcnow() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
+
+
+# The fixed PK of the single default community ("Aiko") seeded by migration 0009
+# (#32, Phase B1). NOT a generated ULID: an all-zero id is an unmistakable
+# sentinel for the system community, and a known constant lets `upsert_channel`
+# assign it WITHOUT a "find-or-create the default" lookup — the contested "which
+# community?" state is never entered, so there is no race window to guard (the
+# remove-the-coupling move). Channels born from the bus inherit it via the
+# `Channel.community_id` model default below.
+DEFAULT_COMMUNITY_ID = "0" * 26
 
 
 class Role(enum.StrEnum):
@@ -41,6 +51,35 @@ class JoinPolicy(enum.StrEnum):
 
     INVITE_ONLY = "invite_only"
     OPEN = "open"
+
+
+class Visibility(enum.StrEnum):
+    """Closed set of community visibility levels (#32). 'public' = listed in the
+    discovery directory and joinable by anyone; 'unlisted' = joinable via a direct
+    link but never listed; 'private' = invite-only and never listed. Same
+    single-source pattern as Role/JoinPolicy: drives the DB CHECK on
+    communities.visibility via _in_check, so the constraint can't drift from the
+    Python closed set. The discovery endpoint (B2) lists ONLY 'public'."""
+
+    PUBLIC = "public"
+    UNLISTED = "unlisted"
+    PRIVATE = "private"
+
+
+class Category(enum.StrEnum):
+    """Closed set of community categories for the discovery directory (#32). A
+    small curated set so the directory can offer category filters; drives the DB
+    CHECK on communities.category via _in_check. Expandable in a later migration
+    as the directory grows (a new member here needs a matching revision that
+    rebuilds the CHECK — the parity gate enforces that)."""
+
+    GENERAL = "general"
+    TECH = "tech"
+    GAMING = "gaming"
+    SOCIAL = "social"
+    MUSIC = "music"
+    EDUCATION = "education"
+    OTHER = "other"
 
 
 class Platform(enum.StrEnum):
@@ -120,6 +159,14 @@ class Channel(Base):
     __table_args__ = (
         CheckConstraint(_in_check("join_policy", JoinPolicy),
                         name="ck_channels_join_policy"),
+        # Every NON-DM channel belongs to a community (#32, Phase B1). A DM is
+        # between two users, not in a server, so it is exempt (community_id NULL).
+        # This is the handoff's invariant ("a non-DM channel with null community_id
+        # is a migration bug") turned from a prose hope into an enforced DB valve.
+        # DMs are near-term planned; their creation path MUST set community_id=None
+        # explicitly (the model default below would otherwise place them in Aiko).
+        CheckConstraint("kind = 'dm' OR community_id IS NOT NULL",
+                        name="ck_channels_community_required"),
     )
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=new_ulid)
     name: Mapped[str] = mapped_column(String(128), nullable=False)
@@ -137,6 +184,17 @@ class Channel(Base):
     # its string value so the column type is a plain VARCHAR.
     join_policy: Mapped[str] = mapped_column(
         String(16), nullable=False, default="invite_only")
+    # The community ("server") this channel belongs to (#32, Phase B1). NULLABLE
+    # in the schema so a DM (kind='dm') can be community-less, but the partial
+    # CHECK above forbids a NULL on any non-DM channel. The model-level default is
+    # the seeded Aiko community, so every channel born from the bus reconcile
+    # (upsert_channel) or constructed directly lands in Aiko with no extra code —
+    # this is also why existing channels need no per-row decision in the migration.
+    # FOOTGUN: a future DM-creation path must pass community_id=None EXPLICITLY,
+    # or this default silently places the DM in Aiko (see #35).
+    community_id: Mapped[str | None] = mapped_column(
+        ForeignKey("communities.id"), nullable=True, index=True,
+        default=DEFAULT_COMMUNITY_ID)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
@@ -151,6 +209,83 @@ class Membership(Base):
     role: Mapped[str] = mapped_column(String(16), nullable=False, default="member")  # member|admin
     can_post: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     joined_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class Community(Base):
+    """A community ("server") that owns channels (#32, Option B / Phase B1).
+
+    Option B introduces a Discord-style nesting: a Community owns many Channels
+    (channels.community_id) and users join at the community grain
+    (community_memberships). Phase B1 ships the model + a migration that seeds ONE
+    default community ("Aiko", id=DEFAULT_COMMUNITY_ID), assigns every existing
+    channel to it, and auto-joins every existing user — so the hierarchy exists
+    under the hood with NO user-visible change (channels still render flat). The
+    discovery/join/list endpoints are Phase B2; user-created communities are
+    deferred (seeded/admin-only for now), so there is no creation path yet.
+
+    owner_id is NULLABLE: the seeded default community is SYSTEM-owned (NULL). On
+    account deletion the owner link is ANONYMIZED (owner_id -> NULL), NEVER
+    cascade-deleted — a community is shared infrastructure like a channel, so
+    destroying it on the owner's departure would strip every other member (the
+    same reasoning as the message tombstone in accounts_service). The cascade
+    guard (test_account_deletion_cascade_guard) enforces that this FK to users.id
+    is handled.
+
+    default_channel_id (the channel a joiner lands in) is DEFERRED to B2 — it is
+    unused without a join flow, and adding it now would introduce a
+    channels<->communities FK cycle that SQLite create_all cannot order.
+    """
+    __tablename__ = "communities"
+    __table_args__ = (
+        CheckConstraint(_in_check("visibility", Visibility),
+                        name="ck_communities_visibility"),
+        CheckConstraint(_in_check("category", Category),
+                        name="ck_communities_category"),
+    )
+    id: Mapped[str] = mapped_column(String(26), primary_key=True, default=new_ulid)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    icon_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    visibility: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="public")
+    category: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="general")
+    owner_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id"), nullable=True, index=True)
+    # Denormalized membership count for the directory projection (#32). Maintained
+    # on join/leave in B2; the migration seeds it to the current user count.
+    member_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Rolls up the latest channel activity for directory sort (#32); populated in
+    # B2. NULL at B1 seed time.
+    last_activity_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True)
+    # Community-level takedown (#32): moderation can remove a whole community as a
+    # unit (channels/messages already have their own takedown). Inert until the B2
+    # discovery/join read paths consult it; carried now so the model is complete.
+    taken_down_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow)
+
+
+class CommunityMembership(Base):
+    """A user's membership in a community (#32, Phase B1). Mirrors Membership (the
+    per-channel join) but at the community grain. Composite PK makes a re-join
+    idempotent (one row per (community, user)). No ON DELETE CASCADE — account
+    deletion tears these down explicitly (children-before-parent), exactly like
+    every other child of users; the cascade guard now requires it."""
+    __tablename__ = "community_memberships"
+    __table_args__ = (
+        CheckConstraint(_in_check("role", Role),
+                        name="ck_community_memberships_role"),
+    )
+    community_id: Mapped[str] = mapped_column(
+        ForeignKey("communities.id"), primary_key=True)
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id"), primary_key=True)
+    role: Mapped[str] = mapped_column(String(16), nullable=False, default="member")
+    joined_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow)
 
 
 class Message(Base):

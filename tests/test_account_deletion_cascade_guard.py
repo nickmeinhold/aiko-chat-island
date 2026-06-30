@@ -38,7 +38,8 @@ from aiko_gateway.db import Base
 from aiko_gateway.domain import (
     accounts_service, devices_service, moderation_service, users_service)
 from aiko_gateway.domain.models import (
-    Channel, Membership, Message, PasskeyCredential)
+    Channel, Community, CommunityMembership, Membership, Message,
+    PasskeyCredential)
 
 
 # This app uses a SINGLE database schema (SQLite today, default-schema Postgres on
@@ -81,6 +82,8 @@ EXPECTED_USERS_FK_COLUMNS: set[tuple[str, str]] = {
     ("passkey_credentials", "user_id"),       # delete
     ("social_identities", "user_id"),         # delete
     ("memberships", "user_id"),               # delete
+    ("community_memberships", "user_id"),     # delete (#32)
+    ("communities", "owner_id"),              # anonymize (ref -> NULL) (#32)
 }
 
 
@@ -147,6 +150,15 @@ async def test_deletion_leaves_no_row_referencing_the_user(session):
     session.add(PasskeyCredential(
         credential_id="cred-primary", user_id=user.id,
         public_key="cHVibGlj", sign_count=0))
+    # communities.owner_id (anonymized on delete) + community_memberships.user_id
+    # (deleted on delete) — the two FK-to-users columns added in #32. The owned
+    # community must survive deletion with owner_id NULLed, not vanish.
+    owned = Community(id="K".ljust(26, "0"), name="Owned", visibility="public",
+                      category="general", owner_id=user.id, member_count=1)
+    session.add(owned)
+    await session.flush()
+    session.add(CommunityMembership(
+        community_id=owned.id, user_id=user.id, role="member"))
     await session.commit()
 
     # device_tokens.user_id
@@ -187,3 +199,14 @@ async def test_deletion_leaves_no_row_referencing_the_user(session):
 
     # And the user row itself is gone.
     assert await users_service.get_by_id(session, user.id) is None
+
+    # The owned community SURVIVES as a tombstone — anonymized, NOT shredded. The
+    # generic post-condition above only proves no row still *references* the user;
+    # this proves the community row itself endures with owner_id NULLed (a community
+    # is shared infrastructure, like a channel — see accounts_service / #32).
+    surviving = (await session.execute(
+        select(Community).where(Community.id == "K".ljust(26, "0")))).scalar_one()
+    assert surviving.owner_id is None
+    # member_count was decremented (the deleted user was its sole member: 1 -> 0),
+    # so the denormalized count doesn't drift on account deletion.
+    assert surviving.member_count == 0
