@@ -34,7 +34,7 @@ from __future__ import annotations
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from . import devices_service, moderation_service
+from . import devices_service, moderation_service, passkey_service
 from .memberships_service import ROLE_ADMIN
 from .models import Membership, Message, SocialIdentity, User
 
@@ -125,6 +125,11 @@ async def delete_user_account(session: AsyncSession, user_id: str) -> None:
     # go before the user row too (verify-the-neighbor: every new users-referencing
     # table must join this cascade, exactly as the moderation rows above did).
     await devices_service.purge_user_devices(session, user_id)
+    # Passkey credentials (#27) are the same shape — a non-null FK child of `users`.
+    # The passkey ship added this table and the cascade has to learn about it, or a
+    # passkey holder's deletion leaves an orphaned credential row (FK off) / FK-
+    # violates the final User delete (FK on / Postgres). Same verify-the-neighbor.
+    await passkey_service.purge_user_credentials(session, user_id)
     # Remove federated-identity links and channel memberships (children first).
     await session.execute(
         delete(SocialIdentity).where(SocialIdentity.user_id == user_id))

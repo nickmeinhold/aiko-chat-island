@@ -243,3 +243,16 @@ async def get_credential(
         select(PasskeyCredential).where(
             PasskeyCredential.credential_id == credential_id_b64)
     )).scalar_one_or_none()
+
+
+async def purge_user_credentials(session: AsyncSession, user_id: str) -> None:
+    """Delete all passkey credentials for a user — called from account deletion
+    (children-before-parent; this codebase has no ON DELETE CASCADE). Does NOT
+    commit: the caller owns the deletion transaction (mirrors
+    devices_service.purge_user_devices / moderation_service.purge_user_moderation_rows).
+    A leaked DB yields only PUBLIC keys, but a credential row outliving its user is
+    still residual account data — and with FK enforcement on it would block the
+    final User delete. Challenges need no purge: passkey_challenges has no user_id."""
+    await session.execute(
+        delete(PasskeyCredential).where(PasskeyCredential.user_id == user_id)
+    )

@@ -21,7 +21,8 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from aiko_gateway.domain import accounts_service, security, users_service
-from aiko_gateway.domain.models import Channel, Membership, Message, SocialIdentity
+from aiko_gateway.domain.models import (
+    Channel, Membership, Message, PasskeyCredential, SocialIdentity)
 from aiko_gateway.rest import auth as auth_routes
 from aiko_gateway.rest.deps import get_session
 from sqlalchemy import func, select
@@ -130,6 +131,36 @@ async def test_delete_does_not_tombstone_other_users_messages(session):
     assert refreshed.body == "hello world"
     assert refreshed.sender_user_id == other.id
     assert refreshed.sender_label == other.display_name
+
+
+async def test_delete_purges_passkey_credentials(session):
+    """Account deletion must tear down passkey_credentials — a users-referencing
+    child table added by the passkey ship (#27). Leaving it orphans the rows (FK
+    enforcement off) or FK-violates the final User delete (FK on / Postgres);
+    either way it's residual ACCOUNT DATA surviving a "your account data are
+    deleted" claim. Same children-before-parent discipline as devices/moderation.
+    """
+    material = {
+        "credential_id": "cGstY3JlZC1pZA",
+        "public_key": "cGstcHVibGljLWtleQ",
+        "sign_count": 0,
+        "transports": '["internal"]',
+        "aaguid": "00000000-0000-0000-0000-000000000000",
+    }
+    user = await users_service.create_passkey_user(
+        session, handle="pk_del", display_name="PK Del", email=None, material=material)
+    # Precondition: the credential exists before deletion (else the test proves nothing).
+    assert (await session.execute(
+        select(func.count()).select_from(PasskeyCredential)
+        .where(PasskeyCredential.user_id == user.id))).scalar_one() == 1
+
+    await accounts_service.delete_user_account(session, user.id)
+
+    assert await users_service.get_by_id(session, user.id) is None
+    # The credential is gone — no orphan pointing at a now-dead user.
+    assert (await session.execute(
+        select(func.count()).select_from(PasskeyCredential)
+        .where(PasskeyCredential.user_id == user.id))).scalar_one() == 0
 
 
 async def test_sole_admin_blocks_deletion_with_no_writes(session):
