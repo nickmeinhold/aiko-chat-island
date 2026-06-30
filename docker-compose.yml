@@ -1,23 +1,34 @@
-# Aiko Chat Gateway — production compose (#1281 incr 3 deploy).
+# Aiko Chat Gateway — production compose.
 #
-# Runs the gateway alongside the matrix stack on Nick's imagineering host,
-# fronted by Caddy at chat.imagineering.cc. Two non-obvious wiring choices,
-# both forced by the deployed topology (mapped 2026-06-25, not assumed):
+# SELF-CONTAINED aiko mesh (islands prereq-0 decouple, design 02). The gateway no
+# longer borrows the matrix bridge stack's broker — it runs its OWN aiko mesh
+# (mosquitto + registrar + ChatServer) in this compose project, on this project's
+# own default network. This is what makes the gateway portable: an island is this
+# same compose on a different host + domain + JWT secret.
 #
-#  1. NETWORK — we attach to the matrix stack's EXISTING `matrix_default`
-#     network (external) rather than minting our own. aiko-mosquitto publishes
-#     NO host port (deliberate; broker stays inside the compose network), so the
-#     ONLY way to reach it is by service name on its own network. We therefore
-#     join matrix_default and address it as `aiko-mosquitto:1883`.
+# Three non-obvious choices, all grounded on the live host (design 02, verified
+# 2026-06-30) — NOT assumed:
 #
-#  2. STORE — DB_URL points at file-backed SQLite on a named volume, NOT
-#     Postgres. Per the #1281 redesign HyperSpace is the topology source of
-#     truth and the gateway's local store is file-backed SQLite (aiosqlite is a
-#     declared PROD dep). The config.py default is Postgres for DEV convenience
-#     (docker PG on :5433); deploy overrides it here.
+#  1. MESH, NOT MATRIX. The gateway reads canonical CHANNEL topology from the aiko
+#     ChatServer (`aiko-chat`) via an ECConsumer(channel_list) share, discovered
+#     through the registrar. The matrix↔aiko BRIDGE is deliberately ABSENT here —
+#     it only injects matrix-originated messages and is not a topology source, so
+#     an independent island doesn't run it (Option A: matrix interop diverges).
 #
-# The port publish binds 127.0.0.1 only — Caddy reverse-proxies localhost:8095
-# and terminates TLS. Nothing on 8095 is reachable off-host directly.
+#  2. STORE — DB_URL points at file-backed SQLite on a named volume (the #1281
+#     single-home thesis; aiosqlite is a declared prod dep). config.py defaults to
+#     file-backed SQLite too now, so dev matches prod; deploy pins the absolute
+#     /data path here.
+#
+#  3. IMAGE — the three mesh roles share `aiko-bridge:latest`, built from
+#     github.com/nickmeinhold/aiko-chat-bridge (the role is chosen by `command`).
+#     On imagineering the image is already present. A NEW island host must build
+#     it first: `git clone …/aiko-chat-bridge && docker build -t aiko-bridge:latest
+#     aiko-chat-bridge` (or pull a pinned tag from a registry).
+#
+# The gateway port publish binds 127.0.0.1 only — Caddy reverse-proxies
+# localhost:8095 and terminates TLS. The broker publishes NO host port (internal
+# to this project's network), so the anonymous mosquitto.conf is safe.
 
 services:
   aiko-chat-gateway:
@@ -29,7 +40,7 @@ services:
       - "127.0.0.1:8095:8095"
     environment:
       # Explicit prod declaration arms config.py's fail-closed JWT guard
-      # (a weak/dev secret crashes the boot — see config.py:74-101).
+      # (a weak/dev secret crashes the boot — see config.py).
       ENVIRONMENT: production
       # Compose-level fail-closed: refuse to even render without a JWT_SECRET in
       # the env (the deploy script writes it from SOPS). Belt-and-suspenders with
@@ -38,53 +49,66 @@ services:
       # File-backed SQLite on the persistent volume below (4 slashes = absolute
       # path /data/aiko.db). aiosqlite dialect ships in the image (prod dep).
       DB_URL: sqlite+aiosqlite:////data/aiko.db
-      # aiko bus — reach the matrix stack's broker by service name on matrix_default.
+      # aiko bus — OUR own broker, by service name on this project's network.
       AIKO_MQTT_HOST: aiko-mosquitto
       AIKO_MQTT_PORT: "1883"
       AIKO_NAMESPACE: aiko
-      # --- social sign-in (#13). The client IDs are PUBLIC (native ID-token flow
-      # has no client secret), so the LIVE prod allowlist is baked here as the
-      # default rather than living only in the hand-managed host .env (#1415). The
-      # footgun this closes: a manual redeploy that re-renders .env from SOPS
-      # (which holds only JWT_SECRET) would otherwise drop these → social silently
-      # OFF, or — if SOCIAL_SIGNIN_ENABLED survived without the IDs — a fail-closed
-      # BOOT CRASH (config.py refuses prod-enabled with an empty allowlist). With
-      # repo-defaults a re-render can't silently change the aud allowlist; the host
-      # .env override stays optional. These values were verified byte-equal to the
-      # live host .env on 2026-06-28 and must stay in sync with the GCP 588100172166
-      # iOS/Web/Android clients + the Apple App ID.
-      #
-      # The *_CLIENT_IDS values MUST be JSON arrays (pydantic-settings json-decodes
-      # list fields; a bare string crashes boot). JWT_SECRET is the ONE secret here
-      # and stays in SOPS — public client IDs are not secrets.
+      # --- social sign-in (#13). Client IDs are PUBLIC (native ID-token flow has
+      # no client secret), baked here as the live prod default; the host .env
+      # override stays optional. JWT_SECRET is the ONE secret and stays in SOPS.
+      # *_CLIENT_IDS MUST be JSON arrays (pydantic json-decodes list fields).
       SOCIAL_SIGNIN_ENABLED: ${SOCIAL_SIGNIN_ENABLED:-true}
       APPLE_CLIENT_IDS: ${APPLE_CLIENT_IDS:-["cc.imagineering.aikoChatApp"]}
       GOOGLE_CLIENT_IDS: ${GOOGLE_CLIENT_IDS:-["588100172166-a0r6ipvpju5rd6fh8lv85qqohpdosp33.apps.googleusercontent.com","588100172166-23ppgk6jdb3et2ehc1qj584c6rgs0c9j.apps.googleusercontent.com","588100172166-bagrmvftp3fcer2j2lvnh33j65g58elk.apps.googleusercontent.com"]}
-      # --- OAuth broker (#21). Unlike the native client IDs above, the broker does
-      # a CONFIDENTIAL authorization-code exchange, so GITHUB_CLIENT_SECRET is a REAL
-      # secret — NOT baked here. Both live ONLY in the host .env; absent → the broker
-      # provider is simply not listed (fail-closed), and the both-or-neither default
-      # ('' when unset) keeps the config.py XOR boot-guard happy on a SOPS re-render.
+      # --- OAuth broker (#21). GITHUB_CLIENT_SECRET is a REAL secret — NOT baked
+      # here; both live only in the host .env. Absent → broker provider not listed
+      # (fail-closed), and the both-or-neither default keeps the XOR boot-guard happy.
       GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
       GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
-      # --- WebAuthn passkeys (#1471 / #29). The endpoints + .well-known deploy DARK
-      # (config.py passkey_enabled=False default); this passthrough is the knob that
-      # flips ADVERTISEMENT on (/providers lists passkey) AFTER device e2e. Default
-      # false here so a deploy without the override stays dark — set PASSKEY_ENABLED=true
-      # in the host .env to advertise. Public, not a secret (mirrors SOCIAL_SIGNIN_ENABLED).
+      # --- WebAuthn passkeys (#1471 / #29). Endpoints deploy DARK; this knob flips
+      # /providers advertisement on AFTER device e2e. Default false → stays dark
+      # without the override. Public, not a secret.
       PASSKEY_ENABLED: ${PASSKEY_ENABLED:-false}
     volumes:
       # Persist the SQLite store across container recreates.
       - aiko_gateway_data:/data
-    networks:
-      - matrix_default
+    depends_on:
+      - aiko-chat
 
-networks:
-  # Pre-existing network owned by the matrix compose project — we attach, we do
-  # not create it. (External so a `docker compose down` here never tears down
-  # the matrix stack's network.)
-  matrix_default:
-    external: true
+  # --- the gateway's OWN aiko mesh (design 02) -------------------------------
+  # mosquitto (transport) + registrar (discovery) + ChatServer (channel/user
+  # topology). No host ports; reachable only within this project's network.
+  aiko-mosquitto:
+    image: eclipse-mosquitto:2
+    restart: always
+    volumes:
+      - ./deploy/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - aiko_mosquitto_data:/mosquitto/data
+
+  aiko-registrar:
+    image: aiko-bridge:latest
+    restart: always
+    environment:
+      AIKO_MQTT_HOST: aiko-mosquitto
+      AIKO_NAMESPACE: aiko
+    command: ["aiko_registrar"]
+    depends_on:
+      - aiko-mosquitto
+
+  aiko-chat:
+    image: aiko-bridge:latest
+    restart: always
+    environment:
+      AIKO_MQTT_HOST: aiko-mosquitto
+      AIKO_NAMESPACE: aiko
+    # geekscape/aiko_chat bootstraps its HyperSpace (channels: general/llm/random/
+    # robot/yolo) before `aiko_chat run`; chat_start.sh does that idempotently from
+    # the _chat_server_ working dir it creates. Verified to reproduce the live
+    # 5-channel set exactly (design 02 §5 — the cutover data-safety condition).
+    command: ["bash", "-c", "cd /tmp && exec bash /opt/aiko_chat/src/aiko_chat/chat_start.sh"]
+    depends_on:
+      - aiko-registrar
 
 volumes:
   aiko_gateway_data:
+  aiko_mosquitto_data:
