@@ -12,7 +12,6 @@ material.
 from __future__ import annotations
 
 import datetime as dt
-import hashlib
 import time
 
 import jwt
@@ -102,9 +101,9 @@ async def test_expired_token_logs_jwt_reason(wired_google, caplog):
 
 async def test_nonce_mismatch_logs_shape_not_value(wired_google, caplog):
     """The #1491 linchpin line: a nonce mismatch logs the SHAPE (lengths +
-    prefixes + nonce_hashed) of both sides so a hashed-vs-raw transform
-    disagreement is distinguishable from a value mismatch — but NEVER the full
-    nonce of either side."""
+    fingerprints + nonce_hashed) of both sides so a hashed-vs-raw transform
+    disagreement is distinguishable from a value mismatch — but NEVER the nonce
+    of either side."""
     expected_nonce = "raw-app-nonce-aaaaaaaaaaaaaaaaaaaa-SECRET"
     token_nonce = "totally-different-bbbbbbbbbbbbbbbbbbbb-SECRET"
     token = _make_token(wired_google, nonce=token_nonce)
@@ -119,6 +118,43 @@ async def test_nonce_mismatch_logs_shape_not_value(wired_google, caplog):
     assert f"len={len(token_nonce)}" in joined
     assert expected_nonce not in joined            # ...but never the full values
     assert token_nonce not in joined
+    # The two distinct nonces get DISTINCT fingerprints — comparison-preserving,
+    # so "same length, different value" is still diagnosable from the log.
+    assert oauth._fingerprint(expected_nonce) in joined
+    assert oauth._fingerprint(token_nonce) in joined
+    assert oauth._fingerprint(expected_nonce) != oauth._fingerprint(token_nonce)
+
+
+async def test_short_nonce_is_not_disclosed(wired_google, caplog):
+    """RED-proof for the cage-match (Carnot HIGH): a nonce of <=10 chars must NOT
+    appear in the trace. The old _short() returned the whole value for short inputs
+    (the truncation marker only fired past n=10), so a short nonce leaked in full.
+    _fingerprint never emits plaintext at any length — this test FAILS on the old
+    prefix renderer and PASSES on the fingerprint."""
+    expected_nonce = "short1"   # 6 chars — a prefix renderer would log it whole
+    token_nonce = "short2"      # 6 chars
+    token = _make_token(wired_google, nonce=token_nonce)
+    with caplog.at_level("WARNING", logger=OAUTH_LOGGER):
+        with pytest.raises(oauth.InvalidProviderToken):
+            await oauth.verify_id_token(
+                "google", token, expected_nonce=expected_nonce)
+    joined = "\n".join(r.getMessage() for r in caplog.records)
+    assert "nonce mismatch" in joined
+    assert expected_nonce not in joined   # the short nonce is NOT disclosed...
+    assert token_nonce not in joined
+    assert f"len={len(expected_nonce)}" in joined  # ...only its shape
+
+
+async def test_short_sub_is_not_disclosed(wired_google, caplog):
+    """Companion RED-proof for Carnot's MEDIUM: a short `sub` must not be logged
+    whole on the OK path. _fingerprint(sub) never emits the plaintext sub."""
+    token = _make_token(wired_google, sub="u1")  # 2 chars
+    with caplog.at_level("INFO", logger=OAUTH_LOGGER):
+        await oauth.verify_id_token("google", token)
+    joined = "\n".join(r.getMessage() for r in caplog.records)
+    assert "social.verify: OK" in joined
+    assert "sub=u1" not in joined            # the short sub is NOT disclosed
+    assert oauth._fingerprint("u1") in joined  # only its fingerprint
 
 
 async def test_nonce_present_in_token_but_none_expected_does_not_log_mismatch(
