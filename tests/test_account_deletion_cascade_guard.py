@@ -41,33 +41,31 @@ from aiko_gateway.domain.models import (
     Channel, Membership, Message, PasskeyCredential)
 
 
+# This app uses a SINGLE database schema (SQLite today, default-schema Postgres on
+# the planned migration), so a bare table name is a unique key and `table.key ==
+# table.name`. The guard intentionally relies on that: it compares bare names here,
+# in EXPECTED_USERS_FK_COLUMNS, and in the Base.metadata.tables[...] lookups, so all
+# three stay consistent. `test_schema_is_single_namespace` below fails loudly if a
+# table ever declares an explicit schema — the signal to revisit this assumption
+# (and the deletion cascade) rather than let same-named tables collapse silently.
 def _references_users_id(col) -> bool:
-    """True iff `col` has a foreign key targeting the `users.id` column specifically
-    — not merely some `users` column (e.g. a future FK to `users.email`), and not a
-    same-named table in another schema. Inspect the referenced column, not the box
-    label: match both the target table name AND that the target column is `id`, keyed
-    on the schema-qualified table identity so a multi-schema Postgres future can't
-    collapse two same-named `users` tables into one entry."""
-    for fk in col.foreign_keys:
-        target = fk.column  # the referenced Column object
-        # table.key is schema-qualified ("users" on SQLite, "public.users" on PG with
-        # an explicit schema); endswith("users") keeps the default-schema case exact
-        # while not matching an unrelated "..._users" table.
-        key = target.table.key
-        if (key == "users" or key.endswith(".users")) and target.name == "id":
-            return True
-    return False
+    """True iff `col` has a foreign key targeting `users.id` specifically — not
+    merely some other `users` column (e.g. a future FK to `users.email`). Inspect
+    the referenced column, not the box label: match the target table name AND that
+    the target column is `id`."""
+    return any(
+        fk.column.table.name == "users" and fk.column.name == "id"
+        for fk in col.foreign_keys
+    )
 
 
 def _users_fk_columns() -> set[tuple[str, str]]:
-    """Every (table, column) whose FK targets `users.id` specifically. Keyed on the
-    schema-qualified source table (`table.key`) so distinct same-named tables in a
-    multi-schema deployment stay distinct rather than collapsing."""
+    """Every (table, column) whose FK targets `users.id` specifically."""
     found: set[tuple[str, str]] = set()
     for table in Base.metadata.tables.values():
         for col in table.columns:
             if _references_users_id(col):
-                found.add((table.key, col.name))
+                found.add((table.name, col.name))
     return found
 
 
@@ -84,6 +82,19 @@ EXPECTED_USERS_FK_COLUMNS: set[tuple[str, str]] = {
     ("social_identities", "user_id"),         # delete
     ("memberships", "user_id"),               # delete
 }
+
+
+def test_schema_is_single_namespace():
+    """The guard's bare-table-name keying assumes a single schema (so `table.key ==
+    table.name`). If a table ever declares an explicit schema, that assumption — and
+    the deletion cascade's table lookups — must be revisited, so fail loudly here
+    rather than let two same-named tables collapse silently in the FK set."""
+    schemad = sorted(t.name for t in Base.metadata.tables.values() if t.schema is not None)
+    assert not schemad, (
+        f"Tables now declare an explicit schema: {schemad}. The cascade guard keys "
+        "FK columns on bare table names assuming a single namespace — revisit "
+        "_users_fk_columns / EXPECTED_USERS_FK_COLUMNS (and delete_user_account) "
+        "before this can be trusted under multiple schemas.")
 
 
 def test_users_fk_set_is_the_expected_set():
