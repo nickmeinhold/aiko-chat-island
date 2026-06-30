@@ -69,13 +69,19 @@ class Settings(BaseSettings):
     # gateway is reachable at all. The risk is named here and in the PR, not
     # silently absorbed.
     social_signin_enabled: bool = False
-    # Replay defense (#13): when True, /v1/auth/social REFUSES a request that
-    # carries no nonce (presence enforcement). Default False because the live app
-    # does not send a nonce yet — flipping this on before the app (separate repo)
-    # generates+sends one would lock every user out. Independent of verification:
-    # a WRONG nonce is always rejected by verify_id_token regardless of this flag;
-    # this only governs whether a MISSING nonce is tolerated. Flip to True as the
-    # final step of the staged rollout, once the app ships nonce generation.
+    # Replay defense (#13). This flag is the SINGLE SWITCH for option-a (the
+    # server-ISSUED single-use nonce). When True, /v1/auth/social (a) REFUSES a
+    # request carrying no nonce (presence enforcement) AND (b) requires the supplied
+    # nonce to be one the gateway issued + not yet consumed (the consume; #1491
+    # gates this on the flag, not on nonce presence). When False (default, today's
+    # app) BOTH are off: a request without a nonce is accepted, and a supplied nonce
+    # is NOT consumed — so option-a's captured-request replay closure is inert even
+    # for a client that opted into POST /v1/auth/nonce (cage-match PR#43). Default
+    # False because the live app does not send a SERVER-issued nonce yet — it sends
+    # its OWN nonce for option-b PROVIDER binding, verified inside verify_id_token.
+    # Independent of verification: a WRONG nonce is ALWAYS rejected by verify_id_token
+    # regardless of this flag (option-b). Flip to True as the final step of the
+    # staged rollout, once the app ships POST /v1/auth/nonce (#1449).
     social_nonce_required: bool = False
     # TTL for a server-ISSUED single-use nonce (#13 option (a)): the window between
     # the app calling POST /v1/auth/nonce and POSTing /v1/auth/social with the

@@ -220,8 +220,33 @@ async def social(req: SocialReq, session: DbSession) -> dict:
     except oauth.InvalidProviderToken:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid provider token")
 
-    # Server-issuance + single-use (#13 option (a)): a supplied nonce must be one
-    # the gateway ISSUED (POST /v1/auth/nonce) and not yet redeemed. Consumed AFTER
+    # Server-issuance + single-use (#13 option (a)) — gated on the rollout POLICY,
+    # NOT on mere nonce presence. WHEN settings.social_nonce_required, a supplied
+    # nonce must be one the gateway ISSUED (POST /v1/auth/nonce) and not yet
+    # redeemed. Until the app adopts /nonce (#1449) it sends its OWN nonce purely for
+    # option-b PROVIDER binding — already verified against the token claim inside
+    # verify_id_token above (the OK trace shows nonce_checked=True). That app-supplied
+    # nonce was never gateway-issued, so force-consuming it found no row and 401'd
+    # EVERY real Google sign-in (#1491). So option-a enforcement (the consume below)
+    # fires only in required mode; in tolerant mode it is inert exactly as #23/#24
+    # intended.
+    #
+    # NAMED TRADEOFF (tolerant mode) — this IS a server-invariant change, stated
+    # plainly (cage-match PR#43, Carnot+Kelvin): the OLD code consumed on nonce
+    # PRESENCE, so it gave captured-request replay closure to ANY client that sent a
+    # server-issued nonce, flag or no flag. Binding the consume to the flag removes
+    # that for tolerant mode: NO request gets option-a replay closure here — not even
+    # a (hypothetical) client that called POST /v1/auth/nonce. Option-b still binds
+    # nonce↔token, but a captured POST carries the matching nonce, so a replay
+    # re-verifies; option-b cannot close captured-request replay.
+    # We accept this because: (a) the only PRODUCTION client is the app, which never
+    # calls /nonce (it sends its own option-b nonce) — so for the live deployment
+    # nothing that ever functioned is lost; presence-gating the consume instead 401'd
+    # EVERY real Google sign-in (#1491). (b) Coupling option-a to the flag is the
+    # staged-rollout design (#23/#24/#1449): the flag is the SINGLE switch for
+    # option-a. Flip social_nonce_required=True (after the app adopts /nonce) to
+    # restore single-use replay closure. Test test_tolerant_mode_does_not_close_replay
+    # pins this behaviour so it can't silently change. Consumed AFTER
     # the token verifies — so a transient JWKS 503 or a bad token does NOT burn the
     # nonce (the user retries with the same one; cage-match PR#33, Carnot MEDIUM) —
     # but BEFORE any session is issued. Replay still collapses here: a replayed
@@ -245,7 +270,7 @@ async def social(req: SocialReq, session: DbSession) -> dict:
     # network call would stall every gateway write) AND it is a one-shot browser
     # redirect with no retry channel, so atomicity there is all cost and no benefit
     # — it commits its state burn eagerly (see oauth_callback / consume_state).
-    if req.nonce is not None and not await nonce_service.consume_nonce(
+    if settings.social_nonce_required and not await nonce_service.consume_nonce(
             session, req.nonce):
         await session.rollback()
         raise HTTPException(
