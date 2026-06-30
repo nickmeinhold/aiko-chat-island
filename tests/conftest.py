@@ -1,9 +1,17 @@
 """Shared test fixtures.
 
-Phase-1 tests run against an in-memory async SQLite engine — fast, isolated, and
-Postgres-free. The production engine (db.py) targets Postgres; tests build their
-own engine + session so they never touch a real DB. `Base.metadata` is shared, so
-`create_all` here builds the same schema the app uses.
+Tests run against an in-memory async SQLite engine — fast, isolated, and the same
+engine family the app uses everywhere now (dev + prod are both file-backed SQLite;
+see db.py / config.py). Tests build their own engine + session so they never touch
+a real DB. `Base.metadata` is shared, so `create_all` here builds the same schema
+the app uses.
+
+NOTE on FK enforcement: the default `session` fixture below does NOT set
+`PRAGMA foreign_keys=ON`, matching prod (the gateway relies on application-level
+cascades, not DB-enforced ones — see channels_service / accounts_service). The
+`fk_enforced_session` fixture in test_account_deletion_cascade_guard.py turns FK
+enforcement ON specifically to prove the manual cascade also satisfies SQLite's
+referential engine (complete AND children-before-parent).
 """
 from __future__ import annotations
 

@@ -1,10 +1,12 @@
 """Async SQLAlchemy engine + session factory.
 
-Dev uses a docker Postgres on :5433 (see spike/devstack notes); deploy uses
-file-backed SQLite via DB_URL (the #1281 redesign makes HyperSpace the topology
-source of truth and the gateway's local store file-backed SQLite — aiosqlite is
-a declared prod dep). The engine is DB_URL-driven, so the dialect follows the
-URL.
+Both dev and deploy use file-backed SQLite via DB_URL (the #1281 redesign makes
+HyperSpace the topology source of truth and the gateway's local store file-backed
+SQLite — aiosqlite is a declared prod dep). Dev defaults to ./aiko_dev.db; deploy
+sets the absolute /data/aiko.db on a volume. Keeping dev on the SAME engine as
+prod is deliberate: SQLite's single-writer locking, type affinity, CHECK quirks,
+and FK-enforcement-off (app-level cascades) must be what dev exercises, not hidden
+behind Postgres. The engine is DB_URL-driven, so the dialect follows the URL.
 
 Schema authority (#14): **alembic owns the schema for any real database.** The
 container entrypoint runs ``aiko_gateway.migrate`` (alembic upgrade head) BEFORE

@@ -46,7 +46,16 @@ class Settings(BaseSettings):
     aiko_channels: list[str] = ["general"]
 
     # --- database ---
-    db_url: str = "postgresql+asyncpg://aiko:dev@localhost:5433/aiko_chat"
+    # Dev defaults to file-backed SQLite — the SAME engine prod runs (deploy sets
+    # DB_URL=sqlite+aiosqlite:////data/aiko.db; the #1281 single-home thesis makes
+    # SQLite the deployment target, not a stopgap). Dev-on-Postgres was legacy
+    # drift from before that move and was blind to everything that actually ships:
+    # SQLite single-writer locking ("database is locked"), type affinity, CHECK
+    # quirks, and FK enforcement defaulting OFF (the gateway relies on
+    # application-level cascades — see channels_service / accounts_service — NOT
+    # ondelete=CASCADE, so the deploy dialect's behavior must be what dev exercises).
+    # A relative path → an ./aiko_dev.db file in the working dir (gitignored).
+    db_url: str = "sqlite+aiosqlite:///./aiko_dev.db"
 
     # --- auth (JWT) ---  dev default; deploy supplies via SOPS.
     jwt_secret: str = _DEV_JWT_SECRET
