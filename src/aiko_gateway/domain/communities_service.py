@@ -226,7 +226,15 @@ async def community_detail(
 
     Existence AND access resolve in ONE statement via ``accessible_predicate``: a
     nonexistent id and a private community the viewer is not in both come back as
-    None, so neither latency nor query shape distinguishes them."""
+    None, so neither latency nor query shape distinguishes them.
+
+    CONSISTENCY (named tradeoff, b2d9): this is a GET, and the community read and
+    the channel read are two statements — a takedown landing between them yields a
+    momentarily-stale detail. That is the explicitly-permitted self-healing case
+    (the next read re-applies the predicate and the community vanishes), and a GET
+    must NOT take a FOR UPDATE row lock the way the join POST does — read endpoints
+    holding write locks is an anti-pattern. The authoritative gate is ``join``,
+    which IS fully locked/consistent; ``detail`` is an advisory read."""
     community = (
         await session.execute(
             select(Community).where(
@@ -301,11 +309,23 @@ async def join(
     # too).
     existing = await session.get(CommunityMembership, (community_id, viewer_id))
     if existing is not None:
-        community = await session.get(Community, community_id)
-        if community is None or community.taken_down_at is not None:
+        # The idempotent re-join is still a POST, so it gets the SAME locked,
+        # visibility-filtered read as the new-join path — its response is a
+        # consistent snapshot of a still-live community, not a stale one (Carnot
+        # cage-match PR#48 r3). FOR UPDATE serialises a concurrent takedown on
+        # Postgres; SQLite's read transaction already blocks the takedown's commit.
+        # taken_down_at gate ONLY — a private flip does not evict an existing member.
+        community = (await session.execute(
+            select(Community).where(
+                Community.id == community_id,
+                Community.taken_down_at.is_(None),
+            ).with_for_update()
+        )).scalar_one_or_none()
+        if community is None:
             raise CommunityNotFound(community_id)
         channels = await acl.visible_channels_in_community(
             session, viewer_id, community_id)
+        await session.commit()  # release the lock — no mutation on this path
         return community, channels, False
 
     # New join. TWO complementary concurrency mechanisms, each covering the other's
