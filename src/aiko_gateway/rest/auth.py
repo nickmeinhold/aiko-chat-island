@@ -282,11 +282,13 @@ async def social_claim(req: SocialClaimReq, session: DbSession) -> dict:
         # persisting — the token is gateway-signed (unforgeable), but a confused
         # caller / future issuer reuse must not become an unchecked credential write.
         if pending.get("provider") != "passkey":
+            log.warning("passkey.claim: REJECT token purpose mismatch (not 'passkey')")
             raise HTTPException(
                 status.HTTP_401_UNAUTHORIZED, "invalid passkey provisioning token")
         try:
             material = _PasskeyMaterial.model_validate(pending["passkey_credential"])
         except ValidationError:
+            log.warning("passkey.claim: REJECT malformed credential material")
             raise HTTPException(
                 status.HTTP_401_UNAUTHORIZED, "malformed passkey credential material")
         try:
@@ -296,9 +298,13 @@ async def social_claim(req: SocialClaimReq, session: DbSession) -> dict:
             )
         except IntegrityError:
             await session.rollback()
+            log.warning("passkey.claim: REJECT conflict cred=%s (handle taken or already claimed)",
+                        _short(material.credential_id))
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
                 "handle already taken or passkey already claimed")
+        log.info("passkey.claim: OK cred=%s -> user=%s (new account)",
+                 _short(material.credential_id), user.id)
         return {**_tokens(user.id), "user": _user_view(user)}
     # Social claim — gated on social sign-in being enabled (unchanged).
     if not settings.social_signin_enabled:
@@ -331,12 +337,29 @@ class PasskeyFinishReq(BaseModel):
     credential: dict
 
 
+def _short(value: object, n: int = 10) -> str:
+    """A LOG-SAFE short prefix of an identifier. Used for passkey ceremony tracing
+    (#1471 observability): the challenge `state` and `credential_id` are public,
+    single-use handles — not secrets — but we still log only a prefix so a full
+    value never lands in logs, and never log tokens / email / key material. Bytes
+    are hex-rendered first."""
+    if value is None:
+        return "?"
+    if isinstance(value, bytes):
+        value = value.hex()
+    s = str(value)
+    return s[:n] + ("…" if len(s) > n else "")
+
+
 @router.post("/passkey/register/start", dependencies=[rate_limit("passkey")])
 async def passkey_register_start(session: DbSession) -> dict:
     """Begin registration for an ANONYMOUS caller (first-passkey-creates-account).
     Returns {state, options} — the raw WebAuthn-JSON the platform authenticator
     parses. No body, no prior session."""
-    return await passkey_service.start_registration(session)
+    result = await passkey_service.start_registration(session)
+    log.info("passkey.register.start: challenge issued state=%s ttl=%ss",
+             _short(result.get("state")), settings.passkey_challenge_ttl_seconds)
+    return result
 
 
 @router.post("/passkey/register/finish", dependencies=[rate_limit("passkey")])
@@ -349,6 +372,8 @@ async def passkey_register_finish(req: PasskeyFinishReq, session: DbSession) -> 
         session, req.state, PasskeyOperation.REGISTER)
     if raw is None:
         await session.rollback()
+        log.warning("passkey.register.finish: REJECT invalid/expired challenge state=%s",
+                    _short(req.state))
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST, "invalid or expired passkey challenge")
     try:
@@ -359,11 +384,15 @@ async def passkey_register_finish(req: PasskeyFinishReq, session: DbSession) -> 
         # wraps parse failures too). Fail closed; the deferred challenge burn rolls
         # back so an honest retry of the SAME ceremony is possible.
         await session.rollback()
+        log.warning("passkey.register.finish: REJECT attestation verification failed state=%s",
+                    _short(req.state))
         raise HTTPException(
             status.HTTP_401_UNAUTHORIZED, "passkey registration verification failed")
     token = security.issue_provisioning(
         "passkey", material["credential_id"], passkey_credential=material)
     await session.commit()  # burn the challenge durably — the ceremony completed
+    log.info("passkey.register.finish: OK state=%s cred=%s -> provisioning token issued "
+             "(awaiting /social/claim)", _short(req.state), _short(material["credential_id"]))
     return {
         "status": "provisioning",
         "provisioning_token": token,
@@ -376,7 +405,10 @@ async def passkey_register_finish(req: PasskeyFinishReq, session: DbSession) -> 
 async def passkey_authenticate_start(session: DbSession) -> dict:
     """Begin usernameless/discoverable authentication (empty allowCredentials).
     Returns {state, options}."""
-    return await passkey_service.start_authentication(session)
+    result = await passkey_service.start_authentication(session)
+    log.info("passkey.authenticate.start: challenge issued state=%s",
+             _short(result.get("state")))
+    return result
 
 
 @router.post("/passkey/authenticate/finish", dependencies=[rate_limit("passkey")])
@@ -389,17 +421,23 @@ async def passkey_authenticate_finish(
         session, req.state, PasskeyOperation.AUTHENTICATE)
     if raw is None:
         await session.rollback()
+        log.warning("passkey.authenticate.finish: REJECT invalid/expired challenge state=%s",
+                    _short(req.state))
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST, "invalid or expired passkey challenge")
     try:
         cred_id = passkey_service.credential_id_of(req.credential)
     except (KeyError, TypeError, ValueError):
         await session.rollback()
+        log.warning("passkey.authenticate.finish: REJECT malformed credential state=%s",
+                    _short(req.state))
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST, "malformed passkey credential")
     cred = await passkey_service.get_credential(session, cred_id)
     if cred is None:
         await session.rollback()
+        log.warning("passkey.authenticate.finish: REJECT unknown credential cred=%s state=%s",
+                    _short(cred_id), _short(req.state))
         raise HTTPException(
             status.HTTP_401_UNAUTHORIZED, "unknown passkey credential")
     try:
@@ -408,11 +446,15 @@ async def passkey_authenticate_finish(
             public_key_b64=cred.public_key, current_sign_count=cred.sign_count)
     except InvalidAuthenticationResponse:
         await session.rollback()
+        log.warning("passkey.authenticate.finish: REJECT assertion verification failed "
+                    "cred=%s state=%s", _short(cred_id), _short(req.state))
         raise HTTPException(
             status.HTTP_401_UNAUTHORIZED, "passkey authentication verification failed")
     user = await users_service.get_by_id(session, cred.user_id)
     if user is None:  # defensive — the FK guarantees it; fail closed regardless
         await session.rollback()
+        log.warning("passkey.authenticate.finish: REJECT credential's user missing "
+                    "cred=%s user_id=%s", _short(cred_id), cred.user_id)
         raise HTTPException(
             status.HTTP_401_UNAUTHORIZED, "unknown passkey credential")
     cred.sign_count = new_count
@@ -421,6 +463,8 @@ async def passkey_authenticate_finish(
     # Durable AFTER the outcome: the challenge burn + sign_count bump commit atomic
     # with the sign-in (a downstream failure rolls both back — the #24 contract).
     await session.commit()
+    log.info("passkey.authenticate.finish: OK cred=%s user=%s sign_count=%s",
+             _short(cred_id), user.id, new_count)
     return outcome
 
 
