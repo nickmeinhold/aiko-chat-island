@@ -32,14 +32,20 @@ from __future__ import annotations
 
 import datetime as dt
 
-from sqlalchemy import func, select
+import pytest
+import pytest_asyncio
+from sqlalchemy import event, func, select
+from sqlalchemy.ext.asyncio import (
+    AsyncSession, async_sessionmaker, create_async_engine)
+from sqlalchemy.pool import StaticPool
 
 from aiko_gateway.db import Base
 from aiko_gateway.domain import (
     accounts_service, devices_service, moderation_service, users_service)
 from aiko_gateway.domain.models import (
-    Channel, Community, CommunityMembership, Membership, Message,
-    PasskeyCredential)
+    DEFAULT_COMMUNITY_ID, Channel, Community, CommunityMembership, Membership,
+    Message, PasskeyCredential, SocialIdentity, User)
+from aiko_gateway.domain.ids import new_ulid
 
 
 # This app uses a SINGLE database schema (SQLite today, default-schema Postgres on
@@ -118,12 +124,12 @@ def test_users_fk_set_is_the_expected_set():
         "delete_user_account no longer references a dropped table.")
 
 
-async def test_deletion_leaves_no_row_referencing_the_user(session):
-    """BEHAVIORAL proof — seed every FK-to-users column, delete, assert no orphan.
-
-    The generic post-condition loop covers EVERY current FK-to-users column (and
-    any future one, once seeded) without naming them one by one — so the cascade's
-    correctness is proven by the schema, not by a hand-maintained list."""
+async def _seed_full_user_graph(session):
+    """Seed a row in EVERY FK-to-`users` column (the full deletion blast radius),
+    returning (primary_user, other_user). Shared by the FK-off behavioral proof and
+    the FK-enforced probe so both exercise the identical graph. Rows are added
+    parent-before-child so the seed itself is valid even under
+    `PRAGMA foreign_keys=ON`."""
     # Primary user (create_social_user also makes the social_identities row).
     user = await users_service.create_social_user(
         session, provider="google", provider_sub="g-primary",
@@ -171,6 +177,16 @@ async def test_deletion_leaves_no_row_referencing_the_user(session):
     # message_reports.reporter_user_id — primary reports other's message.
     await moderation_service.report_message(
         session, reporter_id=user.id, message_id="M2".ljust(26, "0"), reason="spam")
+    return user, other
+
+
+async def test_deletion_leaves_no_row_referencing_the_user(session):
+    """BEHAVIORAL proof — seed every FK-to-users column, delete, assert no orphan.
+
+    The generic post-condition loop covers EVERY current FK-to-users column (and
+    any future one, once seeded) without naming them one by one — so the cascade's
+    correctness is proven by the schema, not by a hand-maintained list."""
+    user, other = await _seed_full_user_graph(session)
 
     # Precondition: EVERY expected FK-to-users column actually references the user
     # now — otherwise a green post-condition would prove nothing for that column.
@@ -210,3 +226,155 @@ async def test_deletion_leaves_no_row_referencing_the_user(session):
     # member_count was decremented (the deleted user was its sole member: 1 -> 0),
     # so the denormalized count doesn't drift on account deletion.
     assert surviving.member_count == 0
+
+
+@pytest_asyncio.fixture
+async def fk_enforced_session() -> AsyncSession:
+    """A fresh in-memory DB per test with SQLite FK enforcement turned ON.
+
+    The default `session` fixture (conftest) leaves `PRAGMA foreign_keys=OFF` to
+    match prod — the gateway enforces no DB-level FKs and relies on application-
+    level cascades. This fixture deliberately turns enforcement ON so a test can
+    use SQLite's own referential engine as an INDEPENDENT auditor of the manual
+    cascade: a teardown that either misses a child or deletes the parent before
+    its children raises an IntegrityError here that the FK-off path swallows."""
+    # StaticPool → ONE shared connection for the whole engine, so the in-memory DB
+    # (and the per-connection foreign_keys pragma) persists across create_all, the
+    # seed, and the test session. With the default pool a :memory: engine can hand
+    # out a fresh empty DB per connection, and the FK pragma would only arm some of
+    # them — both silent footguns this avoids.
+    engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _fk_on(dbapi_conn, _record):  # noqa: ANN001
+        cur = dbapi_conn.cursor()
+        cur.execute("PRAGMA foreign_keys=ON")
+        cur.close()
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+        # Tests use create_all, not migrations; under FK enforcement the default
+        # "Aiko" community row (seeded by migration 0009 in prod) must exist BEFORE
+        # any channel insert, because Channel.community_id defaults to
+        # DEFAULT_COMMUNITY_ID and FK-references communities.id. System-owned
+        # (owner_id NULL), mirroring the migration. Without this, the very first
+        # channel insert would FK-fail — itself the finding that an FK-off prod
+        # silently tolerates a channel pointing at a non-existent community.
+        # created_at is NOT NULL with a Python-side default that raw SQL bypasses,
+        # so supply it explicitly.
+        await conn.exec_driver_sql(
+            "INSERT INTO communities (id, name, visibility, category, owner_id, "
+            "member_count, created_at) VALUES "
+            "(?, 'Aiko', 'public', 'general', NULL, 0, '2026-06-30 00:00:00+00:00')",
+            (DEFAULT_COMMUNITY_ID,))
+    maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with maker() as s:
+        yield s
+    await engine.dispose()
+
+
+async def test_fixture_actually_enforces_foreign_keys(fk_enforced_session):
+    """Guard the guard: prove the fixture's `PRAGMA foreign_keys=ON` is in force, so
+    the probe below can't pass vacuously (an FK-off engine would accept the orphan
+    insert and the probe would prove nothing). Insert a membership pointing at a
+    non-existent user and assert SQLite REJECTS it."""
+    import sqlalchemy.exc
+
+    fk_enforced_session.add(Channel(
+        id="C".ljust(26, "0"), name="general", kind="standard",
+        aiko_channel="general"))
+    await fk_enforced_session.flush()
+    fk_enforced_session.add(Membership(
+        channel_id="C".ljust(26, "0"), user_id="nonexistent-user", role="member"))
+    with pytest.raises(sqlalchemy.exc.IntegrityError):
+        await fk_enforced_session.flush()
+
+
+async def _seed_fk_safe(session):
+    """Seed the SAME full FK-to-`users` graph as `_seed_full_user_graph`, but in
+    explicit dependency LAYERS (flush after each) so the seed itself is valid under
+    `PRAGMA foreign_keys=ON`. Returns (primary_user, other_user).
+
+    Why not reuse `_seed_full_user_graph`? It calls `create_social_user`, which adds
+    a `User` and its `SocialIdentity` in ONE flush. The models define no
+    `relationship()` between them, so SQLAlchemy's unit-of-work has no per-object
+    dependency edge and inserts `social_identities` BEFORE `users` — which RESTRICT
+    rejects under enforcement. That non-FK-safe ordering is harmless on FK-off prod
+    but means the real create path can't run here; we seed the users directly,
+    then reuse the genuinely FK-safe single-row services (register_device /
+    block_user / report_message) for the rest. (Tracked: the create paths assume
+    FK-off — see the session findings / follow-up task.)"""
+    # Layer 1 — users (every other table references these).
+    user = User(id=new_ulid(), username="primary", display_name="Primary",
+                password_hash=None, aiko_username="primary",
+                email="primary@example.com")
+    other = User(id=new_ulid(), username="other", display_name="Other",
+                 password_hash=None, aiko_username="other",
+                 email="other@example.com")
+    session.add_all([user, other])
+    await session.flush()
+    # Layer 2 — direct children of users / communities.
+    session.add_all([
+        SocialIdentity(provider="google", provider_sub="g-primary", user_id=user.id),
+        SocialIdentity(provider="google", provider_sub="g-other", user_id=other.id),
+    ])
+    ch = Channel(id="C".ljust(26, "0"), name="general", kind="standard",
+                 aiko_channel="general")  # community_id defaults to the seeded Aiko
+    owned = Community(id="K".ljust(26, "0"), name="Owned", visibility="public",
+                      category="general", owner_id=user.id, member_count=1)
+    session.add_all([ch, owned])
+    await session.flush()
+    # Layer 3 — rows referencing channel / community / messages' parents.
+    session.add_all([
+        Membership(channel_id=ch.id, user_id=user.id, role="member"),
+        Message(id="M1".ljust(26, "0"), channel_id=ch.id, sender_user_id=user.id,
+                sender_kind="human", sender_label="Primary", body="hi",
+                created_at=dt.datetime(2026, 6, 28, tzinfo=dt.timezone.utc)),
+        Message(id="M2".ljust(26, "0"), channel_id=ch.id, sender_user_id=other.id,
+                sender_kind="human", sender_label="Other", body="yo",
+                created_at=dt.datetime(2026, 6, 28, tzinfo=dt.timezone.utc)),
+        PasskeyCredential(credential_id="cred-primary", user_id=user.id,
+                          public_key="cHVibGlj", sign_count=0),
+        CommunityMembership(community_id=owned.id, user_id=user.id, role="member"),
+    ])
+    await session.commit()
+    # The remaining FK columns via real services — each is a single-row insert
+    # against already-committed parents, so it is FK-safe under enforcement.
+    await devices_service.register_device(
+        session, user_id=user.id, platform="apns", token="tok-primary")
+    await moderation_service.block_user(session, user.id, other.id)
+    await moderation_service.block_user(session, other.id, user.id)
+    await moderation_service.report_message(
+        session, reporter_id=user.id, message_id="M2".ljust(26, "0"), reason="spam")
+    return user, other
+
+
+async def test_deletion_satisfies_referential_integrity(fk_enforced_session):
+    """PROBE — the manual cascade must also satisfy SQLite's referential engine.
+
+    Same full graph as the behavioral proof, but under `PRAGMA foreign_keys=ON`.
+    This catches a class the FK-off behavioral test cannot: an ORDERING bug. None
+    of the FKs declare `ondelete=CASCADE`, so with enforcement on every FK is
+    RESTRICT — `delete_user_account` must tear down (or NULL) each child BEFORE the
+    parent `users` row, or the delete raises IntegrityError. The FK-off path
+    swallows a wrong order silently (it just leaves an orphan the other test then
+    flags); here a wrong order is a hard failure. Passing here proves the cascade
+    is both COMPLETE and correctly ORDERED — the property prod's app-level cascade
+    actually depends on."""
+    user, _other = await _seed_fk_safe(fk_enforced_session)
+
+    # The operation under test. Under FK enforcement this RAISES if the cascade
+    # touches the parent before a child, or misses a child a NOT-NULL FK guards.
+    await accounts_service.delete_user_account(fk_enforced_session, user.id)
+
+    # Belt-and-suspenders: no orphan survived (mirrors the FK-off post-condition).
+    for table_name, col_name in sorted(_users_fk_columns()):
+        table = Base.metadata.tables[table_name]
+        col = table.c[col_name]
+        cnt = (await fk_enforced_session.execute(
+            select(func.count()).select_from(table).where(col == user.id))).scalar_one()
+        assert cnt == 0, (
+            f"ORPHAN under FK enforcement: {table_name}.{col_name} still references "
+            "the deleted user.")
+    assert await users_service.get_by_id(fk_enforced_session, user.id) is None
