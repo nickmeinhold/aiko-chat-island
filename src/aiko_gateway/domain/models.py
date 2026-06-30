@@ -231,9 +231,13 @@ class Community(Base):
     guard (test_account_deletion_cascade_guard) enforces that this FK to users.id
     is handled.
 
-    default_channel_id (the channel a joiner lands in) is DEFERRED to B2 — it is
-    unused without a join flow, and adding it now would introduce a
-    channels<->communities FK cycle that SQLite create_all cannot order.
+    default_channel_id (the channel a joiner lands in) is added in B2 (#32) as a
+    PLAIN String column, deliberately NOT a ForeignKey: a real FK
+    channels.community_id <-> communities.default_channel_id forms a cycle that
+    SQLite create_all cannot order (the reason it was deferred from B1).
+    Referential integrity is an application invariant (the value is only ever set
+    to a channel that belongs to this community); a dangling id degrades
+    gracefully (the app falls back to the first visible channel).
     """
     __tablename__ = "communities"
     __table_args__ = (
@@ -255,8 +259,15 @@ class Community(Base):
     # Denormalized membership count for the directory projection (#32). Maintained
     # on join/leave in B2; the migration seeds it to the current user count.
     member_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    # Rolls up the latest channel activity for directory sort (#32); populated in
-    # B2. NULL at B1 seed time.
+    # The channel a joiner lands in / the directory highlights (#32, Phase B2).
+    # PLAIN String, NOT a ForeignKey — see the class docstring (avoids the
+    # channels<->communities FK cycle SQLite create_all cannot order). Nullable: a
+    # community with no channels yet has no default.
+    default_channel_id: Mapped[str | None] = mapped_column(
+        String(26), nullable=True)
+    # Rolls up the latest channel activity for directory sort (#32); B2 ships the
+    # column but leaves population to a later increment (no per-channel last-ULID
+    # rollup yet), so directory sort is `members`/`name` for now. NULL at seed.
     last_activity_at: Mapped[dt.datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True)
     # Community-level takedown (#32): moderation can remove a whole community as a

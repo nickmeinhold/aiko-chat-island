@@ -98,6 +98,26 @@ async def visible_channels(session: AsyncSession, user_id: str) -> list[Channel]
     return list(rows)
 
 
+async def visible_channels_in_community(
+    session: AsyncSession, user_id: str, community_id: str
+) -> list[Channel]:
+    """The channels of one community the user may see (#32, B2): every public
+    channel in it + every private channel in it they belong to, id asc.
+
+    Reuses ``_readable_predicate`` so the community detail / join read path shares
+    the SAME channel-visibility rule as ``visible_channels`` and the WS subscribe
+    path — the rule can't drift between the flat channel list and the per-community
+    one. Only the ``community_id`` scope is added."""
+    rows = (
+        await session.execute(
+            select(Channel)
+            .where(Channel.community_id == community_id, _readable_predicate(user_id))
+            .order_by(Channel.id)
+        )
+    ).scalars()
+    return list(rows)
+
+
 async def filter_readable_ids(
     session: AsyncSession, user_id: str, channel_ids: list[str]
 ) -> list[str]:
