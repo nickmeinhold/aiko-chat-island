@@ -11,12 +11,14 @@ participants' history and gap their ULID-ordered timelines. So a deleted user's
 messages stay in place as tombstones — the row/slot survives, but every part
 that carries the person is destroyed: `sender_user_id → NULL` (already a
 first-class state, used for non-gateway bus actors), `sender_label → "[deleted
-user]"`, and the free-text `body → "[deleted]"`. Wiping the body matters because
-a message body is unstructured PII ("I'm Nick, call me on 0400…"); leaving it
-would contradict the live privacy policy (imagineering.cc/aiko/privacy §5: "your
-account and associated message data are deleted"). The account-identifying rows —
-the user and its federated identities — are hard-deleted. Net: the conversation
-slot endures, the content and every link back to a person do not.
+user]"`, and BOTH free-text vectors — `body → "[deleted]"` and the 64-char
+client-supplied `client_msg_id → NULL`. Wiping these matters because they are
+unstructured PII ("I'm Nick, call me on 0400…"); a `*_id` column whose value is
+attacker-controlled input is no less sensitive for being named an id. Leaving
+either would contradict the live privacy policy (imagineering.cc/aiko/privacy §5:
+"your account and associated message data are deleted"). The account-identifying
+rows — the user and its federated identities — are hard-deleted. Net: the
+conversation slot endures, the content and every link back to a person do not.
 
 **Sole-admin guard.** Deletion is refused (`CannotDeleteSoleAdmin`) if the user
 is the only admin of any channel, so a channel is never left admin-less; the
@@ -96,14 +98,20 @@ async def delete_user_account(session: AsyncSession, user_id: str) -> None:
     if sole:
         raise CannotDeleteSoleAdmin(sole)
 
-    # Tombstone authored messages: keep the conversation slot, but destroy the
-    # account link, the human's name, AND the free-text body (unstructured PII).
+    # Tombstone authored messages: keep the conversation slot, but destroy every
+    # part that carries the person. Two free-text vectors, not one: the `body`,
+    # and `client_msg_id` — a 64-char client-supplied string (validated only as
+    # "a string", envelopes.py) that can hold an email/phone/handle. Naming a
+    # column `*_id` does not make attacker-controlled input non-PII. Nulling it is
+    # safe: the channel/client_msg_id idempotency it enables is moot for a
+    # now-gone user, and the UNIQUE(channel_id, client_msg_id) treats NULLs as
+    # distinct (SQLite + Postgres), so many tombstones can share NULL.
     # Scoped to this user's messages only — co-participants' rows are untouched.
     await session.execute(
         update(Message)
         .where(Message.sender_user_id == user_id)
         .values(sender_user_id=None, sender_label=DELETED_USER_LABEL,
-                body=DELETED_BODY))
+                body=DELETED_BODY, client_msg_id=None))
     # Moderation footprint (#7): delete this user's blocks (either direction) and
     # anonymize their reports (reporter → NULL, audit trail kept). Both are FK
     # children of `users`, so they must go before the user row — the SAME
