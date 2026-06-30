@@ -41,13 +41,33 @@ from aiko_gateway.domain.models import (
     Channel, Membership, Message, PasskeyCredential)
 
 
+def _references_users_id(col) -> bool:
+    """True iff `col` has a foreign key targeting the `users.id` column specifically
+    — not merely some `users` column (e.g. a future FK to `users.email`), and not a
+    same-named table in another schema. Inspect the referenced column, not the box
+    label: match both the target table name AND that the target column is `id`, keyed
+    on the schema-qualified table identity so a multi-schema Postgres future can't
+    collapse two same-named `users` tables into one entry."""
+    for fk in col.foreign_keys:
+        target = fk.column  # the referenced Column object
+        # table.key is schema-qualified ("users" on SQLite, "public.users" on PG with
+        # an explicit schema); endswith("users") keeps the default-schema case exact
+        # while not matching an unrelated "..._users" table.
+        key = target.table.key
+        if (key == "users" or key.endswith(".users")) and target.name == "id":
+            return True
+    return False
+
+
 def _users_fk_columns() -> set[tuple[str, str]]:
-    """Every (table, column) in the schema whose FK targets `users.id`."""
+    """Every (table, column) whose FK targets `users.id` specifically. Keyed on the
+    schema-qualified source table (`table.key`) so distinct same-named tables in a
+    multi-schema deployment stay distinct rather than collapsing."""
     found: set[tuple[str, str]] = set()
     for table in Base.metadata.tables.values():
         for col in table.columns:
-            if any(fk.column.table.name == "users" for fk in col.foreign_keys):
-                found.add((table.name, col.name))
+            if _references_users_id(col):
+                found.add((table.key, col.name))
     return found
 
 
