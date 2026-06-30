@@ -308,9 +308,34 @@ async def join(
             session, viewer_id, community_id)
         return community, channels, False
 
-    # New join: conditional INSERT (atomic visibility check). begin_nested so a
-    # concurrent same-user insert (lost the existence pre-check race) rolls back ONLY
-    # this insert, leaving the outer txn / aiosqlite greenlet intact.
+    # New join. TWO complementary concurrency mechanisms, each covering the other's
+    # blind spot (mirrors memberships_service / reference_sqlite_concurrency_dual_
+    # mechanism) so the WHOLE join — gate + count bump + response read — is
+    # consistent against a concurrent takedown, not just the insert (Carnot
+    # cage-match PR#48, round 2):
+    #   * FOR UPDATE on the community row — on POSTGRES this locks the row, so a
+    #     concurrent `UPDATE communities SET taken_down_at=...` serialises AFTER this
+    #     join (it blocks until we commit) rather than interleaving between our
+    #     insert and the bump/read. No-op on SQLite (no row locks).
+    #   * the conditional INSERT (WHERE EXISTS public+not-taken-down) — on SQLITE,
+    #     the single-writer lock serialises once we write, and the predicate catches
+    #     a takedown that committed BEFORE our write lock (rowcount 0 -> fail closed).
+    # Together: a takedown that commits before this join finalises always makes the
+    # join fail closed; one that commits after is strictly ordered after a legitimate
+    # join. (The cross-engine race itself is exercised by the deferred Postgres
+    # integration test, claude-tasks #12 cluster — in-memory single-conn tests can't.)
+    locked = (await session.execute(
+        select(Community.id).where(
+            Community.id == community_id,
+            Community.visibility == Visibility.PUBLIC,
+            Community.taken_down_at.is_(None),
+        ).with_for_update()
+    )).scalar_one_or_none()
+    if locked is None:
+        raise CommunityNotFound(community_id)  # not joinable (public + live)
+
+    # begin_nested so a concurrent same-user insert (lost the fast-path race) rolls
+    # back ONLY this insert, leaving the outer txn / aiosqlite greenlet intact.
     try:
         async with session.begin_nested():
             result = await session.execute(_new_join_insert(community_id, viewer_id))
@@ -319,16 +344,14 @@ async def join(
         rowcount = None  # concurrent same-user join already created the row
 
     if rowcount == 0:
-        # The WHERE EXISTS(joinable) was false: nonexistent, private, or taken down.
-        # Fail closed, existence-hidden behind the same 404 — at WRITE time.
+        # WHERE EXISTS(joinable) false: taken down between the lock and our write
+        # lock (SQLite). Fail closed, existence-hidden behind the same 404.
         raise CommunityNotFound(community_id)
 
     inserted = rowcount == 1
     if inserted:
-        # Atomic read-modify-write in ONE statement (correct on both engines: a
-        # single UPDATE = member_count + 1 holds the row lock, so two joins by
-        # DIFFERENT users each bump once). Only on a genuinely new row, so an
-        # idempotent re-join never double-counts.
+        # Atomic read-modify-write in ONE statement; only on a genuinely new row, so
+        # an idempotent re-join never double-counts.
         await session.execute(
             update(Community)
             .where(Community.id == community_id)
@@ -336,7 +359,8 @@ async def join(
         )
 
     # Read the community (fresh — reflects the bump) and channels INSIDE the same
-    # transaction, before commit, so the response is internally consistent.
+    # transaction (we still hold the FOR UPDATE lock), before commit, so the response
+    # is a consistent snapshot of a still-live community.
     community = (await session.execute(
         select(Community).where(Community.id == community_id))).scalar_one()
     channels = await acl.visible_channels_in_community(
