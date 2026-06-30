@@ -5,13 +5,18 @@ removed before the parent so the result is correct whether or not SQLite FK
 enforcement is on — this codebase never relies on `ON DELETE CASCADE` (cf.
 `channels_service.hard_delete_channel`).
 
-**Message handling is ANONYMIZE, not delete.** A chat message lives in a shared
+**Message handling is TOMBSTONE, not delete.** A chat message lives in a shared
 conversation; hard-deleting a departing user's messages would shred *other*
-participants' history. So a deleted user's messages stay in place but are
-unlinked from any account: `sender_user_id → NULL` (already a first-class state,
-used for non-gateway bus actors) and `sender_label → "[deleted user]"`. The
-account-identifying PII — the user row and its federated identities — is
-hard-deleted, so nothing links the surviving message bodies back to a person.
+participants' history and gap their ULID-ordered timelines. So a deleted user's
+messages stay in place as tombstones — the row/slot survives, but every part
+that carries the person is destroyed: `sender_user_id → NULL` (already a
+first-class state, used for non-gateway bus actors), `sender_label → "[deleted
+user]"`, and the free-text `body → "[deleted]"`. Wiping the body matters because
+a message body is unstructured PII ("I'm Nick, call me on 0400…"); leaving it
+would contradict the live privacy policy (imagineering.cc/aiko/privacy §5: "your
+account and associated message data are deleted"). The account-identifying rows —
+the user and its federated identities — are hard-deleted. Net: the conversation
+slot endures, the content and every link back to a person do not.
 
 **Sole-admin guard.** Deletion is refused (`CannotDeleteSoleAdmin`) if the user
 is the only admin of any channel, so a channel is never left admin-less; the
@@ -31,8 +36,13 @@ from . import devices_service, moderation_service
 from .memberships_service import ROLE_ADMIN
 from .models import Membership, Message, SocialIdentity, User
 
-# What an anonymized message's author label becomes once the account is gone.
+# What a tombstoned message's author label becomes once the account is gone.
 DELETED_USER_LABEL = "[deleted user]"
+# What a tombstoned message's body becomes — the free-text PII is destroyed while
+# the row/slot survives. `Message.body` is Text NOT NULL, so this is a non-empty
+# sentinel, never NULL. Makes the live privacy policy (§5 "message data are
+# deleted") literally true without gapping co-participants' timelines.
+DELETED_BODY = "[deleted]"
 
 
 class CannotDeleteSoleAdmin(Exception):
@@ -86,12 +96,14 @@ async def delete_user_account(session: AsyncSession, user_id: str) -> None:
     if sole:
         raise CannotDeleteSoleAdmin(sole)
 
-    # Anonymize authored messages: keep the conversation, drop the account link
-    # and the human's name.
+    # Tombstone authored messages: keep the conversation slot, but destroy the
+    # account link, the human's name, AND the free-text body (unstructured PII).
+    # Scoped to this user's messages only — co-participants' rows are untouched.
     await session.execute(
         update(Message)
         .where(Message.sender_user_id == user_id)
-        .values(sender_user_id=None, sender_label=DELETED_USER_LABEL))
+        .values(sender_user_id=None, sender_label=DELETED_USER_LABEL,
+                body=DELETED_BODY))
     # Moderation footprint (#7): delete this user's blocks (either direction) and
     # anonymize their reports (reporter → NULL, audit trail kept). Both are FK
     # children of `users`, so they must go before the user row — the SAME

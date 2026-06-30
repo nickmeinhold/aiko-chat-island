@@ -77,7 +77,11 @@ async def test_delete_removes_user_identities_and_memberships(session):
         .where(Membership.user_id == user.id))).scalar_one() == 0
 
 
-async def test_delete_anonymizes_messages_preserving_body(session):
+async def test_delete_tombstones_body_keeping_message_slot(session):
+    """Privacy policy §5 ("message data are deleted"): deletion destroys the
+    user's message BODIES (the only free-text PII), but the row/slot survives so
+    co-participants' ULID-ordered timelines don't gap. Tombstone, not hard-delete.
+    """
     user = await _social_user(session, handle="bob", sub="g-bob")
     ch = await _channel(session, cid=1, name="general")
     msg = await _message(session, mid=10, channel=ch, user=user)
@@ -85,11 +89,34 @@ async def test_delete_anonymizes_messages_preserving_body(session):
     await accounts_service.delete_user_account(session, user.id)
 
     refreshed = await session.get(Message, msg.id)
-    # The conversation survives; the account link and the human's name do not.
+    # The slot survives (tombstone, not delete): same PK/ULID ordering key, row
+    # still present, created_at untouched — others' timelines don't gap.
     assert refreshed is not None
-    assert refreshed.body == "hello world"
+    assert refreshed.id == msg.id
+    assert refreshed.created_at is not None
+    # The PII is destroyed: body content gone, account link + human name gone.
+    assert refreshed.body == accounts_service.DELETED_BODY
+    assert refreshed.body != "hello world"
     assert refreshed.sender_user_id is None
     assert refreshed.sender_label == accounts_service.DELETED_USER_LABEL
+
+
+async def test_delete_does_not_tombstone_other_users_messages(session):
+    """The body wipe is scoped to the departing user: a co-participant's message
+    in the same channel is left fully intact (guards against an over-broad UPDATE
+    that would tombstone the whole channel)."""
+    user = await _social_user(session, handle="bob", sub="g-bob")
+    other = await _social_user(session, handle="zoe", sub="g-zoe")
+    ch = await _channel(session, cid=1, name="general")
+    await _message(session, mid=10, channel=ch, user=user)
+    others_msg = await _message(session, mid=11, channel=ch, user=other)
+
+    await accounts_service.delete_user_account(session, user.id)
+
+    refreshed = await session.get(Message, others_msg.id)
+    assert refreshed.body == "hello world"
+    assert refreshed.sender_user_id == other.id
+    assert refreshed.sender_label == other.display_name
 
 
 async def test_sole_admin_blocks_deletion_with_no_writes(session):
