@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Design 02 — Bus Decouple &amp; Islands (gateway off the matrix stack)</title>
+<style>
+  :root { --fg:#1a1a1a; --muted:#666; --accent:#0b5; --warn:#c0392b; --rule:#e2e2e2; --code:#f4f4f6; }
+  body { font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--fg); max-width:820px; margin:2.5rem auto; padding:0 1.2rem; }
+  h1 { font-size:1.7rem; margin-bottom:0.2rem; }
+  h2 { font-size:1.25rem; margin-top:2.2rem; border-bottom:2px solid var(--rule); padding-bottom:0.3rem; }
+  h3 { font-size:1.05rem; margin-top:1.5rem; }
+  code { background:var(--code); padding:0.1rem 0.35rem; border-radius:4px; font-size:0.88em; }
+  pre { background:var(--code); padding:0.9rem 1.1rem; border-radius:8px; overflow-x:auto; font-size:0.85rem; }
+  .sub { color:var(--muted); font-size:0.95rem; margin-top:0; }
+  .decision { background:#f0f9f4; border-left:4px solid var(--accent); padding:0.7rem 1rem; border-radius:0 6px 6px 0; margin:1rem 0; }
+  .warn { background:#fdf2f0; border-left:4px solid var(--warn); padding:0.7rem 1rem; border-radius:0 6px 6px 0; margin:1rem 0; }
+  .ask { background:#fffaf0; border-left:4px solid #e0a800; padding:0.7rem 1rem; border-radius:0 6px 6px 0; margin:1rem 0; }
+  table { border-collapse:collapse; width:100%; margin:1rem 0; font-size:0.9rem; }
+  th,td { border:1px solid var(--rule); padding:0.45rem 0.6rem; text-align:left; vertical-align:top; }
+  th { background:#fafafa; }
+  details { margin:0.8rem 0; }
+  summary { cursor:pointer; font-weight:600; }
+  .tag { display:inline-block; background:#eef; color:#449; font-size:0.72rem; padding:0.1rem 0.45rem; border-radius:10px; vertical-align:middle; }
+  nav { background:#fafafa; border:1px solid var(--rule); border-radius:8px; padding:0.6rem 1rem; margin:1.4rem 0; font-size:0.92rem; }
+  nav a { color:#0a6; text-decoration:none; } nav a:hover { text-decoration:underline; }
+</style>
+</head>
+<body>
+
+<h1>Bus Decouple &amp; Islands <span class="tag">islands prereq-0</span></h1>
+<p class="sub">The gateway currently borrows its message bus from the matrix bridge stack. This unentangles it onto its own aiko mesh — the precondition for a portable "island". Status: <strong>design, awaiting sign-off on one fork + cutover go.</strong> Grounded on the live imagineering host 2026-06-30 (docker inspect / network inspect / retained-topic sniff), not from compose comments.</p>
+
+<nav>
+<strong>Contents</strong> &nbsp;·&nbsp;
+<a href="#headline">1. Headline</a> &nbsp;·&nbsp;
+<a href="#today">2. What's actually coupled today</a> &nbsp;·&nbsp;
+<a href="#island">3. What an island really is</a> &nbsp;·&nbsp;
+<a href="#fork">4. The one fork (your call)</a> &nbsp;·&nbsp;
+<a href="#continuity">5. Why a ChatServer swap is data-safe</a> &nbsp;·&nbsp;
+<a href="#plan">6. Decouple plan + cutover</a> &nbsp;·&nbsp;
+<a href="#risks">7. Risks &amp; rollback</a>
+</nav>
+
+<h2 id="headline">1. The headline (read this first)</h2>
+<div class="decision">
+<strong>What's wrong:</strong> <code>aiko-chat-gateway</code> attaches to the matrix project's <code>matrix_default</code> network and points <code>AIKO_MQTT_HOST=aiko-mosquitto</code> at <code>matrix-aiko-mosquitto-1</code> — a broker <em>owned by the <code>matrix</code> compose project</em>. Tear down the matrix stack and the gateway's bus (and the ChatServer it reads channel topology from) goes with it.<br><br>
+<strong>What changes:</strong> give the gateway its <em>own</em> aiko mesh — <code>mosquitto&nbsp;+&nbsp;registrar&nbsp;+&nbsp;ChatServer</code> — in its own compose project on its own network. The mesh definition already exists (<code>aiko-chat-bridge/deploy/docker-compose.aiko.yml</code>); we take it <em>minus the <code>aiko-bridge</code> (matrix-connector) service</em>.<br><br>
+<strong>Why it's prereq-0 for islands:</strong> the decoupled compose <em>is</em> the island template. Island #2 = same compose, different host + domain + <code>JWT_SECRET</code>. You can't make the bus portable while another project owns it.
+</div>
+<p>This is the runtime-state-machine sibling of <em>remove-the-coupling-not-guard-the-window</em>: we don't add a guard around the shared broker, we delete the sharing.</p>
+
+<h2 id="today">2. What's actually coupled today</h2>
+<p>Live readback of <code>matrix_default</code> (12 containers). The aiko-relevant ones:</p>
+<table>
+<tr><th>Container</th><th>Role</th><th>Image / cmd</th><th>Gateway needs it?</th></tr>
+<tr><td><code>matrix-aiko-mosquitto-1</code></td><td>MQTT broker (transport)</td><td><code>eclipse-mosquitto:2</code></td><td><strong>Yes</strong> — must own its own</td></tr>
+<tr><td><code>matrix-aiko-registrar-1</code></td><td>aiko service discovery root</td><td><code>aiko_registrar</code></td><td><strong>Yes</strong> — discovery for the ChatServer</td></tr>
+<tr><td><code>matrix-aiko-chat-1</code></td><td><strong>aiko ChatServer</strong> (HyperSpace: channel/user topology)</td><td><code>chat_start.sh</code></td><td><strong>Yes</strong> — source of <code>channel_list</code></td></tr>
+<tr><td><code>matrix-aiko-bridge-1</code></td><td>matrix&nbsp;↔&nbsp;aiko relay (message source)</td><td><code>python -m aiko_bridge</code></td><td><strong>No</strong> — see §4</td></tr>
+<tr><td><code>matrix-continuwuity-1</code>, <code>mautrix-*</code></td><td>Matrix homeserver + bridges</td><td>—</td><td>No</td></tr>
+</table>
+<p>The bus uses the <strong>registrar pattern</strong> (the only retained topic on the broker is <code>aiko/service/registrar</code>): services register there, the gateway discovers the ChatServer via it, then <code>ECConsumer(filter="channel_list")</code> reads canonical channel topology from the ChatServer. <strong>The key correction to the original handoff:</strong> the gateway depends on the <em>ChatServer</em> (<code>matrix-aiko-chat-1</code>), not the matrix bridge. The bridge only injects matrix-originated messages — a message <em>source</em>, never topology.</p>
+
+<h2 id="island">3. What an island <em>really</em> is</h2>
+<p>The handoff framed an island as "gateway + own mosquitto + aiko services". The bus map sharpens it:</p>
+<div class="decision">
+An island = <code>gateway</code> + <code>mosquitto</code> + <code>registrar</code> + <code>aiko-chat (ChatServer)</code>. <strong>No matrix, no continuwuity, no mautrix bridges, no aiko-bridge.</strong> A clean standalone aiko mesh — which is simpler than today's entangled host and is exactly the "better than Matrix" shape.
+</div>
+<p><strong>Buildability — resolved.</strong> All three non-broker roles build from one image, <code>aiko-bridge:latest</code>, whose build context is <code>./aiko-chat-bridge</code> = <code>github.com/nickmeinhold/aiko-chat-bridge</code> — <em>your own repo</em>. <code>/opt/aiko_chat</code> (geekscape/aiko_chat, the ChatServer code) is baked into that image. So a fresh island host needs only: clone your bridge repo, <code>docker compose build</code>. No Andy dependency, no registry required (a registry would be a nicety, not a blocker).</p>
+
+<h2 id="fork">4. The one fork — your call</h2>
+<p>Decoupling forces a question the code can't answer: after the gateway gets its own ChatServer, <strong>what happens to matrix&nbsp;↔&nbsp;app chat interop?</strong> Today both share one ChatServer, so a message relayed from Matrix and a message from the app land in the same channel universe. Two independent meshes means two universes.</p>
+<table>
+<tr><th></th><th>Option A — independent mesh <span class="tag">recommended</span></th><th>Option B — shared mesh, gateway-owned</th></tr>
+<tr><th>Move</th><td>Gateway gets its own <code>mosquitto+registrar+chat</code>. Matrix keeps its existing mesh + bridge, untouched.</td><td>Relocate the single mesh into the gateway project; repoint the matrix bridge at the gateway's broker across a shared network.</td></tr>
+<tr><th>Coupling</th><td><strong>Removed.</strong> Gateway depends on nothing in the matrix project.</td><td><strong>Reversed, not removed.</strong> Matrix bridge now depends on the gateway; the "island" still has a matrix tail.</td></tr>
+<tr><th>matrix↔app chat</th><td><strong>Diverges</strong> from cutover — separate channel/message universes.</td><td>Stays unified.</td></tr>
+<tr><th>Island thesis</th><td>Fully satisfied — truly standalone.</td><td>Undermined — not standalone.</td></tr>
+<tr><th>Risk</th><td>Low — no edits to the live matrix bridge.</td><td>Higher — cross-project network + a live matrix-bridge reconfig.</td></tr>
+</table>
+<div class="ask">
+<strong>Recommendation: Option A.</strong> Your own framing — "cleanly separates aiko-chat from the Matrix bridge stack… independent islands require per-island buses regardless" — is the definition of A. The only thing to consciously accept: <strong>from the cutover, app channels and matrix-relayed channels stop sharing a ChatServer.</strong> If matrix↔app interop is load-bearing for anyone today, that's the cost; if Matrix is already the legacy side-world, A is strictly the right move. <em>This is the decision that gates execution.</em>
+</div>
+
+<h2 id="continuity">5. Why swapping the ChatServer is data-safe</h2>
+<p>Natural fear: the gateway has persisted message history (SQLite is the <em>sole</em> store for messages); does pointing it at a fresh ChatServer orphan that history? <strong>No</strong> — verified in the code:</p>
+<ul>
+<li>The gateway keys channels by <strong>name</strong>, not by a ChatServer-minted id. <code>Channel.id</code> is a gateway-local ULID; <code>upsert_channel</code> matches on <code>Channel.aiko_channel == name</code> and returns any existing row <em>untouched</em> (<code>channels_service.py</code>).</li>
+<li>So the gateway — not the ChatServer — owns channel identity and message history. A new ChatServer publishing the same channel <em>names</em> re-attaches to the existing rows by name.</li>
+</ul>
+<p><strong>Condition:</strong> the new mesh's <code>chat_start.sh</code> must bootstrap the <em>same channel names</em>. It's idempotent and seeds the same defaults, so this holds — but it's the thing to verify on the new mesh <em>before</em> repointing the live gateway.</p>
+<div class="warn">
+<strong>The one real hazard:</strong> if the new ChatServer bootstraps a <em>smaller</em> channel set, the reconcile worker could receive a live-producer EC <code>remove</code> for the missing channels and <em>cascade-delete their messages</em> (<code>hard_delete_channel</code>). Mitigation is belt-and-suspenders: (1) same-name bootstrap so no <code>remove</code> fires; (2) the standard <strong>backup-first</strong> deploy (online SQLite backup to <code>~/aiko-db-backups/</code> immediately pre-cutover) so a mistake is recoverable, per the #17 restore drill.
+</div>
+
+<h2 id="plan">6. Decouple plan + cutover</h2>
+<p>Reversible prep is done ahead of time; the single irreversible step (repoint + restart) is foregrounded and verified. <strong>Never fire-and-forget — this is a live bus migration on your host.</strong></p>
+<h3>Prep (no impact on the running gateway)</h3>
+<ol>
+<li>Vendor the aiko mesh into the gateway project: add <code>aiko-mosquitto</code>, <code>aiko-registrar</code>, <code>aiko-chat</code> to <code>aiko-chat-gateway/docker-compose.yml</code> (from <code>docker-compose.aiko.yml</code>, dropping <code>aiko-bridge</code>), plus a project-owned network and the <code>mosquitto.conf</code>. Make <code>matrix_default</code> no longer required.</li>
+<li>Ensure the bridge repo + image are available on the host so the gateway project can <code>build</code> the mesh image (or pull a pinned one).</li>
+<li>Bring the new mesh up <em>in isolation</em> (its own network, distinct project) and verify on it, WITHOUT touching the gateway: registrar retained topic present; ChatServer registers; <code>chat_start.sh</code> bootstraps the <strong>same channel name set</strong> as the live mesh (diff the two channel lists — this is the §5 safety condition).</li>
+</ol>
+<h3>Cutover (foregrounded, one step, verified)</h3>
+<ol>
+<li><strong>Backup first:</strong> online SQLite backup of the live gateway DB to <code>~/aiko-db-backups/aiko.db.predeploy-&lt;ts&gt;</code> (the #17 drill path).</li>
+<li>Repoint the gateway at the new mesh (same project network; <code>AIKO_MQTT_HOST</code> → the new broker) and recreate just the gateway container.</li>
+<li><strong>Verify before declaring done:</strong> gateway boots; <code>/health</code> 200; reconcile attaches to the new ChatServer; channel set unchanged (no spurious deletes — check row counts against the backup); a round-trip message persists.</li>
+<li>Detach the gateway from <code>matrix_default</code> once confirmed independent.</li>
+</ol>
+<p>The matrix project is left entirely alone under Option A — its own aiko mesh keeps running for the matrix bridge.</p>
+
+<h2 id="risks">7. Risks &amp; rollback</h2>
+<table>
+<tr><th>Risk</th><th>Likelihood</th><th>Mitigation / rollback</th></tr>
+<tr><td>Bus downtime during the gateway restart</td><td>Expected, brief</td><td>Reconcile re-reads retained EC state on reconnect; messages are gateway-persisted, not lost. Announce a short blip.</td></tr>
+<tr><td>New ChatServer bootstraps a different channel set → cascade delete</td><td>Low (idempotent same defaults)</td><td>§5: diff channel lists pre-cutover; backup-first; restore from the pre-cutover backup.</td></tr>
+<tr><td>Image not buildable on host</td><td>Resolved — your repo</td><td>Clone <code>aiko-chat-bridge</code>, build; registry optional.</td></tr>
+<tr><td>matrix↔app divergence surprises a user</td><td>Product, not technical</td><td>The §4 fork — confirm A is acceptable before cutover.</td></tr>
+</table>
+<p class="sub">Open items tracked in claude-tasks: <code>#38</code> (this decouple), <code>#39</code> (cross-gateway discovery — a later layer, only meaningful once an island exists). Once Option A is confirmed and the channel-list diff checks out, the cutover is a single foregrounded step.</p>
+
+</body>
+</html>
