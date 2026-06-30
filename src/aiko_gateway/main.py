@@ -135,6 +135,25 @@ class GatewayState:
 state = GatewayState()
 
 
+async def _gossip_loop(interval: int) -> None:
+    """Background anti-entropy for the gateway directory (#1546). Pulls each known
+    peer's /v1/gateways and merges, immediately then every `interval` seconds, so
+    peers converge with no central registry. Best-effort: a failing round is logged
+    and retried, never fatal. Cancelled cleanly on shutdown."""
+    import httpx
+
+    from .domain.peers_service import directory, gossip_once
+    async with httpx.AsyncClient(follow_redirects=False) as client:
+        while True:
+            try:
+                await gossip_once(directory, client)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("gossip loop iteration failed")
+            await asyncio.sleep(interval)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     state.loop = asyncio.get_running_loop()
@@ -159,6 +178,14 @@ async def lifespan(app: FastAPI):
     state.bus.start()
     log.info("Gateway started; subscribed channels=%s (topology via channel_list share)",
              settings.aiko_channels)
+    # Gateway directory gossip (#1546): converge the known-peer set by anti-entropy.
+    # interval 0 disables the loop (the endpoint still serves self + bootstrap).
+    gossip_task: "asyncio.Task | None" = None
+    gi = settings.gateway_gossip_interval_seconds
+    if gi > 0:
+        gossip_task = asyncio.create_task(_gossip_loop(gi))
+        log.info("gateway directory gossip started (interval=%ds, bootstrap_peers=%d)",
+                 gi, len(settings.gateway_bootstrap_peers))
     try:
         yield
     finally:
@@ -168,6 +195,10 @@ async def lifespan(app: FastAPI):
             state._channel_worker.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await state._channel_worker  # clean task ownership (Carnot r2)
+        if gossip_task is not None:
+            gossip_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await gossip_task
 
 
 app = FastAPI(title="Aiko Chat Gateway", version="0.0.1", lifespan=lifespan)
@@ -182,6 +213,7 @@ from .rest import auth as auth_routes  # noqa: E402
 from .rest import channels as channel_routes  # noqa: E402
 from .rest import communities as community_routes  # noqa: E402
 from .rest import devices as device_routes  # noqa: E402
+from .rest import gateways as gateway_routes  # noqa: E402
 from .rest import legal as legal_routes  # noqa: E402
 from .rest import members as member_routes  # noqa: E402
 from .rest import messages as message_routes  # noqa: E402
@@ -193,6 +225,7 @@ app.include_router(auth_routes.me_router)
 app.include_router(channel_routes.router)
 app.include_router(community_routes.router)
 app.include_router(device_routes.router)
+app.include_router(gateway_routes.router)
 app.include_router(legal_routes.router)
 app.include_router(member_routes.router)
 app.include_router(message_routes.router)
