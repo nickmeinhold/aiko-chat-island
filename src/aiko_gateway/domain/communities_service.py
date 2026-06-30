@@ -315,6 +315,11 @@ async def join(
         # cage-match PR#48 r3). FOR UPDATE serialises a concurrent takedown on
         # Postgres; SQLite's read transaction already blocks the takedown's commit.
         # taken_down_at gate ONLY — a private flip does not evict an existing member.
+        # WAL DEPENDENCY (Carnot PR#48 r4): the SQLite half of this guarantee relies
+        # on the current NON-WAL (rollback-journal) posture, where a read txn blocks
+        # the writer's commit. If WAL is enabled (claude-tasks #21), readers no longer
+        # block writers, so this branch's consistency must be revisited (e.g. make the
+        # read itself conditional / re-check rowcount) — see #21.
         community = (await session.execute(
             select(Community).where(
                 Community.id == community_id,
