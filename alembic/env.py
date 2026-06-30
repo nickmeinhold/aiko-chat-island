@@ -43,7 +43,14 @@ config = context.config
 config.set_main_option("sqlalchemy.url", settings.db_url)
 
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # disable_existing_loggers=False: the DEFAULT (True) silently disables every
+    # logger already created in the process. Harmless when alembic runs as its own
+    # process (the prod entrypoint: `python -m aiko_gateway.migrate` then a fresh
+    # `exec uvicorn`), but a latent footgun the moment alembic runs IN-PROCESS with
+    # the app — it would kill the app's loggers (e.g. the passkey ceremony trace,
+    # #1471). The test suite runs migrations in-process, so this also keeps app-log
+    # assertions working there. (#1471 observability follow-up.)
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 target_metadata = Base.metadata
 
