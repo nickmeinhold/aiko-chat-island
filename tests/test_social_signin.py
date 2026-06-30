@@ -312,6 +312,28 @@ async def test_unissued_nonce_tolerated_when_not_required(client, monkeypatch):
     assert r.status_code == 200, r.text
 
 
+async def test_tolerant_mode_does_not_close_replay_even_for_server_issued_nonce(
+        client, monkeypatch):
+    """NAMED-TRADEOFF guard (cage-match PR#43, Carnot+Kelvin): in tolerant mode
+    (flag off) option-a is fully inert — so EVEN a genuinely server-issued nonce can
+    be replayed, because the consume is skipped. This pins the deliberate
+    server-invariant change: the old presence-gated code consumed any server-issued
+    nonce regardless of the flag; this does not. The defense is FLAG-scoped, not
+    presence-scoped — flip social_nonce_required=True to close replay.
+
+    This test asserting a SUCCESSFUL replay is intentional: it documents the accepted
+    tradeoff so it can't change silently. Tolerant-mode replay defense rests on TLS +
+    option-b binding + the provider token's own short TTL, not on option-a."""
+    # flag defaults OFF
+    _mock_verify(monkeypatch, identity=_IDENTITY)
+    nonce = (await client.post("/v1/auth/nonce")).json()["nonce"]  # a REAL server nonce
+    body = {"provider": "google", "id_token": "x", "nonce": nonce}
+    first = await client.post("/v1/auth/social", json=body)
+    assert first.status_code == 200, first.text
+    replay = await client.post("/v1/auth/social", json=body)
+    assert replay.status_code == 200, replay.text  # NOT closed in tolerant mode (by design)
+
+
 async def test_nonce_endpoint_gated_by_killswitch(client, monkeypatch):
     """Issuance is off when social sign-in is administratively disabled."""
     monkeypatch.setattr(settings, "social_signin_enabled", False)

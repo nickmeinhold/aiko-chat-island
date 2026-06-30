@@ -231,15 +231,22 @@ async def social(req: SocialReq, session: DbSession) -> dict:
     # fires only in required mode; in tolerant mode it is inert exactly as #23/#24
     # intended.
     #
-    # NAMED TRADEOFF (tolerant mode): option-b verifies the token is BOUND to the
-    # supplied nonce (nonce↔token), but it does NOT defend against captured-REQUEST
-    # replay — a captured POST already carries the matching nonce, so a replay
-    # re-verifies. Captured-request replay defense is option-a's job and is INERT
-    # until the app adopts POST /v1/auth/nonce + the flag flips (#1449). This is the
-    # documented pre-existing posture (the state before #23, live for weeks), NOT a
-    # regression introduced here — in prod the consume ALWAYS failed (the app never
-    # issued a nonce), so it 401'd every sign-in rather than defending anything.
-    # Consumed AFTER
+    # NAMED TRADEOFF (tolerant mode) — this IS a server-invariant change, stated
+    # plainly (cage-match PR#43, Carnot+Kelvin): the OLD code consumed on nonce
+    # PRESENCE, so it gave captured-request replay closure to ANY client that sent a
+    # server-issued nonce, flag or no flag. Binding the consume to the flag removes
+    # that for tolerant mode: NO request gets option-a replay closure here — not even
+    # a (hypothetical) client that called POST /v1/auth/nonce. Option-b still binds
+    # nonce↔token, but a captured POST carries the matching nonce, so a replay
+    # re-verifies; option-b cannot close captured-request replay.
+    # We accept this because: (a) the only PRODUCTION client is the app, which never
+    # calls /nonce (it sends its own option-b nonce) — so for the live deployment
+    # nothing that ever functioned is lost; presence-gating the consume instead 401'd
+    # EVERY real Google sign-in (#1491). (b) Coupling option-a to the flag is the
+    # staged-rollout design (#23/#24/#1449): the flag is the SINGLE switch for
+    # option-a. Flip social_nonce_required=True (after the app adopts /nonce) to
+    # restore single-use replay closure. Test test_tolerant_mode_does_not_close_replay
+    # pins this behaviour so it can't silently change. Consumed AFTER
     # the token verifies — so a transient JWKS 503 or a bad token does NOT burn the
     # nonce (the user retries with the same one; cage-match PR#33, Carnot MEDIUM) —
     # but BEFORE any session is issued. Replay still collapses here: a replayed
