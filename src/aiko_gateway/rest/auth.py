@@ -220,8 +220,26 @@ async def social(req: SocialReq, session: DbSession) -> dict:
     except oauth.InvalidProviderToken:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid provider token")
 
-    # Server-issuance + single-use (#13 option (a)): a supplied nonce must be one
-    # the gateway ISSUED (POST /v1/auth/nonce) and not yet redeemed. Consumed AFTER
+    # Server-issuance + single-use (#13 option (a)) — gated on the rollout POLICY,
+    # NOT on mere nonce presence. WHEN settings.social_nonce_required, a supplied
+    # nonce must be one the gateway ISSUED (POST /v1/auth/nonce) and not yet
+    # redeemed. Until the app adopts /nonce (#1449) it sends its OWN nonce purely for
+    # option-b PROVIDER binding — already verified against the token claim inside
+    # verify_id_token above (the OK trace shows nonce_checked=True). That app-supplied
+    # nonce was never gateway-issued, so force-consuming it found no row and 401'd
+    # EVERY real Google sign-in (#1491). So option-a enforcement (the consume below)
+    # fires only in required mode; in tolerant mode it is inert exactly as #23/#24
+    # intended.
+    #
+    # NAMED TRADEOFF (tolerant mode): option-b verifies the token is BOUND to the
+    # supplied nonce (nonce↔token), but it does NOT defend against captured-REQUEST
+    # replay — a captured POST already carries the matching nonce, so a replay
+    # re-verifies. Captured-request replay defense is option-a's job and is INERT
+    # until the app adopts POST /v1/auth/nonce + the flag flips (#1449). This is the
+    # documented pre-existing posture (the state before #23, live for weeks), NOT a
+    # regression introduced here — in prod the consume ALWAYS failed (the app never
+    # issued a nonce), so it 401'd every sign-in rather than defending anything.
+    # Consumed AFTER
     # the token verifies — so a transient JWKS 503 or a bad token does NOT burn the
     # nonce (the user retries with the same one; cage-match PR#33, Carnot MEDIUM) —
     # but BEFORE any session is issued. Replay still collapses here: a replayed
@@ -245,7 +263,7 @@ async def social(req: SocialReq, session: DbSession) -> dict:
     # network call would stall every gateway write) AND it is a one-shot browser
     # redirect with no retry channel, so atomicity there is all cost and no benefit
     # — it commits its state burn eagerly (see oauth_callback / consume_state).
-    if req.nonce is not None and not await nonce_service.consume_nonce(
+    if settings.social_nonce_required and not await nonce_service.consume_nonce(
             session, req.nonce):
         await session.rollback()
         raise HTTPException(

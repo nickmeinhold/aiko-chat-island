@@ -268,7 +268,12 @@ async def test_blank_nonce_rejected_at_boundary_422(client, monkeypatch):
 async def test_issued_nonce_single_use_replay_rejected(client, monkeypatch):
     """THE replay defense: a server-issued nonce works ONCE; replaying the same
     /social request (same nonce) fails closed because the nonce is already burned.
-    This is what option (b) — an app-supplied nonce — could not provide."""
+    This is what option (b) — an app-supplied nonce — could not provide.
+
+    Requires the rollout flag ON — option-a (the consume) is gated on
+    social_nonce_required (#1491). With the flag off, option-a is inert by design
+    and this captured-request replay defense is not active (tolerant mode)."""
+    monkeypatch.setattr(settings, "social_nonce_required", True)
     _mock_verify(monkeypatch, identity=_IDENTITY)
     nonce = (await client.post("/v1/auth/nonce")).json()["nonce"]
     body = {"provider": "google", "id_token": "x", "nonce": nonce}
@@ -278,14 +283,33 @@ async def test_issued_nonce_single_use_replay_rejected(client, monkeypatch):
     assert replay.status_code == 401, replay.text  # nonce already consumed
 
 
-async def test_unissued_nonce_rejected(client, monkeypatch):
-    """A nonce the gateway never issued (forged / app-generated) is refused — the
-    consume step requires it to be present + unconsumed in the server store."""
+async def test_unissued_nonce_rejected_when_required(client, monkeypatch):
+    """Flag ON: a nonce the gateway never issued (forged / app-generated) is refused
+    — the consume step requires it to be present + unconsumed in the server store."""
+    monkeypatch.setattr(settings, "social_nonce_required", True)
     _mock_verify(monkeypatch, identity=_IDENTITY)
     r = await client.post("/v1/auth/social",
                           json={"provider": "google", "id_token": "x",
                                 "nonce": "forged-never-issued"})
     assert r.status_code == 401, r.text
+
+
+async def test_unissued_nonce_tolerated_when_not_required(client, monkeypatch):
+    """THE #1491 regression: flag OFF (today's app), an app-GENERATED nonce — never
+    issued by /v1/auth/nonce — must SUCCEED, not 401. The app sends its own nonce for
+    option-b PROVIDER binding (verified inside verify_id_token); option-a consume is
+    inert in tolerant mode and must not force-reject it. Pre-fix the handler gated the
+    consume on `req.nonce is not None`, so this app-supplied nonce found no server row
+    and 401'd every real Google sign-in.
+
+    RED-proof: revert the handler gate to `if req.nonce is not None and not await
+    consume_nonce(...)` and this test gets 401."""
+    # flag defaults OFF — do NOT set social_nonce_required
+    _mock_verify(monkeypatch, identity=_IDENTITY)
+    r = await client.post("/v1/auth/social",
+                          json={"provider": "google", "id_token": "x",
+                                "nonce": "app-generated-not-server-issued"})
+    assert r.status_code == 200, r.text
 
 
 async def test_nonce_endpoint_gated_by_killswitch(client, monkeypatch):
@@ -298,7 +322,12 @@ async def test_nonce_endpoint_gated_by_killswitch(client, monkeypatch):
 async def test_transient_verify_failure_does_not_burn_nonce(client, monkeypatch):
     """Consume-AFTER-verify (Carnot PR#33): a 503 provider/JWKS outage must NOT burn
     the nonce — the user retries the SAME nonce and succeeds once the provider
-    recovers. (Consume-before-verify would have stranded them.)"""
+    recovers. (Consume-before-verify would have stranded them.)
+
+    Flag ON so option-a consume is actually exercised (#1491 gates it on
+    social_nonce_required); otherwise the nonce is never consumed and the test
+    proves nothing about consume-after-verify ordering."""
+    monkeypatch.setattr(settings, "social_nonce_required", True)
     nonce = (await client.post("/v1/auth/nonce")).json()["nonce"]
     body = {"provider": "google", "id_token": "x", "nonce": nonce}
     _mock_verify(monkeypatch, exc=oauth.ProviderUnavailable("down"))
