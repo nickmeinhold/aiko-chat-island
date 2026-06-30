@@ -11,18 +11,24 @@ drift between the paired reads.
 THE TRUST SURFACE — within-instant visibility consistency (global lesson b2d9).
 ``discover`` lists a SNAPSHOT; ``join`` is the AUTHORITATIVE gate. A community can
 flip public->private, or be taken down, BETWEEN a viewer's ``discover`` listing
-and their ``join``. So ``join`` RE-CHECKS visibility at join time and FAILS CLOSED
-(404) when the community is no longer joinable — it never trusts "it was in the
-list". Both detail and join consult ONE predicate (``accessible_predicate``) so the
-contract can't drift between the read and the gate.
+and their ``join`` — even DURING the join call. So ``join`` does not observe-then-
+write: it folds the visibility check INTO the membership INSERT (a conditional
+``INSERT ... SELECT ... WHERE EXISTS(joinable)``), so the check and the mutation are
+ATOMIC and the gate is authoritative at WRITE time, not observe time (Carnot
+cage-match, PR#48). A community no longer joinable inserts nothing and FAILS CLOSED
+(404) — it never trusts "it was in the list".
 
-Two predicates, one per projection:
+Two read predicates + one write predicate, kept DISTINCT (conflating them
+overstates the gate — Carnot cage-match, PR#48):
   * ``discoverable_predicate()`` — what the PUBLIC directory lists: public + not
     taken down. No viewer term: the directory is identical for everyone.
-  * ``accessible_predicate(viewer_id)`` — the AUTHORITATIVE gate for detail + join:
-    (public, anyone) OR (already a member — so a community you're in stays
-    reachable even if it later goes unlisted/private), AND not taken down.
-    Fail-closed: anything else is invisible (404), never a confirmation it exists.
+  * ``accessible_predicate(viewer_id)`` — who may SEE a community (``community_detail``
+    + the idempotent existing-member branch of ``join``): (public, anyone) OR
+    (already a member — so a community you're in stays reachable even if it later
+    goes unlisted/private), AND not taken down. Fail-closed: anything else is 404.
+  * the NEW-join write predicate (in ``_new_join_insert``) — who may newly JOIN:
+    strictly PUBLIC and not taken down. Stricter than "may see": you can SEE a
+    private community you're in, but you cannot newly self-join a non-public one.
 
 DELIBERATE v1 SCOPE (named, not overlooked — these are the cage-match's questions):
   * Only PUBLIC communities are self-joinable. ``accessible_predicate`` admits
@@ -46,7 +52,7 @@ from __future__ import annotations
 
 import base64
 
-from sqlalchemy import and_, exists, or_, select, update
+from sqlalchemy import and_, exists, insert, literal, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -104,17 +110,28 @@ def accessible_predicate(viewer_id: str):
 # --- cursor pagination helpers ----------------------------------------------
 
 
-def _encode_cursor(sort_key, community_id: str) -> str:
-    raw = f"{sort_key}{_CURSOR_SEP}{community_id}"
+def _encode_cursor(sort: str, sort_key, community_id: str) -> str:
+    # The cursor carries the SORT MODE it was minted for, so a cursor from one sort
+    # (e.g. name) can't be silently misinterpreted against another (e.g. members),
+    # which would yield arbitrary results (Carnot cage-match, PR#48).
+    raw = f"{sort}{_CURSOR_SEP}{sort_key}{_CURSOR_SEP}{community_id}"
     return base64.urlsafe_b64encode(raw.encode()).decode()
 
 
-def _decode_cursor(token: str) -> tuple[str, str]:
+def _decode_cursor(token: str, expected_sort: str) -> tuple[str, str]:
+    """Decode a cursor minted for ``expected_sort``. Fails CLOSED (InvalidCursor) on
+    malformed base64, a missing field, OR a sort-mode mismatch — never a silent
+    fallback to a degraded page (Carnot cage-match, PR#48)."""
     try:
         raw = base64.urlsafe_b64decode(token.encode()).decode()
-        sort_key, community_id = raw.rsplit(_CURSOR_SEP, 1)
+        sort, rest = raw.split(_CURSOR_SEP, 1)
+        # rsplit: the id is the fixed last field, so a name containing the separator
+        # can't corrupt the decode.
+        sort_key, community_id = rest.rsplit(_CURSOR_SEP, 1)
     except Exception as exc:  # malformed base64 / missing separator
         raise InvalidCursor() from exc
+    if sort != expected_sort:
+        raise InvalidCursor()  # cursor minted for a different sort mode
     return sort_key, community_id
 
 
@@ -132,26 +149,42 @@ async def discover(
 ) -> tuple[list[Community], str | None]:
     """One page of the public directory + a ``next_cursor`` (None at the end).
 
-    Keyset (not offset) pagination: stable under concurrent inserts and O(page),
-    not O(offset). ``sort`` is clamped to the closed set (an unknown value falls
-    back to ``members``, never an error). ``q`` is a case-insensitive name
-    substring; ``category`` is an exact match. Both AND with the discoverable
-    predicate. ``viewer_id`` is accepted for signature symmetry with the other read
-    paths (the directory itself is viewer-independent in v1)."""
+    Keyset (not offset) pagination: O(page), not O(offset). ``sort`` is clamped to
+    the closed set (an unknown value falls back to ``members``, never an error).
+    ``q`` is a case-insensitive name substring (LIKE metacharacters are escaped, so
+    a literal ``%`` in the query matches a literal ``%``); ``category`` is an exact
+    match. Both AND with the discoverable predicate. ``viewer_id`` is accepted for
+    signature symmetry with the other read paths (the directory is
+    viewer-independent in v1).
+
+    PAGINATION SEMANTICS — this is a LIVE feed, not a frozen snapshot (named
+    tradeoff, Carnot cage-match PR#48). The ``members`` sort keys on the MUTABLE
+    ``member_count``, so a community whose count changes between two page fetches
+    can shift across a page boundary and be seen twice or skipped. That is the
+    standard weak guarantee of an activity-ranked directory; a strict no-gap/no-dupe
+    contract would need a snapshot/version key, deferred until the directory needs
+    it. The ``name`` sort keys on an effectively-immutable field and does not have
+    this property."""
     if sort not in _SORTS:
         sort = "members"
     conds = [discoverable_predicate()]
     if q:
-        conds.append(Community.name.ilike(f"%{q}%"))
+        # Escape LIKE metacharacters so user %/_ are matched literally, not as
+        # wildcards (Carnot/Maxwell cage-match, PR#48).
+        escaped = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        conds.append(Community.name.ilike(f"%{escaped}%", escape="\\"))
     if category:
         conds.append(Community.category == category)
 
     if cursor:
-        sort_key, last_id = _decode_cursor(cursor)
+        sort_key, last_id = _decode_cursor(cursor, sort)
         if sort == "members":
             # ORDER BY member_count DESC, id ASC -> "after" is a strictly smaller
-            # count, or the same count with a strictly greater id.
-            mc = int(sort_key) if sort_key.lstrip("-").isdigit() else 0
+            # count, or the same count with a strictly greater id. A non-integer key
+            # is a tampered/corrupt cursor -> fail closed (not a silent 0 fallback).
+            if not sort_key.lstrip("-").isdigit():
+                raise InvalidCursor()
+            mc = int(sort_key)
             conds.append(or_(
                 Community.member_count < mc,
                 and_(Community.member_count == mc, Community.id > last_id),
@@ -178,7 +211,7 @@ async def discover(
     if has_more and rows:
         last = rows[-1]
         sort_key = last.member_count if sort == "members" else last.name
-        next_cursor = _encode_cursor(sort_key, last.id)
+        next_cursor = _encode_cursor(sort, sort_key, last.id)
     return rows, next_cursor
 
 
@@ -211,25 +244,35 @@ async def community_detail(
 # --- join (the authoritative gate) ------------------------------------------
 
 
-async def _insert_membership_idempotent(
-    session: AsyncSession, community_id: str, user_id: str
-) -> bool:
-    """Insert the (community, user) membership; return True iff THIS call inserted
-    it, False if a concurrent caller already did. The composite PK is the authority
-    (a pre-check has a TOCTOU window), mirroring
-    ``memberships_service._insert_idempotent``. Returning whether we actually
-    inserted is what lets ``join`` bump ``member_count`` EXACTLY ONCE per real join.
+def _new_join_insert(community_id: str, user_id: str):
+    """An ``INSERT ... SELECT ... WHERE EXISTS(joinable)`` statement: it inserts the
+    (community, user) membership IFF the community is a NEW-joinable target — PUBLIC
+    and not taken down — in ONE atomic statement.
 
-    begin_nested (a SAVEPOINT) so a unique-violation rolls back ONLY this insert,
-    leaving the outer transaction (and the aiosqlite greenlet) intact — a plain
-    commit-then-rollback would break the connection state on aiosqlite."""
-    try:
-        async with session.begin_nested():
-            session.add(CommunityMembership(
-                community_id=community_id, user_id=user_id, role=Role.MEMBER))
-        return True
-    except IntegrityError:
-        return False  # a concurrent caller already joined — idempotent no-op
+    This is the heart of the b2d9 fix (Carnot cage-match, PR#48): a plain
+    observe-then-insert proves visibility at READ time, leaving a TOCTOU window in
+    which the community can be taken down / flipped private before the write commits.
+    Folding the visibility predicate INTO the insert makes the check and the
+    mutation atomic — the gate is authoritative at WRITE time, not observe time.
+    Mirrors ``memberships_service._delete_membership_unless_last_admin``'s conditional
+    write (the codebase's established pattern for this exact race class).
+
+    The NEW-join predicate is strictly ``PUBLIC and not taken down`` — NOT
+    ``accessible_predicate`` (which also admits existing members). An existing member
+    never reaches this statement (the idempotent fast-path returns first), so the two
+    concepts — "who may SEE" (accessible_predicate, detail) and "who may newly JOIN"
+    (this, stricter) — stay distinct rather than conflated."""
+    joinable = select(
+        literal(community_id), literal(user_id), literal(Role.MEMBER.value)
+    ).where(
+        exists().where(
+            (Community.id == community_id)
+            & (Community.visibility == Visibility.PUBLIC)
+            & (Community.taken_down_at.is_(None))
+        )
+    )
+    return insert(CommunityMembership).from_select(
+        ["community_id", "user_id", "role"], joinable)
 
 
 async def join(
@@ -241,26 +284,49 @@ async def join(
     public channels need no per-channel membership (acl: public is open to all), so
     join records only the COMMUNITY-grain membership; per-channel opt-in is B3.
 
-    FAIL CLOSED on concurrent shrink (b2d9): visibility is re-checked HERE via
-    ``accessible_predicate`` at join time, so a community that was public at
-    ``discover`` but is now private/taken-down raises ``CommunityNotFound`` (404).
-    Only PUBLIC communities are joinable as a NEW member — the member branch of the
-    predicate exists solely to keep an existing membership idempotent."""
-    community = (
-        await session.execute(
-            select(Community).where(
-                Community.id == community_id, accessible_predicate(viewer_id)
-            )
-        )
-    ).scalar_one_or_none()
-    if community is None:
-        # Not found, OR not visible/joinable to this viewer — indistinguishable.
+    FAIL CLOSED on concurrent shrink (b2d9): the visibility check is folded INTO the
+    membership INSERT (``_new_join_insert``), so a community taken down / flipped
+    private between ``discover`` and ``join`` — even within this call — inserts
+    nothing and raises ``CommunityNotFound`` (404). The gate is authoritative at
+    WRITE time, not observe time (Carnot cage-match, PR#48). Only PUBLIC communities
+    are joinable as a NEW member; unlisted direct-link join + private invites are B3.
+
+    The whole join (conditional insert + member_count bump + the channel + community
+    reads for the response) runs in ONE transaction committed at the end, so the
+    response is a consistent snapshot — a takedown landing after commit can't make
+    the returned channel set inconsistent with the membership we wrote."""
+    # Idempotent fast-path: already a member -> no second insert / no count bump.
+    # Still hide a taken-down community even from an existing member (consistent with
+    # accessible_predicate / list_mine — a taken-down community is gone for members
+    # too).
+    existing = await session.get(CommunityMembership, (community_id, viewer_id))
+    if existing is not None:
+        community = await session.get(Community, community_id)
+        if community is None or community.taken_down_at is not None:
+            raise CommunityNotFound(community_id)
+        channels = await acl.visible_channels_in_community(
+            session, viewer_id, community_id)
+        return community, channels, False
+
+    # New join: conditional INSERT (atomic visibility check). begin_nested so a
+    # concurrent same-user insert (lost the existence pre-check race) rolls back ONLY
+    # this insert, leaving the outer txn / aiosqlite greenlet intact.
+    try:
+        async with session.begin_nested():
+            result = await session.execute(_new_join_insert(community_id, viewer_id))
+        rowcount = result.rowcount
+    except IntegrityError:
+        rowcount = None  # concurrent same-user join already created the row
+
+    if rowcount == 0:
+        # The WHERE EXISTS(joinable) was false: nonexistent, private, or taken down.
+        # Fail closed, existence-hidden behind the same 404 — at WRITE time.
         raise CommunityNotFound(community_id)
 
-    inserted = await _insert_membership_idempotent(session, community_id, viewer_id)
+    inserted = rowcount == 1
     if inserted:
         # Atomic read-modify-write in ONE statement (correct on both engines: a
-        # single UPDATE ... = member_count + 1 holds the row lock, so two joins by
+        # single UPDATE = member_count + 1 holds the row lock, so two joins by
         # DIFFERENT users each bump once). Only on a genuinely new row, so an
         # idempotent re-join never double-counts.
         await session.execute(
@@ -268,11 +334,14 @@ async def join(
             .where(Community.id == community_id)
             .values(member_count=Community.member_count + 1)
         )
-    await session.commit()
-    # Re-read so the returned member_count reflects the increment we just committed.
-    await session.refresh(community)
+
+    # Read the community (fresh — reflects the bump) and channels INSIDE the same
+    # transaction, before commit, so the response is internally consistent.
+    community = (await session.execute(
+        select(Community).where(Community.id == community_id))).scalar_one()
     channels = await acl.visible_channels_in_community(
         session, viewer_id, community_id)
+    await session.commit()
     return community, channels, inserted
 
 

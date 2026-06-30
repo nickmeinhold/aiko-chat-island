@@ -156,6 +156,39 @@ async def test_discover_invalid_cursor_raises(session):
         await svc.discover(session, viewer_id=viewer.id, cursor="!!!not-base64!!!")
 
 
+async def test_discover_cursor_rejects_cross_sort_reuse(session):
+    """A cursor minted for one sort mode must not be silently honoured against
+    another (it would key the wrong column) — fail closed (Carnot, PR#48)."""
+    viewer = await _user(session, "viewer")
+    for i in range(1, svc.PAGE_SIZE + 5):
+        await _community(session, cid=i, name=f"C{i:03d}", member_count=i)
+    # Page 1 under name sort -> a name-bound cursor.
+    _, name_cursor = await svc.discover(session, viewer_id=viewer.id, sort="name")
+    assert name_cursor is not None
+    with pytest.raises(svc.InvalidCursor):
+        await svc.discover(session, viewer_id=viewer.id, sort="members",
+                           cursor=name_cursor)
+
+
+async def test_discover_members_cursor_corrupt_key_rejected(session):
+    """A members-sort cursor whose key is non-numeric is corrupt -> InvalidCursor,
+    not a silent fall-back to an arbitrary page."""
+    viewer = await _user(session, "viewer")
+    bad = svc._encode_cursor("members", "not-a-number", _ulid(1))
+    with pytest.raises(svc.InvalidCursor):
+        await svc.discover(session, viewer_id=viewer.id, sort="members", cursor=bad)
+
+
+async def test_discover_q_escapes_like_metacharacters(session):
+    """A literal % in the query matches a literal %, not 'anything' (Carnot/Maxwell,
+    PR#48)."""
+    viewer = await _user(session, "viewer")
+    await _community(session, cid=1, name="100% Cotton")
+    await _community(session, cid=2, name="Polyester")
+    rows, _ = await svc.discover(session, viewer_id=viewer.id, q="100%")
+    assert [c.name for c in rows] == ["100% Cotton"]  # not both
+
+
 # =========================================================================
 # Service layer — detail (fail closed) + visible channels
 # =========================================================================
@@ -284,6 +317,57 @@ async def test_join_nonexistent_fails_closed(session):
     viewer = await _user(session, "viewer")
     with pytest.raises(svc.CommunityNotFound):
         await svc.join(session, viewer_id=viewer.id, community_id=_ulid(999))
+
+
+async def test_join_taken_down_inserts_nothing_and_no_count_bump(session):
+    """Strengthen the fail-closed: not only 404, but ZERO membership rows AND the
+    member_count is untouched (the conditional write didn't half-apply)."""
+    viewer = await _user(session, "viewer")
+    c = await _community(session, cid=1, name="Gone", member_count=7, taken_down=True)
+    with pytest.raises(svc.CommunityNotFound):
+        await svc.join(session, viewer_id=viewer.id, community_id=c.id)
+    assert (await session.execute(select(CommunityMembership))).scalars().all() == []
+    refetched = await session.get(Community, c.id)
+    assert refetched.member_count == 7  # unchanged — no partial write
+
+
+async def test_new_join_insert_is_conditional_on_visibility(session):
+    """The b2d9 atomicity property, proven at the statement level: the membership
+    INSERT itself carries the joinable predicate, so it inserts 0 rows against a
+    taken-down or private community and 1 against a public one — WITHOUT a separate
+    visibility read. This is what makes the gate authoritative at WRITE time (an
+    unconditional `session.add` would insert regardless — RED-provable)."""
+    viewer = await _user(session, "viewer")
+    pub = await _community(session, cid=1, name="Pub", visibility="public")
+    priv = await _community(session, cid=2, name="Priv", visibility="private")
+    gone = await _community(session, cid=3, name="Gone", taken_down=True)
+
+    async def _insert_count(community) -> int:
+        async with session.begin_nested() as sp:
+            r = await session.execute(
+                svc._new_join_insert(community.id, viewer.id))
+            await sp.rollback()  # don't persist — we only measure the rowcount
+        return r.rowcount
+
+    assert await _insert_count(pub) == 1    # public -> the write fires
+    assert await _insert_count(priv) == 0   # private -> the write is a no-op
+    assert await _insert_count(gone) == 0   # taken down -> the write is a no-op
+
+
+async def test_join_public_then_flipped_private_fails_closed(session):
+    """The exact b2d9 sequence: a community is public when the viewer would have
+    discovered it, then flips private before they join -> fail closed."""
+    viewer = await _user(session, "viewer")
+    c = await _community(session, cid=1, name="Hub", visibility="public")
+    # ... viewer lists it in discover (public) ...
+    rows, _ = await svc.discover(session, viewer_id=viewer.id)
+    assert [x.name for x in rows] == ["Hub"]
+    # ... owner flips it private before the viewer's join lands ...
+    c.visibility = "private"
+    await session.commit()
+    with pytest.raises(svc.CommunityNotFound):
+        await svc.join(session, viewer_id=viewer.id, community_id=c.id)
+    assert (await session.execute(select(CommunityMembership))).scalars().all() == []
 
 
 # =========================================================================
