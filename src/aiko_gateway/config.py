@@ -122,8 +122,42 @@ class Settings(BaseSettings):
     github_client_secret: str = ""
     # The base URL of THIS gateway — used to derive the provider redirect_uri the
     # broker hands to the authorize endpoint (so the host is configured in ONE
-    # place, not hardcoded across the start/callback handlers).
+    # place, not hardcoded across the start/callback handlers). ALSO this gateway's
+    # advertised base_url in the peer directory (#1546).
     gateway_base_url: str = "https://chat.imagineering.cc"
+
+    # --- island/gateway directory via peer gossip (#1546) ---
+    # The DECENTRALIZED discovery layer: each gateway advertises a known-peer set
+    # and converges by anti-entropy gossip — NO central registry. See
+    # domain/peers_service.py + rest/gateways.py. The app's server picker calls
+    # GET /v1/gateways to swap its hardcoded preset list.
+    #
+    # This gateway's stable id in the directory. Empty → derived from the
+    # gateway_base_url host (so a single-gateway deploy still self-identifies).
+    gateway_id: str = ""
+    # Human label the picker shows for THIS gateway.
+    gateway_display_name: str = "Aiko"
+    # Operator-curated static peers: FULL entries merged into the directory at
+    # startup with NO network fetch. Authentic BY CONSTRUCTION (the operator put
+    # them here) — this IS the "operator allowlist" the peers_service trust banner
+    # names as the real anti-poisoning defense, and for a handful of islands it makes
+    # gossip unnecessary: each island lists the others directly, no SSRF-prone fetch.
+    # JSON array of {"id","display_name","base_url"}. Preferred over gossip until
+    # transitive discovery (3+ islands) actually justifies the fetch path.
+    gateway_seed_peers: list[dict] = []
+    # Bootstrap contacts: peer gateway base URLs to GOSSIP with (fetched at startup).
+    # Only used when gossip is enabled. A known-node seed (P2P bootstrap), NOT a
+    # central registry — each island just needs one reachable peer to converge.
+    gateway_bootstrap_peers: list[str] = []
+    # Fail-closed gate on the anti-entropy FETCH path. Gossip pulls attacker-
+    # influenceable peer base URLs (SSRF surface — address-class filtering not yet
+    # implemented; see #1578), so it stays OFF unless explicitly enabled. With it
+    # off, the directory still serves self + seed_peers (no fetch). Enable only once
+    # the SSRF/OOM hardening lands AND transitive discovery is actually needed.
+    gateway_gossip_enabled: bool = False
+    # How often the background gossip loop pulls each known peer's /v1/gateways and
+    # merges. Takes effect only when gateway_gossip_enabled is true.
+    gateway_gossip_interval_seconds: int = 300
     # The app's Universal/App Link the browser is redirected back to after the
     # broker completes (carrying the handoff code, or an error indicator). This is
     # a FIXED config value — open-redirect defense: the final redirect target is
