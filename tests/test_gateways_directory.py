@@ -89,6 +89,22 @@ def test_merge_never_overwrites_self():
     assert [p.base_url for p in d.known()] == ["https://home.example"]
 
 
+def test_merge_rejects_self_by_url_and_duplicate_urls():
+    """Self-immutability is by URL too, not just id (Carnot cage-match): a
+    different-id alias of our own base_url must not become a second self-referential
+    entry, and two ids pointing at the same gateway collapse to one."""
+    d = PeerDirectory(_self())
+    # different id, but OUR url → dropped (self-by-URL, not just self-by-id)
+    assert d.merge([{"id": "notme", "display_name": "Not Me",
+                     "base_url": "https://home.example"}]) == 0
+    assert [p.id for p in d.known()] == ["home"]
+    # first real peer accepted; a second id pointing at the SAME url is dropped
+    assert d.merge([{"id": "a", "display_name": "A", "base_url": "https://a.example"}]) == 1
+    assert d.merge([{"id": "a-alias", "display_name": "Alias",
+                     "base_url": "https://a.example"}]) == 0
+    assert sorted(p.id for p in d.known()) == ["a", "home"]
+
+
 def test_merge_enforces_max_peers_cap():
     d = PeerDirectory(_self())
     flood = [{"id": f"p{i}", "displayName": f"P{i}", "baseURL": f"https://p{i}.example"}

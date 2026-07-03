@@ -142,17 +142,25 @@ class PeerDirectory:
 
     def merge(self, incoming: Iterable[object]) -> int:
         """Merge untrusted peer entries. Returns the count newly added. Drops:
-        malformed shapes, our own id (self is immutable), already-known ids
-        (first-write-wins), and anything past MAX_PEERS."""
+        malformed shapes, our own id OR our own base_url (self is immutable by
+        both), already-known ids or base_urls (one entry per gateway URL,
+        first-write-wins), and anything past MAX_PEERS."""
         added = 0
         for raw in incoming:
             peer = coerce_peer(raw)
             if peer is None:
                 continue
             if self._self is not None and peer.id == self._self.id:
-                continue  # never let a peer impersonate / overwrite us
+                continue  # never let a peer impersonate / overwrite us by id
             if peer.id in self._peers:
                 continue  # first-write-wins; no conflict resolution (test-grade)
+            # One entry per gateway URL. Self is already in _peers, so this rejects a
+            # DIFFERENT-id alias of our own base_url (self-by-URL, not just self-by-id)
+            # AND two ids pointing at the same gateway. Without it, id-only immutability
+            # let {"id":"other","base_url":<self>} become a second self-referential
+            # picker target — and a self-gossip target if gossip is on. (Carnot cage-match.)
+            if any(peer.base_url == p.base_url for p in self._peers.values()):
+                continue
             if len(self._peers) >= MAX_PEERS:
                 log.warning("peer directory at MAX_PEERS=%d; dropping %s",
                             MAX_PEERS, peer.id)

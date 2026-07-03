@@ -19,7 +19,7 @@ router = APIRouter(prefix="/v1", tags=["gateways"])
 
 @router.get("/gateways")
 async def list_gateways() -> dict:
-    """The known peer set, camelCase per the #1546 contract:
-    ``{"gateways": [{"id", "displayName", "baseURL"}, ...]}``. Always includes
+    """The known peer set, snake_case to match the app's ServerEntry reader:
+    ``{"gateways": [{"id", "display_name", "base_url"}, ...]}``. Always includes
     this gateway's own entry (when a valid self identity is configured)."""
     return {"gateways": [p.to_public() for p in directory.known()]}
