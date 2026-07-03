@@ -59,10 +59,14 @@ class GatewayPeer:
     base_url: str
 
     def to_public(self) -> dict:
-        """The wire shape the app picker consumes (camelCase, per the #1546
-        endpoint contract)."""
-        return {"id": self.id, "displayName": self.display_name,
-                "baseURL": self.base_url}
+        """The wire shape the app picker consumes: snake_case, matching the app's
+        ServerEntry reader (base_url/display_name) AND this gateway's house style
+        everywhere else. (The original #1546 draft emitted camelCase `baseURL`,
+        which the app's reader — keys base_url/baseUrl/httpBaseUrl/url — could not
+        match, silently dropping every entry. coerce_peer stays tolerant of the old
+        keys so a mixed-version gossip round still parses.)"""
+        return {"id": self.id, "display_name": self.display_name,
+                "base_url": self.base_url}
 
 
 def _normalize_base_url(raw: str) -> str:
@@ -80,9 +84,11 @@ def coerce_peer(raw: object) -> GatewayPeer | None:
     if isinstance(raw, GatewayPeer):
         gid, name, url = raw.id, raw.display_name, raw.base_url
     elif isinstance(raw, dict):
+        # snake_case is the wire contract; accept the legacy camelCase keys too so a
+        # mixed-version gossip round (a peer still on the old build) still parses.
         gid = raw.get("id")
-        name = raw.get("displayName")
-        url = raw.get("baseURL")
+        name = raw.get("display_name", raw.get("displayName"))
+        url = raw.get("base_url", raw.get("baseURL"))
     else:
         return None
     if not isinstance(gid, str) or not isinstance(name, str) or not isinstance(url, str):
@@ -104,11 +110,18 @@ class PeerDirectory:
     a peer can never overwrite our own entry). Merge is first-write-wins with a
     hard size cap; no conflict resolution (test-grade)."""
 
-    def __init__(self, self_peer: GatewayPeer | None, bootstrap_urls: Iterable[str] = ()):
+    def __init__(self, self_peer: GatewayPeer | None,
+                 bootstrap_urls: Iterable[str] = (),
+                 seed_peers: Iterable[object] = ()):
         self._self = self_peer
         self._peers: dict[str, GatewayPeer] = {}
         if self_peer is not None:
             self._peers[self_peer.id] = self_peer
+        # Operator-curated static peers: FULL entries merged with no network fetch.
+        # Trusted-by-config (authentic by construction), so they populate the known
+        # set directly — the safe alternative to gossip for a handful of islands.
+        # merge() still shape-validates and protects self-immutability.
+        self.merge(seed_peers)
         # Bootstrap URLs have no id/name until we gossip them, so they live as a
         # separate probe set; gossip_once GETs them and learns their self entry.
         self._bootstrap_urls: set[str] = {
@@ -198,7 +211,8 @@ def build_directory_from_settings(settings) -> PeerDirectory:
     if self_peer is None:
         log.warning("could not build a valid self peer (id=%r base=%r); the "
                     "directory will advertise no self entry", gid, base)
-    return PeerDirectory(self_peer, settings.gateway_bootstrap_peers)
+    return PeerDirectory(self_peer, settings.gateway_bootstrap_peers,
+                         seed_peers=settings.gateway_seed_peers)
 
 
 # Process-wide singleton — built once from settings, shared by the REST route and

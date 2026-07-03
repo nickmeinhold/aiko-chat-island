@@ -56,6 +56,14 @@ def test_coerce_rejects_non_string_and_missing_fields():
     assert coerce_peer({"id": 1, "displayName": "X", "baseURL": "https://x.example"}) is None
 
 
+def test_coerce_reads_snake_case_and_tolerates_legacy_camel():
+    """Wire contract is snake_case (matches the app reader); camelCase still parses
+    so a mixed-version gossip round with an old-build peer isn't dropped."""
+    snake = coerce_peer({"id": "a", "display_name": "A", "base_url": "https://a.example"})
+    camel = coerce_peer({"id": "a", "displayName": "A", "baseURL": "https://a.example"})
+    assert snake == camel == GatewayPeer("a", "A", "https://a.example")
+
+
 # --- PeerDirectory.merge: self-immutability + cap -------------------------- #
 
 def _self() -> GatewayPeer:
@@ -149,6 +157,7 @@ class _S:
     gateway_id = ""
     gateway_display_name = "Aiko"
     gateway_bootstrap_peers: list[str] = []
+    gateway_seed_peers: list[dict] = []
 
 
 def test_self_id_falls_back_to_host_when_unset():
@@ -158,7 +167,24 @@ def test_self_id_falls_back_to_host_when_unset():
     assert d.self_peer.base_url == "https://chat.imagineering.cc"  # slash normalized
 
 
-# --- the endpoint contract (camelCase shape) ------------------------------- #
+def test_seed_peers_populate_directory_without_fetch():
+    """Operator-curated seed peers land in the known set at construction — the safe,
+    fetch-free alternative to gossip. A malformed seed is dropped, self is immutable."""
+    class S(_S):
+        gateway_seed_peers = [
+            {"id": "enspyr", "display_name": "Enspyr", "base_url": "https://chat.enspyr.co"},
+            {"id": "chat-imagineering-cc", "display_name": "Impersonator",
+             "base_url": "https://evil.example"},                 # our own id → dropped
+            {"id": "bad", "display_name": "B", "base_url": "http://insecure"},  # non-https → dropped
+        ]
+    d = build_directory_from_settings(S())
+    ids = sorted(p.id for p in d.known())
+    assert ids == ["chat-imagineering-cc", "enspyr"]  # self + the one valid seed
+    # self entry was NOT overwritten by the impersonating seed
+    assert d.self_peer is not None and d.self_peer.base_url == "https://chat.imagineering.cc"
+
+
+# --- the endpoint contract (snake_case — the app-picker reader shape) ------- #
 
 def test_endpoint_returns_self_and_merged_peers_in_contract_shape():
     from fastapi import FastAPI
@@ -170,7 +196,7 @@ def test_endpoint_returns_self_and_merged_peers_in_contract_shape():
     # Mutate the shared singleton the router reads (same object, not a rebind) with
     # a uniquely-id'd peer so we don't depend on / disturb other tests.
     peers_service.directory.merge(
-        [{"id": "test-peer-xyz", "displayName": "Test Peer", "baseURL": "https://tp.example"}])
+        [{"id": "test-peer-xyz", "display_name": "Test Peer", "base_url": "https://tp.example"}])
 
     app = FastAPI()
     app.include_router(gateways.router)  # no lifespan → no aiko bus import
@@ -178,8 +204,23 @@ def test_endpoint_returns_self_and_merged_peers_in_contract_shape():
 
     assert "gateways" in body and isinstance(body["gateways"], list)
     entry = next(g for g in body["gateways"] if g["id"] == "test-peer-xyz")
-    assert set(entry) == {"id", "displayName", "baseURL"}
-    assert entry == {"id": "test-peer-xyz", "displayName": "Test Peer",
-                     "baseURL": "https://tp.example"}
+    # snake_case is the contract: these are the exact keys the app's ServerEntry
+    # reader looks for (base_url / display_name). The old camelCase `baseURL` was
+    # invisible to that reader and silently dropped every entry — regression guard.
+    assert set(entry) == {"id", "display_name", "base_url"}
+    assert entry == {"id": "test-peer-xyz", "display_name": "Test Peer",
+                     "base_url": "https://tp.example"}
     # self entry is present too (built from settings at import).
     assert any(g["id"] for g in body["gateways"])
+
+
+def test_endpoint_shape_matches_app_serverentry_reader_keys():
+    """Pin the cross-repo contract: the app (aiko_chat_app ServerEntry.tryFromJson)
+    reads the URL from base_url/baseUrl/httpBaseUrl/url and the name from
+    name/display_name/displayName/label. Our emitted keys MUST hit that set — this
+    is the assertion that would have caught the baseURL≠baseUrl break."""
+    entry = GatewayPeer("x", "X", "https://x.example").to_public()
+    app_url_keys = {"base_url", "baseUrl", "httpBaseUrl", "url"}
+    app_name_keys = {"name", "display_name", "displayName", "label"}
+    assert app_url_keys & entry.keys(), f"no URL key the app reads in {entry.keys()}"
+    assert app_name_keys & entry.keys(), f"no name key the app reads in {entry.keys()}"

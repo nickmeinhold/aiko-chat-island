@@ -137,12 +137,26 @@ class Settings(BaseSettings):
     gateway_id: str = ""
     # Human label the picker shows for THIS gateway.
     gateway_display_name: str = "Aiko"
-    # Bootstrap contacts: peer gateway base URLs to gossip with at startup. This is
-    # a known-node seed (like any P2P bootstrap), NOT a central registry — each
-    # island just needs one reachable peer to converge. JSON array.
+    # Operator-curated static peers: FULL entries merged into the directory at
+    # startup with NO network fetch. Authentic BY CONSTRUCTION (the operator put
+    # them here) — this IS the "operator allowlist" the peers_service trust banner
+    # names as the real anti-poisoning defense, and for a handful of islands it makes
+    # gossip unnecessary: each island lists the others directly, no SSRF-prone fetch.
+    # JSON array of {"id","display_name","base_url"}. Preferred over gossip until
+    # transitive discovery (3+ islands) actually justifies the fetch path.
+    gateway_seed_peers: list[dict] = []
+    # Bootstrap contacts: peer gateway base URLs to GOSSIP with (fetched at startup).
+    # Only used when gossip is enabled. A known-node seed (P2P bootstrap), NOT a
+    # central registry — each island just needs one reachable peer to converge.
     gateway_bootstrap_peers: list[str] = []
+    # Fail-closed gate on the anti-entropy FETCH path. Gossip pulls attacker-
+    # influenceable peer base URLs (SSRF surface — address-class filtering not yet
+    # implemented; see #1578), so it stays OFF unless explicitly enabled. With it
+    # off, the directory still serves self + seed_peers (no fetch). Enable only once
+    # the SSRF/OOM hardening lands AND transitive discovery is actually needed.
+    gateway_gossip_enabled: bool = False
     # How often the background gossip loop pulls each known peer's /v1/gateways and
-    # merges. 0 disables the loop (the endpoint still serves self + any bootstrap).
+    # merges. Takes effect only when gateway_gossip_enabled is true.
     gateway_gossip_interval_seconds: int = 300
     # The app's Universal/App Link the browser is redirected back to after the
     # broker completes (carrying the handoff code, or an error indicator). This is

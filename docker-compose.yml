@@ -69,6 +69,29 @@ services:
       # /providers advertisement on AFTER device e2e. Default false → stays dark
       # without the override. Public, not a secret.
       PASSKEY_ENABLED: ${PASSKEY_ENABLED:-false}
+      # --- ISLAND IDENTITY (the compose is the island template). Each island sets
+      # these in its host .env; the defaults are island 1 (chat.imagineering.cc) so
+      # an imagineering deploy with no overrides is unchanged. Island 2 (enspyr)
+      # sets GATEWAY_BASE_URL/_ID/_DISPLAY_NAME + PASSKEY_RP_ID to its own domain.
+      GATEWAY_BASE_URL: ${GATEWAY_BASE_URL:-https://chat.imagineering.cc}
+      GATEWAY_ID: ${GATEWAY_ID:-}
+      GATEWAY_DISPLAY_NAME: ${GATEWAY_DISPLAY_NAME:-Aiko}
+      # Directory SEED peers (#1548) — operator-curated FULL peer entries, merged
+      # with NO network fetch (authentic by construction). THIS is how islands list
+      # each other today: JSON array of {"id","display_name","base_url"}. Island 1
+      # seeds enspyr; island 2 seeds imagineering. Safe with gossip off.
+      GATEWAY_SEED_PEERS: ${GATEWAY_SEED_PEERS:-[]}
+      # Gossip FETCH gate — fail-closed. The anti-entropy loop pulls peer base URLs
+      # (SSRF surface, #1578), so it stays OFF until that hardening lands AND 3+
+      # islands make transitive discovery worth it. Off → directory still serves
+      # self + seed peers, no fetch.
+      GATEWAY_GOSSIP_ENABLED: ${GATEWAY_GOSSIP_ENABLED:-false}
+      # Peer-gossip bootstrap (#1546). JSON array of peer base URLs to FETCH. Only
+      # consulted when GATEWAY_GOSSIP_ENABLED is true; leave empty (seed peers are
+      # the fetch-free path).
+      GATEWAY_BOOTSTRAP_PEERS: ${GATEWAY_BOOTSTRAP_PEERS:-[]}
+      # Passkey RP id is domain-scoped — must match the serving host.
+      PASSKEY_RP_ID: ${PASSKEY_RP_ID:-chat.imagineering.cc}
     volumes:
       # Persist the SQLite store across container recreates.
       - aiko_gateway_data:/data

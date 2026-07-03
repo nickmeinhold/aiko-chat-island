@@ -179,13 +179,18 @@ async def lifespan(app: FastAPI):
     log.info("Gateway started; subscribed channels=%s (topology via channel_list share)",
              settings.aiko_channels)
     # Gateway directory gossip (#1546): converge the known-peer set by anti-entropy.
-    # interval 0 disables the loop (the endpoint still serves self + bootstrap).
+    # FAIL-CLOSED: the fetch path is an SSRF surface (#1578), so it runs ONLY when
+    # explicitly enabled. Off by default, the directory still serves self +
+    # seed_peers with no network fetch — the safe operator-curated path.
     gossip_task: "asyncio.Task | None" = None
     gi = settings.gateway_gossip_interval_seconds
-    if gi > 0:
+    if settings.gateway_gossip_enabled and gi > 0:
         gossip_task = asyncio.create_task(_gossip_loop(gi))
-        log.info("gateway directory gossip started (interval=%ds, bootstrap_peers=%d)",
+        log.info("gateway directory gossip ENABLED (interval=%ds, bootstrap_peers=%d)",
                  gi, len(settings.gateway_bootstrap_peers))
+    else:
+        log.info("gateway directory gossip disabled; serving self + %d seed peer(s)",
+                 len(settings.gateway_seed_peers))
     try:
         yield
     finally:
