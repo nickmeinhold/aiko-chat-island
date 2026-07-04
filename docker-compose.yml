@@ -30,10 +30,16 @@
 # localhost:8095 and terminates TLS. The broker publishes NO host port (internal
 # to this project's network), so the anonymous mosquitto.conf is safe.
 
+# Compose PROJECT name is pinned here (not derived from the host dir basename) so
+# container/network/volume prefixes are stable no matter what the checkout is called.
+# The DB lives on an EXTERNAL volume (aiko_data, below) so this name can change freely
+# without ever reprojecting the store.
+name: aiko
+
 services:
-  aiko-chat-island:
+  island:
     build: .
-    image: aiko-chat-island:latest
+    image: aiko-island:latest
     restart: always
     # Reachable by Caddy on the host loopback; never exposed off-host directly.
     ports:
@@ -50,7 +56,7 @@ services:
       # path /data/aiko.db). aiosqlite dialect ships in the image (prod dep).
       DB_URL: sqlite+aiosqlite:////data/aiko.db
       # aiko bus — OUR own broker, by service name on this project's network.
-      AIKO_MQTT_HOST: aiko-mosquitto
+      AIKO_MQTT_HOST: mosquitto
       AIKO_MQTT_PORT: "1883"
       AIKO_NAMESPACE: aiko
       # --- social sign-in (#13). Client IDs are PUBLIC (native ID-token flow has
@@ -93,36 +99,37 @@ services:
       # Passkey RP id is domain-scoped — must match the serving host.
       PASSKEY_RP_ID: ${PASSKEY_RP_ID:-chat.imagineering.cc}
     volumes:
-      # Persist the SQLite store across container recreates.
-      - aiko_gateway_data:/data
+      # Persist the SQLite store across container recreates. External + stably named
+      # so the store survives any project/service rename (see volumes: block).
+      - aiko_data:/data
     depends_on:
-      - aiko-chat
+      - chat
 
   # --- the gateway's OWN aiko mesh (design 02) -------------------------------
   # mosquitto (transport) + registrar (discovery) + ChatServer (channel/user
   # topology). No host ports; reachable only within this project's network.
-  aiko-mosquitto:
+  mosquitto:
     image: eclipse-mosquitto:2
     restart: always
     volumes:
       - ./deploy/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
-      - aiko_mosquitto_data:/mosquitto/data
+      - mosquitto_data:/mosquitto/data
 
-  aiko-registrar:
+  registrar:
     image: aiko-bridge:latest
     restart: always
     environment:
-      AIKO_MQTT_HOST: aiko-mosquitto
+      AIKO_MQTT_HOST: mosquitto
       AIKO_NAMESPACE: aiko
     command: ["aiko_registrar"]
     depends_on:
-      - aiko-mosquitto
+      - mosquitto
 
-  aiko-chat:
+  chat:
     image: aiko-bridge:latest
     restart: always
     environment:
-      AIKO_MQTT_HOST: aiko-mosquitto
+      AIKO_MQTT_HOST: mosquitto
       AIKO_NAMESPACE: aiko
     # geekscape/aiko_chat bootstraps its HyperSpace (channels: general/llm/random/
     # robot/yolo) before `aiko_chat run`; chat_start.sh does that idempotently from
@@ -130,8 +137,15 @@ services:
     # 5-channel set exactly (design 02 §5 — the cutover data-safety condition).
     command: ["bash", "-c", "cd /tmp && exec bash /opt/aiko_chat/src/aiko_chat/chat_start.sh"]
     depends_on:
-      - aiko-registrar
+      - registrar
 
 volumes:
-  aiko_gateway_data:
-  aiko_mosquitto_data:
+  # EXTERNAL + stably named: the store is decoupled from the compose project name, so
+  # renaming the project never reprojects (and never silently empties) the live DB.
+  # One-time prod cutover: `docker volume create aiko_data` then copy the old
+  # aiko-chat-gateway_aiko_gateway_data into it (see deploy runbook).
+  aiko_data:
+    external: true
+    name: aiko_data
+  # Broker state is transport-only (rebuilt on reconnect); a plain managed volume.
+  mosquitto_data:

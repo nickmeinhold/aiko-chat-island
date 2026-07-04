@@ -61,15 +61,19 @@ clients. Do not collapse them.
 - **Config** needs NO changes for the dark deploy: `passkey_rp_id` defaults to
   `chat.imagineering.cc`, `passkey_ios_app_id` is baked, `passkey_enabled` defaults
   `False`, `JWT_SECRET` already lives in the host `.env`.
-- **Container name** = `aiko-chat-gateway-aiko-chat-island-1` — `<project>-<service>-1`.
-  The compose **project** is `aiko-chat-gateway` (from the host dir `~/apps/aiko-chat-gateway`,
-  which is deliberately NOT renamed — its name anchors the `aiko-chat-gateway_aiko_gateway_data`
-  volume that holds the sole-copy DB). The **service** was renamed `aiko-chat-gateway` →
-  `aiko-chat-island`, so the container name changed accordingly.
-- **One-time rename cleanup**: the first deploy after the service rename leaves the old
-  `aiko-chat-gateway-aiko-chat-gateway-1` container orphaned. The deploy commands below pass
-  `--remove-orphans` to clear it. Data is unaffected (it lives on the named volume, not the
-  container).
+- **Compose project** = `aiko` (pinned via `name:` in `docker-compose.yml`, NOT derived
+  from the host dir basename). Containers are `aiko-<service>-1`:
+  `aiko-island-1` (the gateway), `aiko-mosquitto-1`, `aiko-registrar-1`, `aiko-chat-1`.
+- **DB volume** = `aiko_data`, declared **external** with a fixed name — decoupled from the
+  project name, so future project/service renames never reproject (or silently empty) the
+  store. Broker state (`mosquitto_data`) is a plain managed volume (transport-only, rebuilt
+  on reconnect).
+- **⚠ One-time project cutover** (only the FIRST deploy that moves prod from the old
+  `aiko-chat-gateway` project to `aiko`): the live DB currently sits in the old managed volume
+  `aiko-chat-gateway_aiko_gateway_data`. Because the project name changes, `--remove-orphans`
+  will NOT reap the old containers (they belong to a *different* project). Do the cutover
+  explicitly — see **"Project cutover"** below — BEFORE the normal deploy. After the cutover,
+  steady-state deploys are plain `docker compose up -d --build`.
 
 ---
 
@@ -97,7 +101,7 @@ existing `~/aiko-db-backups/aiko.db.predeploy-*` pattern.
 > /data/aiko.db ".backup"` shell call (that errors `executable not found`).
 
 ```bash
-TS=$(date +%Y%m%d-%H%M%S); C=aiko-chat-gateway-aiko-chat-island-1
+TS=$(date +%Y%m%d-%H%M%S); C=aiko-island-1
 ssh imagineering "
 set -e
 docker exec $C python -c \"
@@ -122,6 +126,37 @@ size, and the `.sql` dump ends with `COMMIT;`. A backup that didn't land = STOP
 
 ---
 
+## Project cutover — ONE TIME ONLY (old `aiko-chat-gateway` project → `aiko`)
+
+Skip this entirely on steady-state deploys. Run it exactly once, the first deploy after
+the compose project was pinned to `aiko` and the DB volume made external as `aiko_data`.
+Do it AFTER the Step-1 backup, foreground, verifying each step before the next.
+
+```bash
+# 1. Create the external volume and copy the live DB into it from the OLD project volume.
+#    (alpine one-shot: mount both, cp -a preserves everything. No container writing during copy.)
+ssh imagineering '
+set -e
+docker volume create aiko_data
+docker run --rm \
+  -v aiko-chat-gateway_aiko_gateway_data:/from:ro \
+  -v aiko_data:/to \
+  alpine sh -c "cp -a /from/. /to/ && ls -la /to && echo COPIED"
+'
+# expect: aiko.db present in /to, non-trivial size, "COPIED".
+
+# 2. Tear down the OLD project (its containers belong to project aiko-chat-gateway; the new
+#    project can't see them, so --remove-orphans won't reap them). Volumes are NOT removed
+#    by `down` without -v, so the old data volume stays as a fallback.
+ssh imagineering 'cd ~/apps/aiko-chat-gateway && docker compose -p aiko-chat-gateway down'
+```
+
+Only after the copy is verified and the old project is down, proceed to Step 2. The old
+volume `aiko-chat-gateway_aiko_gateway_data` is left intact as a rollback anchor — delete it
+manually only once the new stack is proven healthy on `aiko_data`.
+
+---
+
 ## Step 2 — Deploy dark (rsync tree, then rebuild)
 
 ```bash
@@ -143,7 +178,7 @@ ssh imagineering 'cd ~/apps/aiko-chat-gateway && docker compose up -d --build --
 Watch the entrypoint migrate before serving:
 
 ```bash
-ssh imagineering "docker logs --since 2m aiko-chat-gateway-aiko-chat-island-1 2>&1 | grep -A2 entrypoint"
+ssh imagineering "docker logs --since 2m aiko-island-1 2>&1 | grep -A2 entrypoint"
 # expect: "[entrypoint] migrating database to head..." then "[entrypoint] starting uvicorn..."
 # NO "Refusing to adopt" / "Adopting" lines — the DB is already managed at 0007.
 ```
@@ -153,7 +188,7 @@ ssh imagineering "docker logs --since 2m aiko-chat-gateway-aiko-chat-island-1 2>
 ## Step 3 — Verify the dark deploy (each invariant, foreground)
 
 ```bash
-C=aiko-chat-gateway-aiko-chat-island-1
+C=aiko-island-1
 # (a) schema advanced 0007 -> 0008, passkey tables exist
 ssh imagineering "docker exec $C python -c \"
 import sqlite3; db=sqlite3.connect('/data/aiko.db')
@@ -188,7 +223,7 @@ created at claim and authenticate returns a session for the same user.
 
 Tail the gateway while testing:
 ```bash
-ssh imagineering "docker logs -f aiko-chat-gateway-aiko-chat-island-1"
+ssh imagineering "docker logs -f aiko-island-1"
 ```
 
 **Android is blocked** until app task #20 supplies the Play App Signing SHA-256
@@ -238,7 +273,7 @@ revert the schema:
 ```bash
 # revert code: rsync the prior commit's tree and rebuild, OR re-tag the old image.
 # revert schema (only if needed): downgrade one revision
-ssh imagineering "docker exec aiko-chat-gateway-aiko-chat-island-1 \
+ssh imagineering "docker exec aiko-island-1 \
   python -c \"from alembic.config import Config; from alembic import command; \
   c=Config('alembic.ini'); c.set_main_option('script_location','alembic'); \
   command.downgrade(c,'0007')\""
