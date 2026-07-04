@@ -1,9 +1,15 @@
 """FastAPI application — the gateway spine.
 
-Phase 1 (persistence slice): boot the aiko bus client, persist every observed
-bus message into its channel (Postgres), and serve channel-list + history over
-REST. Auth, the real WSS contract, and echo-suppressed send-then-persist land
-next (plan §A1-A5).
+Boots the aiko bus client, mirrors channel topology off the bus (an ECConsumer
+on ChatServer's ``channel_list`` share, drained through one ordered FIFO worker),
+persists every observed message into its channel (local SQLite — the store for
+data HyperSpace cannot hold), and serves the durable HTTP/WS contract: auth
+(password, social sign-in, OAuth broker, passkeys), channels + history,
+messages, communities, members, moderation, devices, and the island directory.
+Bus threads hop onto the asyncio loop via ``call_soon_threadsafe``; the gateway
+suppresses its own echoes so a send isn't persisted twice.
+
+See ``README.md`` for architecture and ``docs/design/`` for the design record.
 """
 from __future__ import annotations
 
