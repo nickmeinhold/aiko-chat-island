@@ -29,12 +29,13 @@
 <body>
 
 <h1>Auth on the Bus <span class="tag">where auth belongs</span></h1>
-<p class="sub">Issue #1680 asked "move auth to the bus: passkey → JWT → gate the MQTT connection." Grounding in the live code shows the issue fuses two very different questions. This doc separates them, names the real federation threat, and marks the one fork that gates everything. Status: <strong>design — Layer A buildable now; Layer B awaiting Andy's HyperSpace example code + one federation fork.</strong> Grounded on the repo source 2026-07-04 (mosquitto.conf, docker-compose.yml, aiko/client.py, domain/security.py, config.py), not from issue prose.</p>
+<p class="sub">Issue #1680 asked "move auth to the bus: passkey → JWT → gate the MQTT connection." Grounding in the live code shows the issue fuses two very different questions. This doc separates them, names the real federation threat, and marks the one fork that gates everything. Status: <strong>design — Layer A buildable now; Layer B awaiting the <code>users</code> Category in ChatServer + one federation fork.</strong> Grounded on the gateway repo source and, for the upstream claims, on Andy Gelme's Signal answers of 2026-07-04 verified against <code>geekscape/aiko_chat</code> source (<code>chat.py</code>), not from issue prose. Last grounded 2026-07-05.</p>
 
 <nav>
 <strong>Contents</strong> &nbsp;·&nbsp;
 <a href="#headline">1. Headline</a> &nbsp;·&nbsp;
 <a href="#today">2. What's actually true today</a> &nbsp;·&nbsp;
+<a href="#grounded">2b. What Andy confirmed (verified vs source)</a> &nbsp;·&nbsp;
 <a href="#reframe">3. The reframe: two layers, not one</a> &nbsp;·&nbsp;
 <a href="#threat">4. The real threat is mesh-to-mesh</a> &nbsp;·&nbsp;
 <a href="#findings">5. Two findings</a> &nbsp;·&nbsp;
@@ -59,6 +60,29 @@ The issue's framing — "gate the <em>MQTT connection</em> with a passkey-derive
   <li><code>config.py</code> exports only <code>AIKO_MQTT_HOST</code>/<code>_PORT</code> — <strong>no MQTT credential path exists</strong> in code today.</li>
 </ul>
 
+<h2 id="grounded">2b. What Andy confirmed — verified against source, not taken on authority</h2>
+<p>Andy answered the grounding questions directly over Signal (2026-07-04). Because "delight + framework-author authority" is exactly where an assertion reflex fires, each claim below was checked against <code>geekscape/aiko_chat</code> <code>chat.py</code> (HEAD <code>dea848a</code>, up to date with origin) before being written here. The check <strong>split one confident sentence into a true half and an aspirational half</strong>:</p>
+<table>
+  <tr><th>Andy's claim</th><th>Verdict against source</th></tr>
+  <tr>
+    <td>"ChatServer already runs its own HyperSpace; it contains a <code>channels</code> Category and a <code>users</code> Category… it is already all there, ready to be used." (<code>chat.py</code> L270-273)</td>
+    <td><strong>Half-true.</strong> <span style="color:var(--accent)">✓ <code>channels</code> is real</span> — <code>chat.py:272</code> wires <code>hyperspace.share["entries"]["channels"]</code>, published as the <code>channel_list</code> share our gateway already consumes. <span style="color:var(--warn)">✗ <code>users</code> is not built</span> — it appears only as two TODO comments (<code>chat.py:46,49</code> "Create Category and Users…"), never in code. Andy's own hedge — "no users 😔… no Categories yet" — was the accurate signal; the surrounding "already all there" was aspirational for users.</td>
+  </tr>
+  <tr>
+    <td>"Use EventualConsistency for <em>observing</em> #channels/@users (Dashboards) — it's one-way, you can't create/update/destroy via an EC client. Use the API for CRUD: it's typed (soon) and version-controlled (now, <code>protocol:version</code>), with human-readable messages capturable via <code>mosquitto_sub</code>."</td>
+    <td><strong>Confirmed direction.</strong> Blesses our current split explicitly: the ECConsumer-on-<code>channel_list</code> reactive mirror is sanctioned for <em>liveness</em>; mutations go through the HyperSpace/Category API. Not either/or — the exact shape #1281 was reaching for.</td>
+  </tr>
+  <tr>
+    <td>"HyperSpace can be <strong>embedded</strong> in an Actor (like ChatServer) and <strong>mounted (like a disk) into a larger 'root' HyperSpace</strong>, so you interoperate with #channels/@users using the same API and semantics."</td>
+    <td><strong>Reshapes the §7 fork.</strong> Federation may not be "MQTT-bridge vs gateway-HTTP" at all — a third substrate is HyperSpace-mount into a root graph. See §7.</td>
+  </tr>
+  <tr>
+    <td>"MQTT (or any message server) is a single point of failure; that lowest layer does <em>not</em> guarantee delivery. Store/forward-with-ack queues are 'soon'; until then a higher-layer, application-specific policy decides what to do." (2026-07-03)</td>
+    <td><strong>Validates gateway-as-sole-persister.</strong> Our durable SQLite log + reconnect fence <em>is</em> that application-layer policy. Confirms the #51 cutover call (accept the reconnect blip, replay from SQLite) rather than parallel-broker bridge-draining.</td>
+  </tr>
+</table>
+<div class="decision"><strong>What this moves:</strong> <strong>#1304 half-dissolves.</strong> The direction is right — users should be a HyperSpace <code>users</code> Category read via the API, so the old "ChatServer must publish a <code>user_list</code> EC share" framing dies. But there is no <code>users</code> Category to <code>list</code> today, so we <em>cannot</em> migrate user-reads off the gateway's SQLite yet. The upstream dependency doesn't vanish; it changes shape to "ChatServer must <em>populate</em> a <code>users</code> Category" — still Andy's work, still blocking, now a cleaner ask. The <em>existence-in-HyperSpace / data-in-SQLite</em> split holds; for users it is not even existence yet.</div>
+
 <h2 id="reframe">3. The reframe: two layers, not one</h2>
 <table>
   <tr><th></th><th>Layer A — service-to-broker auth</th><th>Layer B — user-identity-as-bus-peer</th></tr>
@@ -76,22 +100,41 @@ The issue's framing — "gate the <em>MQTT connection</em> with a passkey-derive
 <strong>Finding 1 — the decouple (#1685) shipped without the broker auth its own spec required.</strong> #1685's build-step 2 says "ship <code>password_file</code> + <code>acl_file</code> in the repo, deployed from the repo (substrate-first)." The shipped <code>mosquitto.conf</code> is <code>allow_anonymous true</code>. So <strong>Layer A is really unfinished #1685 scope</strong> — deferred defensibly (internal-only), but the substrate-first intent was silently dropped. A named-but-unfixed tradeoff sitting in a file we own.
 </div>
 <div class="warn">
-<strong>Finding 2 — HS256 is island-local by construction.</strong> A shared symmetric secret can't verify cross-island tokens without <em>sharing the secret between independent operators</em> — a non-starter. Federation-era identity needs <strong>asymmetric</strong> keys (RS256/EdDSA + JWKS) or DID-style key-as-identity. That is the <em>same</em> crypto decision as <a href="#">Design 09</a>'s (#1569) "key-as-identity, reputation-not-personhood." Layer B and the sybil/identity work converge on one keypair choice.
+<strong>Finding 2 — HS256 is island-local by construction.</strong> A shared symmetric secret can't verify cross-island tokens without <em>sharing the secret between independent operators</em> — a non-starter. Federation-era identity needs <strong>asymmetric</strong> keys (RS256/EdDSA + JWKS) or DID-style key-as-identity. That is the <em>same</em> crypto decision as <strong>Design 09</strong> (#1569) "key-as-identity, reputation-not-personhood." Layer B and the sybil/identity work converge on one keypair choice.
 </div>
 
 <h2 id="andy">6. Andy's model gives Layer B a concrete home</h2>
 <p>Andy Gelme's OKF documentation (2026-07-04) and his 318-Russell-St model both put auth at the <strong>HyperSpace / Category function-call level</strong>: authenticate to MQTT at connect with a public key, then per-topic <em>access controllers</em>; the HyperSpace roadmap explicitly lists "security (owners, roles, ACLs)," and every <code>Dependency</code>/<code>ServiceFilter</code> already carries an <code>owner</code> field. That is <strong>finer-grained</strong> than "JWT-gate the connection" — per-entry ownership + per-operation ACL, checked at the Actor. It is Layer B's native shape. See <code>reference_hyperspace_api_vs_ec_interaction</code> and <code>reference_aiko_architecture_andy</code>.</p>
-<div class="warn"><strong>Grounding gate:</strong> the HyperSpace security model is <strong>roadmap, not built</strong> (v0.6 WIP — <code>update()</code> unimplemented, ACLs planned, remote <code>create()</code> has a proxy bug). Do not build Layer B ahead of Andy's promised example code. Layer B = align with a maturing upstream model, on his timeline.</div>
+<div class="warn"><strong>Grounding gate (sharpened 2026-07-05):</strong> Layer B has <strong>two</strong> concrete upstream blockers, not a vague "roadmap." (1) The <code>users</code> Category itself is <strong>not built</strong> in ChatServer — a TODO comment (<code>chat.py:46,49</code>), so there is no user identity in HyperSpace to attach ownership/ACLs to yet (see §2b). (2) The HyperSpace security model (owners, roles, ACLs) is v0.6 WIP — <code>update()</code> unimplemented, ACLs planned, remote <code>create()</code> has a proxy bug. Do not build Layer B ahead of both landing. Layer B = align with a maturing upstream model, on Andy's timeline — the first observable milestone is his promised example code standing up a populated <code>users</code> Category a remote client can <code>list</code>.</div>
 
 <h2 id="fork">7. The fork (the decision that gates everything)</h2>
+<p>The federation threat is mesh-to-mesh, and it doesn't exist yet — so the load-bearing question is <strong>how islands federate</strong>. The original framing was a two-item menu; Andy's "HyperSpace mounts like a disk into a root HyperSpace" (§2b) is a third option the menu excluded, and it may be the native one.</p>
+<table>
+  <tr><th>Substrate</th><th>How A talks to B</th><th>Consequence for auth</th></tr>
+  <tr>
+    <td><strong>1. MQTT-broker bridge</strong></td>
+    <td>Broker-to-broker link; users eventually become bus peers.</td>
+    <td>Layer B becomes reachable; asymmetric key-at-connect + per-topic ACLs (Andy's model). Broker exposed off-host → Layer A becomes load-bearing first.</td>
+  </tr>
+  <tr>
+    <td><strong>2. Gateway HTTP federation API</strong></td>
+    <td>A REST/federation edge between gateways; each bus stays island-internal.</td>
+    <td>Bus stays a sealed cul-de-sac; Layer A never has to ship; asymmetric keys needed only at the HTTP edge for cross-island token verification.</td>
+  </tr>
+  <tr>
+    <td><strong>3. HyperSpace mount into a root graph</strong> <span class="tag">Andy's native model</span></td>
+    <td>Each island's embedded HyperSpace mounts into a larger "root" HyperSpace; you traverse the whole mesh with one API and one set of semantics.</td>
+    <td>Auth lives where Andy already puts it — per-<code>Dependency</code> <code>owner</code> + Category ACLs, checked at the Actor, uniformly across the mounted graph. Subsumes Layer B rather than bolting federation on top. Most aligned, least mature (needs the v0.6 security model + the mount semantics proven remote).</td>
+  </tr>
+</table>
 <div class="ask">
-The federation threat is mesh-to-mesh, and it doesn't exist yet — so the load-bearing question is: <strong>when islands federate, do they bridge at the MQTT-broker layer</strong> (broker-to-broker, users eventually become bus peers → Andy's model, Layer B) <strong>or at the gateway HTTP layer</strong> (a federation API between gateways, bus stays island-internal → Layer A is all we ever need)? Everything downstream — whether Layer B is even on the roadmap, whether we migrate JWT to asymmetric now — hangs off this. <strong>This is Nick's call.</strong>
+Everything downstream — whether Layer B is even on the roadmap, whether we migrate JWT to asymmetric now, whether the gateway stays the user-facing surface or dissolves into a peer — hangs off which substrate we bet on. <strong>This is Nick's call</strong>, and it wants a decision, not more elegant downstream refinement. My read: option 3 is the north star but blocked on upstream maturity; option 2 is the pragmatic near-term path that keeps the gateway sovereign; option 1 is the awkward middle. Recommend deciding 2-vs-3 explicitly rather than drifting.
 </div>
 
 <h2 id="reco">8. Recommendation</h2>
 <ul>
   <li><strong>Layer A — do it, as the honest completion of #1685.</strong> Small substrate-first PR: repo-committed <code>password_file</code> + <code>acl_file</code>, teach <code>config.py</code>/aiko to pass MQTT creds, flip <code>allow_anonymous false</code>. It retires a standing named tradeoff and is a proactive default even though the bus is still internal-only. Worth doing <em>with</em> (or just before) the first federation-bus work.</li>
-  <li><strong>Layer B — align, don't reinvent; hold for Andy's example code.</strong> It's the north star and it converges with Design 09 (#1569) on asymmetric key-as-identity, but it's blocked on both the MQTT-vs-HTTP fork above and Andy's HyperSpace security model maturing past v0.6.</li>
+  <li><strong>Layer B — align, don't reinvent; hold for two concrete milestones.</strong> It's the north star and converges with Design 09 (#1569) on asymmetric key-as-identity, but it's blocked on (i) ChatServer populating a <code>users</code> Category a remote client can <code>list</code> (today it's a TODO comment, §2b), (ii) the HyperSpace security model maturing past v0.6, and (iii) the federation-substrate fork (§7) resolving toward option 1 or 3. Andy's promised example code is the first observable signal on (i)/(ii).</li>
   <li><strong>Migrate JWT HS256 → asymmetric</strong> only once the fork resolves toward cross-island token verification (don't pay the complexity before federation needs it — anticipate the problem, let measurement/decision pick the fix).</li>
 </ul>
 
