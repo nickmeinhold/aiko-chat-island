@@ -6,7 +6,7 @@ Three properties, each a way the migration system could silently lie:
    as the ORM models (``create_all``). Without this, a model change without a
    matching revision drifts the live DB from the code invisibly. This is the
    check ``alembic check`` / a CI autogenerate-diff would run; we run it as a unit
-   test because there is no CI (aiko_chat_gateway#18).
+   test because there is no CI (aiko-chat-island#18).
 
 2. **Fresh upgrade** — an empty DB upgrades to a complete, alembic-managed schema.
 

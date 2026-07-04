@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Design 03 — Auth on the Bus (where authentication belongs in an aiko mesh)</title>
+<style>
+  :root { --fg:#1a1a1a; --muted:#666; --accent:#0b5; --warn:#c0392b; --rule:#e2e2e2; --code:#f4f4f6; }
+  body { font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--fg); max-width:820px; margin:2.5rem auto; padding:0 1.2rem; }
+  h1 { font-size:1.7rem; margin-bottom:0.2rem; }
+  h2 { font-size:1.25rem; margin-top:2.2rem; border-bottom:2px solid var(--rule); padding-bottom:0.3rem; }
+  h3 { font-size:1.05rem; margin-top:1.5rem; }
+  code { background:var(--code); padding:0.1rem 0.35rem; border-radius:4px; font-size:0.88em; }
+  pre { background:var(--code); padding:0.9rem 1.1rem; border-radius:8px; overflow-x:auto; font-size:0.85rem; }
+  .sub { color:var(--muted); font-size:0.95rem; margin-top:0; }
+  .decision { background:#f0f9f4; border-left:4px solid var(--accent); padding:0.7rem 1rem; border-radius:0 6px 6px 0; margin:1rem 0; }
+  .warn { background:#fdf2f0; border-left:4px solid var(--warn); padding:0.7rem 1rem; border-radius:0 6px 6px 0; margin:1rem 0; }
+  .ask { background:#fffaf0; border-left:4px solid #e0a800; padding:0.7rem 1rem; border-radius:0 6px 6px 0; margin:1rem 0; }
+  table { border-collapse:collapse; width:100%; margin:1rem 0; font-size:0.9rem; }
+  th,td { border:1px solid var(--rule); padding:0.45rem 0.6rem; text-align:left; vertical-align:top; }
+  th { background:#fafafa; }
+  details { margin:0.8rem 0; }
+  summary { cursor:pointer; font-weight:600; }
+  .tag { display:inline-block; background:#eef; color:#449; font-size:0.72rem; padding:0.1rem 0.45rem; border-radius:10px; vertical-align:middle; }
+  nav { background:#fafafa; border:1px solid var(--rule); border-radius:8px; padding:0.6rem 1rem; margin:1.4rem 0; font-size:0.92rem; }
+  nav a { color:#0a6; text-decoration:none; } nav a:hover { text-decoration:underline; }
+</style>
+</head>
+<body>
+
+<h1>Auth on the Bus <span class="tag">where auth belongs</span></h1>
+<p class="sub">Issue #1680 asked "move auth to the bus: passkey → JWT → gate the MQTT connection." Grounding in the live code shows the issue fuses two very different questions. This doc separates them, names the real federation threat, and marks the one fork that gates everything. Status: <strong>design — Layer A buildable now; Layer B awaiting Andy's HyperSpace example code + one federation fork.</strong> Grounded on the repo source 2026-07-04 (mosquitto.conf, docker-compose.yml, aiko/client.py, domain/security.py, config.py), not from issue prose.</p>
+
+<nav>
+<strong>Contents</strong> &nbsp;·&nbsp;
+<a href="#headline">1. Headline</a> &nbsp;·&nbsp;
+<a href="#today">2. What's actually true today</a> &nbsp;·&nbsp;
+<a href="#reframe">3. The reframe: two layers, not one</a> &nbsp;·&nbsp;
+<a href="#threat">4. The real threat is mesh-to-mesh</a> &nbsp;·&nbsp;
+<a href="#findings">5. Two findings</a> &nbsp;·&nbsp;
+<a href="#andy">6. Andy's model = Layer B's home</a> &nbsp;·&nbsp;
+<a href="#fork">7. The fork (your call)</a> &nbsp;·&nbsp;
+<a href="#reco">8. Recommendation</a>
+</nav>
+
+<h2 id="headline">1. Headline</h2>
+<div class="decision">
+The issue's framing — "gate the <em>MQTT connection</em> with a passkey-derived JWT" — pictures <strong>end users authenticating to the bus</strong>. They don't. Users talk HTTP/WS to the gateway; the gateway is the <strong>sole bus participant on behalf of every user</strong>. So "auth on the bus" splits into two independent layers: <strong>(A) service-to-broker auth</strong> (close <code>allow_anonymous</code> — buildable now) and <strong>(B) user-identity-as-bus-peer</strong> (Andy's native model — needs the architecture to move users onto the bus, and converges with the federation-identity work). The threat that actually motivates either one is <strong>mesh-to-mesh</strong>, not user-to-bus — and it doesn't exist yet.
+</div>
+
+<h2 id="today">2. What's actually true today</h2>
+<p>Read from source, not compose comments (the config has been wrong 3× on this repo):</p>
+<ul>
+  <li><code>deploy/mosquitto.conf</code>: <code>allow_anonymous true</code>, no <code>password_file</code>, no <code>acl_file</code>.</li>
+  <li><code>docker-compose.yml</code>: the broker publishes <strong>no host port</strong> — it is reachable only within the compose network. The gateway binds <code>127.0.0.1:8095</code>; Caddy terminates TLS. So anonymous is <strong>genuinely safe today</strong> (the conf's own comment says: "If a future island ever exposes the broker off-host, this MUST gain auth first").</li>
+  <li>The bus has exactly <strong>three clients, all co-located trusted containers</strong>: the gateway (<code>aiko/client.py</code> → paho, an <code>ECConsumer</code> on <code>channel_list</code>), the registrar, and the ChatServer.</li>
+  <li>The <strong>app never touches MQTT</strong>. Its entire surface is <code>rest/*</code> + <code>realtime/ws.py</code> (HTTP/WebSocket). The gateway proxies onto a bus it is the only citizen of.</li>
+  <li>The JWT is <strong>HS256 symmetric</strong> (<code>domain/security.py</code>, one shared <code>jwt_secret</code>).</li>
+  <li><code>config.py</code> exports only <code>AIKO_MQTT_HOST</code>/<code>_PORT</code> — <strong>no MQTT credential path exists</strong> in code today.</li>
+</ul>
+
+<h2 id="reframe">3. The reframe: two layers, not one</h2>
+<table>
+  <tr><th></th><th>Layer A — service-to-broker auth</th><th>Layer B — user-identity-as-bus-peer</th></tr>
+  <tr><td><strong>Who authenticates</strong></td><td>The gateway / registrar / ChatServer authenticate to mosquitto.</td><td>Each <em>user</em> authenticates to the bus with their own key ("I'm Nick, here's my public key"), then per-topic access controllers.</td></tr>
+  <tr><td><strong>What it closes</strong></td><td><code>allow_anonymous</code>. Three trusted containers present credentials (password_file or mTLS).</td><td>The gateway's HTTP auth layer as the <em>sole</em> security boundary — the "temporary scaffold" the issue smells.</td></tr>
+  <tr><td><strong>Precondition</strong></td><td>None — buildable now. No user identity involved.</td><td>The architecture must move users <em>onto</em> the bus as peers (the app stops being an HTTP client). A P2P-vs-client-server move, not JWT plumbing.</td></tr>
+  <tr><td><strong>Whose model</strong></td><td>Ours (ordinary broker auth).</td><td>Andy's native aiko model (see §6). We align, we don't reinvent.</td></tr>
+</table>
+
+<h2 id="threat">4. The real threat is mesh-to-mesh, not user-to-bus</h2>
+<p>Today the bus is a sealed cul-de-sac (no host port). It only becomes exposed when <strong>islands federate</strong> — and the exposure is an <strong>inter-mesh link between gateways/brokers</strong>, not end users hitting an open broker. So the thing to secure first is the federation edge between islands. That edge does not exist yet, which is exactly why Layer A is "buildable but not yet load-bearing" and Layer B is "north star, not yet scheduled."</p>
+
+<h2 id="findings">5. Two findings that fell out of grounding</h2>
+<div class="warn">
+<strong>Finding 1 — the decouple (#1685) shipped without the broker auth its own spec required.</strong> #1685's build-step 2 says "ship <code>password_file</code> + <code>acl_file</code> in the repo, deployed from the repo (substrate-first)." The shipped <code>mosquitto.conf</code> is <code>allow_anonymous true</code>. So <strong>Layer A is really unfinished #1685 scope</strong> — deferred defensibly (internal-only), but the substrate-first intent was silently dropped. A named-but-unfixed tradeoff sitting in a file we own.
+</div>
+<div class="warn">
+<strong>Finding 2 — HS256 is island-local by construction.</strong> A shared symmetric secret can't verify cross-island tokens without <em>sharing the secret between independent operators</em> — a non-starter. Federation-era identity needs <strong>asymmetric</strong> keys (RS256/EdDSA + JWKS) or DID-style key-as-identity. That is the <em>same</em> crypto decision as <a href="#">Design 09</a>'s (#1569) "key-as-identity, reputation-not-personhood." Layer B and the sybil/identity work converge on one keypair choice.
+</div>
+
+<h2 id="andy">6. Andy's model gives Layer B a concrete home</h2>
+<p>Andy Gelme's OKF documentation (2026-07-04) and his 318-Russell-St model both put auth at the <strong>HyperSpace / Category function-call level</strong>: authenticate to MQTT at connect with a public key, then per-topic <em>access controllers</em>; the HyperSpace roadmap explicitly lists "security (owners, roles, ACLs)," and every <code>Dependency</code>/<code>ServiceFilter</code> already carries an <code>owner</code> field. That is <strong>finer-grained</strong> than "JWT-gate the connection" — per-entry ownership + per-operation ACL, checked at the Actor. It is Layer B's native shape. See <code>reference_hyperspace_api_vs_ec_interaction</code> and <code>reference_aiko_architecture_andy</code>.</p>
+<div class="warn"><strong>Grounding gate:</strong> the HyperSpace security model is <strong>roadmap, not built</strong> (v0.6 WIP — <code>update()</code> unimplemented, ACLs planned, remote <code>create()</code> has a proxy bug). Do not build Layer B ahead of Andy's promised example code. Layer B = align with a maturing upstream model, on his timeline.</div>
+
+<h2 id="fork">7. The fork (the decision that gates everything)</h2>
+<div class="ask">
+The federation threat is mesh-to-mesh, and it doesn't exist yet — so the load-bearing question is: <strong>when islands federate, do they bridge at the MQTT-broker layer</strong> (broker-to-broker, users eventually become bus peers → Andy's model, Layer B) <strong>or at the gateway HTTP layer</strong> (a federation API between gateways, bus stays island-internal → Layer A is all we ever need)? Everything downstream — whether Layer B is even on the roadmap, whether we migrate JWT to asymmetric now — hangs off this. <strong>This is Nick's call.</strong>
+</div>
+
+<h2 id="reco">8. Recommendation</h2>
+<ul>
+  <li><strong>Layer A — do it, as the honest completion of #1685.</strong> Small substrate-first PR: repo-committed <code>password_file</code> + <code>acl_file</code>, teach <code>config.py</code>/aiko to pass MQTT creds, flip <code>allow_anonymous false</code>. It retires a standing named tradeoff and is a proactive default even though the bus is still internal-only. Worth doing <em>with</em> (or just before) the first federation-bus work.</li>
+  <li><strong>Layer B — align, don't reinvent; hold for Andy's example code.</strong> It's the north star and it converges with Design 09 (#1569) on asymmetric key-as-identity, but it's blocked on both the MQTT-vs-HTTP fork above and Andy's HyperSpace security model maturing past v0.6.</li>
+  <li><strong>Migrate JWT HS256 → asymmetric</strong> only once the fork resolves toward cross-island token verification (don't pay the complexity before federation needs it — anticipate the problem, let measurement/decision pick the fix).</li>
+</ul>
+
+<p class="sub">Related: <code>reference_hyperspace_api_vs_ec_interaction</code> · <code>reference_aiko_architecture_andy</code> · Design 02 (bus decouple) · Design 09 / #1569 (sybil-resistance, key-as-identity) · #1685 (broker decouple) · #1304 (user topology via HyperSpace API).</p>
+
+</body>
+</html>
