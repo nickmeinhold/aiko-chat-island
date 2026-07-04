@@ -1,5 +1,5 @@
 [project]
-name = "aiko_chat_gateway"
+name = "aiko-chat-island"
 version = "0.0.1"
 description = "Self-hosted gateway: stable WSS+REST contract over the aiko_chat MQTT backbone"
 # aiko_services 0.6 caps at <=3.13.0 (verified in Phase 0 spike) -> target 3.12.

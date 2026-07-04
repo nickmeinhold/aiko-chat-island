@@ -31,9 +31,9 @@
 # to this project's network), so the anonymous mosquitto.conf is safe.
 
 services:
-  aiko-chat-gateway:
+  aiko-chat-island:
     build: .
-    image: aiko-chat-gateway:latest
+    image: aiko-chat-island:latest
     restart: always
     # Reachable by Caddy on the host loopback; never exposed off-host directly.
     ports:

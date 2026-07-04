@@ -24,7 +24,7 @@ this check encodes that verification so a future ambiguous DB fails loud instead
 of being silently corrupted.)
 
 There is no host orchestrator to sequence "migrate before boot" (the deploy is a
-manual ``docker compose up -d`` — see aiko_chat_gateway#19), so this MUST run in
+manual ``docker compose up -d`` — see aiko-chat-island#19), so this MUST run in
 the container entrypoint. It fails closed: any error propagates a non-zero exit
 and the entrypoint never starts uvicorn on an unmigrated schema.
 

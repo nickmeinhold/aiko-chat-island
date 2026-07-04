@@ -4,7 +4,7 @@
 # `set -e` makes a failed migration fail the container (fail-closed): uvicorn is
 # only reached if `aiko_gateway.migrate` exits 0, so the app never serves an
 # unmigrated schema. There is no host orchestrator to sequence migrate-before-boot
-# (deploy is a manual `docker compose up -d` — aiko_chat_gateway#19), so the
+# (deploy is a manual `docker compose up -d` — aiko-chat-island#19), so the
 # ordering must live here.
 set -e
 

@@ -61,14 +61,22 @@ clients. Do not collapse them.
 - **Config** needs NO changes for the dark deploy: `passkey_rp_id` defaults to
   `chat.imagineering.cc`, `passkey_ios_app_id` is baked, `passkey_enabled` defaults
   `False`, `JWT_SECRET` already lives in the host `.env`.
-- **Container name** = `aiko-chat-gateway-aiko-chat-gateway-1`.
+- **Container name** = `aiko-chat-gateway-aiko-chat-island-1` — `<project>-<service>-1`.
+  The compose **project** is `aiko-chat-gateway` (from the host dir `~/apps/aiko-chat-gateway`,
+  which is deliberately NOT renamed — its name anchors the `aiko-chat-gateway_aiko_gateway_data`
+  volume that holds the sole-copy DB). The **service** was renamed `aiko-chat-gateway` →
+  `aiko-chat-island`, so the container name changed accordingly.
+- **One-time rename cleanup**: the first deploy after the service rename leaves the old
+  `aiko-chat-gateway-aiko-chat-gateway-1` container orphaned. The deploy commands below pass
+  `--remove-orphans` to clear it. Data is unaffected (it lives on the named volume, not the
+  container).
 
 ---
 
 ## Pre-flight: local gate (CI is dead — YOU are the gate)
 
 ```bash
-cd /Users/nick/git/orgs/aiko/aiko_chat_gateway
+cd /Users/nick/git/orgs/aiko/aiko-chat-island
 git status -s                      # must be clean
 git log --oneline -1               # must be 45d4e5a (passkey merge)
 python -m pytest -q                # 348 tests must pass (incl. the real py_webauthn round-trip)
@@ -89,7 +97,7 @@ existing `~/aiko-db-backups/aiko.db.predeploy-*` pattern.
 > /data/aiko.db ".backup"` shell call (that errors `executable not found`).
 
 ```bash
-TS=$(date +%Y%m%d-%H%M%S); C=aiko-chat-gateway-aiko-chat-gateway-1
+TS=$(date +%Y%m%d-%H%M%S); C=aiko-chat-gateway-aiko-chat-island-1
 ssh imagineering "
 set -e
 docker exec $C python -c \"
@@ -117,7 +125,7 @@ size, and the `.sql` dump ends with `COMMIT;`. A backup that didn't land = STOP
 ## Step 2 — Deploy dark (rsync tree, then rebuild)
 
 ```bash
-cd /Users/nick/git/orgs/aiko/aiko_chat_gateway
+cd /Users/nick/git/orgs/aiko/aiko-chat-island
 # rsync the source tree to the host. NO --delete and EXCLUDE .env: the host .env is
 # gitignored (absent locally) and holds JWT_SECRET + GITHUB_CLIENT_SECRET — --delete
 # would erase it and crash the boot. The image is built from explicit Dockerfile
@@ -129,13 +137,13 @@ rsync -avn \
   ./ imagineering:~/apps/aiko-chat-gateway/          # add real run by dropping the n in -avn
 
 # rebuild + recreate. --build is MANDATORY (no registry; image built from this tree).
-ssh imagineering 'cd ~/apps/aiko-chat-gateway && docker compose up -d --build'
+ssh imagineering 'cd ~/apps/aiko-chat-gateway && docker compose up -d --build --remove-orphans'
 ```
 
 Watch the entrypoint migrate before serving:
 
 ```bash
-ssh imagineering "docker logs --since 2m aiko-chat-gateway-aiko-chat-gateway-1 2>&1 | grep -A2 entrypoint"
+ssh imagineering "docker logs --since 2m aiko-chat-gateway-aiko-chat-island-1 2>&1 | grep -A2 entrypoint"
 # expect: "[entrypoint] migrating database to head..." then "[entrypoint] starting uvicorn..."
 # NO "Refusing to adopt" / "Adopting" lines — the DB is already managed at 0007.
 ```
@@ -145,7 +153,7 @@ ssh imagineering "docker logs --since 2m aiko-chat-gateway-aiko-chat-gateway-1 2
 ## Step 3 — Verify the dark deploy (each invariant, foreground)
 
 ```bash
-C=aiko-chat-gateway-aiko-chat-gateway-1
+C=aiko-chat-gateway-aiko-chat-island-1
 # (a) schema advanced 0007 -> 0008, passkey tables exist
 ssh imagineering "docker exec $C python -c \"
 import sqlite3; db=sqlite3.connect('/data/aiko.db')
@@ -180,7 +188,7 @@ created at claim and authenticate returns a session for the same user.
 
 Tail the gateway while testing:
 ```bash
-ssh imagineering "docker logs -f aiko-chat-gateway-aiko-chat-gateway-1"
+ssh imagineering "docker logs -f aiko-chat-gateway-aiko-chat-island-1"
 ```
 
 **Android is blocked** until app task #20 supplies the Play App Signing SHA-256
@@ -209,7 +217,7 @@ ssh imagineering "grep -q '^PASSKEY_ENABLED=' ~/apps/aiko-chat-gateway/.env \
 
 Then redeploy and confirm advertisement:
 ```bash
-ssh imagineering "cd ~/apps/aiko-chat-gateway && docker compose up -d --build"
+ssh imagineering "cd ~/apps/aiko-chat-gateway && docker compose up -d --build --remove-orphans"
 ssh imagineering "curl -s https://chat.imagineering.cc/v1/auth/providers"
 # expect {"slug":"passkey","display_name":"Passkey","kind":"passkey"} now present
 ```
@@ -230,7 +238,7 @@ revert the schema:
 ```bash
 # revert code: rsync the prior commit's tree and rebuild, OR re-tag the old image.
 # revert schema (only if needed): downgrade one revision
-ssh imagineering "docker exec aiko-chat-gateway-aiko-chat-gateway-1 \
+ssh imagineering "docker exec aiko-chat-gateway-aiko-chat-island-1 \
   python -c \"from alembic.config import Config; from alembic import command; \
   c=Config('alembic.ini'); c.set_main_option('script_location','alembic'); \
   command.downgrade(c,'0007')\""
