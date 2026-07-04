@@ -1,18 +1,25 @@
 # aiko-chat-island
 
-A self-hosted **gateway** that puts a stable WSS + REST contract over the
-[`aiko_chat`](https://github.com/geekscape/aiko_chat) /
-[`aiko_services`](https://github.com/geekscape/aiko_services) MQTT backbone. One
-gateway plus its own broker, registrar, and ChatServer is a fully self-contained
-**island** — the unit of federation. Two independent islands
+An **island** is a complete, self-contained
+[`aiko`](https://github.com/geekscape/aiko_services) mesh — a **gateway** plus its
+own broker, registrar, and [`ChatServer`](https://github.com/geekscape/aiko_chat) —
+that federates with other islands as a peer, not as a client of any hub. The
+island is the unit of federation. Two independent islands
 (`chat.imagineering.cc`, `chat.enspyr.co`) currently run this code.
 
-> **Why a gateway at all?** aiko moves messages over MQTT with an actor/
-> eventual-consistency model. Mobile/web clients want a boring, durable HTTP/
-> WebSocket API — auth, message history, read receipts, account deletion — none
-> of which the bus provides. The gateway is the **sole bus participant on behalf
-> of every user**: clients speak HTTP/WS to it; it speaks MQTT to the island.
-> That boundary is the whole design (see [Design 03](docs/design/03-auth-on-the-bus.html)).
+**This repo builds the gateway** — the one component that puts a stable WSS + REST
+contract over the aiko MQTT backbone, so mobile/web clients get a durable HTTP/
+WebSocket API instead of speaking MQTT. (The broker, registrar, and ChatServer
+that complete an island run from the `aiko-bridge` image; see the compose file.)
+
+> **Why the split?** aiko moves messages over MQTT with an actor / eventual-
+> consistency model. Clients want a boring, durable API — auth, message history,
+> read receipts, account deletion — none of which the bus provides. The gateway
+> is the **sole bus participant on behalf of every user**: clients speak HTTP/WS
+> to it; it speaks MQTT to the island. And islands federate by exposing their
+> **gateways** to each other (the directory at `/v1/gateways` lists gateways, not
+> brokers). That boundary is the whole design — see
+> [Design 03](docs/design/03-auth-on-the-bus.html).
 
 ---
 
