@@ -117,13 +117,38 @@ async def create_passkey_user(
         email=email,
     )
     session.add(user)
-    session.add(PasskeyCredential(
+    session.add(_passkey_credential_row(user.id, material))
+    await session.commit()
+    return user
+
+
+def _passkey_credential_row(user_id: str, material: dict) -> PasskeyCredential:
+    """The SINGLE place a PasskeyCredential row is built from verified material —
+    shared by create_passkey_user (new account) and link_passkey_credential
+    (existing account, #1727) so the persisted shape can never drift between the
+    two doors."""
+    return PasskeyCredential(
         credential_id=material["credential_id"],
-        user_id=user.id,
+        user_id=user_id,
         public_key=material["public_key"],
         sign_count=material["sign_count"],
         transports=material.get("transports"),
         aaguid=material.get("aaguid"),
-    ))
+    )
+
+
+async def link_passkey_credential(
+    session: AsyncSession, *, user_id: str, material: dict,
+) -> None:
+    """Attach a verified passkey credential to an EXISTING, authenticated user
+    (#1727 — the missing link-to-existing path).
+
+    Unlike create_passkey_user this creates NO user and claims NO handle: an
+    already-signed-in user (typically a social account) adds a passkey, and it is
+    persisted DIRECTLY against their user_id. Atomic + replay-safe: a duplicate
+    credential_id trips the UNIQUE constraint → IntegrityError, which the caller
+    maps to 409 (the credential is already registered, to this or another account).
+    This closes the gap where an existing user was forced through register→claim,
+    where a handle conflict with their OWN account orphaned the device credential."""
+    session.add(_passkey_credential_row(user_id, material))
     await session.commit()
-    return user

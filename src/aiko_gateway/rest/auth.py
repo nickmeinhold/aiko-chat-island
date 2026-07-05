@@ -426,6 +426,58 @@ async def passkey_register_finish(req: PasskeyFinishReq, session: DbSession) -> 
     }
 
 
+@router.post("/passkey/add/finish", dependencies=[rate_limit("passkey")])
+async def passkey_add_finish(
+    req: PasskeyFinishReq, user: CurrentUser, session: DbSession,
+) -> dict:
+    """Add a passkey to the AUTHENTICATED user's account (#1727 — link-to-existing).
+
+    Distinct from register/finish, which PROVISIONS a new account: here the user
+    already exists (typically a social sign-in that now wants a passkey), so the
+    verified credential is persisted DIRECTLY against their user_id — no
+    provisioning token, no handle claim, no create-account. This is the path that
+    was missing: without it an existing user was forced through register→claim,
+    where a handle conflict with their OWN account (a rejected claim) orphaned the
+    device credential permanently and left passkey_credentials empty (#1727).
+
+    Reuses /passkey/register/start for the challenge (identity-agnostic); the
+    Authorization bearer is what distinguishes an add from a first-passkey register."""
+    # Capture the id up front: a rollback below EXPIRES the `user` ORM object
+    # (rollback expires regardless of expire_on_commit), so reading `user.id` in a
+    # post-rollback log line would trigger a lazy reload outside the async context
+    # (MissingGreenlet). get_current_user and this route share one session.
+    uid = user.id
+    raw = await passkey_service.consume_challenge(
+        session, req.state, PasskeyOperation.REGISTER)
+    if raw is None:
+        await session.rollback()
+        log.warning("passkey.add.finish: REJECT invalid/expired challenge state=%s user=%s",
+                    _short(req.state), uid)
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, "invalid or expired passkey challenge")
+    try:
+        material = passkey_service.verify_registration(
+            raw_challenge=raw, credential=req.credential)
+    except InvalidRegistrationResponse:
+        await session.rollback()
+        log.warning("passkey.add.finish: REJECT attestation verification failed state=%s user=%s",
+                    _short(req.state), uid)
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED, "passkey registration verification failed")
+    try:
+        await users_service.link_passkey_credential(
+            session, user_id=uid, material=material)
+    except IntegrityError:
+        await session.rollback()
+        log.warning("passkey.add.finish: REJECT credential already registered cred=%s user=%s",
+                    _short(material["credential_id"]), uid)
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "passkey already registered")
+    log.info("passkey.add.finish: OK cred=%s linked to user=%s",
+             _short(material["credential_id"]), uid)
+    return _user_view(user)
+
+
 @router.post("/passkey/authenticate/start", dependencies=[rate_limit("passkey")])
 async def passkey_authenticate_start(session: DbSession) -> dict:
     """Begin usernameless/discoverable authentication (empty allowCredentials).

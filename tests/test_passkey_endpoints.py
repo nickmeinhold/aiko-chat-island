@@ -22,7 +22,11 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 from webauthn.helpers import base64url_to_bytes, bytes_to_base64url
 
+from sqlalchemy import func, select
+
 from aiko_gateway.config import settings
+from aiko_gateway.domain import passkey_service
+from aiko_gateway.domain.models import User
 from aiko_gateway.rest import auth as auth_routes
 from aiko_gateway.rest import well_known as well_known_routes
 from aiko_gateway.rest.deps import get_session
@@ -299,3 +303,75 @@ async def test_well_known_assetlinks_empty_until_fingerprints_configured(
     assert entry["relation"] == ["delegate_permission/common.get_login_creds"]
     assert entry["target"]["package_name"] == settings.passkey_android_package
     assert entry["target"]["sha256_cert_fingerprints"] == ["AB:CD:EF"]
+
+
+# --- add-passkey-to-existing-account (#1727) ------------------------------- #
+# The bug: there was only ONE passkey path (first-passkey-creates-account via
+# register→claim). An existing user (e.g. social) adding a passkey was forced
+# through create+claim; a handle conflict with their OWN account rejected the
+# claim and orphaned the device credential — passkey_credentials stayed empty and
+# every authenticate 401'd. The fix is an AUTHENTICATED add path that links the
+# verified credential straight to the existing user_id (no claim, no new account).
+
+async def _count_users(session) -> int:
+    return (await session.execute(select(func.count()).select_from(User))).scalar_one()
+
+
+async def test_add_passkey_links_to_existing_user_no_new_account(client, session):
+    """An authenticated user adds a passkey; it links to their EXISTING account
+    (no new account) and can then sign in AS them. This is the #1727 repro/fix."""
+    claim, _first = await _register_and_claim(client, handle="existing_nick")
+    token = claim.json()["access_token"]
+    uid = claim.json()["user"]["user_id"]
+    users_before = await _count_users(session)
+
+    added = SoftAuthenticator(credential_id=b"added-credential-0002")
+    start = (await client.post("/v1/auth/passkey/register/start")).json()
+    r = await client.post(
+        "/v1/auth/passkey/add/finish",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"state": start["state"],
+              "credential": added.register(start["options"]["challenge"])})
+    assert r.status_code == 200, r.text
+    assert r.json()["user_id"] == uid
+
+    # No new account — the credential attached to the existing user.
+    assert await _count_users(session) == users_before
+    cred = await passkey_service.get_credential(
+        session, bytes_to_base64url(added.credential_id))
+    assert cred is not None and cred.user_id == uid
+
+    # The freshly-added passkey now authenticates AS that same user.
+    astart = (await client.post("/v1/auth/passkey/authenticate/start")).json()
+    afinish = await client.post(
+        "/v1/auth/passkey/authenticate/finish",
+        json={"state": astart["state"],
+              "credential": added.authenticate(astart["options"]["challenge"])})
+    assert afinish.status_code == 200, afinish.text
+    assert afinish.json()["user"]["user_id"] == uid
+
+
+async def test_add_passkey_requires_authentication(client):
+    """Unauthenticated add/finish is refused — the bearer names which account to
+    link to, so there is no anonymous add."""
+    added = SoftAuthenticator(credential_id=b"unauth-credential-0003")
+    start = (await client.post("/v1/auth/passkey/register/start")).json()
+    r = await client.post(
+        "/v1/auth/passkey/add/finish",
+        json={"state": start["state"],
+              "credential": added.register(start["options"]["challenge"])})
+    assert r.status_code in (401, 403), r.text
+
+
+async def test_add_passkey_duplicate_credential_conflicts(client, session):
+    """Re-adding an already-registered credential is a 409 (credential_id UNIQUE is
+    the replay guard), not a silent second row."""
+    claim, first = await _register_and_claim(client, handle="dup_nick")
+    token = claim.json()["access_token"]
+    start = (await client.post("/v1/auth/passkey/register/start")).json()
+    r = await client.post(
+        "/v1/auth/passkey/add/finish",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"state": start["state"],
+              "credential": first.register(start["options"]["challenge"])})
+    assert r.status_code == 409, r.text
