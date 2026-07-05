@@ -37,9 +37,9 @@
 name: aiko
 
 services:
-  island:
+  chat-island:
     build: .
-    image: aiko-island:latest
+    image: aiko-chat-island:latest
     restart: always
     # Reachable by Caddy on the host loopback; never exposed off-host directly.
     ports:

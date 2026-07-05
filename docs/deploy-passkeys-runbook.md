@@ -63,7 +63,7 @@ clients. Do not collapse them.
   `False`, `JWT_SECRET` already lives in the host `.env`.
 - **Compose project** = `aiko` (pinned via `name:` in `docker-compose.yml`, NOT derived
   from the host dir basename). Containers are `aiko-<service>-1`:
-  `aiko-island-1` (the gateway), `aiko-mosquitto-1`, `aiko-registrar-1`, `aiko-chat-1`.
+  `aiko-chat-island-1` (the gateway), `aiko-mosquitto-1`, `aiko-registrar-1`, `aiko-chat-1`.
 - **DB volume** = `aiko_data`, declared **external** with a fixed name — decoupled from the
   project name, so future project/service renames never reproject (or silently empty) the
   store. Broker state (`mosquitto_data`) is a plain managed volume (transport-only, rebuilt
@@ -101,7 +101,7 @@ existing `~/aiko-db-backups/aiko.db.predeploy-*` pattern.
 > /data/aiko.db ".backup"` shell call (that errors `executable not found`).
 
 ```bash
-TS=$(date +%Y%m%d-%H%M%S); C=aiko-island-1
+TS=$(date +%Y%m%d-%H%M%S); C=aiko-chat-island-1
 ssh imagineering "
 set -e
 docker exec $C python -c \"
@@ -178,7 +178,7 @@ ssh imagineering 'cd ~/apps/aiko-chat-gateway && docker compose up -d --build --
 Watch the entrypoint migrate before serving:
 
 ```bash
-ssh imagineering "docker logs --since 2m aiko-island-1 2>&1 | grep -A2 entrypoint"
+ssh imagineering "docker logs --since 2m aiko-chat-island-1 2>&1 | grep -A2 entrypoint"
 # expect: "[entrypoint] migrating database to head..." then "[entrypoint] starting uvicorn..."
 # NO "Refusing to adopt" / "Adopting" lines — the DB is already managed at 0007.
 ```
@@ -188,7 +188,7 @@ ssh imagineering "docker logs --since 2m aiko-island-1 2>&1 | grep -A2 entrypoin
 ## Step 3 — Verify the dark deploy (each invariant, foreground)
 
 ```bash
-C=aiko-island-1
+C=aiko-chat-island-1
 # (a) schema advanced 0007 -> 0008, passkey tables exist
 ssh imagineering "docker exec $C python -c \"
 import sqlite3; db=sqlite3.connect('/data/aiko.db')
@@ -223,7 +223,7 @@ created at claim and authenticate returns a session for the same user.
 
 Tail the gateway while testing:
 ```bash
-ssh imagineering "docker logs -f aiko-island-1"
+ssh imagineering "docker logs -f aiko-chat-island-1"
 ```
 
 **Android is blocked** until app task #20 supplies the Play App Signing SHA-256
@@ -273,7 +273,7 @@ revert the schema:
 ```bash
 # revert code: rsync the prior commit's tree and rebuild, OR re-tag the old image.
 # revert schema (only if needed): downgrade one revision
-ssh imagineering "docker exec aiko-island-1 \
+ssh imagineering "docker exec aiko-chat-island-1 \
   python -c \"from alembic.config import Config; from alembic import command; \
   c=Config('alembic.ini'); c.set_main_option('script_location','alembic'); \
   command.downgrade(c,'0007')\""
