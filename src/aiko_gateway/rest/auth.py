@@ -872,8 +872,10 @@ async def delete_account(user: CurrentUser, session: DbSession) -> Response:
         # admin memberships (#1583), so a refusal CAN leave uncommitted writes (admin
         # memberships dropped for co-admin channels before hitting the sole-admin
         # one). No explicit rollback here: the per-request session
-        # (deps.get_session = `async with SessionLocal()`) rolls back uncommitted
-        # work when it closes on this exception — the service test
+        # (deps.get_session = `async with SessionLocal()`) DISCARDS uncommitted work
+        # when it closes — SQLAlchemy session close rolls back any open transaction
+        # regardless of how the block exits, so it's the close, not this exception,
+        # that undoes the partial writes. The service test
         # (test_refused_deletion_rolls_back_partial_admin_removal) pins that. An
         # explicit `session.rollback()` would be redundant in prod AND actively
         # wrong under test: the shared-session client override yields the test's own

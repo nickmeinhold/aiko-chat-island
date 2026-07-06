@@ -235,8 +235,13 @@ async def test_concurrent_account_deletions_of_coadmins_keep_one_admin(
     sm = file_sessionmaker
     cid, aid, bid = await _two_admin_channel(sm)
 
-    # Force both deletions into the atomic guard simultaneously (worst-case
-    # interleaving — both past the admin-set read at once).
+    # Release both deletions into the guard together: the barrier sits at the ENTRY
+    # of _remove_admin_memberships_or_refuse, so both tasks begin the guard body at
+    # the same instant and then race on the admin-set read + delete. Under the OLD
+    # read-then-check guard both read admin_count==2 (the read precedes any write, so
+    # neither transaction's SHARED lock blocks the other) and both proceed — a
+    # DETERMINISTIC orphan, which is why the RED-proof (revert the guard) fails every
+    # run, not just under lucky scheduling.
     real = accounts_service._remove_admin_memberships_or_refuse
     barrier = asyncio.Barrier(2)
 

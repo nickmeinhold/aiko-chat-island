@@ -87,8 +87,12 @@ async def _remove_admin_memberships_or_refuse(
         without the other.
 
     Channels are processed in sorted id order so two concurrent deletions sharing
-    several channels take the row locks in the SAME order (no deadlock). Refused
-    channels are collected so the 409 can name all of them.
+    several channels acquire the per-channel locks in the SAME order — no
+    CROSS-channel lock inversion (AB/BA). Intra-channel row-lock ordering is left
+    to Postgres' scan order, as in memberships_service. Refused channels are
+    collected so the 409 can name all of them. (Postgres FOR UPDATE behaviour is
+    reasoned from the mirrored, SQLite-tested memberships_service pattern; the tests
+    here exercise the prod engine, SQLite.)
     """
     admin_channels = sorted((await session.execute(
         select(Membership.channel_id).where(
