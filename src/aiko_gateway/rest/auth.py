@@ -868,12 +868,18 @@ async def delete_account(user: CurrentUser, session: DbSession) -> Response:
     try:
         await accounts_service.delete_user_account(session, user.id)
     except accounts_service.CannotDeleteSoleAdmin as e:
-        # No rollback: the guard raises before delete_user_account performs ANY
-        # write (only SELECTs precede it), so there is nothing to undo. (Carnot
-        # suggested a defensive rollback here; rejected — on the shared async test
-        # session it raises MissingGreenlet, and in prod it is a no-op on a fresh
-        # per-request session. The guard-before-writes invariant is what keeps this
-        # safe; if future guard code writes before raising, roll back THEN.)
+        # The sole-admin guard now enforces ATOMICALLY as it removes the user's
+        # admin memberships (#1583), so a refusal CAN leave uncommitted writes (admin
+        # memberships dropped for co-admin channels before hitting the sole-admin
+        # one). No explicit rollback here: the per-request session
+        # (deps.get_session = `async with SessionLocal()`) DISCARDS uncommitted work
+        # when it closes — SQLAlchemy session close rolls back any open transaction
+        # regardless of how the block exits, so it's the close, not this exception,
+        # that undoes the partial writes. The service test
+        # (test_refused_deletion_rolls_back_partial_admin_removal) pins that. An
+        # explicit `session.rollback()` would be redundant in prod AND actively
+        # wrong under test: the shared-session client override yields the test's own
+        # session, so rolling it back expires the test's ORM objects (MissingGreenlet).
         # The channel ids are ULIDs — useless in a user-facing string — so log them
         # server-side and return a generic, actionable message (cage-match, Carnot).
         log.info("account deletion blocked: user=%s sole admin of channels=%s",
