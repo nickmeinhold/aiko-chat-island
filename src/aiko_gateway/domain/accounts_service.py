@@ -22,8 +22,13 @@ conversation slot endures, the content and every link back to a person do not.
 
 **Sole-admin guard.** Deletion is refused (`CannotDeleteSoleAdmin`) if the user
 is the only admin of any channel, so a channel is never left admin-less; the
-caller surfaces which channels to hand over or leave first. Admin-transfer on
-delete is a deliberate follow-up, not part of this MVP.
+caller surfaces which channels to hand over or leave first. The guard is enforced
+ATOMICALLY with the removal — the user's admin memberships are dropped by a
+conditional ``admins_remaining > 1`` DELETE under a FOR UPDATE lock (the same
+dual-engine mechanism as ``memberships_service._delete_membership_unless_last_admin``),
+so two co-admins deleting concurrently can never both slip past a stale read and
+orphan the channel (#1583). Admin-transfer on delete is a deliberate follow-up,
+not part of this MVP.
 
 Commit convention follows `users_service` (service-owns-commit), not
 `channels_service` (caller-owns-commit): the auth/account routes stay uniformly
@@ -58,34 +63,69 @@ class CannotDeleteSoleAdmin(Exception):
         super().__init__(f"sole admin of channels: {channel_ids}")
 
 
-async def _sole_admin_channel_ids(session: AsyncSession, user_id: str) -> list[str]:
-    """Channel ids where `user_id` is an admin AND the only admin.
+async def _remove_admin_memberships_or_refuse(
+    session: AsyncSession, user_id: str
+) -> None:
+    """Delete every ADMIN membership of `user_id`, REFUSING the whole account
+    deletion (`CannotDeleteSoleAdmin`) if removing any would leave a channel with
+    no admin.
 
-    CONCURRENCY (flagged by all three cage-match reviewers): this is a
-    read-then-write business invariant with NO row lock, so it is not atomic.
-    Under the current single-writer SQLite deployment the race window is small,
-    but two co-admins of the same channel deleting concurrently can each observe
-    the other as the "second admin" and both proceed — orphaning the channel.
-    Moving to Postgres (planned on the public-scale / external-testers path)
-    widens the window. The proper fix is `SELECT … FOR UPDATE` on the channel's
-    admin memberships before the guard (or a DB-level invariant); tracked
-    separately. Accepted for the MVP because the precondition (two simultaneous
-    sole-co-admin deletes) is rare and the blast radius is a recoverable
-    admin-less channel, not data loss.
+    Authoritative and correct on BOTH engines, by the SAME dual mechanism as
+    ``memberships_service._delete_membership_unless_last_admin`` — a mechanism a
+    pure read-then-check guard could not achieve on SQLite, which is why the old
+    `_sole_admin_channel_ids` read had a TOCTOU (two co-admins deleting
+    concurrently each saw the other and both proceeded, orphaning the channel — #1583):
+
+      * ``SELECT … FOR UPDATE`` locks a channel's admin set — serialises a
+        concurrent co-admin's account deletion on Postgres (the second blocks, then
+        re-reads the post-commit count). Inert on SQLite (no row locks).
+      * a conditional ``admins_remaining > 1`` DELETE, the count re-evaluated
+        INSIDE the atomic statement under SQLite's single-writer lock — the loser
+        sees count == 1 and removes 0 rows. FOR UPDATE alone is inert on SQLite (the
+        prod engine, #1281); the conditional DELETE alone is inert on Postgres READ
+        COMMITTED (two DELETEs of different rows don't conflict). Neither suffices
+        without the other.
+
+    Channels are processed in sorted id order so two concurrent deletions sharing
+    several channels take the row locks in the SAME order (no deadlock). Refused
+    channels are collected so the 409 can name all of them.
     """
-    admin_channels = (await session.execute(
+    admin_channels = sorted((await session.execute(
         select(Membership.channel_id).where(
             Membership.user_id == user_id, Membership.role == ROLE_ADMIN)
-    )).scalars().all()
-    sole: list[str] = []
+    )).scalars().all())
+    refused: list[str] = []
     for cid in admin_channels:
-        admin_count = (await session.execute(
+        # Lock this channel's admin set (Postgres); no-op on SQLite.
+        await session.execute(
+            select(Membership.user_id).where(
+                Membership.channel_id == cid, Membership.role == ROLE_ADMIN)
+            .with_for_update())
+        admins_remaining = (
             select(func.count()).select_from(Membership).where(
                 Membership.channel_id == cid, Membership.role == ROLE_ADMIN)
-        )).scalar_one()
-        if admin_count <= 1:
-            sole.append(cid)
-    return sole
+            .scalar_subquery())
+        # Remove this user's admin row only while MORE THAN ONE admin remains — the
+        # count re-evaluated atomically with the delete (closes the SQLite TOCTOU).
+        result = await session.execute(
+            delete(Membership).where(
+                Membership.channel_id == cid,
+                Membership.user_id == user_id,
+                Membership.role == ROLE_ADMIN,
+                admins_remaining > 1))
+        if result.rowcount == 0:
+            # Disambiguate a 0-row delete: a row STILL PRESENT is a genuine
+            # sole-admin refusal; one already GONE (a concurrent removal) is fine
+            # (mirrors _delete_membership_unless_last_admin, PR#29).
+            still_present = (await session.execute(
+                select(Membership.user_id).where(
+                    Membership.channel_id == cid,
+                    Membership.user_id == user_id,
+                    Membership.role == ROLE_ADMIN))).scalar_one_or_none()
+            if still_present is not None:
+                refused.append(cid)
+    if refused:
+        raise CannotDeleteSoleAdmin(refused)
 
 
 async def delete_user_account(session: AsyncSession, user_id: str) -> None:
@@ -95,12 +135,16 @@ async def delete_user_account(session: AsyncSession, user_id: str) -> None:
     credentials, social identities, memberships — then delete the user row, and
     commit — all in one transaction (children-before-parent; no ON DELETE CASCADE).
 
-    Raises `CannotDeleteSoleAdmin` (before performing ANY write) if the user is
-    the only admin of any channel.
+    Raises `CannotDeleteSoleAdmin` if removing the user's admin memberships would
+    leave any channel admin-less. On refusal the account row is left intact; any
+    admin memberships already dropped for OTHER channels in the same call are
+    uncommitted and rolled back by the caller. Enforced atomically — see the
+    module docstring.
     """
-    sole = await _sole_admin_channel_ids(session, user_id)
-    if sole:
-        raise CannotDeleteSoleAdmin(sole)
+    # Drop the user's ADMIN memberships FIRST, refusing the whole deletion if any
+    # channel would be orphaned — atomic on both engines (closes the #1583 TOCTOU).
+    # A refusal raises here, before the irreversible tombstoning below.
+    await _remove_admin_memberships_or_refuse(session, user_id)
 
     # Tombstone authored messages: keep the conversation slot, but destroy every
     # part that carries the person. Two free-text vectors, not one: the `body`,
@@ -159,7 +203,9 @@ async def delete_user_account(session: AsyncSession, user_id: str) -> None:
     await session.execute(
         update(Community).where(Community.owner_id == user_id)
         .values(owner_id=None))
-    # Remove federated-identity links and channel memberships (children first).
+    # Remove federated-identity links and the REMAINING (non-admin) channel
+    # memberships — the admin ones were already dropped by the sole-admin guard
+    # above (children first).
     await session.execute(
         delete(SocialIdentity).where(SocialIdentity.user_id == user_id))
     await session.execute(
