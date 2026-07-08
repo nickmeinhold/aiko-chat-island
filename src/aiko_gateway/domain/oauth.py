@@ -206,11 +206,18 @@ class _JwksCache:
             self._lock = asyncio.Lock()
         return self._lock
 
+    # `_fetched_at == 0.0` is the "never refreshed" sentinel. It must be handled
+    # explicitly, NOT left to the elapsed-time arithmetic: time.monotonic()'s zero
+    # point is arbitrary (near host boot), so on a low-uptime host (a fresh CI
+    # runner, a just-booted container) `monotonic() - 0.0` can be *less than* the
+    # floor — which would wrongly block the very first JWKS fetch and fail every
+    # token closed until uptime exceeds min_refresh_interval. Never-fetched is
+    # always stale and always allowed to refresh.
     def _stale(self) -> bool:
-        return (time.monotonic() - self._fetched_at) >= self._max_age
+        return self._fetched_at == 0.0 or (time.monotonic() - self._fetched_at) >= self._max_age
 
     def _refresh_allowed(self) -> bool:
-        return (time.monotonic() - self._fetched_at) >= self._min_refresh_interval
+        return self._fetched_at == 0.0 or (time.monotonic() - self._fetched_at) >= self._min_refresh_interval
 
     async def get_key(self, kid: str):
         key = self._keys.get(kid)

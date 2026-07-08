@@ -268,6 +268,29 @@ async def test_jwks_cache_floor_bounds_bogus_kid_amplification():
     assert calls["n"] == 1  # first miss refreshed; floor blocked the next five
 
 
+async def test_jwks_first_refresh_not_starved_at_low_uptime(monkeypatch):
+    """REGRESSION: the never-fetched sentinel (`_fetched_at == 0.0`) must bypass the
+    floor. `time.monotonic()`'s zero point is near host boot, so on a low-uptime host
+    (a fresh CI runner, a just-booted container) `monotonic() - 0.0` can be BELOW the
+    floor and wrongly block the very FIRST JWKS fetch — failing every token closed
+    until uptime exceeds min_refresh_interval. We pin monotonic() below the floor so
+    this is caught EVERYWHERE, not only on a fresh runner: the two floor tests around
+    this one pass on a high-uptime dev box for the wrong reason (monotonic happens to
+    exceed the floor), which is exactly how this bug reached main green-locally."""
+    monkeypatch.setattr(oauth.time, "monotonic", lambda: 5.0)  # 5s "uptime" << floor
+    cache = oauth._JwksCache("http://x", min_refresh_interval=1000.0, max_age=10000.0)
+    calls = {"n": 0}
+
+    async def fake_refresh():
+        calls["n"] += 1
+        cache._keys = {"kid-0": object()}
+        cache._fetched_at = oauth.time.monotonic()
+
+    cache._refresh = fake_refresh
+    assert await cache.get_key("kid-0") is not None  # first fetch NOT starved by the floor
+    assert calls["n"] == 1
+
+
 @pytest.mark.parametrize("bad_body", [
     [],                    # bare list, not an object
     {"keys": None},        # keys present but null
