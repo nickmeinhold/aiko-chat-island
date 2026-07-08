@@ -175,6 +175,25 @@ async def test_gossip_falls_back_to_deprecated_gateways_path_for_old_peer():
     assert "old" in [p.id for p in d.known()]
 
 
+async def test_gossip_survives_malformed_body_and_reaches_later_target():
+    """A hostile/buggy peer returning a 200 with a non-dict body (here a JSON list,
+    which has no .get) must be DROPPED as a bad target — not abort the whole round.
+    A healthy target sorted after it must still converge. RED-proof: move the
+    envelope extraction + merge outside the per-target guard and this round crashes
+    on bad.example, never reaching good.example (Carnot cage-match, PR#62)."""
+    d = IslandDirectory(_self(),
+                        bootstrap_urls=["https://bad.example", "https://good.example"])
+    client = _FakeClient({
+        "https://bad.example/v1/islands": [],  # 200 JSON list → body.get() would crash
+        "https://good.example/v1/islands": {"islands": [
+            {"id": "good", "displayName": "Good", "baseURL": "https://good.example"},
+        ]},
+    })
+    learned = await gossip_once(d, client)  # must not raise
+    assert learned == 1
+    assert "good" in [p.id for p in d.known()]  # the round survived the bad target
+
+
 async def test_gossip_swallows_unreachable_peer():
     d = IslandDirectory(_self(), bootstrap_urls=["https://down.example"])
     client = _FakeClient({})  # every GET raises

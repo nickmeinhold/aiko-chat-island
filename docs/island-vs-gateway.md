@@ -50,16 +50,22 @@ safe. Implemented 2026-07-08.)*
 | Node identity / federation / choice | **island** | server picker, discovery directory, presets, the peer-entry *identity* (`id`, `display_name`) |
 | Protocol edge / connection / transport | **gateway** | the `/v1/*` REST + WS API, `base_url`, the `aiko_gateway` package, `GatewayRestApi`/`gateway_transport` (app) |
 
-## Island-repo internal naming (follow-up, non-breaking)
+## Island-repo internal naming (DONE)
 
-`peers_service.py` models a peer as `GatewayPeer` — but the entry *is a peer island*
-(identity) reachable at a gateway `base_url`. An internal rename toward island-centric
-names (the peer is an island; `base_url` is its gateway) would sharpen the split
-without touching the wire. Tracked, not required for the app unblock.
+`peers_service.py` now models a node as `Island` (was `GatewayPeer`) in an
+`IslandDirectory` (was `PeerDirectory`); `coerce_island` (was `coerce_peer`). The
+entry *is a peer island* (its `id`/`display_name`); `base_url` is that island's
+gateway edge. Wire untouched by the rename (keys unchanged). **Deferred, deploy-coupled:**
+the self-identity config env vars are still `GATEWAY_*` (`gateway_base_url`,
+`gateway_display_name`, `GATEWAY_SEED_PEERS`) because renaming them touches the
+compose files on both island boxes — do that with a coordinated deploy, keeping a
+`gateway_*` alias meanwhile.
 
 ## App-side (coordinated, after this lock)
 
 Rename node-identity identifiers to island (`ServerEntry`→`IslandEntry`,
 `kGatewayPresets`→`kIslandPresets`, picker, directory). **Leave** protocol-edge types
-as gateway (`GatewayRestApi`, `gateway_transport`, `GatewayConfig`). Reading
-`/v1/gateways` + `base_url` is unchanged. See app memory `concept_island_vs_gateway.md`.
+as gateway (`GatewayRestApi`, `gateway_transport`, `GatewayConfig`). Adopt the
+canonical `GET /v1/islands` (read the `islands` array); `/v1/gateways` remains a
+deprecated alias through the compat window, so old builds keep working until they age
+out. `base_url` per entry is unchanged. See app memory `concept_island_vs_gateway.md`.

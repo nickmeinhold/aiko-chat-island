@@ -129,7 +129,7 @@ class Settings(BaseSettings):
     # --- island/gateway directory via peer gossip (#1546) ---
     # The DECENTRALIZED discovery layer: each gateway advertises a known-peer set
     # and converges by anti-entropy gossip — NO central registry. See
-    # domain/peers_service.py + rest/gateways.py. The app's server picker calls
+    # domain/peers_service.py + rest/islands.py. The app's server picker calls
     # GET /v1/islands (deprecated alias /v1/gateways) to swap its hardcoded preset list.
     #
     # This gateway's stable id in the directory. Empty → derived from the

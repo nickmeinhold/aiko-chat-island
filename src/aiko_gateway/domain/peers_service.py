@@ -195,22 +195,32 @@ async def gossip_once(directory: IslandDirectory, client, *, timeout: float = 5.
     drift."""
     learned = 0
     for base in directory.gossip_targets():
-        body = None
-        for path in ("/v1/islands", "/v1/gateways"):
-            url = f"{base}{path}"
-            try:
-                resp = await client.get(url, timeout=timeout)
-                resp.raise_for_status()
-                body = resp.json()
-                break  # got a directory; don't try the older path
-            except Exception as exc:  # noqa: BLE001 — best-effort gossip, never fatal
-                log.debug("gossip pull failed for %s: %s", url, exc)
-        if body is None:
-            continue
-        entries = body.get("islands")
-        if entries is None:
-            entries = body.get("gateways", [])
-        learned += directory.merge(entries)
+        # The ENTIRE per-target body — fetch-with-fallback, envelope extraction, AND
+        # merge — is under one exception boundary: a peer being down OR returning a
+        # hostile/malformed 200 (a JSON list, null, {"islands": null}) must be
+        # dropped as a bad target, never abort the whole round (Carnot cage-match:
+        # moving .get()/merge() outside the guard re-opened a one-peer gossip DoS).
+        try:
+            body = None
+            for path in ("/v1/islands", "/v1/gateways"):
+                url = f"{base}{path}"
+                try:
+                    resp = await client.get(url, timeout=timeout)
+                    resp.raise_for_status()
+                    body = resp.json()
+                    break  # got a directory; don't try the older path
+                except Exception as exc:  # noqa: BLE001 — fetch failed; try next path
+                    log.debug("gossip pull failed for %s: %s", url, exc)
+            if body is None:
+                continue
+            # Prefer the canonical `islands` envelope; fall back to the deprecated
+            # `gateways` key. `or []` guards an explicit-null value from either key.
+            entries = body.get("islands")
+            if entries is None:
+                entries = body.get("gateways")
+            learned += directory.merge(entries or [])
+        except Exception as exc:  # noqa: BLE001 — a bad target must never break the loop
+            log.debug("gossip round dropped bad target %s: %s", base, exc)
     if learned:
         log.info("gossip: learned %d new peer(s); known=%d",
                  learned, len(directory.known()))
@@ -229,7 +239,14 @@ def _host_of(base_url: str) -> str:
 
 def build_directory_from_settings(settings) -> IslandDirectory:
     """Construct the process-wide IslandDirectory from config. Self id falls back to
-    the base-url host when gateway_id is unset."""
+    the base-url host when gateway_id is unset.
+
+    NAMED DEFERRAL (#1760): the self-identity config keys are still `gateway_*`
+    (`GATEWAY_BASE_URL` / `GATEWAY_ID` / `GATEWAY_DISPLAY_NAME` / `GATEWAY_SEED_PEERS`),
+    not `island_*`, even though they populate an Island. Renaming them is
+    deploy-coupled — the env names are set in the compose files on both island boxes —
+    so the rename waits for a coordinated deploy (with a `gateway_*` alias meanwhile),
+    NOT this wire PR. Deliberate, not an oversight (Kelvin cage-match)."""
     base = _normalize_base_url(settings.gateway_base_url)
     gid = (settings.gateway_id or _host_of(base)).strip().lower()
     self_peer = coerce_island(
