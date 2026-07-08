@@ -7,10 +7,14 @@ file is the working-context that isn't obvious from the code.
 
 ## Gotchas that will bite you
 
-- **CI is unavailable** (GitHub Actions out of minutes, permanent). The
-  verification burden is LOCAL — run `pytest` and report *that* as the gate.
-  Never say "CI will catch it." Admin-merge over the absent Actions check is
-  expected.
+- **CI is a live gate** (updated 2026-07-09 — the old "Actions out of minutes,
+  permanent" is FALSE; that stale belief nearly buried a real bug). Two GitHub
+  Actions workflows run on every PR and push to `main`: `CI`
+  (`.github/workflows/ci.yml`, the `pytest` suite on 3.12) and `bus-e2e`
+  (round-trip). Don't merge over a red check. STILL verify LOCALLY first (`pytest`)
+  and report that as your gate — but green-locally ≠ green-on-CI: a fresh
+  low-uptime CI runner surfaced a `time.monotonic()` JWKS bug that passed on
+  high-uptime dev boxes (#64). Local pytest is the habit; CI is the confirmation.
 - **Deploy is manual `docker compose up -d --build` over ssh** — no pipeline.
   `--build` is mandatory (image is `build: .`, no registry); without it you ship
   the stale image and exit 0. Back up the DB first (slim image has no `sqlite3`
