@@ -1,7 +1,7 @@
-"""Gateway directory via peer gossip (#1546) — service + endpoint tests.
+"""Island directory via peer gossip (#1546; wire taxonomy #1760) — service + endpoint tests.
 
-The security-critical surface is `coerce_peer` (it validates UNTRUSTED entries from
-gossip peers) and `PeerDirectory.merge` (self-immutability + the anti-spam cap).
+The security-critical surface is `coerce_island` (it validates UNTRUSTED entries from
+gossip peers) and `IslandDirectory.merge` (self-immutability + the anti-spam cap).
 These are SHAPE defenses only — the test-grade trust model (poisoning undefended)
 is documented in peers_service; these tests pin the shape guarantees, not
 authenticity.
@@ -9,20 +9,20 @@ authenticity.
 from __future__ import annotations
 
 from aiko_gateway.domain.peers_service import (
-    MAX_PEERS, GatewayPeer, PeerDirectory, build_directory_from_settings,
-    coerce_peer, gossip_once,
+    MAX_PEERS, Island, IslandDirectory, build_directory_from_settings,
+    coerce_island, gossip_once,
 )
 
 
-# --- coerce_peer: the untrusted-entry validator ---------------------------- #
+# --- coerce_island: the untrusted-entry validator ---------------------------- #
 
 def test_coerce_accepts_well_formed_https_peer():
-    p = coerce_peer({"id": "enspyr", "displayName": "Enspyr", "baseURL": "https://chat.enspyr.co"})
-    assert p == GatewayPeer("enspyr", "Enspyr", "https://chat.enspyr.co")
+    p = coerce_island({"id": "enspyr", "displayName": "Enspyr", "baseURL": "https://chat.enspyr.co"})
+    assert p == Island("enspyr", "Enspyr", "https://chat.enspyr.co")
 
 
 def test_coerce_normalizes_trailing_slash():
-    p = coerce_peer({"id": "x", "displayName": "X", "baseURL": "https://x.example/"})
+    p = coerce_island({"id": "x", "displayName": "X", "baseURL": "https://x.example/"})
     assert p is not None and p.base_url == "https://x.example"
 
 
@@ -30,48 +30,48 @@ def test_coerce_rejects_non_https_scheme():
     # The single most important check: base_url is a navigation target in the app.
     for bad in ["http://x.example", "javascript:alert(1)", "data:text/html,x",
                 "ftp://x.example", "//x.example"]:
-        assert coerce_peer({"id": "x", "displayName": "X", "baseURL": bad}) is None
+        assert coerce_island({"id": "x", "displayName": "X", "baseURL": bad}) is None
 
 
 def test_coerce_rejects_bad_id_and_overlong_fields():
-    assert coerce_peer({"id": "Has Space", "displayName": "X", "baseURL": "https://x.example"}) is None
-    assert coerce_peer({"id": "x", "displayName": "", "baseURL": "https://x.example"}) is None
-    assert coerce_peer({"id": "x", "displayName": "n" * 65, "baseURL": "https://x.example"}) is None
-    assert coerce_peer({"id": "-bad", "displayName": "X", "baseURL": "https://x.example"}) is None
+    assert coerce_island({"id": "Has Space", "displayName": "X", "baseURL": "https://x.example"}) is None
+    assert coerce_island({"id": "x", "displayName": "", "baseURL": "https://x.example"}) is None
+    assert coerce_island({"id": "x", "displayName": "n" * 65, "baseURL": "https://x.example"}) is None
+    assert coerce_island({"id": "-bad", "displayName": "X", "baseURL": "https://x.example"}) is None
 
 
 def test_coerce_rejects_anchor_and_userinfo_evasions():
     # \Z anchor: an internal newline with an evil second line must not match via
     # the $-before-final-newline quirk.
-    assert coerce_peer({"id": "x", "displayName": "X",
+    assert coerce_island({"id": "x", "displayName": "X",
                         "baseURL": "https://ok.example\nhttps://evil.example"}) is None
     # userinfo phishing form: the visible host is real, the actual host is evil.
-    assert coerce_peer({"id": "x", "displayName": "X",
+    assert coerce_island({"id": "x", "displayName": "X",
                         "baseURL": "https://real.example@evil.example"}) is None
 
 
 def test_coerce_rejects_non_string_and_missing_fields():
-    assert coerce_peer("not a dict") is None
-    assert coerce_peer({"id": "x", "displayName": "X"}) is None  # missing baseURL
-    assert coerce_peer({"id": 1, "displayName": "X", "baseURL": "https://x.example"}) is None
+    assert coerce_island("not a dict") is None
+    assert coerce_island({"id": "x", "displayName": "X"}) is None  # missing baseURL
+    assert coerce_island({"id": 1, "displayName": "X", "baseURL": "https://x.example"}) is None
 
 
 def test_coerce_reads_snake_case_and_tolerates_legacy_camel():
     """Wire contract is snake_case (matches the app reader); camelCase still parses
     so a mixed-version gossip round with an old-build peer isn't dropped."""
-    snake = coerce_peer({"id": "a", "display_name": "A", "base_url": "https://a.example"})
-    camel = coerce_peer({"id": "a", "displayName": "A", "baseURL": "https://a.example"})
-    assert snake == camel == GatewayPeer("a", "A", "https://a.example")
+    snake = coerce_island({"id": "a", "display_name": "A", "base_url": "https://a.example"})
+    camel = coerce_island({"id": "a", "displayName": "A", "baseURL": "https://a.example"})
+    assert snake == camel == Island("a", "A", "https://a.example")
 
 
-# --- PeerDirectory.merge: self-immutability + cap -------------------------- #
+# --- IslandDirectory.merge: self-immutability + cap -------------------------- #
 
-def _self() -> GatewayPeer:
-    return GatewayPeer("home", "Home", "https://home.example")
+def _self() -> Island:
+    return Island("home", "Home", "https://home.example")
 
 
 def test_merge_adds_new_and_dedupes_by_id():
-    d = PeerDirectory(_self())
+    d = IslandDirectory(_self())
     assert d.merge([{"id": "a", "displayName": "A", "baseURL": "https://a.example"}]) == 1
     # same id again → first-write-wins, not re-added (even with a different url).
     assert d.merge([{"id": "a", "displayName": "A2", "baseURL": "https://evil.example"}]) == 0
@@ -82,7 +82,7 @@ def test_merge_adds_new_and_dedupes_by_id():
 
 
 def test_merge_never_overwrites_self():
-    d = PeerDirectory(_self())
+    d = IslandDirectory(_self())
     # A hostile peer claims OUR id with its own url — must be ignored.
     assert d.merge([{"id": "home", "displayName": "Pwned", "baseURL": "https://evil.example"}]) == 0
     assert d.self_peer == _self()
@@ -93,7 +93,7 @@ def test_merge_rejects_self_by_url_and_duplicate_urls():
     """Self-immutability is by URL too, not just id (Carnot cage-match): a
     different-id alias of our own base_url must not become a second self-referential
     entry, and two ids pointing at the same gateway collapse to one."""
-    d = PeerDirectory(_self())
+    d = IslandDirectory(_self())
     # different id, but OUR url → dropped (self-by-URL, not just self-by-id)
     assert d.merge([{"id": "notme", "display_name": "Not Me",
                      "base_url": "https://home.example"}]) == 0
@@ -106,7 +106,7 @@ def test_merge_rejects_self_by_url_and_duplicate_urls():
 
 
 def test_merge_enforces_max_peers_cap():
-    d = PeerDirectory(_self())
+    d = IslandDirectory(_self())
     flood = [{"id": f"p{i}", "displayName": f"P{i}", "baseURL": f"https://p{i}.example"}
              for i in range(MAX_PEERS + 50)]
     added = d.merge(flood)
@@ -116,7 +116,7 @@ def test_merge_enforces_max_peers_cap():
 
 
 def test_merge_drops_malformed_without_failing():
-    d = PeerDirectory(_self())
+    d = IslandDirectory(_self())
     added = d.merge([
         {"id": "ok", "displayName": "OK", "baseURL": "https://ok.example"},
         {"id": "bad", "displayName": "B", "baseURL": "http://insecure.example"},  # dropped
@@ -145,10 +145,11 @@ class _FakeClient:
 
 
 async def test_gossip_learns_peers_from_a_target_and_self_converges():
-    d = PeerDirectory(_self(), bootstrap_urls=["https://seed.example"])
+    d = IslandDirectory(_self(), bootstrap_urls=["https://seed.example"])
     # The bootstrap peer reports itself + one further peer → both should be learned.
+    # Canonical path: the peer serves /v1/islands with the `islands` envelope.
     client = _FakeClient({
-        "https://seed.example/v1/gateways": {"gateways": [
+        "https://seed.example/v1/islands": {"islands": [
             {"id": "seed", "displayName": "Seed", "baseURL": "https://seed.example"},
             {"id": "far", "displayName": "Far", "baseURL": "https://far.example"},
         ]},
@@ -158,8 +159,43 @@ async def test_gossip_learns_peers_from_a_target_and_self_converges():
     assert sorted(p.id for p in d.known()) == ["far", "home", "seed"]
 
 
+async def test_gossip_falls_back_to_deprecated_gateways_path_for_old_peer():
+    """Compat window (#1760): a peer still on the pre-taxonomy build serves only
+    /v1/gateways with the legacy `gateways` envelope. The new node's gossip must try
+    /v1/islands (fails → not served), fall back to /v1/gateways, and still converge."""
+    d = IslandDirectory(_self(), bootstrap_urls=["https://old.example"])
+    client = _FakeClient({
+        # No /v1/islands key → that GET raises → fallback to /v1/gateways.
+        "https://old.example/v1/gateways": {"gateways": [
+            {"id": "old", "displayName": "Old", "baseURL": "https://old.example"},
+        ]},
+    })
+    learned = await gossip_once(d, client)
+    assert learned == 1
+    assert "old" in [p.id for p in d.known()]
+
+
+async def test_gossip_survives_malformed_body_and_reaches_later_target():
+    """A hostile/buggy peer returning a 200 with a non-dict body (here a JSON list,
+    which has no .get) must be DROPPED as a bad target — not abort the whole round.
+    A healthy target sorted after it must still converge. RED-proof: move the
+    envelope extraction + merge outside the per-target guard and this round crashes
+    on bad.example, never reaching good.example (Carnot cage-match, PR#62)."""
+    d = IslandDirectory(_self(),
+                        bootstrap_urls=["https://bad.example", "https://good.example"])
+    client = _FakeClient({
+        "https://bad.example/v1/islands": [],  # 200 JSON list → body.get() would crash
+        "https://good.example/v1/islands": {"islands": [
+            {"id": "good", "displayName": "Good", "baseURL": "https://good.example"},
+        ]},
+    })
+    learned = await gossip_once(d, client)  # must not raise
+    assert learned == 1
+    assert "good" in [p.id for p in d.known()]  # the round survived the bad target
+
+
 async def test_gossip_swallows_unreachable_peer():
-    d = PeerDirectory(_self(), bootstrap_urls=["https://down.example"])
+    d = IslandDirectory(_self(), bootstrap_urls=["https://down.example"])
     client = _FakeClient({})  # every GET raises
     learned = await gossip_once(d, client)  # must not raise
     assert learned == 0
@@ -207,7 +243,7 @@ def test_endpoint_returns_self_and_merged_peers_in_contract_shape():
     from fastapi.testclient import TestClient
 
     from aiko_gateway.domain import peers_service
-    from aiko_gateway.rest import gateways
+    from aiko_gateway.rest import islands
 
     # Mutate the shared singleton the router reads (same object, not a rebind) with
     # a uniquely-id'd peer so we don't depend on / disturb other tests.
@@ -215,11 +251,11 @@ def test_endpoint_returns_self_and_merged_peers_in_contract_shape():
         [{"id": "test-peer-xyz", "display_name": "Test Peer", "base_url": "https://tp.example"}])
 
     app = FastAPI()
-    app.include_router(gateways.router)  # no lifespan → no aiko bus import
-    body = TestClient(app).get("/v1/gateways").json()
+    app.include_router(islands.router)  # no lifespan → no aiko bus import
+    body = TestClient(app).get("/v1/islands").json()
 
-    assert "gateways" in body and isinstance(body["gateways"], list)
-    entry = next(g for g in body["gateways"] if g["id"] == "test-peer-xyz")
+    assert "islands" in body and isinstance(body["islands"], list)
+    entry = next(g for g in body["islands"] if g["id"] == "test-peer-xyz")
     # snake_case is the contract: these are the exact keys the app's ServerEntry
     # reader looks for (base_url / display_name). The old camelCase `baseURL` was
     # invisible to that reader and silently dropped every entry — regression guard.
@@ -227,7 +263,25 @@ def test_endpoint_returns_self_and_merged_peers_in_contract_shape():
     assert entry == {"id": "test-peer-xyz", "display_name": "Test Peer",
                      "base_url": "https://tp.example"}
     # self entry is present too (built from settings at import).
-    assert any(g["id"] for g in body["gateways"])
+    assert any(g["id"] for g in body["islands"])
+
+
+def test_deprecated_gateways_alias_serves_same_data_legacy_key():
+    """Compat window (#1760): /v1/gateways is a deprecated alias of /v1/islands with
+    the legacy `gateways` envelope key, so shipped app builds keep working. Same
+    entries; only the array key differs."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from aiko_gateway.rest import islands
+
+    app = FastAPI()
+    app.include_router(islands.router)
+    client = TestClient(app)
+    islands_body = client.get("/v1/islands").json()
+    gateways_body = client.get("/v1/gateways").json()
+    assert "gateways" in gateways_body and "islands" not in gateways_body
+    assert gateways_body["gateways"] == islands_body["islands"]
 
 
 def test_endpoint_shape_matches_app_serverentry_reader_keys():
@@ -235,7 +289,7 @@ def test_endpoint_shape_matches_app_serverentry_reader_keys():
     reads the URL from base_url/baseUrl/httpBaseUrl/url and the name from
     name/display_name/displayName/label. Our emitted keys MUST hit that set — this
     is the assertion that would have caught the baseURL≠baseUrl break."""
-    entry = GatewayPeer("x", "X", "https://x.example").to_public()
+    entry = Island("x", "X", "https://x.example").to_public()
     app_url_keys = {"base_url", "baseUrl", "httpBaseUrl", "url"}
     app_name_keys = {"name", "display_name", "displayName", "label"}
     assert app_url_keys & entry.keys(), f"no URL key the app reads in {entry.keys()}"
