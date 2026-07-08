@@ -1,17 +1,19 @@
-"""Island/gateway directory via peer gossip (#1546) — the DECENTRALIZED discovery
-layer, no central registry.
+"""Island directory via peer gossip (#1546; wire taxonomy #1760) — the DECENTRALIZED
+discovery layer, no central registry.
 
-Each gateway advertises a known-peer set over ``GET /v1/gateways`` and converges by
-anti-entropy: a background loop periodically pulls each known peer's set and merges
-it, so newly-learned peers propagate transitively. No node is an authority — every
-gateway speaks only for itself and what it has learned. The app's server picker
-calls ``GET /v1/gateways`` on whatever gateway it's pointed at to replace its
-hardcoded preset list.
+Each island advertises its known-island set over ``GET /v1/islands`` (the deprecated
+``/v1/gateways`` alias survives the compat window) and converges by anti-entropy: a
+background loop periodically pulls each known peer's set and merges it, so
+newly-learned islands propagate transitively. No node is an authority — every island
+speaks only for itself and what it has learned. The app's server picker calls
+``GET /v1/islands`` on whatever island it's pointed at to replace its hardcoded
+preset list. An entry is a peer ISLAND (the node); its ``base_url`` is that island's
+GATEWAY edge (the protocol front door).
 
 ╔══════════════════════════════════════════════════════════════════════════════╗
 ║ TRUST MODEL — TEST-GRADE, POISONING UNDEFENDED. Read before relying on this. ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
-║ Gossip distributes trust, which distributes the ATTACK: any gateway we gossip ║
+║ Gossip distributes trust, which distributes the ATTACK: any island we gossip  ║
 ║ with can inject a peer entry — e.g. a baseURL labelled "Aiko Official"        ║
 ║ pointing at an attacker's credential-harvesting host. The picker would show   ║
 ║ it. A central directory would get trust "for free" (trust the one operator);  ║
@@ -40,7 +42,7 @@ MAX_ID_LEN = 64
 MAX_NAME_LEN = 64
 MAX_URL_LEN = 255
 
-# A gateway id is a short slug — lowercased alnum + dash. Constrained so it can't
+# An island id is a short slug — lowercased alnum + dash. Constrained so it can't
 # carry markup/control chars into the picker UI. \Z (not $) so a trailing newline
 # can't satisfy the anchor (Python's $ matches before a final \n).
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,%d}\Z" % (MAX_ID_LEN - 1))
@@ -53,18 +55,20 @@ _HTTPS_RE = re.compile(r"^https://[a-zA-Z0-9.-]+(:\d+)?(/[\w./~-]*)?\Z")
 
 
 @dataclass(frozen=True)
-class GatewayPeer:
+class Island:
     id: str
     display_name: str
     base_url: str
 
     def to_public(self) -> dict:
         """The wire shape the app picker consumes: snake_case, matching the app's
-        ServerEntry reader (base_url/display_name) AND this gateway's house style
-        everywhere else. (The original #1546 draft emitted camelCase `baseURL`,
-        which the app's reader — keys base_url/baseUrl/httpBaseUrl/url — could not
-        match, silently dropping every entry. coerce_peer stays tolerant of the old
-        keys so a mixed-version gossip round still parses.)"""
+        reader (base_url/display_name) AND this repo's house style. `id`/`display_name`
+        are the island's identity; `base_url` is its gateway edge. The keys are shared
+        by both /v1/islands and the deprecated /v1/gateways envelope (only the array
+        key differs). (The original #1546 draft emitted camelCase `baseURL`, which the
+        app's reader — keys base_url/baseUrl/httpBaseUrl/url — could not match, silently
+        dropping every entry. coerce_island stays tolerant of the old keys so a
+        mixed-version gossip round still parses.)"""
         return {"id": self.id, "display_name": self.display_name,
                 "base_url": self.base_url}
 
@@ -75,13 +79,13 @@ def _normalize_base_url(raw: str) -> str:
     return raw.rstrip("/")
 
 
-def coerce_peer(raw: object) -> GatewayPeer | None:
+def coerce_island(raw: object) -> Island | None:
     """Validate an untrusted peer entry (dict from a gossip response, or a
-    GatewayPeer) into a GatewayPeer, or None if it fails any SHAPE check. Never
+    Island) into a Island, or None if it fails any SHAPE check. Never
     raises — a malformed entry from a hostile/buggy peer is dropped, not fatal.
 
     SHAPE only: a valid-shaped entry is NOT an authentic one (see the banner)."""
-    if isinstance(raw, GatewayPeer):
+    if isinstance(raw, Island):
         gid, name, url = raw.id, raw.display_name, raw.base_url
     elif isinstance(raw, dict):
         # snake_case is the wire contract; accept the legacy camelCase keys too so a
@@ -102,19 +106,19 @@ def coerce_peer(raw: object) -> GatewayPeer | None:
         return None
     if len(url) > MAX_URL_LEN or not _HTTPS_RE.match(url):
         return None
-    return GatewayPeer(id=gid, display_name=name, base_url=url)
+    return Island(id=gid, display_name=name, base_url=url)
 
 
-class PeerDirectory:
+class IslandDirectory:
     """The known-peer set for THIS gateway. Self is always present (and immutable —
     a peer can never overwrite our own entry). Merge is first-write-wins with a
     hard size cap; no conflict resolution (test-grade)."""
 
-    def __init__(self, self_peer: GatewayPeer | None,
+    def __init__(self, self_peer: Island | None,
                  bootstrap_urls: Iterable[str] = (),
                  seed_peers: Iterable[object] = ()):
         self._self = self_peer
-        self._peers: dict[str, GatewayPeer] = {}
+        self._peers: dict[str, Island] = {}
         if self_peer is not None:
             self._peers[self_peer.id] = self_peer
         # Operator-curated static peers: FULL entries merged with no network fetch.
@@ -130,13 +134,13 @@ class PeerDirectory:
         }
 
     @property
-    def self_peer(self) -> GatewayPeer | None:
+    def self_peer(self) -> Island | None:
         return self._self
 
-    def is_self(self, peer: GatewayPeer) -> bool:
+    def is_self(self, peer: Island) -> bool:
         return self._self is not None and peer.id == self._self.id
 
-    def known(self) -> list[GatewayPeer]:
+    def known(self) -> list[Island]:
         """All known peers (incl. self), sorted by id for a stable response."""
         return sorted(self._peers.values(), key=lambda p: p.id)
 
@@ -147,7 +151,7 @@ class PeerDirectory:
         first-write-wins), and anything past MAX_PEERS."""
         added = 0
         for raw in incoming:
-            peer = coerce_peer(raw)
+            peer = coerce_island(raw)
             if peer is None:
                 continue
             if self._self is not None and peer.id == self._self.id:
@@ -179,20 +183,34 @@ class PeerDirectory:
         return sorted(urls)
 
 
-async def gossip_once(directory: PeerDirectory, client, *, timeout: float = 5.0) -> int:
-    """One anti-entropy round: pull each target's /v1/gateways and merge. Returns
-    the number of newly-learned peers. Per-target failures are swallowed (a peer
-    being down must never break the loop). ``client`` is an httpx.AsyncClient."""
+async def gossip_once(directory: IslandDirectory, client, *, timeout: float = 5.0) -> int:
+    """One anti-entropy round: pull each target's island directory and merge.
+    Returns the number of newly-learned peers. Per-target failures are swallowed (a
+    peer being down must never break the loop). ``client`` is an httpx.AsyncClient.
+
+    COMPAT WINDOW (#1760 wire taxonomy): prefer the canonical ``/v1/islands`` and
+    fall back to the deprecated ``/v1/gateways`` so a new node still converges with a
+    peer still on the pre-taxonomy build during rollout. Parse either envelope key
+    (``islands`` | ``gateways``); merge/coerce_island already tolerate per-entry key
+    drift."""
     learned = 0
     for base in directory.gossip_targets():
-        url = f"{base}/v1/gateways"
-        try:
-            resp = await client.get(url, timeout=timeout)
-            resp.raise_for_status()
-            body = resp.json()
-            learned += directory.merge(body.get("gateways", []))
-        except Exception as exc:  # noqa: BLE001 — best-effort gossip, never fatal
-            log.debug("gossip pull failed for %s: %s", url, exc)
+        body = None
+        for path in ("/v1/islands", "/v1/gateways"):
+            url = f"{base}{path}"
+            try:
+                resp = await client.get(url, timeout=timeout)
+                resp.raise_for_status()
+                body = resp.json()
+                break  # got a directory; don't try the older path
+            except Exception as exc:  # noqa: BLE001 — best-effort gossip, never fatal
+                log.debug("gossip pull failed for %s: %s", url, exc)
+        if body is None:
+            continue
+        entries = body.get("islands")
+        if entries is None:
+            entries = body.get("gateways", [])
+        learned += directory.merge(entries)
     if learned:
         log.info("gossip: learned %d new peer(s); known=%d",
                  learned, len(directory.known()))
@@ -209,17 +227,17 @@ def _host_of(base_url: str) -> str:
     return m.group(1).lower().replace(".", "-")
 
 
-def build_directory_from_settings(settings) -> PeerDirectory:
-    """Construct the process-wide PeerDirectory from config. Self id falls back to
+def build_directory_from_settings(settings) -> IslandDirectory:
+    """Construct the process-wide IslandDirectory from config. Self id falls back to
     the base-url host when gateway_id is unset."""
     base = _normalize_base_url(settings.gateway_base_url)
     gid = (settings.gateway_id or _host_of(base)).strip().lower()
-    self_peer = coerce_peer(
+    self_peer = coerce_island(
         {"id": gid, "displayName": settings.gateway_display_name, "baseURL": base})
     if self_peer is None:
         log.warning("could not build a valid self peer (id=%r base=%r); the "
                     "directory will advertise no self entry", gid, base)
-    return PeerDirectory(self_peer, settings.gateway_bootstrap_peers,
+    return IslandDirectory(self_peer, settings.gateway_bootstrap_peers,
                          seed_peers=settings.gateway_seed_peers)
 
 

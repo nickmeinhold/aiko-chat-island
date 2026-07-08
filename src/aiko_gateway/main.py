@@ -142,8 +142,9 @@ state = GatewayState()
 
 
 async def _gossip_loop(interval: int) -> None:
-    """Background anti-entropy for the gateway directory (#1546). Pulls each known
-    peer's /v1/gateways and merges, immediately then every `interval` seconds, so
+    """Background anti-entropy for the island directory (#1546). Pulls each known
+    peer's island directory (/v1/islands, falling back to the deprecated /v1/gateways
+    for pre-taxonomy peers) and merges, immediately then every `interval` seconds, so
     peers converge with no central registry. Best-effort: a failing round is logged
     and retried, never fatal. Cancelled cleanly on shutdown."""
     import httpx
@@ -224,7 +225,7 @@ from .rest import auth as auth_routes  # noqa: E402
 from .rest import channels as channel_routes  # noqa: E402
 from .rest import communities as community_routes  # noqa: E402
 from .rest import devices as device_routes  # noqa: E402
-from .rest import gateways as gateway_routes  # noqa: E402
+from .rest import islands as island_routes  # noqa: E402
 from .rest import legal as legal_routes  # noqa: E402
 from .rest import members as member_routes  # noqa: E402
 from .rest import messages as message_routes  # noqa: E402
@@ -236,7 +237,7 @@ app.include_router(auth_routes.me_router)
 app.include_router(channel_routes.router)
 app.include_router(community_routes.router)
 app.include_router(device_routes.router)
-app.include_router(gateway_routes.router)
+app.include_router(island_routes.router)
 app.include_router(legal_routes.router)
 app.include_router(member_routes.router)
 app.include_router(message_routes.router)

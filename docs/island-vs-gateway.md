@@ -21,21 +21,27 @@ An **island HAS a gateway** (the landmass vs its front door). This repo is named
 for the node (`aiko-chat-island`) and *contains* the gateway implementation (the
 `aiko_gateway` package) — that nesting is correct, not a naming bug.
 
-## Wire contract decision: NO breaking change
+## Wire contract decision: migrate to `/v1/islands`, deprecate `/v1/gateways`
 
-`GET /v1/gateways` → `{"gateways": [{"id", "display_name", "base_url"}, ...]}`
+The node directory is a directory of **islands** — carry the taxonomy through to the
+wire, with a compat window so shipped app builds and pre-taxonomy peers don't break.
 
-- **Keep the path `/v1/gateways`.** Each entry is a peer **island**, *addressed by
-  its gateway's URL* — the name reads correctly under the taxonomy. Renaming is
-  breaking (shipped app builds call it) for zero semantic gain.
-- **Keep the keys `{id, display_name, base_url}`.** `base_url` correctly names the
-  **gateway** edge; `id` + `display_name` are the **island's** identity. No rename.
-- **Semantics (documented, not encoded):** one entry = one peer island; `base_url`
-  = that island's gateway (protocol-edge) URL.
+- **Canonical: `GET /v1/islands`** → `{"islands": [{"id", "display_name", "base_url"}, ...]}`.
+  Each entry is a peer **island** (`id`/`display_name` = identity); `base_url` is
+  that island's **gateway** edge. The array key is `islands`.
+- **Deprecated alias: `GET /v1/gateways`** → `{"gateways": [...]}` (same entries,
+  legacy envelope key). Kept for the compat window so shipped app builds and peers
+  still on the old build keep working. Remove once the app has adopted `/v1/islands`
+  and old builds have aged out (coordinate via #1760).
+- **Keys unchanged** `{id, display_name, base_url}` — no per-entry key churn; only the
+  collection name moves. `base_url` still names the gateway edge.
+- **Gossip converges both directions during rollout:** a node fetches `/v1/islands`
+  first and falls back to `/v1/gateways`, parsing either envelope key
+  (`peers_service.gossip_once`). So new↔old node pairs still converge.
 
-The split is therefore **conceptual + spoken + internal-identifier only** — it costs
-no wire migration. The app can rename its node-identity identifiers freely while
-still reading `/v1/gateways` + `base_url` unchanged.
+*(Supersedes the initial "no breaking change / keep `/v1/gateways`" call — Nick's
+direction was to finish the taxonomy on the wire, which the compat window makes
+safe. Implemented 2026-07-08.)*
 
 ## Which names go which way
 

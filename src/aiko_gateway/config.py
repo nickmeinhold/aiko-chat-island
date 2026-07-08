@@ -130,7 +130,7 @@ class Settings(BaseSettings):
     # The DECENTRALIZED discovery layer: each gateway advertises a known-peer set
     # and converges by anti-entropy gossip — NO central registry. See
     # domain/peers_service.py + rest/gateways.py. The app's server picker calls
-    # GET /v1/gateways to swap its hardcoded preset list.
+    # GET /v1/islands (deprecated alias /v1/gateways) to swap its hardcoded preset list.
     #
     # This gateway's stable id in the directory. Empty → derived from the
     # gateway_base_url host (so a single-gateway deploy still self-identifies).
@@ -155,7 +155,7 @@ class Settings(BaseSettings):
     # off, the directory still serves self + seed_peers (no fetch). Enable only once
     # the SSRF/OOM hardening lands AND transitive discovery is actually needed.
     gateway_gossip_enabled: bool = False
-    # How often the background gossip loop pulls each known peer's /v1/gateways and
+    # How often the background gossip loop pulls each known peer's island directory and
     # merges. Takes effect only when gateway_gossip_enabled is true.
     gateway_gossip_interval_seconds: int = 300
     # The app's Universal/App Link the browser is redirected back to after the
