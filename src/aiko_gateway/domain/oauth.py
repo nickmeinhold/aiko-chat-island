@@ -192,7 +192,7 @@ class _JwksCache:
                 "of the ceiling-driven refresh.")
         self._uri = jwks_uri
         self._keys: dict[str, object] = {}
-        self._fetched_at = 0.0  # monotonic time of last successful refresh (0 = never)
+        self._fetched_at: float | None = None  # monotonic time of last successful refresh (None = never)
         self._min_refresh_interval = min_refresh_interval
         self._max_age = max_age
         # asyncio.Lock created lazily on first await so the module imports without
@@ -206,18 +206,20 @@ class _JwksCache:
             self._lock = asyncio.Lock()
         return self._lock
 
-    # `_fetched_at == 0.0` is the "never refreshed" sentinel. It must be handled
+    # `_fetched_at is None` is the "never refreshed" sentinel. It must be handled
     # explicitly, NOT left to the elapsed-time arithmetic: time.monotonic()'s zero
     # point is arbitrary (near host boot), so on a low-uptime host (a fresh CI
-    # runner, a just-booted container) `monotonic() - 0.0` can be *less than* the
-    # floor — which would wrongly block the very first JWKS fetch and fail every
-    # token closed until uptime exceeds min_refresh_interval. Never-fetched is
-    # always stale and always allowed to refresh.
+    # runner, a just-booted container) `monotonic() - <small> ` can be *less than*
+    # the floor — which would wrongly block the very first JWKS fetch and fail every
+    # token closed until uptime exceeds min_refresh_interval. Never-fetched is always
+    # stale and always allowed to refresh. The sentinel is `None`, not `0.0`: `0.0`
+    # is a *possible* monotonic value, so using it as the sentinel risks a real
+    # refresh landing there and permanently nullifying the floor (cage-match, Kelvin).
     def _stale(self) -> bool:
-        return self._fetched_at == 0.0 or (time.monotonic() - self._fetched_at) >= self._max_age
+        return self._fetched_at is None or (time.monotonic() - self._fetched_at) >= self._max_age
 
     def _refresh_allowed(self) -> bool:
-        return self._fetched_at == 0.0 or (time.monotonic() - self._fetched_at) >= self._min_refresh_interval
+        return self._fetched_at is None or (time.monotonic() - self._fetched_at) >= self._min_refresh_interval
 
     async def get_key(self, kid: str):
         key = self._keys.get(kid)

@@ -174,7 +174,7 @@ async def test_unknown_kid_rejected_after_single_refresh(wired_google, monkeypat
         refreshes["n"] += 1  # refresh runs but doesn't add the bogus kid
 
     monkeypatch.setattr(cache, "_keys", {})  # force a miss
-    monkeypatch.setattr(cache, "_fetched_at", 0.0)  # ensure the floor permits a refresh
+    monkeypatch.setattr(cache, "_fetched_at", None)  # ensure the floor permits a refresh
     monkeypatch.setattr(cache, "_refresh", fake_refresh)
     token = _make_token(wired_google, kid="bogus-kid")
     with pytest.raises(oauth.InvalidProviderToken):
@@ -192,7 +192,7 @@ async def test_provider_outage_maps_to_unavailable(wired_google, monkeypatch):
         raise httpx.ConnectError("jwks endpoint down")
 
     monkeypatch.setattr(cache, "_keys", {})
-    monkeypatch.setattr(cache, "_fetched_at", 0.0)
+    monkeypatch.setattr(cache, "_fetched_at", None)
     monkeypatch.setattr(cache, "_refresh", boom)
     token = _make_token(wired_google, kid="any-kid")
     with pytest.raises(oauth.ProviderUnavailable):
@@ -208,7 +208,7 @@ async def test_malformed_jwks_body_maps_to_unavailable(wired_google, monkeypatch
         raise ValueError("Expecting value: line 1 column 1 (char 0)")
 
     monkeypatch.setattr(cache, "_keys", {})
-    monkeypatch.setattr(cache, "_fetched_at", 0.0)
+    monkeypatch.setattr(cache, "_fetched_at", None)
     monkeypatch.setattr(cache, "_refresh", bad_json)
     token = _make_token(wired_google, kid="any-kid")
     with pytest.raises(oauth.ProviderUnavailable):
@@ -269,7 +269,7 @@ async def test_jwks_cache_floor_bounds_bogus_kid_amplification():
 
 
 async def test_jwks_first_refresh_not_starved_at_low_uptime(monkeypatch):
-    """REGRESSION: the never-fetched sentinel (`_fetched_at == 0.0`) must bypass the
+    """REGRESSION: the never-fetched sentinel (`_fetched_at is None`) must bypass the
     floor. `time.monotonic()`'s zero point is near host boot, so on a low-uptime host
     (a fresh CI runner, a just-booted container) `monotonic() - 0.0` can be BELOW the
     floor and wrongly block the very FIRST JWKS fetch — failing every token closed
@@ -313,7 +313,7 @@ async def test_malformed_jwks_shape_does_not_500(wired_google, monkeypatch, bad_
         cache._fetched_at = time.monotonic()  # a successful (possibly empty) refresh
 
     monkeypatch.setattr(cache, "_keys", {})
-    monkeypatch.setattr(cache, "_fetched_at", 0.0)
+    monkeypatch.setattr(cache, "_fetched_at", None)
     monkeypatch.setattr(cache, "_refresh", fake_refresh)
     token = _make_token(wired_google, kid="any-kid")
     with pytest.raises((oauth.ProviderUnavailable, oauth.InvalidProviderToken)):
