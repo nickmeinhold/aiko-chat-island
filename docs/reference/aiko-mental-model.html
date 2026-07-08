@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>aiko chat state — the mental model</title>
+<style>
+  :root { --fg:#1a1a1a; --muted:#666; --read:#0a9d54; --write:#2a6dd6; --warn:#c0392b; --amber:#e0a800; --rule:#e2e2e2; --code:#f4f4f6; }
+  body { font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--fg); max-width:1000px; margin:2rem auto; padding:0 1.2rem; }
+  h1 { font-size:1.5rem; margin-bottom:0.1rem; }
+  p.sub { color:var(--muted); margin-top:0.2rem; }
+  code { background:var(--code); padding:0.05rem 0.3rem; border-radius:4px; font-size:0.9em; }
+  .legend { display:flex; gap:1.4rem; flex-wrap:wrap; margin:1rem 0 0.4rem; font-size:0.88rem; }
+  .legend span { display:inline-flex; align-items:center; gap:0.4rem; }
+  .sw { width:26px; height:0; border-top-width:3px; border-top-style:solid; display:inline-block; }
+  .callouts { display:grid; grid-template-columns:1fr 1fr; gap:0.8rem; margin-top:1.2rem; }
+  .call { border-left:4px solid var(--amber); background:#fffaf0; padding:0.6rem 0.9rem; border-radius:0 6px 6px 0; font-size:0.9rem; }
+  .call.b { border-left-color:var(--read); background:#f0f9f4; }
+  .note { color:var(--muted); font-size:0.85rem; margin-top:1.2rem; }
+</style>
+</head>
+<body>
+<h1>aiko chat state — watch vs change</h1>
+<p class="sub">One HyperSpace (<code>chat_space</code>), two Category "directories", and the two lanes for touching them. Grounded on <code>aiko_chat/chat.py</code> + <code>chat_start.sh</code>.</p>
+
+<div class="legend">
+  <span><i class="sw" style="border-top-color:var(--read)"></i> <b>READ</b> — EC share, live mirror, <b>one-way</b> (like <code>tail -f</code>)</span>
+  <span><i class="sw" style="border-top-color:var(--write)"></i> <b>WRITE</b> — Category API (<code>add</code>/<code>remove</code>) — the only mutation path</span>
+  <span><i class="sw" style="border-top-color:var(--muted);border-top-style:dashed"></i> proposed / not built yet</span>
+</div>
+
+<svg viewBox="0 0 1000 560" width="100%" role="img" aria-label="aiko chat state diagram">
+  <defs>
+    <marker id="ar-read" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#0a9d54"/></marker>
+    <marker id="ar-write" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#2a6dd6"/></marker>
+  </defs>
+
+  <!-- ChatServer process -->
+  <rect x="30" y="60" width="470" height="440" rx="10" fill="#fbfbfd" stroke="#cfd2dc"/>
+  <text x="48" y="86" font-size="14" font-weight="700">ChatServer process  <tspan fill="#888" font-weight="400">(an Actor)</tspan></text>
+
+  <!-- HyperSpace -->
+  <rect x="52" y="100" width="426" height="384" rx="8" fill="#f4f6fb" stroke="#b9c1d6"/>
+  <text x="68" y="124" font-size="13" font-weight="700">HyperSpace: <tspan font-family="monospace">chat_space</tspan>  <tspan fill="#888" font-weight="400">— the mounted disk</tspan></text>
+
+  <!-- channels Category -->
+  <rect x="72" y="146" width="386" height="150" rx="7" fill="#eafaf1" stroke="#0a9d54"/>
+  <text x="88" y="170" font-size="13" font-weight="700" fill="#0a7d43">Category: <tspan font-family="monospace">channels/</tspan>  <tspan fill="#3aa" font-weight="400">(a directory)</tspan></text>
+  <text x="88" y="188" font-size="11.5" fill="#666">furnished by chat_start.sh — 5 entries seeded</text>
+  <!-- channel chips -->
+  <g font-size="11.5" font-family="monospace">
+    <rect x="88"  y="204" width="70" height="26" rx="13" fill="#fff" stroke="#0a9d54"/><text x="123" y="221" text-anchor="middle">general</text>
+    <rect x="166" y="204" width="66" height="26" rx="13" fill="#fff" stroke="#0a9d54"/><text x="199" y="221" text-anchor="middle">random</text>
+    <rect x="240" y="204" width="46" height="26" rx="13" fill="#fff" stroke="#0a9d54"/><text x="263" y="221" text-anchor="middle">llm</text>
+    <rect x="294" y="204" width="56" height="26" rx="13" fill="#fff" stroke="#0a9d54"/><text x="322" y="221" text-anchor="middle">robot</text>
+    <rect x="358" y="204" width="52" height="26" rx="13" fill="#fff" stroke="#0a9d54"/><text x="384" y="221" text-anchor="middle">yolo</text>
+  </g>
+  <text x="88" y="258" font-size="11.5" fill="#555">each entry = a <tspan font-weight="700">Dependency</tspan> (a symlink / reference)</text>
+  <text x="88" y="278" font-size="11.5" fill="#555">its share is what the gateway mirrors →</text>
+
+  <!-- users Category -->
+  <rect x="72" y="312" width="386" height="150" rx="7" fill="#fdf6ee" stroke="#e0a800" stroke-dasharray="0"/>
+  <text x="88" y="336" font-size="13" font-weight="700" fill="#a9760a">Category: <tspan font-family="monospace">users/</tspan>  <tspan fill="#c9a24a" font-weight="400">(a directory)</tspan></text>
+  <text x="88" y="356" font-size="11.5" fill="#666">created by chat_start.sh (line 53) — but…</text>
+  <rect x="88" y="372" width="322" height="40" rx="6" fill="#fff" stroke="#e0a800" stroke-dasharray="5 4"/>
+  <text x="249" y="396" font-size="12.5" fill="#a9760a" text-anchor="middle" font-style="italic">( empty — nothing populates it yet )</text>
+  <text x="88" y="436" font-size="11.5" fill="#555">a user entry would <tspan font-weight="700">also</tspan> be a Dependency — same as a channel.</text>
+  <text x="88" y="453" font-size="11.5" fill="#555">open question: what does one user entry <tspan font-weight="700">hold?</tspan></text>
+
+  <!-- Gateway -->
+  <rect x="700" y="150" width="270" height="250" rx="10" fill="#fbfbfd" stroke="#cfd2dc"/>
+  <text x="718" y="176" font-size="14" font-weight="700">Gateway</text>
+  <text x="718" y="194" font-size="11.5" fill="#888">aiko-chat-island — an ECConsumer</text>
+  <!-- SQLite cylinder -->
+  <g>
+    <ellipse cx="835" cy="250" rx="70" ry="14" fill="#eef1f7" stroke="#9aa3bd"/>
+    <path d="M765,250 v46 a70,14 0 0 0 140,0 v-46" fill="#eef1f7" stroke="#9aa3bd"/>
+    <ellipse cx="835" cy="250" rx="70" ry="14" fill="#f7f9fd" stroke="#9aa3bd"/>
+    <text x="835" y="248" font-size="11.5" text-anchor="middle" font-weight="700">SQLite</text>
+    <text x="835" y="282" font-size="10.5" text-anchor="middle" fill="#666">users live HERE</text>
+    <text x="835" y="296" font-size="10.5" text-anchor="middle" fill="#666">today</text>
+  </g>
+  <text x="718" y="340" font-size="11" fill="#888">reconciling identity across</text>
+  <text x="718" y="356" font-size="11" fill="#888">islands needs a stable user id</text>
+
+  <!-- READ arrow: channels -> gateway (exists) -->
+  <path d="M458,230 C560,230 600,240 698,240" fill="none" stroke="#0a9d54" stroke-width="2.5" marker-end="url(#ar-read)"/>
+  <rect x="500" y="196" width="150" height="34" rx="6" fill="#eafaf1" stroke="#0a9d54"/>
+  <text x="575" y="211" font-size="11" text-anchor="middle" font-weight="700" fill="#0a7d43">channel_list</text>
+  <text x="575" y="224" font-size="10" text-anchor="middle" fill="#0a7d43">EC share ✓ live now</text>
+
+  <!-- READ arrow: users -> gateway (proposed, dashed) -->
+  <path d="M458,388 C580,388 620,330 698,318" fill="none" stroke="#0a9d54" stroke-width="2.5" stroke-dasharray="6 5" marker-end="url(#ar-read)"/>
+  <rect x="500" y="410" width="180" height="34" rx="6" fill="#f0f9f4" stroke="#0a9d54" stroke-dasharray="5 4"/>
+  <text x="590" y="425" font-size="11" text-anchor="middle" font-weight="700" fill="#0a7d43">user_list (proposed #6)</text>
+  <text x="590" y="438" font-size="10" text-anchor="middle" fill="#0a7d43">would mirror an EMPTY list</text>
+
+  <!-- WRITE arrow: gateway -> Category API (dashed blue, the other lane) -->
+  <path d="M760,400 C700,470 520,500 300,478" fill="none" stroke="#2a6dd6" stroke-width="2.5" stroke-dasharray="2 4" marker-end="url(#ar-write)"/>
+  <rect x="430" y="500" width="330" height="34" rx="6" fill="#eef4fd" stroke="#2a6dd6"/>
+  <text x="595" y="515" font-size="11" text-anchor="middle" font-weight="700" fill="#2a6dd6">create / remove a user → Category API (add/remove)</text>
+  <text x="595" y="528" font-size="10" text-anchor="middle" fill="#2a6dd6">NOT through the share — writing is a separate lane</text>
+</svg>
+
+<div class="callouts">
+  <div class="call">
+    <b>Blocker 1 — the room is empty.</b> <code>users/</code> exists but nothing creates user entries in it. A <code>user_list</code> share would mirror an empty list until ChatServer (or something) starts populating it.
+  </div>
+  <div class="call">
+    <b>Blocker 2 — what's in a user entry?</b> Andy's own TODO: <i>"What is stored in each User Dependency storage file?"</i> The gateway needs a <b>stable id</b> inside it to say "this user = that user on another island."
+  </div>
+</div>
+
+<p class="note">The whole #6 question in one line: the <b>read lane</b> (green) is three lines and Andy already blessed it — but it mirrors an empty room until <b>Blocker 1 &amp; 2</b> (both his design calls) are resolved. Writing users is the <b>other lane</b> (blue) entirely.</p>
+
+<hr style="margin:2.6rem 0 1.4rem; border:none; border-top:1px solid var(--rule)">
+
+<h1>Panel 2 — why federation needs a <em>key</em> in that user entry</h1>
+<p class="sub">Zoom out from one island to the mesh. Two <b>sovereign</b> islands run today. The same human can be on both — and that is where Blocker 2 stops being a detail and becomes the whole game.</p>
+
+<div class="legend">
+  <span><i class="sw" style="border-top-color:#0a9d54"></i> live today</span>
+  <span><i class="sw" style="border-top-color:var(--write);border-top-style:dashed"></i> design / not built (the no-regrets move)</span>
+  <span><i class="sw" style="border-top-color:var(--warn);border-top-style:dashed"></i> the problem</span>
+</div>
+
+<svg viewBox="0 0 1000 500" width="100%" role="img" aria-label="federation identity diagram">
+  <defs>
+    <marker id="ar-warn2" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#c0392b"/></marker>
+    <marker id="ar-key" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#2a6dd6"/></marker>
+    <marker id="ar-dir" markerWidth="9" markerHeight="9" refX="4" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#0a9d54"/></marker>
+  </defs>
+
+  <!-- Island A -->
+  <rect x="30" y="80" width="380" height="250" rx="10" fill="#fbfbfd" stroke="#cfd2dc"/>
+  <text x="50" y="106" font-size="14" font-weight="700">Island A <tspan fill="#888" font-weight="400">— chat.imagineering.cc (Sydney)</tspan></text>
+  <text x="50" y="124" font-size="11" fill="#0a9d54" font-weight="700">sovereign: own users, own operator, own data</text>
+  <rect x="52" y="140" width="336" height="170" rx="7" fill="#fdf6ee" stroke="#e0a800"/>
+  <text x="66" y="162" font-size="12.5" font-weight="700" fill="#a9760a">Category: <tspan font-family="monospace">users/</tspan></text>
+  <!-- user entries A -->
+  <rect x="66" y="176" width="150" height="30" rx="6" fill="#fff" stroke="#c0392b" stroke-dasharray="4 3"/>
+  <text x="141" y="196" font-size="12" text-anchor="middle" font-family="monospace" font-weight="700">nick</text>
+  <text x="66" y="228" font-size="11" fill="#666">local id here: <tspan font-family="monospace" fill="#c0392b">A:1</tspan></text>
+  <rect x="66" y="244" width="150" height="28" rx="6" fill="#fff" stroke="#e0a800"/>
+  <text x="141" y="263" font-size="12" text-anchor="middle" font-family="monospace">andy</text>
+
+  <!-- Island B -->
+  <rect x="590" y="80" width="380" height="250" rx="10" fill="#fbfbfd" stroke="#cfd2dc"/>
+  <text x="610" y="106" font-size="14" font-weight="700">Island B <tspan fill="#888" font-weight="400">— chat.enspyr.co (Melbourne)</tspan></text>
+  <text x="610" y="124" font-size="11" fill="#0a9d54" font-weight="700">sovereign: independent HyperSpace + gateway</text>
+  <rect x="612" y="140" width="336" height="170" rx="7" fill="#fdf6ee" stroke="#e0a800"/>
+  <text x="626" y="162" font-size="12.5" font-weight="700" fill="#a9760a">Category: <tspan font-family="monospace">users/</tspan></text>
+  <rect x="784" y="176" width="150" height="30" rx="6" fill="#fff" stroke="#c0392b" stroke-dasharray="4 3"/>
+  <text x="859" y="196" font-size="12" text-anchor="middle" font-family="monospace" font-weight="700">nick</text>
+  <text x="784" y="228" font-size="11" fill="#666" text-anchor="start">local id here: <tspan font-family="monospace" fill="#c0392b">B:1</tspan></text>
+  <rect x="784" y="244" width="150" height="28" rx="6" fill="#fff" stroke="#e0a800"/>
+  <text x="859" y="263" font-size="12" text-anchor="middle" font-family="monospace">claudia</text>
+
+  <!-- Directory link (live) -->
+  <path d="M410,150 C480,120 520,120 590,150" fill="none" stroke="#0a9d54" stroke-width="2.5" marker-end="url(#ar-dir)" marker-start="url(#ar-dir)"/>
+  <rect x="430" y="96" width="140" height="30" rx="6" fill="#eafaf1" stroke="#0a9d54"/>
+  <text x="500" y="115" font-size="10.5" text-anchor="middle" fill="#0a7d43" font-weight="700">directory: each lists the other ✓</text>
+
+  <!-- The problem: nick on both -->
+  <path d="M216,191 C360,250 640,250 784,191" fill="none" stroke="#c0392b" stroke-width="2.5" stroke-dasharray="6 5" marker-end="url(#ar-warn2)" marker-start="url(#ar-warn2)"/>
+  <rect x="360" y="300" width="280" height="46" rx="8" fill="#fdf2f0" stroke="#c0392b"/>
+  <text x="500" y="320" font-size="12" text-anchor="middle" fill="#c0392b" font-weight="700">same human — but A:1 ≠ B:1</text>
+  <text x="500" y="336" font-size="11" text-anchor="middle" fill="#c0392b">local ids can't prove it. no central registry to ask.</text>
+
+  <!-- Resolution: the key -->
+  <rect x="150" y="384" width="700" height="96" rx="10" fill="#eef4fd" stroke="#2a6dd6"/>
+  <text x="500" y="408" font-size="13" text-anchor="middle" font-weight="700" fill="#2a6dd6">Blocker 2's answer for federation: put a public KEY inside the user entry</text>
+  <rect x="250" y="420" width="220" height="30" rx="6" fill="#fff" stroke="#2a6dd6"/>
+  <text x="360" y="440" font-size="11.5" text-anchor="middle" font-family="monospace">nick → pk:9f3a…</text>
+  <rect x="530" y="420" width="220" height="30" rx="6" fill="#fff" stroke="#2a6dd6"/>
+  <text x="640" y="440" font-size="11.5" text-anchor="middle" font-family="monospace">nick → pk:9f3a…</text>
+  <path d="M470,435 H530" fill="none" stroke="#2a6dd6" stroke-width="2.5" marker-end="url(#ar-key)" marker-start="url(#ar-key)"/>
+  <text x="500" y="472" font-size="11.5" text-anchor="middle" fill="#2a6dd6" font-weight="700">same key ⇒ same principal — provably, with no one to trust in the middle</text>
+</svg>
+
+<div class="callouts" style="grid-template-columns:1fr 1fr 1fr">
+  <div class="call b">
+    <b>→ #1680 auth on the bus.</b> If the entry holds a key, a client proves who it is by signing ("I'm nick, here's my key"). Today mosquitto is <code>allow_anonymous</code> — the WSS/REST front door is locked but the bus behind it isn't. The key closes that.
+  </div>
+  <div class="call b">
+    <b>→ #1569 sybil resistance.</b> If identity is a key and minting one on an island costs something, you can't cheaply spin up a thousand fake principals. Federation trust rests on that cost, not on personhood.
+  </div>
+  <div class="call">
+    <b>Already live: the directory.</b> Each island already lists the other (seed-peers). The mesh exists — what it's missing is a shared way to name <em>who</em>, which is exactly the key.
+  </div>
+</div>
+
+<p class="note">The through-line, Panel 1 → 2: "what's stored in a user entry?" looked like a small ChatServer detail. Zoomed out, the answer <b>a public key</b> is the same primitive that closes the bus's open door (#1680) and makes sybil-resistance possible (#1569). That's why the memory calls key-as-identity <b>the no-regrets move</b> — one decision, three payoffs.</p>
+</body>
+</html>
