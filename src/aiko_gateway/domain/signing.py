@@ -180,8 +180,8 @@ def validate_origin(raw: Any, *, frame_client_msg_id: str) -> dict | None:
     # bool is an int subclass — exclude it everywhere an int is expected so a JSON
     # `true`/`false` can't satisfy `== 1` (True == 1) and slip past. `v` is the
     # frozen envelope discriminator, so it gets the guard too.
-    if isinstance(raw["v"], bool) or raw["v"] != SUPPORTED_V:
-        raise OriginError(f"origin.v {raw['v']!r} unsupported (expected {SUPPORTED_V})")
+    if isinstance(raw["v"], bool) or not isinstance(raw["v"], int) or raw["v"] != SUPPORTED_V:
+        raise OriginError(f"origin.v {raw['v']!r} unsupported (expected int {SUPPORTED_V})")
     if raw["alg"] != ALG:
         raise OriginError(f"origin.alg {raw['alg']!r} not allowed (only {ALG!r})")
     kv = raw["key_version"]
