@@ -31,6 +31,17 @@ router = APIRouter(prefix="/v1", tags=["keys"])
 # base58 bigint decode); matches signing._MAX_PUBKEY_STR and the column width.
 _MAX_PUBKEY_STR = 128
 
+# Per-user cap on EXPLICIT key registration (cage-match Tesla). Unlike device
+# tokens (issued by APNs/FCM, so naturally bounded), a signing pubkey is any
+# client-minted shape-valid Multikey — an authed principal could otherwise POST
+# unlimited rows to grief storage and poison the cross-account collision well. A
+# real principal needs a handful (one live key, a few across rotations); 32 is
+# generous headroom while bounding abuse. The IMPLICIT send path is deliberately
+# NOT capped — a real signed message must never fail on a key count; this guards
+# only the arbitrary-mint API surface. Re-registering an existing key (idempotent)
+# is always allowed, even at the cap.
+_MAX_KEYS_PER_USER = 32
+
 
 class RegisterKeyReq(BaseModel):
     # The multibase-base58btc ed25519 Multikey string (`z…`). Shape-validated in the
@@ -63,6 +74,17 @@ async def register_key(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"invalid signing pubkey: {e}") from e
+    # Per-user cap — but only for a genuinely NEW key. A re-registration of an
+    # already-recorded key is an idempotent bump and must stay allowed even at the
+    # cap (else revoking to make room would be forced). count + existence are read
+    # inside the same session/txn; a race to exceed the cap by one is a benign
+    # bookkeeping slop, not a security boundary.
+    if await svc.get_key(session, user_id=user.id, pubkey=req.pubkey) is None:
+        if await svc.count_keys(session, user.id) >= _MAX_KEYS_PER_USER:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=f"signing-key limit reached ({_MAX_KEYS_PER_USER}); "
+                       "revoke an unused key before registering another")
     row = await svc.record_signing_key(
         session, user_id=user.id, pubkey=req.pubkey, key_version=req.key_version)
     # record_signing_key does not commit (caller owns the txn) — commit the

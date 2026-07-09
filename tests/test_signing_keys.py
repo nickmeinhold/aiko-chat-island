@@ -178,6 +178,23 @@ async def test_revoke_unknown_key_returns_false(session):
     assert await svc.revoke_key(session, user_id=alice.id, pubkey="z-never") is False
 
 
+async def test_record_after_revoke_reinserts_a_fresh_row(session):
+    """Revoke hard-deletes, so re-recording the same key mints a virgin row (new
+    first_seen). This also exercises the record_signing_key insert path when a
+    prior conflicting row is gone — the same code path the raced-revoke retry lands
+    on under concurrency (which can't be forced deterministically in a unit test)."""
+    alice = await _user(session, "alice")
+    first = await svc.record_signing_key(session, user_id=alice.id, pubkey="z-k")
+    await session.commit()
+    first_seen = _naive(first.first_seen_at)
+    assert await svc.revoke_key(session, user_id=alice.id, pubkey="z-k") is True
+    assert await _key_count(session, alice.id) == 0
+    reborn = await svc.record_signing_key(session, user_id=alice.id, pubkey="z-k")
+    await session.commit()
+    assert await _key_count(session, alice.id) == 1
+    assert _naive(reborn.first_seen_at) >= first_seen, "re-register is a fresh birth"
+
+
 async def test_purge_removes_all_keys_for_user(session):
     alice = await _user(session, "alice")
     bob = await _user(session, "bob")
@@ -364,6 +381,32 @@ async def test_post_rejects_bad_multicodec_pubkey_with_400(client, session):
         "/v1/keys", json={"pubkey": "z" + "1" * 40}, headers=_headers(alice))
     assert resp.status_code == 400
     assert await _key_count(session, alice.id) == 0
+
+
+async def test_post_enforces_per_user_key_cap(client, session):
+    """The explicit route caps distinct keys per user (Tesla: arbitrary client-minted
+    Multikeys are a storage-griefing vector). Seed the cap via the service, then a
+    NEW valid key is 429 while re-registering an EXISTING key stays 201."""
+    alice = await _user(session, "alice")
+    # Seed cap-1 junk rows + the valid MK directly via the service (no shape gate),
+    # reaching exactly the cap with VALID_MK present.
+    for i in range(key_routes._MAX_KEYS_PER_USER - 1):
+        await svc.record_signing_key(session, user_id=alice.id, pubkey=f"z-seed-{i}")
+    await svc.record_signing_key(session, user_id=alice.id, pubkey=VALID_MK)
+    await session.commit()
+    assert await _key_count(session, alice.id) == key_routes._MAX_KEYS_PER_USER
+
+    # Re-registering an EXISTING key is idempotent and allowed even at the cap.
+    resp_existing = await client.post(
+        "/v1/keys", json={"pubkey": VALID_MK}, headers=_headers(alice))
+    assert resp_existing.status_code == 201
+
+    # A genuinely NEW key over the cap is refused (429), no row written.
+    fresh_mk = _multikey(Ed25519PrivateKey.generate().public_key().public_bytes_raw())
+    resp_new = await client.post(
+        "/v1/keys", json={"pubkey": fresh_mk}, headers=_headers(alice))
+    assert resp_new.status_code == 429
+    assert await svc.get_key(session, user_id=alice.id, pubkey=fresh_mk) is None
 
 
 async def test_post_rejects_key_version_below_one_with_422(client, session):

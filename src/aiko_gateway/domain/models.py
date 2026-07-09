@@ -470,6 +470,17 @@ class SigningKey(Base):
     victim (sends bind ``sender_user_id`` to the authed session server-side —
     invariant I5).
 
+    EVIDENCE DURABILITY IS SCOPED TO LIVE KEYS (cage-match Tesla): the collision
+    signal above persists only while both rows exist. User-facing revoke
+    (``signing_keys_service.revoke_key``) HARD-deletes, so a caller can erase their
+    own ``(caller, pubkey)`` observation — the roster is a live-key ledger, not an
+    append-only audit log. This is acceptable pre-trust-root because nothing
+    adjudicates collisions yet; a retained-evidence soft-revoke (``revoked_at``
+    tombstone) + a non-unique index on ``pubkey`` to make the collision query cheap
+    are part of the revocation/rotation lifecycle explicitly deferred to federation
+    #1760. Until then, treat this table as a notarized ledger of live presentations,
+    NOT proof of possession.
+
     No ON DELETE CASCADE (codebase convention): account deletion tears these down
     explicitly (children-before-parent) via ``signing_keys_service.purge_user_keys``;
     the cascade guard (``test_account_deletion_cascade_guard``) requires it.
