@@ -423,6 +423,81 @@ class DeviceToken(Base):
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
 
 
+class SigningKey(Base):
+    """An observed pubkey->account binding for sovereign message signing (#1816 PR B).
+
+    Records the fact "authenticated account ``user_id`` presented Ed25519 public
+    key ``pubkey`` at send time" — the contemporaneous binding that elevates an
+    echoed ``origin`` from *forgery-as-echo* (a sig proves *a* key signed these
+    bytes) toward *whose* key an account uses. Written two ways through ONE door
+    (``signing_keys_service.record_signing_key``): IMPLICITLY inside
+    ``create_outbound`` whenever a signed message is sent, and EXPLICITLY via
+    ``POST /v1/keys``. Both are the same idempotent upsert.
+
+    UNIQUENESS IS PER-USER, NOT GLOBAL — a deliberate carrier-semantics choice,
+    not an oversight. The gateway is a CARRIER, not a verifier: it never checks a
+    signature, so when account A presents ``pubkey``, all it *knows* is "A (authed
+    via its session) used this key", NEVER "this key belongs to A". A `UNIQUE`
+    constraint must encode a fact the system can actually know, so the key is
+    ``(user_id, pubkey)`` — dedupe the observation A actually made — not
+    ``(pubkey)``, which would assert single-account ownership the carrier cannot
+    establish. Enforcing global uniqueness here would be actively wrong:
+
+      * The pubkey is PUBLIC (it rides in every echoed message). With no
+        proof-of-possession, global-unique degrades to "first account to *present*
+        the key owns it" — so an attacker who merely SAW Alice's key could race to
+        register it first, locking Alice out and notarizing the impostor's binding
+        with DB authority.
+      * The security-interesting event — two accounts presenting the same key —
+        is a SIGNAL a future trust root should adjudicate. Per-user storage keeps
+        BOTH observations (``(A, k)`` and ``(B, k)``, timestamped) as durable
+        evidence; a global `UNIQUE` would destroy the collision as an
+        ``IntegrityError`` at write time, decided by a layer with no basis to say
+        which account is the impostor.
+      * It would be a fail-closed griefing primitive (register a victim's public
+        key first → their legitimate key-record fails) that stops nothing (the
+        attacker can still stuff any pubkey into a message frame).
+
+    Global uniqueness becomes correct — and this stance flips — ONLY once key
+    REGISTRATION gains proof-of-possession (a challenge the caller signs with the
+    private key). That trust root is deferred (#1816 T-series / federation #1760).
+    Until it exists, per-user is the only HONEST model — exactly as strong as the
+    carrier's real knowledge, no stronger (cf. transport-vs-trust-boundary).
+
+    Cross-user pollution is therefore harmless and self-labeling: an attacker can
+    record ``(attacker, victim_pubkey)``, but it is filed under the ATTACKER's
+    account, never touches the victim's row, and can never let them send AS the
+    victim (sends bind ``sender_user_id`` to the authed session server-side —
+    invariant I5).
+
+    No ON DELETE CASCADE (codebase convention): account deletion tears these down
+    explicitly (children-before-parent) via ``signing_keys_service.purge_user_keys``;
+    the cascade guard (``test_account_deletion_cascade_guard``) requires it.
+    """
+    __tablename__ = "signing_keys"
+    # Named constraint (not column-level) so the ORM metadata matches the
+    # hand-written 0012 migration EXACTLY — the parity gate diffs reflected
+    # unique constraints and an unnamed one would not match the named migration.
+    __table_args__ = (
+        UniqueConstraint("user_id", "pubkey", name="uq_signing_keys_user_pubkey"),
+    )
+    id: Mapped[str] = mapped_column(String(26), primary_key=True, default=new_ulid)
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id"), nullable=False, index=True)
+    # The multibase-base58btc ed25519 Multikey string (`z…`) exactly as it rides in
+    # `origin.sender_pubkey`. 128 matches signing._MAX_PUBKEY_STR (a real Multikey
+    # is ~48 chars; the cap is defense-in-depth). Stored as the wire string — human
+    # inspectable and the exact value a verifier feeds `decode_multikey`.
+    pubkey: Mapped[str] = mapped_column(String(128), nullable=False)
+    # The app's announced key version for this pubkey (>= 1). Carried for the future
+    # rotation/revocation lifecycle; a fixed pubkey keeps its first-seen version.
+    key_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    first_seen_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow)
+    last_seen_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow)
+
+
 class OAuthHandoff(Base):
     """A one-time handoff for the server-side OAuth broker flow (#21).
 

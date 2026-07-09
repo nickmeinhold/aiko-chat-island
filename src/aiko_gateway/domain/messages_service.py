@@ -13,7 +13,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..aiko.payload import InboundMessage
-from . import channels_service, moderation_service
+from . import channels_service, moderation_service, signing_keys_service
 from .ids import new_ulid
 from .models import Channel, Message, User
 
@@ -53,7 +53,16 @@ async def create_outbound(
     equals this one). It is carried verbatim; the gateway does not verify it. A
     resend keeps the FIRST row's origin — the idempotency key already pins the
     stored message, so a differing re-signed envelope on a retry is ignored, not a
-    second row (consistent with the existing client_msg_id no-op contract)."""
+    second row (consistent with the existing client_msg_id no-op contract).
+
+    When `origin` is present, the sender's pubkey->account binding is observed at
+    send time through the single door `signing_keys_service.record_signing_key`
+    (#1816 PR B) — the IMPLICIT half of key binding. It is recorded BEFORE the
+    Message is added so the idempotency SAVEPOINT inside `record_signing_key` wraps
+    only the key row (never the un-flushed Message), and the key + message land in
+    this function's ONE commit — atomic, so a signed message can never persist
+    without its binding. A resend short-circuits above and does not re-record (the
+    binding already exists from the first send)."""
     existing = (await session.execute(
         select(Message).where(
             Message.channel_id == channel.id,
@@ -62,6 +71,10 @@ async def create_outbound(
     )).scalar_one_or_none()
     if existing is not None:
         return existing, False
+    if origin is not None:
+        await signing_keys_service.record_signing_key(
+            session, user_id=user.id,
+            pubkey=origin["sender_pubkey"], key_version=origin["key_version"])
     row = Message(
         id=new_ulid(),
         channel_id=channel.id,

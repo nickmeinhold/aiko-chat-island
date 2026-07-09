@@ -41,10 +41,11 @@ from sqlalchemy.pool import StaticPool
 
 from aiko_gateway.db import Base
 from aiko_gateway.domain import (
-    accounts_service, devices_service, moderation_service, users_service)
+    accounts_service, devices_service, moderation_service,
+    signing_keys_service, users_service)
 from aiko_gateway.domain.models import (
     DEFAULT_COMMUNITY_ID, Channel, Community, CommunityMembership, Membership,
-    Message, PasskeyCredential, SocialIdentity, User)
+    Message, PasskeyCredential, SigningKey, SocialIdentity, User)
 from aiko_gateway.domain.ids import new_ulid
 
 
@@ -86,6 +87,7 @@ EXPECTED_USERS_FK_COLUMNS: set[tuple[str, str]] = {
     ("user_blocks", "blocked_user_id"),       # delete (either direction)
     ("device_tokens", "user_id"),             # delete
     ("passkey_credentials", "user_id"),       # delete
+    ("signing_keys", "user_id"),              # delete (#1816 PR B)
     ("social_identities", "user_id"),         # delete
     ("memberships", "user_id"),               # delete
     ("community_memberships", "user_id"),     # delete (#32)
@@ -177,6 +179,11 @@ async def _seed_full_user_graph(session):
     # message_reports.reporter_user_id — primary reports other's message.
     await moderation_service.report_message(
         session, reporter_id=user.id, message_id="M2".ljust(26, "0"), reason="spam")
+    # signing_keys.user_id (#1816 PR B) — primary has an observed signing key.
+    # record_signing_key does not commit (caller owns the txn), so commit here.
+    await signing_keys_service.record_signing_key(
+        session, user_id=user.id, pubkey="z-signing-primary", key_version=1)
+    await session.commit()
     return user, other
 
 
@@ -347,6 +354,11 @@ async def _seed_fk_safe(session):
     await moderation_service.block_user(session, other.id, user.id)
     await moderation_service.report_message(
         session, reporter_id=user.id, message_id="M2".ljust(26, "0"), reason="spam")
+    # signing_keys.user_id (#1816 PR B) — FK-safe (user committed above); commit
+    # since record_signing_key leaves the txn to the caller.
+    await signing_keys_service.record_signing_key(
+        session, user_id=user.id, pubkey="z-signing-primary", key_version=1)
+    await session.commit()
     return user, other
 
 
