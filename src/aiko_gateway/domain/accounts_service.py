@@ -39,7 +39,8 @@ from __future__ import annotations
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from . import devices_service, moderation_service, passkey_service
+from . import (
+    devices_service, moderation_service, passkey_service, signing_keys_service)
 from .memberships_service import ROLE_ADMIN
 from .models import (
     Community, CommunityMembership, Membership, Message, SocialIdentity, User)
@@ -181,6 +182,11 @@ async def delete_user_account(session: AsyncSession, user_id: str) -> None:
     # passkey holder's deletion leaves an orphaned credential row (FK off) / FK-
     # violates the final User delete (FK on / Postgres). Same verify-the-neighbor.
     await passkey_service.purge_user_credentials(session, user_id)
+    # Signing-key bindings (#1816 PR B) are another FK child of `users` — a personal
+    # pubkey->account observation, hard-deleted with the account (verify-the-neighbor:
+    # every new users-referencing table must join this cascade, exactly as the
+    # passkey/device/moderation rows above did). The cascade guard now requires it.
+    await signing_keys_service.purge_user_keys(session, user_id)
     # Community footprint (#32). TWO FK children of `users`, handled differently —
     # the same verify-the-neighbor discipline, and BOTH are now required by the
     # cascade guard:

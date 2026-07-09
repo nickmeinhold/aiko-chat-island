@@ -226,6 +226,7 @@ from .rest import channels as channel_routes  # noqa: E402
 from .rest import communities as community_routes  # noqa: E402
 from .rest import devices as device_routes  # noqa: E402
 from .rest import islands as island_routes  # noqa: E402
+from .rest import keys as key_routes  # noqa: E402
 from .rest import legal as legal_routes  # noqa: E402
 from .rest import members as member_routes  # noqa: E402
 from .rest import messages as message_routes  # noqa: E402
@@ -238,6 +239,7 @@ app.include_router(channel_routes.router)
 app.include_router(community_routes.router)
 app.include_router(device_routes.router)
 app.include_router(island_routes.router)
+app.include_router(key_routes.router)
 app.include_router(legal_routes.router)
 app.include_router(member_routes.router)
 app.include_router(message_routes.router)
