@@ -134,6 +134,46 @@ async def test_message_view_omits_origin_when_unsigned(session):
     assert "origin" not in messages_service.message_view(row)
 
 
+@pytest.mark.asyncio
+async def test_resend_keeps_first_origin(session):
+    """A resend (same client_msg_id) returns the FIRST row and does NOT overwrite
+    its origin — a confused-or-malicious re-signed envelope on retry can't mutate
+    stored history (the idempotency contract, RED-proven)."""
+    channel = Channel(id="0" * 26, name="general", kind="standard", aiko_channel="general")
+    user = User(id="u" * 26, username="ada", display_name="Ada", aiko_username="ada")
+    session.add_all([channel, user])
+    await session.commit()
+
+    priv = Ed25519PrivateKey.generate()
+    o1 = _origin_for(priv, channel_id=channel.id, client_msg_id="m1",
+                     signed_at_ms=1720000000000, body="hi", reply_to=None)
+    o2 = _origin_for(Ed25519PrivateKey.generate(), channel_id=channel.id,
+                     client_msg_id="m1", signed_at_ms=1720000009999, body="hi", reply_to=None)
+    assert o1 != o2
+
+    row1, c1 = await messages_service.create_outbound(
+        session, user=user, channel=channel, body="hi", client_msg_id="m1", origin=o1)
+    row2, c2 = await messages_service.create_outbound(
+        session, user=user, channel=channel, body="hi", client_msg_id="m1", origin=o2)
+    assert c1 and not c2          # second is the idempotent no-op
+    assert row2.id == row1.id
+    assert row2.origin == o1      # first origin wins; o2 discarded
+
+
+@pytest.mark.asyncio
+async def test_bus_born_message_never_carries_origin(session):
+    """A bus-ingested message (aiko_origin=True) has NULL origin and message_view
+    omits it — so 'absent == unverified' can't decay into 'bus looks signed' if a
+    future PR touches ingest."""
+    from aiko_gateway.aiko.payload import InboundMessage
+    msg = InboundMessage(username="someone", channel="general",
+                         timestamp=1720000000.0, message="from the bus", raw="{}")
+    row = await messages_service.persist_inbound(session, msg)
+    assert row is not None and row.aiko_origin is True
+    assert row.origin is None
+    assert "origin" not in messages_service.message_view(row)
+
+
 # -- 3. trust boundary is fail-closed ----------------------------------------
 def _valid_raw():
     priv = Ed25519PrivateKey.generate()
@@ -149,22 +189,39 @@ def test_validate_origin_none_is_legal():
     (lambda o: o.update(alg="none"), "alg not allowlisted (alg-confusion)"),
     (lambda o: o.update(alg="RS256"), "alg swapped"),
     (lambda o: o.update(v=2), "unsupported version"),
+    (lambda o: o.update(v=True), "v bool-as-int (True == 1) must not pass"),
     (lambda o: o.update(key_version=0), "key_version < 1"),
     (lambda o: o.update(key_version=True), "key_version bool sneaking as int"),
     (lambda o: o.update(signed_at_ms=-1), "negative signed_at_ms"),
     (lambda o: o.update(signed_at_ms="123"), "signed_at_ms not int"),
+    (lambda o: o.update(signed_at_ms=True), "signed_at_ms bool-as-int"),
+    (lambda o: o.update(client_msg_id=123), "client_msg_id not a string"),
+    (lambda o: o.update(client_msg_id="x" * 65), "client_msg_id over the size cap"),
     (lambda o: o.update(sender_pubkey="Qm-not-multibase"), "pubkey not z-multibase"),
     (lambda o: o.update(sender_pubkey="z" + "1" * 40), "pubkey bad multicodec/len"),
+    (lambda o: o.update(sender_pubkey="z" + "1" * 200), "pubkey over the size cap"),
     (lambda o: o.update(sig="!!!!"), "sig not base64url"),
     (lambda o: o.update(sig=_b64url(b"\x00" * 63)), "sig wrong length (63)"),
+    (lambda o: o.update(sig=_b64url(b"\x00" * 64) + "=="), "sig with '=' padding (non-canonical)"),
+    (lambda o: o.update(sig="+/" + _b64url(b"\x00" * 64)[2:]), "sig with standard-base64 chars"),
     (lambda o: o.pop("sig"), "missing required key"),
     (lambda o: o.update(extra="x"), "unexpected extra key"),
 ])
 def test_validate_origin_rejects_malformed(mutate, desc):
     raw = _valid_raw()
     mutate(raw)
+    # For the cap/charset cases the frame id still matches; only the mutated field
+    # is at fault, so a raised OriginError isolates that field.
+    fid = raw["client_msg_id"] if isinstance(raw.get("client_msg_id"), str) else "m1"
     with pytest.raises(signing.OriginError):
-        signing.validate_origin(raw, frame_client_msg_id="m1")
+        signing.validate_origin(raw, frame_client_msg_id=fid)
+
+
+@pytest.mark.parametrize("bad", [[], "str", 123, 0])
+def test_validate_origin_rejects_non_object(bad):
+    """A non-dict origin (list/str/number) is rejected, not coerced."""
+    with pytest.raises(signing.OriginError):
+        signing.validate_origin(bad, frame_client_msg_id="m1")
 
 
 def test_validate_origin_rejects_client_msg_id_mismatch():
@@ -172,3 +229,23 @@ def test_validate_origin_rejects_client_msg_id_mismatch():
     raw = _valid_raw()  # signed with client_msg_id="m1"
     with pytest.raises(signing.OriginError):
         signing.validate_origin(raw, frame_client_msg_id="DIFFERENT")
+
+
+def test_validate_origin_returns_fresh_projection():
+    """The returned dict is a fresh copy (not the caller's), so a later mutation of
+    the inbound frame can't reach the persisted/echoed JSON."""
+    raw = _valid_raw()
+    out = signing.validate_origin(raw, frame_client_msg_id="m1")
+    assert out == raw and out is not raw
+
+
+def test_decode_multikey_external_known_answer():
+    """Pin the Multikey/base58 decoder against an EXTERNAL vector, not our own
+    encoder — a self-consistent codec can be self-consistently WRONG (this bug was
+    nearly shipped). This (multikey -> raw pubkey) pair was cross-verified against
+    the reference `base58` library; if the decoder drifts it fails here even while
+    the golden signing-bytes vector stays green."""
+    mk = "z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK"
+    expected = bytes.fromhex(
+        "2e6fcce36701dc791488e0d0b1745cc1e33a4c1c9fcc41c63bd343dbbe0970e6")
+    assert signing.decode_multikey(mk) == expected

@@ -4,11 +4,23 @@ The app signs every message client-side (Ed25519 over a length-prefixed,
 domain-separated byte layout — the interop contract is frozen in the app's
 `docs/crucible/sovereign-message-signing/SIGNING-SPEC.md`, pinned by a golden
 vector). This gateway is a **carrier, not a verifier**: it validates the SHAPE
-of the `origin` envelope at the trust boundary, binds the claimed key to the
-*authenticated* sender, persists it, and echoes it verbatim on every read path
-so a recipient can reconstruct the signed bytes and verify. It never checks the
-signature itself — verification is the recipient's job and is gated behind a
-trust root that does not exist yet (app TEMPER T4: no "verified sender" UI).
+of the `origin` envelope at the trust boundary, persists it, and echoes it
+verbatim on every read path so a recipient can reconstruct the signed bytes and
+verify. It never checks the signature itself — verification is the recipient's
+job and is gated behind a trust root that does not exist yet (app TEMPER T4: no
+"verified sender" UI).
+
+WHAT THIS DOES AND DOES NOT BIND (read before trusting an echoed origin): the
+only binding this carrier makes is `origin.client_msg_id == the frame's
+client_msg_id` — i.e. the signed id is the id the message is stored under. It
+does NOT bind `sender_pubkey` to the authenticated account: shape-valid means
+"*some* key signed *these* bytes", never "*this user's* key". Any authenticated
+client may attach any well-formed Multikey + any 64-byte sig, and the gateway
+will carry it. So an echoed origin is *attestation of a signature over the body*,
+NOT proof of *who* signed — treating echo as identity is forgery-as-echo. The
+pubkey->account binding (contemporaneous, at send time) is #1816 PR B
+(`signing_keys`); until it lands and a trust root exists, no consumer may render
+"verified sender" from origin alone (app TEMPER T4).
 
 Why validate shape but not signature: an unverifiable-but-well-formed envelope
 is still safe to carry (absent/garbage origin = "unverified", never "invalid").
@@ -24,6 +36,7 @@ silently drift from the app's signer.
 from __future__ import annotations
 
 import base64
+import re
 import struct
 from typing import Any
 
@@ -38,7 +51,16 @@ SIG_RAW_LEN = 64
 # a Multikey pubkey is ~48 chars, a raw-64 sig is ~86 base64url chars.
 _MAX_PUBKEY_STR = 128
 _MAX_SIG_STR = 128
+_MAX_CLIENT_MSG_ID = 64            # matches the messages.client_msg_id column width
 _MAX_SIGNED_AT_MS = 1 << 62        # sane u64-ish upper bound (well past any real clock)
+
+# Unpadded base64url charset — the spec pins sig to base64url-unpadded, so we
+# reject `=` padding and any non-[A-Za-z0-9_-] byte BEFORE decoding. Python's
+# base64.urlsafe_b64decode is permissive (ignores some junk, tolerates padding),
+# so a length check alone would let a non-canonical string decode to 64 bytes and
+# be echoed verbatim across the trust boundary. Charset-gate first.
+_B64URL_UNPADDED_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+_MAX_B58_STR = 128                 # decode_multikey input cap (defense-in-depth for the bigint loop)
 
 # Exactly these keys, no more (frozen v1 shape; a change is a v2, never a silent add).
 _REQUIRED_KEYS = frozenset(
@@ -76,6 +98,10 @@ def decode_multikey(s: str) -> bytes:
     is not a well-formed ed25519 Multikey."""
     if not s or s[0] != "z":
         raise OriginError("sender_pubkey must be a multibase-base58btc Multikey (z…)")
+    # Length-guard the base58 body before the O(n^2) bigint decode — defense in
+    # depth so the decoder is safe even if a future caller forgets the field cap.
+    if len(s) > _MAX_B58_STR:
+        raise OriginError("sender_pubkey too long")
     decoded = _b58decode(s[1:])
     if not decoded.startswith(_MULTICODEC_ED25519):
         raise OriginError("sender_pubkey is not an ed25519 Multikey (bad multicodec)")
@@ -86,10 +112,15 @@ def decode_multikey(s: str) -> bytes:
 
 
 def _b64url_raw(s: str, *, expect_len: int, field: str) -> bytes:
-    """Decode unpadded base64url and assert an exact decoded length."""
+    """Strictly decode UNPADDED base64url and assert an exact decoded length.
+    Charset-gate before decoding — `base64.urlsafe_b64decode` is permissive
+    (tolerates `=` padding and silently skips some junk), so without this an
+    `=`-padded or standard-alphabet string could decode to the right length and
+    be echoed across the trust boundary as if canonical."""
+    if not _B64URL_UNPADDED_RE.match(s):
+        raise OriginError(f"{field} must be unpadded base64url ([A-Za-z0-9_-], no '=')")
     try:
-        pad = "=" * (-len(s) % 4)
-        raw = base64.urlsafe_b64decode(s + pad)
+        raw = base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
     except (ValueError, TypeError) as e:
         raise OriginError(f"{field} is not valid base64url") from e
     if len(raw) != expect_len:
@@ -146,9 +177,11 @@ def validate_origin(raw: Any, *, frame_client_msg_id: str) -> dict | None:
         extra = keys - _REQUIRED_KEYS
         raise OriginError(f"origin key set invalid (missing={sorted(missing)}, unexpected={sorted(extra)})")
 
-    if raw["v"] != SUPPORTED_V:
+    # bool is an int subclass — exclude it everywhere an int is expected so a JSON
+    # `true`/`false` can't satisfy `== 1` (True == 1) and slip past. `v` is the
+    # frozen envelope discriminator, so it gets the guard too.
+    if isinstance(raw["v"], bool) or raw["v"] != SUPPORTED_V:
         raise OriginError(f"origin.v {raw['v']!r} unsupported (expected {SUPPORTED_V})")
-    # bool is an int subclass — exclude it so `true`/`false` can't sneak through int checks.
     if raw["alg"] != ALG:
         raise OriginError(f"origin.alg {raw['alg']!r} not allowed (only {ALG!r})")
     kv = raw["key_version"]
@@ -161,8 +194,8 @@ def validate_origin(raw: Any, *, frame_client_msg_id: str) -> dict | None:
     decode_multikey(pubkey)  # raises OriginError if not a well-formed ed25519 Multikey
 
     cmid = raw["client_msg_id"]
-    if not isinstance(cmid, str):
-        raise OriginError("origin.client_msg_id must be a string")
+    if not isinstance(cmid, str) or len(cmid) > _MAX_CLIENT_MSG_ID:
+        raise OriginError("origin.client_msg_id must be a string within the size cap")
     if cmid != frame_client_msg_id:
         raise OriginError("origin.client_msg_id does not match the frame client_msg_id")
 
@@ -175,4 +208,7 @@ def validate_origin(raw: Any, *, frame_client_msg_id: str) -> dict | None:
         raise OriginError("origin.sig must be a string within the size cap")
     _b64url_raw(sig, expect_len=SIG_RAW_LEN, field="origin.sig")
 
-    return raw
+    # Return a FRESH closed projection (exactly the required keys), not the
+    # caller's dict — so the persisted/echoed JSON can't be mutated through a
+    # lingering reference to the inbound frame.
+    return {k: raw[k] for k in _REQUIRED_KEYS}
