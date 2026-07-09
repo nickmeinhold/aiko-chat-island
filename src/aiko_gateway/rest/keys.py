@@ -40,6 +40,20 @@ _MAX_PUBKEY_STR = 128
 # NOT capped — a real signed message must never fail on a key count; this guards
 # only the arbitrary-mint API surface. Re-registering an existing key (idempotent)
 # is always allowed, even at the cap.
+#
+# This is a SOFT abuse-mitigation limit, NOT a correctness invariant — the SAME
+# class as the per-IP fixed-window `rate_limit.py`, and deliberately enforced the
+# same approximate way. NAMED TRADEOFF (cage-match Carnot): the count()+get_key
+# read below is not atomic with the insert, so concurrent POSTs of distinct keys
+# can each observe count < cap before any commits and overshoot. The overshoot is
+# BOUNDED, not unbounded: once the first burst commits, count >= cap rejects every
+# later new key, so the worst case is cap + one concurrent burst — a few extra tiny
+# rows, never runaway growth. Since the stake is storage slop (not an orphaned
+# channel or a minted duplicate — the classes that DO get the atomic
+# fold-into-write guard here), an exact conditional-insert guard would be
+# gold-plating a soft limit the codebase elsewhere rate-limits approximately. If a
+# future consumer makes the roster load-bearing (federation adjudication, #1760),
+# revisit with a real quota counter or guarded write.
 _MAX_KEYS_PER_USER = 32
 
 
@@ -76,9 +90,10 @@ async def register_key(
             detail=f"invalid signing pubkey: {e}") from e
     # Per-user cap — but only for a genuinely NEW key. A re-registration of an
     # already-recorded key is an idempotent bump and must stay allowed even at the
-    # cap (else revoking to make room would be forced). count + existence are read
-    # inside the same session/txn; a race to exceed the cap by one is a benign
-    # bookkeeping slop, not a security boundary.
+    # cap (else revoking to make room would be forced). This read is NOT atomic with
+    # the insert (see the _MAX_KEYS_PER_USER note): concurrent POSTs of distinct keys
+    # can overshoot by up to one burst, bounded because a committed burst then blocks
+    # further new keys. Accepted for a soft storage-abuse limit.
     if await svc.get_key(session, user_id=user.id, pubkey=req.pubkey) is None:
         if await svc.count_keys(session, user.id) >= _MAX_KEYS_PER_USER:
             raise HTTPException(
