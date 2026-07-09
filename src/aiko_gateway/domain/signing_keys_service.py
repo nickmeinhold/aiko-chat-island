@@ -22,10 +22,11 @@ its single ``record_signing_key`` call.
 """
 from __future__ import annotations
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, insert, literal, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .ids import new_ulid
 from .models import SigningKey, _utcnow
 
 
@@ -119,6 +120,75 @@ async def get_key(
         select(SigningKey).where(
             SigningKey.user_id == user_id, SigningKey.pubkey == pubkey))
     ).scalar_one_or_none()
+
+
+def _capped_insert(*, key_id: str, user_id: str, pubkey: str,
+                   key_version: int, now, max_keys: int):
+    """An ``INSERT ... SELECT ... WHERE (count < max_keys)`` statement: it inserts the
+    new binding IFF the user is under the per-user cap, in ONE atomic statement.
+
+    The heart of the cap being EXACT rather than best-effort (cage-match Carnot,
+    PR#67 round 2): a plain count-then-insert proves "under cap" at READ time,
+    leaving a TOCTOU in which concurrent POSTs each observe count < cap and all
+    insert. Folding the count INTO the insert makes the check and the mutation
+    atomic — the count subquery is re-evaluated at WRITE time under SQLite's
+    single-writer lock (a concurrent writer blocks until the first commits, then
+    sees the committed row), so a burst can no longer overshoot. Mirrors
+    ``communities_service._new_join_insert`` — the codebase's established pattern
+    for folding a predicate into a write."""
+    under_cap = select(
+        literal(key_id), literal(user_id), literal(pubkey),
+        literal(key_version), literal(now), literal(now),
+    ).where(
+        (select(func.count()).select_from(SigningKey)
+         .where(SigningKey.user_id == user_id).scalar_subquery()) < max_keys
+    )
+    return insert(SigningKey).from_select(
+        ["id", "user_id", "pubkey", "key_version", "first_seen_at", "last_seen_at"],
+        under_cap)
+
+
+async def register_explicit_key(
+    session: AsyncSession, *, user_id: str, pubkey: str,
+    key_version: int, max_keys: int,
+) -> tuple[SigningKey | None, bool]:
+    """Explicit ``POST /v1/keys`` registration with an ATOMIC per-user cap. Returns
+    ``(row, True)`` on success (new insert OR idempotent re-register) and
+    ``(None, False)`` when a genuinely NEW key would exceed ``max_keys``. Does NOT
+    commit — the route owns the transaction.
+
+    Distinct from ``record_signing_key`` (the shared, UNcapped door the implicit
+    send path uses): a real signed message must never fail on a key count, so the
+    cap lives ONLY here, on the arbitrary-mint API surface. Re-registering an
+    existing key is idempotent and always allowed, even at the cap (bumps
+    last_seen_at)."""
+    # Idempotent re-register: an existing key bumps last_seen_at, always allowed.
+    existing = await get_key(session, user_id=user_id, pubkey=pubkey)
+    if existing is not None:
+        existing.last_seen_at = _utcnow()
+        return existing, True
+    # Genuinely new key: atomic capped insert (count folded into the write).
+    now = _utcnow()
+    key_id = new_ulid()
+    try:
+        async with session.begin_nested():
+            result = await session.execute(_capped_insert(
+                key_id=key_id, user_id=user_id, pubkey=pubkey,
+                key_version=key_version, now=now, max_keys=max_keys))
+    except IntegrityError:
+        # A concurrent POST of the SAME new pubkey won the (user_id, pubkey) race.
+        # Treat as idempotent success (re-fetch + bump), mirroring
+        # record_signing_key's conflict handling.
+        existing = await get_key(session, user_id=user_id, pubkey=pubkey)
+        if existing is None:
+            raise
+        existing.last_seen_at = _utcnow()
+        return existing, True
+    if result.rowcount == 0:
+        return None, False  # cap reached — the guard's count subquery excluded the row
+    # from_select doesn't return an ORM object; re-fetch the inserted row.
+    row = await get_key(session, user_id=user_id, pubkey=pubkey)
+    return row, True
 
 
 async def list_keys(session: AsyncSession, user_id: str) -> list[SigningKey]:

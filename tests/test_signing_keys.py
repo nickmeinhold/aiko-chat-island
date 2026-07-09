@@ -383,6 +383,34 @@ async def test_post_rejects_bad_multicodec_pubkey_with_400(client, session):
     assert await _key_count(session, alice.id) == 0
 
 
+async def test_register_explicit_key_guard_is_exact_at_the_boundary(session):
+    """The atomic cap (guarded INSERT...SELECT WHERE count<cap) admits keys up to the
+    cap and rejects the (cap+1)th NEW key — the count is re-evaluated inside the
+    write, so the guard is exact, not a read-then-insert. Idempotent re-register of
+    an existing key is allowed even AT the cap."""
+    alice = await _user(session, "alice")
+    cap = 3
+    # Fill to the cap through the guarded path itself.
+    for i in range(cap):
+        row, ok = await svc.register_explicit_key(
+            session, user_id=alice.id, pubkey=f"z-cap-{i}", key_version=1, max_keys=cap)
+        assert ok and row is not None
+    await session.commit()
+    assert await _key_count(session, alice.id) == cap
+
+    # A genuinely NEW key over the cap: guard inserts 0 rows -> (None, False).
+    row, ok = await svc.register_explicit_key(
+        session, user_id=alice.id, pubkey="z-overflow", key_version=1, max_keys=cap)
+    assert ok is False and row is None
+    assert await _key_count(session, alice.id) == cap, "guard must not have written a row"
+
+    # Re-registering an EXISTING key at the cap is still allowed (idempotent bump).
+    row, ok = await svc.register_explicit_key(
+        session, user_id=alice.id, pubkey="z-cap-0", key_version=1, max_keys=cap)
+    assert ok is True and row is not None
+    assert await _key_count(session, alice.id) == cap
+
+
 async def test_post_enforces_per_user_key_cap(client, session):
     """The explicit route caps distinct keys per user (Tesla: arbitrary client-minted
     Multikeys are a storage-griefing vector). Seed the cap via the service, then a
