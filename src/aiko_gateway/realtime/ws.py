@@ -15,7 +15,8 @@ from sqlalchemy import select
 
 from ..db import SessionLocal
 from ..domain import (
-    acl, echo, messages_service, moderation_service, security, users_service,
+    acl, echo, messages_service, moderation_service, security, signing,
+    users_service,
 )
 from . import envelopes
 from .hub import Connection
@@ -140,10 +141,21 @@ async def _handle_send(gw, conn: Connection, user, frame: dict) -> None:
                     "blocked", "cannot reply to a blocked user",
                     frame["client_msg_id"]))
                 return
+        # Sovereign-signing carriage (#1816): shape-validate the `origin` envelope
+        # at the trust boundary (never trust its claimed alg; its client_msg_id must
+        # match the frame's). The gateway carries it verbatim, it does NOT verify
+        # the signature. Absent origin is legal (unsigned message). A malformed
+        # envelope is rejected fail-closed rather than persisted.
+        try:
+            origin = signing.validate_origin(
+                frame.get("origin"), frame_client_msg_id=frame["client_msg_id"])
+        except signing.OriginError as e:
+            await conn.send(envelopes.error("bad_origin", str(e), frame["client_msg_id"]))
+            return
         row, created = await messages_service.create_outbound(
             session, user=user, channel=channel,
             body=frame["body"], client_msg_id=frame["client_msg_id"],
-            reply_to=reply_to,
+            reply_to=reply_to, origin=origin,
         )
         view = messages_service.message_view(row)
         # Block exclusion for live fanout: everyone in a block relationship with
