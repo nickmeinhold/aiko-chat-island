@@ -19,8 +19,14 @@ from .models import Channel, Message, User
 
 
 def message_view(m: Message) -> dict:
-    """The stable MessageView the client contract exposes (plan §A1)."""
-    return {
+    """The stable MessageView the client contract exposes (plan §A1).
+
+    This is the SINGLE serializer — REST history, WS ack-fanout, and bus-ingest
+    fanout all pass through here, so echoing the signing `origin` here carries it
+    on every read path at once. `origin` is included ONLY when present (signed
+    gateway-side messages); it is omitted for unsigned + bus-born rows so an
+    absent key reads as "unverified", per the app's verifier contract (#1816)."""
+    view = {
         "msg_id": m.id,
         "channel_id": m.channel_id,
         "sender": {"user_id": m.sender_user_id, "kind": m.sender_kind, "label": m.sender_label},
@@ -28,15 +34,26 @@ def message_view(m: Message) -> dict:
         "created_at": m.created_at.isoformat(),
         "reply_to": m.reply_to,
     }
+    if m.origin is not None:
+        view["origin"] = m.origin
+    return view
 
 
 async def create_outbound(
     session: AsyncSession, *, user: User, channel: Channel,
     body: str, client_msg_id: str, reply_to: str | None = None,
+    origin: dict | None = None,
 ) -> tuple[Message, bool]:
     """Persist a user's outgoing message (server ULID, server-derived sender —
     invariant I5). Idempotent on (channel, client_msg_id): a resend returns the
-    existing row. Returns (row, created)."""
+    existing row. Returns (row, created).
+
+    `origin` is the SHAPE-validated sovereign-signing envelope (already checked by
+    domain/signing.validate_origin at the call site, incl. that its client_msg_id
+    equals this one). It is carried verbatim; the gateway does not verify it. A
+    resend keeps the FIRST row's origin — the idempotency key already pins the
+    stored message, so a differing re-signed envelope on a retry is ignored, not a
+    second row (consistent with the existing client_msg_id no-op contract)."""
     existing = (await session.execute(
         select(Message).where(
             Message.channel_id == channel.id,
@@ -55,6 +72,7 @@ async def create_outbound(
         reply_to=reply_to,
         client_msg_id=client_msg_id,
         aiko_origin=False,
+        origin=origin,
     )
     session.add(row)
     await session.commit()

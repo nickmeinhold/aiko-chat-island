@@ -54,6 +54,11 @@ def parse_inbound(raw: Any) -> dict:
             raise FrameError("send requires client_msg_id, channel_id, body (str)")
         if not body.strip():
             raise FrameError("send.body must be non-empty")
+        # `origin` (sovereign-signing envelope) is passed through raw; its deep
+        # trust-boundary validation lives in domain/signing.validate_origin, called
+        # in the send handler where the authenticated identity is in scope. Absent
+        # is legal (unsigned message).
         return {"type": "send", "client_msg_id": cmid, "channel_id": cid,
-                "body": body, "reply_to": raw.get("reply_to")}
+                "body": body, "reply_to": raw.get("reply_to"),
+                "origin": raw.get("origin")}
     raise FrameError(f"unknown frame type: {ftype!r}")

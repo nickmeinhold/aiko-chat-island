@@ -12,8 +12,8 @@ import datetime as dt
 import enum
 
 from sqlalchemy import (
-    BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Integer, String,
-    Text, UniqueConstraint,
+    JSON, BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Integer,
+    String, Text, UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -316,6 +316,13 @@ class Message(Base):
     client_msg_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # True if it arrived FROM the bus; False if it originated gateway-side.
     aiko_origin: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Sovereign-signing envelope (#1816): the client-supplied `origin` object
+    # {v, alg, key_version, sender_pubkey, client_msg_id, signed_at_ms, sig},
+    # validated for SHAPE at the trust boundary (domain/signing.validate_origin)
+    # then carried VERBATIM — the gateway is a carrier, not a verifier. NULL for
+    # unsigned messages and every bus-born message (not signed through here);
+    # absent origin means "unverified", never "invalid".
+    origin: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     edited_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     deleted_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
