@@ -185,7 +185,21 @@ async def register_explicit_key(
         existing.last_seen_at = _utcnow()
         return existing, True
     if result.rowcount == 0:
-        return None, False  # cap reached — the guard's count subquery excluded the row
+        # rowcount 0 has TWO causes (cage-match Carnot, PR#67 round 3):
+        #   (a) genuinely at the cap, OR
+        #   (b) a CONCURRENT request registered this SAME pubkey and filled the final
+        #       slot between our top idempotency check and this insert. The cap
+        #       predicate (count < max_keys) then suppresses OUR SELECT row, so SQLite
+        #       never attempts the insert and the UNIQUE conflict never fires — the
+        #       IntegrityError branch above is bypassed. Returning (None, False) here
+        #       would wrongly 429 a registration that should be idempotent success.
+        # Disambiguate by re-fetching: if the key now exists it is OURS (idempotent
+        # success, bump last_seen_at); only a still-absent key is a real cap rejection.
+        existing = await get_key(session, user_id=user_id, pubkey=pubkey)
+        if existing is not None:
+            existing.last_seen_at = _utcnow()
+            return existing, True
+        return None, False
     # from_select doesn't return an ORM object; re-fetch the inserted row.
     row = await get_key(session, user_id=user_id, pubkey=pubkey)
     return row, True

@@ -411,6 +411,48 @@ async def test_register_explicit_key_guard_is_exact_at_the_boundary(session):
     assert await _key_count(session, alice.id) == cap
 
 
+async def test_cap_boundary_concurrent_same_pubkey_is_idempotent(session, monkeypatch):
+    """Boundary race (cage-match Carnot round 3): a NEW pubkey passes the top
+    idempotency check (get_key None), but a concurrent request registers the SAME
+    pubkey and fills the final slot before our guarded insert runs. The cap predicate
+    then suppresses our insert (rowcount 0) WITHOUT a UNIQUE conflict — so a naive
+    rowcount==0 -> (None, False) would wrongly 429 an idempotent registration. Assert
+    we re-fetch and return success instead.
+
+    RED-proof: with the re-fetch removed (return None, False on rowcount 0) this fails
+    with ok=False; with the fix it returns the existing row."""
+    alice = await _user(session, "alice")
+    cap = 2
+    # Reach the cap with the contended key K already present (as the concurrent
+    # 'winner' would have left it).
+    await svc.register_explicit_key(
+        session, user_id=alice.id, pubkey="z-a", key_version=1, max_keys=cap)
+    await svc.register_explicit_key(
+        session, user_id=alice.id, pubkey="z-K", key_version=1, max_keys=cap)
+    await session.commit()
+    assert await _key_count(session, alice.id) == cap  # at cap, K present
+
+    # Force the TOP idempotency get_key to MISS once (the race window: K looked absent
+    # when we checked), so we proceed into the guarded insert — which hits count==cap,
+    # suppresses the row (rowcount 0), and must re-fetch K rather than 429.
+    real_get_key = svc.get_key
+    calls = {"n": 0}
+
+    async def flaky_get_key(session, *, user_id, pubkey):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None  # idempotency check misses (simulating the race)
+        return await real_get_key(session, user_id=user_id, pubkey=pubkey)
+
+    monkeypatch.setattr(svc, "get_key", flaky_get_key)
+
+    row, ok = await svc.register_explicit_key(
+        session, user_id=alice.id, pubkey="z-K", key_version=1, max_keys=cap)
+    assert ok is True and row is not None and row.pubkey == "z-K", \
+        "rowcount 0 with the key already present must be idempotent success, not a cap reject"
+    assert await _key_count(session, alice.id) == cap  # no overshoot, no new row
+
+
 async def test_post_enforces_per_user_key_cap(client, session):
     """The explicit route caps distinct keys per user (Tesla: arbitrary client-minted
     Multikeys are a storage-griefing vector). Seed the cap via the service, then a
