@@ -14,21 +14,41 @@ from .security import hash_password, verify_password
 
 _AIKO_USERNAME_RE = re.compile(r"[^A-Za-z0-9_]")
 
-# Bound on auto-handle regeneration. A handle is aiko-<8 hex> (~4.3e9 space) against
-# a near-empty user table, so a collision is astronomically unlikely; the retry is a
-# correctness belt-and-braces, not a hot path. Exhausting it means something is very
-# wrong (RNG stuck / table saturated), so it fails loudly rather than looping forever.
+# Bound on auto-handle regeneration. A handle is aiko-<12 hex> (~2.8e14 space)
+# against a near-empty user table, so a genuine collision is vanishingly unlikely;
+# the retry is a correctness belt-and-braces, not a hot path. Exhausting it means
+# something is very wrong (RNG stuck / table saturated), so the caller maps it to a
+# deliberate 503 rather than letting it escape as an uncategorised 500.
 _MAX_HANDLE_ATTEMPTS = 5
+
+
+class HandleAllocationExhausted(Exception):
+    """create_passkey_account could not find a free auto-handle within
+    _MAX_HANDLE_ATTEMPTS. Only reachable under a stuck RNG or a saturated table —
+    the caller owns this as a deliberate 503, not a bare 500."""
 
 
 class CredentialAlreadyRegistered(Exception):
     """A passkey register/finish presented a credential_id that is ALREADY stored.
     That is not an account creation — the device should AUTHENTICATE. Carries the
-    owning user_id so the caller can decide (a 409 today)."""
+    owning user_id when known (may be None if a concurrent winner's row is not yet
+    visible to this transaction's snapshot — the caller 409s regardless)."""
 
-    def __init__(self, user_id: str) -> None:
+    def __init__(self, user_id: str | None) -> None:
         super().__init__("passkey credential already registered")
         self.user_id = user_id
+
+
+def _is_credential_id_conflict(err: IntegrityError) -> bool:
+    """True iff the IntegrityError is the passkey_credentials.credential_id UNIQUE
+    violation (vs a users.username / users.aiko_username auto-handle clash). SQLite
+    names the column in the message ('UNIQUE constraint failed: <table>.<col>'), so
+    we classify DETERMINISTICALLY from the constraint rather than inferring it from a
+    follow-up SELECT — a snapshot-isolated read can miss a concurrent winner's row
+    and misclassify a credential race as a handle clash (Tesla, cage-match PR#68).
+    SQLite is the sole engine in dev AND prod (see CLAUDE.md), so matching the SQLite
+    message is safe here."""
+    return "passkey_credentials.credential_id" in str(getattr(err, "orig", err))
 
 
 def _sanitize_aiko_username(username: str) -> str:
@@ -117,15 +137,19 @@ async def create_passkey_user(
     session: AsyncSession, *, handle: str, display_name: str,
     email: str | None, material: dict,
 ) -> User:
-    """Create a passkey-only user + its first credential in ONE transaction (#1471).
+    """Create a passkey-only user with an EXPLICIT handle + its first credential in
+    ONE transaction (#1471).
 
-    A passkey is a CREDENTIAL, not a federated identity, so there is NO
-    SocialIdentity row and NO password — the user is identified solely by their
-    passkey(s). `material` is the verified credential carried in the provisioning
-    token. Atomic + replay-safe: a replayed claim re-inserts the same credential_id,
-    trips the UNIQUE constraint, and the WHOLE transaction (the new user included)
-    rolls back → IntegrityError, which the caller maps to 409. There is therefore no
-    window where a user exists without their credential."""
+    The explicit-handle sibling of create_passkey_account (which auto-generates the
+    handle for the live register/finish path). Retained as a test/seed helper — the
+    live passkey flow no longer routes through a caller-chosen handle. A passkey is a
+    CREDENTIAL, not a federated identity, so there is NO SocialIdentity row and NO
+    password — the user is identified solely by their passkey(s). `material` is the
+    verified credential from verify_registration. Atomic + replay-safe: a replayed
+    insert re-inserts the same credential_id, trips the UNIQUE constraint, and the
+    WHOLE transaction (the new user included) rolls back → IntegrityError, which the
+    caller maps to 409. There is therefore no window where a user exists without their
+    credential."""
     user = User(
         id=new_ulid(),
         username=handle,
@@ -167,7 +191,7 @@ async def create_passkey_account(
         raise CredentialAlreadyRegistered(existing)
 
     for _ in range(_MAX_HANDLE_ATTEMPTS):
-        handle = f"aiko-{secrets.token_hex(4)}"
+        handle = f"aiko-{secrets.token_hex(6)}"
         user = User(
             id=new_ulid(),
             username=handle,
@@ -181,15 +205,19 @@ async def create_passkey_account(
                 session.add(user)
                 session.add(_passkey_credential_row(user.id, material))
             return user
-        except IntegrityError:
+        except IntegrityError as e:
             # The savepoint rolled back; the outer txn (challenge consume) is intact.
-            # Distinguish the two UNIQUE constraints that can trip: a now-present
-            # credential_id is a same-credential race → conflict; otherwise it was a
-            # username/aiko_username auto-handle clash → mint a new handle and retry.
-            owner = await _credential_owner(session, material["credential_id"])
-            if owner is not None:
-                raise CredentialAlreadyRegistered(owner)
-    raise RuntimeError("could not allocate a unique passkey handle")
+            # Classify by WHICH UNIQUE constraint fired — deterministically, from the
+            # error, NOT from a follow-up SELECT (which a snapshot-isolated read can
+            # get wrong under a concurrent same-credential winner). credential_id
+            # conflict → the device already has an account (409); anything else is a
+            # username/aiko_username auto-handle clash → mint a fresh handle and retry.
+            if _is_credential_id_conflict(e):
+                # owner may be None if the concurrent winner's row isn't visible to
+                # our snapshot yet — the caller 409s on the exception regardless.
+                raise CredentialAlreadyRegistered(
+                    await _credential_owner(session, material["credential_id"]))
+    raise HandleAllocationExhausted()
 
 
 async def _credential_owner(session: AsyncSession, credential_id: str) -> str | None:

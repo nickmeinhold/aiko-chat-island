@@ -285,6 +285,13 @@ async def social_claim(req: SocialClaimReq, session: DbSession) -> dict:
     except jwt.InvalidTokenError:
         raise HTTPException(
             status.HTTP_401_UNAUTHORIZED, "invalid or expired provisioning token")
+    # A pre-cutover passkey provisioning token (provider="passkey") must NOT be
+    # processed as a social identity — passkeys create their account at
+    # register/finish now (Design 04 Step 1). Reject the ghost explicitly (cage-match
+    # PR#68, Tesla) rather than minting a bogus SocialIdentity(provider="passkey").
+    if pending.get("provider") == "passkey":
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED, "invalid or expired provisioning token")
     # Social claim — gated on social sign-in being enabled.
     if not settings.social_signin_enabled:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "social sign-in is disabled")
@@ -381,6 +388,15 @@ async def passkey_register_finish(req: PasskeyFinishReq, session: DbSession) -> 
                     "cred=%s state=%s", _short(material["credential_id"]), _short(req.state))
         raise HTTPException(
             status.HTTP_409_CONFLICT, "passkey already registered")
+    except users_service.HandleAllocationExhausted:
+        # No free auto-handle within the retry bound — only reachable under a stuck
+        # RNG or a saturated table. Own it as a deliberate 503 (transient/retryable),
+        # never let it escape as an uncategorised 500 (cage-match PR#68, Carnot+Tesla).
+        await session.rollback()
+        log.error("passkey.register.finish: handle allocation exhausted state=%s",
+                  _short(req.state))
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "could not allocate an account handle")
     # Read the view BEFORE commit — expire_on_commit would otherwise lazy-reload the
     # ORM object outside the async context (the add/finish MissingGreenlet trap).
     outcome = {**_tokens(user.id), "user": _user_view(user)}

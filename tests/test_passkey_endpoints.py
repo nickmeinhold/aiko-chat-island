@@ -249,6 +249,42 @@ async def test_register_finish_retries_on_handle_collision(client, session, monk
     assert replay.status_code == 400
 
 
+async def test_register_finish_handle_exhaustion_returns_503_no_orphan(
+        client, session, monkeypatch):
+    """If EVERY auto-handle attempt collides (stuck RNG / saturated table), register
+    fails with a deliberate 503 — never a bare 500 — and leaves no orphan user or
+    credential (cage-match PR#68, Carnot+Tesla)."""
+    from aiko_gateway.domain import users_service
+    # Seed the single handle every attempt will generate.
+    await users_service.create_passkey_user(
+        session, handle="aiko-deadbeefcafe", display_name="", email=None,
+        material={"credential_id": "c2VlZC1leGg", "public_key": "cGs",
+                  "sign_count": 0, "transports": None, "aaguid": None})
+    users_before = await _count_users(session)
+    # Every attempt yields the SAME colliding hex → all 5 savepoints fail on username.
+    monkeypatch.setattr(users_service.secrets, "token_hex", lambda n: "deadbeefcafe")
+    auth = SoftAuthenticator(credential_id=b"exhaustion-cred")
+    start = (await client.post("/v1/auth/passkey/register/start")).json()
+    finish = await client.post("/v1/auth/passkey/register/finish", json={
+        "state": start["state"], "credential": auth.register(start["options"]["challenge"])})
+    assert finish.status_code == 503, finish.text
+    # No orphan — the credential was never persisted, no extra user rows.
+    assert await _count_users(session) == users_before
+    assert await passkey_service.get_credential(
+        session, bytes_to_base64url(auth.credential_id)) is None
+
+
+async def test_social_claim_rejects_passkey_provider_token(client):
+    """A pre-cutover passkey provisioning token (provider='passkey') must NOT be
+    processed as a social identity at /social/claim — rejected 401 (cage-match PR#68,
+    Tesla), not minted into a bogus SocialIdentity(provider='passkey')."""
+    from aiko_gateway.domain import security
+    tok = security.issue_provisioning("passkey", "some-credential-id")
+    r = await client.post("/v1/auth/social/claim", json={
+        "provisioning_token": tok, "handle": "x", "display_name": ""})
+    assert r.status_code == 401, r.text
+
+
 # --- fail-closed paths ----------------------------------------------------- #
 
 async def test_register_finish_bad_state_rejected(client):
