@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Design 05 — Social recovery (self-custody, guardian-held key shares)</title>
+<style>
+  :root { --fg:#1a1a1a; --muted:#666; --accent:#0b5; --warn:#c0392b; --rule:#e2e2e2; --code:#f4f4f6; }
+  body { font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--fg); max-width:820px; margin:2.5rem auto; padding:0 1.2rem; }
+  h1 { font-size:1.7rem; margin-bottom:0.2rem; }
+  h2 { font-size:1.25rem; margin-top:2.2rem; border-bottom:2px solid var(--rule); padding-bottom:0.3rem; }
+  h3 { font-size:1.05rem; margin-top:1.5rem; }
+  code { background:var(--code); padding:0.1rem 0.35rem; border-radius:4px; font-size:0.88em; }
+  pre { background:var(--code); padding:0.9rem 1.1rem; border-radius:8px; overflow-x:auto; font-size:0.85rem; }
+  .sub { color:var(--muted); font-size:0.95rem; margin-top:0; }
+  .decision { background:#f0f9f4; border-left:4px solid var(--accent); padding:0.7rem 1rem; border-radius:0 6px 6px 0; margin:1rem 0; }
+  .warn { background:#fdf2f0; border-left:4px solid var(--warn); padding:0.7rem 1rem; border-radius:0 6px 6px 0; margin:1rem 0; }
+  .ask { background:#fffaf0; border-left:4px solid #e0a800; padding:0.7rem 1rem; border-radius:0 6px 6px 0; margin:1rem 0; }
+  table { border-collapse:collapse; width:100%; margin:1rem 0; font-size:0.9rem; }
+  th,td { border:1px solid var(--rule); padding:0.45rem 0.6rem; text-align:left; vertical-align:top; }
+  th { background:#fafafa; }
+  details { margin:0.8rem 0; }
+  summary { cursor:pointer; font-weight:600; }
+  .tag { display:inline-block; background:#eef; color:#449; font-size:0.72rem; padding:0.1rem 0.45rem; border-radius:10px; vertical-align:middle; }
+  nav { background:#fafafa; border:1px solid var(--rule); border-radius:8px; padding:0.6rem 1rem; margin:1.4rem 0; font-size:0.92rem; }
+  nav a { color:#0a6; text-decoration:none; } nav a:hover { text-decoration:underline; }
+  .seam { background:#eef6ff; border-left:4px solid #2b7; padding:0.7rem 1rem; border-radius:0 6px 6px 0; margin:1rem 0; }
+</style>
+</head>
+<body>
+
+<h1>Social recovery <span class="tag">self-custody · guardian-held key shares</span></h1>
+<p class="sub">The recovery hatch that <a href="04-passkey-first-identity.html">Design 04</a> left as an open fork. Decision (Nick, 2026-07-10): <strong>self-custody via social recovery</strong> — "self-custody but give your friends parts of your key." A recovery secret is split <em>k</em>-of-<em>n</em> across the user's chosen guardians (Shamir); no island or provider is ever a recovery authority. Status: <strong>design — for the temper (§9), then build.</strong> Grounded on gateway source (<code>domain/models.py</code>, <code>domain/signing_keys_service.py</code>, <code>domain/passkey_service.py</code>, <code>tests/test_account_deletion_cascade_guard.py</code>). Last grounded 2026-07-10.</p>
+
+<nav>
+<strong>Contents</strong> &nbsp;·&nbsp;
+<a href="#headline">1. Headline</a> &nbsp;·&nbsp;
+<a href="#decided">2. What's decided</a> &nbsp;·&nbsp;
+<a href="#threat">3. Threat model</a> &nbsp;·&nbsp;
+<a href="#seam">4. The seam</a> &nbsp;·&nbsp;
+<a href="#flow">5. The flows</a> &nbsp;·&nbsp;
+<a href="#veto">6. Time-locked veto</a> &nbsp;·&nbsp;
+<a href="#data">7. Data model</a> &nbsp;·&nbsp;
+<a href="#split">8. Gateway vs app</a> &nbsp;·&nbsp;
+<a href="#temper">9. For the temper</a> &nbsp;·&nbsp;
+<a href="#plan">10. Build plan</a>
+</nav>
+
+<h2 id="headline">1. Headline</h2>
+<div class="decision">
+Recovery is, by construction, an <strong>account-takeover primitive</strong>: whoever can re-bind a passkey to your account owns it. Social recovery makes the authority to do that a secret <em>you</em> minted and <em>split across friends you chose</em> — never Google, never the island. The design keeps the gateway <strong>completely blind to the sharing scheme</strong>: it stores one public key (a commitment) and verifies one signature. All Shamir math, guardian delivery, and the printed fallback live in the app. A <strong>time-locked veto</strong> turns "k friends collude" from silent theft into a cancellable, notified event.
+</div>
+
+<h2 id="decided">2. What's decided (and what this is not)</h2>
+<p>Design 04 posed the recovery fork as <em>self-custody (recovery codes) vs. assisted (email/OTP)</em>. The answer is a third path that the two-option frame excluded: <strong>self-custody, but the recovery secret is socially sharded.</strong> Sub-decisions taken 2026-07-10:</p>
+<table>
+  <tr><th>Question</th><th>Decision</th></tr>
+  <tr><td>Recovery authority</td><td>A user-minted secret <code>R</code>, Shamir <em>k</em>-of-<em>n</em> across guardians. No provider/island hatch.</td></tr>
+  <tr><td>Timing</td><td><strong>Time-locked veto</strong>: recovery notifies existing devices and waits out a delay in which the real owner can cancel.</td></tr>
+  <tr><td>Share delivery</td><td><strong>In-network</strong>, each share encrypted to the guardian's aiko identity key (guardians must be aiko users for this path).</td></tr>
+  <tr><td>Solo fallback</td><td><strong>Yes</strong> — a printed master key for the no-guardians / brand-new-user case. It is the <em>n</em>=1 degenerate share (see §4).</td></tr>
+</table>
+<div class="warn">
+<strong>Out of scope.</strong> This is <em>not</em> moving auth onto the bus (<a href="03-auth-on-the-bus.html">#1680</a>), <em>not</em> touching sovereign message signing (#1816), and <em>not</em> the password path (<code>/register</code>/<code>/login</code>, separable per Design 04 §5). It is one new capability: re-bind a passkey to an existing account by proving possession of that account's recovery secret.
+</div>
+
+<h2 id="threat">3. Threat model — name the primitive first</h2>
+<p>Recovery = "enroll a new passkey on account <code>U</code>, revoke the old ones." That is account takeover with the owner's blessing. Enumerate who can drive it and what stops them:</p>
+<table>
+  <tr><th>Actor / event</th><th>What they get</th><th>What stops it</th></tr>
+  <tr><td>The legit owner, lost device</td><td>Recovers by assembling <em>k</em> shares (or reading the printed card)</td><td>— (this is the happy path)</td></tr>
+  <tr><td><em>k</em> guardians collude, or one guardian coerced <em>k</em>−1 others</td><td>Can reconstruct <code>R</code> and initiate recovery</td><td><strong>Time-locked veto</strong> (§6): the owner's still-live devices are notified and can cancel during the window. Choosing <em>k</em> and <em>n</em> is the user's trust dial.</td></tr>
+  <tr><td>The island / a leaked gateway DB</td><td>Sees only the commitment pubkey + a <code>pending_recovery</code> row</td><td><strong>The seam</strong> (§4): the gateway never holds <code>R</code> or any share. A leaked DB cannot recover an account — same property as the passkey DB holding only public keys.</td></tr>
+  <tr><td>Network attacker on the recovery request</td><td>Sees a challenge + a signature over it</td><td>Signature is over a <strong>single-use server challenge</strong> (the <code>consume_*</code> pattern); replay is dead on burn. <code>R</code> never crosses the wire.</td></tr>
+  <tr><td>Account-existence prober</td><td>Wants to learn if a handle/pubkey maps to a user</td><td><code>recover/start</code> returns a challenge unconditionally (§5); no oracle.</td></tr>
+  <tr><td>Owner with <strong>no</strong> surviving device (the true lockout)</td><td>Cannot veto</td><td>Correct — that is exactly when recovery <em>should</em> proceed. The veto defends against malicious recovery <em>while the owner still holds a device</em>; it is not a second factor on legitimate recovery.</td></tr>
+</table>
+
+<h2 id="seam">4. The seam — the gateway is Shamir-blind</h2>
+<div class="seam">
+<code>R</code> is an <strong>Ed25519 keypair</strong>. The <strong>private key</strong> is Shamir-split across guardians (and/or written on the printed card). The gateway stores <strong>only the public key</strong>, as a commitment, and verifies a challenge-signature against it. It never learns how many shares exist, who holds them, or how <code>R</code> was reassembled.
+</div>
+<pre>  R = Ed25519 keypair  (minted client-side at enrollment)
+  ├─ private key  ─┬─ Shamir k-of-n  →  encrypted to each guardian's identity key
+  │                └─ (n=1 case)      →  the printed master card
+  └─ public key   ────────────────────→  the ONLY thing the gateway stores
+
+  Recover:  client reassembles R locally  →  signs a server challenge
+            gateway checks sig against the stored pubkey  →  never sees R
+</pre>
+<h3>Why a pubkey commitment, not a hash</h3>
+<p>If the gateway stored <code>H(R)</code> and the client sent <code>R</code> to prove knowledge, <code>R</code> would cross the wire in plaintext and the island would momentarily be a recovery authority — self-custody broken for that instant. With <code>R</code> as a keypair the proof is a <em>signature over a challenge</em>; the secret stays on the client. This is exactly the property the passkey pivot already bought us (<code>PasskeyCredential</code> stores only <code>public_key</code>; "a leaked DB yields only public keys, which are worthless").</p>
+<h3>The printed card is the n=1 share, not a second mechanism</h3>
+<p>The printed master key is just <code>R</code>'s private key written down. Reassembling from three guardians and reading it off paper are two client-side ways to obtain the <em>same</em> <code>R</code>. The gateway cannot tell them apart and does not need to — <strong>one verification path covers both the social case and the printed fallback.</strong> "Yes to printed fallback" costs the gateway nothing extra.</p>
+<div class="seam">
+<strong>Contrast with <code>SigningKey</code> (#1816), deliberately.</strong> The signing-key roster stores a pubkey the gateway <em>never verifies against</em> — it is a carrier, so uniqueness is per-user and a collision is kept as evidence, not rejected. The recovery commitment is the <strong>mirror image</strong>: proof-of-possession <em>does</em> exist here (the challenge-signature), so the gateway legitimately verifies, the commitment is <strong>authoritative and unique per user</strong>, and enrollment happens <em>authenticated</em> (no "first to present the key wins" griefing vector, because you must already be logged in to set your recovery pubkey). Same table shape, opposite trust posture — worth stating so a reviewer doesn't pattern-match the wrong invariant.
+</div>
+
+<h2 id="flow">5. The flows</h2>
+<h3>Enroll (authenticated) — set up recovery</h3>
+<ol>
+  <li>App mints <code>R</code>, Shamir-splits the private key <em>k</em>-of-<em>n</em>, encrypts each share to a guardian's aiko identity key, delivers them, and shows the printed card.</li>
+  <li>App registers the commitment: <code>POST /v1/auth/recovery/enroll</code> (session-authed) <code>{recovery_pubkey, k, n}</code>. Gateway stores one active <code>recovery_commitment</code> for the user (re-enroll = rotation, replaces the row). <code>k</code>/<code>n</code> are stored for display only — the gateway does not enforce them (it can't; it's Shamir-blind).</li>
+</ol>
+<h3>Recover — re-bind a passkey after losing the device</h3>
+<ol>
+  <li><code>POST /v1/auth/passkey/recover/start</code> <code>{recovery_pubkey}</code> → gateway issues a <strong>single-use challenge</strong> (a <code>PasskeyChallenge</code>-shaped row, <code>operation='recover'</code>), returns it. <em>Always</em> returns a challenge — no account-existence oracle.</li>
+  <li>Client reassembles <code>R</code> (from <em>k</em> shares or the printed card), signs the challenge, and also runs a normal WebAuthn registration for the <em>new</em> passkey.</li>
+  <li><code>POST /v1/auth/passkey/recover/finish</code> <code>{challenge_state, recovery_sig, new_credential_attestation}</code> → gateway: (a) consumes the challenge atomically (the guarded-<code>UPDATE</code> <code>consume_*</code> pattern), (b) finds the user by <code>recovery_commitment.pubkey</code>, (c) verifies <code>recovery_sig</code> against it, (d) verifies the new passkey attestation, (e) opens a <code>pending_recovery</code> row staging the new credential with <code>veto_deadline = now + WINDOW</code>, (f) notifies the user's existing devices. Returns <code>{status:'pending', veto_deadline}</code> — <strong>no session yet.</strong></li>
+  <li><code>POST /v1/auth/passkey/recover/finalize</code> <code>{recovery_id}</code> (client polls) → if <code>now ≥ veto_deadline</code> and not cancelled: enroll the staged credential, revoke the old passkeys, delete the <code>pending_recovery</code>, issue a session. Idempotent; gated on the deadline server-side, so a client cannot rush it. No scheduler needed (same "self-expire, no sweeper at this scale" stance as <code>OAuthState</code>/<code>SocialNonce</code>).</li>
+</ol>
+<h3>Cancel — the owner vetoes</h3>
+<p><code>POST /v1/auth/passkey/recover/cancel</code>, called from an <strong>existing authenticated device</strong> within the window → deletes the <code>pending_recovery</code>. A malicious recovery is now a notification the owner taps "No, that wasn't me" on.</p>
+
+<h2 id="veto">6. Time-locked veto — the state machine</h2>
+<pre>  recover/finish ──▶ [ PENDING ]  (veto_deadline = now + WINDOW, new cred staged)
+                        │  │
+      owner cancels ────┘  └──── deadline passes, finalize polled
+      from live device            │
+        ▼                         ▼
+     [ CANCELLED ]            [ FINALIZED ]  (new passkey bound, old ones revoked,
+     (row deleted;            session issued; pending_recovery deleted)
+      old passkeys intact)
+</pre>
+<ul>
+  <li><strong>One pending recovery per user</strong> — <code>UNIQUE(user_id)</code> on <code>pending_recovery</code>. A second <code>recover/finish</code> while one is pending either no-ops onto the existing row or is rejected (temper decides; lean: reject, so an attacker can't refresh the deadline).</li>
+  <li><strong>Notification degrades gracefully.</strong> The ideal channel is push (#1406/#1445), not yet built. Without it the veto still works: an authenticated device sees the pending recovery via <code>GET /v1/auth/recovery/status</code> (or a field on <code>/me</code>) and can cancel on next open. Push only makes the alert <em>timely</em>; it is not a blocker.</li>
+  <li><strong>Window length</strong> is a §9 temper call (24h / 72h / 7d). Longer = more chance to catch a malicious recovery, slower legitimate recovery.</li>
+</ul>
+
+<h2 id="data">7. Data model &amp; migration <span class="tag">migration 0013</span></h2>
+<p>Two new tables, both FK <code>users.id</code>. Following the codebase convention (no <code>ON DELETE CASCADE</code>; account deletion tears children down explicitly, children-before-parent):</p>
+<pre>recovery_commitments
+  user_id        FK users.id   UNIQUE   -- one active commitment per user (rotation replaces)
+  recovery_pubkey  String(128)          -- the Ed25519 pubkey (multibase, like SigningKey.pubkey)
+  k, n           Integer                -- display-only (gateway is Shamir-blind)
+  created_at     DateTime
+
+pending_recovery
+  id             String(26) PK (ulid)
+  user_id        FK users.id   UNIQUE   -- one in-flight recovery per user
+  staged_credential_id   String(512)    -- the new passkey's credential_id
+  staged_public_key      Text           -- base64url(COSE), staged not yet live
+  staged_sign_count      BigInteger
+  veto_deadline  DateTime
+  created_at     DateTime</pre>
+<div class="warn">
+<strong>The cascade guard will fail the build until this is wired</strong> — by design (#46, <code>test_account_deletion_cascade_guard</code>). Both new FKs to <code>users.id</code> must be (1) added to <code>EXPECTED_USERS_FK_COLUMNS</code>, (2) torn down in <code>accounts_service.delete_user_account</code> via new <code>purge_user_recovery_commitment</code> / <code>purge_user_pending_recovery</code> helpers (mirroring <code>signing_keys_service.purge_user_keys</code>), children-before-parent. The <code>test_migrations_match_models</code> parity gate also requires the hand-written 0013 to match the ORM exactly (named constraints, not column-level <code>unique=True</code>).
+</div>
+
+<h2 id="split">8. What the gateway owns vs. what the app owns</h2>
+<table>
+  <tr><th>Gateway (this repo — cage-match by law)</th><th>App (<code>aiko_chat_app</code> — separate PR)</th></tr>
+  <tr><td>
+    <ul>
+      <li><code>recovery_commitments</code> + <code>pending_recovery</code> tables, migration 0013</li>
+      <li><code>domain/recovery_service.py</code>: enroll (upsert commitment), start (issue challenge), finish (verify sig + stage + open pending), cancel, finalize (deadline-gated, revoke old, issue session)</li>
+      <li>Ed25519 challenge-sig verification (reuse <code>domain/signing.py</code> multikey decode)</li>
+      <li>Cascade-guard extension + purge helpers</li>
+      <li>Rate-limit <code>recover/*</code> (the <code>rate_limit("passkey")</code> bucket already exists)</li>
+    </ul>
+  </td><td>
+    <ul>
+      <li>Shamir split / reassemble of <code>R</code>'s private key</li>
+      <li>Encrypt each share to a guardian's identity key; in-network delivery + accept/store on the guardian side</li>
+      <li>Printed master-key export (the n=1 share)</li>
+      <li>Guardian-picker + recovery UX; the "recovery pending — cancel?" surface</li>
+      <li>Guardian-set change = re-mint <code>R</code> + re-enroll (a removed guardian may keep their old share)</li>
+    </ul>
+  </td></tr>
+</table>
+<p>The seam is clean because the wire contract between them is tiny: a pubkey at enroll, a signature at recover. Everything cryptographically interesting is client-side.</p>
+
+<h2 id="temper">9. Open questions for the temper</h2>
+<div class="ask">
+<ol>
+  <li><strong>Fresh <code>R</code> vs. reuse the sovereign signing key (#1816)?</strong> Lean <strong>fresh</strong>: the signing key is <em>hot</em> (on-device, used every message); the recovery key is <em>cold</em> (split, offline, rarely touched). Splitting your hot signing key among friends would be a category error. But confirm — reuse would mean one fewer keypair for the user to understand.</li>
+  <li><strong>Veto window length</strong> — 24h / 72h / 7d? And is it per-island configurable?</li>
+  <li><strong>Notification path before push exists.</strong> Ship <code>GET /recovery/status</code> now and treat push as a later upgrade, or hold the veto UX until #1406? (Lean: ship status-poll now, it's the graceful-degrade floor.)</li>
+  <li><strong>Does finalize revoke old <em>signing keys</em> too, not just passkeys?</strong> Recovery implies "my old device is gone / possibly compromised." Lean: revoke old passkey_credentials <em>and</em> old signing_keys, forcing a clean re-key on the new device.</li>
+  <li><strong>Force re-enroll of <code>R</code> after a successful recovery?</strong> The shares that were just assembled are now "spent" (guardians saw them travel). Lean: yes — prompt a fresh split post-recovery.</li>
+  <li><strong>Concurrent second <code>recover/finish</code></strong> while one is pending — reject (don't let an attacker refresh the deadline) vs. no-op onto the existing row?</li>
+</ol>
+</div>
+
+<h2 id="plan">10. Build plan</h2>
+<ol>
+  <li><strong>Temper this doc</strong> (design cage-match, ~2 rounds — trust boundary, but 0 real users + undeployed, so calibrated light). Settle §9.</li>
+  <li><strong>Gateway PR</strong> (cage-match by law): migration 0013, <code>recovery_service.py</code>, the four <code>recover/*</code> endpoints + <code>enroll</code> + <code>status</code>, cascade-guard extension, tests (RED-prove: a leaked commitment alone can't recover; a replayed challenge fails; finalize before deadline fails; cancel from a live device wins the race).</li>
+  <li><strong>App PR</strong> (separate): Shamir + guardian delivery + printed export + UX.</li>
+  <li><strong>Deploy dark, then flip.</strong> The gateway half is inert until the app calls it (same discipline as the passkey rollout in Design 04). Existing social accounts get wiped/re-registered at 0 real users before the door closes.</li>
+</ol>
+
+<hr style="margin-top:2.5rem;border:none;border-top:1px solid var(--rule)">
+<p class="sub">Design 05 · aiko-chat-island · grounded on repo source 2026-07-10 · follows <a href="04-passkey-first-identity.html">Design 04</a>.</p>
+
+</body>
+</html>
