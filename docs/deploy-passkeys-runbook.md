@@ -18,7 +18,8 @@ the "before" facts before running — a liveness claim has a shelf life.
 #   2. backup:       online-copy the sole-copy prod DB off-host FIRST
 #   3. deploy dark:  rsync tree -> docker compose up -d --build   (MUST be --build)
 #   4. verify dark:  0008 applied, AASA serves, /providers still hides passkey
-#   5. device e2e:   register->claim->authenticate on a real iPhone (gate 3)
+#   5. device e2e:   register->authenticate on a real iPhone (gate 3; register
+#                     creates the account directly, no claim — Design 04 Step 1)
 #   6. flip on:      passkey_enabled=true, redeploy, confirm /providers advertises
 ```
 
@@ -217,9 +218,12 @@ At this point gate 1 is crossed; gates 2 + 3 remain.
 
 Requires app PR#38 live with the `webcredentials:chat.imagineering.cc` entitlement.
 On the device, drive the full ceremony against the dark endpoints:
-`passkey/register/start` -> `finish` -> `/social/claim` (passkey branch) ->
-`passkey/authenticate/start` -> `finish`. Confirm a `passkey_credentials` row is
-created at claim and authenticate returns a session for the same user.
+`passkey/register/start` -> `finish` -> `passkey/authenticate/start` -> `finish`.
+As of Design 04 Step 1 (#1728), `register/finish` creates the account directly
+(auto-generated handle) and returns session tokens — there is NO `/social/claim`
+step for passkeys anymore. Confirm a `passkey_credentials` row is created at
+`register/finish` (not at claim) and that authenticate returns a session for the
+same user.
 
 Tail the gateway while testing:
 ```bash
