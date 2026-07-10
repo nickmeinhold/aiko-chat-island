@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import re
+import secrets
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .ids import new_ulid
@@ -11,6 +13,22 @@ from .models import PasskeyCredential, SocialIdentity, User
 from .security import hash_password, verify_password
 
 _AIKO_USERNAME_RE = re.compile(r"[^A-Za-z0-9_]")
+
+# Bound on auto-handle regeneration. A handle is aiko-<8 hex> (~4.3e9 space) against
+# a near-empty user table, so a collision is astronomically unlikely; the retry is a
+# correctness belt-and-braces, not a hot path. Exhausting it means something is very
+# wrong (RNG stuck / table saturated), so it fails loudly rather than looping forever.
+_MAX_HANDLE_ATTEMPTS = 5
+
+
+class CredentialAlreadyRegistered(Exception):
+    """A passkey register/finish presented a credential_id that is ALREADY stored.
+    That is not an account creation — the device should AUTHENTICATE. Carries the
+    owning user_id so the caller can decide (a 409 today)."""
+
+    def __init__(self, user_id: str) -> None:
+        super().__init__("passkey credential already registered")
+        self.user_id = user_id
 
 
 def _sanitize_aiko_username(username: str) -> str:
@@ -120,6 +138,66 @@ async def create_passkey_user(
     session.add(_passkey_credential_row(user.id, material))
     await session.commit()
     return user
+
+
+async def create_passkey_account(
+    session: AsyncSession, *, material: dict, display_name: str = "",
+) -> User:
+    """Create a passkey-only account with NO caller-chosen handle (Design 04 Step 1).
+
+    register/finish calls this directly: a device that completes attestation gets its
+    own account immediately, identified solely by the passkey. The handle is
+    auto-generated (``aiko-<hex>``) and cosmetic — you authenticate by passkey, never
+    by name — so account creation can never collide with a pre-existing account. This
+    is what closes #1728: persistence is no longer gated on a handle claim that could
+    be rejected and orphan the device credential forever.
+
+    Transaction: this DOES NOT commit — the caller owns the commit so the credential
+    write lands atomically with the deferred challenge burn (the atomic-with-outcome
+    contract, #24). Each account-INSERT attempt runs in a SAVEPOINT so a handle
+    collision rolls back ONLY that attempt, never the outer transaction's challenge
+    consume. Re-registering an already-stored credential_id is not a create — it
+    raises CredentialAlreadyRegistered (the device should authenticate); the
+    credential_id UNIQUE constraint is the real arbiter of a concurrent race."""
+    # Friendly pre-check (UX, not correctness): surface an existing credential as a
+    # clean typed conflict rather than an opaque IntegrityError. The UNIQUE constraint
+    # inside the savepoint is what actually arbitrates a concurrent same-credential race.
+    existing = await _credential_owner(session, material["credential_id"])
+    if existing is not None:
+        raise CredentialAlreadyRegistered(existing)
+
+    for _ in range(_MAX_HANDLE_ATTEMPTS):
+        handle = f"aiko-{secrets.token_hex(4)}"
+        user = User(
+            id=new_ulid(),
+            username=handle,
+            display_name=display_name or handle,
+            password_hash=None,
+            aiko_username=_sanitize_aiko_username(handle),
+            email=None,
+        )
+        try:
+            async with session.begin_nested():  # SAVEPOINT — isolates this attempt
+                session.add(user)
+                session.add(_passkey_credential_row(user.id, material))
+            return user
+        except IntegrityError:
+            # The savepoint rolled back; the outer txn (challenge consume) is intact.
+            # Distinguish the two UNIQUE constraints that can trip: a now-present
+            # credential_id is a same-credential race → conflict; otherwise it was a
+            # username/aiko_username auto-handle clash → mint a new handle and retry.
+            owner = await _credential_owner(session, material["credential_id"])
+            if owner is not None:
+                raise CredentialAlreadyRegistered(owner)
+    raise RuntimeError("could not allocate a unique passkey handle")
+
+
+async def _credential_owner(session: AsyncSession, credential_id: str) -> str | None:
+    """user_id that owns credential_id, or None if unregistered."""
+    return (await session.execute(
+        select(PasskeyCredential.user_id).where(
+            PasskeyCredential.credential_id == credential_id)
+    )).scalar_one_or_none()
 
 
 def _passkey_credential_row(user_id: str, material: dict) -> PasskeyCredential:

@@ -134,46 +134,119 @@ class SoftAuthenticator:
         }
 
 
-async def _register_and_claim(client, handle="passkey_nick", auth=None):
-    """Drive register/start -> device -> register/finish -> claim. Returns the
-    claim response (authenticated) and the authenticator."""
+async def _register_passkey(client, auth=None):
+    """Drive register/start -> device -> register/finish. Returns the finish response
+    (now an AUTHENTICATED outcome — the account is created directly at register/finish,
+    Design 04 Step 1; no /social/claim) and the authenticator."""
     auth = auth or SoftAuthenticator()
+    start = (await client.post("/v1/auth/passkey/register/start")).json()
+    finish = await client.post("/v1/auth/passkey/register/finish", json={
+        "state": start["state"], "credential": auth.register(start["options"]["challenge"])})
+    return finish, auth
+
+
+# --- Design 04 Step 1: register creates its own account (fixes #1728) ------- #
+
+async def test_register_finish_creates_account_and_returns_session(client, session):
+    """Design 04 Step 1 / #1728 fix: passkey register/finish creates its OWN account
+    directly (auto-handle, no /social/claim) and returns session tokens. The
+    credential persists immediately — persistence is no longer gated on a handle
+    claim that could collide with a pre-existing account and orphan the device
+    credential forever."""
+    auth = SoftAuthenticator()
     start = (await client.post("/v1/auth/passkey/register/start")).json()
     finish = await client.post("/v1/auth/passkey/register/finish", json={
         "state": start["state"], "credential": auth.register(start["options"]["challenge"])})
     assert finish.status_code == 200, finish.text
     body = finish.json()
-    assert body["status"] == "provisioning" and body["provisioning_token"]
-    claim = await client.post("/v1/auth/social/claim", json={
-        "provisioning_token": body["provisioning_token"],
-        "handle": handle, "display_name": "PK Nick"})
-    return claim, auth
-
-
-# --- full ceremonies ------------------------------------------------------- #
-
-async def test_register_then_claim_creates_authenticated_user(client):
-    claim, _ = await _register_and_claim(client)
-    assert claim.status_code == 200, claim.text
-    body = claim.json()
-    # Byte-identical to the social/broker authenticated outcome shape.
+    # AUTHENTICATED outcome (byte-identical to the social/broker door), NOT provisioning.
     assert set(body) == {"access_token", "refresh_token", "user"}
-    assert set(body["user"]) == {
-        "user_id", "username", "display_name", "aiko_username"}
-    assert body["user"]["username"] == "passkey_nick"
+    assert set(body["user"]) == {"user_id", "username", "display_name", "aiko_username"}
+    # An auto-generated handle — nobody picked one, and it did not collide.
+    assert body["user"]["username"].startswith("aiko-")
+    # The credential is persisted right now (the #1728 orphan is impossible).
+    cred = await passkey_service.get_credential(
+        session, bytes_to_base64url(auth.credential_id))
+    assert cred is not None and cred.user_id == body["user"]["user_id"]
 
 
-async def test_full_round_trip_register_claim_authenticate(client):
-    """The whole point: a registered passkey can sign in afterwards."""
-    claim, auth = await _register_and_claim(client)
-    assert claim.status_code == 200
-    start = (await client.post("/v1/auth/passkey/authenticate/start")).json()
-    finish = await client.post("/v1/auth/passkey/authenticate/finish", json={
-        "state": start["state"], "credential": auth.authenticate(start["options"]["challenge"])})
+async def test_register_finish_persists_even_when_a_handle_is_taken(client, session):
+    """#1728 root cause, pinned: a pre-existing account owning a name no longer blocks
+    passkey account creation — register auto-assigns a unique handle instead of
+    claiming a chosen one, so there is no collision to reject and no orphan."""
+    from aiko_gateway.domain import users_service
+    # A social-style account already exists (mirrors Nick's live case).
+    await users_service.create_passkey_user(
+        session, handle="nick", display_name="Nick", email=None,
+        material={"credential_id": "cHJlZXhpc3Rpbmc", "public_key": "cGs",
+                  "sign_count": 0, "transports": None, "aaguid": None})
+    auth = SoftAuthenticator(credential_id=b"fresh-passkey-cred")
+    start = (await client.post("/v1/auth/passkey/register/start")).json()
+    finish = await client.post("/v1/auth/passkey/register/finish", json={
+        "state": start["state"], "credential": auth.register(start["options"]["challenge"])})
+    assert finish.status_code == 200, finish.text  # NOT a 409 — no handle claim to collide
+    cred = await passkey_service.get_credential(
+        session, bytes_to_base64url(auth.credential_id))
+    assert cred is not None
+
+
+async def test_register_finish_then_authenticate_round_trip(client):
+    """The whole point of Step 1: the just-registered device signs in immediately,
+    with no claim step in between."""
+    auth = SoftAuthenticator()
+    start = (await client.post("/v1/auth/passkey/register/start")).json()
+    reg = (await client.post("/v1/auth/passkey/register/finish", json={
+        "state": start["state"], "credential": auth.register(start["options"]["challenge"])})).json()
+    astart = (await client.post("/v1/auth/passkey/authenticate/start")).json()
+    afinish = await client.post("/v1/auth/passkey/authenticate/finish", json={
+        "state": astart["state"], "credential": auth.authenticate(astart["options"]["challenge"])})
+    assert afinish.status_code == 200, afinish.text
+    assert afinish.json()["user"]["user_id"] == reg["user"]["user_id"]
+
+
+async def test_register_finish_duplicate_credential_conflicts(client):
+    """Re-registering an already-known credential is a 409 (credential_id UNIQUE),
+    not a silent second account — the device should authenticate, not re-register."""
+    auth = SoftAuthenticator(credential_id=b"dup-reg-cred-0001")
+    s1 = (await client.post("/v1/auth/passkey/register/start")).json()
+    r1 = await client.post("/v1/auth/passkey/register/finish", json={
+        "state": s1["state"], "credential": auth.register(s1["options"]["challenge"])})
+    assert r1.status_code == 200
+    s2 = (await client.post("/v1/auth/passkey/register/start")).json()
+    r2 = await client.post("/v1/auth/passkey/register/finish", json={
+        "state": s2["state"], "credential": auth.register(s2["options"]["challenge"])})
+    assert r2.status_code == 409, r2.text
+
+
+async def test_register_finish_retries_on_handle_collision(client, session, monkeypatch):
+    """The auto-handle SAVEPOINT-retry path: when a generated handle collides, register
+    mints a fresh one inside a nested savepoint and still succeeds — and because the
+    savepoint is opened AFTER the challenge consume, the single-use challenge burn
+    survives the inner rollback. Forces exactly ONE collision, then a fresh handle."""
+    from aiko_gateway.domain import users_service
+    # Pre-seed an account owning the FIRST handle the RNG will yield (aiko-<hex>).
+    await users_service.create_passkey_user(
+        session, handle="aiko-collide0", display_name="", email=None,
+        material={"credential_id": "c2VlZC1jcmVk", "public_key": "cGs",
+                  "sign_count": 0, "transports": None, "aaguid": None})
+    hexes = iter(["collide0", "fresh001"])  # attempt-1 collides; attempt-2 is free
+    monkeypatch.setattr(users_service.secrets, "token_hex", lambda n: next(hexes))
+
+    auth = SoftAuthenticator(credential_id=b"collision-retry-cred")
+    start = (await client.post("/v1/auth/passkey/register/start")).json()
+    finish = await client.post("/v1/auth/passkey/register/finish", json={
+        "state": start["state"], "credential": auth.register(start["options"]["challenge"])})
     assert finish.status_code == 200, finish.text
-    body = finish.json()
-    assert "access_token" in body and "refresh_token" in body
-    assert body["user"]["username"] == "passkey_nick"
+    assert finish.json()["user"]["username"] == "aiko-fresh001"  # the retried handle
+    # Credential persisted under the fresh account.
+    cred = await passkey_service.get_credential(
+        session, bytes_to_base64url(auth.credential_id))
+    assert cred is not None
+    # The challenge is single-use: replaying the SAME state now fails (burn survived
+    # the inner savepoint rollback).
+    replay = await client.post("/v1/auth/passkey/register/finish", json={
+        "state": start["state"], "credential": auth.register(start["options"]["challenge"])})
+    assert replay.status_code == 400
 
 
 # --- fail-closed paths ----------------------------------------------------- #
@@ -209,29 +282,13 @@ async def test_authenticate_unknown_credential_rejected(client):
 
 async def test_authenticate_wrong_key_rejected(client):
     """A DIFFERENT keypair claiming a registered credential_id → signature fails."""
-    claim, _ = await _register_and_claim(client)
-    assert claim.status_code == 200
+    reg, _ = await _register_passkey(client)
+    assert reg.status_code == 200
     impostor = SoftAuthenticator(credential_id=b"test-credential-0001")  # same id, new key
     start = (await client.post("/v1/auth/passkey/authenticate/start")).json()
     finish = await client.post("/v1/auth/passkey/authenticate/finish", json={
         "state": start["state"], "credential": impostor.authenticate(start["options"]["challenge"])})
     assert finish.status_code == 401
-
-
-async def test_replayed_provisioning_token_conflicts(client):
-    """Claiming the same passkey provisioning token twice → 409 (credential_id
-    UNIQUE; the whole second create rolls back, no orphan user)."""
-    auth = SoftAuthenticator()
-    start = (await client.post("/v1/auth/passkey/register/start")).json()
-    finish = (await client.post("/v1/auth/passkey/register/finish", json={
-        "state": start["state"], "credential": auth.register(start["options"]["challenge"])})).json()
-    tok = finish["provisioning_token"]
-    r1 = await client.post("/v1/auth/social/claim", json={
-        "provisioning_token": tok, "handle": "first", "display_name": ""})
-    assert r1.status_code == 200
-    r2 = await client.post("/v1/auth/social/claim", json={
-        "provisioning_token": tok, "handle": "second", "display_name": ""})
-    assert r2.status_code == 409
 
 
 # --- cage-match #38 hardening (Carnot findings) ---------------------------- #
@@ -244,30 +301,6 @@ async def test_register_rejects_unverified_user(client):
     finish = await client.post("/v1/auth/passkey/register/finish", json={
         "state": start["state"], "credential": auth.register(start["options"]["challenge"])})
     assert finish.status_code == 401
-
-
-async def test_claim_rejects_non_passkey_token_with_injected_material(client):
-    """Confused-deputy guard (Carnot MEDIUM): a token whose provider is NOT 'passkey'
-    but which carries passkey_credential must NOT create a passkey — the branch keys
-    on an explicit purpose, not mere field presence."""
-    from aiko_gateway.domain import security
-    tok = security.issue_provisioning("google", "sub-x", passkey_credential={
-        "credential_id": "Y2lk", "public_key": "cGs", "sign_count": 0})
-    r = await client.post("/v1/auth/social/claim", json={
-        "provisioning_token": tok, "handle": "x", "display_name": ""})
-    assert r.status_code == 401
-
-
-async def test_claim_rejects_malformed_passkey_material(client):
-    """Typed-boundary guard (Carnot MEDIUM): a passkey token whose material fails
-    shape validation (missing public_key) is refused with 401, not persisted (and
-    NOT a 500 from a KeyError deep in create_passkey_user)."""
-    from aiko_gateway.domain import security
-    tok = security.issue_provisioning("passkey", "Y2lk", passkey_credential={
-        "credential_id": "Y2lk"})  # missing public_key / sign_count
-    r = await client.post("/v1/auth/social/claim", json={
-        "provisioning_token": tok, "handle": "x", "display_name": ""})
-    assert r.status_code == 401
 
 
 # --- advertisement + domain association ------------------------------------ #
@@ -320,9 +353,10 @@ async def _count_users(session) -> int:
 async def test_add_passkey_links_to_existing_user_no_new_account(client, session):
     """An authenticated user adds a passkey; it links to their EXISTING account
     (no new account) and can then sign in AS them. This is the #1727 repro/fix."""
-    claim, _first = await _register_and_claim(client, handle="existing_nick")
-    token = claim.json()["access_token"]
-    uid = claim.json()["user"]["user_id"]
+    reg, _first = await _register_passkey(client)
+    assert reg.status_code == 200, reg.text
+    token = reg.json()["access_token"]
+    uid = reg.json()["user"]["user_id"]
     users_before = await _count_users(session)
 
     added = SoftAuthenticator(credential_id=b"added-credential-0002")
@@ -366,8 +400,9 @@ async def test_add_passkey_requires_authentication(client):
 async def test_add_passkey_duplicate_credential_conflicts(client, session):
     """Re-adding an already-registered credential is a 409 (credential_id UNIQUE is
     the replay guard), not a silent second row."""
-    claim, first = await _register_and_claim(client, handle="dup_nick")
-    token = claim.json()["access_token"]
+    reg, first = await _register_passkey(client)
+    assert reg.status_code == 200, reg.text
+    token = reg.json()["access_token"]
     start = (await client.post("/v1/auth/passkey/register/start")).json()
     r = await client.post(
         "/v1/auth/passkey/add/finish",

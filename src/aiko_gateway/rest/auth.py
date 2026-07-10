@@ -13,7 +13,7 @@ import logging
 import jwt
 from fastapi import APIRouter, HTTPException, Response, status
 from fastapi.responses import RedirectResponse
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from webauthn.helpers.exceptions import (
@@ -103,18 +103,6 @@ class SocialReq(BaseModel):
     # the issued size (token_urlsafe(32) -> 43 chars, stored String(64)) so an
     # oversized attacker string never reaches the DB comparison (cage-match PR#33).
     nonce: str | None = Field(default=None, min_length=1, max_length=64)
-
-
-class _PasskeyMaterial(BaseModel):
-    """Shape of the verified passkey credential carried in the provisioning token
-    (#1471). Validated at /social/claim before persistence — a TYPED boundary on
-    gateway-signed material so a confused caller / future issuer reuse can't write
-    an unchecked credential row (cage-match #38, Carnot)."""
-    credential_id: str = Field(min_length=1, max_length=512)
-    public_key: str = Field(min_length=1)
-    sign_count: int = Field(ge=0)
-    transports: str | None = None
-    aaguid: str | None = Field(default=None, max_length=64)
 
 
 class SocialClaimReq(BaseModel):
@@ -288,50 +276,16 @@ async def social(req: SocialReq, session: DbSession) -> dict:
 
 @router.post("/social/claim", dependencies=[rate_limit("social")])
 async def social_claim(req: SocialClaimReq, session: DbSession) -> dict:
-    """Complete provisioning: verify the provisioning token (OUR token, so the
+    """Complete social provisioning: verify the provisioning token (OUR token, so the
     identity it carries cannot be forged), create the user atomically, and return
-    real tokens. Serves BOTH the social flow (creates a SocialIdentity) and the
-    passkey flow (#1471 — creates a PasskeyCredential from the verified material the
-    token carries); the token's shape selects the path. ONE claim endpoint, as the
-    app contract requires."""
+    real tokens. Social-only: passkeys create their account directly at
+    register/finish (Design 04 Step 1) and never round-trip through a handle claim."""
     try:
         pending = security.decode_provisioning(req.provisioning_token)
     except jwt.InvalidTokenError:
         raise HTTPException(
             status.HTTP_401_UNAUTHORIZED, "invalid or expired provisioning token")
-    if pending.get("passkey_credential") is not None:
-        # Passkey claim: ungated like the passkey endpoints (deploy-dark). Atomic +
-        # replay-safe via the credential_id UNIQUE constraint (see create_passkey_user).
-        # Defense-in-depth (cage-match #38, Carnot): branch on an EXPLICIT token
-        # purpose, not just field presence, and validate the material's SHAPE before
-        # persisting — the token is gateway-signed (unforgeable), but a confused
-        # caller / future issuer reuse must not become an unchecked credential write.
-        if pending.get("provider") != "passkey":
-            log.warning("passkey.claim: REJECT token purpose mismatch (not 'passkey')")
-            raise HTTPException(
-                status.HTTP_401_UNAUTHORIZED, "invalid passkey provisioning token")
-        try:
-            material = _PasskeyMaterial.model_validate(pending["passkey_credential"])
-        except ValidationError:
-            log.warning("passkey.claim: REJECT malformed credential material")
-            raise HTTPException(
-                status.HTTP_401_UNAUTHORIZED, "malformed passkey credential material")
-        try:
-            user = await users_service.create_passkey_user(
-                session, handle=req.handle, display_name=req.display_name,
-                email=pending["email"], material=material.model_dump(),
-            )
-        except IntegrityError:
-            await session.rollback()
-            log.warning("passkey.claim: REJECT conflict cred=%s (handle taken or already claimed)",
-                        _short(material.credential_id))
-            raise HTTPException(
-                status.HTTP_409_CONFLICT,
-                "handle already taken or passkey already claimed")
-        log.info("passkey.claim: OK cred=%s -> user=%s (new account)",
-                 _short(material.credential_id), user.id)
-        return {**_tokens(user.id), "user": _user_view(user)}
-    # Social claim — gated on social sign-in being enabled (unchanged).
+    # Social claim — gated on social sign-in being enabled.
     if not settings.social_signin_enabled:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "social sign-in is disabled")
     try:
@@ -389,10 +343,13 @@ async def passkey_register_start(session: DbSession) -> dict:
 
 @router.post("/passkey/register/finish", dependencies=[rate_limit("passkey")])
 async def passkey_register_finish(req: PasskeyFinishReq, session: DbSession) -> dict:
-    """Verify the attestation and return a PROVISIONING outcome (new identity must
-    claim a handle). The verified credential rides in the provisioning token and is
-    persisted at /social/claim — byte-identical shape to the social provisioning
-    outcome so the app's single resolver accepts it."""
+    """Verify the attestation and CREATE the account directly (Design 04 Step 1 /
+    #1728). No provisioning token, no /social/claim: a device that proves an
+    attestation gets its OWN passkey-only account with an auto-assigned handle and a
+    session. Account creation is atomic with the challenge burn, so a credential can
+    never be orphaned by a rejected handle claim (the #1728 root cause — persistence
+    was gated on a handle claim that collided with a pre-existing account). Returns
+    the SAME authenticated shape as authenticate/finish + the social/broker door."""
     raw = await passkey_service.consume_challenge(
         session, req.state, PasskeyOperation.REGISTER)
     if raw is None:
@@ -413,17 +370,26 @@ async def passkey_register_finish(req: PasskeyFinishReq, session: DbSession) -> 
                     _short(req.state))
         raise HTTPException(
             status.HTTP_401_UNAUTHORIZED, "passkey registration verification failed")
-    token = security.issue_provisioning(
-        "passkey", material["credential_id"], passkey_credential=material)
-    await session.commit()  # burn the challenge durably — the ceremony completed
-    log.info("passkey.register.finish: OK state=%s cred=%s -> provisioning token issued "
-             "(awaiting /social/claim)", _short(req.state), _short(material["credential_id"]))
-    return {
-        "status": "provisioning",
-        "provisioning_token": token,
-        "suggested_name": None,
-        "email": None,
-    }
+    try:
+        user = await users_service.create_passkey_account(session, material=material)
+    except users_service.CredentialAlreadyRegistered:
+        # The device is re-registering a credential we already hold — it should
+        # AUTHENTICATE, not mint a second account. Fail closed (409); the deferred
+        # challenge burn rolls back so this is not a silent success.
+        await session.rollback()
+        log.warning("passkey.register.finish: REJECT credential already registered "
+                    "cred=%s state=%s", _short(material["credential_id"]), _short(req.state))
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "passkey already registered")
+    # Read the view BEFORE commit — expire_on_commit would otherwise lazy-reload the
+    # ORM object outside the async context (the add/finish MissingGreenlet trap).
+    outcome = {**_tokens(user.id), "user": _user_view(user)}
+    # Durable AFTER the account is built: the challenge burn + account creation commit
+    # atomically (the #24 contract) — a downstream failure rolls both back.
+    await session.commit()
+    log.info("passkey.register.finish: OK cred=%s -> user=%s (new account)",
+             _short(material["credential_id"]), user.id)
+    return outcome
 
 
 @router.post("/passkey/add/finish", dependencies=[rate_limit("passkey")])
