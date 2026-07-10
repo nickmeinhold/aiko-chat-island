@@ -50,6 +50,9 @@ The instinct "get rid of social accounts" is sound: <strong>social OAuth is the 
 </div>
 
 <h2 id="today">2. What's true today</h2>
+<div class="warn">
+<strong>Update 2026-07-10 — Step 1 has SHIPPED (PR #68).</strong> The bullet below about a passkey "not persisting at registration" is now the <em>historical</em> pre-fix state that motivated this design. As of PR #68, <code>passkey/register/finish</code> creates the account directly with an auto-generated handle and returns session tokens — there is no provisioning token and no <code>/social/claim</code> step for passkeys, and the #1728 orphan is structurally gone. The rest of this section (social/broker flows, the standalone primitives, the <code>User</code> shape) remains current.
+</div>
 <p>Read from source, not from comments:</p>
 <ul>
   <li>Three sign-in kinds coexist: <strong>native social</strong> (Apple/Google id-token → <code>/v1/auth/social</code>), <strong>broker social</strong> (GitHub server-side code flow → <code>/oauth/*</code>), and <strong>passkey</strong> (WebAuthn → <code>/v1/auth/passkey/*</code>). Plus a dev-only password path (<code>/register</code>+<code>/login</code>, <code>open_registration=False</code> in prod).</li>
