@@ -261,6 +261,42 @@ async def test_a_guard_is_real_delete_the_guard_red_prove(session):
     assert await _pending_count(session, user.id) == 1  # row untouched
 
 
+async def test_a_finalize_credential_collision_fails_closed(session):
+    """RED-prove the finalize credential-insert guard (cage-match Carnot+Tesla, PR#69):
+    if the staged credential_id already belongs to ANOTHER account (a global UNIQUE
+    collision), finalize must FAIL CLOSED — roll back (restoring the pending row so it
+    stays retryable) and return None, never raise a raw IntegrityError/500 on the
+    takeover path. Remove the begin_nested try/except in finalize_recovery and this
+    goes red with an unhandled IntegrityError."""
+    user = await _user(session, username="alice")
+    uid = user.id  # capture BEFORE finalize — its rollback expires the shared-session
+                   # ORM objects (a test-harness artifact of one session across the
+                   # whole test; in prod the route just 409s on None, no ORM access).
+    gs = [Guardian(), Guardian()]
+    await _enroll(session, user, gs, k=2)
+    result, auth = await _drive_finish(session, user, gs, k=2)
+    staged_cred_id = bytes_to_base64url(auth.credential_id)
+
+    # A DIFFERENT account already holds this credential_id (it is globally UNIQUE).
+    bob = await _user(session, username="bob")
+    bob_id = bob.id
+    session.add(PasskeyCredential(
+        credential_id=staged_cred_id, user_id=bob_id,
+        public_key="AAAA", sign_count=0))
+    await session.commit()
+
+    await _expire_pending(session, uid)  # window passed — finalize is eligible
+    outcome = await recovery_service.finalize_recovery(
+        session, recovery_id=result["recovery_id"],
+        finalize_token=result["finalize_token"])
+    assert outcome is None, "a credential collision must fail closed, not 500"
+    # Fail-closed AND retryable: the rollback undid the guarded DELETE, so alice's
+    # pending row is restored; bob's credential is untouched.
+    assert await _pending_count(session, uid) == 1
+    bobs = await passkey_service.get_credential(session, staged_cred_id)
+    assert bobs is not None and bobs.user_id == bob_id
+
+
 # ---- (b) expired attacker row does NOT lock out a fresh legit recovery ------ #
 
 async def test_b_expired_pending_is_reclaimable(session):

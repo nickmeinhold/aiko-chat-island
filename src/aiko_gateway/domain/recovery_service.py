@@ -46,6 +46,7 @@ import struct
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from sqlalchemy import delete, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import settings
@@ -232,8 +233,13 @@ async def enroll_policy(
 async def start_recovery(session: AsyncSession, user: User) -> dict:
     """Issue a single-use server nonce for a recovery, reusing the PasskeyChallenge
     store (operation='recover'). Returns {server_nonce (base64url state), threshold_k}.
-    Does NOT reveal approver identities (no social-graph oracle) — only the threshold,
-    which the login path's handle-existence already effectively discloses.
+    Does NOT reveal approver identities (no social-graph oracle) — only the threshold.
+
+    NAMED DISCLOSURE (cage-match Tesla, PR#69): returning threshold_k reveals to any
+    caller who knows a handle whether that account has recovery ENROLLED and its k.
+    Accepted: the recovering owner needs k, approver IDENTITIES are never revealed, and
+    handle-existence already leaks via the login path. Not a C1/C2 concern. See
+    Design 05 §4/§11.
 
     Requires an existing policy (else NoRecoveryPolicy). The nonce is a
     PasskeyChallenge row consumed atomically at finish — the same guarded-UPDATE
@@ -384,7 +390,19 @@ async def finish_recovery(
         veto_deadline=deadline,
         finalize_token_hash=token_hash,
         created_at=now)
-    session.add(pending)
+    # Insert inside a SAVEPOINT so a UNIQUE(user_id) collision from a concurrent
+    # finish that raced past the live-check above surfaces HERE as a clean
+    # RecoveryAlreadyPending (409), never a raw IntegrityError/500 at the route's
+    # commit (cage-match Carnot+Tesla, PR#69). Mirrors signing_keys_service's
+    # begin_nested guard; matters more if WAL (#1450) ever relaxes the single-writer
+    # serialization the select-then-insert otherwise leans on.
+    try:
+        async with session.begin_nested():
+            session.add(pending)
+    except IntegrityError:
+        await session.rollback()
+        raise RecoveryAlreadyPending(
+            "a recovery is already pending for this account")
     # NOTE: notification of existing devices is a named requirement (§7); the floor
     # is GET /v1/auth/recovery/status (the caller/app polls). Push (#1406) not built.
     return {
@@ -434,9 +452,18 @@ async def finalize_recovery(
 
     THE guarded statement: a single DELETE with veto_deadline <= now folded into the
     WHERE, arbitrated by rowcount. On rowcount == 1 this caller won the race — it then
-    re-asserts the account is live + in good standing, enrolls the staged credential
-    through the SINGLE passkey door, revokes the old passkeys AND old signing keys
-    (clean re-key on the new device), issues a session, and commits — ONE commit.
+    re-asserts the account still EXISTS (not self-deleted), enrolls the staged
+    credential through the SINGLE passkey door, revokes the old passkeys AND old
+    signing keys (clean re-key on the new device), issues a session, and commits —
+    ONE commit.
+
+    SESSION-PLANE RESIDUAL (named — cage-match Tesla, PR#69): this revokes the old
+    CREDENTIALS but NOT existing JWT sessions — sessions are stateless HS256 tokens
+    with no revocation mechanism, so a lost/old device keeps riding its refresh token
+    until it expires (refresh TTL = 30d). Acceptable ONLY because recovery is
+    deploy-dark + un-invokable today. Per-user token_generation revocation
+    (claude-tasks #1914) MUST land + be live-verified BEFORE recovery is enabled for
+    real users — that is the lift condition. See Design 05 §10/§11.
 
     Idempotent: a later poll (or a lost first response) finds the row already gone,
     so the DELETE matches 0 rows and this returns None. The route maps None to a clean
@@ -474,8 +501,13 @@ async def finalize_recovery(
         return None
     user_id, cred_id, public_key, sign_count = row
 
-    # Re-assert the account is LIVE + in good standing IN this transaction (§4
-    # banned/self-deleting row). A recovery must not resurrect a deleted account.
+    # Re-assert the account still EXISTS (not self-deleted) IN this transaction (§4
+    # self-deleting row). A recovery must not resurrect a deleted account. NOTE
+    # (cage-match Carnot+Tesla, PR#69): there is no user-level ban/suspension field in
+    # the schema today, so existence IS the complete standing check. If such a flag is
+    # ever added, it MUST also be checked here — else recovery re-binds a passkey and
+    # mints a session for a suspended account (ban-evasion). Existence-only is honest
+    # for the current schema, not a stronger "good standing" than the data supports.
     user = await users_service.get_by_id(session, user_id)
     if user is None:
         # The account vanished (self-deleted) between finish and finalize. The pending
@@ -499,7 +531,19 @@ async def finalize_recovery(
     # Delete BEFORE inserting the new credential so the new one survives the sweep.
     await passkey_service.purge_user_credentials(session, user_id)
     await signing_keys_service.purge_user_keys(session, user_id)
-    session.add(users_service._passkey_credential_row(user_id, material))
+    # Insert the new credential inside a SAVEPOINT. credential_id is globally UNIQUE
+    # and the user's own creds were just purged, so a collision could only come from
+    # ANOTHER account holding this authenticator handle (astronomically unlikely).
+    # Guard it anyway (cage-match Carnot+Tesla, PR#69): a collision fails CLOSED — the
+    # full rollback restores the pending row (the guarded DELETE + purges are undone),
+    # so finalize is retryable and returns a clean terminal 409, never a raw 500 on
+    # the takeover path.
+    try:
+        async with session.begin_nested():
+            session.add(users_service._passkey_credential_row(user_id, material))
+    except IntegrityError:
+        await session.rollback()
+        return None
     # Read the session view BEFORE commit (expire_on_commit / MissingGreenlet trap).
     outcome = {
         "access_token": security.issue_access(user.id),
