@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Design 04 — Passkey-first identity (retiring social sign-in)</title>
+<style>
+  :root { --fg:#1a1a1a; --muted:#666; --accent:#0b5; --warn:#c0392b; --rule:#e2e2e2; --code:#f4f4f6; }
+  body { font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--fg); max-width:820px; margin:2.5rem auto; padding:0 1.2rem; }
+  h1 { font-size:1.7rem; margin-bottom:0.2rem; }
+  h2 { font-size:1.25rem; margin-top:2.2rem; border-bottom:2px solid var(--rule); padding-bottom:0.3rem; }
+  h3 { font-size:1.05rem; margin-top:1.5rem; }
+  code { background:var(--code); padding:0.1rem 0.35rem; border-radius:4px; font-size:0.88em; }
+  pre { background:var(--code); padding:0.9rem 1.1rem; border-radius:8px; overflow-x:auto; font-size:0.85rem; }
+  .sub { color:var(--muted); font-size:0.95rem; margin-top:0; }
+  .decision { background:#f0f9f4; border-left:4px solid var(--accent); padding:0.7rem 1rem; border-radius:0 6px 6px 0; margin:1rem 0; }
+  .warn { background:#fdf2f0; border-left:4px solid var(--warn); padding:0.7rem 1rem; border-radius:0 6px 6px 0; margin:1rem 0; }
+  .ask { background:#fffaf0; border-left:4px solid #e0a800; padding:0.7rem 1rem; border-radius:0 6px 6px 0; margin:1rem 0; }
+  table { border-collapse:collapse; width:100%; margin:1rem 0; font-size:0.9rem; }
+  th,td { border:1px solid var(--rule); padding:0.45rem 0.6rem; text-align:left; vertical-align:top; }
+  th { background:#fafafa; }
+  details { margin:0.8rem 0; }
+  summary { cursor:pointer; font-weight:600; }
+  .tag { display:inline-block; background:#eef; color:#449; font-size:0.72rem; padding:0.1rem 0.45rem; border-radius:10px; vertical-align:middle; }
+  nav { background:#fafafa; border:1px solid var(--rule); border-radius:8px; padding:0.6rem 1rem; margin:1.4rem 0; font-size:0.92rem; }
+  nav a { color:#0a6; text-decoration:none; } nav a:hover { text-decoration:underline; }
+</style>
+</head>
+<body>
+
+<h1>Passkey-first identity <span class="tag">retiring social sign-in</span></h1>
+<p class="sub">Proposal to drop federated social sign-in (Apple / Google / GitHub OAuth) and make a device-held passkey the identity root, with a deliberate recovery hatch. Motivated by <a href="https://github.com/nickmeinhold/claude-tasks/issues/1728">#1728</a> (passkey sign-in returns 401 because passkeys are bolted onto the social account flow) and by coherence with the sovereign-signing work just shipped (gateway #66/#67). Status: <strong>design — pending team vote on the recovery fork (§7).</strong> Grounded on the gateway repo source (<code>rest/auth.py</code>, <code>domain/passkey_service.py</code>, <code>domain/users_service.py</code>, <code>domain/models.py</code>) and a mid-2026 capability review (§4, cited). Last grounded 2026-07-10.</p>
+
+<nav>
+<strong>Contents</strong> &nbsp;·&nbsp;
+<a href="#headline">1. Headline</a> &nbsp;·&nbsp;
+<a href="#today">2. What's true today</a> &nbsp;·&nbsp;
+<a href="#reframe">3. The reframe</a> &nbsp;·&nbsp;
+<a href="#evidence">4. The evidence</a> &nbsp;·&nbsp;
+<a href="#design">5. The design (3 steps)</a> &nbsp;·&nbsp;
+<a href="#recovery">6. Recovery codes</a> &nbsp;·&nbsp;
+<a href="#fork">7. The fork (team call)</a> &nbsp;·&nbsp;
+<a href="#gotchas">8. Gotchas</a> &nbsp;·&nbsp;
+<a href="#reco">9. Recommendation</a>
+</nav>
+
+<h2 id="headline">1. Headline</h2>
+<div class="decision">
+The instinct "get rid of social accounts" is sound: <strong>social OAuth is the one centralized Apple/Google dependency that contradicts a self-hosted, federated island.</strong> But the evidence (§4) is blunt — <strong>no credible service ships auth with <em>zero</em> fallback.</strong> So the decision is not "passkey-only vs. keep social." It is: <strong>remove social OAuth, make the passkey the identity root, and add a thin recovery hatch that is NOT a federated identity.</strong> The only open question is which hatch (§7). Critically, <strong>the hard primitives already exist in the codebase</strong> — this is mostly subtraction plus two small additions.
+</div>
+
+<h2 id="today">2. What's true today</h2>
+<p>Read from source, not from comments:</p>
+<ul>
+  <li>Three sign-in kinds coexist: <strong>native social</strong> (Apple/Google id-token → <code>/v1/auth/social</code>), <strong>broker social</strong> (GitHub server-side code flow → <code>/oauth/*</code>), and <strong>passkey</strong> (WebAuthn → <code>/v1/auth/passkey/*</code>). Plus a dev-only password path (<code>/register</code>+<code>/login</code>, <code>open_registration=False</code> in prod).</li>
+  <li>A passkey <strong>does not persist at registration</strong>. <code>passkey/register/finish</code> verifies the attestation, packs the credential into a gateway-signed <em>provisioning token</em>, and returns it. The credential is only written when the app calls the <strong>shared</strong> <code>/social/claim</code> endpoint with a chosen handle (<code>passkey_service.py:13</code>, <code>rest/auth.py:302</code>).</li>
+  <li>This is <a href="https://github.com/nickmeinhold/claude-tasks/issues/1728">#1728</a>: if the handle is already taken — e.g. you hold "nick" via an <em>existing social account</em> — the claim is rejected, the provisioning token is discarded, and the device is left holding a passkey with <strong>no server-side row</strong>. Every later <code>authenticate/finish</code> then correctly reports "unknown credential" → 401, forever.</li>
+  <li>The standalone-persist primitives <strong>already exist</strong>: <code>/passkey/add/finish</code> (<code>rest/auth.py:429</code>) persists a credential <em>directly</em> against an authenticated user via <code>link_passkey_credential</code> — no token, no claim. And <code>create_passkey_user</code> (<code>users_service.py:98</code>) mints a User + PasskeyCredential atomically. Both are reachable today only through the colliding social-claim detour.</li>
+  <li>The <code>User</code> row: <code>username</code> (unique), <code>aiko_username</code> (unique, bus attribution), <code>password_hash</code> (nullable — social & passkey accounts carry <code>None</code>), <code>email</code> (nullable). A passkey account needs no password and no third-party token.</li>
+</ul>
+
+<h2 id="reframe">3. The reframe</h2>
+<div class="decision">
+It is <strong>not</strong> "passkey-only vs. keep social." A recovery hatch (recovery codes, or email/OTP) carries <strong>zero Google-identity dependency</strong> — it is a backup/delivery channel, not a federated identity. Removing social OAuth and adding a recovery hatch is fully consistent with the sovereignty thesis <em>and</em> with the evidence that fallback-less auth is an outlier bet. The passkey becomes the identity root — which is exactly what the sovereign-signing work (a device-held keypair bound to an account, #66/#67) already assumes. Social login was always the awkward centralized graft.
+</div>
+
+<h2 id="evidence">4. The evidence <span class="tag">mid-2026, cited</span></h2>
+<table>
+<tr><th>Question</th><th>Finding</th><th>Source</th></tr>
+<tr><td>iOS 16+ (platform-passkey floor)</td><td><strong>~96%</strong> of active iPhones. Non-issue.</td><td>StatCounter, Jun 2026</td></tr>
+<tr><td>Android 9+ with Google Play Services</td><td><strong>~95%</strong>. Non-issue <em>on GMS devices</em> (Credential Manager is back-ported via Play Services, not gated on OS version).</td><td>StatCounter, Jun 2026</td></tr>
+<tr><td>Google-Play-Services-<em>less</em> Android</td><td><strong>&lt;1–2% in the West, but ~15–20% of the China market</strong> (Huawei/HarmonyOS + de-Googled OEMs). HMS has no Credential Manager: these devices can <em>use</em> a passkey via browser-WebAuthn + cross-device QR, but cannot smoothly <em>create/store</em> a synced platform passkey locally.</td><td>HuaweiCentral / Forasoft, 2025–26</td></tr>
+<tr><td>Cross-device onboarding (QR hybrid)</td><td><strong>52–76% completion</strong> vs 79–98% same-device, and it deposits <em>nothing</em> locally — an iOS→Android switcher re-scans every login until FIDO Credential Exchange matures.</td><td>Corbado benchmark, 2026</td></tr>
+<tr><td>Passkey-<strong>only, zero fallback</strong></td><td><strong>Essentially nobody credible ships it.</strong> Microsoft, Gemini, Air NZ all went passkey-<em>first</em> with an OTP/email escape hatch. No published lockout-rate dataset exists to reassure otherwise.</td><td>Corbado / NuSummit, 2025</td></tr>
+</table>
+<p class="sub">Flagged as estimate/thinly-sourced: the exact sub-Android-9 tail and de-Googled-ROM global share.</p>
+
+<div class="warn">
+<strong>Two real bleed points</strong> the evidence surfaces, both at the highest-intent moment: (1) the <strong>iOS→Android switcher</strong> (24–48% drop-off on cross-device sign-in); (2) the <strong>de-Googled / China user</strong>, who can't enroll a local platform passkey at all. If aiko's privacy-minded, self-hosting audience skews de-Googled — plausibly your <em>core</em>, not your margin — this is engineering work (browser-WebAuthn + cross-device support) <em>regardless</em> of the recovery fork.
+</div>
+
+<h2 id="design">5. The design (3 shippable steps, in order)</h2>
+
+<h3>Step 1 — Passkey creates its own account <span class="tag">this IS the #1728 fix</span></h3>
+<p>Replace the provisioning-token/claim detour: <code>register/finish</code> persists a fresh account <strong>immediately</strong> — a User with an auto-generated unique handle (<code>aiko-a3f9c1</code>, exactly the provisional name <code>passkey_service.py:151</code> already mints) plus the PasskeyCredential, atomically, via the same direct-persist that <code>add/finish</code> already proves. The unlocking insight: <strong>once you authenticate by passkey, the username is cosmetic, not a login credential</strong> — it needs no pick-and-confirm before the account exists. Renaming becomes a profile edit, never an account-creation gate. This deletes the entire provisioning-token dance and closes #1728.</p>
+
+<h3>Step 2 — Recovery codes (the escape hatch the evidence demands)</h3>
+<p>A new single-use-token table, mirroring the exact consume pattern the codebase already uses everywhere (<code>consume_challenge</code> / <code>consume_nonce</code> / <code>consume_state</code>). Details in §6.</p>
+
+<h3>Step 3 — Delete the OAuth/social stack <span class="tag">the subtraction win</span></h3>
+<table>
+<tr><th>Removed entirely</th><th>Trimmed</th></tr>
+<tr>
+<td><code>oauth.py</code>, <code>oauth_broker.py</code>, <code>handoff_service.py</code>, <code>nonce_service.py</code>, <code>pkce.py</code>, <code>state_service.py</code>; <code>SocialIdentity</code> model + <code>oauth_states</code>/<code>social_nonces</code> tables; <strong>the entire provisioning-token machinery</strong> (<code>security.issue/decode_provisioning</code>) — nothing uses it once passkey persists directly.</td>
+<td><code>rest/auth.py</code>: <code>/social</code>, <code>/social/claim</code>, <code>/nonce</code>, <code>/oauth/{start,callback,exchange}</code>; <code>users_service</code>: <code>create_social_user</code>, <code>get_user_by_social</code>; <code>config.py</code>: <code>apple_client_ids</code>, <code>google_client_ids</code>, broker config, <code>social_nonce_required</code>, <code>social_signin_enabled</code>; <code>/providers</code> social entries.</td>
+</tr>
+</table>
+<p><strong>~1,000–1,500 LOC of the highest-risk code in the gateway</strong>, and it dissolves (not just closes) open tasks <a href="https://github.com/nickmeinhold/claude-tasks/issues/1467">#1467</a> (app-authenticity), <a href="https://github.com/nickmeinhold/claude-tasks/issues/1755">#1755</a> (nonce flip), and the #13/#33/#34/#35 replay-defense lineage. Each step is independently shippable and cage-matched (trust boundary → cage-match by law).</p>
+
+<h2 id="recovery">6. Recovery codes <span class="tag">Step 2 detail</span></h2>
+<pre>recovery_code:
+  id          ULID  PK
+  user_id     FK users.id, index
+  code_hash   String, unique per user   # store ONLY sha256/argon2 of the code
+  used_at     DateTime nullable          # tombstone; NULL = still valid
+  created_at  DateTime</pre>
+<ul>
+  <li><strong>At account creation:</strong> generate 8 codes, show them <em>once</em>, store only hashes (never persist the plaintext — the redaction lesson).</li>
+  <li><strong><code>POST /v1/auth/passkey/recover</code>:</strong> submit a code → atomic conditional <code>UPDATE … WHERE user_id=? AND code_hash=? AND used_at IS NULL</code>, arbitrated by rowcount (TOCTOU-free, idiomatic here) → on rowcount==1, issue a session and route straight into <code>add/finish</code> to enroll a passkey on the new device. Code burned atomically with the outcome (the defer-commit contract, #24).</li>
+  <li><strong>Threat framing:</strong> a recovery code <em>is</em> a bearer credential — same model as a crypto-wallet seed phrase. That is the self-custody bargain, and it is the honest thing to tell users. It is <em>not</em> a federated identity, so it does not reintroduce the dependency social OAuth carried.</li>
+</ul>
+
+<h2 id="fork">7. The fork (team call)</h2>
+<div class="ask">
+The recovery hatch maps directly onto <strong>who aiko is for</strong>. This is the decision the team owns.
+</div>
+<table>
+<tr><th></th><th>Recovery codes only (self-custody)</th><th>+ risk-scored email/OTP fallback (assisted)</th></tr>
+<tr><td><strong>Fits</strong></td><td>The sovereignty ethos. Zero PII, zero external dependency, no new infra.</td><td>Reach. Catches both bleed points (§4) — the iOS→Android switcher and the de-Googled/China user.</td></tr>
+<tr><td><strong>Costs</strong></td><td>Does nothing for the two bleed points. A lost set of codes = lost account (accepted as principled).</td><td>Reintroduces email as a channel (PII + an SMTP/SES dependency the gateway lacks today). Far lighter centralization than OAuth, and per-island-optional keeps it sovereign.</td></tr>
+</table>
+
+<h2 id="gotchas">8. Gotchas to design for now</h2>
+<div class="warn">
+<strong>1. The cascade guard will (correctly) fail the build</strong> until <code>recovery_codes</code> is added to the account-deletion purge. The #46 <code>Base.metadata</code>-introspection tripwire trips on any new <code>users.id</code> FK unless you add <code>purge_user_recovery_codes</code> + extend the EXPECTED FK set. That is the runtime guard earning its keep — a feature, not friction.
+</div>
+<div class="warn">
+<strong>2. Existing social accounts get stranded.</strong> The 2 Sydney test accounts are <code>password_hash=None</code> + SocialIdentity, no passkey — deleting social locks them out. At 0 real users / 2 <em>test</em> accounts this is "wipe and re-register" — which is exactly why <strong>now</strong> is the cheap moment. For a real migration with real users you'd need a "link a passkey before we remove social" window; that door closes cheaply only while it's empty.
+</div>
+<div class="warn">
+<strong>3. De-Googled Android is a primary-<em>enrollment</em> problem, not just recovery.</strong> A Huawei user can't create a synced platform passkey locally; they need browser-WebAuthn + cross-device QR to work at all. Independent of the recovery fork, and worth scoping if the de-Googled audience matters.
+</div>
+<p><strong>Not bundled:</strong> the dev-only password path (<code>/register</code>+<code>/login</code>) is separable. "Kill social" (OAuth) ≠ "kill passwords"; treat the password path as a later, separate call.</p>
+
+<h2 id="reco">9. Recommendation</h2>
+<div class="decision">
+Do the core move: <strong>remove social OAuth, go passkey-first</strong>, via the three steps above (Step 1 is unavoidable — it's the #1728 fix — and makes passkey-only <em>viable</em>; Step 2 makes it <em>safe</em>; Step 3 is the subtraction win). Do <strong>not</strong> ship it fallback-less. Recovery codes are the minimum viable hatch and fit the ethos — a defensible baseline. But the evidence says recovery-codes-alone will bleed the cross-device switcher and exclude de-Googled/China; a per-island-<em>optional</em> email/OTP hatch is the evidence-backed way to plug that <strong>without</strong> the centralization social OAuth carried. The self-custody-vs-assisted choice (§7) is the team's, and it is really a choice about audience.
+</div>
+
+</body>
+</html>
