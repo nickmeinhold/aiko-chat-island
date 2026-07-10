@@ -9,9 +9,10 @@ challenge WE issued.
 
 Two ceremonies, each a start/finish pair:
   * REGISTER  — the authenticator mints a new keypair (attestation). finish
-    verifies the attestation and yields the credential material; the credential is
-    persisted at /social/claim (carried in the gateway-signed provisioning token),
-    so an abandoned handle-pick leaves no orphan credential row.
+    verifies the attestation and yields the credential material; the account +
+    credential are then created directly (users_service.create_passkey_account,
+    Design 04 Step 1) — no provisioning token, no /social/claim handle pick, so a
+    credential can never be orphaned by a rejected handle claim (#1728).
   * AUTHENTICATE — the authenticator signs the challenge with an existing key
     (assertion). finish looks the credential up by id, verifies the signature
     against the stored public key, and issues a session.
@@ -142,9 +143,10 @@ async def start_registration(session: AsyncSession) -> dict:
     platform authenticator parses. resident_key REQUIRED so the credential is
     discoverable (usernameless authentication later)."""
     raw = secrets.token_bytes(32)
-    # No real username yet (the user picks a handle at /social/claim); the WebAuthn
-    # user_name/display_name are cosmetic (shown in the OS passkey list). A random
-    # provisional name avoids collisions in that list.
+    # The WebAuthn user_name/display_name are COSMETIC ceremony metadata (shown in the
+    # OS passkey list) — distinct from the account handle, which register/finish
+    # auto-generates when it creates the account (create_passkey_account). A random
+    # provisional name here just avoids collisions in that OS list.
     options = webauthn.generate_registration_options(
         rp_id=settings.passkey_rp_id,
         rp_name=settings.passkey_rp_name,
@@ -179,10 +181,9 @@ async def start_authentication(session: AsyncSession) -> dict:
 
 def verify_registration(*, raw_challenge: bytes, credential: dict) -> dict:
     """Verify an attestation response and return JSON-safe credential material
-    (base64url strings) ready to ride in the provisioning token and be persisted at
-    claim. Raises webauthn InvalidRegistrationResponse on any failure (the caller
-    maps to a 4xx). The expected_challenge/origin/rp_id are OURS, never read from
-    the response."""
+    (base64url strings) ready to persist directly via create_passkey_account. Raises
+    webauthn InvalidRegistrationResponse on any failure (the caller maps to a 4xx).
+    The expected_challenge/origin/rp_id are OURS, never read from the response."""
     verified = webauthn.verify_registration_response(
         credential=json.dumps(credential),
         expected_challenge=raw_challenge,

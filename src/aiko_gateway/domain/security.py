@@ -73,7 +73,6 @@ _PROVISIONING_TYPE = "provisioning"
 def issue_provisioning(
     provider: str, provider_sub: str, *,
     suggested_name: str | None = None, email: str | None = None,
-    passkey_credential: dict | None = None,
 ) -> str:
     now = dt.datetime.now(dt.timezone.utc)
     payload = {
@@ -86,13 +85,6 @@ def issue_provisioning(
         "exp": int((now + dt.timedelta(
             seconds=settings.provisioning_ttl_seconds)).timestamp()),
     }
-    # Passkey registration carries the VERIFIED credential material here (#1471):
-    # the credential is persisted at /social/claim, not at register/finish, so an
-    # abandoned handle-pick leaves no orphan credential row. Riding it in OUR signed
-    # token is the same trust model as (provider, sub) — we minted it, it's
-    # tamper-proof, short-lived. Only present for the passkey flow.
-    if passkey_credential is not None:
-        payload["passkey_credential"] = passkey_credential
     return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm)
 
 
@@ -115,8 +107,6 @@ def decode_provisioning(token: str) -> dict:
         "provider_sub": provider_sub,
         "suggested_name": payload.get("suggested_name"),
         "email": payload.get("email"),
-        # Present only for a passkey provisioning token (#1471); None for social.
-        "passkey_credential": payload.get("passkey_credential"),
     }
 
 

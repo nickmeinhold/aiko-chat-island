@@ -113,10 +113,10 @@ async def test_disabled_returns_403(client, monkeypatch):
     r = await client.post("/v1/auth/social",
                           json={"provider": "google", "id_token": "x"})
     assert r.status_code == 403
-    # /social/claim now serves the passkey flow too, so it decodes the token FIRST
-    # and applies the social gate to the SOCIAL branch. A VALID social provisioning
-    # token therefore still 403s while social is disabled (the gate fires after a
-    # successful decode — a stronger check than a garbage-token parse failure).
+    # /social/claim decodes the token FIRST, then applies the social gate. A VALID
+    # social provisioning token therefore still 403s while social is disabled (the
+    # gate fires after a successful decode — a stronger check than a garbage-token
+    # parse failure).
     prov = security.issue_provisioning("google", "sub-disabled")
     r2 = await client.post("/v1/auth/social/claim", json={
         "provisioning_token": prov, "handle": "h"})
