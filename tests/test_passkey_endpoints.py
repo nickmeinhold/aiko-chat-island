@@ -4,8 +4,9 @@ soft-webauthn (the off-the-shelf software authenticator) is dep-incompatible wit
 our cryptography pin (it needs <45 via fido2; py_webauthn needs >=46), so we drive
 a minimal inline P-256 authenticator that produces REAL attestation/assertion
 responses through the genuine py_webauthn verification path — no mocking of the
-crypto boundary. This is what proves register -> claim -> authenticate works, the
-sign_count contract holds, and the outcome shapes match the social/broker door.
+crypto boundary. This is what proves register -> authenticate works (register now
+creates the account directly — Design 04 Step 1, no /social/claim), the sign_count
+contract holds, and the outcome shapes match the social/broker door.
 """
 from __future__ import annotations
 
