@@ -143,9 +143,10 @@ async def start_registration(session: AsyncSession) -> dict:
     platform authenticator parses. resident_key REQUIRED so the credential is
     discoverable (usernameless authentication later)."""
     raw = secrets.token_bytes(32)
-    # No real username yet (the user picks a handle at /social/claim); the WebAuthn
-    # user_name/display_name are cosmetic (shown in the OS passkey list). A random
-    # provisional name avoids collisions in that list.
+    # The WebAuthn user_name/display_name are COSMETIC ceremony metadata (shown in the
+    # OS passkey list) — distinct from the account handle, which register/finish
+    # auto-generates when it creates the account (create_passkey_account). A random
+    # provisional name here just avoids collisions in that OS list.
     options = webauthn.generate_registration_options(
         rp_id=settings.passkey_rp_id,
         rp_name=settings.passkey_rp_name,
