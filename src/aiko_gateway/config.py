@@ -210,6 +210,16 @@ class Settings(BaseSettings):
     # App Links won't verify yet; the iOS AASA is unaffected). Configure when known.
     passkey_android_cert_sha256: list[str] = []
 
+    # --- social recovery (Design 05: guardian approval quorum) ---
+    # The time-locked veto window: after a valid guardian quorum opens a pending
+    # recovery, existing devices have this long to cancel before the client can
+    # finalize (re-bind the new passkey). 72h default — the one genuine product-feel
+    # dial (Design 05 §11 open question 1). Per-island env-overridable
+    # (RECOVERY_VETO_WINDOW_SECONDS) like every other setting. The deadline is server
+    # wall-clock and WRITE-ONCE at pending-row birth; changing this value affects only
+    # NEW recoveries, never advances a live deadline.
+    recovery_veto_window_seconds: int = 72 * 3600  # 72h
+
     # --- abuse limits (#28) ---
     # Per-client rate limit on the public auth ceremonies (passkey/social/oauth/
     # register/login/nonce). A blast-radius cap on unauthenticated, sometimes

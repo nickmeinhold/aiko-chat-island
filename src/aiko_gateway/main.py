@@ -231,6 +231,7 @@ from .rest import legal as legal_routes  # noqa: E402
 from .rest import members as member_routes  # noqa: E402
 from .rest import messages as message_routes  # noqa: E402
 from .rest import moderation as moderation_routes  # noqa: E402
+from .rest import recovery as recovery_routes  # noqa: E402
 from .rest import well_known as well_known_routes  # noqa: E402
 from .realtime import ws as ws_routes  # noqa: E402
 app.include_router(auth_routes.router)
@@ -244,6 +245,7 @@ app.include_router(legal_routes.router)
 app.include_router(member_routes.router)
 app.include_router(message_routes.router)
 app.include_router(moderation_routes.router)
+app.include_router(recovery_routes.router)
 app.include_router(ws_routes.router)
 app.include_router(well_known_routes.router)
 

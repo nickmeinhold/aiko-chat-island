@@ -36,6 +36,7 @@ _MODEL_TABLES = {
     "messages", "user_blocks", "message_reports", "device_tokens",
     "oauth_handoffs", "oauth_states", "social_nonces",
     "communities", "community_memberships",
+    "recovery_policies", "recovery_approvers", "pending_recovery",
 }
 
 
@@ -92,6 +93,9 @@ def test_fresh_db_upgrades_to_head(tmp_path, monkeypatch) -> None:
         with engine.connect() as conn:
             device_sql = conn.exec_driver_sql(
                 "SELECT sql FROM sqlite_master WHERE name='device_tokens'").scalar()
+            challenge_sql = conn.exec_driver_sql(
+                "SELECT sql FROM sqlite_master WHERE name='passkey_challenges'"
+            ).scalar()
     finally:
         engine.dispose()
     assert _MODEL_TABLES <= tables
@@ -104,6 +108,14 @@ def test_fresh_db_upgrades_to_head(tmp_path, monkeypatch) -> None:
     # not only the ORM.
     assert "ck_device_tokens_platform" in device_sql
     assert "'apns'" in device_sql and "'fcm'" in device_sql
+    # The passkey_challenges.operation CHECK must include the social-recovery
+    # 'recover' member (Design 05, migration 0013 widened it). compare_metadata is
+    # CHECK-blind on SQLite, so assert it structurally in the migrated DDL — a
+    # migration that forgot to widen the constraint would reject every recovery
+    # nonce insert at write time (the closed set = reject-all for 'recover').
+    assert "ck_passkey_challenges_operation" in challenge_sql
+    assert "'register'" in challenge_sql and "'authenticate'" in challenge_sql
+    assert "'recover'" in challenge_sql
 
 
 def test_adopt_pre_alembic_db_stamps_baseline(tmp_path, monkeypatch) -> None:

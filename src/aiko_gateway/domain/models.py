@@ -102,6 +102,13 @@ class PasskeyOperation(enum.StrEnum):
 
     REGISTER = "register"
     AUTHENTICATE = "authenticate"
+    # Social recovery (Design 05): the single-use server nonce a recover/start
+    # issues is a PasskeyChallenge row pinned to this operation, so a register /
+    # authenticate challenge can never complete a recovery (and vice versa) — the
+    # same ceremony-pinning guard the other two members provide. Adding a member
+    # here rebuilds the passkey_challenges CHECK via _in_check; the matching
+    # migration (0013) must rebuild the DB CHECK to match, or the parity gate fails.
+    RECOVER = "recover"
 
 
 def _in_check(column: str, values: type[enum.StrEnum]) -> str:
@@ -680,5 +687,121 @@ class PasskeyChallenge(Base):
         DateTime(timezone=True), nullable=False)
     consumed: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow)
+
+
+class RecoveryPolicy(Base):
+    """A user's social-recovery policy — the k-of-n quorum threshold (Design 05).
+
+    ONE active policy per user (UNIQUE user_id); a rotation REPLACES it (through the
+    veto machinery — see recovery_service.enroll_policy). The gateway stores only the
+    threshold here; the n approver public keys are RecoveryApprover rows. Neither
+    holds anything that can recover an account alone — a leaked DB has verifier keys
+    (they check signatures, they cannot PRODUCE them) + a threshold, never a signing
+    secret. Contrast SigningKey (#1816): that pubkey is a CARRIER the gateway never
+    verifies against (per-user non-unique, collisions kept as evidence); an approver
+    pubkey is the mirror image — the gateway DOES verify against it, a quorum of them
+    is authoritative-for-takeover, so the roster is registered authenticated and
+    DISTINCT (UNIQUE(user_id, approver_pubkey) on RecoveryApprover).
+
+    No ON DELETE CASCADE (codebase convention): account deletion tears these down
+    explicitly via recovery_service.purge_user_recovery; the cascade guard
+    (test_account_deletion_cascade_guard) requires it.
+    """
+    __tablename__ = "recovery_policies"
+    # Named constraint (not column-level unique=True) so the ORM metadata matches
+    # the hand-written 0013 migration EXACTLY — the parity gate diffs reflected
+    # unique constraints and an unnamed one would not match the named migration.
+    __table_args__ = (
+        UniqueConstraint("user_id", name="uq_recovery_policies_user"),
+    )
+    id: Mapped[str] = mapped_column(String(26), primary_key=True, default=new_ulid)
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id"), nullable=False)
+    # The quorum size: how many DISTINCT approver signatures a recovery needs. The
+    # service enforces 1 <= threshold_k <= n at enroll time; stored as-is.
+    threshold_k: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow)
+
+
+class RecoveryApprover(Base):
+    """One guardian's Ed25519 approver PUBLIC key registered for a user's recovery
+    policy (Design 05). The guardian holds the private half (generated in-app, never
+    delivered to the island); the gateway stores only the public key and VERIFIES
+    approval signatures against it. Approver keys are independent of any aiko account
+    — a guardian need not be an aiko user — so the roster is opaque (keys, not
+    identities).
+
+    UNIQUE(user_id, approver_pubkey) is the DISTINCT-approver invariant at the schema
+    level: one guardian's key can be registered against a user only once, so a quorum
+    of >= k rows is >= k distinct guardians (the service also de-dupes at verify time
+    on the presented signatures, closing the "one guardian signs k times" attack).
+
+    No ON DELETE CASCADE (codebase convention): purged via
+    recovery_service.purge_user_recovery on account deletion; the cascade guard
+    requires it.
+    """
+    __tablename__ = "recovery_approvers"
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id", "approver_pubkey", name="uq_recovery_approvers_user_pubkey"),
+    )
+    id: Mapped[str] = mapped_column(String(26), primary_key=True, default=new_ulid)
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id"), nullable=False, index=True)
+    # The multibase-base58btc ed25519 Multikey string (`z…`) — same wire format as
+    # SigningKey.pubkey / origin.sender_pubkey. 128 matches signing._MAX_PUBKEY_STR
+    # (a real Multikey is ~48 chars; the cap is defense-in-depth).
+    approver_pubkey: Mapped[str] = mapped_column(String(128), nullable=False)
+    # A client-side hint only ("mum's phone"), opaque to the gateway. Nullable.
+    label: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow)
+
+
+class PendingRecovery(Base):
+    """An in-flight recovery in the time-locked veto window (Design 05 §7).
+
+    Created ONLY after a valid quorum (recover/finish), staging the new passkey
+    credential with a write-once veto_deadline. Existing devices are notified and can
+    cancel during the window; after the deadline the client polls finalize, which is a
+    single guarded DELETE with the deadline folded into the WHERE (never observe-then-
+    write) — the anti-TOCTOU contract the whole design rests on (§7 fixes C2).
+
+    UNIQUE(user_id): one in-flight recovery per user. A griefer cannot weaponize the
+    slot into a lockout — a pending row is created only after a valid quorum, and an
+    EXPIRED-unfinalized row is reclaimable by a fresh recovery (recovery_service
+    .start/finish reclaim on expiry), so it can't wedge the slot past its window.
+
+    finalize_token_hash stores sha256(finalize_token) — the raw high-entropy token is
+    returned to the caller once at finish and NEVER stored (the ULID id is ordered,
+    not secret, so it can't be the finalize authorizer alone).
+
+    No ON DELETE CASCADE (codebase convention): purged via
+    recovery_service.purge_user_recovery on account deletion; the cascade guard
+    requires it.
+    """
+    __tablename__ = "pending_recovery"
+    __table_args__ = (
+        UniqueConstraint("user_id", name="uq_pending_recovery_user"),
+    )
+    id: Mapped[str] = mapped_column(String(26), primary_key=True, default=new_ulid)
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id"), nullable=False)
+    # The staged WebAuthn credential (verified attestation, not yet live). Mirrors
+    # PasskeyCredential's column shapes so finalize can enroll it through the single
+    # passkey door without any type coercion.
+    staged_credential_id: Mapped[str] = mapped_column(String(512), nullable=False)
+    staged_public_key: Mapped[str] = mapped_column(Text, nullable=False)  # base64url(COSE)
+    staged_sign_count: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    # Server wall-clock (_utcnow) deadline, WRITE-ONCE — set at row birth, never
+    # advanced (a repeated finish can't push the window out; §7). The finalize
+    # DELETE folds `veto_deadline <= :now` into its WHERE.
+    veto_deadline: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False)
+    # sha256 hex of the high-entropy finalize token (never the raw token).
+    finalize_token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow)

@@ -45,7 +45,8 @@ from aiko_gateway.domain import (
     signing_keys_service, users_service)
 from aiko_gateway.domain.models import (
     DEFAULT_COMMUNITY_ID, Channel, Community, CommunityMembership, Membership,
-    Message, PasskeyCredential, SigningKey, SocialIdentity, User)
+    Message, PasskeyCredential, PendingRecovery, RecoveryApprover,
+    RecoveryPolicy, SigningKey, SocialIdentity, User)
 from aiko_gateway.domain.ids import new_ulid
 
 
@@ -92,6 +93,9 @@ EXPECTED_USERS_FK_COLUMNS: set[tuple[str, str]] = {
     ("memberships", "user_id"),               # delete
     ("community_memberships", "user_id"),     # delete (#32)
     ("communities", "owner_id"),              # anonymize (ref -> NULL) (#32)
+    ("recovery_policies", "user_id"),         # delete (Design 05)
+    ("recovery_approvers", "user_id"),        # delete (Design 05)
+    ("pending_recovery", "user_id"),          # delete (Design 05)
 }
 
 
@@ -183,6 +187,22 @@ async def _seed_full_user_graph(session):
     # record_signing_key does not commit (caller owns the txn), so commit here.
     await signing_keys_service.record_signing_key(
         session, user_id=user.id, pubkey="z-signing-primary", key_version=1)
+    # Social-recovery footprint (Design 05): a policy + an approver + a pending row,
+    # so all three new FK-to-users columns reference the user before deletion.
+    session.add(RecoveryPolicy(
+        id="RP".ljust(26, "0"), user_id=user.id, threshold_k=1,
+        created_at=dt.datetime(2026, 7, 11, tzinfo=dt.timezone.utc)))
+    session.add(RecoveryApprover(
+        id="RA".ljust(26, "0"), user_id=user.id,
+        approver_pubkey="z-approver-primary", label=None,
+        created_at=dt.datetime(2026, 7, 11, tzinfo=dt.timezone.utc)))
+    session.add(PendingRecovery(
+        id="PR".ljust(26, "0"), user_id=user.id,
+        staged_credential_id="staged-cred", staged_public_key="c3RhZ2Vk",
+        staged_sign_count=0,
+        veto_deadline=dt.datetime(2026, 7, 14, tzinfo=dt.timezone.utc),
+        finalize_token_hash="0" * 64,
+        created_at=dt.datetime(2026, 7, 11, tzinfo=dt.timezone.utc)))
     await session.commit()
     return user, other
 
@@ -358,6 +378,22 @@ async def _seed_fk_safe(session):
     # since record_signing_key leaves the txn to the caller.
     await signing_keys_service.record_signing_key(
         session, user_id=user.id, pubkey="z-signing-primary", key_version=1)
+    # Social-recovery footprint (Design 05) — FK-safe (user committed above): a
+    # policy + approver + pending row referencing all three new FK-to-users columns.
+    session.add_all([
+        RecoveryPolicy(id="RP".ljust(26, "0"), user_id=user.id, threshold_k=1,
+                       created_at=dt.datetime(2026, 7, 11, tzinfo=dt.timezone.utc)),
+        RecoveryApprover(id="RA".ljust(26, "0"), user_id=user.id,
+                         approver_pubkey="z-approver-primary", label=None,
+                         created_at=dt.datetime(2026, 7, 11, tzinfo=dt.timezone.utc)),
+        PendingRecovery(
+            id="PR".ljust(26, "0"), user_id=user.id,
+            staged_credential_id="staged-cred", staged_public_key="c3RhZ2Vk",
+            staged_sign_count=0,
+            veto_deadline=dt.datetime(2026, 7, 14, tzinfo=dt.timezone.utc),
+            finalize_token_hash="0" * 64,
+            created_at=dt.datetime(2026, 7, 11, tzinfo=dt.timezone.utc)),
+    ])
     await session.commit()
     return user, other
 

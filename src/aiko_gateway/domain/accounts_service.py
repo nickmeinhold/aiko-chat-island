@@ -40,7 +40,8 @@ from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from . import (
-    devices_service, moderation_service, passkey_service, signing_keys_service)
+    devices_service, moderation_service, passkey_service, recovery_service,
+    signing_keys_service)
 from .memberships_service import ROLE_ADMIN
 from .models import (
     Community, CommunityMembership, Membership, Message, SocialIdentity, User)
@@ -187,6 +188,14 @@ async def delete_user_account(session: AsyncSession, user_id: str) -> None:
     # every new users-referencing table must join this cascade, exactly as the
     # passkey/device/moderation rows above did). The cascade guard now requires it.
     await signing_keys_service.purge_user_keys(session, user_id)
+    # Social-recovery footprint (Design 05) — THREE FK children of `users`:
+    # pending_recovery, recovery_approvers, recovery_policies. All hard-deleted with
+    # the account (verify-the-neighbor: every new users-referencing table must join
+    # this cascade, exactly as the passkey/signing/device/moderation rows above did).
+    # The cascade guard now requires all three. NOTE: finalize (the one flow that
+    # mints a session for a not-previously-authed party) works on a separate row that
+    # is torn down here too, so a deleted account can never be recovered afterward.
+    await recovery_service.purge_user_recovery(session, user_id)
     # Community footprint (#32). TWO FK children of `users`, handled differently —
     # the same verify-the-neighbor discipline, and BOTH are now required by the
     # cascade guard:
