@@ -7,10 +7,11 @@ name: release
 # image on their own schedule (`docker compose pull && up -d`). That's the whole
 # point — CI holds an artifact, not prod credentials.
 #
-# Two images make an island runnable; this repo owns the gateway. The broker
-# roles live in `ghcr.io/nickmeinhold/aiko-bridge` (published from the
-# aiko-chat-bridge repo). The Dockerfile's AIKO_CHAT_REF wire-contract lock means
-# the gateway and bridge must be released at MATCHING versions together.
+# ONE image runs the whole island. This image already bundles aiko_services +
+# aiko_chat, so it serves every aiko role by `command:` override — the gateway
+# (default), the registrar (`aiko_registrar`), and the ChatServer (`chat_start.sh`).
+# The only other container an island runs is stock `eclipse-mosquitto`. (The
+# island does NOT run the Matrix bridge; aiko-chat-bridge is unrelated to it.)
 #
 # Arch: both live islands are arm64 (aarch64) and third-party operators are often
 # amd64, so we build BOTH natively (public repos get free arm64 hosted runners —
