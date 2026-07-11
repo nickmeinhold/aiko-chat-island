@@ -1,0 +1,30 @@
+# Standalone Caddy stack for an aiko island — OPT-IN, separate from the gateway
+# compose on purpose.
+#
+# Why its own project (not a service in the main docker-compose.yml): the two
+# already-live islands run Caddy as a separate host stack. Folding Caddy into the
+# gateway compose would make the next `docker compose up` on THOSE hosts try to
+# bind 80/443 and collide with their existing proxy. Keeping it separate means a
+# NEW island opts in here while the live islands are untouched.
+#
+# `network_mode: host` is deliberate: the gateway publishes 127.0.0.1:8095 on the
+# host, so Caddy must share the host network namespace to reach `localhost:8095`
+# (and to bind 80/443 for ACME). This mirrors the live islands' wiring exactly.
+name: aiko-caddy
+
+services:
+  caddy:
+    image: caddy:2
+    restart: always
+    network_mode: host
+    environment:
+      # Substituted into the Caddyfile. Written by standup.sh into ./.env.
+      ISLAND_DOMAIN: ${ISLAND_DOMAIN:?ISLAND_DOMAIN required (the island's public hostname)}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data      # ACME account + issued certs — persist across restarts
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:

@@ -172,9 +172,20 @@ community default channel.
 
 ## Deployment
 
-Deployment is a **manual `docker compose up -d --build` over ssh** — there is no
-CI/CD pipeline (GitHub Actions is unavailable on this repo). Two live islands
-run this way.
+**Standing up a NEW island?** One script does the whole thing — build the broker
+image, create the data volume, write a production `.env` with a generated JWT
+secret, bring the stack up, and terminate TLS:
+
+```bash
+./deploy/standup.sh --domain chat.example.org --name "Example Island"
+```
+
+See [`docs/standup-guide.md`](docs/standup-guide.md) for prerequisites (a host, a
+domain, Docker), federation, passkeys, and the manual step-by-step.
+
+**Updating an existing island** is a **manual `docker compose up -d --build` over
+ssh** — there is no CI/CD pipeline (GitHub Actions is unavailable on this repo).
+Two live islands run this way.
 
 The load-bearing facts (learned the hard way, grounded against the live hosts):
 
