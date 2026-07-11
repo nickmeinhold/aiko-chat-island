@@ -1,0 +1,48 @@
+name: ghcr-retention
+
+# Prune the GHCR package: delete unreferenced untagged manifests while KEEPING
+# every tagged version (edge / sha-* / vX.Y.Z / latest).
+#
+# WHY THIS EXISTS: the multi-arch build in release.yml pushes each arch by digest,
+# then stitches them into one tagged index. The per-arch manifests are "untagged"
+# but the tagged index REFERENCES them — a naive delete-all-untagged would orphan
+# the children of the live :edge/:latest image and break it. dataaxiom's action
+# walks the manifest tree and only removes genuinely-unreferenced digests, so the
+# tagged multi-arch images stay intact.
+#
+# WHY A SEPARATE WORKFLOW (not a job in release.yml): deletion is irreversible and
+# a cleanup bug must NEVER break delivery. This runs on its own clock; if it fails,
+# images are still published. It is decoupled on purpose.
+#
+# WHY PINNED BY COMMIT SHA: the action runs with `packages: write` and can DELETE
+# images — a compromised new release of a floating tag could wipe the registry, so
+# we pin the exact reviewed commit (v1.2.2) rather than a mutable @v1.
+
+on:
+  schedule:
+    - cron: '17 4 * * 1'   # weekly, Monday 04:17 UTC (off the hour to dodge cron pileups)
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Only LIST what would be deleted (no deletion)'
+        type: boolean
+        default: true       # manual runs default to safe/dry; verify, then it deletes
+
+permissions:
+  packages: write
+  contents: read
+
+jobs:
+  prune:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete unreferenced untagged GHCR manifests
+        uses: dataaxiom/ghcr-cleanup-action@d52806a0dc70b430571a37da1fde39733ffd640f  # v1.2.2
+        with:
+          package: aiko-chat-island
+          # Keep everything TAGGED; prune only untagged + genuinely-orphaned digests.
+          delete-untagged: true
+          delete-orphaned-images: true
+          delete-partial-images: true
+          # Scheduled runs delete for real; manual runs default to dry (safe to inspect).
+          dry-run: ${{ inputs.dry_run || false }}
