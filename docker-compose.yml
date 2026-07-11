@@ -144,6 +144,11 @@ services:
   registrar:
     image: ghcr.io/nickmeinhold/aiko-chat-island:${ISLAND_VERSION:-edge}
     restart: always
+    # The image bakes a gateway HEALTHCHECK (curl /health :8095). This role serves
+    # no HTTP, so that check fails forever and shows "unhealthy". Disable it — the
+    # role has no HTTP surface to probe; restart:always covers a crash.
+    healthcheck:
+      disable: true
     environment:
       AIKO_MQTT_HOST: mosquitto
       AIKO_NAMESPACE: aiko
@@ -154,6 +159,10 @@ services:
   chat:
     image: ghcr.io/nickmeinhold/aiko-chat-island:${ISLAND_VERSION:-edge}
     restart: always
+    # Same as registrar: this role serves no HTTP, so the image's baked gateway
+    # HEALTHCHECK would fail forever. Disable it.
+    healthcheck:
+      disable: true
     environment:
       AIKO_MQTT_HOST: mosquitto
       AIKO_NAMESPACE: aiko
