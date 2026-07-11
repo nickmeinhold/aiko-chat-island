@@ -1,0 +1,16 @@
+# Caddyfile for an aiko island — TLS termination + reverse proxy.
+#
+# Caddy auto-provisions a Let's Encrypt certificate for $ISLAND_DOMAIN on first
+# boot (needs ports 80 + 443 reachable from the internet and the domain's A/AAAA
+# record already pointing at this host). It then reverse-proxies to the gateway,
+# which publishes only on 127.0.0.1:8095 — this Caddy runs with `network_mode:
+# host` (see docker-compose.caddy.yml) so `localhost:8095` resolves to the
+# gateway's host-loopback publish, exactly as the live islands are wired.
+#
+# {$ISLAND_DOMAIN} is substituted from the environment at container start
+# (standup.sh writes it into deploy/caddy/.env). The clean catch-all means the
+# gateway's /.well-known/apple-app-site-association and /.well-known/assetlinks.json
+# (passkey domain binding) pass straight through untouched.
+{$ISLAND_DOMAIN} {
+	reverse_proxy localhost:8095
+}
