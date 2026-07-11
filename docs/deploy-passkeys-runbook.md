@@ -230,9 +230,16 @@ Tail the gateway while testing:
 ssh imagineering "docker logs -f aiko-chat-island-1"
 ```
 
-**Android is blocked** until app task #20 supplies the Play App Signing SHA-256
-(`passkey_android_cert_sha256` + the apk-key-hash in `passkey_extra_origins`).
-assetlinks serves `[]` until then by design. iOS is unaffected.
+**Android is UNBLOCKED (#1911, 2026-07-11).** The Play App Signing + upload +
+debug SHA-256 fingerprints are now baked as the `PASSKEY_ANDROID_CERT_SHA256`
+compose default (public values, source-controlled so they can't drift/revert on
+redeploy). `/.well-known/assetlinks.json` serves the populated
+`get_login_creds` target once the compose change is deployed (`up -d --build`).
+Verify after deploy: `curl -s https://<host>/.well-known/assetlinks.json | jq`
+returns a non-empty array with `package_name: cc.imagineering.aiko_chat_app` and
+the Play App Signing fingerprint present; cross-check with Google's validator
+(`digitalassetlinks.googleapis.com/v1/assetlinks:check`). Ground truth is a real
+passkey register→chat on a Play-signed install (internal-testing track counts).
 
 ---
 
