@@ -59,15 +59,16 @@ services:
       AIKO_MQTT_HOST: mosquitto
       AIKO_MQTT_PORT: "1883"
       AIKO_NAMESPACE: aiko
-      # --- social sign-in (#13). RETIRED 2026-07-11 (#1923): the app went
-      # passkey-sole-ingress (app-PR#69), so the gateway retires social to match —
-      # default OFF disables the /social* endpoints AND drops apple/google/github
-      # from /providers (all gated on this flag in auth.py). This DELETES the
-      # tolerant-nonce replay window instead of guarding it (closed #1755). No
-      # social-only users were stranded (verified: passkey/password paths cover
-      # all accounts; enspyr empty). Client IDs kept as public defaults so a host
-      # .env flip back to true still works if ever needed. *_CLIENT_IDS MUST be
-      # JSON arrays (pydantic json-decodes list fields).
+      # --- social sign-in (#13). DISABLED by default 2026-07-11 (#1923): the app
+      # dropped social (app-PR#69), so the gateway follows. Default OFF gates off
+      # the /social* endpoints AND drops apple/google/github from /providers (all
+      # behind this flag in auth.py). This CLOSES the tolerant-nonce replay path by
+      # making it unreachable (supersedes #1755) — the code that IS that path is
+      # only removed in Phase 2 (#1923), so this is a disable, not a delete.
+      # Reversible: a host .env SOCIAL_SIGNIN_ENABLED=true re-enables it (client IDs
+      # kept as public defaults for that path). Password login (/register,/login)
+      # is unaffected — passkeys are the primary, not the sole, ingress.
+      # *_CLIENT_IDS MUST be JSON arrays (pydantic json-decodes list fields).
       SOCIAL_SIGNIN_ENABLED: ${SOCIAL_SIGNIN_ENABLED:-false}
       APPLE_CLIENT_IDS: ${APPLE_CLIENT_IDS:-["cc.imagineering.aikoChatApp"]}
       GOOGLE_CLIENT_IDS: ${GOOGLE_CLIENT_IDS:-["588100172166-a0r6ipvpju5rd6fh8lv85qqohpdosp33.apps.googleusercontent.com","588100172166-23ppgk6jdb3et2ehc1qj584c6rgs0c9j.apps.googleusercontent.com","588100172166-bagrmvftp3fcer2j2lvnh33j65g58elk.apps.googleusercontent.com"]}
@@ -76,11 +77,15 @@ services:
       # (fail-closed), and the both-or-neither default keeps the XOR boot-guard happy.
       GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
       GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
-      # --- WebAuthn passkeys (#1471 / #29). Now the SOLE ingress (social retired,
-      # #1923) so the template default is ON — both islands serve /.well-known
-      # assetlinks.json + AASA (#1911), the prerequisite for the advertisement.
-      # A host .env can still force it off per-island. Public, not a secret.
-      PASSKEY_ENABLED: ${PASSKEY_ENABLED:-true}
+      # --- WebAuthn passkeys (#1471 / #29). The primary ingress now that social is
+      # disabled (#1923). Default stays OFF (dark) at the TEMPLATE level on purpose:
+      # advertising passkey requires THIS island to serve valid /.well-known
+      # assetlinks.json + AASA for ITS rpId (#1911) — a per-island precondition. So
+      # each ready island opts in via its host .env (PASSKEY_ENABLED=true) rather
+      # than the template asserting that precondition for every future island (a
+      # cloned island with unconfigured well-known files would otherwise advertise a
+      # sign-in path that dies mid-ceremony). Public, not a secret.
+      PASSKEY_ENABLED: ${PASSKEY_ENABLED:-false}
       # --- ISLAND IDENTITY (the compose is the island template). Each island sets
       # these in its host .env; the defaults are island 1 (chat.imagineering.cc) so
       # an imagineering deploy with no overrides is unchanged. Island 2 (enspyr)
