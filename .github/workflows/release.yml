@@ -1,0 +1,128 @@
+name: release
+
+# Continuous DELIVERY of the official gateway image — NOT deployment.
+#
+# This publishes a versioned, multi-arch container image to GHCR. It never
+# touches a prod host: islands are sovereign nodes and deploy by PULLING this
+# image on their own schedule (`docker compose pull && up -d`). That's the whole
+# point — CI holds an artifact, not prod credentials.
+#
+# ONE image runs the whole island. This image already bundles aiko_services +
+# aiko_chat, so it serves every aiko role by `command:` override — the gateway
+# (default), the registrar (`aiko_registrar`), and the ChatServer (`chat_start.sh`).
+# The only other container an island runs is stock `eclipse-mosquitto`. (The
+# island does NOT run the Matrix bridge; aiko-chat-bridge is unrelated to it.)
+#
+# Arch: both live islands are arm64 (aarch64) and third-party operators are often
+# amd64, so we build BOTH natively (public repos get free arm64 hosted runners —
+# no slow QEMU emulation of this crypto-heavy image). Built per-arch by digest,
+# then stitched into one multi-arch tag in the `merge` job (the canonical docker
+# buildx pattern).
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write   # push to GHCR via the built-in GITHUB_TOKEN — no extra secret
+
+env:
+  IMAGE: ghcr.io/nickmeinhold/aiko-chat-island
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm   # free native arm64 for public repos
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build this arch and push it to GHCR addressed only by digest (no tag yet).
+      # The merge job collects the per-arch digests into the human tags.
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Derive the tag set from the ref:
+      #   push to main -> :edge        (bleeding edge)
+      #   tag vX.Y.Z   -> :X.Y.Z :X.Y :X and (auto) :latest
+      #   any build    -> :sha-<short> (traceability / rollback anchor)
+      - name: Compute tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=edge,branch=main
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,prefix=sha-
+          # latest tracks semver releases only (NOT main) — flavor default is fine.
+
+      # Stitch the per-arch digests into ONE multi-arch image per tag.
+      - name: Create multi-arch manifest
+        working-directory: /tmp/digests
+        run: |
+          tags=$(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          # shellcheck disable=SC2046,SC2086
+          docker buildx imagetools create $tags \
+            $(for d in *; do printf '%s@sha256:%s ' "$IMAGE" "$d"; done)
+
+      - name: Inspect published image
+        run: docker buildx imagetools inspect "${IMAGE}:${DOCKER_METADATA_OUTPUT_VERSION}"
