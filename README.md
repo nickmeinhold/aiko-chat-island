@@ -204,9 +204,9 @@ Load-bearing facts (still true, grounded against the live hosts):
 - Pin a version with `ISLAND_VERSION` (default `edge` tracks `main`); `:latest`
   tracks the newest `v*` release tag.
 
-> The two existing live islands (`chat.imagineering.cc`, `chat.enspyr.co`) still
-> build-on-host from an rsync'd tree; cutting them over to pull-based updates is a
-> one-time deploy, not yet done.
+> Both live islands (`chat.imagineering.cc`, `chat.enspyr.co`) run the published
+> image, pinned `ISLAND_VERSION=0.1.0` (cut over 2026-07-11). Update them with
+> `deploy/update.sh` — no more build-on-host.
 
 ## Testing
 
