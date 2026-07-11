@@ -172,31 +172,41 @@ community default channel.
 
 ## Deployment
 
-**Standing up a NEW island?** One script does the whole thing — build the broker
-image, create the data volume, write a production `.env` with a generated JWT
-secret, bring the stack up, and terminate TLS:
+An island is **four containers from one published image** (gateway + broker +
+registrar + ChatServer) plus stock `mosquitto`. CI builds that image multi-arch
+(amd64 + arm64) and publishes it to `ghcr.io/nickmeinhold/aiko-chat-island` on
+every push/tag — this is continuous **delivery** (an artifact), not deployment: an
+island **pulls** it and never has CI push to it.
+
+**Stand up a NEW island** — one script creates the volume, writes a production
+`.env` with a generated JWT secret, pulls the image, starts the stack, and
+terminates TLS:
 
 ```bash
 ./deploy/standup.sh --domain chat.example.org --name "Example Island"
 ```
 
-See [`docs/standup-guide.md`](docs/standup-guide.md) for prerequisites (a host, a
-domain, Docker), federation, passkeys, and the manual step-by-step.
+**Update a running island** — backup → pull → recreate → verify:
 
-**Updating an existing island** is a **manual `docker compose up -d --build` over
-ssh** — there is no CI/CD pipeline (GitHub Actions is unavailable on this repo).
-Two live islands run this way.
+```bash
+./deploy/update.sh          # add --from-source to build from this checkout instead
+```
 
-The load-bearing facts (learned the hard way, grounded against the live hosts):
+See [`docs/standup-guide.md`](docs/standup-guide.md) for prerequisites, federation,
+passkeys, build-from-source, and the manual step-by-step.
 
-- The host app dir is a **plain rsync'd tree, not a git repo** — deploy = rsync
-  the whole tree, then rebuild on the host.
-- **`docker compose up -d` alone does NOT rebuild from changed source** (no
-  registry; image is `build: .`). You **must** pass `--build` or it recreates
-  the container from the stale image and ships nothing while exiting `0`.
-- **Back up first.** The slim image has no `sqlite3` CLI — use Python's
-  `.backup()` (see [`docs/deploy-passkeys-runbook.md`](docs/deploy-passkeys-runbook.md)).
+Load-bearing facts (still true, grounded against the live hosts):
+
+- **Back up first** — `update.sh` does this fail-closed. The slim image has no
+  `sqlite3` CLI; backups use Python's online `.backup()`
+  (see [`docs/deploy-passkeys-runbook.md`](docs/deploy-passkeys-runbook.md)).
 - The entrypoint migrates before serving; a failed migration fails the container.
+- Pin a version with `ISLAND_VERSION` (default `edge` tracks `main`); `:latest`
+  tracks the newest `v*` release tag.
+
+> The two existing live islands (`chat.imagineering.cc`, `chat.enspyr.co`) still
+> build-on-host from an rsync'd tree; cutting them over to pull-based updates is a
+> one-time deploy, not yet done.
 
 ## Testing
 

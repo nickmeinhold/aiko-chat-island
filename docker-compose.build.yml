@@ -1,0 +1,19 @@
+# Build-from-source overlay for the island.
+#
+# By default docker-compose.yml PULLS the published image
+# (ghcr.io/nickmeinhold/aiko-chat-island). Overlay this file to build that image
+# locally from THIS checkout instead — for a fork, an unreleased change, or an
+# air-gapped host that can't reach GHCR:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+#
+# Only `chat-island` carries `build:`. All three aiko roles share ONE image tag,
+# so building it once produces the exact tag `registrar` and `chat` reference —
+# compose builds every image before starting any container, so they find it
+# locally and never try to pull. (standup.sh --from-source wires this for you.)
+name: aiko
+
+services:
+  chat-island:
+    build: .
+    image: ghcr.io/nickmeinhold/aiko-chat-island:${ISLAND_VERSION:-edge}

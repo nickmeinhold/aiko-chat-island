@@ -20,11 +20,16 @@
 #     file-backed SQLite too now, so dev matches prod; deploy pins the absolute
 #     /data path here.
 #
-#  3. IMAGE — the three mesh roles share `aiko-bridge:latest`, built from
-#     github.com/nickmeinhold/aiko-chat-bridge (the role is chosen by `command`).
-#     On imagineering the image is already present. A NEW island host must build
-#     it first: `git clone …/aiko-chat-bridge && docker build -t aiko-bridge:latest
-#     aiko-chat-bridge` (or pull a pinned tag from a registry).
+#  3. IMAGE — ONE image runs the whole island. The gateway image already bundles
+#     aiko_services + aiko_chat, so it serves all three aiko roles by `command:`
+#     override: the gateway (default entrypoint), the registrar (`aiko_registrar`),
+#     and the ChatServer (`chat_start.sh`). It is published multi-arch (amd64 +
+#     arm64) at ghcr.io/nickmeinhold/aiko-chat-island by CI on every push/tag, so a
+#     new island just PULLS it — nothing to build on the host. Pin a version with
+#     ISLAND_VERSION (default `edge`, which tracks main). To build from source
+#     instead, overlay docker-compose.build.yml (see that file). The old
+#     aiko-bridge image is gone: aiko-chat-bridge is the Matrix bridge, which an
+#     island does not run.
 #
 # The gateway port publish binds 127.0.0.1 only — Caddy reverse-proxies
 # localhost:8095 and terminates TLS. The broker publishes NO host port (internal
@@ -38,8 +43,9 @@ name: aiko
 
 services:
   chat-island:
-    build: .
-    image: aiko-chat-island:latest
+    # Published multi-arch by CI; pull, don't build (build-from-source overlay:
+    # docker-compose.build.yml). ISLAND_VERSION pins the tag (default: edge=main).
+    image: ghcr.io/nickmeinhold/aiko-chat-island:${ISLAND_VERSION:-edge}
     restart: always
     # Reachable by Caddy on the host loopback; never exposed off-host directly.
     ports:
@@ -136,7 +142,7 @@ services:
       - mosquitto_data:/mosquitto/data
 
   registrar:
-    image: aiko-bridge:latest
+    image: ghcr.io/nickmeinhold/aiko-chat-island:${ISLAND_VERSION:-edge}
     restart: always
     environment:
       AIKO_MQTT_HOST: mosquitto
@@ -146,7 +152,7 @@ services:
       - mosquitto
 
   chat:
-    image: aiko-bridge:latest
+    image: ghcr.io/nickmeinhold/aiko-chat-island:${ISLAND_VERSION:-edge}
     restart: always
     environment:
       AIKO_MQTT_HOST: mosquitto
