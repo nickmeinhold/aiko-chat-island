@@ -2,17 +2,17 @@
 #
 # standup.sh — stand up a brand-new aiko island on a fresh host.
 #
-# An "island" is a complete, self-contained aiko mesh: the gateway (this repo) +
-# its own mosquitto broker, registrar, and ChatServer. This script closes the
-# three gaps the compose file deliberately leaves open on a fresh host, then
-# brings the whole stack (and optional TLS) up:
+# An "island" is a complete, self-contained aiko mesh: 4 containers (the gateway
+# from this repo + its own mosquitto broker, registrar, and ChatServer) from ONE
+# published image plus stock mosquitto. This script:
 #
-#   1. builds the `aiko-bridge:latest` image (compose references it but can't
-#      build it — no registry; it comes from the aiko-chat-bridge repo),
-#   2. creates the `external` `aiko_data` volume (the SQLite store's stable home),
-#   3. writes a production `.env` with a freshly-generated strong JWT secret and
+#   1. creates the `external` `aiko_data` volume (the SQLite store's stable home),
+#   2. writes a production `.env` with a freshly-generated strong JWT secret and
 #      this island's identity (domain, display name, optional federation peers),
-#   then `docker compose up -d --build`, brings up Caddy for HTTPS, and verifies.
+#   3. PULLS the published image and starts the stack (no build — the gateway image
+#      serves all three aiko roles by command override; `--from-source` builds it
+#      from this checkout instead),
+#   4. brings up Caddy for HTTPS (skippable) and verifies.
 #
 # Design goal (from docker-compose.yml): "one script, and it just works." Safe to
 # re-run — it never rotates an existing JWT secret and skips work already done.
@@ -29,6 +29,7 @@
 #   --seed-peers <json>   JSON array of {"id","display_name","base_url"} to federate with
 #   --enable-passkeys     advertise passkey sign-in (only after well-known files serve; see guide)
 #   --no-tls              skip the bundled Caddy step (you run your own reverse proxy)
+#   --from-source         build the island image from this checkout instead of pulling
 #   --yes                 non-interactive; fail instead of prompting for missing values
 
 set -euo pipefail
@@ -47,9 +48,7 @@ cd "$REPO_ROOT"
 [ -f docker-compose.yml ] || die "docker-compose.yml not found in $REPO_ROOT — run from the aiko-chat-island checkout"
 
 # --- defaults + arg parsing -------------------------------------------------
-DOMAIN=""; DISPLAY_NAME=""; SEED_PEERS="[]"; ENABLE_PASSKEYS="false"; DO_TLS="true"; INTERACTIVE="true"
-BRIDGE_REPO="https://github.com/nickmeinhold/aiko-chat-bridge.git"
-BRIDGE_IMAGE="aiko-bridge:latest"
+DOMAIN=""; DISPLAY_NAME=""; SEED_PEERS="[]"; ENABLE_PASSKEYS="false"; DO_TLS="true"; INTERACTIVE="true"; FROM_SOURCE="false"
 DATA_VOLUME="aiko_data"
 
 while [ $# -gt 0 ]; do
@@ -59,6 +58,7 @@ while [ $# -gt 0 ]; do
     --seed-peers)     SEED_PEERS="${2:-[]}"; shift 2 ;;
     --enable-passkeys) ENABLE_PASSKEYS="true"; shift ;;
     --no-tls)         DO_TLS="false"; shift ;;
+    --from-source)    FROM_SOURCE="true"; shift ;;
     --yes)            INTERACTIVE="false"; shift ;;
     -h|--help)        sed -n '2,/^set -euo/p' "$0" | sed 's/^# \{0,1\}//;/^set -euo/d'; exit 0 ;;
     *)                die "unknown argument: $1 (see --help)" ;;
@@ -85,7 +85,7 @@ BASE_URL="https://$DOMAIN"
 # --- preflight: required tools ---------------------------------------------
 log "Preflight — checking required tools"
 need() { command -v "$1" >/dev/null 2>&1 || die "missing required tool: $1"; }
-need docker; need git; need openssl; need curl
+need docker; need openssl; need curl
 docker compose version >/dev/null 2>&1 || die "docker compose v2 not available (need the 'docker compose' plugin)"
 docker info >/dev/null 2>&1 || die "cannot talk to the Docker daemon (is it running? are you in the docker group?)"
 ok "docker, git, openssl, curl, docker compose present"
@@ -105,22 +105,8 @@ else
   warn "Could not confirm DNS (resolved='$dom_ip' host_ip='$host_ip'). Ensure $DOMAIN -> this host before trusting HTTPS."
 fi
 
-# --- step 1: build the aiko-bridge image (broker roles) if missing ----------
-log "Step 1/5 — aiko-bridge image ($BRIDGE_IMAGE)"
-if docker image inspect "$BRIDGE_IMAGE" >/dev/null 2>&1; then
-  ok "$BRIDGE_IMAGE already present — skipping build"
-else
-  build_dir="$(mktemp -d)"
-  trap 'rm -rf "$build_dir"' EXIT
-  log "cloning $BRIDGE_REPO"
-  git clone --depth 1 "$BRIDGE_REPO" "$build_dir/aiko-chat-bridge"
-  log "building $BRIDGE_IMAGE (this pulls aiko_services + aiko_chat — a few minutes)"
-  docker build -t "$BRIDGE_IMAGE" "$build_dir/aiko-chat-bridge"
-  ok "built $BRIDGE_IMAGE"
-fi
-
-# --- step 2: external data volume ------------------------------------------
-log "Step 2/5 — persistent data volume ($DATA_VOLUME)"
+# --- step 1: external data volume ------------------------------------------
+log "Step 1/4 — persistent data volume ($DATA_VOLUME)"
 if docker volume inspect "$DATA_VOLUME" >/dev/null 2>&1; then
   ok "volume $DATA_VOLUME already exists — leaving it (never re-created; it holds the DB)"
 else
@@ -128,8 +114,8 @@ else
   ok "created external volume $DATA_VOLUME"
 fi
 
-# --- step 3: write the production .env --------------------------------------
-log "Step 3/5 — writing .env (island identity + secrets)"
+# --- step 2: write the production .env --------------------------------------
+log "Step 2/4 — writing .env (island identity + secrets)"
 ENV_FILE="$REPO_ROOT/.env"
 
 # Preserve an existing JWT secret across re-runs — rotating it invalidates every
@@ -173,9 +159,15 @@ EOF
 chmod 600 "$ENV_FILE"
 ok "wrote $ENV_FILE (mode 600)"
 
-# --- step 4: bring the island up -------------------------------------------
-log "Step 4/5 — docker compose up -d --build (gateway + broker + registrar + ChatServer)"
-docker compose up -d --build
+# --- step 3: bring the island up (4 containers, 1 image + stock mosquitto) ---
+if [ "$FROM_SOURCE" = "true" ]; then
+  log "Step 3/4 — building the island image from source + starting (gateway + broker + registrar + ChatServer)"
+  docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+else
+  log "Step 3/4 — pulling the published island image + starting (gateway + broker + registrar + ChatServer)"
+  docker compose pull
+  docker compose up -d
+fi
 ok "compose stack started"
 
 log "waiting for the gateway to pass its health check (migrate-then-serve)…"
@@ -194,7 +186,7 @@ fi
 
 # --- step 5: TLS via Caddy (optional) --------------------------------------
 if [ "$DO_TLS" = "true" ]; then
-  log "Step 5/5 — TLS reverse proxy (Caddy, host network)"
+  log "Step 4/4 — TLS reverse proxy (Caddy, host network)"
   caddy_env="$SCRIPT_DIR/caddy/.env"
   printf 'ISLAND_DOMAIN=%s\n' "$DOMAIN" > "$caddy_env"
   docker compose -f "$SCRIPT_DIR/caddy/docker-compose.caddy.yml" up -d
@@ -213,7 +205,7 @@ if [ "$DO_TLS" = "true" ]; then
     warn "https://$DOMAIN/health not answering yet. Check: DNS points here, ports 80+443 open, then: docker compose -f deploy/caddy/docker-compose.caddy.yml logs"
   fi
 else
-  log "Step 5/5 — TLS skipped (--no-tls). Point your own proxy at 127.0.0.1:8095."
+  log "Step 4/4 — TLS skipped (--no-tls). Point your own proxy at 127.0.0.1:8095."
 fi
 
 # --- done -------------------------------------------------------------------

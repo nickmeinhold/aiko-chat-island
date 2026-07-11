@@ -51,10 +51,11 @@ in a preflight step — it fails early and tells you what's missing.
 
 That's the whole thing. In a few minutes you'll have:
 
-- the **aiko-bridge image** built (broker roles),
 - a persistent **data volume** created,
 - a production **`.env`** written with a freshly-generated strong JWT secret,
-- the **gateway + broker + registrar + ChatServer** running,
+- the **official island image pulled** (multi-arch) and the **gateway + broker +
+  registrar + ChatServer** running — four containers from one image plus stock
+  mosquitto, nothing built on the host,
 - **Caddy** terminating TLS with an auto-provisioned Let's Encrypt certificate,
 
 and the script will print `https://chat.example.org/health is live 🎉` once it has
@@ -73,25 +74,26 @@ Run `./deploy/standup.sh --help` for every flag.
 
 ## What the script does
 
-The compose file is deliberately **not** self-sufficient on a fresh host — it
-references an image it can't build and a volume that must pre-exist. The script
-closes those gaps and does nothing magic; every step is one you could run by hand
-(see [Manual standup](#manual-standup-no-script)).
+An island is **four containers from one image** — the gateway, and its own broker,
+registrar, and ChatServer — plus stock `mosquitto`. The gateway image
+(`ghcr.io/nickmeinhold/aiko-chat-island`, published multi-arch by CI) already
+bundles `aiko_services` + `aiko_chat`, so it serves all three aiko roles by
+`command:` override. The script does nothing magic; every step is one you could run
+by hand (see [Manual standup](#manual-standup-no-script)).
 
 | Step | What | Why it's needed |
 |---|---|---|
-| Preflight | check tools + DNS | fail early, not halfway through a build |
-| 1 | build `aiko-bridge:latest` from the [`aiko-chat-bridge`](https://github.com/nickmeinhold/aiko-chat-bridge) repo | the broker/registrar/ChatServer roles run from this image; there's no registry, so it's built locally |
-| 2 | `docker volume create aiko_data` | the SQLite store's home is declared `external` in compose (decoupled from the project name so a rename never empties it) — external volumes must exist before `up` |
-| 3 | write `.env` | island identity (domain, display name, peers) + a **generated ≥32-char JWT secret**. `ENVIRONMENT` is left unset on purpose — absence means *production*, which fail-closes the boot unless a strong secret is present |
-| 4 | `docker compose up -d --build` | `--build` is mandatory — without it compose recreates from a stale image and ships nothing while exiting 0. The container migrates the DB to head, then serves |
-| 5 | bring up Caddy | TLS termination + reverse proxy to `127.0.0.1:8095`, in its own stack so it never collides with an existing proxy |
+| Preflight | check tools + DNS | fail early, not halfway through |
+| 1 | `docker volume create aiko_data` | the SQLite store's home is declared `external` in compose (decoupled from the project name so a rename never empties it) — external volumes must exist before `up` |
+| 2 | write `.env` | island identity (domain, display name, peers) + a **generated ≥32-char JWT secret**. `ENVIRONMENT` is left unset on purpose — absence means *production*, which fail-closes the boot unless a strong secret is present |
+| 3 | `docker compose pull && up -d` | pulls the official image and starts all four containers. No `--build` — nothing is built on the host. (Want to build from your own checkout instead? `--from-source`.) The container migrates the DB to head, then serves |
+| 4 | bring up Caddy | TLS termination + reverse proxy to `127.0.0.1:8095`, in its own stack so it never collides with an existing proxy |
 
 Two safety properties worth knowing:
 
-- **It's idempotent.** Re-running skips the image build and volume creation if they
-  already exist, and it **never rotates an existing JWT secret** (that would sign
-  out every user). Safe to re-run to change the display name or add peers.
+- **It's idempotent.** Re-running skips volume creation if it already exists, and it
+  **never rotates an existing JWT secret** (that would sign out every user). Safe to
+  re-run to change the display name or add peers.
 - **The secret never leaves the host.** `.env` is written mode `600` and is
   gitignored. There is no phone-home.
 
@@ -179,11 +181,14 @@ sole-copy prod DB".
 ## Re-running, upgrading, tearing down
 
 ```bash
+# UPDATE to the latest published image — backup -> pull -> recreate -> verify:
+./deploy/update.sh                              # the safe path (fail-closed on backup)
+
 # change display name / add peers / flip a flag — safe, keeps data + secret:
 ./deploy/standup.sh --domain chat.example.org --name "New Name" --seed-peers '[…]'
 
-# pull new gateway code and redeploy (from the updated checkout):
-git pull && docker compose up -d --build        # --build is MANDATORY
+# pin a specific version instead of tracking `edge` (main):
+ISLAND_VERSION=v0.1.0 ./deploy/update.sh        # or set ISLAND_VERSION in .env
 
 # stop the island (data volume survives — `down` without -v keeps volumes):
 docker compose down
@@ -193,6 +198,11 @@ docker compose -f deploy/caddy/docker-compose.caddy.yml down
 docker compose down && docker volume rm aiko_data
 ```
 
+`update.sh` is the recommended update path: it hot-copies the sole-copy SQLite
+store to `backups/` **before** touching the stack (aborting if the backup doesn't
+land), then `docker compose pull && up -d`, then verifies `/health`. Add
+`--from-source` to build from your checkout instead of pulling.
+
 ---
 
 ## Manual standup (no script)
@@ -201,14 +211,10 @@ If you'd rather run the steps yourself (or debug one), this is exactly what the
 script automates:
 
 ```bash
-# 1. build the broker-roles image
-git clone --depth 1 https://github.com/nickmeinhold/aiko-chat-bridge.git
-docker build -t aiko-bridge:latest aiko-chat-bridge
-
-# 2. create the external data volume
+# 1. create the external data volume
 docker volume create aiko_data
 
-# 3. write .env (production: NO ENVIRONMENT line; strong secret required)
+# 2. write .env (production: NO ENVIRONMENT line; strong secret required)
 cat > .env <<EOF
 JWT_SECRET=$(openssl rand -hex 32)
 GATEWAY_BASE_URL=https://chat.example.org
@@ -219,11 +225,14 @@ PASSKEY_ENABLED=false
 EOF
 chmod 600 .env
 
-# 4. bring up the island (migrates then serves)
-docker compose up -d --build
+# 3. pull the official image + bring up the island (migrates then serves).
+#    All four containers run from this one image (bar stock mosquitto).
+docker compose pull && docker compose up -d
 curl -s http://127.0.0.1:8095/health         # {"status":"ok",...}
+#    (build from THIS checkout instead of pulling:)
+#    docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 
-# 5. TLS
+# 4. TLS
 echo "ISLAND_DOMAIN=chat.example.org" > deploy/caddy/.env
 docker compose -f deploy/caddy/docker-compose.caddy.yml up -d
 curl -s https://chat.example.org/health      # via Caddy + Let's Encrypt
@@ -238,9 +247,26 @@ curl -s https://chat.example.org/health      # via Caddy + Let's Encrypt
 | `JWT_SECRET required` at boot | `.env` missing or secret too short | the script generates one; if hand-writing, use `openssl rand -hex 32` |
 | Container restarts / `/health` never answers | migration failed, or bad config | `docker compose logs chat-island` — the entrypoint migrates before serving and fails closed |
 | HTTPS never comes up | DNS not pointing here yet, or 80/443 blocked | confirm `getent hosts chat.example.org` = this host's IP; open 80+443 in the cloud SG **and** on-box firewall; `docker compose -f deploy/caddy/docker-compose.caddy.yml logs` |
-| `image aiko-bridge:latest not found` | build step skipped/failed | re-run the script, or build manually (step 1 above) |
+| image pull fails / `manifest unknown` | wrong/absent `ISLAND_VERSION` tag | default is `edge`; pin a real tag (`ISLAND_VERSION=v0.1.0`) or build locally with `--from-source` |
 | App picker doesn't show my island | seed peers not mutual | the *other* island's operator must add your entry too |
 | Passkey sign-in starts then dies | advertised before well-known files valid | set `PASSKEY_ENABLED=false`, fix `/.well-known`, re-verify, re-enable |
+
+### FAQ
+
+**I already run mosquitto / Postgres / Redis / something on this host — will it clash?**
+No. The island is **hermetic**: its broker publishes no host port, the gateway
+binds only `127.0.0.1:8095`, and its store is a named Docker volume. It never
+reaches for a host resource, so there's nothing to collide with. Your existing
+services are untouched, and the island brings its own broker invisibly. (Reusing
+*your* broker isn't supported on purpose — the island's isolated broker is what
+keeps it an independent, self-contained node.)
+
+**I already run Caddy / nginx / Traefik on this host — do I have to use the bundled Caddy?**
+No — run the script with `--no-tls` and point your existing proxy at
+`127.0.0.1:8095` (add a vhost / `reverse_proxy`). The reverse proxy is the one
+piece it makes sense to reuse; it lives *outside* the sealed island for exactly
+that reason. Everything else (gateway, broker, registrar, ChatServer) is the
+island's own and isn't shared.
 
 For the deep operational details (deploy invariants, DB backup/restore, passkey
 device e2e), see [`deploy-passkeys-runbook.md`](deploy-passkeys-runbook.md) and the
