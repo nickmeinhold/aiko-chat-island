@@ -15,11 +15,20 @@ file is the working-context that isn't obvious from the code.
   and report that as your gate — but green-locally ≠ green-on-CI: a fresh
   low-uptime CI runner surfaced a `time.monotonic()` JWKS bug that passed on
   high-uptime dev boxes (#64). Local pytest is the habit; CI is the confirmation.
-- **Deploy is manual `docker compose up -d --build` over ssh** — no pipeline.
-  `--build` is mandatory (image is `build: .`, no registry); without it you ship
-  the stale image and exit 0. Back up the DB first (slim image has no `sqlite3`
-  CLI → use Python `.backup()`; see `docs/deploy-passkeys-runbook.md`). Two live
-  islands: `chat.imagineering.cc`, `chat.enspyr.co`.
+- **Deploy is PULL-BASED over ssh** (since the 2026-07-11 standup pipeline; the
+  old "`docker compose up -d --build`" model is DEAD for the islands). The live
+  islands run a published, version-pinned image
+  (`ghcr.io/nickmeinhold/aiko-chat-island:${ISLAND_VERSION}`, pinned in each box's
+  `.env`) — there is NO `build:` on the box, so `--build` is wrong here. Ship a fix:
+  merge → cut a `vX.Y.Z` tag (CI `release.yml` publishes the multi-arch image; `edge`
+  tracks `main`) → bump the box's `ISLAND_VERSION` pin → `deploy/update.sh`
+  (backup-first fail-closed → `compose pull && up -d` → verify `/health`). Verify the
+  RUNNING container's image ref, not this doc, for the live mechanism. Slim image has
+  no `sqlite3` CLI → Python `.backup()` (`update.sh` does it). See
+  `docs/deploy-passkeys-runbook.md`. Two live islands: `chat.imagineering.cc`
+  (`~/apps/aiko-chat-gateway`), `chat.enspyr.co` (`~/apps/aiko-chat-gateway`, `ssh
+  nick-mel`, `sudo -n docker`). NOTE: imagineering's separate `matrix-*` stack is
+  still the old build-on-host model — don't conflate it with the island.
 - **Alembic is the sole schema authority.** `alembic history` must show a SINGLE
   head — two `0006`s merge clean in git but wedge boot (mergeable ≠ correct).
   SQLite is blind to some ALTERs; hand-edit migrations via `batch_alter_table`.
