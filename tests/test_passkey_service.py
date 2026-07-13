@@ -28,6 +28,15 @@ async def test_start_registration_returns_state_and_webauthn_options(session):
     assert base64url_to_bytes(out["state"]) == base64url_to_bytes(opts["challenge"])
 
 
+async def test_start_registration_user_handle_within_android_limit(session):
+    # The WebAuthn user handle must be <= 32 bytes: py_webauthn defaults it to the
+    # spec MAXIMUM (64 bytes) when user_id is omitted, and Android's Credential
+    # Manager rejects a 64-byte handle at the boundary with TYPE_DATA_ERROR (#1957).
+    out = await passkey_service.start_registration(session)
+    handle = base64url_to_bytes(out["options"]["user"]["id"])
+    assert len(handle) <= 32, f"user.id is {len(handle)} bytes; Android rejects > 32"
+
+
 async def test_start_authentication_is_usernameless(session):
     out = await passkey_service.start_authentication(session)
     opts = out["options"]

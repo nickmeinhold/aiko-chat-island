@@ -147,10 +147,18 @@ async def start_registration(session: AsyncSession) -> dict:
     # OS passkey list) — distinct from the account handle, which register/finish
     # auto-generates when it creates the account (create_passkey_account). A random
     # provisional name here just avoids collisions in that OS list.
+    #
+    # user_id is the WebAuthn user HANDLE. It is EPHEMERAL here: we never persist it
+    # and authenticate looks credentials up by credential_id, so its only constraint
+    # is the spec's 1..64-byte range. py_webauthn's default (when user_id is omitted)
+    # is generate_user_handle() = 64 bytes — the spec MAXIMUM — which Android's
+    # Credential Manager rejects at the boundary with TYPE_DATA_ERROR (#1957). Pin an
+    # explicit 16-byte handle (22 base64url chars, well under Android's limit).
     options = webauthn.generate_registration_options(
         rp_id=settings.passkey_rp_id,
         rp_name=settings.passkey_rp_name,
         user_name=f"aiko-{secrets.token_hex(4)}",
+        user_id=secrets.token_bytes(16),
         challenge=raw,
         authenticator_selection=AuthenticatorSelectionCriteria(
             resident_key=ResidentKeyRequirement.REQUIRED,
