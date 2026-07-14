@@ -90,19 +90,46 @@ docker compose version >/dev/null 2>&1 || die "docker compose v2 not available (
 docker info >/dev/null 2>&1 || die "cannot talk to the Docker daemon (is it running? are you in the docker group?)"
 ok "docker, git, openssl, curl, docker compose present"
 
-# --- preflight: DNS advisory (does the domain point here?) ------------------
-log "Preflight — DNS advisory for $DOMAIN"
-host_ip="$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null || true)"
-dom_ip="$(getent hosts "$DOMAIN" 2>/dev/null | awk '{print $1; exit}' || true)"
-if [ -n "$host_ip" ] && [ -n "$dom_ip" ]; then
-  if [ "$host_ip" = "$dom_ip" ]; then
-    ok "$DOMAIN resolves to this host ($host_ip)"
+# --- preflight: TLS preconditions (only when we run the bundled Caddy) -------
+# Both checks below matter ONLY under the bundled Caddy; --no-tls means the
+# operator brings their own proxy, so neither DNS-points-here nor ports-80/443-free
+# is our concern.
+if [ "$DO_TLS" = "true" ]; then
+  # DNS advisory (does the domain point here?)
+  log "Preflight — DNS advisory for $DOMAIN"
+  host_ip="$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null || true)"
+  dom_ip="$(getent hosts "$DOMAIN" 2>/dev/null | awk '{print $1; exit}' || true)"
+  if [ -n "$host_ip" ] && [ -n "$dom_ip" ]; then
+    if [ "$host_ip" = "$dom_ip" ]; then
+      ok "$DOMAIN resolves to this host ($host_ip)"
+    else
+      warn "$DOMAIN resolves to $dom_ip but this host's public IP is $host_ip."
+      warn "TLS issuance will fail until the A record points here. Continuing (fix DNS before relying on HTTPS)."
+    fi
   else
-    warn "$DOMAIN resolves to $dom_ip but this host's public IP is $host_ip."
-    warn "TLS issuance will fail until the A record points here. Continuing (fix DNS before relying on HTTPS)."
+    warn "Could not confirm DNS (resolved='$dom_ip' host_ip='$host_ip'). Ensure $DOMAIN -> this host before trusting HTTPS."
   fi
-else
-  warn "Could not confirm DNS (resolved='$dom_ip' host_ip='$host_ip'). Ensure $DOMAIN -> this host before trusting HTTPS."
+
+  # Port advisory. The bundled Caddy uses network_mode: host and binds 80+443 for
+  # ACME — but with host networking docker can't detect the clash at create time,
+  # so a pre-existing Caddy/nginx/Apache lets `up -d` report success while Caddy
+  # crash-loops, surfacing only as an opaque "https not answering" 30s later. Catch
+  # it here and name the escape (--no-tls). SKIP when OUR OWN Caddy from a prior run
+  # holds the ports (idempotent re-run must not self-abort).
+  ours_caddy="$(docker compose -f "$SCRIPT_DIR/caddy/docker-compose.caddy.yml" ps -q caddy 2>/dev/null || true)"
+  if [ -z "$ours_caddy" ]; then
+    if command -v ss >/dev/null 2>&1; then
+      if ss -ltnH 2>/dev/null | awk '{n=split($4,a,":"); print a[n]}' | grep -qxE '80|443'; then
+        die "port 80 and/or 443 is already in use (an existing Caddy/nginx/Apache?).
+     The bundled Caddy binds them for Let's Encrypt and would crash-loop. Either stop
+     the other proxy, or re-run with --no-tls and point your existing proxy at
+     127.0.0.1:8095 (the gateway's local publish)."
+      fi
+      ok "ports 80 + 443 are free for the bundled Caddy"
+    else
+      warn "could not check ports 80/443 (no 'ss' on PATH); if another proxy is running, re-run with --no-tls."
+    fi
+  fi
 fi
 
 # --- step 1: external data volume ------------------------------------------
