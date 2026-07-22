@@ -178,6 +178,40 @@ footer{
 footer a{color:var(--signal); text-decoration:none}
 footer a:hover{text-decoration:underline}
 
+/* ---- tour / play mode ---- */
+.tour-btn{
+  margin-top:10px; background:var(--beacon); color:#fff; border:none; cursor:pointer;
+  font-family:var(--font-mono); font-size:12px; letter-spacing:.18em; text-transform:uppercase;
+  padding:13px 26px; border-radius:999px; font-weight:600;
+  box-shadow:0 6px 20px -8px var(--beacon); transition:transform .2s, box-shadow .2s;
+}
+:root[data-theme="dark"] .tour-btn,
+@media (prefers-color-scheme:dark){.tour-btn{color:#0a1720}}
+.tour-btn:hover{transform:translateY(-2px); box-shadow:0 10px 26px -8px var(--beacon)}
+.tour-btn:focus-visible{outline:2px solid var(--signal); outline-offset:3px}
+.tour-ctl{
+  position:fixed; right:clamp(16px,4vw,40px); bottom:26px; z-index:6;
+  display:none; align-items:center; gap:12px;
+  background:var(--bg-panel); border:1px solid var(--line); border-radius:999px;
+  padding:8px 10px 8px 16px; box-shadow:0 8px 30px -12px rgba(0,0,0,.5);
+}
+.tour-ctl.show{display:flex}
+.tour-ctl .lbl{font-family:var(--font-mono); font-size:11px; letter-spacing:.14em;
+  text-transform:uppercase; color:var(--text-dim)}
+.tour-ctl button{
+  width:34px; height:34px; border-radius:50%; border:1px solid var(--line);
+  background:transparent; color:var(--text); cursor:pointer; font-size:13px;
+  display:flex; align-items:center; justify-content:center;
+}
+.tour-ctl button:hover{border-color:var(--beacon); color:var(--beacon)}
+.tour-ctl button:focus-visible{outline:2px solid var(--signal); outline-offset:2px}
+.tour-bar{
+  position:fixed; left:0; bottom:0; height:3px; width:0%; z-index:7;
+  background:var(--beacon); box-shadow:0 0 12px var(--beacon); display:none;
+}
+.tour-bar.show{display:block}
+body.rec .topbar,body.rec .rail,body.rec .tour-ctl,body.rec .scrollcue{display:none !important}
+
 /* svg helpers */
 .sea-fill{fill:var(--sea)}
 .sea-fill-2{fill:var(--sea-2)}
@@ -211,6 +245,12 @@ footer a:hover{text-decoration:underline}
   <a href="#end" data-dot="end" aria-label="Closing"></a>
 </nav>
 
+<div class="tour-bar" id="tourBar"></div>
+<div class="tour-ctl" id="tourCtl">
+  <span class="lbl" id="tourLbl">Tour</span>
+  <button id="tourToggle" aria-label="Pause or resume tour">&#10073;&#10073;</button>
+</div>
+
 <div class="wrap">
 
   <!-- HERO -->
@@ -227,7 +267,8 @@ footer a:hover{text-decoration:underline}
     <p class="eyebrow">A six-scene explainer</p>
     <h1>Who goes there?</h1>
     <p class="sub">How a network of self-run islands can know who you are &mdash; with no giant company vouching for anyone.</p>
-    <div class="scrollcue">Scroll to set sail<span></span></div>
+    <button class="tour-btn" id="tourBtn">&#9654;&ensp;Play the tour</button>
+    <div class="scrollcue">or scroll to explore<span></span></div>
   </header>
 
   <!-- SCENE 1 -->
@@ -500,6 +541,77 @@ footer a:hover{text-decoration:underline}
       });
     }, {threshold:0.5});
     lio.observe(ledger);
+  }
+
+  /* ---- self-playing tour ---- */
+  var TOUR = [
+    {id:"hero", ms:5000}, {id:"s1", ms:11000}, {id:"s2", ms:10000},
+    {id:"s3", ms:10000}, {id:"s4", ms:12500}, {id:"s5", ms:10000},
+    {id:"s6", ms:11000}, {id:"end", ms:8000}
+  ];
+  var TOTAL = TOUR.reduce(function(a,s){return a+s.ms;},0);
+  var tourBtn=document.getElementById("tourBtn"),
+      tourCtl=document.getElementById("tourCtl"),
+      tourBar=document.getElementById("tourBar"),
+      tourToggle=document.getElementById("tourToggle"),
+      tourLbl=document.getElementById("tourLbl");
+  var tState={i:0, paused:false, timer:null, stepStart:0, remaining:0, elapsedBefore:0, playing:false};
+  window.__tourDone=false;
+
+  function fmtLbl(i){ return i>=TOUR.length ? "Done" : (i===0?"Opening":(i===TOUR.length-1?"Closing":"Scene "+i)); }
+  function setBar(frac, ms){
+    tourBar.style.transition = ms ? ("width "+ms+"ms linear") : "none";
+    tourBar.style.width = (frac*100).toFixed(2)+"%";
+  }
+  function runStep(){
+    if(tState.i>=TOUR.length){ finishTour(); return; }
+    var step=TOUR[tState.i];
+    var el=document.getElementById(step.id);
+    if(el) el.scrollIntoView({behavior: reduce?"auto":"smooth", block: step.id==="hero"||step.id==="end"?"center":"center"});
+    tourLbl.textContent=fmtLbl(tState.i);
+    setBar((tState.elapsedBefore+step.ms)/TOTAL, step.ms);
+    tState.stepStart=Date.now(); tState.remaining=step.ms;
+    tState.timer=setTimeout(function(){
+      tState.elapsedBefore+=step.ms; tState.i++; runStep();
+    }, step.ms);
+  }
+  function startTour(){
+    tState.i=0; tState.elapsedBefore=0; tState.paused=false; tState.playing=true;
+    window.__tourDone=false;
+    tourCtl.classList.add("show"); tourBar.classList.add("show");
+    tourToggle.innerHTML="&#10073;&#10073;";
+    setBar(0,0);
+    runStep();
+  }
+  function finishTour(){
+    tState.playing=false; setBar(1,400);
+    tourLbl.textContent="Done"; tourToggle.innerHTML="&#8635;";
+    window.__tourDone=true;
+  }
+  function pauseTour(){
+    if(!tState.playing||tState.paused) return;
+    tState.paused=true; clearTimeout(tState.timer);
+    tState.remaining -= (Date.now()-tState.stepStart);
+    var frozen=(tState.elapsedBefore+(TOUR[tState.i].ms-tState.remaining))/TOTAL;
+    setBar(frozen,0); tourToggle.innerHTML="&#9654;"; tourLbl.textContent="Paused";
+  }
+  function resumeTour(){
+    if(!tState.playing||!tState.paused) return;
+    tState.paused=false; tourToggle.innerHTML="&#10073;&#10073;";
+    tourLbl.textContent=fmtLbl(tState.i);
+    setBar((tState.elapsedBefore+TOUR[tState.i].ms)/TOTAL, tState.remaining);
+    tState.stepStart=Date.now();
+    tState.timer=setTimeout(function(){ tState.elapsedBefore+=TOUR[tState.i].ms; tState.i++; runStep(); }, tState.remaining);
+  }
+  if(tourBtn) tourBtn.addEventListener("click", startTour);
+  if(tourToggle) tourToggle.addEventListener("click", function(){
+    if(!tState.playing || tState.i>=TOUR.length){ startTour(); return; }
+    tState.paused ? resumeTour() : pauseTour();
+  });
+  var params=new URLSearchParams(location.search);
+  if(params.get("rec")==="1") document.body.classList.add("rec");
+  if(params.get("tour")==="1" || params.get("rec")==="1"){
+    setTimeout(startTour, 800);
   }
 
   /* ambient sea shimmer */
