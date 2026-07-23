@@ -209,6 +209,7 @@ footer a:hover{text-decoration:underline}
   <a href="#s3" data-dot="s3" aria-label="Scene 3"></a>
   <a href="#s4" data-dot="s4" aria-label="Scene 4"></a>
   <a href="#s5" data-dot="s5" aria-label="Scene 5"></a>
+  <a href="#s6" data-dot="s6" aria-label="Scene 6"></a>
   <a href="#end" data-dot="end" aria-label="Closing"></a>
 </nav>
 
@@ -229,9 +230,9 @@ footer a:hover{text-decoration:underline}
       <path d="M133 44 A18 18 0 0 1 133 66" fill="none" class="signal-st" stroke-width="1.6"/>
       <path d="M107 44 A18 18 0 0 0 107 66" fill="none" class="signal-st" stroke-width="1.6"/>
     </svg>
-    <p class="eyebrow">A five-scene explainer</p>
+    <p class="eyebrow">A six-scene explainer</p>
     <h1>The radio room</h1>
-    <p class="sub">You hold a key to the island&rsquo;s front door &mdash; and never to its radio. That isn&rsquo;t a gap in the design. It <em>is</em> the design.</p>
+    <p class="sub">Follow a single message from your hands to a friend&rsquo;s &mdash; carried across the island by its harbourmaster, who does the one job you never have to.</p>
     <div class="scrollcue">Scroll to explore<span></span></div>
   </header>
 
@@ -239,39 +240,38 @@ footer a:hover{text-decoration:underline}
   <section class="scene" id="s1">
     <div class="copy reveal">
       <div class="scene-num">Scene 01</div>
-      <h2>You never key the radio yourself</h2>
+      <h2>You hand it to the harbourmaster</h2>
       <span class="voice-label">The idea</span>
-      <p class="voice">Picture arriving at the island. You walk up to a desk at the shore and speak to the harbourmaster: send this message, join that room. What you <em>don&rsquo;t</em> do is stride into the radio room out back and key the transmitter yourself. You never touch it. You tell the harbourmaster, and the island puts your words on the air for you.</p>
-      <div class="takeaway"><b>What that maps to:</b> people talk to the gateway over ordinary web traffic <span class="k">(HTTP / WebSocket)</span> &mdash; the desk at the shore. The island&rsquo;s private message bus <span class="k">(MQTT)</span> is the radio. The app never touches it. The gateway is the one voice speaking on the bus, on everyone&rsquo;s behalf.</div>
+      <p class="voice">It begins with you, at the shore, with something to say &mdash; &ldquo;hi Andy.&rdquo; You step up to the desk and hand your message to the island&rsquo;s harbourmaster. From here it&rsquo;s theirs to carry: they know every berth on the island, they know which one is Andy&rsquo;s, and they&rsquo;ll see your words the rest of the way. You arrived holding a message; you leave having simply handed it across.</p>
+      <div class="takeaway"><b>What that maps to:</b> your app speaks to the gateway over ordinary web traffic <span class="k">(HTTP / WebSocket)</span> &mdash; the desk at the shore. The gateway is the harbourmaster: the island&rsquo;s one carrier, who takes your message and moves it onward. You bring it to the island&rsquo;s edge; the island takes it from there.</div>
     </div>
     <div class="stage reveal" aria-hidden="true">
-      <svg viewBox="0 0 320 300" role="img" aria-label="A visitor at a shore desk speaking to a harbourmaster, who relays into a sealed radio room behind">
+      <svg viewBox="0 0 320 300" role="img" aria-label="You handing your message to the harbourmaster at a shore desk, with the island's berths where people live behind">
         <path class="sea-fill-2" d="M0 250 Q80 238 160 250 T320 250 V300 H0 Z"/>
         <path class="sea-fill" d="M0 240 Q80 228 160 240 T320 240 V300 H0 Z"/>
-        <!-- visitor -->
-        <circle cx="46" cy="150" r="12" class="ink-dim"/>
-        <path d="M30 190 Q46 164 62 190 Z" class="ink-dim"/>
-        <text x="46" y="210" text-anchor="middle" class="mono" font-size="9" fill="var(--text-dim)">you</text>
-        <!-- request arrow -->
-        <path d="M66 152 L104 152" fill="none" class="signal-st" stroke-width="2" marker-end="url(#a1)"/>
-        <text x="86" y="142" text-anchor="middle" class="mono" font-size="8" fill="var(--signal)">HTTP / WS</text>
+        <!-- the island behind, where people live -->
+        <path class="ink" d="M150 240 Q235 150 320 240 Z" opacity=".16"/>
+        <g class="mono" font-size="8" fill="var(--text-dim)" text-anchor="middle">
+          <rect x="208" y="206" width="12" height="9" class="ink-dim"/><path d="M207 206 l7 -9 7 9 z" class="ink-dim"/><text x="214" y="228">Andy</text>
+          <rect x="252" y="198" width="12" height="9" class="ink-dim" opacity=".7"/><path d="M251 198 l7 -9 7 9 z" class="ink-dim" opacity=".7"/><text x="258" y="220" opacity=".7">others</text>
+          <circle cx="294" cy="206" r="6" class="signalf"/><text x="294" y="224">keeper</text>
+        </g>
+        <!-- you -->
+        <circle cx="40" cy="150" r="12" class="ink-dim"/>
+        <path d="M24 190 Q40 164 56 190 Z" class="ink-dim"/>
+        <text x="40" y="210" text-anchor="middle" class="mono" font-size="9" fill="var(--text-dim)">you</text>
+        <!-- the note being handed over -->
+        <rect x="68" y="145" width="16" height="12" rx="2" class="panelf" stroke="var(--beacon)" stroke-width="1.6"/>
+        <path d="M71 149 h10 M71 153 h7" stroke="var(--beacon)" stroke-width="1"/>
+        <path d="M90 151 L110 151" fill="none" class="signal-st" stroke-width="2" marker-end="url(#a1)"/>
+        <text x="100" y="142" text-anchor="middle" class="mono" font-size="8" fill="var(--signal)">HTTP / WS</text>
         <defs><marker id="a1" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 z" class="signalf"/></marker></defs>
         <!-- shore desk / harbourmaster -->
-        <rect x="112" y="120" width="86" height="96" rx="9" class="panelf" stroke="var(--line)" stroke-width="1.6"/>
-        <text x="155" y="140" text-anchor="middle" class="mono" font-size="8.5" fill="var(--text-dim)" letter-spacing="1">THE DESK</text>
-        <circle cx="155" cy="164" r="11" class="beacon"/>
-        <path d="M140 200 Q155 176 170 200 Z" class="beacon"/>
-        <text x="155" y="212" text-anchor="middle" class="mono" font-size="8.5" fill="var(--beacon)">gateway</text>
-        <!-- relay arrow into radio room -->
-        <path d="M200 152 L234 152" fill="none" class="signal-st" stroke-width="2" marker-end="url(#a1)"/>
-        <!-- sealed radio room -->
-        <rect x="240" y="112" width="66" height="112" rx="8" fill="none" class="linef" stroke-width="2" stroke-dasharray="5 4"/>
-        <text x="273" y="130" text-anchor="middle" class="mono" font-size="8" fill="var(--text-dim)" letter-spacing="1">RADIO</text>
-        <line x1="273" y1="176" x2="273" y2="140" stroke="var(--text)" stroke-width="2"/>
-        <path d="M266 150 L273 140 L280 150" fill="none" stroke="var(--text)" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
-        <circle cx="273" cy="138" r="2.6" class="beacon"/>
-        <path d="M285 143 A13 13 0 0 1 285 159" fill="none" class="signal-st" stroke-width="1.3"/>
-        <text x="273" y="200" text-anchor="middle" class="mono" font-size="8" fill="var(--text-dim)">crew only</text>
+        <rect x="116" y="120" width="92" height="98" rx="9" class="panelf" stroke="var(--line)" stroke-width="1.6"/>
+        <text x="162" y="140" text-anchor="middle" class="mono" font-size="8.5" fill="var(--text-dim)" letter-spacing="1">THE DESK</text>
+        <circle cx="162" cy="166" r="12" class="beacon"/>
+        <path d="M146 204 Q162 178 178 204 Z" class="beacon"/>
+        <text x="162" y="214" text-anchor="middle" class="mono" font-size="8" fill="var(--beacon)">harbourmaster</text>
       </svg>
     </div>
   </section>
@@ -280,9 +280,47 @@ footer a:hover{text-decoration:underline}
   <section class="scene flip" id="s2">
     <div class="copy reveal">
       <div class="scene-num">Scene 02</div>
+      <h2>Carried to Andy&rsquo;s berth &mdash; not called across the water</h2>
+      <span class="voice-label">The idea</span>
+      <p class="voice">So how does it reach him? The harbourmaster carries it inland, hands it to the island&rsquo;s record-keeper to write down, and walks it out to Andy&rsquo;s own berth on the far shore, where it&rsquo;s put straight into his hands. It goes to <em>him</em>. What they never do is climb the mast and call your message out across the whole harbour on the open channel, for every passing boat to catch. It&rsquo;s carried and delivered &mdash; addressed to a person, not thrown to the wind.</p>
+      <div class="takeaway"><b>What that maps to:</b> the gateway routes your message to the specific people it&rsquo;s meant for, over their own connections &mdash; delivered and addressed, never posted to an open channel for anyone to overhear.</div>
+    </div>
+    <div class="stage reveal" aria-hidden="true">
+      <svg viewBox="0 0 320 300" role="img" aria-label="Above: the harbourmaster carrying a note along a path to Andy's berth. Below: shouting the message across the whole harbour, crossed out">
+        <path class="sea-fill-2" d="M0 250 Q80 238 160 250 T320 250 V300 H0 Z"/>
+        <path class="sea-fill" d="M0 240 Q80 228 160 240 T320 240 V300 H0 Z"/>
+        <!-- TOP: what does happen — carried to Andy -->
+        <text x="160" y="34" text-anchor="middle" class="mono" font-size="8.5" fill="var(--signal)" letter-spacing="1.2">CARRIED TO ANDY</text>
+        <circle cx="42" cy="82" r="10" class="beacon"/>
+        <rect x="52" y="76" width="12" height="9" rx="1.5" class="panelf" stroke="var(--beacon)" stroke-width="1.4"/>
+        <path d="M60 94 Q150 122 244 92" fill="none" class="signal-st" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#a2)"/>
+        <defs><marker id="a2" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 z" class="signalf"/></marker></defs>
+        <rect x="252" y="86" width="12" height="10" class="ink-dim"/><path d="M251 86 l7 -10 7 10 z" class="ink-dim"/>
+        <text x="258" y="112" text-anchor="middle" class="mono" font-size="8.5" fill="var(--text)">Andy</text>
+        <!-- divider -->
+        <path d="M28 148 H292" class="linef" stroke-width="1" stroke-dasharray="3 5"/>
+        <!-- BOTTOM: what doesn't — shouted over open water -->
+        <text x="160" y="174" text-anchor="middle" class="mono" font-size="8.5" fill="var(--text-dim)" letter-spacing="1.2">NOT CALLED OVER OPEN WATER</text>
+        <line x1="160" y1="238" x2="160" y2="196" stroke="var(--text-dim)" stroke-width="2"/>
+        <circle cx="160" cy="194" r="3" class="ink-dim"/>
+        <path d="M171 200 A15 15 0 0 1 171 224" fill="none" class="linef" stroke-width="1.4"/>
+        <path d="M186 196 A25 25 0 0 1 186 230" fill="none" class="linef" stroke-width="1.1"/>
+        <path d="M149 200 A15 15 0 0 0 149 224" fill="none" class="linef" stroke-width="1.4"/>
+        <path d="M134 196 A25 25 0 0 0 134 230" fill="none" class="linef" stroke-width="1.1"/>
+        <path d="M64 228 l14 0 -3 7 -8 0 z" class="ink-dim" opacity=".45"/>
+        <path d="M242 228 l14 0 -3 7 -8 0 z" class="ink-dim" opacity=".45"/>
+        <line x1="122" y1="236" x2="198" y2="188" class="alerts" stroke-width="3" stroke-linecap="round"/>
+      </svg>
+    </div>
+  </section>
+
+  <!-- SCENE 3 -->
+  <section class="scene" id="s3">
+    <div class="copy reveal">
+      <div class="scene-num">Scene 03</div>
       <h2>Two locks people mistake for one</h2>
       <span class="voice-label">The idea</span>
-      <p class="voice">Someone asks, sensibly enough, &ldquo;shouldn&rsquo;t we put a lock on the radio, so only the right people get on the air?&rdquo; It sounds like one lock. It&rsquo;s really two, quietly wearing the same coat. One lock decides which of the island&rsquo;s own machines may key the radio at all. A completely different lock decides which <em>people</em> belong to the community. Different door, different key, different keyholder.</p>
+      <p class="voice">Now a fair question: &ldquo;shouldn&rsquo;t we put a lock on that radio, so only the right people get on the air?&rdquo; It sounds like one lock. It&rsquo;s really two, quietly wearing the same coat. One decides which of the island&rsquo;s own machines may key the radio at all. A completely different one decides which <em>people</em> belong to the community &mdash; the question the harbourmaster settles right at the desk. Different door, different key, different keyholder.</p>
       <div class="takeaway"><b>The split that matters:</b> lock one is <b>letting a service onto the bus</b> &mdash; the island&rsquo;s own gateway, room-keeper and directory presenting credentials to the broker. Lock two is <b>letting a person into the community</b> &mdash; handled up at the desk, over the web. Tangle them together and you can&rsquo;t build either well.</div>
     </div>
     <div class="stage reveal" aria-hidden="true">
@@ -317,14 +355,14 @@ footer a:hover{text-decoration:underline}
     </div>
   </section>
 
-  <!-- SCENE 3 -->
-  <section class="scene" id="s3">
+  <!-- SCENE 4 -->
+  <section class="scene flip" id="s4">
     <div class="copy reveal">
-      <div class="scene-num">Scene 03</div>
-      <h2>The radio room has no door to the sea</h2>
+      <div class="scene-num">Scene 04</div>
+      <h2>Today the radio only reaches its own crew</h2>
       <span class="voice-label">The idea</span>
-      <p class="voice">Here&rsquo;s why the radio&rsquo;s lock isn&rsquo;t urgent yet. Today the room has no door to the outside world at all &mdash; you cannot reach the transmitter from a boat, from the next island, from anywhere off this patch of land. The only ones who can key it are the island&rsquo;s own three machines, standing right there inside. So the room being unlocked is genuinely safe: there&rsquo;s no way in to walk through.</p>
-      <div class="takeaway"><b>Grounded in the wiring:</b> the broker exposes no outside port &mdash; it&rsquo;s reachable only within the island. Its only clients are three co-located, trusted services. So <span class="k">allow_anonymous</span> being on is safe <em>while the room stays sealed</em>. The note is blunt that this is a comfort of today, not a law.</div>
+      <p class="voice">So about that lock on the radio. Today the transmitter reaches exactly three listeners: the island&rsquo;s own record-keeper, its directory, and the harbourmaster &mdash; all standing together in one room. It answers to no one off the island, because there is nowhere off the island to call in from. So an unlocked radio is genuinely safe right now: the only hands that can reach it are already trusted, already inside.</p>
+      <div class="takeaway"><b>Grounded in the wiring:</b> the broker exposes no outside port &mdash; it&rsquo;s reachable only within the island, and its only clients are three co-located, trusted services. So <span class="k">allow_anonymous</span> being on is safe <em>while the room stays sealed</em>. A comfort of today, not a law.</div>
     </div>
     <div class="stage reveal" aria-hidden="true">
       <svg viewBox="0 0 320 300" role="img" aria-label="A sealed radio room holding three trusted machines, with a solid wall and no opening toward the sea">
@@ -347,19 +385,19 @@ footer a:hover{text-decoration:underline}
         <line x1="275" y1="214" x2="275" y2="196" stroke="var(--text-dim)" stroke-width="1.6"/>
         <!-- barred approach -->
         <path d="M252 150 L262 208" fill="none" class="alerts" stroke-width="2" stroke-dasharray="4 4"/>
-        <text x="252" y="230" text-anchor="middle" class="mono" font-size="8" fill="var(--text-dim)">no way in from the sea</text>
+        <text x="252" y="230" text-anchor="middle" class="mono" font-size="8" fill="var(--text-dim)">nowhere to call in from</text>
       </svg>
     </div>
   </section>
 
-  <!-- SCENE 4 -->
-  <section class="scene flip" id="s4">
+  <!-- SCENE 5 -->
+  <section class="scene" id="s5">
     <div class="copy reveal">
-      <div class="scene-num">Scene 04</div>
-      <h2>The hole opens when two islands wire up</h2>
+      <div class="scene-num">Scene 05</div>
+      <h2>The lock starts to matter when two islands wire up</h2>
       <span class="voice-label">The idea</span>
-      <p class="voice">So when does the lock start to matter? Not when a person shows up &mdash; they were always going to the desk. It matters the day two islands run a cable between their radio rooms so they can talk. <em>That</em> link is the first time the transmitter faces open water. A neighbouring island &mdash; or something pretending to be one &mdash; could reach in. The real danger was never a stranger at your door; it&rsquo;s an island on the other end of a wire.</p>
-      <div class="takeaway"><b>Where the threat actually lives:</b> it&rsquo;s island-to-island, not person-to-bus &mdash; a federation link between gateways and brokers that doesn&rsquo;t exist yet. Leaving the radio open is a latent hole a future neighbour could exploit. That&rsquo;s why fitting the crew&rsquo;s lock <em>before</em> the first cable is the honest, cheap move.</div>
+      <p class="voice">So when does that lock earn its keep? The day two islands run a cable between their radio rooms so they can talk. <em>That</em> link is the first time the transmitter faces open water &mdash; and a neighbouring island, or something pretending to be one, could reach in. The danger was never a person at your door; they were always going to the desk. It&rsquo;s an island on the other end of a wire.</p>
+      <div class="takeaway"><b>Where the threat actually lives:</b> it&rsquo;s island-to-island, not person-to-bus &mdash; a federation link between gateways and brokers that doesn&rsquo;t exist yet. Leaving the radio open would be a latent hole a future neighbour could exploit. That&rsquo;s why fitting the crew&rsquo;s lock <em>before</em> the first cable is the honest, cheap move.</div>
     </div>
     <div class="stage reveal" id="federateStage" aria-hidden="true">
       <svg viewBox="0 0 320 300" role="img" aria-label="Two islands linking their radio rooms by a cable across open water, a lock waiting to be fitted on the link">
@@ -390,10 +428,10 @@ footer a:hover{text-decoration:underline}
     </div>
   </section>
 
-  <!-- SCENE 5 -->
-  <section class="scene" id="s5">
+  <!-- SCENE 6 -->
+  <section class="scene flip" id="s6">
     <div class="copy reveal">
-      <div class="scene-num">Scene 05</div>
+      <div class="scene-num">Scene 06</div>
       <h2>Fit the crew&rsquo;s lock first</h2>
       <span class="voice-label">The idea</span>
       <p class="voice">That leaves two jobs of very different size. The small, buildable one: give the island&rsquo;s own three machines a proper key to the radio and turn the lock &mdash; done from the island&rsquo;s own settings, ready before the first cable. The big one: making <em>you</em> a full voice on the radio in your own right, keying it yourself. That&rsquo;s a deeper rebuild of how the whole thing is shaped, and it waits on work still coming from upstream.</p>
@@ -476,7 +514,7 @@ footer a:hover{text-decoration:underline}
       }
     });
   }, {threshold:0.5});
-  ["hero","s1","s2","s3","s4","s5","end"].forEach(function(id){
+  ["hero","s1","s2","s3","s4","s5","s6","end"].forEach(function(id){
     var el=document.getElementById(id); if(el) spy.observe(el);
   });
 
