@@ -240,7 +240,7 @@ footer a:hover{text-decoration:underline}
     <div class="copy reveal">
       <div class="scene-num">Scene 01</div>
       <h2>You never key the radio yourself</h2>
-      <span class="voice-label">Voiceover</span>
+      <span class="voice-label">The idea</span>
       <p class="voice">Picture arriving at the island. You walk up to a desk at the shore and speak to the harbourmaster: send this message, join that room. What you <em>don&rsquo;t</em> do is stride into the radio room out back and key the transmitter yourself. You never touch it. You tell the harbourmaster, and the island puts your words on the air for you.</p>
       <div class="takeaway"><b>What that maps to:</b> people talk to the gateway over ordinary web traffic <span class="k">(HTTP / WebSocket)</span> &mdash; the desk at the shore. The island&rsquo;s private message bus <span class="k">(MQTT)</span> is the radio. The app never touches it. The gateway is the one voice speaking on the bus, on everyone&rsquo;s behalf.</div>
     </div>
@@ -281,7 +281,7 @@ footer a:hover{text-decoration:underline}
     <div class="copy reveal">
       <div class="scene-num">Scene 02</div>
       <h2>Two locks people mistake for one</h2>
-      <span class="voice-label">Voiceover</span>
+      <span class="voice-label">The idea</span>
       <p class="voice">Someone asks, sensibly enough, &ldquo;shouldn&rsquo;t we put a lock on the radio, so only the right people get on the air?&rdquo; It sounds like one lock. It&rsquo;s really two, quietly wearing the same coat. One lock decides which of the island&rsquo;s own machines may key the radio at all. A completely different lock decides which <em>people</em> belong to the community. Different door, different key, different keyholder.</p>
       <div class="takeaway"><b>The split that matters:</b> lock one is <b>letting a service onto the bus</b> &mdash; the island&rsquo;s own gateway, room-keeper and directory presenting credentials to the broker. Lock two is <b>letting a person into the community</b> &mdash; handled up at the desk, over the web. Tangle them together and you can&rsquo;t build either well.</div>
     </div>
@@ -322,7 +322,7 @@ footer a:hover{text-decoration:underline}
     <div class="copy reveal">
       <div class="scene-num">Scene 03</div>
       <h2>The radio room has no door to the sea</h2>
-      <span class="voice-label">Voiceover</span>
+      <span class="voice-label">The idea</span>
       <p class="voice">Here&rsquo;s why the radio&rsquo;s lock isn&rsquo;t urgent yet. Today the room has no door to the outside world at all &mdash; you cannot reach the transmitter from a boat, from the next island, from anywhere off this patch of land. The only ones who can key it are the island&rsquo;s own three machines, standing right there inside. So the room being unlocked is genuinely safe: there&rsquo;s no way in to walk through.</p>
       <div class="takeaway"><b>Grounded in the wiring:</b> the broker exposes no outside port &mdash; it&rsquo;s reachable only within the island. Its only clients are three co-located, trusted services. So <span class="k">allow_anonymous</span> being on is safe <em>while the room stays sealed</em>. The note is blunt that this is a comfort of today, not a law.</div>
     </div>
@@ -357,7 +357,7 @@ footer a:hover{text-decoration:underline}
     <div class="copy reveal">
       <div class="scene-num">Scene 04</div>
       <h2>The hole opens when two islands wire up</h2>
-      <span class="voice-label">Voiceover</span>
+      <span class="voice-label">The idea</span>
       <p class="voice">So when does the lock start to matter? Not when a person shows up &mdash; they were always going to the desk. It matters the day two islands run a cable between their radio rooms so they can talk. <em>That</em> link is the first time the transmitter faces open water. A neighbouring island &mdash; or something pretending to be one &mdash; could reach in. The real danger was never a stranger at your door; it&rsquo;s an island on the other end of a wire.</p>
       <div class="takeaway"><b>Where the threat actually lives:</b> it&rsquo;s island-to-island, not person-to-bus &mdash; a federation link between gateways and brokers that doesn&rsquo;t exist yet. Leaving the radio open is a latent hole a future neighbour could exploit. That&rsquo;s why fitting the crew&rsquo;s lock <em>before</em> the first cable is the honest, cheap move.</div>
     </div>
@@ -395,7 +395,7 @@ footer a:hover{text-decoration:underline}
     <div class="copy reveal">
       <div class="scene-num">Scene 05</div>
       <h2>Fit the crew&rsquo;s lock first</h2>
-      <span class="voice-label">Voiceover</span>
+      <span class="voice-label">The idea</span>
       <p class="voice">That leaves two jobs of very different size. The small, buildable one: give the island&rsquo;s own three machines a proper key to the radio and turn the lock &mdash; done from the island&rsquo;s own settings, ready before the first cable. The big one: making <em>you</em> a full voice on the radio in your own right, keying it yourself. That&rsquo;s a deeper rebuild of how the whole thing is shaped, and it waits on work still coming from upstream.</p>
       <div class="takeaway"><b>Buildable now vs the north star:</b> close <span class="k">allow_anonymous</span> and have the services present credentials &mdash; small, and shipped from the repo the way the rest of the setup is. Making a person a first-class bus peer is the aspiration, aligned with aiko&rsquo;s own native model, and it lands on its own timeline &mdash; not before.</div>
     </div>
