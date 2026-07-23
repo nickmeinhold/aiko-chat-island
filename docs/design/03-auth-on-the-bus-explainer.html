@@ -143,6 +143,11 @@ body{
 }
 .takeaway b{color:var(--text); font-weight:600}
 .k{font-family:var(--font-mono); font-size:.86em; color:var(--beacon)}
+.realname{margin-top:12px; padding-top:11px; border-top:1px solid var(--line);
+  font-family:var(--font-mono); font-size:.8rem; line-height:1.55; color:var(--text-dim)}
+.realname b{display:block; color:var(--signal); font-weight:600; font-size:.68rem;
+  letter-spacing:.16em; text-transform:uppercase; margin-bottom:5px}
+.realname .t{color:var(--beacon)}
 
 /* reveal */
 .reveal{opacity:0; transform:translateY(26px); transition:opacity .8s ease, transform .8s ease}
@@ -243,7 +248,9 @@ footer a:hover{text-decoration:underline}
       <h2>You hand it to the harbourmaster</h2>
       <span class="voice-label">The idea</span>
       <p class="voice">It begins with you, at the shore, with something to say &mdash; &ldquo;hi Andy.&rdquo; You step up to the desk and hand your message to the island&rsquo;s harbourmaster. From here it&rsquo;s theirs to carry: they know every berth on the island, they know which one is Andy&rsquo;s, and they&rsquo;ll see your words the rest of the way. You arrived holding a message; you leave having simply handed it across.</p>
-      <div class="takeaway"><b>What that maps to:</b> your app speaks to the gateway over ordinary web traffic <span class="k">(HTTP / WebSocket)</span> &mdash; the desk at the shore. The gateway is the harbourmaster: the island&rsquo;s one carrier, who takes your message and moves it onward. You bring it to the island&rsquo;s edge; the island takes it from there.</div>
+      <div class="takeaway"><b>What that maps to:</b> your app speaks to the gateway over ordinary web traffic <span class="k">(HTTP / WebSocket)</span> &mdash; the desk at the shore. The gateway is the harbourmaster: the island&rsquo;s one carrier, who takes your message and moves it onward. You bring it to the island&rsquo;s edge; the island takes it from there.
+        <div class="realname"><b>The real machinery</b>Client &harr; gateway over <span class="t">HTTP / WebSocket</span> &mdash; the gateway is the sole participant on the internal bus.</div>
+      </div>
     </div>
     <div class="stage reveal" aria-hidden="true">
       <svg viewBox="0 0 320 300" role="img" aria-label="You handing your message to the harbourmaster at a shore desk, with the island's berths where people live behind">
@@ -283,7 +290,9 @@ footer a:hover{text-decoration:underline}
       <h2>Carried to Andy&rsquo;s berth &mdash; not called across the water</h2>
       <span class="voice-label">The idea</span>
       <p class="voice">So how does it reach him? The harbourmaster carries it inland, hands it to the island&rsquo;s record-keeper to write down, and walks it out to Andy&rsquo;s own berth on the far shore, where it&rsquo;s put straight into his hands. It goes to <em>him</em>. What they never do is climb the mast and call your message out across the whole harbour on the open channel, for every passing boat to catch. It&rsquo;s carried and delivered &mdash; addressed to a person, not thrown to the wind.</p>
-      <div class="takeaway"><b>What that maps to:</b> the gateway routes your message to the specific people it&rsquo;s meant for, over their own connections &mdash; delivered and addressed, never posted to an open channel for anyone to overhear.</div>
+      <div class="takeaway"><b>What that maps to:</b> the gateway routes your message to the specific people it&rsquo;s meant for, over their own connections &mdash; delivered and addressed, never posted to an open channel for anyone to overhear.
+        <div class="realname"><b>The real machinery</b>Delivered to recipients over their own WS connections &mdash; the <span class="t">MQTT</span> bus is internal transport between the island&rsquo;s services, not a public broadcast.</div>
+      </div>
     </div>
     <div class="stage reveal" aria-hidden="true">
       <svg viewBox="0 0 320 300" role="img" aria-label="Above: the harbourmaster carrying a note along a path to Andy's berth. Below: shouting the message across the whole harbour, crossed out">
@@ -321,7 +330,9 @@ footer a:hover{text-decoration:underline}
       <h2>Two locks people mistake for one</h2>
       <span class="voice-label">The idea</span>
       <p class="voice">Now a fair question: &ldquo;shouldn&rsquo;t we put a lock on that radio, so only the right people get on the air?&rdquo; It sounds like one lock. It&rsquo;s really two, quietly wearing the same coat. One decides which of the island&rsquo;s own machines may key the radio at all. A completely different one decides which <em>people</em> belong to the community &mdash; the question the harbourmaster settles right at the desk. Different door, different key, different keyholder.</p>
-      <div class="takeaway"><b>The split that matters:</b> lock one is <b>letting a service onto the bus</b> &mdash; the island&rsquo;s own gateway, room-keeper and directory presenting credentials to the broker. Lock two is <b>letting a person into the community</b> &mdash; handled up at the desk, over the web. Tangle them together and you can&rsquo;t build either well.</div>
+      <div class="takeaway"><b>The split that matters:</b> lock one is <b>letting a service onto the bus</b> &mdash; the island&rsquo;s own gateway, room-keeper and directory presenting credentials to the broker. Lock two is <b>letting a person into the community</b> &mdash; handled up at the desk, over the web. Tangle them together and you can&rsquo;t build either well.
+        <div class="realname"><b>The real machinery</b>Two boundaries: <span class="t">service&rarr;broker auth (MQTT credentials)</span> vs <span class="t">person&rarr;community auth</span> at the gateway, over the web.</div>
+      </div>
     </div>
     <div class="stage reveal" aria-hidden="true">
       <svg viewBox="0 0 320 300" role="img" aria-label="Two very different keys: a radio-room key for a machine, and a front-door key for a person">
@@ -362,7 +373,9 @@ footer a:hover{text-decoration:underline}
       <h2>Today the radio only reaches its own crew</h2>
       <span class="voice-label">The idea</span>
       <p class="voice">So about that lock on the radio. Today the transmitter reaches exactly three listeners: the island&rsquo;s own record-keeper, its directory, and the harbourmaster &mdash; all standing together in one room. It answers to no one off the island, because there is nowhere off the island to call in from. So an unlocked radio is genuinely safe right now: the only hands that can reach it are already trusted, already inside.</p>
-      <div class="takeaway"><b>Grounded in the wiring:</b> the broker exposes no outside port &mdash; it&rsquo;s reachable only within the island, and its only clients are three co-located, trusted services. So <span class="k">allow_anonymous</span> being on is safe <em>while the room stays sealed</em>. A comfort of today, not a law.</div>
+      <div class="takeaway"><b>Grounded in the wiring:</b> the broker exposes no outside port &mdash; it&rsquo;s reachable only within the island, and its only clients are three co-located, trusted services. So <span class="k">allow_anonymous</span> being on is safe <em>while the room stays sealed</em>. A comfort of today, not a law.
+        <div class="realname"><b>The real machinery</b><span class="t">mosquitto</span> binds no external port; only three co-located services connect &mdash; so <span class="t">allow_anonymous</span> is safe only while the bus stays sealed.</div>
+      </div>
     </div>
     <div class="stage reveal" aria-hidden="true">
       <svg viewBox="0 0 320 300" role="img" aria-label="A sealed radio room holding three trusted machines, with a solid wall and no opening toward the sea">
@@ -397,7 +410,9 @@ footer a:hover{text-decoration:underline}
       <h2>The lock starts to matter when two islands wire up</h2>
       <span class="voice-label">The idea</span>
       <p class="voice">So when does that lock earn its keep? The day two islands run a cable between their radio rooms so they can talk. <em>That</em> link is the first time the transmitter faces open water &mdash; and a neighbouring island, or something pretending to be one, could reach in. The danger was never a person at your door; they were always going to the desk. It&rsquo;s an island on the other end of a wire.</p>
-      <div class="takeaway"><b>Where the threat actually lives:</b> it&rsquo;s island-to-island, not person-to-bus &mdash; a federation link between gateways and brokers that doesn&rsquo;t exist yet. Leaving the radio open would be a latent hole a future neighbour could exploit. That&rsquo;s why fitting the crew&rsquo;s lock <em>before</em> the first cable is the honest, cheap move.</div>
+      <div class="takeaway"><b>Where the threat actually lives:</b> it&rsquo;s island-to-island, not person-to-bus &mdash; a federation link between gateways and brokers that doesn&rsquo;t exist yet. Leaving the radio open would be a latent hole a future neighbour could exploit. That&rsquo;s why fitting the crew&rsquo;s lock <em>before</em> the first cable is the honest, cheap move.
+        <div class="realname"><b>The real machinery</b>The real exposure is a future <span class="t">gateway&harr;broker federation link</span> &mdash; island-to-island, not person-to-bus.</div>
+      </div>
     </div>
     <div class="stage reveal" id="federateStage" aria-hidden="true">
       <svg viewBox="0 0 320 300" role="img" aria-label="Two islands linking their radio rooms by a cable across open water, a lock waiting to be fitted on the link">
@@ -435,7 +450,9 @@ footer a:hover{text-decoration:underline}
       <h2>Fit the crew&rsquo;s lock first</h2>
       <span class="voice-label">The idea</span>
       <p class="voice">That leaves two jobs of very different size. The small, buildable one: give the island&rsquo;s own three machines a proper key to the radio and turn the lock &mdash; done from the island&rsquo;s own settings, ready before the first cable. The big one: making <em>you</em> a full voice on the radio in your own right, keying it yourself. That&rsquo;s a deeper rebuild of how the whole thing is shaped, and it waits on work still coming from upstream.</p>
-      <div class="takeaway"><b>Buildable now vs the north star:</b> close <span class="k">allow_anonymous</span> and have the services present credentials &mdash; small, and shipped from the repo the way the rest of the setup is. Making a person a first-class bus peer is the aspiration, aligned with aiko&rsquo;s own native model, and it lands on its own timeline &mdash; not before.</div>
+      <div class="takeaway"><b>Buildable now vs the north star:</b> close <span class="k">allow_anonymous</span> and have the services present credentials &mdash; small, and shipped from the repo the way the rest of the setup is. Making a person a first-class bus peer is the aspiration, aligned with aiko&rsquo;s own native model, and it lands on its own timeline &mdash; not before.
+        <div class="realname"><b>The real machinery</b>Buildable now: <span class="t">allow_anonymous=false</span> + a repo-committed <span class="t">password_file / acl_file</span>. User-as-bus-peer is the upstream-gated north star.</div>
+      </div>
     </div>
     <div class="stage reveal" aria-hidden="true">
       <svg viewBox="0 0 320 300" role="img" aria-label="A near lock being fitted now, and a distant lighthouse marked north star for making a person a full radio peer">
