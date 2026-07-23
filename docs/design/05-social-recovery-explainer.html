@@ -143,6 +143,11 @@ body{
 }
 .takeaway b{color:var(--text); font-weight:600}
 .k{font-family:var(--font-mono); font-size:.86em; color:var(--beacon)}
+.realname{margin-top:12px; padding-top:11px; border-top:1px solid var(--line);
+  font-family:var(--font-mono); font-size:.8rem; line-height:1.55; color:var(--text-dim)}
+.realname b{display:block; color:var(--signal); font-weight:600; font-size:.68rem;
+  letter-spacing:.16em; text-transform:uppercase; margin-bottom:5px}
+.realname .t{color:var(--beacon)}
 
 /* reveal */
 .reveal{opacity:0; transform:translateY(26px); transition:opacity .8s ease, transform .8s ease}
@@ -241,7 +246,9 @@ footer a:hover{text-decoration:underline}
       <h2>Lose the key, and the island sinks</h2>
       <span class="voice-label">The idea</span>
       <p class="voice">Here is the scariest question in a world where your identity is a key only you hold. What happens the day you lose it? There&rsquo;s no company that kept a copy, no &ldquo;forgot my password&rdquo; link, no support desk to email. The old safety net was always someone <em>else</em> holding a spare. Take that away, and normally the island just&hellip; goes under. For good.</p>
-      <div class="takeaway"><b>Why it&rsquo;s real:</b> whoever can put a fresh key on your account effectively <em>becomes</em> you. So &ldquo;how do you get back in?&rdquo; is the same dangerous power as &ldquo;how does a stranger take you over?&rdquo; &mdash; one door, two visitors. Design 05 is about who gets to open it.</div>
+      <div class="takeaway"><b>Why it&rsquo;s real:</b> whoever can put a fresh key on your account effectively <em>becomes</em> you. So &ldquo;how do you get back in?&rdquo; is the same dangerous power as &ldquo;how does a stranger take you over?&rdquo; &mdash; one door, two visitors. Design 05 is about who gets to open it.
+        <div class="realname"><b>The real machinery</b><span class="t">Key-as-identity has no built-in reset</span> &mdash; &ldquo;recover&rdquo; and &ldquo;take over&rdquo; are the same operation; this design is about who may perform it.</div>
+      </div>
     </div>
     <div class="stage reveal anim" aria-hidden="true">
       <svg viewBox="0 0 320 300" role="img" aria-label="An island sunk below the waterline, its flag underwater, a key drifting down, bubbles rising">
@@ -281,7 +288,9 @@ footer a:hover{text-decoration:underline}
       <h2>On a calm day, you hand out spare oars</h2>
       <span class="voice-label">The idea</span>
       <p class="voice">The trick is to build the lifeboat <em>before</em> the storm. On an ordinary day, while everything&rsquo;s fine, you pick a handful of people you trust &mdash; your <em>guardians</em>. Each one holds a little seal that&rsquo;s theirs alone. Not a copy of your key, not a piece of it. Just their own signature, ready to vouch for you if the day ever comes.</p>
-      <div class="takeaway"><b>What the island keeps:</b> only the <em>public print</em> of each guardian&rsquo;s seal &mdash; enough to recognise their signature later, never enough to make it. Your account remembers <span class="k">n guardians and a number k</span>. No master key sits anywhere. Nothing in a vault to steal.</div>
+      <div class="takeaway"><b>What the island keeps:</b> only the <em>public print</em> of each guardian&rsquo;s seal &mdash; enough to recognise their signature later, never enough to make it. Your account remembers <span class="k">n guardians and a number k</span>. No master key sits anywhere. Nothing in a vault to steal.
+        <div class="realname"><b>The real machinery</b>You register <span class="t">n guardians and a threshold k</span> &mdash; the account stores only each guardian&rsquo;s public key; no master secret anywhere.</div>
+      </div>
     </div>
     <div class="stage reveal" aria-hidden="true">
       <svg viewBox="0 0 320 300" role="img" aria-label="Your island in the center handing a small seal to each of four friend-islands around it">
@@ -317,7 +326,9 @@ footer a:hover{text-decoration:underline}
       <h2>Enough oars, and the boat moves</h2>
       <span class="voice-label">The idea</span>
       <p class="voice">Now the day comes: your key is gone. You don&rsquo;t beg a company &mdash; you go to your friends. You show them the <em>new</em> key you want to use, and you ask. Enough of them agreeing <em>together</em> can row you home. Not any one alone &mdash; a lifeboat needs several oars pulling at once, or it just spins in place.</p>
-      <div class="takeaway"><b>How it locks:</b> each guardian signs a <em>fresh</em> approval of <span class="k">this exact rescue</span> &mdash; the specific new key you&rsquo;re installing, not a blank cheque. The island counts them: <span class="k">k of n</span> distinct guardians, or nothing happens. You chose k when you chose your friends. That number is your trust dial.</div>
+      <div class="takeaway"><b>How it locks:</b> each guardian signs a <em>fresh</em> approval of <span class="k">this exact rescue</span> &mdash; the specific new key you&rsquo;re installing, not a blank cheque. The island counts them: <span class="k">k of n</span> distinct guardians, or nothing happens. You chose k when you chose your friends. That number is your trust dial.
+        <div class="realname"><b>The real machinery</b><span class="t">k-of-n guardians</span> each sign an approval of the <em>exact</em> new key &mdash; a threshold over this specific re-key, not a blank cheque.</div>
+      </div>
     </div>
     <div class="stage reveal" id="quorumStage" aria-hidden="true">
       <svg viewBox="0 0 320 300" role="img" aria-label="A lifeboat carrying a rescued flag; three of four oars have rowers pulling, the fourth is empty">
@@ -347,7 +358,9 @@ footer a:hover{text-decoration:underline}
       <h2>The rescue rings a bell first</h2>
       <span class="voice-label">The idea</span>
       <p class="voice">But wait &mdash; what if it wasn&rsquo;t you asking? What if someone leaned on your friends to row <em>them</em> in, pretending to be you? So the rescue never lands the instant the oars agree. It rings a bell and holds at the shoreline for a set time. Every device you still have lights up: &ldquo;a rescue is underway.&rdquo; If it wasn&rsquo;t you, you shout &mdash; and it stops.</p>
-      <div class="takeaway"><b>The safety catch:</b> a valid quorum opens a <span class="k">waiting period</span>, not an instant handover. Your existing devices are notified and can cancel before it finalizes &mdash; and a cancel from a device you still hold <em>always</em> beats the clock. An attacker can&rsquo;t do this quietly, and can&rsquo;t do it fast.</div>
+      <div class="takeaway"><b>The safety catch:</b> a valid quorum opens a <span class="k">waiting period</span>, not an instant handover. Your existing devices are notified and can cancel before it finalizes &mdash; and a cancel from a device you still hold <em>always</em> beats the clock. An attacker can&rsquo;t do this quietly, and can&rsquo;t do it fast.
+        <div class="realname"><b>The real machinery</b>A <span class="t">time-locked waiting period</span> &mdash; existing devices are notified and can veto; on finalize, <span class="t">token_generation</span> bumps to revoke old sessions.</div>
+      </div>
     </div>
     <div class="stage reveal anim" aria-hidden="true">
       <svg viewBox="0 0 320 300" role="img" aria-label="A ringing bell over a waiting-period bar, and a phone showing a cancel button">
@@ -391,7 +404,9 @@ footer a:hover{text-decoration:underline}
       <h2>Why a living crew beats a buried key</h2>
       <span class="voice-label">The idea</span>
       <p class="voice">You might ask: why all this &mdash; why not just lock one master key in a vault somewhere as a backup? Because a buried key is a sitting target. Steal it once, quietly, and you own the account forever, with no one the wiser. A living crew is the opposite: to move it, several real people must act, out in the open, with a delay &mdash; and any one of them can turn and warn you.</p>
-      <div class="takeaway"><b>The heart of it:</b> a stored secret can be taken in <em>silence</em>; a live quorum cannot. Recovery here always means <span class="k">asking real friends</span>, so it can never happen without someone noticing. That&rsquo;s the whole reason friends beat a vault &mdash; not convenience, but that silence is impossible.</div>
+      <div class="takeaway"><b>The heart of it:</b> a stored secret can be taken in <em>silence</em>; a live quorum cannot. Recovery here always means <span class="k">asking real friends</span>, so it can never happen without someone noticing. That&rsquo;s the whole reason friends beat a vault &mdash; not convenience, but that silence is impossible.
+        <div class="realname"><b>The real machinery</b>A <span class="t">live approval quorum</span>, not a stored or Shamir-split secret &mdash; a passive secret can be stolen silently; a live quorum can&rsquo;t act without real people noticing.</div>
+      </div>
     </div>
     <div class="stage reveal anim" aria-hidden="true">
       <svg viewBox="0 0 320 300" role="img" aria-label="Two panels: a lone master key in a vault that can be stolen silently, versus a live crew of friends who must all act in the open">

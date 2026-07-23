@@ -143,6 +143,11 @@ body{
 }
 .takeaway b{color:var(--text); font-weight:600}
 .k{font-family:var(--font-mono); font-size:.86em; color:var(--beacon)}
+.realname{margin-top:12px; padding-top:11px; border-top:1px solid var(--line);
+  font-family:var(--font-mono); font-size:.8rem; line-height:1.55; color:var(--text-dim)}
+.realname b{display:block; color:var(--signal); font-weight:600; font-size:.68rem;
+  letter-spacing:.16em; text-transform:uppercase; margin-bottom:5px}
+.realname .t{color:var(--beacon)}
 
 /* reveal */
 .reveal{opacity:0; transform:translateY(26px); transition:opacity .8s ease, transform .8s ease}
@@ -243,7 +248,9 @@ footer a:hover{text-decoration:underline}
       <h2>A map printed once, and trusted forever</h2>
       <span class="voice-label">The idea</span>
       <p class="voice">Picture a harbourmaster with a chart pinned to the wall. It was drawn years ago and never touched since. Meanwhile the sea has gone on living: new coves have opened, others have quietly silted up. When a captain asks &ldquo;what harbours can I sail to?&rdquo;, the harbourmaster reads the one line the old chart happens to show &mdash; and is honestly, confidently wrong about everywhere else.</p>
-      <div class="takeaway"><b>The bug, made plain:</b> the island once carried a chart with a single room hand-written on it &mdash; <span class="k">&ldquo;general&rdquo;</span> &mdash; while the real world already had five. A map printed once and trusted forever is blind to every harbour that appeared after the ink dried.</div>
+      <div class="takeaway"><b>The bug, made plain:</b> the island once carried a chart with a single room hand-written on it &mdash; <span class="k">&ldquo;general&rdquo;</span> &mdash; while the real world already had five. A map printed once and trusted forever is blind to every harbour that appeared after the ink dried.
+        <div class="realname"><b>The real machinery</b>The old failure: a <span class="t">seeded / hardcoded channel list</span> &mdash; blind to topology that changes at runtime.</div>
+      </div>
     </div>
     <div class="stage reveal" aria-hidden="true">
       <svg viewBox="0 0 320 300" role="img" aria-label="A weathered wall chart showing only one harbour, while unmarked coves ripple in the water around it">
@@ -275,7 +282,9 @@ footer a:hover{text-decoration:underline}
       <h2>Don&rsquo;t buy the map &mdash; watch the harbour</h2>
       <span class="voice-label">The idea</span>
       <p class="voice">So the island stops trusting a map someone handed it once. Instead it puts a lookout in the watchtower. Every harbour in these waters calls out its own name on the open air &mdash; a living roll-call the lookout can hear. The island doesn&rsquo;t ask a central office &ldquo;please send me the list.&rdquo; There is no central office. It simply listens, continuously, to what the sea itself announces.</p>
-      <div class="takeaway"><b>The mechanism:</b> the island subscribes to a live announcement stream from the running service-graph &mdash; the rooms broadcast themselves. No hardcoded list, no registry to phone. <span class="k">Watch, don&rsquo;t ask once</span> &mdash; the chart is fed by a stream that never stops arriving.</div>
+      <div class="takeaway"><b>The mechanism:</b> the island subscribes to a live announcement stream from the running service-graph &mdash; the rooms broadcast themselves. No hardcoded list, no registry to phone. <span class="k">Watch, don&rsquo;t ask once</span> &mdash; the chart is fed by a stream that never stops arriving.
+        <div class="realname"><b>The real machinery</b>An <span class="t">event-cache subscription</span> &mdash; <span class="t">ECConsumer(filter=&quot;channel_list&quot;)</span> on the discovered ChatServer. A live stream, not a one-time fetch.</div>
+      </div>
     </div>
     <div class="stage reveal" aria-hidden="true">
       <svg viewBox="0 0 320 300" role="img" aria-label="A watchtower on the island receiving a stream of named signal flags from across the water">
@@ -321,7 +330,9 @@ footer a:hover{text-decoration:underline}
       <h2>A new cove is heard &mdash; so it&rsquo;s inked in</h2>
       <span class="voice-label">The idea</span>
       <p class="voice">The lookout hears a name it hasn&rsquo;t got yet. A new harbour has opened out there. The island doesn&rsquo;t wait for permission or a printing run &mdash; it takes up its own pen and draws the cove straight onto its chart. And if it hears the same name again tomorrow, it doesn&rsquo;t draw a second one on top: the chart already knows that cove, so it just nods.</p>
-      <div class="takeaway"><b>Reconcile, arriving edge:</b> a room announced upstream is <em>added</em> to the island&rsquo;s own records the moment it&rsquo;s heard &mdash; and hearing it twice changes nothing. <span class="k">Add on announce, idempotent on repeat</span>: the map grows to match the world without ever doubling up.</div>
+      <div class="takeaway"><b>Reconcile, arriving edge:</b> a room announced upstream is <em>added</em> to the island&rsquo;s own records the moment it&rsquo;s heard &mdash; and hearing it twice changes nothing. <span class="k">Add on announce, idempotent on repeat</span>: the map grows to match the world without ever doubling up.
+        <div class="realname"><b>The real machinery</b>An <span class="t">idempotent upsert</span> on the add event &mdash; matched by channel name, so re-announcing is a no-op.</div>
+      </div>
     </div>
     <div class="stage reveal" id="inkStage" aria-hidden="true">
       <svg viewBox="0 0 320 300" role="img" aria-label="A pen inking a new cove onto a chart that already holds several named harbours">
@@ -355,7 +366,9 @@ footer a:hover{text-decoration:underline}
       <h2>Struck off only when the harbour is truly gone</h2>
       <span class="voice-label">The idea</span>
       <p class="voice">Now the dangerous edge. Sometimes a name goes quiet. But <em>why</em> it went quiet matters enormously. A passing fog can hide a cove for an afternoon &mdash; and a wise cartographer does not erase a harbour just because he can&rsquo;t see it right now. Only when the sea plainly reports the cove is <em>actually gone</em> does he cross it off &mdash; and tear out its old logbook pages with it.</p>
-      <div class="takeaway"><b>Real removal vs a transient blip:</b> the island strikes a room &mdash; and clears its old messages &mdash; only on a genuine &ldquo;this is gone&rdquo; from a live source. A watchtower briefly losing contact is fog, not news; nothing is erased. <span class="k">Delete on real removal, never on a blink</span> keeps a momentary hiccup from wiping real history.</div>
+      <div class="takeaway"><b>Real removal vs a transient blip:</b> the island strikes a room &mdash; and clears its old messages &mdash; only on a genuine &ldquo;this is gone&rdquo; from a live source. A watchtower briefly losing contact is fog, not news; nothing is erased. <span class="k">Delete on real removal, never on a blink</span> keeps a momentary hiccup from wiping real history.
+        <div class="realname"><b>The real machinery</b><span class="t">hard_delete_channel</span> fires only on a genuine live-remove event &mdash; a dropped connection is not a removal, so nothing cascades on a blip.</div>
+      </div>
     </div>
     <div class="stage reveal anim" aria-hidden="true">
       <svg viewBox="0 0 320 300" role="img" aria-label="Two panels: a fogged-over cove kept on the chart, versus a genuinely removed cove crossed out with its logbook pages torn">
@@ -399,7 +412,9 @@ footer a:hover{text-decoration:underline}
       <h2>Filed by name, and the island&rsquo;s own to keep</h2>
       <span class="voice-label">The idea</span>
       <p class="voice">One last worry. The roll-call out in the harbour can restart from scratch &mdash; a new caller takes over, and hands out fresh numbers to everyone. If the island had filed its coves by <em>number</em>, its whole chart would suddenly point at the wrong places. But it never did. It files every cove by its <em>name</em> &mdash; and the chart is the island&rsquo;s own table, not a copy borrowed from anyone.</p>
-      <div class="takeaway"><b>Why it holds:</b> rooms are keyed by <em>name</em>, and the island owns the chart locally &mdash; so when the upstream caller restarts and re-announces the same names, they land straight back on the existing entries. <span class="k">Keyed by name, owned locally</span> is what keeps the map true across a world that keeps shifting underneath it.</div>
+      <div class="takeaway"><b>Why it holds:</b> rooms are keyed by <em>name</em>, and the island owns the chart locally &mdash; so when the upstream caller restarts and re-announces the same names, they land straight back on the existing entries. <span class="k">Keyed by name, owned locally</span> is what keeps the map true across a world that keeps shifting underneath it.
+        <div class="realname"><b>The real machinery</b>Channels <span class="t">keyed by name in gateway-local SQLite</span> &mdash; the gateway owns identity + history; the ChatServer is a topology source, not the store.</div>
+      </div>
     </div>
     <div class="stage reveal" aria-hidden="true">
       <svg viewBox="0 0 320 300" role="img" aria-label="A chart drawer filed by room name on the island, with a new surveyor re-announcing the same names onto the same drawers">

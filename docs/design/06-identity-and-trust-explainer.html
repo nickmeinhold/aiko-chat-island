@@ -144,6 +144,11 @@ body{
 }
 .takeaway b{color:var(--text); font-weight:600}
 .k{font-family:var(--font-mono); font-size:.86em; color:var(--beacon)}
+.realname{margin-top:12px; padding-top:11px; border-top:1px solid var(--line);
+  font-family:var(--font-mono); font-size:.8rem; line-height:1.55; color:var(--text-dim)}
+.realname b{display:block; color:var(--signal); font-weight:600; font-size:.68rem;
+  letter-spacing:.16em; text-transform:uppercase; margin-bottom:5px}
+.realname .t{color:var(--beacon)}
 
 /* reveal */
 .reveal{opacity:0; transform:translateY(26px); transition:opacity .8s ease, transform .8s ease}
@@ -237,7 +242,9 @@ footer a:hover{text-decoration:underline}
       <h2>The middleman does two jobs</h2>
       <span class="voice-label">The idea</span>
       <p class="voice">When you visit your bank online, a trusted company &mdash; a <em>Certificate Authority</em> &mdash; quietly vouches: &ldquo;yes, this really is your bank.&rdquo; Think of it as a bouncer doing two jobs at once. Job one: checking your ID against a government database, proving you&rsquo;re a specific real person. Job two: remembering your face for the rest of the night, so you&rsquo;re not carded at every door.</p>
-      <div class="takeaway"><b>The move:</b> aiko chat keeps job two &mdash; recognising you again &mdash; but deliberately fires job one. Here a bot is a full citizen, so &ldquo;is there a real human behind this?&rdquo; is the wrong question. The one thing a Certificate Authority is really <em>for</em> is the job aiko chat doesn&rsquo;t want.</div>
+      <div class="takeaway"><b>The move:</b> aiko chat keeps job two &mdash; recognising you again &mdash; but deliberately fires job one. Here a bot is a full citizen, so &ldquo;is there a real human behind this?&rdquo; is the wrong question. The one thing a Certificate Authority is really <em>for</em> is the job aiko chat doesn&rsquo;t want.
+        <div class="realname"><b>The real machinery</b>A <span class="t">Certificate Authority (CA)</span> binds name&rarr;key <em>and</em> vouches personhood &mdash; aiko chat keeps the binding, drops the personhood check.</div>
+      </div>
     </div>
     <div class="stage reveal" aria-hidden="true">
       <svg viewBox="0 0 320 300" role="img" aria-label="A bouncer figure with two clipboards: an ID check crossed out, and face-recognition kept">
@@ -271,7 +278,9 @@ footer a:hover{text-decoration:underline}
       <h2>You <em>are</em> your flag</h2>
       <span class="voice-label">The idea</span>
       <p class="voice">So what replaces the bouncer? Three simple layers. The first: your identity isn&rsquo;t a card someone hands you &mdash; it&rsquo;s a signature only you can make. Picture every island flying a flag that&rsquo;s impossible to forge. To prove the island is yours, you wave the flag. You sign.</p>
-      <div class="takeaway"><b>Why it&rsquo;s solid:</b> there&rsquo;s no &ldquo;real you&rdquo; hiding behind the flag that could be faked, because the flag <em>is</em> the whole story. Hold the key <span class="k">&mdash;&mdash;&#9670;&mdash;&mdash;</span>, and you&rsquo;re the island. That&rsquo;s the entire proof.</div>
+      <div class="takeaway"><b>Why it&rsquo;s solid:</b> there&rsquo;s no &ldquo;real you&rdquo; hiding behind the flag that could be faked, because the flag <em>is</em> the whole story. Hold the key <span class="k">&mdash;&mdash;&#9670;&mdash;&mdash;</span>, and you&rsquo;re the island. That&rsquo;s the entire proof.
+        <div class="realname"><b>The real machinery</b><span class="t">Ed25519 public key</span> &mdash; the key <em>is</em> the principal, the model cryptographers call <span class="t">SPKI/SDSI (RFC&nbsp;2693)</span>. No separate &ldquo;real you&rdquo; to forge.</div>
+      </div>
     </div>
     <div class="stage reveal anim" aria-hidden="true">
       <svg viewBox="0 0 320 300" role="img" aria-label="An island waving its unique flag">
@@ -300,7 +309,9 @@ footer a:hover{text-decoration:underline}
       <h2>Your own private map</h2>
       <span class="voice-label">The idea</span>
       <p class="voice">But flags are long, ugly strings of characters no human can remember. So the second layer is just&hellip; nicknames. Exactly like naming a contact in your phone. On your own private map, you scribble &ldquo;Andy&rdquo; next to his flag.</p>
-      <div class="takeaway"><b>The freedom in it:</b> &ldquo;Andy&rdquo; means that <em>one specific island</em> &mdash; to you. It means nothing to anyone else, and that&rsquo;s the point. No global list of names, no fighting over who gets to be &ldquo;Andy.&rdquo; Just your map, your names.</div>
+      <div class="takeaway"><b>The freedom in it:</b> &ldquo;Andy&rdquo; means that <em>one specific island</em> &mdash; to you. It means nothing to anyone else, and that&rsquo;s the point. No global list of names, no fighting over who gets to be &ldquo;Andy.&rdquo; Just your map, your names.
+        <div class="realname"><b>The real machinery</b>A <span class="t">petname system</span> &mdash; resolves Zooko&rsquo;s Triangle at the system level: names are memorable + secure precisely by being local, never global.</div>
+      </div>
     </div>
     <div class="stage reveal" aria-hidden="true">
       <svg viewBox="0 0 320 300" role="img" aria-label="A hand-drawn map with personal nicknames written beside three islands">
@@ -333,7 +344,9 @@ footer a:hover{text-decoration:underline}
       <h2>The ledger that catches a liar</h2>
       <span class="voice-label">The idea</span>
       <p class="voice">Now the clever part. How do you trust the island handing out these flags isn&rsquo;t lying? The old answer was &ldquo;just trust the authority.&rdquo; aiko chat&rsquo;s answer is better: don&rsquo;t trust it &mdash; <em>watch</em> it. Every claim of &ldquo;this flag belongs to this name&rdquo; gets carved into a public ledger everyone can read and no one can quietly rewrite.</p>
-      <div class="takeaway"><b>The trap springs:</b> if the island tells <em>you</em> one thing and your friend another, both lies now sit on the ledger side by side, for anyone to spot. It stays in charge &mdash; it just can&rsquo;t lie without getting caught. We don&rsquo;t need a middleman you <em>trust</em>. We need one you can <em>catch</em>.</div>
+      <div class="takeaway"><b>The trap springs:</b> if the island tells <em>you</em> one thing and your friend another, both lies now sit on the ledger side by side, for anyone to spot. It stays in charge &mdash; it just can&rsquo;t lie without getting caught. We don&rsquo;t need a middleman you <em>trust</em>. We need one you can <em>catch</em>.
+        <div class="realname"><b>The real machinery</b>A <span class="t">CONIKS-style key-transparency log</span> &mdash; append-only; every binding carries a Merkle consistency proof, so <em>equivocation</em> (telling two people different keys) is self-incriminating.</div>
+      </div>
     </div>
     <div class="stage reveal" id="ledgerStage" aria-hidden="true">
       <svg viewBox="0 0 320 300" role="img" aria-label="A public stone ledger; two contradictory entries for the same name are flagged and stamped caught">
@@ -362,7 +375,9 @@ footer a:hover{text-decoration:underline}
       <h2>The honest catch: meeting strangers</h2>
       <span class="voice-label">The idea</span>
       <p class="voice">Now, being honest about the cost &mdash; every real design has one. Without a vouching authority, how do you meet a total stranger? The old dream was &ldquo;a friend of a friend of a friend.&rdquo; In practice, that chain snaps after about two hops. It never really reaches strangers.</p>
-      <div class="takeaway"><b>So aiko chat doesn&rsquo;t pretend:</b> meeting strangers is handled a different way &mdash; by <em>reputation</em> and <em>cost</em>, the way a good community keeps out spammers. You earn your standing, and bad behaviour gets expensive. No pretending the friend-chain reaches everyone.</div>
+      <div class="takeaway"><b>So aiko chat doesn&rsquo;t pretend:</b> meeting strangers is handled a different way &mdash; by <em>reputation</em> and <em>cost</em>, the way a good community keeps out spammers. You earn your standing, and bad behaviour gets expensive. No pretending the friend-chain reaches everyone.
+        <div class="realname"><b>The real machinery</b><span class="t">Reputation + economic cost</span>, not proof-of-personhood &mdash; per-island rate-limits &amp; moderation (Design&nbsp;09); web-of-trust chains break at ~2 hops.</div>
+      </div>
     </div>
     <div class="stage reveal anim" aria-hidden="true">
       <svg viewBox="0 0 320 300" role="img" aria-label="A chain of trust from you to a friend to a friend, breaking before it reaches a distant stranger">
@@ -394,7 +409,9 @@ footer a:hover{text-decoration:underline}
       <h2>Lose your flag? Your friends vote you back</h2>
       <span class="voice-label">The idea</span>
       <p class="voice">And the hard one: if your identity <em>is</em> your flag, what happens when you lose it? Normally &mdash; that&rsquo;s it, the island&rsquo;s gone for good. So aiko chat builds a lifeboat in from day one. You pick a handful of friends as guardians. Lose your flag, and enough of them vouching together can vote you back in.</p>
-      <div class="takeaway"><b>With a safety catch:</b> the vote opens a waiting period, so if someone tries it <em>against</em> you, you have time to stop them. No company holds a master key. Your friends do &mdash; and only a chosen few of them, together.</div>
+      <div class="takeaway"><b>With a safety catch:</b> the vote opens a waiting period, so if someone tries it <em>against</em> you, you have time to stop them. No company holds a master key. Your friends do &mdash; and only a chosen few of them, together.
+        <div class="realname"><b>The real machinery</b>A <span class="t">guardian quorum (k-of-n social recovery)</span> &mdash; a time-locked waiting period lets you veto a hostile attempt (Design&nbsp;05).</div>
+      </div>
     </div>
     <div class="stage reveal" aria-hidden="true">
       <svg viewBox="0 0 320 300" role="img" aria-label="Four guardian islands, three lit, raising a lost island back up">
