@@ -13,6 +13,7 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ..config import settings
 from ..db import SessionLocal
 from ..domain import security, users_service
 from ..domain.models import User
@@ -36,8 +37,29 @@ async def get_current_user(
     user = await users_service.get_by_id(session, user_id)
     if user is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "user not found")
+    # Ban enforcement (Piece B): a suspended account is rejected on EVERY
+    # authenticated REST route here, even if it still holds a valid (unexpired)
+    # access token. This is one of the enumerated ingresses — the WS handshake,
+    # refresh, and each login/mint path apply the same is_banned predicate.
+    if users_service.is_banned(user):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "account suspended")
     return user
 
 
 CurrentUser = Annotated[User, Depends(get_current_user)]
 DbSession = Annotated[AsyncSession, Depends(get_session)]
+
+
+async def require_moderator(user: CurrentUser) -> User:
+    """Gate for the site-wide moderation endpoints (Piece B). Depends on
+    CurrentUser (so auth + ban are already enforced), then requires the caller be
+    a configured site moderator. Parallel to the per-channel admin gate
+    (memberships_service._require_admin) but island-wide, sourced from
+    settings.moderator_user_ids (fail-closed empty). 403 for a non-moderator —
+    same opaque code as any other forbidden action, no existence leak."""
+    if user.id not in settings.moderator_user_ids:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "not a moderator")
+    return user
+
+
+ModeratorUser = Annotated[User, Depends(require_moderator)]

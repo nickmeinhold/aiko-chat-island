@@ -104,6 +104,14 @@ class Settings(BaseSettings):
     # never authenticate here.
     apple_client_ids: list[str] = []
     google_client_ids: list[str] = []
+    # Site-wide moderators (Piece B, #7). User ids (ULIDs) that may act on the
+    # report queue: view pending reports, take a message down, dismiss a report,
+    # ban/unban a user. Fail-closed empty — an island with no configured moderator
+    # has no one who can reach the moderation endpoints (require_moderator 403s
+    # everyone). JSON array in the env (MODERATOR_USER_IDS), mirroring
+    # apple_client_ids. Config, not a role system: full role machinery (invite
+    # co-mods, audit log) is deferred until there's a second moderator.
+    moderator_user_ids: list[str] = []
     # Provisioning token TTL: a brand-new social user gets a short-lived signed
     # token (NOT a DB row) to carry (provider, sub, suggested name/email) from the
     # verify step to the handle-claim step. Short window — it's a one-step

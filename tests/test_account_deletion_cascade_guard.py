@@ -45,7 +45,7 @@ from aiko_gateway.domain import (
     signing_keys_service, users_service)
 from aiko_gateway.domain.models import (
     DEFAULT_COMMUNITY_ID, Channel, Community, CommunityMembership, Membership,
-    Message, PasskeyCredential, PendingRecovery, RecoveryApprover,
+    Message, MessageReport, PasskeyCredential, PendingRecovery, RecoveryApprover,
     RecoveryPolicy, SigningKey, SocialIdentity, User)
 from aiko_gateway.domain.ids import new_ulid
 
@@ -84,6 +84,7 @@ def _users_fk_columns() -> set[tuple[str, str]]:
 EXPECTED_USERS_FK_COLUMNS: set[tuple[str, str]] = {
     ("messages", "sender_user_id"),          # tombstone (ref -> NULL)
     ("message_reports", "reporter_user_id"),  # anonymize (ref -> NULL)
+    ("message_reports", "resolved_by_user_id"),  # anonymize (ref -> NULL) — Piece B moderator
     ("user_blocks", "blocker_user_id"),       # delete (either direction)
     ("user_blocks", "blocked_user_id"),       # delete (either direction)
     ("device_tokens", "user_id"),             # delete
@@ -183,6 +184,17 @@ async def _seed_full_user_graph(session):
     # message_reports.reporter_user_id — primary reports other's message.
     await moderation_service.report_message(
         session, reporter_id=user.id, message_id="M2".ljust(26, "0"), reason="spam")
+    # message_reports.resolved_by_user_id (Piece B) — a report OTHER filed that the
+    # primary user RESOLVED as a moderator; deletion must anonymize the resolver
+    # link (ref -> NULL), keeping the report + audit trail. Seeded directly to keep
+    # the (message, reporter) UNIQUE pair distinct from the reporter row above.
+    session.add(MessageReport(
+        id="RES".ljust(26, "0"), message_id="M2".ljust(26, "0"),
+        reporter_user_id=other.id, resolved_by_user_id=user.id,
+        reason="spam", resolution="dismissed",
+        created_at=dt.datetime(2026, 7, 27, tzinfo=dt.timezone.utc),
+        resolved_at=dt.datetime(2026, 7, 27, tzinfo=dt.timezone.utc)))
+    await session.commit()
     # signing_keys.user_id (#1816 PR B) — primary has an observed signing key.
     # record_signing_key does not commit (caller owns the txn), so commit here.
     await signing_keys_service.record_signing_key(

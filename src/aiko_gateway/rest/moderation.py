@@ -20,12 +20,12 @@ from enum import Enum
 from urllib.parse import urlparse
 
 import httpx
-from fastapi import APIRouter, BackgroundTasks, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request, status
 from pydantic import BaseModel
 
 from ..config import settings
 from ..domain import moderation_service
-from .deps import CurrentUser, DbSession
+from .deps import CurrentUser, DbSession, ModeratorUser
 
 log = logging.getLogger(__name__)
 
@@ -133,3 +133,85 @@ async def report_message(
             },
         )
     return {"report_id": report.id}
+
+
+# --- moderator act-on-report (Piece B) --------------------------------------
+# All gated by ``ModeratorUser`` (require_moderator): a non-moderator gets 403,
+# an unauthenticated caller 401, both before any row is touched. Enforcement is
+# server-side; the app's /me is_moderator flag only shows/hides the UI.
+
+
+@router.get("/reports")
+async def list_reports(
+    moderator: ModeratorUser, session: DbSession,
+    status_: str = Query("pending", alias="status"),
+) -> dict:
+    """The moderator triage queue. Only ``status=pending`` (unresolved) is served
+    today — the queue behind the EULA's 24h-action commitment. Privileged read:
+    shows already-soft-deleted / block-hidden context (no visibility filter)."""
+    if status_ != "pending":
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, "only status=pending is supported")
+    return {"reports": await moderation_service.list_pending_reports(session)}
+
+
+@router.post("/reports/{report_id}/resolve", status_code=status.HTTP_204_NO_CONTENT)
+async def resolve_report(
+    report_id: str, moderator: ModeratorUser, session: DbSession,
+) -> None:
+    """Act on a report by taking the reported message down (soft-delete) and
+    marking the report ``taken_down``. Idempotent. 404 for an unknown report."""
+    try:
+        await moderation_service.take_down_message(
+            session, report_id=report_id, moderator_id=moderator.id)
+    except moderation_service.ReportNotFound:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "report not found")
+
+
+@router.post("/reports/{report_id}/dismiss", status_code=status.HTTP_204_NO_CONTENT)
+async def dismiss_report(
+    report_id: str, moderator: ModeratorUser, session: DbSession,
+) -> None:
+    """Dismiss a frivolous report (mark ``dismissed``, leave the message). Idempotent.
+    404 for an unknown report."""
+    try:
+        await moderation_service.dismiss_report(
+            session, report_id=report_id, moderator_id=moderator.id)
+    except moderation_service.ReportNotFound:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "report not found")
+
+
+@router.post("/users/{user_id}/ban", status_code=status.HTTP_204_NO_CONTENT)
+async def ban_user(
+    user_id: str, moderator: ModeratorUser, session: DbSession, request: Request,
+) -> None:
+    """Suspend ``user_id`` from this island. Per-island, reversible, forward-looking.
+    400 for a self-ban, 404 for an unknown target. Active-disconnect (option a): after
+    the ban commits, drop the banned user's live socket(s) so they can't keep posting
+    on an already-open connection — the auth gates already refuse every new request,
+    reconnect, and refresh."""
+    try:
+        await moderation_service.ban_user(
+            session, target_id=user_id, moderator_id=moderator.id)
+    except moderation_service.CannotBanSelf:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "you cannot ban yourself")
+    except moderation_service.UserNotFound:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "user not found")
+    # Active-disconnect: reach the realtime hub via app state (absent in unit/route
+    # contexts without a running bus — nothing live to drop, so skip cleanly).
+    gw = getattr(request.app.state, "gw", None)
+    if gw is not None and getattr(gw, "hub", None) is not None:
+        dropped = await gw.hub.disconnect_user(user_id)
+        if dropped:
+            log.info("ban: dropped %s live socket(s) for user=%s", dropped, user_id)
+
+
+@router.delete("/users/{user_id}/ban", status_code=status.HTTP_204_NO_CONTENT)
+async def unban_user(
+    user_id: str, moderator: ModeratorUser, session: DbSession,
+) -> None:
+    """Lift ``user_id``'s ban. Idempotent. 404 for an unknown target."""
+    try:
+        await moderation_service.unban_user(session, target_id=user_id)
+    except moderation_service.UserNotFound:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "user not found")
