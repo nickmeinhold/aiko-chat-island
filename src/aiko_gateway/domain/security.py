@@ -1,8 +1,10 @@
 """Auth primitives: argon2id password hashing + JWT issue/verify.
 
-Tokens carry only `sub` (user_id) + `type` (access|refresh) + expiry — NOT
-roles. Roles/membership are read live from Postgres on each request (plan §A3)
-so a revoked membership takes effect immediately, not at next token refresh.
+Tokens carry `sub` (user_id) + `type` (access|refresh) + `gen` (the user's
+token_generation at mint time, #1914) + expiry — NOT roles. Roles/membership AND
+the live token_generation are read from the DB on each request (plan §A3) so a
+revoked membership OR a bumped generation takes effect immediately, not at next
+token refresh.
 """
 from __future__ import annotations
 
@@ -76,7 +78,17 @@ def decode_token(token: str, *, expected_type: str) -> tuple[str, int]:
     sub = payload.get("sub")
     if not sub:
         raise jwt.InvalidTokenError("missing sub")
-    return sub, int(payload.get("gen", 0))
+    # Fail CLOSED on a malformed generation. Only we mint these (HS256-signed), so a
+    # bad `gen` shouldn't occur — but a trust-boundary decoder must never 500 on a
+    # bad claim (the ingresses catch only InvalidTokenError; anything else escapes as
+    # a 500 / WS crash). Missing → 0 (legacy pre-#1914 tokens). Present must be a
+    # non-negative int; a bool / null / string / negative is an INVALID token, not a
+    # server error — same fail-closed posture as signing.validate_origin's type guards
+    # (bool is an int subclass, so exclude it explicitly).
+    gen = payload.get("gen", 0)
+    if isinstance(gen, bool) or not isinstance(gen, int) or gen < 0:
+        raise jwt.InvalidTokenError("invalid gen claim")
+    return sub, gen
 
 
 # --- social sign-in provisioning token (#13) ------------------------------- #

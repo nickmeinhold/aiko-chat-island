@@ -550,11 +550,24 @@ async def finalize_recovery(
     # not outlive them. Bump the user's token_generation so EVERY previously-issued
     # token is rejected at every auth ingress, and mint THIS new session at the
     # bumped generation. One write, folded into the single finalize commit below.
-    user.token_generation += 1
+    #
+    # ATOMIC increment (cage-match Carnot+Tesla, PR#94): fold +1 into a DB-side
+    # UPDATE ... RETURNING rather than a read-modify-write on the ORM object. Today's
+    # single-winner finalize DELETE serializes bumps per user, so += 1 would be
+    # correct — but that correctness leans on an invariant held OUTSIDE this function;
+    # a future second bumper (#1865 key revocation, a "log out everywhere") would
+    # silently lose an increment and let a token that should be dead survive. The
+    # atomic form is self-contained-correct regardless of callers (mirrors the repo's
+    # fold-predicate-into-the-write convention). `new_gen` is the authoritative post-
+    # bump value used to mint the new session.
+    new_gen = (await session.execute(
+        update(User).where(User.id == user.id)
+        .values(token_generation=User.token_generation + 1)
+        .returning(User.token_generation))).scalar_one()
     # Read the session view BEFORE commit (expire_on_commit / MissingGreenlet trap).
     outcome = {
-        "access_token": security.issue_access(user.id, gen=user.token_generation),
-        "refresh_token": security.issue_refresh(user.id, gen=user.token_generation),
+        "access_token": security.issue_access(user.id, gen=new_gen),
+        "refresh_token": security.issue_refresh(user.id, gen=new_gen),
         "user": {
             "user_id": user.id, "username": user.username,
             "display_name": user.display_name, "aiko_username": user.aiko_username,

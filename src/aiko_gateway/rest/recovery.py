@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, Field
 from webauthn.helpers.exceptions import InvalidRegistrationResponse
 
@@ -201,7 +201,9 @@ async def recover_finish(req: RecoverFinishReq, session: DbSession) -> dict:
 
 
 @router.post("/passkey/recover/finalize", dependencies=[rate_limit("passkey")])
-async def recover_finalize(req: RecoverFinalizeReq, session: DbSession) -> dict:
+async def recover_finalize(
+    req: RecoverFinalizeReq, session: DbSession, request: Request,
+) -> dict:
     """Poll to finalize a recovery whose veto window has passed. The guarded DELETE
     (deadline + token hash in the WHERE) either wins (issues a session, re-keys) or
     matches nothing (cancelled / too-early / wrong-token / already-finalized) → a
@@ -215,8 +217,22 @@ async def recover_finalize(req: RecoverFinalizeReq, session: DbSession) -> dict:
         # unavailable". (finalize_recovery commits any account-vanished cleanup.)
         raise HTTPException(
             status.HTTP_409_CONFLICT, "recovery not finalizable")
-    log.info("recovery.finalize: OK user=%s (re-keyed, session issued)",
-             outcome["user"]["user_id"])
+    user_id = outcome["user"]["user_id"]
+    # Active-disconnect (#1914, mirrors moderation.ban_user's twin). finalize_recovery
+    # bumped token_generation, so the lost/old device's tokens are dead for REST,
+    # refresh, and WS RECONNECT — but a socket already ACCEPTED at handshake keeps its
+    # receive loop (auth is handshake-only; the loop never re-checks gen). A recovery
+    # is an account TAKEOVER, so sever the old device's live sockets now rather than
+    # let them ride to natural disconnect. Reach the hub via app state; in prod the
+    # lifespan always wires app.state.gw, so this fires — it is absent only in unit
+    # tests that don't need realtime. Sockets on other workers ride to their next
+    # gated request (single-process today).
+    gw = getattr(request.app.state, "gw", None)
+    if gw is not None:
+        dropped = await gw.hub.disconnect_user(user_id)
+        log.info("recovery.finalize: dropped %s live socket(s) for user=%s",
+                 dropped, user_id)
+    log.info("recovery.finalize: OK user=%s (re-keyed, session issued)", user_id)
     return outcome
 
 

@@ -78,6 +78,22 @@ async def test_absent_gen_claim_reads_as_zero():
     assert gen == 0
 
 
+@pytest.mark.parametrize("bad_gen", ["not-int", None, -1, True, 1.5])
+async def test_malformed_gen_claim_fails_closed(bad_gen):
+    """decode_token is the trust-boundary parser: a signed-but-malformed `gen`
+    (string / JSON-null / negative / bool / float) must raise InvalidTokenError, not
+    a raw ValueError/TypeError that escapes the ingress try/except as a 500. Only we
+    mint these (HS256), so this is defense-in-depth — same fail-closed posture as
+    validate_origin. Cage-match Carnot+Tesla, PR#94."""
+    now = dt.datetime.now(dt.timezone.utc)
+    tok = jwt.encode(
+        {"sub": "u1", "type": "access", "gen": bad_gen, "iat": int(now.timestamp()),
+         "exp": int((now + dt.timedelta(hours=1)).timestamp())},
+        settings.jwt_secret, algorithm=settings.jwt_algorithm)
+    with pytest.raises(jwt.InvalidTokenError):
+        security.decode_token(tok, expected_type="access")
+
+
 # -- 2. REST ingress: get_current_user --------------------------------------- #
 
 async def test_get_current_user_rejects_stale_generation(session):

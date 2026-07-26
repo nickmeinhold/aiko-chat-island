@@ -232,13 +232,62 @@ async def test_finalize_bumps_token_generation_revoking_old_sessions(session):
         finalize_token=result["finalize_token"])
     assert outcome is not None
 
-    # The generation advanced — every token minted at gen 0 is now stale.
+    # The generation advanced — every token minted at gen 0 is now stale. Reload the
+    # PERSISTED value (the bump is a DB-side atomic UPDATE, so the ORM object is stale
+    # until refreshed — asserting the reloaded row also proves the write committed).
+    await session.refresh(user)
     assert user.token_generation == 1
     _, pre_gen = security.decode_token(pre_recovery_access, expected_type="access")
     assert pre_gen != user.token_generation           # old session revoked
     # The freshly-issued session carries the NEW generation, so it is honoured.
     _, new_gen = security.decode_token(outcome["access_token"], expected_type="access")
     assert new_gen == user.token_generation == 1
+
+
+async def test_finalize_actively_disconnects_open_sockets(session):
+    """Session-plane re-key completeness (#1914, cage-match Tesla PR#94): bumping
+    token_generation kills the old device's tokens for REST/refresh/reconnect, but a
+    socket already ACCEPTED at handshake rides its receive loop until natural
+    disconnect (auth is handshake-only). Recovery is a TAKEOVER, so the finalize
+    route must actively drop the recovered user's live sockets — the twin of ban's
+    hub.disconnect_user. Assert an OPEN connection is severed, not merely that a new
+    handshake fails."""
+    from types import SimpleNamespace
+
+    from aiko_gateway.realtime.hub import Connection, Hub
+
+    user = await _user(session)
+    gs = [Guardian(), Guardian(), Guardian()]
+    await _enroll(session, user, gs, k=2)
+    result, _auth = await _drive_finish(session, user, gs, k=2)
+    await _expire_pending(session, user.id)
+
+    # A live socket for this user, registered in a hub wired onto app.state.gw.
+    class _WS:
+        def __init__(self): self.closed_code = None
+        async def close(self, code=1000): self.closed_code = code
+    live = _WS()
+    hub = Hub()
+    hub.register(Connection(live, user.id))
+
+    async def _override_session():
+        yield session
+    app = _build_app()
+    app.dependency_overrides[get_session] = _override_session
+    app.state.gw = SimpleNamespace(hub=hub)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.post("/v1/auth/passkey/recover/finalize", json={
+            "recovery_id": result["recovery_id"],
+            "finalize_token": result["finalize_token"]})
+    app.dependency_overrides.clear()
+
+    assert resp.status_code == 200
+    # The open socket was closed (1008) AND unregistered — a second disconnect finds
+    # nothing left. Without the route's active-disconnect this connection would still
+    # be live (RED-proves the fix, not just the handshake gate).
+    assert live.closed_code == 1008  # WS_1008_POLICY_VIOLATION (hub default)
+    assert await hub.disconnect_user(user.id) == 0
 
 
 async def _expire_pending(session, user_id):
