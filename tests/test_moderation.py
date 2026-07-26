@@ -615,3 +615,82 @@ async def test_report_unknown_message_is_404(client, session):
     resp = await client.post(
         f"/v1/messages/{_ulid(999)}/report", json={"reason": "spam"}, headers=_auth(a))
     assert resp.status_code == 404
+
+
+# =========================================================================
+# operator moderation alert webhook (Piece A)
+# =========================================================================
+
+async def test_report_no_alert_when_webhook_unset(client, session, monkeypatch):
+    """URL unset (the default) → the report still lands 201 and NOTHING is
+    enqueued: the existing behavior is byte-for-byte unchanged."""
+    calls: list = []
+
+    async def _spy(url, payload):
+        calls.append((url, payload))
+
+    monkeypatch.setattr(moderation_routes, "_deliver_moderation_alert", _spy)
+    monkeypatch.setattr(
+        moderation_routes.settings, "moderation_alert_webhook_url", None)
+    ch = await _public_channel(session)
+    a = await _user(session, "alice")
+    b = await _user(session, "bob")
+    m = await _msg(session, mid=1, channel=ch, sender=b)
+    resp = await client.post(
+        f"/v1/messages/{m.id}/report", json={"reason": "spam"}, headers=_auth(a))
+    assert resp.status_code == 201
+    assert calls == []
+
+
+async def test_report_enqueues_alert_when_webhook_set(client, session, monkeypatch):
+    """URL set → exactly one alert is enqueued with the full triage payload."""
+    calls: list = []
+
+    async def _spy(url, payload):
+        calls.append((url, payload))
+
+    monkeypatch.setattr(moderation_routes, "_deliver_moderation_alert", _spy)
+    monkeypatch.setattr(
+        moderation_routes.settings, "moderation_alert_webhook_url",
+        "https://hook.example/ops")
+    ch = await _public_channel(session)
+    a = await _user(session, "alice")
+    b = await _user(session, "bob")
+    m = await _msg(session, mid=1, channel=ch, sender=b)
+    resp = await client.post(
+        f"/v1/messages/{m.id}/report", json={"reason": "harassment"}, headers=_auth(a))
+    assert resp.status_code == 201
+    assert len(calls) == 1
+    url, payload = calls[0]
+    assert url == "https://hook.example/ops"
+    assert set(payload) == {
+        "report_id", "message_id", "channel_id", "reason",
+        "reporter_user_id", "created_at", "preview"}
+    assert payload["report_id"] == resp.json()["report_id"]
+    assert payload["message_id"] == m.id
+    assert payload["channel_id"] == ch.id
+    assert payload["reason"] == "harassment"
+    assert payload["reporter_user_id"] == a.id
+    assert len(payload["preview"]) <= 120
+
+
+async def test_deliver_alert_swallows_failure(monkeypatch):
+    """_deliver_moderation_alert must NEVER raise, even if the POST blows up —
+    a broken webhook can't be allowed to surface into the report path."""
+    class _BoomClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, *a, **k):
+            raise RuntimeError("network down")
+
+    monkeypatch.setattr(moderation_routes.httpx, "AsyncClient", _BoomClient)
+    # Must complete without raising.
+    await moderation_routes._deliver_moderation_alert(
+        "https://hook.example/ops", {"report_id": "x"})

@@ -15,15 +15,43 @@ private-channel message stays existence-hidden behind the same 404).
 """
 from __future__ import annotations
 
+import logging
 from enum import Enum
+from urllib.parse import urlparse
 
-from fastapi import APIRouter, HTTPException, status
+import httpx
+from fastapi import APIRouter, BackgroundTasks, HTTPException, status
 from pydantic import BaseModel
 
+from ..config import settings
 from ..domain import moderation_service
 from .deps import CurrentUser, DbSession
 
+log = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/v1", tags=["moderation"])
+
+# Operator alert (Piece A): the reported-message body preview is truncated to this
+# many chars in the webhook payload — enough for triage, not a content dump.
+_ALERT_PREVIEW_MAX = 120
+
+
+async def _deliver_moderation_alert(url: str, payload: dict) -> None:
+    """Best-effort operator ping when a report lands. Fire-and-forget: any failure
+    (timeout, DNS, non-2xx) is swallowed with a HOST-ONLY warning so a broken
+    webhook never affects the report write. The destination comes solely from
+    operator config (``settings.moderation_alert_webhook_url``), never a request
+    value — so there is no SSRF surface; only the payload carries user content. We
+    log the exception TYPE and the URL host only (never ``str(exc)`` or the full
+    URL) so a token embedded in either can't leak into logs."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.post(url, json=payload)
+            resp.raise_for_status()
+    except Exception as exc:  # noqa: BLE001 — best-effort; must never propagate
+        host = urlparse(url).hostname or "?"
+        log.warning("moderation alert webhook failed (host=%s): %s",
+                    host, type(exc).__name__)
 
 
 # Closed set, mirrors moderation_service.REPORT_REASONS — an unknown reason is a
@@ -64,7 +92,8 @@ async def list_blocks(user: CurrentUser, session: DbSession) -> dict:
 
 @router.post("/messages/{message_id}/report", status_code=status.HTTP_201_CREATED)
 async def report_message(
-    message_id: str, req: ReportReq, user: CurrentUser, session: DbSession
+    message_id: str, req: ReportReq, user: CurrentUser, session: DbSession,
+    background: BackgroundTasks,
 ) -> dict:
     """Report ``message_id`` as objectionable. Idempotent per (message, reporter):
     a re-report returns the existing report id. 404 if the message does not exist
@@ -86,4 +115,21 @@ async def report_message(
         )
     except moderation_service.MessageNotFound:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "message not found")
+    # Best-effort operator ping — enqueued AFTER the report is committed, so a
+    # webhook failure can never affect the report write, and non-blocking so it
+    # can't delay the reporter's response. No-op when the URL is unset.
+    if settings.moderation_alert_webhook_url:
+        background.add_task(
+            _deliver_moderation_alert,
+            settings.moderation_alert_webhook_url,
+            {
+                "report_id": report.id,
+                "message_id": report.message_id,
+                "channel_id": msg.channel_id,
+                "reason": report.reason,
+                "reporter_user_id": report.reporter_user_id,
+                "created_at": report.created_at.isoformat(),
+                "preview": (msg.body or "")[:_ALERT_PREVIEW_MAX],
+            },
+        )
     return {"report_id": report.id}

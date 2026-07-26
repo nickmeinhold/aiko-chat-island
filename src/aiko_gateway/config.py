@@ -235,6 +235,17 @@ class Settings(BaseSettings):
     # there is no upload endpoint, so this never trips a legitimate request.
     max_request_bytes: int = 64 * 1024  # 64 KiB
 
+    # --- moderation / ops ---
+    # Best-effort operator alert: when set, creating a message report fires a
+    # fire-and-forget POST to this URL so the island operator is pinged the moment
+    # abuse is flagged (channel-agnostic — point it at a Telegram bot / ntfy / a
+    # Worker). None → no-op (the default; existing behavior byte-for-byte
+    # unchanged). The destination comes ONLY from here, never from a request, so it
+    # carries no SSRF surface; only the payload carries user content. Delivery is
+    # non-blocking (BackgroundTasks) and swallows every failure — a broken webhook
+    # never affects the report write. See rest/moderation.py.
+    moderation_alert_webhook_url: str | None = None
+
     # --- HTTP server ---
     host: str = "127.0.0.1"
     port: int = 8095
