@@ -201,6 +201,10 @@ async def ban_user(
             session, target_id=user_id, moderator_id=moderator.id)
     except moderation_service.CannotBanSelf:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "you cannot ban yourself")
+    except moderation_service.CannotBanModerator:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "cannot ban a moderator — remove them from the moderator set first")
     except moderation_service.UserNotFound:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "user not found")
     # Active-disconnect: reach the realtime hub via app state. In production the

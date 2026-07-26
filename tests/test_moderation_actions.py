@@ -208,6 +208,19 @@ async def test_ban_missing_target_raises(session):
             session, target_id=_ulid(999), moderator_id=_ulid(1))
 
 
+async def test_cannot_ban_a_configured_moderator(session, monkeypatch):
+    """A configured moderator can't be banned (cage-match Carnot/Tesla): guarantees
+    the moderator set stays fully unbanned — no lockout, no mod-bans-peer."""
+    mod_a = await _user(session, "moda")
+    mod_b = await _user(session, "modb")
+    monkeypatch.setattr(settings, "moderator_user_ids", [mod_a.id, mod_b.id])
+    with pytest.raises(moderation_service.CannotBanModerator):
+        await moderation_service.ban_user(
+            session, target_id=mod_b.id, moderator_id=mod_a.id)
+    await session.refresh(mod_b)
+    assert mod_b.banned_at is None
+
+
 # --- service: queue + is_moderator ------------------------------------------
 
 async def test_pending_queue_excludes_resolved_and_carries_preview(session):

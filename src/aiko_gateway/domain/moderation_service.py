@@ -68,6 +68,14 @@ class CannotBanSelf(Exception):
     """A moderator tried to ban their own account."""
 
 
+class CannotBanModerator(Exception):
+    """A moderator tried to ban another configured moderator. Refused so the
+    moderator set is always fully unbanned by construction — no ban can lock a
+    moderator (including the last one) out of the recovery endpoint, and one mod
+    can't sanction a peer. To sanction someone who is currently a moderator,
+    remove them from MODERATOR_USER_IDS first, then ban (cage-match Carnot/Tesla)."""
+
+
 class ReportAlreadyResolved(Exception):
     """A moderator tried to act on a report that was already resolved a DIFFERENT
     way (e.g. take down a dismissed report). Re-applying the SAME action is an
@@ -380,6 +388,11 @@ async def ban_user(session: AsyncSession, *, target_id: str, moderator_id: str) 
     drop the banned user's live socket(s) (active-disconnect enforcement)."""
     if target_id == moderator_id:
         raise CannotBanSelf()
+    # A configured moderator can't be banned (demote via MODERATOR_USER_IDS first).
+    # Guarantees the moderator set is always fully unbanned -> no ban can lock the
+    # last moderator out of the recovery endpoint, and no mod can sanction a peer.
+    if is_moderator(target_id):
+        raise CannotBanModerator()
     target = await session.get(User, target_id)
     if target is None:
         raise UserNotFound()
