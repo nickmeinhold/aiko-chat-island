@@ -116,6 +116,54 @@ async def test_take_down_unknown_report_raises(session):
             session, report_id=_ulid(999), moderator_id=_ulid(1))
 
 
+async def test_take_down_after_dismiss_conflicts_and_leaves_message(session):
+    """The cage-match HIGH finding: acting on an already-DISMISSED report must NOT
+    soft-delete the message while leaving resolution='dismissed'. It raises
+    ReportAlreadyResolved and the message stays intact."""
+    mod = await _user(session, "mod")
+    author = await _user(session, "author")
+    ch = await _channel(session)
+    msg = await _msg(session, mid=1, channel=ch, sender=author)
+    rep = await _report(session, rid=100, message=msg, reporter=author)
+
+    await moderation_service.dismiss_report(session, report_id=rep.id, moderator_id=mod.id)
+    with pytest.raises(moderation_service.ReportAlreadyResolved):
+        await moderation_service.take_down_message(
+            session, report_id=rep.id, moderator_id=mod.id)
+
+    await session.refresh(msg)
+    await session.refresh(rep)
+    assert msg.deleted_at is None            # message NOT deleted
+    assert rep.resolution == "dismissed"     # resolution unchanged — state agrees with label
+
+
+async def test_dismiss_after_take_down_conflicts(session):
+    """Symmetric: dismissing an already-taken-down report is refused."""
+    mod = await _user(session, "mod")
+    author = await _user(session, "author")
+    ch = await _channel(session)
+    msg = await _msg(session, mid=1, channel=ch, sender=author)
+    rep = await _report(session, rid=100, message=msg, reporter=author)
+
+    await moderation_service.take_down_message(session, report_id=rep.id, moderator_id=mod.id)
+    with pytest.raises(moderation_service.ReportAlreadyResolved):
+        await moderation_service.dismiss_report(
+            session, report_id=rep.id, moderator_id=mod.id)
+
+
+async def test_resolve_after_dismiss_route_409(client, session, monkeypatch):
+    """The conflict surfaces as HTTP 409 at the route (not a silent state/label split)."""
+    mod = await _user(session, "mod")
+    author = await _user(session, "author")
+    monkeypatch.setattr(settings, "moderator_user_ids", [mod.id])
+    ch = await _channel(session)
+    msg = await _msg(session, mid=1, channel=ch, sender=author)
+    rep = await _report(session, rid=100, message=msg, reporter=author)
+    h = _auth(mod)
+    assert (await client.post(f"/v1/reports/{rep.id}/dismiss", headers=h)).status_code == 204
+    assert (await client.post(f"/v1/reports/{rep.id}/resolve", headers=h)).status_code == 409
+
+
 async def test_take_down_is_idempotent(session):
     mod = await _user(session, "mod")
     author = await _user(session, "author")

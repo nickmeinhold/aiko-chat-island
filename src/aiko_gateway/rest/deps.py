@@ -13,9 +13,8 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..config import settings
 from ..db import SessionLocal
-from ..domain import security, users_service
+from ..domain import moderation_service, security, users_service
 from ..domain.models import User
 
 _bearer = HTTPBearer(auto_error=True)
@@ -57,7 +56,10 @@ async def require_moderator(user: CurrentUser) -> User:
     (memberships_service._require_admin) but island-wide, sourced from
     settings.moderator_user_ids (fail-closed empty). 403 for a non-moderator —
     same opaque code as any other forbidden action, no existence leak."""
-    if user.id not in settings.moderator_user_ids:
+    # Route through the SAME moderation_service.is_moderator predicate the /me flag
+    # reads, so the enforced gate and the shown flag can never drift (cage-match
+    # Tesla — one function, not two inlined copies of the config lookup).
+    if not moderation_service.is_moderator(user.id):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "not a moderator")
     return user
 

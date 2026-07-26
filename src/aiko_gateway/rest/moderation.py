@@ -17,10 +17,11 @@ from __future__ import annotations
 
 import logging
 from enum import Enum
+from typing import Literal
 from urllib.parse import urlparse
 
 import httpx
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request, status
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, status
 from pydantic import BaseModel
 
 from ..config import settings
@@ -144,14 +145,13 @@ async def report_message(
 @router.get("/reports")
 async def list_reports(
     moderator: ModeratorUser, session: DbSession,
-    status_: str = Query("pending", alias="status"),
+    status: Literal["pending"] = "pending",
 ) -> dict:
     """The moderator triage queue. Only ``status=pending`` (unresolved) is served
-    today — the queue behind the EULA's 24h-action commitment. Privileged read:
-    shows already-soft-deleted / block-hidden context (no visibility filter)."""
-    if status_ != "pending":
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY, "only status=pending is supported")
+    today — the queue behind the EULA's 24h-action commitment. The closed set is a
+    ``Literal`` so FastAPI validates it at the boundary (422 + OpenAPI-documented)
+    rather than a hand-rolled check. Privileged read: shows already-soft-deleted /
+    block-hidden context (no visibility filter)."""
     return {"reports": await moderation_service.list_pending_reports(session)}
 
 
@@ -166,6 +166,9 @@ async def resolve_report(
             session, report_id=report_id, moderator_id=moderator.id)
     except moderation_service.ReportNotFound:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "report not found")
+    except moderation_service.ReportAlreadyResolved:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "report already resolved a different way")
 
 
 @router.post("/reports/{report_id}/dismiss", status_code=status.HTTP_204_NO_CONTENT)
@@ -179,6 +182,9 @@ async def dismiss_report(
             session, report_id=report_id, moderator_id=moderator.id)
     except moderation_service.ReportNotFound:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "report not found")
+    except moderation_service.ReportAlreadyResolved:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "report already resolved a different way")
 
 
 @router.post("/users/{user_id}/ban", status_code=status.HTTP_204_NO_CONTENT)
@@ -197,8 +203,15 @@ async def ban_user(
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "you cannot ban yourself")
     except moderation_service.UserNotFound:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "user not found")
-    # Active-disconnect: reach the realtime hub via app state (absent in unit/route
-    # contexts without a running bus — nothing live to drop, so skip cleanly).
+    # Active-disconnect: reach the realtime hub via app state. In production the
+    # lifespan always wires app.state.gw, so this fires; it is absent only in
+    # unit/route contexts without a running bus (nothing live to drop — skip
+    # cleanly). SINGLE-PROCESS SCOPE (cage-match Tesla): the hub is in-process
+    # memory, so this drops sockets on THIS worker only. The gateway runs a single
+    # uvicorn worker today (realtime/hub.py), so that is complete; if it ever scales
+    # to multiple workers/replicas, active-disconnect must fan across the fleet (the
+    # same redis-fanout path the hub's multi-worker plan names) or the already-open
+    # sockets on other workers ride token expiry until their next gated request.
     gw = getattr(request.app.state, "gw", None)
     if gw is not None and getattr(gw, "hub", None) is not None:
         dropped = await gw.hub.disconnect_user(user_id)

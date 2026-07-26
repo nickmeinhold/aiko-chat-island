@@ -68,6 +68,13 @@ class CannotBanSelf(Exception):
     """A moderator tried to ban their own account."""
 
 
+class ReportAlreadyResolved(Exception):
+    """A moderator tried to act on a report that was already resolved a DIFFERENT
+    way (e.g. take down a dismissed report). Re-applying the SAME action is an
+    idempotent no-op; a conflicting action is refused rather than silently
+    producing a message state that disagrees with the recorded resolution."""
+
+
 # --- blocks: mutations ------------------------------------------------------
 
 
@@ -309,23 +316,37 @@ async def take_down_message(
     """Act on a report by taking the message down: soft-delete the message (first
     writer of `Message.deleted_at`) and resolve the report as `taken_down`.
 
-    Idempotent: re-running keeps the first `deleted_at` and the first resolution
-    (a report already resolved is not re-stamped; a message already deleted is not
-    re-deleted). Raises `ReportNotFound` for a bad id. The soft-delete propagates to
-    the read paths through the existing `deleted_at IS NULL` filter shared by
-    `get_history` / `latest_ulid`, so the message vanishes from history and the
-    fence at once."""
+    A report resolves EXACTLY ONCE, to one outcome. Re-running take-down on an
+    already-taken-down report is an idempotent no-op; running it on an already-
+    DISMISSED report raises `ReportAlreadyResolved` rather than soft-deleting the
+    message while the recorded resolution still reads `dismissed` (a state/label
+    disagreement — cage-match Carnot HIGH + Tesla). The resolution gate and the
+    soft-delete are therefore NOT independent: the message is only ever deleted on
+    the transition that also stamps `taken_down`. Raises `ReportNotFound` for a bad
+    id. The soft-delete propagates to the read paths through the existing
+    `deleted_at IS NULL` filter shared by `get_history` / `latest_ulid`, so the
+    message vanishes from history and the fence at once.
+
+    CONCURRENCY (named MVP tradeoff, mirrors `block_user`): the resolved-check is
+    read-then-write, not an atomic conditional UPDATE. Under the single-writer
+    SQLite deployment there is no race. On the future Postgres path two concurrent
+    moderators could both pass the `resolved_at is None` check; the robust fix is a
+    guarded `UPDATE ... WHERE resolved_at IS NULL` + rowcount, tracked with that
+    migration cluster."""
     report = await session.get(MessageReport, report_id)
     if report is None:
         raise ReportNotFound()
+    if report.resolved_at is not None:
+        if report.resolution == ReportResolution.TAKEN_DOWN:
+            return  # idempotent: same action, already applied
+        raise ReportAlreadyResolved()
     now = _utcnow()
     message = await session.get(Message, report.message_id)
     if message is not None and message.deleted_at is None:
         message.deleted_at = now
-    if report.resolved_at is None:
-        report.resolved_at = now
-        report.resolution = ReportResolution.TAKEN_DOWN
-        report.resolved_by_user_id = moderator_id
+    report.resolved_at = now
+    report.resolution = ReportResolution.TAKEN_DOWN
+    report.resolved_by_user_id = moderator_id
     await session.commit()
 
 
@@ -333,15 +354,20 @@ async def dismiss_report(
     session: AsyncSession, *, report_id: str, moderator_id: str,
 ) -> None:
     """Dismiss a frivolous report: stamp resolution `dismissed`, leave the message
-    untouched. Idempotent (an already-resolved report is not re-stamped). Raises
+    untouched. Re-dismissing is an idempotent no-op; dismissing an already-TAKEN-
+    DOWN report raises `ReportAlreadyResolved` (symmetric with `take_down_message`
+    — one resolution per report, conflicting re-resolution refused). Raises
     `ReportNotFound` for a bad id."""
     report = await session.get(MessageReport, report_id)
     if report is None:
         raise ReportNotFound()
-    if report.resolved_at is None:
-        report.resolved_at = _utcnow()
-        report.resolution = ReportResolution.DISMISSED
-        report.resolved_by_user_id = moderator_id
+    if report.resolved_at is not None:
+        if report.resolution == ReportResolution.DISMISSED:
+            return  # idempotent: same action, already applied
+        raise ReportAlreadyResolved()
+    report.resolved_at = _utcnow()
+    report.resolution = ReportResolution.DISMISSED
+    report.resolved_by_user_id = moderator_id
     await session.commit()
 
 
