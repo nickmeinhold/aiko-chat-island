@@ -41,6 +41,25 @@ class Hub:
     def unregister(self, conn: Connection) -> None:
         self._conns.discard(conn)
 
+    async def disconnect_user(self, user_id: str, *, code: int = 1008) -> int:
+        """Close and unregister every live connection owned by `user_id`.
+
+        The active-disconnect enforcement for a moderation ban (Piece B, option a):
+        a banned user's already-open socket(s) drop immediately rather than
+        persisting until the access token expires. Returns the number of
+        connections closed. Best-effort per socket — a close that raises (an
+        already-dead connection) is swallowed and the connection is unregistered
+        regardless, so a stale entry can't survive the ban. Default close code 1008
+        (policy violation), matching the WS handshake's ban rejection."""
+        targets = [c for c in self._conns if c.user_id == user_id]
+        for conn in targets:
+            try:
+                await conn.ws.close(code=code)
+            except Exception:  # noqa: BLE001 — dead socket; drop it regardless
+                log.debug("disconnect_user: close failed (dead conn?) user=%s", user_id)
+            self.unregister(conn)
+        return len(targets)
+
     async def fanout(
         self, channel_id: str, frame: dict, *, exclude_user_ids: set[str] | None = None
     ) -> None:

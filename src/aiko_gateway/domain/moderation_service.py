@@ -29,12 +29,19 @@ Commit convention: service-owns-commit (mirrors `accounts_service` /
 """
 from __future__ import annotations
 
+import datetime as dt
+
 from sqlalchemy import and_, delete, exists, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ..config import settings
 from . import acl
 from .ids import new_ulid
-from .models import Message, MessageReport, User, UserBlock
+from .models import Message, MessageReport, ReportResolution, User, UserBlock
+
+
+def _utcnow() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
 
 # The closed set of report reasons. Validated at the API boundary (pydantic enum)
 # so an unknown reason is a 422, never a silently-stored free-text blob.
@@ -51,6 +58,29 @@ class UserNotFound(Exception):
 
 class MessageNotFound(Exception):
     """The reported message does not exist (or is not visible to the reporter)."""
+
+
+class ReportNotFound(Exception):
+    """The report id a moderator tried to act on does not exist."""
+
+
+class CannotBanSelf(Exception):
+    """A moderator tried to ban their own account."""
+
+
+class CannotBanModerator(Exception):
+    """A moderator tried to ban another configured moderator. Refused so the
+    moderator set is always fully unbanned by construction — no ban can lock a
+    moderator (including the last one) out of the recovery endpoint, and one mod
+    can't sanction a peer. To sanction someone who is currently a moderator,
+    remove them from MODERATOR_USER_IDS first, then ban (cage-match Carnot/Tesla)."""
+
+
+class ReportAlreadyResolved(Exception):
+    """A moderator tried to act on a report that was already resolved a DIFFERENT
+    way (e.g. take down a dismissed report). Re-applying the SAME action is an
+    idempotent no-op; a conflicting action is refused rather than silently
+    producing a message state that disagrees with the recorded resolution."""
 
 
 # --- blocks: mutations ------------------------------------------------------
@@ -244,6 +274,144 @@ async def report_message(
     return row
 
 
+# --- moderator act-on-report (Piece B) --------------------------------------
+
+
+def is_moderator(user_id: str) -> bool:
+    """Whether `user_id` is a configured site moderator. Config lookup, no DB —
+    backs the /me `is_moderator` flag and mirrors the `require_moderator` gate, so
+    the flag the client sees and the gate the server enforces read one source."""
+    return user_id in settings.moderator_user_ids
+
+
+async def list_pending_reports(session: AsyncSession, *, limit: int = 100) -> list[dict]:
+    """The moderator queue: unresolved reports (`resolved_at IS NULL`), newest
+    first, joined to the reported message (body preview + channel) and the reporter
+    (display name; OUTER join because a report's reporter may be anonymized to NULL
+    by account deletion).
+
+    PRIVILEGED read — applies NO visibility filter (`deleted_at` / block predicate)
+    so a moderator sees already-soft-deleted or block-hidden context. The route
+    gates it hard behind `require_moderator`."""
+    rows = (await session.execute(
+        select(MessageReport, Message, User)
+        .join(Message, Message.id == MessageReport.message_id)
+        .outerjoin(User, User.id == MessageReport.reporter_user_id)
+        .where(MessageReport.resolved_at.is_(None))
+        .order_by(MessageReport.created_at.desc())
+        .limit(limit)
+    )).all()
+    return [
+        {
+            "report_id": r.id,
+            "message_id": r.message_id,
+            "channel_id": m.channel_id,
+            "reason": r.reason,
+            "reporter_user_id": r.reporter_user_id,
+            "reporter_display_name": u.display_name if u is not None else None,
+            "created_at": r.created_at.isoformat(),
+            "message_body": m.body,
+            "message_sender_user_id": m.sender_user_id,
+            "message_deleted_at": m.deleted_at.isoformat() if m.deleted_at else None,
+        }
+        for r, m, u in rows
+    ]
+
+
+async def take_down_message(
+    session: AsyncSession, *, report_id: str, moderator_id: str,
+) -> None:
+    """Act on a report by taking the message down: soft-delete the message (first
+    writer of `Message.deleted_at`) and resolve the report as `taken_down`.
+
+    A report resolves EXACTLY ONCE, to one outcome. Re-running take-down on an
+    already-taken-down report is an idempotent no-op; running it on an already-
+    DISMISSED report raises `ReportAlreadyResolved` rather than soft-deleting the
+    message while the recorded resolution still reads `dismissed` (a state/label
+    disagreement — cage-match Carnot HIGH + Tesla). The resolution gate and the
+    soft-delete are therefore NOT independent: the message is only ever deleted on
+    the transition that also stamps `taken_down`. Raises `ReportNotFound` for a bad
+    id. The soft-delete propagates to the read paths through the existing
+    `deleted_at IS NULL` filter shared by `get_history` / `latest_ulid`, so the
+    message vanishes from history and the fence at once.
+
+    CONCURRENCY (named MVP tradeoff, mirrors `block_user`): the resolved-check is
+    read-then-write, not an atomic conditional UPDATE. Under the single-writer
+    SQLite deployment there is no race. On the future Postgres path two concurrent
+    moderators could both pass the `resolved_at is None` check; the robust fix is a
+    guarded `UPDATE ... WHERE resolved_at IS NULL` + rowcount, tracked with that
+    migration cluster."""
+    report = await session.get(MessageReport, report_id)
+    if report is None:
+        raise ReportNotFound()
+    if report.resolved_at is not None:
+        if report.resolution == ReportResolution.TAKEN_DOWN:
+            return  # idempotent: same action, already applied
+        raise ReportAlreadyResolved()
+    now = _utcnow()
+    message = await session.get(Message, report.message_id)
+    if message is not None and message.deleted_at is None:
+        message.deleted_at = now
+    report.resolved_at = now
+    report.resolution = ReportResolution.TAKEN_DOWN
+    report.resolved_by_user_id = moderator_id
+    await session.commit()
+
+
+async def dismiss_report(
+    session: AsyncSession, *, report_id: str, moderator_id: str,
+) -> None:
+    """Dismiss a frivolous report: stamp resolution `dismissed`, leave the message
+    untouched. Re-dismissing is an idempotent no-op; dismissing an already-TAKEN-
+    DOWN report raises `ReportAlreadyResolved` (symmetric with `take_down_message`
+    — one resolution per report, conflicting re-resolution refused). Raises
+    `ReportNotFound` for a bad id."""
+    report = await session.get(MessageReport, report_id)
+    if report is None:
+        raise ReportNotFound()
+    if report.resolved_at is not None:
+        if report.resolution == ReportResolution.DISMISSED:
+            return  # idempotent: same action, already applied
+        raise ReportAlreadyResolved()
+    report.resolved_at = _utcnow()
+    report.resolution = ReportResolution.DISMISSED
+    report.resolved_by_user_id = moderator_id
+    await session.commit()
+
+
+async def ban_user(session: AsyncSession, *, target_id: str, moderator_id: str) -> User:
+    """Suspend `target_id` from this island (set `banned_at`). Per-island,
+    reversible (see `unban_user`), forward-looking — it does not delete the row or
+    the user's past messages. Idempotent: a re-ban keeps the first `banned_at`.
+    Raises `CannotBanSelf` (a moderator can't lock themselves out) and
+    `UserNotFound` for a missing target. Returns the target row so the caller can
+    drop the banned user's live socket(s) (active-disconnect enforcement)."""
+    if target_id == moderator_id:
+        raise CannotBanSelf()
+    # A configured moderator can't be banned (demote via MODERATOR_USER_IDS first).
+    # Guarantees the moderator set is always fully unbanned -> no ban can lock the
+    # last moderator out of the recovery endpoint, and no mod can sanction a peer.
+    if is_moderator(target_id):
+        raise CannotBanModerator()
+    target = await session.get(User, target_id)
+    if target is None:
+        raise UserNotFound()
+    if target.banned_at is None:
+        target.banned_at = _utcnow()
+    await session.commit()
+    return target
+
+
+async def unban_user(session: AsyncSession, *, target_id: str) -> None:
+    """Lift `target_id`'s ban (clear `banned_at`). Idempotent (unbanning an active
+    user is a no-op). Raises `UserNotFound` for a missing target."""
+    target = await session.get(User, target_id)
+    if target is None:
+        raise UserNotFound()
+    target.banned_at = None
+    await session.commit()
+
+
 # --- account-deletion cascade (called by accounts_service) ------------------
 
 
@@ -257,6 +425,9 @@ async def purge_user_moderation_rows(session: AsyncSession, user_id: str) -> Non
       * reports authored by the user are ANONYMIZED (reporter_user_id → NULL),
         not deleted — the report still drives ops action; only the PII link goes,
         exactly as authored messages are anonymized rather than shredded.
+      * reports this user RESOLVED as a moderator are likewise anonymized
+        (resolved_by_user_id → NULL) — the resolution + audit trail stay, only the
+        deleted moderator's identity link is severed (Piece B).
     """
     await session.execute(
         delete(UserBlock).where(
@@ -270,4 +441,9 @@ async def purge_user_moderation_rows(session: AsyncSession, user_id: str) -> Non
         update(MessageReport)
         .where(MessageReport.reporter_user_id == user_id)
         .values(reporter_user_id=None)
+    )
+    await session.execute(
+        update(MessageReport)
+        .where(MessageReport.resolved_by_user_id == user_id)
+        .values(resolved_by_user_id=None)
     )

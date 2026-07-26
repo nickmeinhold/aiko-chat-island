@@ -36,7 +36,12 @@ async def ws_endpoint(websocket: WebSocket) -> None:
 
     async with SessionLocal() as session:
         user = await users_service.get_by_id(session, user_id)
-    if user is None:
+    # Ban enforcement (Piece B) at the WS ingress: a suspended account is refused
+    # the socket even with a still-valid access token — the live twin of the REST
+    # get_current_user gate. Same 1008 close as an invalid token (no existence
+    # leak). An already-open socket is dropped separately by hub.disconnect_user
+    # at ban time (active-disconnect).
+    if user is None or users_service.is_banned(user):
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
 

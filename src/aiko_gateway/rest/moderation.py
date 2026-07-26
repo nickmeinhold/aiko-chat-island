@@ -17,15 +17,16 @@ from __future__ import annotations
 
 import logging
 from enum import Enum
+from typing import Literal
 from urllib.parse import urlparse
 
 import httpx
-from fastapi import APIRouter, BackgroundTasks, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request, status
 from pydantic import BaseModel
 
 from ..config import settings
 from ..domain import moderation_service
-from .deps import CurrentUser, DbSession
+from .deps import CurrentUser, DbSession, ModeratorUser
 
 log = logging.getLogger(__name__)
 
@@ -133,3 +134,105 @@ async def report_message(
             },
         )
     return {"report_id": report.id}
+
+
+# --- moderator act-on-report (Piece B) --------------------------------------
+# All gated by ``ModeratorUser`` (require_moderator): a non-moderator gets 403,
+# an unauthenticated caller 401, both before any row is touched. Enforcement is
+# server-side; the app's /me is_moderator flag only shows/hides the UI.
+
+
+@router.get("/reports")
+async def list_reports(
+    moderator: ModeratorUser, session: DbSession,
+    status: Literal["pending"] = "pending",
+    limit: int = Query(100, ge=1, le=500),
+) -> dict:
+    """The moderator triage queue. Only ``status=pending`` (unresolved) is served
+    today — the queue behind the EULA's 24h-action commitment. The closed set is a
+    ``Literal`` so FastAPI validates it at the boundary (422 + OpenAPI-documented)
+    rather than a hand-rolled check. ``limit`` is a validated page size (1..500,
+    default 100) so a backlog past the default can't leave the oldest pending
+    reports permanently unreachable through the API (cage-match Carnot); full
+    cursor pagination is deferred to #44. Privileged read: shows already-soft-
+    deleted / block-hidden context (no visibility filter)."""
+    return {"reports": await moderation_service.list_pending_reports(session, limit=limit)}
+
+
+@router.post("/reports/{report_id}/resolve", status_code=status.HTTP_204_NO_CONTENT)
+async def resolve_report(
+    report_id: str, moderator: ModeratorUser, session: DbSession,
+) -> None:
+    """Act on a report by taking the reported message down (soft-delete) and
+    marking the report ``taken_down``. Idempotent. 404 for an unknown report."""
+    try:
+        await moderation_service.take_down_message(
+            session, report_id=report_id, moderator_id=moderator.id)
+    except moderation_service.ReportNotFound:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "report not found")
+    except moderation_service.ReportAlreadyResolved:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "report already resolved a different way")
+
+
+@router.post("/reports/{report_id}/dismiss", status_code=status.HTTP_204_NO_CONTENT)
+async def dismiss_report(
+    report_id: str, moderator: ModeratorUser, session: DbSession,
+) -> None:
+    """Dismiss a frivolous report (mark ``dismissed``, leave the message). Idempotent.
+    404 for an unknown report."""
+    try:
+        await moderation_service.dismiss_report(
+            session, report_id=report_id, moderator_id=moderator.id)
+    except moderation_service.ReportNotFound:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "report not found")
+    except moderation_service.ReportAlreadyResolved:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "report already resolved a different way")
+
+
+@router.post("/users/{user_id}/ban", status_code=status.HTTP_204_NO_CONTENT)
+async def ban_user(
+    user_id: str, moderator: ModeratorUser, session: DbSession, request: Request,
+) -> None:
+    """Suspend ``user_id`` from this island. Per-island, reversible, forward-looking.
+    400 for a self-ban, 404 for an unknown target. Active-disconnect (option a): after
+    the ban commits, drop the banned user's live socket(s) so they can't keep posting
+    on an already-open connection — the auth gates already refuse every new request,
+    reconnect, and refresh."""
+    try:
+        await moderation_service.ban_user(
+            session, target_id=user_id, moderator_id=moderator.id)
+    except moderation_service.CannotBanSelf:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "you cannot ban yourself")
+    except moderation_service.CannotBanModerator:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "cannot ban a moderator — remove them from the moderator set first")
+    except moderation_service.UserNotFound:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "user not found")
+    # Active-disconnect: reach the realtime hub via app state. In production the
+    # lifespan always wires app.state.gw, so this fires; it is absent only in
+    # unit/route contexts without a running bus (nothing live to drop — skip
+    # cleanly). SINGLE-PROCESS SCOPE (cage-match Tesla): the hub is in-process
+    # memory, so this drops sockets on THIS worker only. The gateway runs a single
+    # uvicorn worker today (realtime/hub.py), so that is complete; if it ever scales
+    # to multiple workers/replicas, active-disconnect must fan across the fleet (the
+    # same redis-fanout path the hub's multi-worker plan names) or the already-open
+    # sockets on other workers ride token expiry until their next gated request.
+    gw = getattr(request.app.state, "gw", None)
+    if gw is not None and getattr(gw, "hub", None) is not None:
+        dropped = await gw.hub.disconnect_user(user_id)
+        if dropped:
+            log.info("ban: dropped %s live socket(s) for user=%s", dropped, user_id)
+
+
+@router.delete("/users/{user_id}/ban", status_code=status.HTTP_204_NO_CONTENT)
+async def unban_user(
+    user_id: str, moderator: ModeratorUser, session: DbSession,
+) -> None:
+    """Lift ``user_id``'s ban. Idempotent. 404 for an unknown target."""
+    try:
+        await moderation_service.unban_user(session, target_id=user_id)
+    except moderation_service.UserNotFound:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "user not found")

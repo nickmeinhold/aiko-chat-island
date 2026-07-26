@@ -75,6 +75,16 @@ async def get_by_id(session: AsyncSession, user_id: str) -> User | None:
     return await session.get(User, user_id)
 
 
+def is_banned(user: User) -> bool:
+    """Whether `user` is suspended from this island (moderation ban, Piece B).
+
+    A pure predicate on the already-loaded row (no DB round-trip) so every auth
+    ingress can apply the SAME check: REST (get_current_user), the WS handshake,
+    token refresh, and each login/mint path. `banned_at` set = suspended; NULL =
+    active. The single source of truth for 'is this account allowed to act'."""
+    return user.banned_at is not None
+
+
 async def authenticate(session: AsyncSession, username: str, password: str) -> User | None:
     user = (await session.execute(
         select(User).where(User.username == username)

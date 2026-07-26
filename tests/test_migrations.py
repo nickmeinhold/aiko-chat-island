@@ -96,6 +96,8 @@ def test_fresh_db_upgrades_to_head(tmp_path, monkeypatch) -> None:
             challenge_sql = conn.exec_driver_sql(
                 "SELECT sql FROM sqlite_master WHERE name='passkey_challenges'"
             ).scalar()
+            report_sql = conn.exec_driver_sql(
+                "SELECT sql FROM sqlite_master WHERE name='message_reports'").scalar()
     finally:
         engine.dispose()
     assert _MODEL_TABLES <= tables
@@ -116,6 +118,12 @@ def test_fresh_db_upgrades_to_head(tmp_path, monkeypatch) -> None:
     assert "ck_passkey_challenges_operation" in challenge_sql
     assert "'register'" in challenge_sql and "'authenticate'" in challenge_sql
     assert "'recover'" in challenge_sql
+    # The message_reports.resolution CHECK (Piece B, migration 0014) enforces the
+    # closed ReportResolution set. compare_metadata is CHECK-blind on SQLite, so a
+    # migration that dropped or mis-spelled the constraint would let a bogus
+    # resolution write succeed — assert it structurally in the migrated DDL.
+    assert "ck_message_reports_resolution" in report_sql
+    assert "'taken_down'" in report_sql and "'dismissed'" in report_sql
 
 
 def test_adopt_pre_alembic_db_stamps_baseline(tmp_path, monkeypatch) -> None:

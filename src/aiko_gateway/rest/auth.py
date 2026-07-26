@@ -22,8 +22,8 @@ from webauthn.helpers.exceptions import (
 
 from ..config import settings
 from ..domain import (
-    accounts_service, handoff_service, nonce_service, oauth, oauth_broker,
-    passkey_service, security, state_service, users_service,
+    accounts_service, handoff_service, moderation_service, nonce_service, oauth,
+    oauth_broker, passkey_service, security, state_service, users_service,
 )
 from ..domain.models import PasskeyOperation, User
 from ..domain.oauth import Provider, VerifiedIdentity
@@ -63,6 +63,20 @@ def _tokens(user_id: str) -> dict:
             "refresh_token": security.issue_refresh(user_id)}
 
 
+def _deny_if_banned(user: User) -> None:
+    """Refuse to mint tokens for a suspended account (Piece B ban enforcement).
+
+    Applied at EVERY login/refresh path that resolves an EXISTING user — the token
+    mint is a distinct ingress from get_current_user (a banned user must not obtain
+    a FRESH token, not just be rejected when presenting one). Brand-new-user mints
+    (register, social claim, passkey register) skip this: the row was just created,
+    so it cannot be banned. The set of call sites here is the exhaustive
+    _tokens()/issue_access() enumeration, not the design doc's prose list — the
+    auth-ingress fragmentation (#1927) is exactly the risk of missing one."""
+    if users_service.is_banned(user):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "account suspended")
+
+
 @router.post("/register", dependencies=[rate_limit("account")])
 async def register(req: RegisterReq, session: DbSession) -> dict:
     if not settings.open_registration:
@@ -85,6 +99,7 @@ async def login(req: LoginReq, session: DbSession) -> dict:
     user = await users_service.authenticate(session, req.username, req.password)
     if user is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid credentials")
+    _deny_if_banned(user)
     return {**_tokens(user.id), "user": _user_view(user)}
 
 
@@ -146,6 +161,7 @@ async def _resolve_identity(
     user = await users_service.get_user_by_social(
         session, identity.provider, identity.sub)
     if user is not None:
+        _deny_if_banned(user)  # ban gate for BOTH native /social and broker /callback
         return {**_tokens(user.id), "user": _user_view(user)}
 
     provisioning_token = security.issue_provisioning(
@@ -516,6 +532,7 @@ async def passkey_authenticate_finish(
                     "cred=%s user_id=%s", _short(cred_id), cred.user_id)
         raise HTTPException(
             status.HTTP_401_UNAUTHORIZED, "unknown passkey credential")
+    _deny_if_banned(user)
     cred.sign_count = new_count
     cred.last_used_at = dt.datetime.now(dt.timezone.utc)
     outcome = {**_tokens(user.id), "user": _user_view(user)}
@@ -528,11 +545,19 @@ async def passkey_authenticate_finish(
 
 
 @router.post("/refresh", dependencies=[rate_limit("account")])
-async def refresh(req: RefreshReq) -> dict:
+async def refresh(req: RefreshReq, session: DbSession) -> dict:
     try:
         user_id = security.decode_token(req.refresh_token, expected_type="refresh")
     except jwt.InvalidTokenError:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid refresh token")
+    # Ban enforcement (Piece B): the refresh path previously loaded no row and
+    # minted purely from a valid refresh token — a bypass for a banned user. Load
+    # the row so a suspended account can't obtain a fresh access token, and fail
+    # closed if the user vanished (deleted account) rather than issuing for a ghost.
+    user = await users_service.get_by_id(session, user_id)
+    if user is None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid refresh token")
+    _deny_if_banned(user)
     return {"access_token": security.issue_access(user_id)}
 
 
@@ -784,6 +809,7 @@ async def oauth_exchange(req: OAuthExchangeReq, session: DbSession) -> dict:
             # The user vanished between callback and exchange (deleted account).
             raise HTTPException(
                 status.HTTP_401_UNAUTHORIZED, "invalid or expired handoff code")
+        _deny_if_banned(user)  # ingress the plan's prose missed — caught by the mint grep
         return {**_tokens(user.id), "user": _user_view(user)}
     # provisioning — mint the provisioning token now (the verified identity was
     # carried in the handoff payload; it cannot be forged because the payload was
@@ -836,7 +862,11 @@ me_router = APIRouter(prefix="/v1", tags=["auth"])
 
 @me_router.get("/me")
 async def me(user: CurrentUser) -> dict:
-    return _user_view(user)
+    # is_moderator is UI-only (show/hide the moderation surface in the app);
+    # enforcement stays server-side in require_moderator. Sourced from the SAME
+    # moderation_service.is_moderator config lookup the gate uses, so the flag and
+    # the gate can't disagree.
+    return {**_user_view(user), "is_moderator": moderation_service.is_moderator(user.id)}
 
 
 @me_router.delete("/account", status_code=status.HTTP_204_NO_CONTENT)

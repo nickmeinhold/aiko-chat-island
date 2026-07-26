@@ -111,6 +111,18 @@ class PasskeyOperation(enum.StrEnum):
     RECOVER = "recover"
 
 
+class ReportResolution(enum.StrEnum):
+    """Closed set of moderator outcomes for a message report (Piece B, #7). Same
+    single-source-of-truth pattern as Role/Platform: drives the DB CHECK on
+    message_reports.resolution via _in_check, so the constraint can't drift from
+    the Python closed set. NULL resolution = the report is still pending (not yet
+    actioned); a resolved report carries one of these. 'taken_down' = the message
+    was soft-deleted; 'dismissed' = the report was judged frivolous, message kept."""
+
+    TAKEN_DOWN = "taken_down"
+    DISMISSED = "dismissed"
+
+
 def _in_check(column: str, values: type[enum.StrEnum]) -> str:
     """SQL `column IN ('a', 'b')` derived FROM the enum members, so the DB CHECK
     can never drift from the Python closed set — change the enum, the constraint
@@ -136,6 +148,13 @@ class User(Base):
     # first consent (and may be a private-relay address).
     email: Mapped[str | None] = mapped_column(String(320), nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    # Moderation ban (Piece B, #7). NULL = active; a timestamp = suspended FROM
+    # this island (per-island, reversible, forward-looking — see moderation_service.
+    # ban_user). Enforced at every auth ingress via users_service.is_banned; it does
+    # NOT delete the user row (distinct from account deletion) nor their past
+    # messages (use take-down for content).
+    banned_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True)
 
 
 class SocialIdentity(Base):
@@ -372,6 +391,12 @@ class MessageReport(Base):
     __table_args__ = (
         UniqueConstraint(
             "message_id", "reporter_user_id", name="uq_report_message_reporter"),
+        # Closed set for the moderator outcome (Piece B). NULL passes the IN check
+        # (SQL NULL IN (...) is NULL, not false), so a pending report is allowed;
+        # only a non-null value must be a member of the set.
+        CheckConstraint(
+            _in_check("resolution", ReportResolution),
+            name="ck_message_reports_resolution"),
     )
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=new_ulid)
     message_id: Mapped[str] = mapped_column(
@@ -382,6 +407,12 @@ class MessageReport(Base):
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     resolved_at: Mapped[dt.datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True)
+    # Piece B: WHO actioned the report and HOW. Both NULL while pending. The FK is
+    # nullable so a moderator's own later account deletion doesn't cascade-destroy
+    # the report's audit trail (mirrors reporter_user_id anonymization).
+    resolved_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id"), nullable=True)
+    resolution: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
 
 class DeviceToken(Base):
