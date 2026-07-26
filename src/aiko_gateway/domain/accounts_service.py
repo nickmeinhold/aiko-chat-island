@@ -230,5 +230,10 @@ async def delete_user_account(session: AsyncSession, user_id: str) -> None:
     await session.execute(
         delete(Membership).where(Membership.user_id == user_id))
     # Finally the account row itself.
+    # NO token_generation bump here (#1914): deletion HARD-removes the user row, and
+    # every auth ingress (get_current_user, refresh, WS handshake) fails closed when
+    # get_by_id returns None. So a lingering token is already dead once this commits —
+    # bumping a column on a row we delete in the same transaction is an inert write.
+    # (Recovery finalize DOES bump, because it re-keys a SURVIVING account.)
     await session.execute(delete(User).where(User.id == user_id))
     await session.commit()

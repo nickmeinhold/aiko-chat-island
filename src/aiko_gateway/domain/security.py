@@ -1,8 +1,10 @@
 """Auth primitives: argon2id password hashing + JWT issue/verify.
 
-Tokens carry only `sub` (user_id) + `type` (access|refresh) + expiry — NOT
-roles. Roles/membership are read live from Postgres on each request (plan §A3)
-so a revoked membership takes effect immediately, not at next token refresh.
+Tokens carry `sub` (user_id) + `type` (access|refresh) + `gen` (the user's
+token_generation at mint time, #1914) + expiry — NOT roles. Roles/membership AND
+the live token_generation are read from the DB on each request (plan §A3) so a
+revoked membership OR a bumped generation takes effect immediately, not at next
+token refresh.
 """
 from __future__ import annotations
 
@@ -28,28 +30,46 @@ def verify_password(plain: str, hashed: str) -> bool:
         return False
 
 
-def _issue(user_id: str, token_type: str, ttl_seconds: int) -> str:
+def _issue(user_id: str, token_type: str, ttl_seconds: int, *, gen: int) -> str:
     now = dt.datetime.now(dt.timezone.utc)
     payload = {
         "sub": user_id,
         "type": token_type,
+        # Session-revocation generation (#1914). The token is valid only while this
+        # equals the user's live `users.token_generation`; bumping that column
+        # (recovery re-key) invalidates every token minted at an older gen. The
+        # equality check happens at each auth ingress (it needs the DB row), not
+        # here — decode_token only surfaces the claim.
+        "gen": gen,
         "iat": int(now.timestamp()),
         "exp": int((now + dt.timedelta(seconds=ttl_seconds)).timestamp()),
     }
     return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm)
 
 
-def issue_access(user_id: str) -> str:
-    return _issue(user_id, "access", settings.jwt_access_ttl_seconds)
+def issue_access(user_id: str, *, gen: int = 0) -> str:
+    """Mint an access token bound to the user's token_generation. `gen` defaults to
+    0 — the un-revoked baseline — so a caller that omits it can only ever produce a
+    token that is REJECTED for a revoked user (0 != their bumped gen), never one
+    that bypasses revocation. Real mint paths pass the user's live token_generation."""
+    return _issue(user_id, "access", settings.jwt_access_ttl_seconds, gen=gen)
 
 
-def issue_refresh(user_id: str) -> str:
-    return _issue(user_id, "refresh", settings.jwt_refresh_ttl_seconds)
+def issue_refresh(user_id: str, *, gen: int = 0) -> str:
+    """Mint a refresh token bound to token_generation (see issue_access on the
+    fail-closed default)."""
+    return _issue(user_id, "refresh", settings.jwt_refresh_ttl_seconds, gen=gen)
 
 
-def decode_token(token: str, *, expected_type: str) -> str:
-    """Return the user_id (sub) if valid and of the expected type, else raise
-    jwt.InvalidTokenError."""
+def decode_token(token: str, *, expected_type: str) -> tuple[str, int]:
+    """Return (user_id, generation) if valid and of the expected type, else raise
+    jwt.InvalidTokenError.
+
+    A token minted before #1914 carries no `gen` claim; it reads as generation 0
+    so it validates against the default users.token_generation=0 (no mass-logout on
+    deploy). The `gen` is signed, so a client cannot forge or strip it undetected.
+    The caller must compare the returned generation against the live user row — an
+    ingress that ignores it leaves revocation unenforced (mirror is_banned)."""
     payload = jwt.decode(
         token, settings.jwt_secret, algorithms=[settings.jwt_algorithm]
     )
@@ -58,7 +78,17 @@ def decode_token(token: str, *, expected_type: str) -> str:
     sub = payload.get("sub")
     if not sub:
         raise jwt.InvalidTokenError("missing sub")
-    return sub
+    # Fail CLOSED on a malformed generation. Only we mint these (HS256-signed), so a
+    # bad `gen` shouldn't occur — but a trust-boundary decoder must never 500 on a
+    # bad claim (the ingresses catch only InvalidTokenError; anything else escapes as
+    # a 500 / WS crash). Missing → 0 (legacy pre-#1914 tokens). Present must be a
+    # non-negative int; a bool / null / string / negative is an INVALID token, not a
+    # server error — same fail-closed posture as signing.validate_origin's type guards
+    # (bool is an int subclass, so exclude it explicitly).
+    gen = payload.get("gen", 0)
+    if isinstance(gen, bool) or not isinstance(gen, int) or gen < 0:
+        raise jwt.InvalidTokenError("invalid gen claim")
+    return sub, gen
 
 
 # --- social sign-in provisioning token (#13) ------------------------------- #

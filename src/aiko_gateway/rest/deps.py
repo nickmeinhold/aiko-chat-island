@@ -30,12 +30,19 @@ async def get_current_user(
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> User:
     try:
-        user_id = security.decode_token(creds.credentials, expected_type="access")
+        user_id, token_gen = security.decode_token(
+            creds.credentials, expected_type="access")
     except jwt.InvalidTokenError:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid or expired token")
     user = await users_service.get_by_id(session, user_id)
     if user is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "user not found")
+    # Session revocation (#1914): a token minted at an older generation is dead,
+    # even if unexpired. This is one of the enumerated ingresses (WS handshake +
+    # refresh apply the identical check) — the live twin of is_banned for whole-
+    # session revocation. Opaque 401, same as any invalid token.
+    if token_gen != user.token_generation:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid or expired token")
     # Ban enforcement (Piece B): a suspended account is rejected on EVERY
     # authenticated REST route here, even if it still holds a valid (unexpired)
     # access token. This is one of the enumerated ingresses — the WS handshake,

@@ -58,9 +58,13 @@ def _user_view(u: User) -> dict:
             "display_name": u.display_name, "aiko_username": u.aiko_username}
 
 
-def _tokens(user_id: str) -> dict:
-    return {"access_token": security.issue_access(user_id),
-            "refresh_token": security.issue_refresh(user_id)}
+def _tokens(user: User) -> dict:
+    """Mint an access+refresh pair bound to the user's CURRENT token_generation
+    (#1914). Takes the User row (not just the id) so every mint carries the live
+    generation — a token minted here is honoured until the user's generation is
+    bumped (recovery re-key). A freshly-created user has generation 0."""
+    return {"access_token": security.issue_access(user.id, gen=user.token_generation),
+            "refresh_token": security.issue_refresh(user.id, gen=user.token_generation)}
 
 
 def _deny_if_banned(user: User) -> None:
@@ -91,7 +95,7 @@ async def register(req: RegisterReq, session: DbSession) -> dict:
         # (a failed commit leaves it needing rollback).
         await session.rollback()
         raise HTTPException(status.HTTP_409_CONFLICT, "username already taken")
-    return {**_tokens(user.id), "user": _user_view(user)}
+    return {**_tokens(user), "user": _user_view(user)}
 
 
 @router.post("/login", dependencies=[rate_limit("account")])
@@ -100,7 +104,7 @@ async def login(req: LoginReq, session: DbSession) -> dict:
     if user is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid credentials")
     _deny_if_banned(user)
-    return {**_tokens(user.id), "user": _user_view(user)}
+    return {**_tokens(user), "user": _user_view(user)}
 
 
 class SocialReq(BaseModel):
@@ -162,7 +166,7 @@ async def _resolve_identity(
         session, identity.provider, identity.sub)
     if user is not None:
         _deny_if_banned(user)  # ban gate for BOTH native /social and broker /callback
-        return {**_tokens(user.id), "user": _user_view(user)}
+        return {**_tokens(user), "user": _user_view(user)}
 
     provisioning_token = security.issue_provisioning(
         identity.provider, identity.sub,
@@ -323,7 +327,7 @@ async def social_claim(req: SocialClaimReq, session: DbSession) -> dict:
         await session.rollback()
         raise HTTPException(
             status.HTTP_409_CONFLICT, "handle already taken or identity already claimed")
-    return {**_tokens(user.id), "user": _user_view(user)}
+    return {**_tokens(user), "user": _user_view(user)}
 
 
 # --- WebAuthn passkeys (#1471) --------------------------------------------- #
@@ -415,7 +419,7 @@ async def passkey_register_finish(req: PasskeyFinishReq, session: DbSession) -> 
             status.HTTP_503_SERVICE_UNAVAILABLE, "could not allocate an account handle")
     # Read the view BEFORE commit — expire_on_commit would otherwise lazy-reload the
     # ORM object outside the async context (the add/finish MissingGreenlet trap).
-    outcome = {**_tokens(user.id), "user": _user_view(user)}
+    outcome = {**_tokens(user), "user": _user_view(user)}
     # Durable AFTER the account is built: the challenge burn + account creation commit
     # atomically (the #24 contract) — a downstream failure rolls both back.
     await session.commit()
@@ -535,7 +539,7 @@ async def passkey_authenticate_finish(
     _deny_if_banned(user)
     cred.sign_count = new_count
     cred.last_used_at = dt.datetime.now(dt.timezone.utc)
-    outcome = {**_tokens(user.id), "user": _user_view(user)}
+    outcome = {**_tokens(user), "user": _user_view(user)}
     # Durable AFTER the outcome: the challenge burn + sign_count bump commit atomic
     # with the sign-in (a downstream failure rolls both back — the #24 contract).
     await session.commit()
@@ -547,7 +551,8 @@ async def passkey_authenticate_finish(
 @router.post("/refresh", dependencies=[rate_limit("account")])
 async def refresh(req: RefreshReq, session: DbSession) -> dict:
     try:
-        user_id = security.decode_token(req.refresh_token, expected_type="refresh")
+        user_id, token_gen = security.decode_token(
+            req.refresh_token, expected_type="refresh")
     except jwt.InvalidTokenError:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid refresh token")
     # Ban enforcement (Piece B): the refresh path previously loaded no row and
@@ -557,8 +562,15 @@ async def refresh(req: RefreshReq, session: DbSession) -> dict:
     user = await users_service.get_by_id(session, user_id)
     if user is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid refresh token")
+    # Session revocation (#1914): a refresh token from a superseded generation must
+    # not re-mint access — this is the ingress that most needs it (refresh TTL is
+    # 30d, the whole window a revoked device could otherwise keep riding). Check
+    # BEFORE the mint; the new access token carries the CURRENT generation.
+    if token_gen != user.token_generation:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid refresh token")
     _deny_if_banned(user)
-    return {"access_token": security.issue_access(user_id)}
+    return {"access_token": security.issue_access(
+        user.id, gen=user.token_generation)}
 
 
 # --- OAuth broker (server-side authorization-code flow, #21) ---------------- #
@@ -810,7 +822,7 @@ async def oauth_exchange(req: OAuthExchangeReq, session: DbSession) -> dict:
             raise HTTPException(
                 status.HTTP_401_UNAUTHORIZED, "invalid or expired handoff code")
         _deny_if_banned(user)  # ingress the plan's prose missed — caught by the mint grep
-        return {**_tokens(user.id), "user": _user_view(user)}
+        return {**_tokens(user), "user": _user_view(user)}
     # provisioning — mint the provisioning token now (the verified identity was
     # carried in the handoff payload; it cannot be forged because the payload was
     # written server-side under an unguessable code).
