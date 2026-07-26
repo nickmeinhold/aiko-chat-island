@@ -457,13 +457,14 @@ async def finalize_recovery(
     signing keys (clean re-key on the new device), issues a session, and commits —
     ONE commit.
 
-    SESSION-PLANE RESIDUAL (named — cage-match Tesla, PR#69): this revokes the old
-    CREDENTIALS but NOT existing JWT sessions — sessions are stateless HS256 tokens
-    with no revocation mechanism, so a lost/old device keeps riding its refresh token
-    until it expires (refresh TTL = 30d). Acceptable ONLY because recovery is
-    deploy-dark + un-invokable today. Per-user token_generation revocation
-    (claude-tasks #1914) MUST land + be live-verified BEFORE recovery is enabled for
-    real users — that is the lift condition. See Design 05 §10/§11.
+    SESSION-PLANE RE-KEY (#1914, resolved): this revokes the old CREDENTIALS AND the
+    old JWT SESSIONS. Stateless HS256 tokens have no built-in revocation, so we bump
+    the user's token_generation below — every access/refresh token minted at the old
+    generation is then rejected at every auth ingress (get_current_user, refresh, WS
+    handshake), and this new session is minted at the bumped generation. The old
+    residual (a lost device riding a 30d refresh token past a "clean re-key") is
+    closed. This was the lift condition for enabling recovery for real users. See
+    Design 05 §10/§11.
 
     Idempotent: a later poll (or a lost first response) finds the row already gone,
     so the DELETE matches 0 rows and this returns None. The route maps None to a clean
@@ -544,10 +545,16 @@ async def finalize_recovery(
     except IntegrityError:
         await session.rollback()
         return None
+    # Session-plane re-key (#1914): a recovery is an account TAKEOVER — the old
+    # device's still-valid JWTs (refresh TTL 30d) must die with the old credentials,
+    # not outlive them. Bump the user's token_generation so EVERY previously-issued
+    # token is rejected at every auth ingress, and mint THIS new session at the
+    # bumped generation. One write, folded into the single finalize commit below.
+    user.token_generation += 1
     # Read the session view BEFORE commit (expire_on_commit / MissingGreenlet trap).
     outcome = {
-        "access_token": security.issue_access(user.id),
-        "refresh_token": security.issue_refresh(user.id),
+        "access_token": security.issue_access(user.id, gen=user.token_generation),
+        "refresh_token": security.issue_refresh(user.id, gen=user.token_generation),
         "user": {
             "user_id": user.id, "username": user.username,
             "display_name": user.display_name, "aiko_username": user.aiko_username,

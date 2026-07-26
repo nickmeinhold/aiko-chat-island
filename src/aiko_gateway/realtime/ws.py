@@ -29,7 +29,7 @@ router = APIRouter()
 async def ws_endpoint(websocket: WebSocket) -> None:
     token = websocket.query_params.get("token", "")
     try:
-        user_id = security.decode_token(token, expected_type="access")
+        user_id, token_gen = security.decode_token(token, expected_type="access")
     except jwt.InvalidTokenError:
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
@@ -41,7 +41,13 @@ async def ws_endpoint(websocket: WebSocket) -> None:
     # get_current_user gate. Same 1008 close as an invalid token (no existence
     # leak). An already-open socket is dropped separately by hub.disconnect_user
     # at ban time (active-disconnect).
-    if user is None or users_service.is_banned(user):
+    #
+    # Session revocation (#1914) is enforced HERE too — the WS handshake decodes the
+    # token directly (outside get_current_user), so it is a distinct ingress that
+    # must apply the SAME token_generation check or a revoked device keeps riding an
+    # open/reconnecting socket. A stale generation closes 1008 like any dead token.
+    if (user is None or users_service.is_banned(user)
+            or token_gen != user.token_generation):
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
 

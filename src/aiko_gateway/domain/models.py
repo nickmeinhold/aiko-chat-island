@@ -155,6 +155,15 @@ class User(Base):
     # messages (use take-down for content).
     banned_at: Mapped[dt.datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True)
+    # Session-revocation generation (#1914). Every access/refresh token embeds the
+    # `gen` it was minted at; a token is honoured only while its gen == this column.
+    # Bumping it (recovery finalize re-key) invalidates EVERY outstanding token for
+    # the user in one write — the revocation mechanism stateless HS256 JWTs lack.
+    # Checked live at every auth ingress (get_current_user, refresh, WS handshake),
+    # exactly like is_banned. DEFAULT 0 = the un-revoked baseline; pre-#1914 tokens
+    # (no `gen` claim) read as 0 too, so a deploy doesn't mass-logout live sessions.
+    token_generation: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0")
 
 
 class SocialIdentity(Base):
