@@ -21,7 +21,7 @@ from typing import Literal
 from urllib.parse import urlparse
 
 import httpx
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, status
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request, status
 from pydantic import BaseModel
 
 from ..config import settings
@@ -146,13 +146,17 @@ async def report_message(
 async def list_reports(
     moderator: ModeratorUser, session: DbSession,
     status: Literal["pending"] = "pending",
+    limit: int = Query(100, ge=1, le=500),
 ) -> dict:
     """The moderator triage queue. Only ``status=pending`` (unresolved) is served
     today — the queue behind the EULA's 24h-action commitment. The closed set is a
     ``Literal`` so FastAPI validates it at the boundary (422 + OpenAPI-documented)
-    rather than a hand-rolled check. Privileged read: shows already-soft-deleted /
-    block-hidden context (no visibility filter)."""
-    return {"reports": await moderation_service.list_pending_reports(session)}
+    rather than a hand-rolled check. ``limit`` is a validated page size (1..500,
+    default 100) so a backlog past the default can't leave the oldest pending
+    reports permanently unreachable through the API (cage-match Carnot); full
+    cursor pagination is deferred to #44. Privileged read: shows already-soft-
+    deleted / block-hidden context (no visibility filter)."""
+    return {"reports": await moderation_service.list_pending_reports(session, limit=limit)}
 
 
 @router.post("/reports/{report_id}/resolve", status_code=status.HTTP_204_NO_CONTENT)

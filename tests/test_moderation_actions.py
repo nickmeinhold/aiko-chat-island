@@ -358,6 +358,48 @@ async def test_banned_user_refused_login(client, session):
     assert resp.status_code == 403
 
 
+async def test_banned_user_refused_social_login(session):
+    """Social single door (_resolve_identity — covers native /social AND broker
+    /callback): a banned social user is refused a session; an active one gets tokens."""
+    from fastapi import HTTPException
+
+    from aiko_gateway.domain.oauth import VerifiedIdentity
+    from aiko_gateway.rest.auth import _resolve_identity
+
+    await users_service.create_social_user(
+        session, provider="google", provider_sub="sub-active",
+        handle="socialactive", display_name="Active")
+    banned = await users_service.create_social_user(
+        session, provider="google", provider_sub="sub-banned",
+        handle="socialbanned", display_name="Banned")
+    banned.banned_at = dt.datetime.now(dt.timezone.utc)
+    await session.commit()
+
+    ok = await _resolve_identity(session, VerifiedIdentity(
+        provider="google", sub="sub-active", email=None, suggested_name=None))
+    assert "access_token" in ok
+    with pytest.raises(HTTPException) as ei:
+        await _resolve_identity(session, VerifiedIdentity(
+            provider="google", sub="sub-banned", email=None, suggested_name=None))
+    assert ei.value.status_code == 403
+
+
+async def test_reports_limit_validated_and_capped(client, session, monkeypatch):
+    """The queue exposes a validated `limit` (1..500) so a backlog past the default
+    can't hide the oldest reports; out-of-range is a 422 (cage-match Carnot)."""
+    mod = await _user(session, "mod")
+    author = await _user(session, "author")
+    monkeypatch.setattr(settings, "moderator_user_ids", [mod.id])
+    ch = await _channel(session)
+    for i in range(3):
+        m = await _msg(session, mid=i + 1, channel=ch, sender=author)
+        await _report(session, rid=100 + i, message=m, reporter=author)
+    h = _auth(mod)
+    assert len((await client.get("/v1/reports?limit=2", headers=h)).json()["reports"]) == 2
+    assert (await client.get("/v1/reports?limit=0", headers=h)).status_code == 422
+    assert (await client.get("/v1/reports?limit=999", headers=h)).status_code == 422
+
+
 async def _run_handshake(session, monkeypatch, user):
     """Drive ws_endpoint against a stub socket, returning (accepted, close_code)."""
     class _CM:
