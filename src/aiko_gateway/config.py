@@ -347,6 +347,17 @@ class Settings(BaseSettings):
             # social_signin_enabled alone is sound: the social guard above already
             # refused boot if social is on without a usable provider, so the flag
             # here implies an advertised, usable social ingress.
+            #
+            # Asymmetry (intentional): social needs the provider-completeness check
+            # above, but passkey_enabled alone is treated as viable because passkey
+            # has NO half-config state today — passkey_rp_id defaults to a real
+            # value, so flipping passkey_enabled on is a complete ingress by itself.
+            # If passkey ever grows a half-config footgun (e.g. a required RP/origin
+            # that can be blank), mirror the social completeness guard here or this
+            # "viable" claim goes hollow. When a THIRD legitimate prod ingress lands
+            # (open_registration/invites after I2 membership, #36), this predicate
+            # MUST be extended in the same change or a joinable-by-policy island
+            # would refuse boot — see the follow-up task.
             if not (self.passkey_enabled or self.social_signin_enabled):
                 raise ValueError(
                     "no viable sign-in ingress is configured for production: both "

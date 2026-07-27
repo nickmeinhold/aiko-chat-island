@@ -1,10 +1,17 @@
-"""Fail-closed configuration guards (prod auth hardening, task #38).
+"""Fail-closed configuration guards (prod auth hardening).
 
-Two invariants:
-  1. A production-like deployment MUST NOT boot with the dev-default jwt_secret —
-     `Settings()` raises rather than serving forgeable tokens.
+Invariants (all prod-only unless noted):
+  1. A production-like deployment MUST NOT boot with the dev-default/weak
+     jwt_secret — `Settings()` raises rather than serving forgeable tokens.
   2. Open self-registration defaults OFF in production and ON in dev, with an
-     explicit override either way.
+     explicit override either way (and no prod break-glass until I2 lands).
+  3. Social sign-in enabled in prod requires a usable provider (native client
+     IDs or a fully-configured broker); an empty allowlist would reject-all.
+  4. An OAuth broker provider is both-or-neither: a half (id XOR secret) config
+     refuses boot rather than failing opaquely mid-login.
+  5. At least one viable NEW-USER ingress (passkey ∨ social) must exist in prod —
+     otherwise the island can log in existing accounts but can never onboard
+     anyone (a locked, un-joinable deployment). #1927/#49.
 
 `_env_file=None` disables the repo `.env` so these tests exercise the code
 defaults, not whatever a local `.env` happens to set.
