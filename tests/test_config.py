@@ -12,10 +12,11 @@ Invariants (all prod-only unless noted):
   5. At least one viable NEW-USER ingress (passkey ∨ social) must exist in prod —
      otherwise the island can log in existing accounts but can never onboard
      anyone (a locked, un-joinable deployment). #1927/#49.
-  6. If passkey is enabled in prod, passkey_rp_id must match the serving host
-     (equal or a registrable parent per the WebAuthn rp_id rule) — else the
-     advertised passkey ingress is bound to the wrong domain and every
-     registration fails (passkey viability; cage-match PR#97).
+  6. If passkey is enabled in prod, passkey_rp_id gets a BEST-EFFORT sanity check
+     against the configured host (must be multi-label AND equal/registrable-parent
+     per the WebAuthn rp_id rule). This catches an obviously-wrong rp_id but cannot
+     prove a working ceremony — Settings can't see the real serving host (cage-match
+     PR#97). Invariant 5 (an ingress is ENABLED) is the complete guarantee.
 
 `_env_file=None` disables the repo `.env` so these tests exercise the code
 defaults, not whatever a local `.env` happens to set.
@@ -283,6 +284,17 @@ def test_prod_passkey_rp_id_sibling_domain_raises():
         Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
                  passkey_enabled=True, gateway_base_url="https://chat.example.com",
                  passkey_rp_id="other.example.com")
+
+
+def test_prod_passkey_single_label_rp_raises():
+    # A single-label / public-suffix rp_id ("com") would pass a naive suffix check
+    # (host "chat.com" endswith ".com") but no browser scopes a credential to a
+    # public suffix — reject it (cage-match PR#97, Carnot). KNOWN RESIDUAL: a
+    # multi-label public suffix ("co.uk") still slips through without a PSL (#51).
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
+                 passkey_enabled=True, gateway_base_url="https://chat.com",
+                 passkey_rp_id="com")
 
 
 def test_prod_passkey_disabled_skips_rp_id_check():

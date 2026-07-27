@@ -349,42 +349,54 @@ class Settings(BaseSettings):
             # refused boot if social is on without a usable provider, so the flag
             # here implies an advertised, usable social ingress.
             #
-            # Asymmetry (intentional): social needs the provider-completeness check
-            # above, but passkey_enabled alone is treated as viable because passkey
-            # has NO half-config state today — passkey_rp_id defaults to a real
-            # value, so flipping passkey_enabled on is a complete ingress by itself.
-            # If passkey ever grows a half-config footgun (e.g. a required RP/origin
-            # that can be blank), mirror the social completeness guard here or this
-            # "viable" claim goes hollow. When a THIRD legitimate prod ingress lands
+            # Both arms are lint-checked upstream, but with different reach: social
+            # gets a full provider-completeness guard (social_signin_enabled ⟹ a
+            # usable provider), while passkey gets only a BEST-EFFORT rp_id sanity
+            # check (see the passkey block just above) — it catches an obviously-bad
+            # rp_id but CANNOT confirm a working ceremony from Settings alone. So this
+            # invariant's honest guarantee is "at least one ingress is ENABLED and not
+            # obviously-misconfigured", not "a registration will succeed". That
+            # enabled-check is itself complete and is the real value here. When a THIRD
+            # legitimate prod ingress lands
             # (open_registration/invites after I2 membership, #36), this predicate
             # MUST be extended in the same change or a joinable-by-policy island
             # would refuse boot — see the follow-up task.
             #
-            # Passkey VIABILITY (prod): passkey_enabled alone is a real ingress only
-            # if the Relying Party ID actually matches the host this gateway serves.
-            # A passkey credential is bound to passkey_rp_id and is unusable unless
-            # the serving host equals it OR is a subdomain of it (the WebAuthn rp_id
-            # rule: rp_id must be a registrable suffix of the origin's host). Without
-            # this check, a misconfigured passkey-only island (e.g. PASSKEY_ENABLED
-            # =true but passkey_rp_id left at ANOTHER island's default) passes the
-            # viable-ingress guard below, advertises passkeys on /providers, yet no
-            # user can complete registration — a locked island wearing a working
-            # ingress (cage-match PR#97, Carnot). This mirrors the social provider-
-            # completeness guard above so passkey_enabled ⟹ a usable passkey ingress,
-            # making the passkey arm of the viable-ingress guard honest, not flag-only.
+            # Passkey RP-ID SANITY (prod) — a BEST-EFFORT lint, NOT a guarantee the
+            # ceremony works. Honest scope (cage-match PR#97, Carnot + Tesla): Settings
+            # cannot see the REAL serving host, so config self-consistency != config
+            # correctness. If gateway_base_url AND passkey_rp_id are BOTH left at
+            # defaults that don't match the true host, this cannot detect it — the two
+            # defaults agree with each other while disagreeing with reality. (We can't
+            # "require non-default" either: imagineering legitimately runs on the
+            # defaults.) The COMPLETE guarantee is invariant 5 (an ingress is ENABLED);
+            # this is a lint on top of it. What the lint DOES catch:
+            #   (a) an rp_id that doesn't match the CONFIGURED host — e.g. base_url set
+            #       to this island but rp_id left at another island's default (a common,
+            #       real operator slip); and
+            #   (b) an obviously-invalid single-label / public-suffix rp_id (e.g. "com")
+            #       that no browser will scope a credential to.
+            # A passkey credential is bound to rp_id and is usable only where the origin
+            # host equals rp_id or is a subdomain of it (the WebAuthn rp_id rule).
+            # KNOWN RESIDUAL: multi-label public suffixes ("co.uk") need the Public
+            # Suffix List to reject and are NOT caught here (no PSL dependency) — #51.
             if self.passkey_enabled:
                 host = (urlparse(self.gateway_base_url).hostname or "").strip().lower()
                 rp = self.passkey_rp_id.strip().lower()
-                if not rp or not host or not (host == rp or host.endswith("." + rp)):
+                rp_single_label = "." not in rp  # "com", "localhost": never a valid prod RP
+                if (not rp or not host or rp_single_label
+                        or not (host == rp or host.endswith("." + rp))):
                     raise ValueError(
                         f"passkey_enabled is True in production but passkey_rp_id "
-                        f"({self.passkey_rp_id!r}) is not valid for this gateway's host "
-                        f"({host!r}, derived from gateway_base_url={self.gateway_base_url!r}). "
-                        "A passkey credential is bound to the RP ID and is unusable unless the "
-                        "serving host equals it or is a subdomain of it (the WebAuthn rp_id "
-                        "rule). Refusing to boot — set PASSKEY_RP_ID to this gateway's "
-                        "registrable domain (typically the host in GATEWAY_BASE_URL), or the "
-                        "advertised passkey ingress would fail every registration."
+                        f"({self.passkey_rp_id!r}) is not a usable Relying Party ID for this "
+                        f"gateway's host ({host!r}, from gateway_base_url="
+                        f"{self.gateway_base_url!r}). It must be a multi-label domain that the "
+                        "serving host equals or is a subdomain of (the WebAuthn rp_id rule; a "
+                        "single-label or public-suffix rp_id like 'com' is rejected by browsers). "
+                        "Refusing to boot — set PASSKEY_RP_ID to this gateway's registrable "
+                        "domain (typically the host in GATEWAY_BASE_URL). NOTE: this is a "
+                        "best-effort check; it cannot confirm the rp_id matches the REAL serving "
+                        "host when gateway_base_url is also left at a default."
                     )
             if not (self.passkey_enabled or self.social_signin_enabled):
                 raise ValueError(
