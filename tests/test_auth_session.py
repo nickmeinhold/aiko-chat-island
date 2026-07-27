@@ -86,3 +86,17 @@ async def test_banned_user_is_session_banned(session):
     tok = security.issue_access(u.id, gen=u.token_generation)
     with pytest.raises(auth_session.SessionBanned):
         await auth_session.resolve_session_user(session, tok, expected_type="access")
+
+
+async def test_banned_and_stale_is_invalid_session_not_banned(session):
+    """Precedence / non-leak ordering: a banned user presenting a REVOKED-generation
+    token gets the opaque InvalidSession, NOT SessionBanned. The revocation/existence
+    gate is checked before the ban gate, so a dead token never reveals suspension —
+    the ban signal (structured 403) is only exposed to a token that is otherwise
+    valid. Locks the check order against a future reshuffle."""
+    u = await _user(session, "frank", banned=True)
+    stale = security.issue_access(u.id, gen=u.token_generation)  # gen 0
+    u.token_generation += 1
+    await session.commit()
+    with pytest.raises(auth_session.InvalidSession):
+        await auth_session.resolve_session_user(session, stale, expected_type="access")

@@ -1,8 +1,10 @@
 """FastAPI dependencies: DB session + authenticated current user.
 
-`get_current_user` is the I1 enforcement point for REST (the WS handshake reuses
-`decode_token` directly). It verifies the access JWT and loads the live user row
-— roles/membership are NOT trusted from the token (plan §A3).
+`get_current_user` is the REST adapter over the shared session resolver
+(`domain.auth_session`) — the single per-user gate that REST, token refresh, and
+the WS handshake all funnel through. It maps the resolver's neutral outcomes to
+HTTP (opaque 401 / structured 403); roles/membership are NOT trusted from the
+token (plan §A3).
 """
 from __future__ import annotations
 

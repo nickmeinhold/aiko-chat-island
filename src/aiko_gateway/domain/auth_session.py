@@ -21,6 +21,8 @@ the current generation; their ban gate is `auth._deny_if_banned`.
 """
 from __future__ import annotations
 
+from typing import Literal
+
 import jwt
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -41,7 +43,7 @@ class SessionBanned(Exception):
 
 
 async def resolve_session_user(
-    session: AsyncSession, token: str, *, expected_type: str
+    session: AsyncSession, token: str, *, expected_type: Literal["access", "refresh"]
 ) -> User:
     """Decode → load → gate. Returns the live user or raises a neutral exception.
 

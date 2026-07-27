@@ -72,11 +72,13 @@ def _tokens(user: User) -> dict:
 def _deny_if_banned(user: User) -> None:
     """Refuse to mint tokens for a suspended account (Piece B ban enforcement).
 
-    Applied at EVERY login/refresh path that resolves an EXISTING user — the token
-    mint is a distinct ingress from get_current_user (a banned user must not obtain
-    a FRESH token, not just be rejected when presenting one). Brand-new-user mints
-    (register, social claim, passkey register) skip this: the row was just created,
-    so it cannot be banned. The set of call sites here is the exhaustive
+    Applied at EVERY CREDENTIAL login path that resolves an EXISTING user — the
+    token mint is a distinct ingress from get_current_user (a banned user must not
+    obtain a FRESH token, not just be rejected when presenting one). Refresh is NOT
+    here: it presents a session token, so it funnels through the shared session
+    resolver (`domain.auth_session`) which applies the ban gate itself. Brand-new-
+    user mints (register, social claim, passkey register) skip this: the row was
+    just created, so it cannot be banned. The set of call sites here is the exhaustive
     _tokens()/issue_access() enumeration, not the design doc's prose list — the
     auth-ingress fragmentation (#1927) is exactly the risk of missing one."""
     if users_service.is_banned(user):
