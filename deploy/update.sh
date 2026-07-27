@@ -45,10 +45,26 @@ while [ $# -gt 0 ]; do
 done
 
 command -v docker >/dev/null 2>&1 || die "missing required tool: docker"
-docker compose version >/dev/null 2>&1 || die "docker compose v2 not available"
+
+# Elevation autodetect: some island hosts run the deploy user OUTSIDE the docker
+# group (enspyr/nick-mel: user 'ubuntu' needs `sudo -n docker`), while others are
+# in-group (imagineering: bare docker works). Probe once and route every docker
+# call through $DOCKER so this script runs natively on BOTH without a manual shim.
+# `sudo -n` is non-interactive: if elevation is needed but passwordless sudo isn't
+# configured, fail closed with a clear message rather than a cryptic permission error.
+DOCKER="docker"
+if ! docker ps >/dev/null 2>&1; then
+  if sudo -n docker ps >/dev/null 2>&1; then
+    DOCKER="sudo -n docker"
+  else
+    die "docker needs elevation on this host but 'sudo -n docker' failed — add the deploy user to the 'docker' group, or configure passwordless sudo for docker"
+  fi
+fi
+
+$DOCKER compose version >/dev/null 2>&1 || die "docker compose v2 not available"
 
 # The island must actually be running (this is an UPDATE, not a first standup).
-docker compose ps --status running --services 2>/dev/null | grep -qx chat-island \
+$DOCKER compose ps --status running --services 2>/dev/null | grep -qx chat-island \
   || die "the 'chat-island' service isn't running — use deploy/standup.sh for a first standup"
 
 # --- step 1: back up the sole-copy DB (fail-closed) -------------------------
@@ -59,7 +75,7 @@ if [ "$DO_BACKUP" = "true" ]; then
   ts="$(date +%Y%m%d-%H%M%S)"
   # Online .backup() inside the container (no sqlite3 CLI in the slim image), then
   # copy the artifact out and remove the in-container temp. integrity_check gates.
-  docker compose exec -T chat-island python -c "
+  $DOCKER compose exec -T chat-island python -c "
 import sqlite3, sys
 src = sqlite3.connect('/data/aiko.db')
 dst = sqlite3.connect('/data/_update-$ts.db')
@@ -68,9 +84,9 @@ res = dst.execute('PRAGMA integrity_check').fetchone()[0]
 print('integrity_check:', res)
 sys.exit(0 if res == 'ok' else 1)
 " || die "backup integrity_check failed — ABORTING before touching the stack"
-  docker compose cp "chat-island:/data/_update-$ts.db" "$backup_dir/aiko.db.preupdate-$ts" \
+  $DOCKER compose cp "chat-island:/data/_update-$ts.db" "$backup_dir/aiko.db.preupdate-$ts" \
     || die "could not copy the backup out of the container — ABORTING"
-  docker compose exec -T chat-island rm -f "/data/_update-$ts.db" || true
+  $DOCKER compose exec -T chat-island rm -f "/data/_update-$ts.db" || true
   sz=$(wc -c < "$backup_dir/aiko.db.preupdate-$ts" | tr -d ' ')
   [ "${sz:-0}" -gt 4096 ] || die "backup file is implausibly small ($sz bytes) — ABORTING"
   ok "backed up to backups/aiko.db.preupdate-$ts ($sz bytes, integrity ok)"
@@ -87,11 +103,11 @@ fi
 # --- step 2: update the image + recreate ------------------------------------
 if [ "$FROM_SOURCE" = "true" ]; then
   log "Step 2/3 — building the island image from source + recreating"
-  docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+  $DOCKER compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 else
   log "Step 2/3 — pulling the latest published image + recreating"
-  docker compose pull
-  docker compose up -d
+  $DOCKER compose pull
+  $DOCKER compose up -d
 fi
 ok "stack recreated (entrypoint migrates fail-closed before serving)"
 
