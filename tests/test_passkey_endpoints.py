@@ -367,10 +367,16 @@ async def test_well_known_assetlinks_empty_until_fingerprints_configured(
     monkeypatch.setattr(settings, "passkey_android_cert_sha256", [])
     r = await client.get("/.well-known/assetlinks.json")
     assert r.status_code == 200 and r.json() == []
-    # Once configured, the target appears with the fingerprint.
+    # Once configured, the target appears with the fingerprint. BOTH relations are
+    # required: get_login_creds alone passes Google's assetlinks:check but GMS's
+    # on-device ValidateRpIdOperation additionally needs handle_all_urls, whose
+    # absence was the Android passkey-create [50152] block (2026-07-28).
     monkeypatch.setattr(settings, "passkey_android_cert_sha256", ["AB:CD:EF"])
     entry = (await client.get("/.well-known/assetlinks.json")).json()[0]
-    assert entry["relation"] == ["delegate_permission/common.get_login_creds"]
+    assert entry["relation"] == [
+        "delegate_permission/common.get_login_creds",
+        "delegate_permission/common.handle_all_urls",
+    ]
     assert entry["target"]["package_name"] == settings.passkey_android_package
     assert entry["target"]["sha256_cert_fingerprints"] == ["AB:CD:EF"]
 
