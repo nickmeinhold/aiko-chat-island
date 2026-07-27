@@ -25,16 +25,28 @@ def apple_app_site_association() -> dict:
 
 @router.get("/.well-known/assetlinks.json")
 def android_asset_links() -> list[dict]:
-    """Android Digital Asset Links (get_login_creds). The sha256 fingerprint is the
+    """Android Digital Asset Links for passkeys. The sha256 fingerprint is the
     Play App Signing cert (app task #20). Until it is configured we serve an EMPTY
     document rather than a target with no fingerprints — a fingerprint-less target
     can never verify, so publishing it is a negative/malformed association artifact
     that a client might cache (cage-match #38, Carnot). Once configured, the target
-    appears."""
+    appears.
+
+    BOTH relations are required. `get_login_creds` alone passes Google's
+    `assetlinks:check` API (so the association *looks* valid), but GMS's on-device
+    passkey `ValidateRpIdOperation` ADDITIONALLY requires `handle_all_urls` — its
+    absence fails registration with `[50152] RP ID cannot be validated` on every
+    device, even a certified one, even though every other input is correct. This
+    was the root cause of the Android passkey-create block (2026-07-28); Google's
+    own "seamless credential sharing" codelab documents `handle_all_urls` as a
+    "strict requirement" for cross-platform passkeys."""
     if not settings.passkey_android_cert_sha256:
         return []
     return [{
-        "relation": ["delegate_permission/common.get_login_creds"],
+        "relation": [
+            "delegate_permission/common.get_login_creds",
+            "delegate_permission/common.handle_all_urls",
+        ],
         "target": {
             "namespace": "android_app",
             "package_name": settings.passkey_android_package,
