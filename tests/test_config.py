@@ -297,6 +297,31 @@ def test_prod_passkey_single_label_rp_raises():
                  passkey_rp_id="com")
 
 
+def test_prod_passkey_partial_label_suffix_raises():
+    # Regression guard (cage-match PR#97 round 3, Tesla): the check is a LABEL-
+    # boundary suffix, not a character suffix. rp_id="app.com" must NOT match host
+    # "myapp.com" — `"myapp.com".endswith(".app.com")` is False because the "."+rp
+    # construction requires a full-label boundary. Locks the refutation of the
+    # claimed "myapp/app.com trap".
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
+                 passkey_enabled=True, gateway_base_url="https://myapp.com",
+                 passkey_rp_id="app.com")
+
+
+def test_prod_passkey_both_defaults_boot_is_known_limitation():
+    # PINS the documented blind spot (cage-match PR#97, Tesla): Settings cannot see
+    # the REAL serving host, so if gateway_base_url AND passkey_rp_id are BOTH left
+    # at their (matching) defaults, this boots even though a deploy on a DIFFERENT
+    # host would have a hollow passkey ingress. This is NOT a bug we can fix at the
+    # Settings layer — it's asserted here so the limitation is explicit and any
+    # future change to the default-matching behavior is a conscious one. Full
+    # passkey-config correctness belongs at deploy/runtime (#51).
+    s = Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
+                 passkey_enabled=True)  # base_url + rp_id both default to chat.imagineering.cc
+    assert s.passkey_enabled is True
+
+
 def test_prod_passkey_disabled_skips_rp_id_check():
     # Passkey off → the rp_id check is irrelevant; social carries the ingress.
     s = Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,

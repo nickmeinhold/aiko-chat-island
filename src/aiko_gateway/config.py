@@ -352,7 +352,7 @@ class Settings(BaseSettings):
             # Both arms are lint-checked upstream, but with different reach: social
             # gets a full provider-completeness guard (social_signin_enabled ⟹ a
             # usable provider), while passkey gets only a BEST-EFFORT rp_id sanity
-            # check (see the passkey block just above) — it catches an obviously-bad
+            # check (see the passkey block just below) — it catches an obviously-bad
             # rp_id but CANNOT confirm a working ceremony from Settings alone. So this
             # invariant's honest guarantee is "at least one ingress is ENABLED and not
             # obviously-misconfigured", not "a registration will succeed". That
