@@ -8,13 +8,12 @@ from __future__ import annotations
 
 from typing import Annotated, AsyncIterator
 
-import jwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..db import SessionLocal
-from ..domain import moderation_service, security, users_service
+from ..domain import auth_session, moderation_service
 from ..domain.models import User
 from .errors import AccountSuspended
 
@@ -30,27 +29,18 @@ async def get_current_user(
     creds: Annotated[HTTPAuthorizationCredentials, Depends(_bearer)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> User:
+    # Thin adapter over the shared session resolver (auth_session): the per-user
+    # gate policy (exists / generation-current / not-banned) lives there so every
+    # token-presenting ingress applies it identically. This ingress renders the
+    # neutral outcomes as HTTP: opaque 401 for any invalid session, structured 403
+    # for a ban. WS handshake + refresh are the sibling adapters.
     try:
-        user_id, token_gen = security.decode_token(
-            creds.credentials, expected_type="access")
-    except jwt.InvalidTokenError:
+        return await auth_session.resolve_session_user(
+            session, creds.credentials, expected_type="access")
+    except auth_session.InvalidSession:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid or expired token")
-    user = await users_service.get_by_id(session, user_id)
-    if user is None:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "user not found")
-    # Session revocation (#1914): a token minted at an older generation is dead,
-    # even if unexpired. This is one of the enumerated ingresses (WS handshake +
-    # refresh apply the identical check) — the live twin of is_banned for whole-
-    # session revocation. Opaque 401, same as any invalid token.
-    if token_gen != user.token_generation:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid or expired token")
-    # Ban enforcement (Piece B): a suspended account is rejected on EVERY
-    # authenticated REST route here, even if it still holds a valid (unexpired)
-    # access token. This is one of the enumerated ingresses — the WS handshake,
-    # refresh, and each login/mint path apply the same is_banned predicate.
-    if users_service.is_banned(user):
+    except auth_session.SessionBanned:
         raise AccountSuspended()
-    return user
 
 
 CurrentUser = Annotated[User, Depends(get_current_user)]

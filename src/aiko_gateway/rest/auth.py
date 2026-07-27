@@ -22,8 +22,9 @@ from webauthn.helpers.exceptions import (
 
 from ..config import settings
 from ..domain import (
-    accounts_service, handoff_service, moderation_service, nonce_service, oauth,
-    oauth_broker, passkey_service, security, state_service, users_service,
+    accounts_service, auth_session, handoff_service, moderation_service,
+    nonce_service, oauth, oauth_broker, passkey_service, security, state_service,
+    users_service,
 )
 from ..domain.models import PasskeyOperation, User
 from ..domain.oauth import Provider, VerifiedIdentity
@@ -551,25 +552,19 @@ async def passkey_authenticate_finish(
 
 @router.post("/refresh", dependencies=[rate_limit("account")])
 async def refresh(req: RefreshReq, session: DbSession) -> dict:
+    # Thin adapter over the shared session resolver (auth_session): the same
+    # per-user gate as REST + WS (exists / generation-current / not-banned), so a
+    # banned or revoked-generation refresh token cannot re-mint access — this is the
+    # ingress that most needs it (30d refresh TTL). InvalidSession renders as the
+    # opaque "invalid refresh token"; a ban renders as the structured 403. On
+    # success the new access token carries the user's CURRENT generation.
     try:
-        user_id, token_gen = security.decode_token(
-            req.refresh_token, expected_type="refresh")
-    except jwt.InvalidTokenError:
+        user = await auth_session.resolve_session_user(
+            session, req.refresh_token, expected_type="refresh")
+    except auth_session.InvalidSession:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid refresh token")
-    # Ban enforcement (Piece B): the refresh path previously loaded no row and
-    # minted purely from a valid refresh token — a bypass for a banned user. Load
-    # the row so a suspended account can't obtain a fresh access token, and fail
-    # closed if the user vanished (deleted account) rather than issuing for a ghost.
-    user = await users_service.get_by_id(session, user_id)
-    if user is None:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid refresh token")
-    # Session revocation (#1914): a refresh token from a superseded generation must
-    # not re-mint access — this is the ingress that most needs it (refresh TTL is
-    # 30d, the whole window a revoked device could otherwise keep riding). Check
-    # BEFORE the mint; the new access token carries the CURRENT generation.
-    if token_gen != user.token_generation:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid refresh token")
-    _deny_if_banned(user)
+    except auth_session.SessionBanned:
+        raise AccountSuspended()
     return {"access_token": security.issue_access(
         user.id, gen=user.token_generation)}
 

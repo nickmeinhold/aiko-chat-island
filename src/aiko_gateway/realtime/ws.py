@@ -9,14 +9,11 @@ from __future__ import annotations
 
 import logging
 
-import jwt
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
-from sqlalchemy import select
 
 from ..db import SessionLocal
 from ..domain import (
-    acl, echo, messages_service, moderation_service, security, signing,
-    users_service,
+    acl, auth_session, echo, messages_service, moderation_service, signing,
 )
 from . import envelopes
 from .hub import Connection
@@ -28,28 +25,20 @@ router = APIRouter()
 @router.websocket("/v1/ws")
 async def ws_endpoint(websocket: WebSocket) -> None:
     token = websocket.query_params.get("token", "")
-    try:
-        user_id, token_gen = security.decode_token(token, expected_type="access")
-    except jwt.InvalidTokenError:
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-        return
-
+    # Thin adapter over the shared session resolver (auth_session): the SAME
+    # per-user gate as REST + refresh, applied at the ingress that was historically
+    # the one forgotten (it decodes tokens outside get_current_user). Any neutral
+    # rejection — invalid/expired/revoked token, unknown user, OR a ban — closes
+    # 1008 with no body (a frame has none; the app reclassifies the drop via a REST
+    # refresh, no existence leak). An already-open socket is dropped separately by
+    # hub.disconnect_user at policy-change time (active-disconnect, out of scope here).
     async with SessionLocal() as session:
-        user = await users_service.get_by_id(session, user_id)
-    # Ban enforcement (Piece B) at the WS ingress: a suspended account is refused
-    # the socket even with a still-valid access token — the live twin of the REST
-    # get_current_user gate. Same 1008 close as an invalid token (no existence
-    # leak). An already-open socket is dropped separately by hub.disconnect_user
-    # at ban time (active-disconnect).
-    #
-    # Session revocation (#1914) is enforced HERE too — the WS handshake decodes the
-    # token directly (outside get_current_user), so it is a distinct ingress that
-    # must apply the SAME token_generation check or a revoked device keeps riding an
-    # open/reconnecting socket. A stale generation closes 1008 like any dead token.
-    if (user is None or users_service.is_banned(user)
-            or token_gen != user.token_generation):
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-        return
+        try:
+            user = await auth_session.resolve_session_user(
+                session, token, expected_type="access")
+        except (auth_session.InvalidSession, auth_session.SessionBanned):
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
 
     await websocket.accept()
     gw = websocket.app.state.gw
