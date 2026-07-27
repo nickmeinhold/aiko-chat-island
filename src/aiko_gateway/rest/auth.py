@@ -11,7 +11,7 @@ import datetime as dt
 import logging
 
 import jwt
-from fastapi import APIRouter, HTTPException, Response, status
+from fastapi import APIRouter, HTTPException, Request, Response, status
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.exc import IntegrityError
@@ -880,7 +880,9 @@ async def me(user: CurrentUser) -> dict:
 
 
 @me_router.delete("/account", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_account(user: CurrentUser, session: DbSession) -> Response:
+async def delete_account(
+    user: CurrentUser, session: DbSession, request: Request,
+) -> Response:
     """Permanently delete the authenticated user's account (Apple 5.1.1(v)).
 
     Hard-deletes the user row + federated identities + channel memberships and
@@ -911,4 +913,23 @@ async def delete_account(user: CurrentUser, session: DbSession) -> Response:
             "You are the sole admin of one or more channels. Transfer them to "
             "another member or leave them before deleting your account.",
         )
+    # Active-disconnect (mirrors moderation.ban_user / recovery.finalize). The auth
+    # ingresses fail closed once the row is gone (get_by_id -> None), but an
+    # ALREADY-OPEN WS socket authenticates ONLY at handshake — its receive loop never
+    # re-checks, and the send path (_handle_send) reuses the handshake-cached user
+    # object with no per-message existence check. So without this, a self-deleted
+    # user's live socket keeps posting (to any channel it can already reach) until it
+    # naturally closes; under prod FK-off the orphaned-sender insert doesn't even
+    # fail. Sever it now. SINGLE-PROCESS SCOPE: the hub is in-process, so this drops
+    # sockets on THIS worker only — complete at one worker (the gateway runs a single
+    # uvicorn worker today); the cross-worker backstop is the #46 reconciliation
+    # sweep (designed + tempered in docs/crucible/46-cross-worker-disconnect/,
+    # gated on multi-worker actually landing). Reach the hub via app state; absent
+    # only in unit/route contexts without a running bus (nothing live to drop).
+    gw = getattr(request.app.state, "gw", None)
+    if gw is not None and getattr(gw, "hub", None) is not None:
+        dropped = await gw.hub.disconnect_user(user.id)
+        if dropped:
+            log.info("account deletion: dropped %s live socket(s) for user=%s",
+                     dropped, user.id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
