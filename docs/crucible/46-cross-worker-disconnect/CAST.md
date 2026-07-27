@@ -196,4 +196,66 @@ policy without removing the sweep (they compose).
    assert a ban committed with only worker-A's `disconnect_user` fired leaves worker
    B's socket open until one `reconcile()`, then closed. RED-prove by asserting the
    socket is open pre-sweep.
+
+## FOLD — author self-adversarial pass (2026-07-27)
+
+Near-zero weight on intent-vs-bytes (I wrote it); full weight on domain-local design
+holes I can see. Nine attacks; three landed as refinements, one resolved *for* the
+design, the rest held.
+
+### Refinements that change the design (fold these into Blade)
+
+- **F1 — don't hold the DB session across socket-close I/O.** The Cast's
+  `_reconcile_loop` opens `SessionLocal()` and calls `reconcile(load)`, which loads
+  users AND then `await conn.ws.close()`s each stale socket — network I/O holding a DB
+  connection open for no reason. **Split it:** load the `{id: user}` map inside a
+  short session, release it, THEN run the evaluate+close loop with no session held.
+  `reconcile` should receive the already-loaded map (or a load-then-release helper),
+  not do network closes inside the session block. Cheap, and it stops a slow client
+  socket-close from pinning a DB connection.
+- **F2 — keep the policy predicate OUT of `hub.py`; inject it.** `Hub`'s docstring is
+  "in-process connection registry + channel fanout" — a pure infrastructure registry
+  with zero domain knowledge. Importing `domain.auth_session` into `hub.py` to call
+  `evaluate_session` inverts that. Instead `reconcile(users, is_valid)` takes the
+  predicate as a callback (same shape as passing `load_users`); `main.py`'s loop —
+  which already imports `domain` freely — supplies `evaluate_session`. Hub stays a
+  registry that knows *how to close a socket*, not *when a session is invalid*.
+- **F3 — cite the proven cross-task-close precedent, still red-team interleaving.**
+  The sweep closes a socket from a task *other* than the one awaiting
+  `websocket.receive_json()`. That exact cross-task close is already what shipped-and-
+  cage-matched `disconnect_user` does (ban request task closes while the WS receive
+  loop runs elsewhere), so the pattern is accepted here — de-risks the concurrency
+  question. Temper should still explicitly interleave register/unregister/reconcile.
+
+### Attack that resolved FOR the design (a property, not a bug)
+
+- **TOCTOU on the captured generation is correct behaviour.** `conn.token_gen` is read
+  from the `user` object the resolver loaded, captured at register time *after* the
+  resolver's session closed. If a gen-bump commits in the window between resolve and
+  register, the detached object carries the OLD gen — and the sweep then closes the
+  socket next round (captured-old ≠ row-new). That is exactly right: a socket that
+  authenticated against a now-superseded generation *should* die. The capture is
+  honest about "what this socket authed with," and the sweep enforces "is that still
+  current." No guard needed.
+
+### Attacks that held (no change)
+
+- Deleted user → batch load omits the id → `.get()` returns `None` →
+  `evaluate_session(None, gen)` raises `InvalidSession` → closed. Correct.
+- Idempotent close/unregister: `unregister` is `set.discard` (no KeyError on double);
+  `ws.close()` on an already-closed socket is swallowed. Double-drop (sweep + receive
+  loop `finally`) is safe.
+- Socket registered mid-sweep is simply skipped this round — it was validated at its
+  own handshake ms ago, covered next round. No leak.
+- Standing cost: one `SELECT ... IN (:online_user_ids)` per worker per interval,
+  O(online users) — negligible at island scale even with per-worker phase overlap.
+
+### Fold verdict
+
+Design is sound; F1/F2 are mechanical hygiene folded into the plan, F3 is a de-risk.
+The one thing only a *different-family* Temper can pressure that I cannot: whether the
+whole build is justified *now* given it is mostly future-proofing + one small live
+gap — i.e. Ore-slag-check #2 (is it worth building vs document-and-wait), which an
+author instance is biased to answer "yes, it's elegant." That is the question to hand
+the five families.
 ```
