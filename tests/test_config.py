@@ -12,6 +12,10 @@ Invariants (all prod-only unless noted):
   5. At least one viable NEW-USER ingress (passkey ∨ social) must exist in prod —
      otherwise the island can log in existing accounts but can never onboard
      anyone (a locked, un-joinable deployment). #1927/#49.
+  6. If passkey is enabled in prod, passkey_rp_id must match the serving host
+     (equal or a registrable parent per the WebAuthn rp_id rule) — else the
+     advertised passkey ingress is bound to the wrong domain and every
+     registration fails (passkey viability; cage-match PR#97).
 
 `_env_file=None` disables the repo `.env` so these tests exercise the code
 defaults, not whatever a local `.env` happens to set.
@@ -240,4 +244,60 @@ def test_dev_no_ingress_boots():
     # so a dev island is always joinable via /register regardless of the flags.
     s = Settings(_env_file=None, environment="dev",
                  passkey_enabled=False, social_signin_enabled=False)
+    assert s.is_production is False
+
+
+# --- invariant 6: passkey viability — rp_id must match the serving host (PR#97) --
+
+def test_prod_passkey_rp_id_mismatch_raises():
+    # THE hollow-passkey guard (cage-match PR#97, Carnot). passkey_enabled=True with
+    # an rp_id bound to a DIFFERENT host (here: a passkey-only island that forgot to
+    # change passkey_rp_id off another island's default) passes the flag-only
+    # viable-ingress check but can never complete a registration. Fail LOUD at boot.
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
+                 passkey_enabled=True, gateway_base_url="https://chat.enspyr.co",
+                 passkey_rp_id="chat.imagineering.cc")
+
+
+def test_prod_passkey_rp_id_match_boots():
+    s = Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
+                 passkey_enabled=True, gateway_base_url="https://chat.enspyr.co",
+                 passkey_rp_id="chat.enspyr.co")
+    assert s.passkey_rp_id == "chat.enspyr.co"
+
+
+def test_prod_passkey_rp_id_registrable_parent_boots():
+    # WebAuthn allows rp_id to be a registrable PARENT of the serving host — a
+    # credential scoped to example.com is usable on chat.example.com. Must boot.
+    s = Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
+                 passkey_enabled=True, gateway_base_url="https://chat.example.com",
+                 passkey_rp_id="example.com")
+    assert s.passkey_enabled is True
+
+
+def test_prod_passkey_rp_id_sibling_domain_raises():
+    # A sibling (not a parent): rp_id=other.example.com is NOT a suffix of the host
+    # chat.example.com — endswith('.'+rp) must not accept it. Fail closed.
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
+                 passkey_enabled=True, gateway_base_url="https://chat.example.com",
+                 passkey_rp_id="other.example.com")
+
+
+def test_prod_passkey_disabled_skips_rp_id_check():
+    # Passkey off → the rp_id check is irrelevant; social carries the ingress.
+    s = Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
+                 passkey_enabled=False, social_signin_enabled=True,
+                 gateway_base_url="https://chat.enspyr.co",
+                 passkey_rp_id="chat.imagineering.cc",
+                 google_client_ids=["my-client-id.apps.googleusercontent.com"])
+    assert s.social_signin_enabled is True
+
+
+def test_dev_passkey_rp_id_mismatch_boots():
+    # Dev is exempt (guard is prod-only) — a mismatched rp_id in dev still boots.
+    s = Settings(_env_file=None, environment="dev", passkey_enabled=True,
+                 gateway_base_url="https://chat.enspyr.co",
+                 passkey_rp_id="chat.imagineering.cc")
     assert s.is_production is False

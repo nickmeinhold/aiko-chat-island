@@ -8,6 +8,7 @@ present in os.environ before any aiko import composes a process.
 from __future__ import annotations
 
 from typing import Literal
+from urllib.parse import urlparse
 
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -358,6 +359,33 @@ class Settings(BaseSettings):
             # (open_registration/invites after I2 membership, #36), this predicate
             # MUST be extended in the same change or a joinable-by-policy island
             # would refuse boot — see the follow-up task.
+            #
+            # Passkey VIABILITY (prod): passkey_enabled alone is a real ingress only
+            # if the Relying Party ID actually matches the host this gateway serves.
+            # A passkey credential is bound to passkey_rp_id and is unusable unless
+            # the serving host equals it OR is a subdomain of it (the WebAuthn rp_id
+            # rule: rp_id must be a registrable suffix of the origin's host). Without
+            # this check, a misconfigured passkey-only island (e.g. PASSKEY_ENABLED
+            # =true but passkey_rp_id left at ANOTHER island's default) passes the
+            # viable-ingress guard below, advertises passkeys on /providers, yet no
+            # user can complete registration — a locked island wearing a working
+            # ingress (cage-match PR#97, Carnot). This mirrors the social provider-
+            # completeness guard above so passkey_enabled ⟹ a usable passkey ingress,
+            # making the passkey arm of the viable-ingress guard honest, not flag-only.
+            if self.passkey_enabled:
+                host = (urlparse(self.gateway_base_url).hostname or "").strip().lower()
+                rp = self.passkey_rp_id.strip().lower()
+                if not rp or not host or not (host == rp or host.endswith("." + rp)):
+                    raise ValueError(
+                        f"passkey_enabled is True in production but passkey_rp_id "
+                        f"({self.passkey_rp_id!r}) is not valid for this gateway's host "
+                        f"({host!r}, derived from gateway_base_url={self.gateway_base_url!r}). "
+                        "A passkey credential is bound to the RP ID and is unusable unless the "
+                        "serving host equals it or is a subdomain of it (the WebAuthn rp_id "
+                        "rule). Refusing to boot — set PASSKEY_RP_ID to this gateway's "
+                        "registrable domain (typically the host in GATEWAY_BASE_URL), or the "
+                        "advertised passkey ingress would fail every registration."
+                    )
             if not (self.passkey_enabled or self.social_signin_enabled):
                 raise ValueError(
                     "no viable sign-in ingress is configured for production: both "
