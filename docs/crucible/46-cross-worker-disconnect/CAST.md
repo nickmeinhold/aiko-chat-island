@@ -258,4 +258,80 @@ whole build is justified *now* given it is mostly future-proofing + one small li
 gap — i.e. Ore-slag-check #2 (is it worth building vs document-and-wait), which an
 author instance is biased to answer "yes, it's elegant." That is the question to hand
 the five families.
+
+## TEMPER — five-family cage-match on the design (2026-07-28)
+
+Maxwell (Claude), Kelvin (Gemini), Carnot (GPT), Tesla (Grok), Wu (Kimi), each a
+different inductive bias, run in parallel on this document. All five reported.
+
+### Verdict: DEFER the sweep, ship the one-liner (UNANIMOUS 5/5 on Q2)
+
+Every family independently reached the same disposition on "build now?":
+**wire the account-deletion active-disconnect one-liner now** (it closes the only
+live-at-single-worker gap, reusing the shipped ban/recovery mechanism), **document
+the multi-worker ceiling**, and **build this sweep when `--workers`/multi-replica is
+actually planned** — not before. Kelvin: "a Dyson Sphere to power a lightbulb."
+Tesla: "machinery-before-simple-pick energy on the deletion one-liner." Maxwell
+reached it against its own design. **Acted on: the one-liner shipped (this branch);
+the deletion ghost-send hinge was verified by reading the send path (no per-message
+existence re-check + FK-off ⇒ real). This sweep design is banked here, tempered.**
+
+### Q1 (shape): 4/5 hold Option B; Kelvin dissents
+
+Maxwell, Carnot, Wu, Tesla: Option B is the right shape *when built* — re-derive from
+the SoT beats broadcast-per-policy (which re-fragments what PR#96 unified), and the
+latency falsifier was resolved by a human pin, not handwaved. **Kelvin dissents**:
+polling to reconcile an event is a category error; an event-driven problem wants an
+event-driven solution. Recorded, not dismissed — but note the design's frame survives
+it, and the composition answer (Tesla) neutralizes the dichotomy: **keep Option A in
+the drawer for a future *hard-SLA* (sub-second, network-wide) policy; it composes ON
+TOP of B, it does not replace it.**
+
+### Q3 holes to FOLD IN when this is built (beyond the author Fold)
+
+These are the price of admission for the eventual sweep build — do not skip them:
+
+1. **Detached-ORM footgun (Tesla, Carnot).** F1 releases the DB session before the
+   socket-close loop, which detaches the `User` ORM object — post-session access to
+   `token_generation`/`banned_at` can raise `DetachedInstanceError` or trigger lazy
+   I/O. **The sweep must snapshot to PLAIN DATA inside the session**
+   (`{user_id: (token_generation, banned_at) | None}`) and hand the predicate plain
+   values, never a live ORM instance. This is a correctness hole the author Fold missed.
+2. **Predicate returns a bool/enum, not raises (Tesla, Maxwell).** Injecting an
+   `evaluate_session` that *raises* `InvalidSession`/`SessionBanned` still couples the
+   Hub to domain exception types — F2 only half-done. Give the sweep an
+   `is_valid(snapshot, conn_token_gen) -> bool` (or a close-reason enum with no auth
+   types); Hub closes when false. Finishes the registry-purity goal.
+3. **Jitter / thundering herd (Kelvin, Carnot, Tesla).** N workers on the same
+   interval + aligned lifespan start = synchronized `IN (…)` reads. Add per-worker
+   jitter or a phase offset. Cheap; name it before anyone copies this to a big deploy.
+4. **True stale window is `interval + sweep_duration + close` (Carnot).** Not
+   `≤ interval`. Use monotonic start-to-start scheduling and state/log the real bound.
+5. **SQLite `IN (:ids)` parameter limit (Carnot).** Large online sets exceed SQLite's
+   variable cap; chunk the batch load or document a max-online-socket assumption, or
+   the first high-watermark sweep fail-loops forever.
+6. **Unban-during-sweep race (Carnot).** A user unbanned between snapshot-load and
+   close is disconnected on a stale read (harmless for revocation's monotonic gen;
+   for ban it forces a reconnect). State "reconnect after unban is acceptable," or
+   re-check just before close if that UX matters.
+7. **Fail-open + observability (Carnot, Kelvin).** Sweep task death or a DB outage
+   silently leaves stale sockets alive. Add last-success timestamp, exception
+   counters, alertable logs; log the closed-count only when `> 0` (Kelvin: no 30s
+   forever-zero spam). Supervise the lifespan task.
+8. **`evaluate_session` precondition (Wu).** "Any future per-user gate rides free" is
+   true ONLY for gates expressible from `(user_row, captured_token_gen)`. A gate
+   needing the token itself (claims/audience/IP) cannot be swept — the sweep holds no
+   token. Document this precondition so the invariant can't silently rot.
+9. **Delete also keeps the instant acting-worker disconnect (Tesla).** Even with the
+   sweep, deletion gets the instant `disconnect_user` (shipped this branch) — the
+   sweep is a cross-worker/future backstop, never a substitute for the acting path.
+
+### Rejected finding (false positive, with reasoning)
+
+- **Kelvin: "`conn.token_gen` is redundant — you already load `user.token_generation`."**
+  No. `conn.token_gen` is the generation the socket *authenticated with* (frozen at
+  handshake); `user.token_generation` is the *current* row value. Revocation is
+  detected precisely by comparing frozen≠current — with only the current value there
+  is nothing to compare against. The field is load-bearing for the gen-bump case
+  (valid only if we didn't care about revocation, which we do).
 ```

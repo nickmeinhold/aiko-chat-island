@@ -12,4 +12,11 @@ echo "[entrypoint] migrating database to head..."
 python -m aiko_gateway.migrate
 
 echo "[entrypoint] starting uvicorn..."
+# SINGLE WORKER ON PURPOSE — do NOT add `--workers N` (or scale to multiple
+# replicas) until the #46 cross-worker session-reconciliation sweep lands. The
+# realtime Hub keeps WS connections in per-process memory, so an active-disconnect
+# (ban / recovery re-key / account deletion) only reaches sockets on the worker
+# that handled it — a banned or deleted user's live socket on another worker would
+# ride on until natural close. The tempered design for the cross-worker fix is
+# docs/crucible/46-cross-worker-disconnect/CAST.md; build it before going wide.
 exec uvicorn aiko_gateway.main:app --host 0.0.0.0 --port 8095
