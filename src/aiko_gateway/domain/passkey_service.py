@@ -52,7 +52,6 @@ import webauthn
 from webauthn.helpers import base64url_to_bytes, bytes_to_base64url
 from webauthn.helpers.structs import (
     AuthenticatorSelectionCriteria,
-    COSEAlgorithmIdentifier,
     ResidentKeyRequirement,
     UserVerificationRequirement,
 )
@@ -165,18 +164,15 @@ async def start_registration(session: AsyncSession) -> dict:
             resident_key=ResidentKeyRequirement.REQUIRED,
             user_verification=_uv_requirement(),
         ),
-        # Offer only ES256 (-7) and RS256 (-257). py_webauthn's default set
-        # includes EdDSA (-8), which Android's Credential Manager HARD-REJECTS at
-        # the create boundary with TYPE_DATA_ERROR (a known Android quirk — it
-        # errors instead of gracefully skipping the unsupported alg), breaking
-        # passkey CREATE on every real Android device (app-tab handoff 2026-07-27,
-        # blocked the Play launch). Narrowing to the two universally-supported algs
-        # can't regress iOS/browsers — they already pick ES256. This is also the
-        # only registration-options call: the add-passkey path reuses this ceremony.
-        supported_pub_key_algs=[
-            COSEAlgorithmIdentifier.ECDSA_SHA_256,              # -7  ES256
-            COSEAlgorithmIdentifier.RSASSA_PKCS1_v1_5_SHA_256,  # -257 RS256
-        ],
+        # Use py_webauthn's default alg set {ES256(-7), EdDSA(-8), RS256(-257)}.
+        # PR#98 narrowed this to drop -8, on the theory that Android's Credential
+        # Manager hard-rejects EdDSA at the create boundary — but that diagnosis
+        # was REFUTED (#52): the real Android CREATE blocker was the assetlinks
+        # `handle_all_urls` relation ([50152] RP-ID, fixed 2026-07-28), not the alg
+        # set. With the narrowing's justification gone, the default is restored so
+        # EdDSA-capable authenticators aren't needlessly excluded. Broadening back
+        # can't regress iOS/browsers (they already pick ES256). Sole registration-
+        # options call; the add-passkey path reuses this ceremony.
     )
     state = await _store_challenge(
         session, raw=raw, operation=PasskeyOperation.REGISTER)
