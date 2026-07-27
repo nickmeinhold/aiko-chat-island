@@ -1,10 +1,22 @@
-"""Fail-closed configuration guards (prod auth hardening, task #38).
+"""Fail-closed configuration guards (prod auth hardening).
 
-Two invariants:
-  1. A production-like deployment MUST NOT boot with the dev-default jwt_secret —
-     `Settings()` raises rather than serving forgeable tokens.
+Invariants (all prod-only unless noted):
+  1. A production-like deployment MUST NOT boot with the dev-default/weak
+     jwt_secret — `Settings()` raises rather than serving forgeable tokens.
   2. Open self-registration defaults OFF in production and ON in dev, with an
-     explicit override either way.
+     explicit override either way (and no prod break-glass until I2 lands).
+  3. Social sign-in enabled in prod requires a usable provider (native client
+     IDs or a fully-configured broker); an empty allowlist would reject-all.
+  4. An OAuth broker provider is both-or-neither: a half (id XOR secret) config
+     refuses boot rather than failing opaquely mid-login.
+  5. At least one viable NEW-USER ingress (passkey ∨ social) must exist in prod —
+     otherwise the island can log in existing accounts but can never onboard
+     anyone (a locked, un-joinable deployment). #1927/#49.
+  6. If passkey is enabled in prod, passkey_rp_id gets a BEST-EFFORT sanity check
+     against the configured host (must be multi-label AND equal/registrable-parent
+     per the WebAuthn rp_id rule). This catches an obviously-wrong rp_id but cannot
+     prove a working ceremony — Settings can't see the real serving host (cage-match
+     PR#97). Invariant 5 (an ingress is ENABLED) is the complete guarantee.
 
 `_env_file=None` disables the repo `.env` so these tests exercise the code
 defaults, not whatever a local `.env` happens to set.
@@ -28,7 +40,11 @@ _STRONG_SECRET = "a-real-32-byte-minimum-secret-value"  # 35 chars >= 32
 
 
 def test_prod_with_real_secret_boots():
-    s = Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET)
+    # passkey_enabled makes this a joinable island — invariant 5 (below) now
+    # requires a viable ingress in prod, so a password-only prod is a locked
+    # island. This test is about the jwt_secret invariant, so give it an ingress.
+    s = Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
+                 passkey_enabled=True)
     assert s.is_production is True
 
 
@@ -82,7 +98,8 @@ def test_open_registration_defaults_on_in_dev():
 
 
 def test_open_registration_defaults_off_in_prod():
-    s = Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET)
+    s = Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
+                 passkey_enabled=True)
     assert s.open_registration is False
 
 
@@ -163,15 +180,19 @@ def test_prod_broker_secret_without_id_raises():
 
 
 def test_prod_broker_both_set_boots():
+    # Broker configured but social_signin_enabled defaults False, so the broker is
+    # NOT advertised (invariant 5) — passkey_enabled supplies the viable ingress so
+    # this test stays about the broker XOR invariant, not onboarding.
     s = Settings(_env_file=None, environment="production",
-                 jwt_secret=_STRONG_SECRET,
+                 jwt_secret=_STRONG_SECRET, passkey_enabled=True,
                  github_client_id="gh-id", github_client_secret="gh-secret")
     assert s.github_client_id == "gh-id"
 
 
 def test_prod_broker_neither_set_boots():
     # No broker provider configured at all is fine — the provider is simply absent.
-    s = Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET)
+    s = Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
+                 passkey_enabled=True)
     assert s.github_client_id == ""
 
 
@@ -180,3 +201,140 @@ def test_dev_broker_half_config_boots():
     # provider simply lists/behaves as not-configured at runtime, fail-closed).
     s = Settings(_env_file=None, environment="dev", github_client_id="gh-id")
     assert s.github_client_id == "gh-id"
+
+
+# --- invariant 5: at-least-one-viable-ingress in prod (#1927 / #49) ----------
+
+def test_prod_no_ingress_raises():
+    # THE locked-island guard. passkey OFF + social OFF + open_registration
+    # force-closed in prod = an island that can authenticate pre-existing accounts
+    # but can never onboard a new user. Fail LOUD at boot (same fail-closed
+    # discipline as the broker XOR guard). This is the durable fix for "retiring
+    # social is one env line from bricking onboarding" (#1923).
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET)
+
+
+def test_prod_passkey_only_boots():
+    # Passkey alone is a complete ingress (registration creates the account).
+    s = Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
+                 passkey_enabled=True, social_signin_enabled=False)
+    assert s.passkey_enabled is True
+
+
+def test_prod_social_only_boots():
+    # Social alone (with a provider) is a complete ingress — passkey may stay dark.
+    s = Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
+                 passkey_enabled=False, social_signin_enabled=True,
+                 google_client_ids=["my-client-id.apps.googleusercontent.com"])
+    assert s.social_signin_enabled is True
+
+
+def test_prod_both_ingresses_boot():
+    # The passkey-migration steady state: both on. The #1923 retirement flips
+    # social off only AFTER passkey is enabled, so this guard is never tripped in a
+    # correct migration — only by turning BOTH off (the bug).
+    s = Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
+                 passkey_enabled=True, social_signin_enabled=True,
+                 google_client_ids=["my-client-id.apps.googleusercontent.com"])
+    assert s.passkey_enabled and s.social_signin_enabled
+
+
+def test_dev_no_ingress_boots():
+    # Dev is exempt (guard is prod-only) AND has open_registration on by default,
+    # so a dev island is always joinable via /register regardless of the flags.
+    s = Settings(_env_file=None, environment="dev",
+                 passkey_enabled=False, social_signin_enabled=False)
+    assert s.is_production is False
+
+
+# --- invariant 6: passkey viability — rp_id must match the serving host (PR#97) --
+
+def test_prod_passkey_rp_id_mismatch_raises():
+    # THE hollow-passkey guard (cage-match PR#97, Carnot). passkey_enabled=True with
+    # an rp_id bound to a DIFFERENT host (here: a passkey-only island that forgot to
+    # change passkey_rp_id off another island's default) passes the flag-only
+    # viable-ingress check but can never complete a registration. Fail LOUD at boot.
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
+                 passkey_enabled=True, gateway_base_url="https://chat.enspyr.co",
+                 passkey_rp_id="chat.imagineering.cc")
+
+
+def test_prod_passkey_rp_id_match_boots():
+    s = Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
+                 passkey_enabled=True, gateway_base_url="https://chat.enspyr.co",
+                 passkey_rp_id="chat.enspyr.co")
+    assert s.passkey_rp_id == "chat.enspyr.co"
+
+
+def test_prod_passkey_rp_id_registrable_parent_boots():
+    # WebAuthn allows rp_id to be a registrable PARENT of the serving host — a
+    # credential scoped to example.com is usable on chat.example.com. Must boot.
+    s = Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
+                 passkey_enabled=True, gateway_base_url="https://chat.example.com",
+                 passkey_rp_id="example.com")
+    assert s.passkey_enabled is True
+
+
+def test_prod_passkey_rp_id_sibling_domain_raises():
+    # A sibling (not a parent): rp_id=other.example.com is NOT a suffix of the host
+    # chat.example.com — endswith('.'+rp) must not accept it. Fail closed.
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
+                 passkey_enabled=True, gateway_base_url="https://chat.example.com",
+                 passkey_rp_id="other.example.com")
+
+
+def test_prod_passkey_single_label_rp_raises():
+    # A single-label / public-suffix rp_id ("com") would pass a naive suffix check
+    # (host "chat.com" endswith ".com") but no browser scopes a credential to a
+    # public suffix — reject it (cage-match PR#97, Carnot). KNOWN RESIDUAL: a
+    # multi-label public suffix ("co.uk") still slips through without a PSL (#51).
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
+                 passkey_enabled=True, gateway_base_url="https://chat.com",
+                 passkey_rp_id="com")
+
+
+def test_prod_passkey_partial_label_suffix_raises():
+    # Regression guard (cage-match PR#97 round 3, Tesla): the check is a LABEL-
+    # boundary suffix, not a character suffix. rp_id="app.com" must NOT match host
+    # "myapp.com" — `"myapp.com".endswith(".app.com")` is False because the "."+rp
+    # construction requires a full-label boundary. Locks the refutation of the
+    # claimed "myapp/app.com trap".
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
+                 passkey_enabled=True, gateway_base_url="https://myapp.com",
+                 passkey_rp_id="app.com")
+
+
+def test_prod_passkey_both_defaults_boot_is_known_limitation():
+    # PINS the documented blind spot (cage-match PR#97, Tesla): Settings cannot see
+    # the REAL serving host, so if gateway_base_url AND passkey_rp_id are BOTH left
+    # at their (matching) defaults, this boots even though a deploy on a DIFFERENT
+    # host would have a hollow passkey ingress. This is NOT a bug we can fix at the
+    # Settings layer — it's asserted here so the limitation is explicit and any
+    # future change to the default-matching behavior is a conscious one. Full
+    # passkey-config correctness belongs at deploy/runtime (#51).
+    s = Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
+                 passkey_enabled=True)  # base_url + rp_id both default to chat.imagineering.cc
+    assert s.passkey_enabled is True
+
+
+def test_prod_passkey_disabled_skips_rp_id_check():
+    # Passkey off → the rp_id check is irrelevant; social carries the ingress.
+    s = Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
+                 passkey_enabled=False, social_signin_enabled=True,
+                 gateway_base_url="https://chat.enspyr.co",
+                 passkey_rp_id="chat.imagineering.cc",
+                 google_client_ids=["my-client-id.apps.googleusercontent.com"])
+    assert s.social_signin_enabled is True
+
+
+def test_dev_passkey_rp_id_mismatch_boots():
+    # Dev is exempt (guard is prod-only) — a mismatched rp_id in dev still boots.
+    s = Settings(_env_file=None, environment="dev", passkey_enabled=True,
+                 gateway_base_url="https://chat.enspyr.co",
+                 passkey_rp_id="chat.imagineering.cc")
+    assert s.is_production is False

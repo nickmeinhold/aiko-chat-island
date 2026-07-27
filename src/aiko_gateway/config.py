@@ -8,6 +8,7 @@ present in os.environ before any aiko import composes a process.
 from __future__ import annotations
 
 from typing import Literal
+from urllib.parse import urlparse
 
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -334,6 +335,80 @@ class Settings(BaseSettings):
                         f"the missing {slug.upper()}_{missing.upper()} or unset "
                         "both to disable the provider."
                     )
+            # At least one viable NEW-USER ingress must exist in production.
+            # open_registration is force-closed above (I2 unenforced), so the ONLY
+            # ways a new account comes into existence in prod are passkey
+            # registration or social sign-in. With BOTH off, the island can still
+            # authenticate pre-existing password accounts via /login but can never
+            # ONBOARD anyone — a locked, un-joinable deployment. This is the
+            # "retirement is one env line from being false" footgun (#1927):
+            # retiring social (#1923) BEFORE enabling passkey silently bricks
+            # onboarding. Fail closed — same both-or-neither discipline as the
+            # broker XOR guard above; the operator just flips one flag. Relying on
+            # social_signin_enabled alone is sound: the social guard above already
+            # refused boot if social is on without a usable provider, so the flag
+            # here implies an advertised, usable social ingress.
+            #
+            # Both arms are lint-checked upstream, but with different reach: social
+            # gets a full provider-completeness guard (social_signin_enabled ⟹ a
+            # usable provider), while passkey gets only a BEST-EFFORT rp_id sanity
+            # check (see the passkey block just below) — it catches an obviously-bad
+            # rp_id but CANNOT confirm a working ceremony from Settings alone. So this
+            # invariant's honest guarantee is "at least one ingress is ENABLED and not
+            # obviously-misconfigured", not "a registration will succeed". That
+            # enabled-check is itself complete and is the real value here. When a THIRD
+            # legitimate prod ingress lands
+            # (open_registration/invites after I2 membership, #36), this predicate
+            # MUST be extended in the same change or a joinable-by-policy island
+            # would refuse boot — see the follow-up task.
+            #
+            # Passkey RP-ID SANITY (prod) — a BEST-EFFORT lint, NOT a guarantee the
+            # ceremony works. Honest scope (cage-match PR#97, Carnot + Tesla): Settings
+            # cannot see the REAL serving host, so config self-consistency != config
+            # correctness. If gateway_base_url AND passkey_rp_id are BOTH left at
+            # defaults that don't match the true host, this cannot detect it — the two
+            # defaults agree with each other while disagreeing with reality. (We can't
+            # "require non-default" either: imagineering legitimately runs on the
+            # defaults.) The COMPLETE guarantee is invariant 5 (an ingress is ENABLED);
+            # this is a lint on top of it. What the lint DOES catch:
+            #   (a) an rp_id that doesn't match the CONFIGURED host — e.g. base_url set
+            #       to this island but rp_id left at another island's default (a common,
+            #       real operator slip); and
+            #   (b) an obviously-invalid single-label / public-suffix rp_id (e.g. "com")
+            #       that no browser will scope a credential to.
+            # A passkey credential is bound to rp_id and is usable only where the origin
+            # host equals rp_id or is a subdomain of it (the WebAuthn rp_id rule).
+            # KNOWN RESIDUAL: multi-label public suffixes ("co.uk") need the Public
+            # Suffix List to reject and are NOT caught here (no PSL dependency) — #51.
+            if self.passkey_enabled:
+                host = (urlparse(self.gateway_base_url).hostname or "").strip().lower()
+                rp = self.passkey_rp_id.strip().lower()
+                rp_single_label = "." not in rp  # "com", "localhost": never a valid prod RP
+                if (not rp or not host or rp_single_label
+                        or not (host == rp or host.endswith("." + rp))):
+                    raise ValueError(
+                        f"passkey_enabled is True in production but passkey_rp_id "
+                        f"({self.passkey_rp_id!r}) is not a usable Relying Party ID for this "
+                        f"gateway's host ({host!r}, from gateway_base_url="
+                        f"{self.gateway_base_url!r}). It must be a multi-label domain that the "
+                        "serving host equals or is a subdomain of (the WebAuthn rp_id rule; a "
+                        "single-label or public-suffix rp_id like 'com' is rejected by browsers). "
+                        "Refusing to boot — set PASSKEY_RP_ID to this gateway's registrable "
+                        "domain (typically the host in GATEWAY_BASE_URL). NOTE: this is a "
+                        "best-effort check; it cannot confirm the rp_id matches the REAL serving "
+                        "host when gateway_base_url is also left at a default."
+                    )
+            if not (self.passkey_enabled or self.social_signin_enabled):
+                raise ValueError(
+                    "no viable sign-in ingress is configured for production: both "
+                    "passkey (PASSKEY_ENABLED) and social sign-in "
+                    "(SOCIAL_SIGNIN_ENABLED) are disabled, and self-registration "
+                    "is closed in production until I2 membership is enforced. The "
+                    "island could authenticate pre-existing accounts but could "
+                    "never onboard a new user (a locked, un-joinable deployment). "
+                    "Refusing to boot — enable at least one of PASSKEY_ENABLED or "
+                    "SOCIAL_SIGNIN_ENABLED (with a configured provider)."
+                )
         # Resolve registration default by environment when not explicitly set:
         # open in dev, closed in prod.
         if self.open_registration is None:
