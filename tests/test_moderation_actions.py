@@ -31,6 +31,7 @@ from aiko_gateway.realtime.hub import Connection, Hub
 from aiko_gateway.rest import auth as auth_routes
 from aiko_gateway.rest import moderation as moderation_routes
 from aiko_gateway.rest.deps import get_session
+from aiko_gateway.rest.errors import register_error_handlers
 
 
 def _ulid(n: int) -> str:
@@ -259,6 +260,7 @@ async def client(session):
     app.include_router(auth_routes.router)
     app.include_router(auth_routes.me_router)
     app.include_router(moderation_routes.router)
+    register_error_handlers(app)  # structured ban-403 body (mirrors main)
     app.dependency_overrides[get_session] = _override_session
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as c:
@@ -456,3 +458,30 @@ async def test_hub_disconnect_user_closes_and_unregisters():
     assert ws_b.closed is None                  # other users untouched
     # A now has no live connections; disconnecting again drops zero.
     assert await hub.disconnect_user("user-a") == 0
+
+
+# --- ban 403 carries a machine-stable error code (app §2 ask, #30) ----------
+
+_SUSPENDED_BODY = {"error": "account_suspended", "detail": "account suspended"}
+
+
+async def test_ban_403_carries_machine_stable_error_code(client, session):
+    """The ban 403 body carries a top-level `error` code at BOTH REST ingresses,
+    so a client branches on the code not the human-readable prose (which we're
+    free to retune). `detail` is preserved verbatim — additive, non-breaking for
+    the existing prose match. RED-proven against the two distinct ingress paths:
+    authed route (get_current_user / deps.py) and login-mint (_deny_if_banned /
+    auth.py, reached here via refresh)."""
+    banned = await _user(session, "banned", banned=True)
+
+    # ingress 1: authed route (get_current_user)
+    r = await client.get("/v1/blocks", headers=_auth(banned))
+    assert r.status_code == 403
+    assert r.json() == _SUSPENDED_BODY
+
+    # ingress 2: login/mint door (_deny_if_banned), reached via refresh
+    r2 = await client.post(
+        "/v1/auth/refresh",
+        json={"refresh_token": security.issue_refresh(banned.id)})
+    assert r2.status_code == 403
+    assert r2.json() == _SUSPENDED_BODY
