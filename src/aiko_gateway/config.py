@@ -334,6 +334,30 @@ class Settings(BaseSettings):
                         f"the missing {slug.upper()}_{missing.upper()} or unset "
                         "both to disable the provider."
                     )
+            # At least one viable NEW-USER ingress must exist in production.
+            # open_registration is force-closed above (I2 unenforced), so the ONLY
+            # ways a new account comes into existence in prod are passkey
+            # registration or social sign-in. With BOTH off, the island can still
+            # authenticate pre-existing password accounts via /login but can never
+            # ONBOARD anyone — a locked, un-joinable deployment. This is the
+            # "retirement is one env line from being false" footgun (#1927):
+            # retiring social (#1923) BEFORE enabling passkey silently bricks
+            # onboarding. Fail closed — same both-or-neither discipline as the
+            # broker XOR guard above; the operator just flips one flag. Relying on
+            # social_signin_enabled alone is sound: the social guard above already
+            # refused boot if social is on without a usable provider, so the flag
+            # here implies an advertised, usable social ingress.
+            if not (self.passkey_enabled or self.social_signin_enabled):
+                raise ValueError(
+                    "no viable sign-in ingress is configured for production: both "
+                    "passkey (PASSKEY_ENABLED) and social sign-in "
+                    "(SOCIAL_SIGNIN_ENABLED) are disabled, and self-registration "
+                    "is closed in production until I2 membership is enforced. The "
+                    "island could authenticate pre-existing accounts but could "
+                    "never onboard a new user (a locked, un-joinable deployment). "
+                    "Refusing to boot — enable at least one of PASSKEY_ENABLED or "
+                    "SOCIAL_SIGNIN_ENABLED (with a configured provider)."
+                )
         # Resolve registration default by environment when not explicitly set:
         # open in dev, closed in prod.
         if self.open_registration is None:

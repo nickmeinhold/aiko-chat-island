@@ -28,7 +28,11 @@ _STRONG_SECRET = "a-real-32-byte-minimum-secret-value"  # 35 chars >= 32
 
 
 def test_prod_with_real_secret_boots():
-    s = Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET)
+    # passkey_enabled makes this a joinable island — invariant 5 (below) now
+    # requires a viable ingress in prod, so a password-only prod is a locked
+    # island. This test is about the jwt_secret invariant, so give it an ingress.
+    s = Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
+                 passkey_enabled=True)
     assert s.is_production is True
 
 
@@ -82,7 +86,8 @@ def test_open_registration_defaults_on_in_dev():
 
 
 def test_open_registration_defaults_off_in_prod():
-    s = Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET)
+    s = Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
+                 passkey_enabled=True)
     assert s.open_registration is False
 
 
@@ -163,15 +168,19 @@ def test_prod_broker_secret_without_id_raises():
 
 
 def test_prod_broker_both_set_boots():
+    # Broker configured but social_signin_enabled defaults False, so the broker is
+    # NOT advertised (invariant 5) — passkey_enabled supplies the viable ingress so
+    # this test stays about the broker XOR invariant, not onboarding.
     s = Settings(_env_file=None, environment="production",
-                 jwt_secret=_STRONG_SECRET,
+                 jwt_secret=_STRONG_SECRET, passkey_enabled=True,
                  github_client_id="gh-id", github_client_secret="gh-secret")
     assert s.github_client_id == "gh-id"
 
 
 def test_prod_broker_neither_set_boots():
     # No broker provider configured at all is fine — the provider is simply absent.
-    s = Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET)
+    s = Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
+                 passkey_enabled=True)
     assert s.github_client_id == ""
 
 
@@ -180,3 +189,48 @@ def test_dev_broker_half_config_boots():
     # provider simply lists/behaves as not-configured at runtime, fail-closed).
     s = Settings(_env_file=None, environment="dev", github_client_id="gh-id")
     assert s.github_client_id == "gh-id"
+
+
+# --- invariant 5: at-least-one-viable-ingress in prod (#1927 / #49) ----------
+
+def test_prod_no_ingress_raises():
+    # THE locked-island guard. passkey OFF + social OFF + open_registration
+    # force-closed in prod = an island that can authenticate pre-existing accounts
+    # but can never onboard a new user. Fail LOUD at boot (same fail-closed
+    # discipline as the broker XOR guard). This is the durable fix for "retiring
+    # social is one env line from bricking onboarding" (#1923).
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET)
+
+
+def test_prod_passkey_only_boots():
+    # Passkey alone is a complete ingress (registration creates the account).
+    s = Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
+                 passkey_enabled=True, social_signin_enabled=False)
+    assert s.passkey_enabled is True
+
+
+def test_prod_social_only_boots():
+    # Social alone (with a provider) is a complete ingress — passkey may stay dark.
+    s = Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
+                 passkey_enabled=False, social_signin_enabled=True,
+                 google_client_ids=["my-client-id.apps.googleusercontent.com"])
+    assert s.social_signin_enabled is True
+
+
+def test_prod_both_ingresses_boot():
+    # The passkey-migration steady state: both on. The #1923 retirement flips
+    # social off only AFTER passkey is enabled, so this guard is never tripped in a
+    # correct migration — only by turning BOTH off (the bug).
+    s = Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
+                 passkey_enabled=True, social_signin_enabled=True,
+                 google_client_ids=["my-client-id.apps.googleusercontent.com"])
+    assert s.passkey_enabled and s.social_signin_enabled
+
+
+def test_dev_no_ingress_boots():
+    # Dev is exempt (guard is prod-only) AND has open_registration on by default,
+    # so a dev island is always joinable via /register regardless of the flags.
+    s = Settings(_env_file=None, environment="dev",
+                 passkey_enabled=False, social_signin_enabled=False)
+    assert s.is_production is False
