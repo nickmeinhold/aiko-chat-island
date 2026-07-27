@@ -37,6 +37,18 @@ async def test_start_registration_user_handle_within_android_limit(session):
     assert len(handle) <= 32, f"user.id is {len(handle)} bytes; Android rejects > 32"
 
 
+async def test_start_registration_omits_eddsa_alg_for_android(session):
+    # Android's Credential Manager HARD-REJECTS alg -8 (EdDSA) at the passkey-create
+    # boundary with TYPE_DATA_ERROR instead of skipping it, breaking CREATE on every
+    # real Android device (app-tab handoff 2026-07-27, blocked the Play launch).
+    # py_webauthn's default offers [-7, -8, -257]; we pin [-7, -257]. Assert -8 is
+    # gone and the two universally-supported algs remain.
+    out = await passkey_service.start_registration(session)
+    algs = {p["alg"] for p in out["options"]["pubKeyCredParams"]}
+    assert -8 not in algs, f"EdDSA (-8) is offered; Android rejects it. Got {algs}"
+    assert algs == {-7, -257}, f"expected ES256+RS256 only, got {algs}"
+
+
 async def test_start_authentication_is_usernameless(session):
     out = await passkey_service.start_authentication(session)
     opts = out["options"]
