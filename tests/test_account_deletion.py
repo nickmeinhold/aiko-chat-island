@@ -235,3 +235,46 @@ async def test_delete_account_sole_admin_is_409(client, session):
     assert "sole admin" in resp.json()["detail"].lower()
     # Rejected → the account still exists.
     assert await users_service.get_by_id(session, user.id) is not None
+
+
+async def test_delete_account_actively_disconnects_open_sockets(session):
+    """Active-disconnect on deletion (mirrors ban / recovery-finalize; #46 Temper).
+
+    The auth ingresses fail closed once the row is gone, but a socket already
+    ACCEPTED at handshake rides its receive loop until natural disconnect — and the
+    send path reuses the handshake-cached user with no per-message existence check,
+    so a self-deleted user's live socket keeps posting until it drops. The delete
+    route must actively sever it, exactly as ban and recovery do. Assert an OPEN
+    connection is closed (1008) AND unregistered — RED-proves the wiring, not just
+    that a fresh handshake would fail (it can't; the socket is already open)."""
+    from types import SimpleNamespace
+
+    from aiko_gateway.realtime.hub import Connection, Hub
+
+    user = await _social_user(session, handle="hank", sub="g-hank")
+
+    class _WS:
+        def __init__(self): self.closed_code = None
+        async def close(self, code=1000): self.closed_code = code
+    live = _WS()
+    hub = Hub()
+    hub.register(Connection(live, user.id))
+
+    async def _override_session():
+        yield session
+    app = FastAPI()
+    app.include_router(auth_routes.me_router)
+    app.dependency_overrides[get_session] = _override_session
+    app.state.gw = SimpleNamespace(hub=hub)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.delete("/v1/account", headers=_auth(user))
+    app.dependency_overrides.clear()
+
+    assert resp.status_code == 204
+    assert await users_service.get_by_id(session, user.id) is None
+    # The open socket was closed (1008) AND unregistered — a second disconnect finds
+    # nothing left. Without the route's active-disconnect this connection would ride
+    # on and the deleted user could keep posting.
+    assert live.closed_code == 1008
+    assert await hub.disconnect_user(user.id) == 0
