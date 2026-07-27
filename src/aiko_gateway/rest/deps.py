@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..db import SessionLocal
 from ..domain import moderation_service, security, users_service
 from ..domain.models import User
+from .errors import AccountSuspended
 
 _bearer = HTTPBearer(auto_error=True)
 
@@ -48,7 +49,7 @@ async def get_current_user(
     # access token. This is one of the enumerated ingresses — the WS handshake,
     # refresh, and each login/mint path apply the same is_banned predicate.
     if users_service.is_banned(user):
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "account suspended")
+        raise AccountSuspended()
     return user
 
 

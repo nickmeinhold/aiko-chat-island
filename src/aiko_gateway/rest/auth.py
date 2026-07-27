@@ -32,6 +32,7 @@ from ..domain.pkce import (
 )
 from ..domain.rate_limit import rate_limit
 from .deps import CurrentUser, DbSession
+from .errors import AccountSuspended
 
 router = APIRouter(prefix="/v1/auth", tags=["auth"])
 
@@ -78,7 +79,7 @@ def _deny_if_banned(user: User) -> None:
     _tokens()/issue_access() enumeration, not the design doc's prose list — the
     auth-ingress fragmentation (#1927) is exactly the risk of missing one."""
     if users_service.is_banned(user):
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "account suspended")
+        raise AccountSuspended()
 
 
 @router.post("/register", dependencies=[rate_limit("account")])
