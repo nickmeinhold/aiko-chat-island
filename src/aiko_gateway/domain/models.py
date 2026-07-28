@@ -466,8 +466,10 @@ class Retraction(Base):
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=new_ulid)
     # The taken-down message. The row survives the soft-delete (and the account-
     # deletion husk keeps rows too), so this FK target is stable. Indexed for the
-    # per-message dedup lookup ("is this message already retracted?") and the block
-    # join in get_history / the fence.
+    # per-message dedup lookup ("is this message already retracted?"). NOTE: there is
+    # deliberately NO block join on retractions anywhere — a delete carries no content,
+    # so it is never block-filtered (#7 add/remove asymmetry). Do not add one; it would
+    # strand takedowns across a block/unblock epoch.
     target_msg_id: Mapped[str] = mapped_column(
         ForeignKey("messages.id"), nullable=False, index=True)
     # Scopes the retraction to a channel so get_history pages it on the same

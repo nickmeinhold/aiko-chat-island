@@ -186,9 +186,11 @@ async def resolve_report(
         raise HTTPException(
             status.HTTP_409_CONFLICT, "report already resolved a different way")
     except moderation_service.RetractionOrderingError:
-        # Structurally unreachable (would need a clock regression); the service
-        # already failed closed (session clean, report unresolved). Map it to an
-        # observable 500 rather than an opaque stack trace (cage-match Tesla + Wu).
+        # Practically unreachable (a takedown post-dates its target by human latency;
+        # only a same-millisecond mint could invert the random ULID tail), but a real
+        # load-bearing guard, not an impossible branch. The service already failed
+        # closed (session clean, report unresolved); map it to an observable 500 rather
+        # than an opaque stack trace (cage-match Tesla + Wu).
         raise HTTPException(
             status.HTTP_500_INTERNAL_SERVER_ERROR,
             "retraction ordering invariant violated — takedown refused")

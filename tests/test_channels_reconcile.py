@@ -20,7 +20,7 @@ from aiko_gateway.aiko import topology
 from aiko_gateway.aiko.payload import InboundMessage
 from aiko_gateway.domain import channels_service, messages_service
 from aiko_gateway.domain.models import (
-    Channel, Membership, Message, Retraction, User)
+    Channel, Membership, Message, MessageReport, Retraction, User)
 
 
 # --- parse: EC channel_list payload -> channel names ----------------------- #
@@ -111,24 +111,29 @@ async def test_hard_delete_cascades_messages_and_memberships(session):
 
 
 @pytest.mark.asyncio
-async def test_hard_delete_cascades_retractions(session):
-    """Retractions (#7) FK both messages AND the channel, so the cascade must tear
-    them down too (cage-match Tesla + Carnot) — else they orphan under FK-off, or
-    refuse the teardown order under FK-on."""
+async def test_hard_delete_cascades_retractions_and_reports(session):
+    """Everything FK'd to a channel's messages must tear down with them (else orphan
+    under FK-off / refuse under FK-on): retractions (#7, FK messages + channel) AND
+    message_reports (cage-match Wu — FK messages.id, the child the cascade missed)."""
+    reporter = User(id="U1", username="alice", display_name="Alice",
+                    password_hash="x", aiko_username="alice")
     ch = Channel(id="C1", name="random", kind="standard", aiko_channel="random")
-    session.add(ch)
+    session.add_all([reporter, ch])
     await session.flush()
     session.add_all([
         Message(id="M1", channel_id="C1", sender_kind="human", body="bad"),
         Retraction(id="R1", target_msg_id="M1", channel_id="C1"),
+        MessageReport(id="RP1", message_id="M1", reporter_user_id="U1", reason="x"),
     ])
     await session.commit()
 
     assert await channels_service.hard_delete_channel(session, "random") is True
+    for model in (Retraction, MessageReport, Message):
+        assert (await session.execute(
+            select(func.count()).select_from(model))).scalar_one() == 0
+    # The reporter user is NOT a channel-owned row — it survives.
     assert (await session.execute(
-        select(func.count()).select_from(Retraction))).scalar_one() == 0
-    assert (await session.execute(
-        select(func.count()).select_from(Message))).scalar_one() == 0
+        select(func.count()).select_from(User))).scalar_one() == 1
 
 
 @pytest.mark.asyncio

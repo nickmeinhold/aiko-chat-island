@@ -85,11 +85,16 @@ class ReportAlreadyResolved(Exception):
 
 
 class RetractionOrderingError(Exception):
-    """A minted retraction id did not sort strictly after its target message id —
-    the forward-ULID axis the whole propagation design rests on has regressed (a
-    clock rollback). Fail closed: a retraction the forward cursor would never carry
-    is worse than useless. Structurally unreachable (new_ulid() is time-forward and
-    a takedown always post-dates its target); this makes the invariant executable."""
+    """A minted retraction id did not sort strictly after its target message id — the
+    forward-ULID axis the whole propagation design rests on would be inverted. Fail
+    closed: a retraction the forward cursor would never carry is worse than useless.
+
+    LOAD-BEARING, not decorative (cage-match Wu): a ULID's ordering WITHIN one
+    millisecond is its random 80-bit tail, not monotonic. In practice a takedown
+    post-dates its target by human-moderation latency, so their millisecond fields
+    differ and the retraction always wins — but a same-millisecond mint (a message
+    taken down within 1ms of posting) could invert on the random tail. So this is a
+    real guard on a distrust-the-clock invariant, not an impossible branch."""
 
 
 # --- blocks: mutations ------------------------------------------------------
@@ -397,9 +402,10 @@ async def take_down_message(
     retraction: Retraction | None = None
     if existing is None:
         # Mint the id explicitly so the forward-ordering invariant is EXECUTABLE
-        # (cage-match Carnot): new_ulid() is time-forward, so a retraction minted now
-        # is always > a message minted earlier. A violation means a clock rollback
-        # broke the shared ULID axis — fail closed rather than emit a retraction the
+        # (cage-match Carnot + Wu). new_ulid() is time-forward across MILLISECONDS, and
+        # a takedown post-dates its target by human latency, so it is practically always
+        # greater — but intra-millisecond ULID ordering is the random tail, so the guard
+        # is load-bearing, not decorative. Fail closed rather than emit a retraction the
         # forward cursor would never carry. Checked HERE, before any mutation.
         rid = new_ulid()
         if rid <= message.id:

@@ -19,9 +19,9 @@ domain/models.py (the parity gate test_migrations_match_models enforces it).
 
 A plain CREATE TABLE (no batch_alter_table): there is no existing table to rebuild.
 Two indexes match the ORM exactly (parity gate): ``ix_message_retractions_target_msg_id``
-(the ``index=True`` column, for the per-message dedup lookup + block join) and the
-COMPOSITE ``ix_message_retractions_channel_id_id`` on ``(channel_id, id)`` (the
-forward-catch-up access path), declared via the model's ``__table_args__``.
+(the ``index=True`` column, for the per-message dedup lookup) and the COMPOSITE
+``ix_message_retractions_channel_id_id`` on ``(channel_id, id)`` (the forward-catch-up
+access path), declared via the model's ``__table_args__``.
 
 Revision ID: 0016
 Revises: 0015
