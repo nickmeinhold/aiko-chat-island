@@ -25,7 +25,8 @@ from sqlalchemy import func, select
 from aiko_gateway.domain import (
     accounts_service, messages_service, moderation_service, security, users_service,
 )
-from aiko_gateway.domain.models import Channel, Message, MessageReport, UserBlock
+from aiko_gateway.domain.models import (
+    Channel, Message, MessageReport, Retraction, UserBlock)
 from aiko_gateway.realtime.ws import _handle_send
 from aiko_gateway.rest import moderation as moderation_routes
 from aiko_gateway.rest.deps import get_session
@@ -150,6 +151,29 @@ async def test_block_is_mutual_blocked_user_also_loses_sight(session):
 
     rows = await messages_service.get_history(session, ch.id, b.id, limit=50)
     assert [r.id for r in rows] == [_ulid(2)]  # alice's msg 1 hidden from bob too
+
+
+async def test_retraction_is_not_block_filtered_delivers_regardless_of_block(session):
+    """#7 ADD/REMOVE asymmetry (cage-match: the frame-flip). A retraction carries no
+    content and only REMOVES, so it is NOT block-filtered — it reaches every channel
+    member, incl. a viewer blocked with the target's author (the way Matrix redactions
+    / Discord deletes reach everyone in the room while block stays a content filter).
+    Filtering it would only strand takedowns across a block/unblock epoch for zero
+    privacy benefit (the id is opaque + unattributable). Contrast: bob's MESSAGE stays
+    hidden from alice — content IS filtered, the delete of it is not."""
+    ch = await _public_channel(session)
+    a = await _user(session, "alice")
+    b = await _user(session, "bob")
+    await _msg(session, mid=2, channel=ch, sender=b)            # bob's message (content)
+    session.add(Retraction(id=_ulid(9), target_msg_id=_ulid(2), channel_id=ch.id))
+    await session.commit()
+    await moderation_service.block_user(session, a.id, b.id)    # alice blocks bob
+
+    ids = [r.id for r in await messages_service.get_history(session, ch.id, a.id, limit=50)]
+    assert _ulid(2) not in ids     # bob's MESSAGE hidden from alice (content filtered)
+    assert _ulid(9) in ids         # but the RETRACTION reaches her (delete not filtered)
+    # Fence includes the retraction too — the paired read stays consistent, unfiltered.
+    assert await messages_service.latest_ulid(session, ch.id, a.id) == _ulid(9)
 
 
 async def test_third_party_sees_everyone(session):

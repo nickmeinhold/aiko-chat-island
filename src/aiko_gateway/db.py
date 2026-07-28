@@ -71,6 +71,11 @@ def make_engine(url: str) -> AsyncEngine:
 
 
 engine = make_engine(settings.db_url)
+# expire_on_commit=False is LOAD-BEARING, not a default (cage-match Kelvin + Wu). These
+# paths read ORM attributes AFTER commit and would MissingGreenlet-crash on a lazy reload
+# if it were True: create_outbound -> message_view (WS/REST fanout), ban_user route
+# (active-disconnect), and resolve_report's retraction fanout (#7). Flip this to True and
+# those three break — grep them before you do.
 SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 

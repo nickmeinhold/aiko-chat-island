@@ -12,7 +12,7 @@ import datetime as dt
 import enum
 
 from sqlalchemy import (
-    JSON, BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Integer,
+    JSON, BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer,
     String, Text, UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -422,6 +422,62 @@ class MessageReport(Base):
     resolved_by_user_id: Mapped[str | None] = mapped_column(
         ForeignKey("users.id"), nullable=True)
     resolution: Mapped[str | None] = mapped_column(String(16), nullable=True)
+
+
+class Retraction(Base):
+    """A forward-ULID *retraction* event — the durable, catch-uppable record that a
+    message was taken down (#7 takedown propagation).
+
+    WHY a new event and not just ``Message.deleted_at``: the soft-delete mutates a
+    row *below* a client's forward watermark. ``get_history`` catch-up is
+    ``id > after`` (strictly greater; ``id`` is a monotonic ULID), so a client that
+    already synced the message (``id <= last_id``) never re-observes the deletion —
+    it would hold a taken-down message forever, and a cold reload of the durable
+    on-disk cache doesn't heal it. A retraction is a NEW row with its OWN higher
+    ULID that references the taken-down message, so it rides the EXISTING forward
+    paths: normal ``get_history`` catch-up (offline-then-reconnect clients) AND WS
+    fanout (live clients) — one mechanism, no separate deletions feed, no second
+    cursor.
+
+    The retraction IS the durable system of record; WS fanout is a latency
+    optimisation over it. It is therefore written in the SAME transaction as the
+    soft-delete (``moderation_service.take_down_message``): a delete that committed
+    without its retraction would be un-catch-uppable for a client that also missed
+    the live frame.
+
+    ``id > target_msg_id`` is guaranteed — ``id`` is minted via ``new_ulid()``
+    (time-forward) at takedown, strictly after the target message's own mint, so
+    the forward cursor always carries the retraction past any client watermark that
+    already includes the target.
+
+    NOT the account-deletion *husk* (``accounts_service``: a deleted user's message
+    keeps its slot but has its body/PII wiped, staying visible under a placeholder
+    label). A husk REMAINS; a retraction REMOVES. Different mechanism, different
+    word, on purpose.
+    """
+    __tablename__ = "message_retractions"
+    __table_args__ = (
+        # The forward-catch-up query filters channel_id then ranges/orders on id
+        # (`WHERE channel_id=? AND id > ? ORDER BY id`); a COMPOSITE (channel_id, id)
+        # index matches that access path exactly (cage-match Carnot) — sharper than a
+        # channel_id-only index leaning on the global PK order across all channels.
+        Index("ix_message_retractions_channel_id_id", "channel_id", "id"),
+    )
+    id: Mapped[str] = mapped_column(String(26), primary_key=True, default=new_ulid)
+    # The taken-down message. The row survives the soft-delete (and the account-
+    # deletion husk keeps rows too), so this FK target is stable. Indexed for the
+    # per-message dedup lookup ("is this message already retracted?"). NOTE: there is
+    # deliberately NO block join on retractions anywhere — a delete carries no content,
+    # so it is never block-filtered (#7 add/remove asymmetry). Do not add one; it would
+    # strand takedowns across a block/unblock epoch.
+    target_msg_id: Mapped[str] = mapped_column(
+        ForeignKey("messages.id"), nullable=False, index=True)
+    # Scopes the retraction to a channel so get_history pages it on the same
+    # (channel_id, id) axis as messages — covered by the composite index above.
+    channel_id: Mapped[str] = mapped_column(
+        ForeignKey("channels.id"), nullable=False)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow)
 
 
 class DeviceToken(Base):

@@ -22,7 +22,7 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from aiko_gateway.domain import acl, messages_service, security, users_service
-from aiko_gateway.domain.models import Channel, Membership, Message
+from aiko_gateway.domain.models import Channel, Membership, Message, Retraction
 from aiko_gateway.realtime.hub import Connection
 from aiko_gateway.realtime.ws import _handle_send, _handle_subscribe
 from aiko_gateway.rest import channels as channel_routes
@@ -240,6 +240,31 @@ async def test_history_public_channel_open_to_any_authed_user(client, session):
     bob = await _user(session, "bob")  # no membership anywhere
     resp = await client.get(f"/v1/channels/{pub.id}/messages", headers=await _headers(bob))
     assert resp.status_code == 200
+
+
+async def test_history_wire_shape_interleaves_typed_message_and_retraction(client, session):
+    """Wire contract (#7, option A): the history `messages` array is HETEROGENEOUS —
+    message items carry "type":"message", retraction items "type":"retraction" — so
+    the app disambiguates on one field. Both advance next_before/next_after. (This is
+    the island↔app coordination point; the app builds its consumer to exactly this.)"""
+    pub = await _public_channel(session, cid=0, name="general")
+    session.add(Message(id=_ulid(1), channel_id=pub.id, sender_kind="human",
+                        body="hi", created_at=_now()))
+    session.add(Retraction(id=_ulid(5), target_msg_id=_ulid(1), channel_id=pub.id))
+    await session.commit()
+    bob = await _user(session, "bob")
+    resp = await client.get(f"/v1/channels/{pub.id}/messages", headers=await _headers(bob))
+    assert resp.status_code == 200
+    body = resp.json()
+    items = body["messages"]
+    assert [i["type"] for i in items] == ["message", "retraction"]  # ULID-ordered
+    msg_item, ret_item = items
+    assert msg_item["msg_id"] == _ulid(1) and msg_item["body"] == "hi"
+    assert ret_item == {"type": "retraction", "id": _ulid(5),
+                        "target_msg_id": _ulid(1), "channel_id": pub.id}
+    # The cursor advances across BOTH item types (single shared axis).
+    assert body["next_before"] == _ulid(1)
+    assert body["next_after"] == _ulid(5)
 
 
 # =========================================================================

@@ -37,7 +37,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..config import settings
 from . import acl
 from .ids import new_ulid
-from .models import Message, MessageReport, ReportResolution, User, UserBlock
+from .models import (
+    Message, MessageReport, ReportResolution, Retraction, User, UserBlock)
 
 
 def _utcnow() -> dt.datetime:
@@ -81,6 +82,19 @@ class ReportAlreadyResolved(Exception):
     way (e.g. take down a dismissed report). Re-applying the SAME action is an
     idempotent no-op; a conflicting action is refused rather than silently
     producing a message state that disagrees with the recorded resolution."""
+
+
+class RetractionOrderingError(Exception):
+    """A minted retraction id did not sort strictly after its target message id — the
+    forward-ULID axis the whole propagation design rests on would be inverted. Fail
+    closed: a retraction the forward cursor would never carry is worse than useless.
+
+    LOAD-BEARING, not decorative (cage-match Wu): a ULID's ordering WITHIN one
+    millisecond is its random 80-bit tail, not monotonic. In practice a takedown
+    post-dates its target by human-moderation latency, so their millisecond fields
+    differ and the retraction always wins — but a same-millisecond mint (a message
+    taken down within 1ms of posting) could invert on the random tail. So this is a
+    real guard on a distrust-the-clock invariant, not an impossible branch."""
 
 
 # --- blocks: mutations ------------------------------------------------------
@@ -320,12 +334,15 @@ async def list_pending_reports(session: AsyncSession, *, limit: int = 100) -> li
 
 async def take_down_message(
     session: AsyncSession, *, report_id: str, moderator_id: str,
-) -> None:
+) -> Retraction | None:
     """Act on a report by taking the message down: soft-delete the message (first
     writer of `Message.deleted_at`) and resolve the report as `taken_down`.
 
     A report resolves EXACTLY ONCE, to one outcome. Re-running take-down on an
-    already-taken-down report is an idempotent no-op; running it on an already-
+    already-taken-down report is idempotent for the resolution + soft-delete, but it
+    is NOT a dead end: it SELF-HEALS a missing retraction (emits one iff the target
+    has none), so a message taken down before retractions existed can be repaired by
+    a re-resolve (cage-match Carnot). Running take-down on an already-
     DISMISSED report raises `ReportAlreadyResolved` rather than soft-deleting the
     message while the recorded resolution still reads `dismissed` (a state/label
     disagreement — cage-match Carnot HIGH + Tesla). The resolution gate and the
@@ -334,6 +351,17 @@ async def take_down_message(
     id. The soft-delete propagates to the read paths through the existing
     `deleted_at IS NULL` filter shared by `get_history` / `latest_ulid`, so the
     message vanishes from history and the fence at once.
+
+    PROPAGATION (#7): the soft-delete alone only hides the message from FUTURE
+    reads — a client that already synced it (id <= its forward watermark) never
+    re-observes the deletion. So the takedown TRANSITION also appends a forward-ULID
+    `Retraction` in the SAME transaction (see the Retraction model docstring): a new
+    row with its own higher ULID that rides history catch-up + WS fanout to reach
+    both offline and live clients. Returns the created `Retraction` so the caller
+    can fan it out live; returns None on the idempotent re-resolve (clients already
+    received the first retraction). Emitted even when the message was already
+    soft-deleted (e.g. a prior account-deletion husk) — a client may still hold the
+    pre-takedown row and needs the removal signal.
 
     CONCURRENCY (named MVP tradeoff, mirrors `block_user`): the resolved-check is
     read-then-write, not an atomic conditional UPDATE. Under the single-writer
@@ -344,18 +372,63 @@ async def take_down_message(
     report = await session.get(MessageReport, report_id)
     if report is None:
         raise ReportNotFound()
-    if report.resolved_at is not None:
-        if report.resolution == ReportResolution.TAKEN_DOWN:
-            return  # idempotent: same action, already applied
+    already_taken_down = (
+        report.resolved_at is not None
+        and report.resolution == ReportResolution.TAKEN_DOWN)
+    if report.resolved_at is not None and not already_taken_down:
+        # Resolved a DIFFERENT way (dismissed) — a conflicting re-resolution is refused.
         raise ReportAlreadyResolved()
-    now = _utcnow()
     message = await session.get(Message, report.message_id)
-    if message is not None and message.deleted_at is None:
-        message.deleted_at = now
-    report.resolved_at = now
-    report.resolution = ReportResolution.TAKEN_DOWN
-    report.resolved_by_user_id = moderator_id
+    if message is None:
+        # A NEW takedown of an absent message fails closed (cage-match Carnot): reports
+        # FK a non-null message_id and messages are never hard-deleted, so this is
+        # unreachable in practice — but raising beats stamping a `taken_down` label for a
+        # transition that never happened. An already-taken-down re-resolve whose message
+        # somehow vanished has nothing to heal — no-op.
+        if already_taken_down:
+            return None
+        raise MessageNotFound()
+    # ENSURE exactly one retraction exists for this taken-down message — emit iff none
+    # yet. This runs on the first takedown AND on a re-resolve of an already-taken-down
+    # report, so a message taken down BEFORE retractions existed (a pre-0016 takedown, or
+    # any takedown whose retraction was never minted) SELF-HEALS on the next resolve
+    # (cage-match Carnot): the idempotent path is no longer a dead end. It also covers the
+    # account-deletion husk (deleted_at set, no retraction → first takedown emits) and the
+    # multi-report case (the 2nd+ report finds the existing retraction → no duplicate).
+    #
+    # DEDUP + the FALLIBLE ordering guard run BEFORE any mutation, so a fail-closed raise
+    # leaves the session clean (cage-match Wu). SELECT-then-insert is race-free under the
+    # single-writer SQLite deployment; the Postgres UNIQUE(target_msg_id) hardening is
+    # tracked with that migration cluster.
+    existing = (await session.execute(
+        select(Retraction.id).where(Retraction.target_msg_id == message.id)
+    )).first()
+    retraction: Retraction | None = None
+    if existing is None:
+        # Mint the id explicitly so the forward-ordering invariant is EXECUTABLE
+        # (cage-match Carnot + Wu). new_ulid() is time-forward across MILLISECONDS, but
+        # intra-millisecond ordering is the random tail, so the guard is load-bearing,
+        # not decorative. Fail closed rather than emit a retraction the forward cursor
+        # would never carry. Checked HERE, before any mutation.
+        rid = new_ulid()
+        if rid <= message.id:
+            raise RetractionOrderingError(
+                f"retraction id {rid} not > target {message.id} — ULID axis regressed")
+        retraction = Retraction(
+            id=rid, target_msg_id=message.id, channel_id=message.channel_id)
+    if not already_taken_down:
+        # FIRST takedown only: soft-delete the message + stamp the resolution. A
+        # re-resolve skips this — it exists solely to heal a missing retraction above.
+        now = _utcnow()
+        if message.deleted_at is None:
+            message.deleted_at = now
+        report.resolved_at = now
+        report.resolution = ReportResolution.TAKEN_DOWN
+        report.resolved_by_user_id = moderator_id
+    if retraction is not None:
+        session.add(retraction)
     await session.commit()
+    return retraction
 
 
 async def dismiss_report(

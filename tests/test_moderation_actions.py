@@ -23,9 +23,11 @@ import pytest_asyncio
 from fastapi import FastAPI, WebSocketDisconnect
 from httpx import ASGITransport, AsyncClient
 
+from sqlalchemy import select
+
 from aiko_gateway.config import settings
 from aiko_gateway.domain import moderation_service, security, users_service
-from aiko_gateway.domain.models import Channel, Message, MessageReport
+from aiko_gateway.domain.models import Channel, Message, MessageReport, Retraction
 from aiko_gateway.realtime import ws as ws_module
 from aiko_gateway.realtime.hub import Connection, Hub
 from aiko_gateway.rest import auth as auth_routes
@@ -179,6 +181,276 @@ async def test_take_down_is_idempotent(session):
     await moderation_service.take_down_message(session, report_id=rep.id, moderator_id=mod.id)
     await session.refresh(msg)
     assert msg.deleted_at == first_deleted
+
+
+# --- service: takedown retraction emission (#7 propagation) ------------------
+
+async def _all_retractions(session) -> list[Retraction]:
+    return list((await session.execute(select(Retraction))).scalars())
+
+
+async def test_take_down_emits_forward_retraction(session):
+    """The takedown transition appends a forward-ULID retraction in the same txn,
+    and returns it. The retraction targets the message, is scoped to its channel,
+    and its id sorts ABOVE the target's id so a client's forward cursor carries it."""
+    mod = await _user(session, "mod")
+    author = await _user(session, "author")
+    ch = await _channel(session)
+    msg = await _msg(session, mid=1, channel=ch, sender=author)
+    rep = await _report(session, rid=100, message=msg, reporter=author)
+
+    retraction = await moderation_service.take_down_message(
+        session, report_id=rep.id, moderator_id=mod.id)
+
+    assert retraction is not None
+    assert retraction.target_msg_id == msg.id
+    assert retraction.channel_id == ch.id
+    assert retraction.id > msg.id                     # forward cursor carries it
+    # Persisted (durable system of record), exactly one, committed with the delete.
+    rows = await _all_retractions(session)
+    assert [r.id for r in rows] == [retraction.id]
+
+
+async def test_idempotent_re_resolve_emits_no_second_retraction(session):
+    """A re-resolve of an already-taken-down report returns None and does NOT mint a
+    second retraction — clients already received the first."""
+    mod = await _user(session, "mod")
+    author = await _user(session, "author")
+    ch = await _channel(session)
+    msg = await _msg(session, mid=1, channel=ch, sender=author)
+    rep = await _report(session, rid=100, message=msg, reporter=author)
+
+    first = await moderation_service.take_down_message(
+        session, report_id=rep.id, moderator_id=mod.id)
+    second = await moderation_service.take_down_message(
+        session, report_id=rep.id, moderator_id=mod.id)
+
+    assert first is not None and second is None
+    assert [r.id for r in await _all_retractions(session)] == [first.id]  # still one
+
+
+async def test_take_down_of_already_soft_deleted_message_still_emits_retraction(session):
+    """A message soft-deleted by a PRIOR path (e.g. account-deletion husk) can still
+    be taken down; the re-delete is skipped but the retraction MUST still emit — a
+    client may still hold the pre-takedown row and needs the removal signal."""
+    mod = await _user(session, "mod")
+    author = await _user(session, "author")
+    ch = await _channel(session)
+    msg = await _msg(session, mid=1, channel=ch, sender=author)
+    msg.deleted_at = dt.datetime.now(dt.timezone.utc)   # already soft-deleted
+    await session.commit()
+    rep = await _report(session, rid=100, message=msg, reporter=author)
+
+    retraction = await moderation_service.take_down_message(
+        session, report_id=rep.id, moderator_id=mod.id)
+
+    assert retraction is not None
+    assert retraction.target_msg_id == msg.id
+
+
+# --- HTTP: resolve route fans the retraction out live -----------------------
+
+class _RecordingConn(Connection):
+    """A Connection that records frames instead of touching a socket."""
+
+    def __init__(self, user_id: str):
+        self.ws = None  # type: ignore[assignment]
+        self.user_id = user_id
+        self.subscribed: set[str] = set()
+        self.sent: list[dict] = []
+
+    async def send(self, frame: dict) -> None:
+        self.sent.append(frame)
+
+
+async def test_resolve_route_fans_out_retraction_frame(session, monkeypatch):
+    """The resolve route delivers a live `retraction` frame to a subscriber of the
+    channel — the live twin of the history catch-up. Best-effort layer over the
+    durable Retraction row."""
+    mod = await _user(session, "mod")
+    author = await _user(session, "author")
+    monkeypatch.setattr(settings, "moderator_user_ids", [mod.id])
+    ch = await _channel(session)
+    msg = await _msg(session, mid=1, channel=ch, sender=author)
+    rep = await _report(session, rid=100, message=msg, reporter=author)
+
+    hub = Hub()
+    watcher = _RecordingConn(author.id)
+    watcher.subscribed.add(ch.id)
+    hub.register(watcher)
+
+    async def _override_session():
+        yield session
+
+    app = FastAPI()
+    app.include_router(moderation_routes.router)
+    register_error_handlers(app)
+    app.state.gw = SimpleNamespace(hub=hub)   # what the route reaches for the fanout
+    app.dependency_overrides[get_session] = _override_session
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.post(f"/v1/reports/{rep.id}/resolve", headers=_auth(mod))
+    app.dependency_overrides.clear()
+
+    assert resp.status_code == 204
+    frames = [f for f in watcher.sent if f.get("type") == "retraction"]
+    assert len(frames) == 1
+    assert frames[0]["channel_id"] == ch.id
+    assert frames[0]["target_msg_id"] == msg.id
+    assert frames[0]["id"] > msg.id
+
+
+async def test_second_report_on_same_message_emits_no_duplicate_retraction(session):
+    """At most ONE retraction per taken-down message (cage-match Tesla + Carnot). Two
+    DISTINCT reports on the same message, each resolved: the first takedown emits, the
+    second (message already retracted) returns None — no duplicate — yet the second
+    report is still properly resolved."""
+    mod = await _user(session, "mod")
+    author = await _user(session, "author")
+    r2 = await _user(session, "reporter2")
+    ch = await _channel(session)
+    msg = await _msg(session, mid=1, channel=ch, sender=author)
+    rep1 = await _report(session, rid=100, message=msg, reporter=author)
+    rep2 = await _report(session, rid=101, message=msg, reporter=r2)
+
+    first = await moderation_service.take_down_message(
+        session, report_id=rep1.id, moderator_id=mod.id)
+    second = await moderation_service.take_down_message(
+        session, report_id=rep2.id, moderator_id=mod.id)
+
+    assert first is not None and second is None
+    assert [r.id for r in await _all_retractions(session)] == [first.id]  # exactly one
+    await session.refresh(rep2)
+    assert rep2.resolution == "taken_down"  # dedup didn't block rep2's resolution
+
+
+async def test_re_resolve_heals_a_takedown_missing_its_retraction(session):
+    """A message taken down BEFORE retractions existed (pre-0016, or any takedown whose
+    retraction was never minted) has deleted_at set + a taken_down report but no
+    retraction row — the exact watermark gap this PR closes, left open for old data.
+    Re-resolving must SELF-HEAL (emit the missing retraction), not dead-end on the
+    idempotent return (cage-match Carnot)."""
+    mod = await _user(session, "mod")
+    author = await _user(session, "author")
+    ch = await _channel(session)
+    msg = await _msg(session, mid=1, channel=ch, sender=author)
+    rep = await _report(session, rid=100, message=msg, reporter=author)
+    # Simulate a pre-retraction takedown: soft-deleted + resolved taken_down, NO retraction.
+    msg.deleted_at = dt.datetime.now(dt.timezone.utc)
+    rep.resolved_at = dt.datetime.now(dt.timezone.utc)
+    rep.resolution = "taken_down"
+    rep.resolved_by_user_id = mod.id
+    await session.commit()
+    assert await _all_retractions(session) == []            # the stranded state
+
+    healed = await moderation_service.take_down_message(
+        session, report_id=rep.id, moderator_id=mod.id)
+    assert healed is not None                                # emitted the missing retraction
+    assert healed.target_msg_id == msg.id
+    assert [r.id for r in await _all_retractions(session)] == [healed.id]
+    # A second re-resolve is now a genuine no-op (retraction already exists).
+    assert await moderation_service.take_down_message(
+        session, report_id=rep.id, moderator_id=mod.id) is None
+
+
+async def test_take_down_missing_message_fails_closed(session):
+    """A report whose target message row is absent fails closed with MessageNotFound
+    rather than stamping a taken_down label for a non-transition (cage-match Carnot
+    LOW). FK-off in tests lets us seed the orphan directly."""
+    mod = await _user(session, "mod")
+    reporter = await _user(session, "reporter")
+    orphan = MessageReport(
+        id=_ulid(200), message_id=_ulid(777), reporter_user_id=reporter.id,
+        reason="harassment", created_at=dt.datetime.now(dt.timezone.utc))
+    session.add(orphan)
+    await session.commit()
+
+    with pytest.raises(moderation_service.MessageNotFound):
+        await moderation_service.take_down_message(
+            session, report_id=orphan.id, moderator_id=mod.id)
+
+    assert await _all_retractions(session) == []   # nothing emitted
+    await session.refresh(orphan)
+    assert orphan.resolved_at is None              # NOT stamped resolved
+
+
+async def test_resolve_route_maps_ordering_violation_to_500(client, session, monkeypatch):
+    """The (unreachable) ordering guard surfaces as an observable 500 at the route,
+    not an opaque stack trace (cage-match Tesla + Wu). Fail-closed: report unresolved."""
+    mod = await _user(session, "mod")
+    author = await _user(session, "author")
+    monkeypatch.setattr(settings, "moderator_user_ids", [mod.id])
+    ch = await _channel(session)
+    msg = await _msg(session, mid=5, channel=ch, sender=author)
+    rep = await _report(session, rid=100, message=msg, reporter=author)
+    monkeypatch.setattr(moderation_service, "new_ulid", lambda: _ulid(1))  # < target(5)
+
+    resp = await client.post(f"/v1/reports/{rep.id}/resolve", headers=_auth(mod))
+    assert resp.status_code == 500
+
+
+async def test_ordering_violation_fails_clean_with_no_partial_mutation(session, monkeypatch):
+    """cage-match Wu: the retraction ordering guard must fail CLEAN — if it fires it
+    must leave NO partial mutation, so a LATER commit on the same session cannot
+    persist a `taken_down` resolution with no retraction (the exact un-catch-uppable
+    split the PR exists to prevent). RED-proves the validate-before-mutate ordering:
+    force new_ulid() below the target, then commit and assert nothing stuck."""
+    mod = await _user(session, "mod")
+    author = await _user(session, "author")
+    ch = await _channel(session)
+    msg = await _msg(session, mid=5, channel=ch, sender=author)
+    rep = await _report(session, rid=100, message=msg, reporter=author)
+    monkeypatch.setattr(moderation_service, "new_ulid", lambda: _ulid(1))  # id < target(5)
+
+    with pytest.raises(moderation_service.RetractionOrderingError):
+        await moderation_service.take_down_message(
+            session, report_id=rep.id, moderator_id=mod.id)
+
+    # Force the "later commit" the dirty-session harm depends on. Clean code has
+    # nothing pending, so this persists nothing.
+    await session.commit()
+    await session.refresh(msg)
+    await session.refresh(rep)
+    assert msg.deleted_at is None                    # NOT soft-deleted
+    assert rep.resolved_at is None                   # NOT stamped taken_down
+    assert await _all_retractions(session) == []
+
+
+async def test_resolve_route_fans_retraction_to_blocked_subscriber_too(
+        session, monkeypatch):
+    """#7 ADD/REMOVE asymmetry: the live retraction fanout is NOT block-filtered — a
+    subscriber blocked with the taken-down message's author STILL receives the frame
+    (a delete carries no content, only removes). Contrast the message fanout, which IS
+    block-filtered. Delivering the delete to a blocked viewer removes stale content
+    they may hold and leaks nothing (opaque id)."""
+    mod = await _user(session, "mod")
+    author = await _user(session, "author")
+    blocker = await _user(session, "blocker")
+    monkeypatch.setattr(settings, "moderator_user_ids", [mod.id])
+    ch = await _channel(session)
+    msg = await _msg(session, mid=1, channel=ch, sender=author)
+    rep = await _report(session, rid=100, message=msg, reporter=author)
+    await moderation_service.block_user(session, blocker.id, author.id)
+
+    hub = Hub()
+    blocked_conn = _RecordingConn(blocker.id); blocked_conn.subscribed.add(ch.id)
+    hub.register(blocked_conn)
+
+    async def _override_session():
+        yield session
+    app = FastAPI()
+    app.include_router(moderation_routes.router)
+    register_error_handlers(app)
+    app.state.gw = SimpleNamespace(hub=hub)
+    app.dependency_overrides[get_session] = _override_session
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.post(f"/v1/reports/{rep.id}/resolve", headers=_auth(mod))
+    app.dependency_overrides.clear()
+
+    assert resp.status_code == 204
+    # Blocked subscriber DOES receive the retraction (delete is not block-filtered).
+    assert len([f for f in blocked_conn.sent if f.get("type") == "retraction"]) == 1
 
 
 # --- service: ban / unban ----------------------------------------------------

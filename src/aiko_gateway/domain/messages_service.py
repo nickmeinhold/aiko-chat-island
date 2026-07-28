@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..aiko.payload import InboundMessage
 from . import channels_service, moderation_service, signing_keys_service
 from .ids import new_ulid
-from .models import Channel, Message, User
+from .models import Channel, Message, Retraction, User
 
 
 def message_view(m: Message) -> dict:
@@ -37,6 +37,22 @@ def message_view(m: Message) -> dict:
     if m.origin is not None:
         view["origin"] = m.origin
     return view
+
+
+def retraction_view(r: Retraction) -> dict:
+    """Wire item for a takedown retraction — used BOTH as a heterogeneous item in
+    the `get_history` stream and as the WS `retraction` frame body (envelopes.
+    retraction_frame). `id` advances the client's forward watermark exactly like a
+    message id (that is what makes the deletion catch-uppable); `target_msg_id` is
+    the message the client must suppress + remove. `id > target_msg_id` holds by
+    construction — see the Retraction model. `type` disambiguates it from a
+    `message` item in the interleaved history array (wire contract, #7)."""
+    return {
+        "type": "retraction",
+        "id": r.id,
+        "target_msg_id": r.target_msg_id,
+        "channel_id": r.channel_id,
+    }
 
 
 async def create_outbound(
@@ -178,6 +194,16 @@ async def latest_ulid(session: AsyncSession, channel_id: str, viewer_id: str) ->
     visible rows and the violation check would false-positive. One predicate, both
     reads — the partition stays clean and the invariant stays assertable.
 
+    The axis now carries takedown ``Retraction`` events too (#7), so the fence is
+    the newest of (visible messages) ∪ (channel retractions) — exactly the set
+    ``get_history`` can return. Were the fence to ignore retractions, a retraction
+    with an id above the newest visible message would land in the "id > fence → live"
+    partition on a fresh subscribe and never be replayed. Retractions are NOT
+    block-filtered (they carry no content, only remove — see ``get_history``'s
+    add/remove asymmetry note), so the retraction component here matches ``get_history``
+    by ALSO not filtering them; the paired read stays consistent because both reads
+    apply the identical (channel-only) retraction predicate.
+
     Visibility has TWO dimensions, both viewer-INdependent EXCEPT blocks: a
     soft-deleted row (``deleted_at IS NULL``) is hidden from everyone, while a
     BLOCKED author's row is hidden only from the viewer in the block relationship
@@ -196,15 +222,27 @@ async def latest_ulid(session: AsyncSession, channel_id: str, viewer_id: str) ->
     so blocker and history agree and the loop converges. The durable fix is making
     B4 treat empty-page-before-fence as a benign re-sync (refetch the fence) rather
     than an assert — a CLIENT/protocol change tracked in the app repo, not here.
+
+    Retractions do NOT add to this shrink race: because they are never block-filtered
+    (#7 add/remove asymmetry), no block/unblock transition can hide a retraction that
+    was in a viewer's fence, so a takedown always propagates on forward catch-up
+    regardless of block state. Only the message component carries the visibility-shrink
+    coupling described above.
     """
-    result = await session.execute(
+    msg_result = await session.execute(
         select(func.max(Message.id)).where(
             Message.channel_id == channel_id,
             Message.deleted_at.is_(None),
             moderation_service.not_blocked_predicate(viewer_id),
         )
     )
-    return result.scalar_one() or ""
+    ret_result = await session.execute(
+        select(func.max(Retraction.id)).where(Retraction.channel_id == channel_id)
+    )
+    # "" is lexicographically below any 26-char ULID, so max() picks the newer real
+    # id and collapses to "" only when the channel has neither a visible message nor
+    # a retraction.
+    return max(msg_result.scalar_one() or "", ret_result.scalar_one() or "")
 
 
 async def get_history(
@@ -215,35 +253,64 @@ async def get_history(
     before: str | None = None,
     after: str | None = None,
     limit: int,
-) -> list[Message]:
-    """A page of messages in a channel visible to `viewer_id`, **always returned
-    ascending** (oldest first) for display. Two cursor directions, mutually
-    exclusive — a ULID is a total order, so both walk the same axis:
+) -> list[Message | Retraction]:
+    """A page of channel history visible to `viewer_id`, **always returned
+    ascending** (oldest first) for display. The stream is HETEROGENEOUS: `Message`
+    rows AND `Retraction` events (takedown propagation, #7), interleaved on the one
+    shared ULID axis — both types carry an `id` on the same monotonic order, so a
+    single cursor pages them together. Two cursor directions, mutually exclusive:
 
-    * ``before`` (backward, the default — UI scroll-up): the ``limit`` newest
-      messages with ``id < before``. Used to load older history a page at a time.
-    * ``after`` (forward — B4 reconnect catch-up): the ``limit`` oldest messages
-      with ``id > after``. Forward paging fills the oldest gap first, which is
-      what makes ``MAX(serverUlid)`` a crash-resumable watermark on the client
-      (design 04 §Gap 2). ``after`` wins if both are passed.
+    * ``before`` (backward, the default — UI scroll-up): the ``limit`` newest items
+      with ``id < before``. Used to load older history a page at a time.
+    * ``after`` (forward — B4 reconnect catch-up): the ``limit`` oldest items with
+      ``id > after``. Forward paging fills the oldest gap first, which is what makes
+      ``MAX(serverUlid)`` a crash-resumable watermark on the client (design 04
+      §Gap 2). ``after`` wins if both are passed. A retraction with
+      ``id > client watermark`` is delivered here — that is how an offline client
+      catches up on a deletion it never re-observes otherwise.
 
-    Visibility filter: soft-deleted rows are hidden from all; a blocked author's
-    rows are hidden from the viewer in the block relationship (#7). This MUST be
-    the same predicate ``latest_ulid`` (the fence) uses — see its docstring.
+    Visibility — the ADD/REMOVE asymmetry (#7). Messages carry CONTENT, so they are
+    filtered: soft-deleted rows are hidden from all; a blocked author's rows are
+    hidden from the viewer in the block relationship. This MUST be the same predicate
+    ``latest_ulid`` (the fence) uses — see its docstring. Retractions are the opposite
+    kind of event: they carry NO content and only ever REMOVE something, so they are
+    NOT block-filtered — they ride the unfiltered stream to every channel member, the
+    way Matrix redactions / Discord deletes reach everyone in the room while block
+    stays a content filter. A delete can only reduce what you see, so it needs no
+    permission to be delivered; and block-filtering it would only STRAND takedowns
+    across a block/unblock epoch (a monotonic watermark can't reach back to replay a
+    delete it skipped) for zero privacy benefit — the id is opaque and unattributable.
+    (Retractions are channel-scoped only; no ``deleted_at`` filter — the target's
+    soft-delete is exactly what they announce.)
+
+    Interleave/limit correctness: each type is queried for its own ``limit`` items
+    above/below the cursor, the two ascending (or descending) streams are merged by
+    ``id`` and truncated to ``limit``. Because each sub-stream already yielded its
+    ``limit`` smallest (or largest) qualifying ids, no item that belongs inside the
+    page can hide beyond position ``limit`` of the union.
     """
-    stmt = select(Message).where(
+    msg_stmt = select(Message).where(
         Message.channel_id == channel_id,
         Message.deleted_at.is_(None),
         moderation_service.not_blocked_predicate(viewer_id),
     )
+    ret_stmt = select(Retraction).where(Retraction.channel_id == channel_id)
     if after is not None:
-        # Forward: oldest-above-cursor first; already ascending, no reverse.
-        stmt = stmt.where(Message.id > after).order_by(Message.id.asc()).limit(limit)
-        return list((await session.execute(stmt)).scalars())
-    # Backward (default): newest-below-cursor first, then flip to ascending.
+        # Forward: oldest-above-cursor first from each stream, merge ascending.
+        msg_stmt = msg_stmt.where(Message.id > after).order_by(Message.id.asc()).limit(limit)
+        ret_stmt = ret_stmt.where(Retraction.id > after).order_by(Retraction.id.asc()).limit(limit)
+        msgs = list((await session.execute(msg_stmt)).scalars())
+        rets = list((await session.execute(ret_stmt)).scalars())
+        return sorted([*msgs, *rets], key=lambda r: r.id)[:limit]
+    # Backward (default): newest-below-cursor first from each stream, merge
+    # descending, truncate, then flip to ascending for display.
     if before:
-        stmt = stmt.where(Message.id < before)
-    stmt = stmt.order_by(Message.id.desc()).limit(limit)
-    rows = list((await session.execute(stmt)).scalars())
+        msg_stmt = msg_stmt.where(Message.id < before)
+        ret_stmt = ret_stmt.where(Retraction.id < before)
+    msg_stmt = msg_stmt.order_by(Message.id.desc()).limit(limit)
+    ret_stmt = ret_stmt.order_by(Retraction.id.desc()).limit(limit)
+    msgs = list((await session.execute(msg_stmt)).scalars())
+    rets = list((await session.execute(ret_stmt)).scalars())
+    rows = sorted([*msgs, *rets], key=lambda r: r.id, reverse=True)[:limit]
     rows.reverse()
     return rows
