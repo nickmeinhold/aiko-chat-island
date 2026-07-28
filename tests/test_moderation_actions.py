@@ -387,15 +387,16 @@ async def test_ordering_violation_fails_clean_with_no_partial_mutation(session, 
     assert await _all_retractions(session) == []
 
 
-async def test_resolve_route_excludes_blocked_subscriber_from_retraction_fanout(
+async def test_resolve_route_fans_retraction_to_blocked_subscriber_too(
         session, monkeypatch):
-    """The live retraction fanout honours the block boundary (cage-match Carnot): a
-    subscriber blocked with the taken-down message's author does NOT receive the
-    frame, while a non-blocked bystander does — mirroring the history read."""
+    """#7 ADD/REMOVE asymmetry: the live retraction fanout is NOT block-filtered — a
+    subscriber blocked with the taken-down message's author STILL receives the frame
+    (a delete carries no content, only removes). Contrast the message fanout, which IS
+    block-filtered. Delivering the delete to a blocked viewer removes stale content
+    they may hold and leaks nothing (opaque id)."""
     mod = await _user(session, "mod")
     author = await _user(session, "author")
     blocker = await _user(session, "blocker")
-    bystander = await _user(session, "bystander")
     monkeypatch.setattr(settings, "moderator_user_ids", [mod.id])
     ch = await _channel(session)
     msg = await _msg(session, mid=1, channel=ch, sender=author)
@@ -404,8 +405,7 @@ async def test_resolve_route_excludes_blocked_subscriber_from_retraction_fanout(
 
     hub = Hub()
     blocked_conn = _RecordingConn(blocker.id); blocked_conn.subscribed.add(ch.id)
-    open_conn = _RecordingConn(bystander.id); open_conn.subscribed.add(ch.id)
-    hub.register(blocked_conn); hub.register(open_conn)
+    hub.register(blocked_conn)
 
     async def _override_session():
         yield session
@@ -420,8 +420,8 @@ async def test_resolve_route_excludes_blocked_subscriber_from_retraction_fanout(
     app.dependency_overrides.clear()
 
     assert resp.status_code == 204
-    assert [f for f in blocked_conn.sent if f.get("type") == "retraction"] == []
-    assert len([f for f in open_conn.sent if f.get("type") == "retraction"]) == 1
+    # Blocked subscriber DOES receive the retraction (delete is not block-filtered).
+    assert len([f for f in blocked_conn.sent if f.get("type") == "retraction"]) == 1
 
 
 # --- service: ban / unban ----------------------------------------------------

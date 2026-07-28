@@ -26,7 +26,6 @@ from pydantic import BaseModel
 
 from ..config import settings
 from ..domain import moderation_service
-from ..domain.models import Message
 from ..realtime import envelopes
 from .deps import CurrentUser, DbSession, ModeratorUser
 
@@ -198,27 +197,20 @@ async def resolve_report(
     if retraction is not None:
         gw = getattr(request.app.state, "gw", None)
         if gw is not None and getattr(gw, "hub", None) is not None:
-            # Exclude subscribers blocked-with the taken-down message's sender, so the
-            # live retraction honours the SAME block boundary as the history read and
-            # the message fanout (cage-match Carnot): a blocked viewer never saw the
-            # message and must not receive its retraction. A NULL-sender (bus actor)
-            # is never blocked, so no exclusion.
+            # Retractions are NOT block-filtered (#7 add/remove asymmetry): a delete
+            # carries no content and only reduces visibility, so it fans out to EVERY
+            # subscriber — the live twin of the unfiltered history/fence retraction
+            # read. No exclusion set to compute.
             #
             # Reading retraction.* here is post-commit — safe only because SessionLocal
-            # runs expire_on_commit=False (the same coupling create_outbound->message_view
-            # and ban_user already rely on). Flagged (cage-match Wu) so it's not silent:
-            # a MissingGreenlet here would 500 AFTER the durable commit and skip fanout —
-            # harmless, since history self-heals from the durable Retraction row.
-            target = await session.get(Message, retraction.target_msg_id)
-            exclude: set[str] = set()
-            if target is not None and target.sender_user_id is not None:
-                exclude = await moderation_service.blocked_pair_user_ids(
-                    session, target.sender_user_id)
+            # runs expire_on_commit=False (same coupling create_outbound->message_view
+            # and ban_user rely on). Flagged (cage-match Wu): a MissingGreenlet here
+            # would 500 AFTER the durable commit and skip fanout — harmless, history
+            # self-heals from the durable Retraction row.
             await gw.hub.fanout(
                 retraction.channel_id,
                 envelopes.retraction_frame(
-                    retraction.channel_id, retraction.id, retraction.target_msg_id),
-                exclude_user_ids=exclude)
+                    retraction.channel_id, retraction.id, retraction.target_msg_id))
 
 
 @router.post("/reports/{report_id}/dismiss", status_code=status.HTTP_204_NO_CONTENT)

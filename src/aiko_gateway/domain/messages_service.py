@@ -195,14 +195,14 @@ async def latest_ulid(session: AsyncSession, channel_id: str, viewer_id: str) ->
     reads — the partition stays clean and the invariant stays assertable.
 
     The axis now carries takedown ``Retraction`` events too (#7), so the fence is
-    the newest of (visible messages) ∪ (visible-target retractions) — exactly the set
-    ``get_history`` can return FOR THIS VIEWER. Were the fence to ignore retractions,
-    a retraction with an id above the newest visible message would land in the "id >
-    fence → live" partition on a fresh subscribe and never be replayed. The retraction
-    component applies the IDENTICAL block filter as ``get_history`` (joined to the
-    target message, ``not_blocked_predicate``): a retraction hidden from this viewer
-    by a block must not enter their fence either, or the paired read would disagree
-    for the blocked case exactly as it would for the message case.
+    the newest of (visible messages) ∪ (channel retractions) — exactly the set
+    ``get_history`` can return. Were the fence to ignore retractions, a retraction
+    with an id above the newest visible message would land in the "id > fence → live"
+    partition on a fresh subscribe and never be replayed. Retractions are NOT
+    block-filtered (they carry no content, only remove — see ``get_history``'s
+    add/remove asymmetry note), so the retraction component here matches ``get_history``
+    by ALSO not filtering them; the paired read stays consistent because both reads
+    apply the identical (channel-only) retraction predicate.
 
     Visibility has TWO dimensions, both viewer-INdependent EXCEPT blocks: a
     soft-deleted row (``deleted_at IS NULL``) is hidden from everyone, while a
@@ -223,18 +223,11 @@ async def latest_ulid(session: AsyncSession, channel_id: str, viewer_id: str) ->
     B4 treat empty-page-before-fence as a benign re-sync (refetch the fence) rather
     than an assert — a CLIENT/protocol change tracked in the app repo, not here.
 
-    RETRACTION INSTANCE of the same class (cage-match Carnot/Tesla/Wu, #7): a
-    takedown-while-blocked strands its retraction below a monotonic watermark. If a
-    viewer synced message M, then a block forms with M's author, then M is taken down
-    (its retraction now hidden from this viewer), then the viewer advances past the
-    retraction's id on other content — a later UNBLOCK never replays the retraction
-    via ``id > after``, so M can resurface from the durable cache as taken-down
-    content. This is the SAME monotonic-watermark-across-visibility-epochs family as
-    the message case above (a blocked-then-unblocked author's below-watermark messages
-    already need the identical re-sync), and the heal is the SAME client/protocol move
-    (a visibility-change re-sync in the app repo), NOT a server change here — the
-    server correctly hides the retraction during the block. Named as an accepted
-    tradeoff so the app's unblock handling scopes the re-sync to cover retractions.
+    Retractions do NOT add to this shrink race: because they are never block-filtered
+    (#7 add/remove asymmetry), no block/unblock transition can hide a retraction that
+    was in a viewer's fence, so a takedown always propagates on forward catch-up
+    regardless of block state. Only the message component carries the visibility-shrink
+    coupling described above.
     """
     msg_result = await session.execute(
         select(func.max(Message.id)).where(
@@ -244,12 +237,7 @@ async def latest_ulid(session: AsyncSession, channel_id: str, viewer_id: str) ->
         )
     )
     ret_result = await session.execute(
-        select(func.max(Retraction.id))
-        .join(Message, Message.id == Retraction.target_msg_id)
-        .where(
-            Retraction.channel_id == channel_id,
-            moderation_service.not_blocked_predicate(viewer_id),
-        )
+        select(func.max(Retraction.id)).where(Retraction.channel_id == channel_id)
     )
     # "" is lexicographically below any 26-char ULID, so max() picks the newer real
     # id and collapses to "" only when the channel has neither a visible message nor
@@ -281,15 +269,19 @@ async def get_history(
       ``id > client watermark`` is delivered here — that is how an offline client
       catches up on a deletion it never re-observes otherwise.
 
-    Visibility filter (messages): soft-deleted rows are hidden from all; a blocked
-    author's rows are hidden from the viewer in the block relationship (#7). This
-    MUST be the same predicate ``latest_ulid`` (the fence) uses — see its docstring.
-    Retractions inherit the SAME block visibility as their target message (cage-match
-    Carnot): a retraction is joined to its target and hidden from a viewer blocked
-    with the target's author — otherwise a blocked viewer, who never saw the message,
-    could observe its id + takedown timing, weakening the existing block boundary the
-    message fanout already enforces. (Retractions are not soft-deleted, so no
-    ``deleted_at`` filter — the target's soft-delete is exactly what they announce.)
+    Visibility — the ADD/REMOVE asymmetry (#7). Messages carry CONTENT, so they are
+    filtered: soft-deleted rows are hidden from all; a blocked author's rows are
+    hidden from the viewer in the block relationship. This MUST be the same predicate
+    ``latest_ulid`` (the fence) uses — see its docstring. Retractions are the opposite
+    kind of event: they carry NO content and only ever REMOVE something, so they are
+    NOT block-filtered — they ride the unfiltered stream to every channel member, the
+    way Matrix redactions / Discord deletes reach everyone in the room while block
+    stays a content filter. A delete can only reduce what you see, so it needs no
+    permission to be delivered; and block-filtering it would only STRAND takedowns
+    across a block/unblock epoch (a monotonic watermark can't reach back to replay a
+    delete it skipped) for zero privacy benefit — the id is opaque and unattributable.
+    (Retractions are channel-scoped only; no ``deleted_at`` filter — the target's
+    soft-delete is exactly what they announce.)
 
     Interleave/limit correctness: each type is queried for its own ``limit`` items
     above/below the cursor, the two ascending (or descending) streams are merged by
@@ -302,14 +294,7 @@ async def get_history(
         Message.deleted_at.is_(None),
         moderation_service.not_blocked_predicate(viewer_id),
     )
-    ret_stmt = (
-        select(Retraction)
-        .join(Message, Message.id == Retraction.target_msg_id)
-        .where(
-            Retraction.channel_id == channel_id,
-            moderation_service.not_blocked_predicate(viewer_id),
-        )
-    )
+    ret_stmt = select(Retraction).where(Retraction.channel_id == channel_id)
     if after is not None:
         # Forward: oldest-above-cursor first from each stream, merge ascending.
         msg_stmt = msg_stmt.where(Message.id > after).order_by(Message.id.asc()).limit(limit)
