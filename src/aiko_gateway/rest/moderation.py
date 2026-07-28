@@ -26,6 +26,7 @@ from pydantic import BaseModel
 
 from ..config import settings
 from ..domain import moderation_service
+from ..realtime import envelopes
 from .deps import CurrentUser, DbSession, ModeratorUser
 
 log = logging.getLogger(__name__)
@@ -161,18 +162,34 @@ async def list_reports(
 
 @router.post("/reports/{report_id}/resolve", status_code=status.HTTP_204_NO_CONTENT)
 async def resolve_report(
-    report_id: str, moderator: ModeratorUser, session: DbSession,
+    report_id: str, moderator: ModeratorUser, session: DbSession, request: Request,
 ) -> None:
     """Act on a report by taking the reported message down (soft-delete) and
-    marking the report ``taken_down``. Idempotent. 404 for an unknown report."""
+    marking the report ``taken_down``. Idempotent. 404 for an unknown report.
+
+    Propagation (#7): the soft-delete + its forward-ULID retraction commit together
+    in take_down_message; here we additionally fan the retraction to live
+    subscribers so a connected client removes the message immediately. Best-effort
+    over the wire — the Retraction row is the durable record, so an offline or
+    single-worker-missed client self-heals on its next forward get_history catch-up.
+    Single-process hub scope, identical to the ban active-disconnect (see
+    ``ban_user``)."""
     try:
-        await moderation_service.take_down_message(
+        retraction = await moderation_service.take_down_message(
             session, report_id=report_id, moderator_id=moderator.id)
     except moderation_service.ReportNotFound:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "report not found")
     except moderation_service.ReportAlreadyResolved:
         raise HTTPException(
             status.HTTP_409_CONFLICT, "report already resolved a different way")
+    # None on an idempotent re-resolve (clients already got the first retraction).
+    if retraction is not None:
+        gw = getattr(request.app.state, "gw", None)
+        if gw is not None and getattr(gw, "hub", None) is not None:
+            await gw.hub.fanout(
+                retraction.channel_id,
+                envelopes.retraction_frame(
+                    retraction.channel_id, retraction.id, retraction.target_msg_id))
 
 
 @router.post("/reports/{report_id}/dismiss", status_code=status.HTTP_204_NO_CONTENT)

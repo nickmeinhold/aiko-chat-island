@@ -20,7 +20,7 @@ from __future__ import annotations
 import datetime as dt
 
 from aiko_gateway.domain import messages_service
-from aiko_gateway.domain.models import Channel, Message
+from aiko_gateway.domain.models import Channel, Message, Retraction
 from aiko_gateway.realtime import envelopes
 from aiko_gateway.realtime.hub import Connection, Hub
 from aiko_gateway.realtime.ws import _handle_subscribe
@@ -127,6 +127,42 @@ async def test_fence_excludes_soft_deleted_tail_matching_get_history(session):
         conn, {"type": "subscribe", "channel_ids": [channel.id]}, session)
     # fence is _ulid(1) (newest visible), NOT _ulid(2) (the soft-deleted tail).
     assert _suback_fences(conn) == {channel.id: _ulid(1)}
+
+
+async def test_fence_advances_to_include_a_retraction_above_newest_message(session):
+    """The fence axis now carries retractions (#7). A retraction with an id ABOVE
+    the newest visible message must PULL THE FENCE UP to it — otherwise it lands in
+    the `id > fence -> live` partition on a fresh subscribe and is never replayed.
+    get_history returns retractions, so the fence (its paired read) must agree."""
+    channel = Channel(id=_ulid(0), name="general", kind="standard", aiko_channel="general")
+    session.add(channel)
+    session.add(Message(id=_ulid(3), channel_id=channel.id, sender_kind="human",
+                        body="newest visible msg", created_at=_now()))
+    await session.commit()
+    # A takedown of msg 3 mints a retraction ABOVE it and soft-deletes it.
+    session.add(Retraction(id=_ulid(7), target_msg_id=_ulid(3), channel_id=channel.id))
+    await session.commit()
+    conn = _RecordingConn()
+    await _handle_subscribe(
+        conn, {"type": "subscribe", "channel_ids": [channel.id]}, session)
+    # Fence is the retraction id (7), the newest thing on the axis — NOT msg 3.
+    assert _suback_fences(conn) == {channel.id: _ulid(7)}
+
+
+async def test_fence_is_retraction_even_when_its_target_message_is_soft_deleted(session):
+    """The retraction's target being soft-deleted (as every takedown target is)
+    must not drop the fence back below the retraction — the retraction is on the
+    axis regardless of its target's visibility."""
+    channel = Channel(id=_ulid(0), name="general", kind="standard", aiko_channel="general")
+    session.add(channel)
+    session.add(Message(id=_ulid(3), channel_id=channel.id, sender_kind="human",
+                        body="taken down", created_at=_now(), deleted_at=_now()))
+    session.add(Retraction(id=_ulid(7), target_msg_id=_ulid(3), channel_id=channel.id))
+    await session.commit()
+    conn = _RecordingConn()
+    await _handle_subscribe(
+        conn, {"type": "subscribe", "channel_ids": [channel.id]}, session)
+    assert _suback_fences(conn) == {channel.id: _ulid(7)}
 
 
 async def test_no_message_lost_in_the_subscribe_effectiveness_gap(session, monkeypatch):

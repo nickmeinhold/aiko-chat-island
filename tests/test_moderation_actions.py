@@ -23,9 +23,11 @@ import pytest_asyncio
 from fastapi import FastAPI, WebSocketDisconnect
 from httpx import ASGITransport, AsyncClient
 
+from sqlalchemy import select
+
 from aiko_gateway.config import settings
 from aiko_gateway.domain import moderation_service, security, users_service
-from aiko_gateway.domain.models import Channel, Message, MessageReport
+from aiko_gateway.domain.models import Channel, Message, MessageReport, Retraction
 from aiko_gateway.realtime import ws as ws_module
 from aiko_gateway.realtime.hub import Connection, Hub
 from aiko_gateway.rest import auth as auth_routes
@@ -179,6 +181,123 @@ async def test_take_down_is_idempotent(session):
     await moderation_service.take_down_message(session, report_id=rep.id, moderator_id=mod.id)
     await session.refresh(msg)
     assert msg.deleted_at == first_deleted
+
+
+# --- service: takedown retraction emission (#7 propagation) ------------------
+
+async def _all_retractions(session) -> list[Retraction]:
+    return list((await session.execute(select(Retraction))).scalars())
+
+
+async def test_take_down_emits_forward_retraction(session):
+    """The takedown transition appends a forward-ULID retraction in the same txn,
+    and returns it. The retraction targets the message, is scoped to its channel,
+    and its id sorts ABOVE the target's id so a client's forward cursor carries it."""
+    mod = await _user(session, "mod")
+    author = await _user(session, "author")
+    ch = await _channel(session)
+    msg = await _msg(session, mid=1, channel=ch, sender=author)
+    rep = await _report(session, rid=100, message=msg, reporter=author)
+
+    retraction = await moderation_service.take_down_message(
+        session, report_id=rep.id, moderator_id=mod.id)
+
+    assert retraction is not None
+    assert retraction.target_msg_id == msg.id
+    assert retraction.channel_id == ch.id
+    assert retraction.id > msg.id                     # forward cursor carries it
+    # Persisted (durable system of record), exactly one, committed with the delete.
+    rows = await _all_retractions(session)
+    assert [r.id for r in rows] == [retraction.id]
+
+
+async def test_idempotent_re_resolve_emits_no_second_retraction(session):
+    """A re-resolve of an already-taken-down report returns None and does NOT mint a
+    second retraction — clients already received the first."""
+    mod = await _user(session, "mod")
+    author = await _user(session, "author")
+    ch = await _channel(session)
+    msg = await _msg(session, mid=1, channel=ch, sender=author)
+    rep = await _report(session, rid=100, message=msg, reporter=author)
+
+    first = await moderation_service.take_down_message(
+        session, report_id=rep.id, moderator_id=mod.id)
+    second = await moderation_service.take_down_message(
+        session, report_id=rep.id, moderator_id=mod.id)
+
+    assert first is not None and second is None
+    assert [r.id for r in await _all_retractions(session)] == [first.id]  # still one
+
+
+async def test_take_down_of_already_soft_deleted_message_still_emits_retraction(session):
+    """A message soft-deleted by a PRIOR path (e.g. account-deletion husk) can still
+    be taken down; the re-delete is skipped but the retraction MUST still emit — a
+    client may still hold the pre-takedown row and needs the removal signal."""
+    mod = await _user(session, "mod")
+    author = await _user(session, "author")
+    ch = await _channel(session)
+    msg = await _msg(session, mid=1, channel=ch, sender=author)
+    msg.deleted_at = dt.datetime.now(dt.timezone.utc)   # already soft-deleted
+    await session.commit()
+    rep = await _report(session, rid=100, message=msg, reporter=author)
+
+    retraction = await moderation_service.take_down_message(
+        session, report_id=rep.id, moderator_id=mod.id)
+
+    assert retraction is not None
+    assert retraction.target_msg_id == msg.id
+
+
+# --- HTTP: resolve route fans the retraction out live -----------------------
+
+class _RecordingConn(Connection):
+    """A Connection that records frames instead of touching a socket."""
+
+    def __init__(self, user_id: str):
+        self.ws = None  # type: ignore[assignment]
+        self.user_id = user_id
+        self.subscribed: set[str] = set()
+        self.sent: list[dict] = []
+
+    async def send(self, frame: dict) -> None:
+        self.sent.append(frame)
+
+
+async def test_resolve_route_fans_out_retraction_frame(session, monkeypatch):
+    """The resolve route delivers a live `retraction` frame to a subscriber of the
+    channel — the live twin of the history catch-up. Best-effort layer over the
+    durable Retraction row."""
+    mod = await _user(session, "mod")
+    author = await _user(session, "author")
+    monkeypatch.setattr(settings, "moderator_user_ids", [mod.id])
+    ch = await _channel(session)
+    msg = await _msg(session, mid=1, channel=ch, sender=author)
+    rep = await _report(session, rid=100, message=msg, reporter=author)
+
+    hub = Hub()
+    watcher = _RecordingConn(author.id)
+    watcher.subscribed.add(ch.id)
+    hub.register(watcher)
+
+    async def _override_session():
+        yield session
+
+    app = FastAPI()
+    app.include_router(moderation_routes.router)
+    register_error_handlers(app)
+    app.state.gw = SimpleNamespace(hub=hub)   # what the route reaches for the fanout
+    app.dependency_overrides[get_session] = _override_session
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.post(f"/v1/reports/{rep.id}/resolve", headers=_auth(mod))
+    app.dependency_overrides.clear()
+
+    assert resp.status_code == 204
+    frames = [f for f in watcher.sent if f.get("type") == "retraction"]
+    assert len(frames) == 1
+    assert frames[0]["channel_id"] == ch.id
+    assert frames[0]["target_msg_id"] == msg.id
+    assert frames[0]["id"] > msg.id
 
 
 # --- service: ban / unban ----------------------------------------------------

@@ -20,6 +20,18 @@ def message_frame(msg_view: dict) -> dict:
     return {"type": "message", "msg": msg_view}
 
 
+def retraction_frame(channel_id: str, retraction_id: str, target_msg_id: str) -> dict:
+    """Server->client takedown retraction (#7): tells a live subscriber to suppress +
+    remove ``target_msg_id``. ``id`` advances the client's forward watermark exactly
+    like a message id, so a client that later reconnects and catches up via
+    ``get_history`` won't re-request work already applied. Best-effort over the wire —
+    a missed/unsubscribed socket self-heals on the next forward catch-up, because the
+    Retraction row is the durable system of record this frame merely mirrors. Same
+    shape as the history `retraction` item (messages_service.retraction_view)."""
+    return {"type": "retraction", "channel_id": channel_id,
+            "id": retraction_id, "target_msg_id": target_msg_id}
+
+
 def suback(channel_fences: dict[str, str]) -> dict:
     """Subscription-ack: confirms a `subscribe` and carries each channel's live/
     history *fence* — the newest persisted id at subscribe time (``""`` if the

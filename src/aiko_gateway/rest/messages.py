@@ -11,6 +11,7 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException, Query
 
 from ..domain import acl, messages_service
+from ..domain.models import Message
 from .deps import CurrentUser, DbSession
 
 router = APIRouter(prefix="/v1", tags=["messages"])
@@ -37,11 +38,21 @@ async def history(
     rows = await messages_service.get_history(
         session, channel_id, user.id, before=before, after=after, limit=limit
     )
+    # Heterogeneous stream (#7): message items AND takedown `retraction` items,
+    # interleaved in ULID order. Both advance next_before/next_after (each row has an
+    # `id` on the shared axis), so a client paging forward from its watermark receives
+    # a retraction inline and reconciles. Messages carry an explicit "type":"message"
+    # (wire contract option A) so the app disambiguates by a single `type` field;
+    # message_view stays untyped, keeping the WS/bus fanout shape unchanged.
+    items = [
+        {"type": "message", **messages_service.message_view(r)}
+        if isinstance(r, Message)
+        else messages_service.retraction_view(r)
+        for r in rows
+    ]
     return {
         "channel_id": channel_id,
-        # Single source for the MessageView wire shape — shared with the WS
-        # fanout path so REST and live frames can never drift (plan §A1).
-        "messages": [messages_service.message_view(m) for m in rows],
+        "messages": items,
         "next_before": rows[0].id if rows else None,
         "next_after": rows[-1].id if rows else None,
     }

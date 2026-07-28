@@ -424,6 +424,53 @@ class MessageReport(Base):
     resolution: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
 
+class Retraction(Base):
+    """A forward-ULID *retraction* event — the durable, catch-uppable record that a
+    message was taken down (#7 takedown propagation).
+
+    WHY a new event and not just ``Message.deleted_at``: the soft-delete mutates a
+    row *below* a client's forward watermark. ``get_history`` catch-up is
+    ``id > after`` (strictly greater; ``id`` is a monotonic ULID), so a client that
+    already synced the message (``id <= last_id``) never re-observes the deletion —
+    it would hold a taken-down message forever, and a cold reload of the durable
+    on-disk cache doesn't heal it. A retraction is a NEW row with its OWN higher
+    ULID that references the taken-down message, so it rides the EXISTING forward
+    paths: normal ``get_history`` catch-up (offline-then-reconnect clients) AND WS
+    fanout (live clients) — one mechanism, no separate deletions feed, no second
+    cursor.
+
+    The retraction IS the durable system of record; WS fanout is a latency
+    optimisation over it. It is therefore written in the SAME transaction as the
+    soft-delete (``moderation_service.take_down_message``): a delete that committed
+    without its retraction would be un-catch-uppable for a client that also missed
+    the live frame.
+
+    ``id > target_msg_id`` is guaranteed — ``id`` is minted via ``new_ulid()``
+    (time-forward) at takedown, strictly after the target message's own mint, so
+    the forward cursor always carries the retraction past any client watermark that
+    already includes the target.
+
+    NOT the account-deletion *husk* (``accounts_service``: a deleted user's message
+    keeps its slot but has its body/PII wiped, staying visible under a placeholder
+    label). A husk REMAINS; a retraction REMOVES. Different mechanism, different
+    word, on purpose.
+    """
+    __tablename__ = "message_retractions"
+    id: Mapped[str] = mapped_column(String(26), primary_key=True, default=new_ulid)
+    # The taken-down message. The row survives the soft-delete (and the account-
+    # deletion husk keeps rows too), so this FK target is stable. Indexed for the
+    # rare "was this message retracted?" lookup / dedup.
+    target_msg_id: Mapped[str] = mapped_column(
+        ForeignKey("messages.id"), nullable=False, index=True)
+    # Scopes the retraction to a channel so get_history can page it on the same
+    # (channel_id, id) axis as messages. Indexed — the forward-catch-up query
+    # filters channel_id then walks id.
+    channel_id: Mapped[str] = mapped_column(
+        ForeignKey("channels.id"), nullable=False, index=True)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow)
+
+
 class DeviceToken(Base):
     """A user's registered push-notification device token (#16, increment 1).
 

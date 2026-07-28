@@ -37,7 +37,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..config import settings
 from . import acl
 from .ids import new_ulid
-from .models import Message, MessageReport, ReportResolution, User, UserBlock
+from .models import (
+    Message, MessageReport, ReportResolution, Retraction, User, UserBlock)
 
 
 def _utcnow() -> dt.datetime:
@@ -320,7 +321,7 @@ async def list_pending_reports(session: AsyncSession, *, limit: int = 100) -> li
 
 async def take_down_message(
     session: AsyncSession, *, report_id: str, moderator_id: str,
-) -> None:
+) -> Retraction | None:
     """Act on a report by taking the message down: soft-delete the message (first
     writer of `Message.deleted_at`) and resolve the report as `taken_down`.
 
@@ -335,6 +336,17 @@ async def take_down_message(
     `deleted_at IS NULL` filter shared by `get_history` / `latest_ulid`, so the
     message vanishes from history and the fence at once.
 
+    PROPAGATION (#7): the soft-delete alone only hides the message from FUTURE
+    reads — a client that already synced it (id <= its forward watermark) never
+    re-observes the deletion. So the takedown TRANSITION also appends a forward-ULID
+    `Retraction` in the SAME transaction (see the Retraction model docstring): a new
+    row with its own higher ULID that rides history catch-up + WS fanout to reach
+    both offline and live clients. Returns the created `Retraction` so the caller
+    can fan it out live; returns None on the idempotent re-resolve (clients already
+    received the first retraction). Emitted even when the message was already
+    soft-deleted (e.g. a prior account-deletion husk) — a client may still hold the
+    pre-takedown row and needs the removal signal.
+
     CONCURRENCY (named MVP tradeoff, mirrors `block_user`): the resolved-check is
     read-then-write, not an atomic conditional UPDATE. Under the single-writer
     SQLite deployment there is no race. On the future Postgres path two concurrent
@@ -346,7 +358,7 @@ async def take_down_message(
         raise ReportNotFound()
     if report.resolved_at is not None:
         if report.resolution == ReportResolution.TAKEN_DOWN:
-            return  # idempotent: same action, already applied
+            return None  # idempotent: same action, already applied (already emitted)
         raise ReportAlreadyResolved()
     now = _utcnow()
     message = await session.get(Message, report.message_id)
@@ -355,7 +367,19 @@ async def take_down_message(
     report.resolved_at = now
     report.resolution = ReportResolution.TAKEN_DOWN
     report.resolved_by_user_id = moderator_id
+    # Forward-ULID retraction, atomic with the soft-delete. Scoped to the message's
+    # channel so get_history pages it on the same (channel_id, id) axis. `id` defaults
+    # to a fresh new_ulid() (time-forward), strictly greater than the target's id, so
+    # the forward cursor always carries it. Skipped only if the target row is somehow
+    # missing (no channel to scope to) — reports FK a non-null message_id and messages
+    # are never hard-deleted, so in practice a retraction is always emitted here.
+    retraction: Retraction | None = None
+    if message is not None:
+        retraction = Retraction(
+            target_msg_id=message.id, channel_id=message.channel_id)
+        session.add(retraction)
     await session.commit()
+    return retraction
 
 
 async def dismiss_report(
