@@ -53,14 +53,16 @@ def upgrade() -> None:
     op.create_index(
         "ix_message_retractions_target_msg_id",
         "message_retractions", ["target_msg_id"], unique=False)
+    # Composite (channel_id, id) — matches the forward-catch-up access path
+    # (`WHERE channel_id=? AND id > ? ORDER BY id`), not a channel_id-only index.
     op.create_index(
-        "ix_message_retractions_channel_id",
-        "message_retractions", ["channel_id"], unique=False)
+        "ix_message_retractions_channel_id_id",
+        "message_retractions", ["channel_id", "id"], unique=False)
 
 
 def downgrade() -> None:
     op.drop_index(
-        "ix_message_retractions_channel_id", table_name="message_retractions")
+        "ix_message_retractions_channel_id_id", table_name="message_retractions")
     op.drop_index(
         "ix_message_retractions_target_msg_id", table_name="message_retractions")
     op.drop_table("message_retractions")

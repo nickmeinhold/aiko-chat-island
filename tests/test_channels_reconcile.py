@@ -19,7 +19,8 @@ from sqlalchemy import func, select
 from aiko_gateway.aiko import topology
 from aiko_gateway.aiko.payload import InboundMessage
 from aiko_gateway.domain import channels_service, messages_service
-from aiko_gateway.domain.models import Channel, Membership, Message, User
+from aiko_gateway.domain.models import (
+    Channel, Membership, Message, Retraction, User)
 
 
 # --- parse: EC channel_list payload -> channel names ----------------------- #
@@ -107,6 +108,27 @@ async def test_hard_delete_cascades_messages_and_memberships(session):
     # The user is NOT a channel-owned row — it survives.
     assert (await session.execute(
         select(func.count()).select_from(User))).scalar_one() == 1
+
+
+@pytest.mark.asyncio
+async def test_hard_delete_cascades_retractions(session):
+    """Retractions (#7) FK both messages AND the channel, so the cascade must tear
+    them down too (cage-match Tesla + Carnot) — else they orphan under FK-off, or
+    refuse the teardown order under FK-on."""
+    ch = Channel(id="C1", name="random", kind="standard", aiko_channel="random")
+    session.add(ch)
+    await session.flush()
+    session.add_all([
+        Message(id="M1", channel_id="C1", sender_kind="human", body="bad"),
+        Retraction(id="R1", target_msg_id="M1", channel_id="C1"),
+    ])
+    await session.commit()
+
+    assert await channels_service.hard_delete_channel(session, "random") is True
+    assert (await session.execute(
+        select(func.count()).select_from(Retraction))).scalar_one() == 0
+    assert (await session.execute(
+        select(func.count()).select_from(Message))).scalar_one() == 0
 
 
 @pytest.mark.asyncio

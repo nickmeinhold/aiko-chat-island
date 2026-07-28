@@ -26,6 +26,7 @@ from pydantic import BaseModel
 
 from ..config import settings
 from ..domain import moderation_service
+from ..domain.models import Message
 from ..realtime import envelopes
 from .deps import CurrentUser, DbSession, ModeratorUser
 
@@ -179,17 +180,32 @@ async def resolve_report(
             session, report_id=report_id, moderator_id=moderator.id)
     except moderation_service.ReportNotFound:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "report not found")
+    except moderation_service.MessageNotFound:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, "reported message no longer exists")
     except moderation_service.ReportAlreadyResolved:
         raise HTTPException(
             status.HTTP_409_CONFLICT, "report already resolved a different way")
-    # None on an idempotent re-resolve (clients already got the first retraction).
+    # None on an idempotent re-resolve, or a message already retracted by an earlier
+    # report (clients already got the first retraction) — so this never double-fans.
     if retraction is not None:
         gw = getattr(request.app.state, "gw", None)
         if gw is not None and getattr(gw, "hub", None) is not None:
+            # Exclude subscribers blocked-with the taken-down message's sender, so the
+            # live retraction honours the SAME block boundary as the history read and
+            # the message fanout (cage-match Carnot): a blocked viewer never saw the
+            # message and must not receive its retraction. A NULL-sender (bus actor)
+            # is never blocked, so no exclusion.
+            target = await session.get(Message, retraction.target_msg_id)
+            exclude: set[str] = set()
+            if target is not None and target.sender_user_id is not None:
+                exclude = await moderation_service.blocked_pair_user_ids(
+                    session, target.sender_user_id)
             await gw.hub.fanout(
                 retraction.channel_id,
                 envelopes.retraction_frame(
-                    retraction.channel_id, retraction.id, retraction.target_msg_id))
+                    retraction.channel_id, retraction.id, retraction.target_msg_id),
+                exclude_user_ids=exclude)
 
 
 @router.post("/reports/{report_id}/dismiss", status_code=status.HTTP_204_NO_CONTENT)

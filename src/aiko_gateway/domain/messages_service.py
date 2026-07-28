@@ -195,12 +195,14 @@ async def latest_ulid(session: AsyncSession, channel_id: str, viewer_id: str) ->
     reads — the partition stays clean and the invariant stays assertable.
 
     The axis now carries takedown ``Retraction`` events too (#7), so the fence is
-    the newest of (visible messages) ∪ (channel retractions) — exactly the set
-    ``get_history`` can return. Were the fence to ignore retractions, a retraction
-    with an id above the newest visible message would land in the "id > fence →
-    live" partition on a fresh subscribe and never be replayed. Retractions are
-    channel-scoped, never soft-deleted, and always returnable by the pager, so
-    including one in the fence can never point at a row history refuses to return.
+    the newest of (visible messages) ∪ (visible-target retractions) — exactly the set
+    ``get_history`` can return FOR THIS VIEWER. Were the fence to ignore retractions,
+    a retraction with an id above the newest visible message would land in the "id >
+    fence → live" partition on a fresh subscribe and never be replayed. The retraction
+    component applies the IDENTICAL block filter as ``get_history`` (joined to the
+    target message, ``not_blocked_predicate``): a retraction hidden from this viewer
+    by a block must not enter their fence either, or the paired read would disagree
+    for the blocked case exactly as it would for the message case.
 
     Visibility has TWO dimensions, both viewer-INdependent EXCEPT blocks: a
     soft-deleted row (``deleted_at IS NULL``) is hidden from everyone, while a
@@ -229,7 +231,12 @@ async def latest_ulid(session: AsyncSession, channel_id: str, viewer_id: str) ->
         )
     )
     ret_result = await session.execute(
-        select(func.max(Retraction.id)).where(Retraction.channel_id == channel_id)
+        select(func.max(Retraction.id))
+        .join(Message, Message.id == Retraction.target_msg_id)
+        .where(
+            Retraction.channel_id == channel_id,
+            moderation_service.not_blocked_predicate(viewer_id),
+        )
     )
     # "" is lexicographically below any 26-char ULID, so max() picks the newer real
     # id and collapses to "" only when the channel has neither a visible message nor
@@ -264,9 +271,12 @@ async def get_history(
     Visibility filter (messages): soft-deleted rows are hidden from all; a blocked
     author's rows are hidden from the viewer in the block relationship (#7). This
     MUST be the same predicate ``latest_ulid`` (the fence) uses — see its docstring.
-    Retractions carry no author and are not soft-deleted, so they are channel-scoped
-    only: a retraction for a message the viewer can't see is harmless (the client
-    suppresses a dead id it never held — presence-independent).
+    Retractions inherit the SAME block visibility as their target message (cage-match
+    Carnot): a retraction is joined to its target and hidden from a viewer blocked
+    with the target's author — otherwise a blocked viewer, who never saw the message,
+    could observe its id + takedown timing, weakening the existing block boundary the
+    message fanout already enforces. (Retractions are not soft-deleted, so no
+    ``deleted_at`` filter — the target's soft-delete is exactly what they announce.)
 
     Interleave/limit correctness: each type is queried for its own ``limit`` items
     above/below the cursor, the two ascending (or descending) streams are merged by
@@ -279,7 +289,14 @@ async def get_history(
         Message.deleted_at.is_(None),
         moderation_service.not_blocked_predicate(viewer_id),
     )
-    ret_stmt = select(Retraction).where(Retraction.channel_id == channel_id)
+    ret_stmt = (
+        select(Retraction)
+        .join(Message, Message.id == Retraction.target_msg_id)
+        .where(
+            Retraction.channel_id == channel_id,
+            moderation_service.not_blocked_predicate(viewer_id),
+        )
+    )
     if after is not None:
         # Forward: oldest-above-cursor first from each stream, merge ascending.
         msg_stmt = msg_stmt.where(Message.id > after).order_by(Message.id.asc()).limit(limit)

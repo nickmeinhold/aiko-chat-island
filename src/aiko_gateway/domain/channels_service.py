@@ -33,7 +33,7 @@ from __future__ import annotations
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .models import Channel, Membership, Message
+from .models import Channel, Membership, Message, Retraction
 
 # Pure `channel_list` EC-share parsing (CHANNEL_LIST_KEY, parse_channel_names,
 # channel_name_from_item) moved to aiko/topology.py (#7) so the bus client can
@@ -76,6 +76,10 @@ async def hard_delete_channel(session: AsyncSession, aiko_channel: str) -> bool:
     if channel is None:
         return False
     await session.execute(delete(Membership).where(Membership.channel_id == channel.id))
+    # Retractions FK both messages AND the channel, so they must go before either
+    # (#7 takedown propagation) — otherwise they orphan under FK-off, or refuse the
+    # teardown order under FK-on.
+    await session.execute(delete(Retraction).where(Retraction.channel_id == channel.id))
     await session.execute(delete(Message).where(Message.channel_id == channel.id))
     await session.execute(delete(Channel).where(Channel.id == channel.id))
     await session.flush()  # caller owns commit (see module docstring)

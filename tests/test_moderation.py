@@ -25,7 +25,8 @@ from sqlalchemy import func, select
 from aiko_gateway.domain import (
     accounts_service, messages_service, moderation_service, security, users_service,
 )
-from aiko_gateway.domain.models import Channel, Message, MessageReport, UserBlock
+from aiko_gateway.domain.models import (
+    Channel, Message, MessageReport, Retraction, UserBlock)
 from aiko_gateway.realtime.ws import _handle_send
 from aiko_gateway.rest import moderation as moderation_routes
 from aiko_gateway.rest.deps import get_session
@@ -150,6 +151,34 @@ async def test_block_is_mutual_blocked_user_also_loses_sight(session):
 
     rows = await messages_service.get_history(session, ch.id, b.id, limit=50)
     assert [r.id for r in rows] == [_ulid(2)]  # alice's msg 1 hidden from bob too
+
+
+async def test_retraction_inherits_target_block_visibility_history_and_fence(session):
+    """#7 + block boundary (cage-match Carnot MEDIUM): a retraction inherits the SAME
+    block visibility as its target message. A viewer blocked with the taken-down
+    message's author must not see the retraction in history OR have it enter their
+    fence — otherwise they'd observe an id + takedown timing for a message they were
+    never allowed to see, punching a hole in the existing block boundary."""
+    ch = await _public_channel(session)
+    a = await _user(session, "alice")
+    b = await _user(session, "bob")
+    c = await _user(session, "carol")
+    await _msg(session, mid=1, channel=ch, sender=c)            # carol's msg (visible to all)
+    await _msg(session, mid=2, channel=ch, sender=b)            # bob's msg
+    session.add(Retraction(id=_ulid(9), target_msg_id=_ulid(2), channel_id=ch.id))
+    await session.commit()
+    await moderation_service.block_user(session, a.id, b.id)    # alice blocks bob
+
+    # History: alice sees carol's msg but NOT bob's msg nor its retraction.
+    arows = await messages_service.get_history(session, ch.id, a.id, limit=50)
+    assert [r.id for r in arows] == [_ulid(1)]
+    # Fence: alice's fence is carol's msg (1), NOT the retraction (9) — proving the
+    # retraction was excluded, not merely that the channel is empty.
+    assert await messages_service.latest_ulid(session, ch.id, a.id) == _ulid(1)
+    # A non-blocked third party (carol) DOES see the retraction on the axis.
+    crows = await messages_service.get_history(session, ch.id, c.id, limit=50)
+    assert _ulid(9) in [r.id for r in crows]
+    assert await messages_service.latest_ulid(session, ch.id, c.id) == _ulid(9)
 
 
 async def test_third_party_sees_everyone(session):

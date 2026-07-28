@@ -12,7 +12,7 @@ import datetime as dt
 import enum
 
 from sqlalchemy import (
-    JSON, BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Integer,
+    JSON, BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer,
     String, Text, UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -456,17 +456,24 @@ class Retraction(Base):
     word, on purpose.
     """
     __tablename__ = "message_retractions"
+    __table_args__ = (
+        # The forward-catch-up query filters channel_id then ranges/orders on id
+        # (`WHERE channel_id=? AND id > ? ORDER BY id`); a COMPOSITE (channel_id, id)
+        # index matches that access path exactly (cage-match Carnot) — sharper than a
+        # channel_id-only index leaning on the global PK order across all channels.
+        Index("ix_message_retractions_channel_id_id", "channel_id", "id"),
+    )
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=new_ulid)
     # The taken-down message. The row survives the soft-delete (and the account-
     # deletion husk keeps rows too), so this FK target is stable. Indexed for the
-    # rare "was this message retracted?" lookup / dedup.
+    # per-message dedup lookup ("is this message already retracted?") and the block
+    # join in get_history / the fence.
     target_msg_id: Mapped[str] = mapped_column(
         ForeignKey("messages.id"), nullable=False, index=True)
-    # Scopes the retraction to a channel so get_history can page it on the same
-    # (channel_id, id) axis as messages. Indexed — the forward-catch-up query
-    # filters channel_id then walks id.
+    # Scopes the retraction to a channel so get_history pages it on the same
+    # (channel_id, id) axis as messages — covered by the composite index above.
     channel_id: Mapped[str] = mapped_column(
-        ForeignKey("channels.id"), nullable=False, index=True)
+        ForeignKey("channels.id"), nullable=False)
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow)
 

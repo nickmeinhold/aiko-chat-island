@@ -84,6 +84,14 @@ class ReportAlreadyResolved(Exception):
     producing a message state that disagrees with the recorded resolution."""
 
 
+class RetractionOrderingError(Exception):
+    """A minted retraction id did not sort strictly after its target message id —
+    the forward-ULID axis the whole propagation design rests on has regressed (a
+    clock rollback). Fail closed: a retraction the forward cursor would never carry
+    is worse than useless. Structurally unreachable (new_ulid() is time-forward and
+    a takedown always post-dates its target); this makes the invariant executable."""
+
+
 # --- blocks: mutations ------------------------------------------------------
 
 
@@ -360,23 +368,47 @@ async def take_down_message(
         if report.resolution == ReportResolution.TAKEN_DOWN:
             return None  # idempotent: same action, already applied (already emitted)
         raise ReportAlreadyResolved()
-    now = _utcnow()
     message = await session.get(Message, report.message_id)
-    if message is not None and message.deleted_at is None:
+    if message is None:
+        # Fail closed (cage-match Carnot LOW): a report whose target message row is
+        # absent cannot be taken down. Reports FK a non-null message_id and messages
+        # are never hard-deleted (the account-deletion husk keeps the row), so this
+        # is unreachable in practice — but raising beats stamping a `taken_down`
+        # audit label for a state transition that never happened.
+        raise MessageNotFound()
+    now = _utcnow()
+    if message.deleted_at is None:
         message.deleted_at = now
     report.resolved_at = now
     report.resolution = ReportResolution.TAKEN_DOWN
     report.resolved_by_user_id = moderator_id
     # Forward-ULID retraction, atomic with the soft-delete. Scoped to the message's
-    # channel so get_history pages it on the same (channel_id, id) axis. `id` defaults
-    # to a fresh new_ulid() (time-forward), strictly greater than the target's id, so
-    # the forward cursor always carries it. Skipped only if the target row is somehow
-    # missing (no channel to scope to) — reports FK a non-null message_id and messages
-    # are never hard-deleted, so in practice a retraction is always emitted here.
+    # channel so get_history pages it on the same (channel_id, id) axis.
+    #
+    # AT MOST ONE retraction per taken-down message (cage-match Tesla + Carnot): a
+    # message can carry many reports, and resolving the 2nd+ must NOT mint a duplicate
+    # retraction (clients already got the first). Emit iff none exists yet for this
+    # target — which ALSO satisfies the account-deletion husk case (a husk sets
+    # deleted_at but emits no retraction, so the first takedown of a husked message
+    # still emits). SELECT-then-insert is race-free under the single-writer SQLite
+    # deployment; the future-Postgres caveat is the same one the resolved-check above
+    # carries (a guarded insert / UNIQUE would harden it with that migration cluster).
+    existing = (await session.execute(
+        select(Retraction.id).where(Retraction.target_msg_id == message.id)
+    )).first()
     retraction: Retraction | None = None
-    if message is not None:
+    if existing is None:
+        # Mint the id explicitly so the forward-ordering invariant is EXECUTABLE
+        # (cage-match Carnot): new_ulid() is time-forward, so a retraction minted now
+        # is always > a message minted earlier. A violation means a clock rollback
+        # broke the shared ULID axis — fail closed rather than emit a retraction the
+        # forward cursor would never carry.
+        rid = new_ulid()
+        if rid <= message.id:
+            raise RetractionOrderingError(
+                f"retraction id {rid} not > target {message.id} — ULID axis regressed")
         retraction = Retraction(
-            target_msg_id=message.id, channel_id=message.channel_id)
+            id=rid, target_msg_id=message.id, channel_id=message.channel_id)
         session.add(retraction)
     await session.commit()
     return retraction
