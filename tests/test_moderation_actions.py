@@ -324,6 +324,35 @@ async def test_second_report_on_same_message_emits_no_duplicate_retraction(sessi
     assert rep2.resolution == "taken_down"  # dedup didn't block rep2's resolution
 
 
+async def test_re_resolve_heals_a_takedown_missing_its_retraction(session):
+    """A message taken down BEFORE retractions existed (pre-0016, or any takedown whose
+    retraction was never minted) has deleted_at set + a taken_down report but no
+    retraction row — the exact watermark gap this PR closes, left open for old data.
+    Re-resolving must SELF-HEAL (emit the missing retraction), not dead-end on the
+    idempotent return (cage-match Carnot)."""
+    mod = await _user(session, "mod")
+    author = await _user(session, "author")
+    ch = await _channel(session)
+    msg = await _msg(session, mid=1, channel=ch, sender=author)
+    rep = await _report(session, rid=100, message=msg, reporter=author)
+    # Simulate a pre-retraction takedown: soft-deleted + resolved taken_down, NO retraction.
+    msg.deleted_at = dt.datetime.now(dt.timezone.utc)
+    rep.resolved_at = dt.datetime.now(dt.timezone.utc)
+    rep.resolution = "taken_down"
+    rep.resolved_by_user_id = mod.id
+    await session.commit()
+    assert await _all_retractions(session) == []            # the stranded state
+
+    healed = await moderation_service.take_down_message(
+        session, report_id=rep.id, moderator_id=mod.id)
+    assert healed is not None                                # emitted the missing retraction
+    assert healed.target_msg_id == msg.id
+    assert [r.id for r in await _all_retractions(session)] == [healed.id]
+    # A second re-resolve is now a genuine no-op (retraction already exists).
+    assert await moderation_service.take_down_message(
+        session, report_id=rep.id, moderator_id=mod.id) is None
+
+
 async def test_take_down_missing_message_fails_closed(session):
     """A report whose target message row is absent fails closed with MessageNotFound
     rather than stamping a taken_down label for a non-transition (cage-match Carnot
