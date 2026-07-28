@@ -186,6 +186,13 @@ async def resolve_report(
     except moderation_service.ReportAlreadyResolved:
         raise HTTPException(
             status.HTTP_409_CONFLICT, "report already resolved a different way")
+    except moderation_service.RetractionOrderingError:
+        # Structurally unreachable (would need a clock regression); the service
+        # already failed closed (session clean, report unresolved). Map it to an
+        # observable 500 rather than an opaque stack trace (cage-match Tesla + Wu).
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "retraction ordering invariant violated — takedown refused")
     # None on an idempotent re-resolve, or a message already retracted by an earlier
     # report (clients already got the first retraction) — so this never double-fans.
     if retraction is not None:
@@ -196,6 +203,12 @@ async def resolve_report(
             # the message fanout (cage-match Carnot): a blocked viewer never saw the
             # message and must not receive its retraction. A NULL-sender (bus actor)
             # is never blocked, so no exclusion.
+            #
+            # Reading retraction.* here is post-commit — safe only because SessionLocal
+            # runs expire_on_commit=False (the same coupling create_outbound->message_view
+            # and ban_user already rely on). Flagged (cage-match Wu) so it's not silent:
+            # a MissingGreenlet here would 500 AFTER the durable commit and skip fanout —
+            # harmless, since history self-heals from the durable Retraction row.
             target = await session.get(Message, retraction.target_msg_id)
             exclude: set[str] = set()
             if target is not None and target.sender_user_id is not None:

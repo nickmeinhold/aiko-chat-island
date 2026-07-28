@@ -345,6 +345,21 @@ async def test_take_down_missing_message_fails_closed(session):
     assert orphan.resolved_at is None              # NOT stamped resolved
 
 
+async def test_resolve_route_maps_ordering_violation_to_500(client, session, monkeypatch):
+    """The (unreachable) ordering guard surfaces as an observable 500 at the route,
+    not an opaque stack trace (cage-match Tesla + Wu). Fail-closed: report unresolved."""
+    mod = await _user(session, "mod")
+    author = await _user(session, "author")
+    monkeypatch.setattr(settings, "moderator_user_ids", [mod.id])
+    ch = await _channel(session)
+    msg = await _msg(session, mid=5, channel=ch, sender=author)
+    rep = await _report(session, rid=100, message=msg, reporter=author)
+    monkeypatch.setattr(moderation_service, "new_ulid", lambda: _ulid(1))  # < target(5)
+
+    resp = await client.post(f"/v1/reports/{rep.id}/resolve", headers=_auth(mod))
+    assert resp.status_code == 500
+
+
 async def test_ordering_violation_fails_clean_with_no_partial_mutation(session, monkeypatch):
     """cage-match Wu: the retraction ordering guard must fail CLEAN — if it fires it
     must leave NO partial mutation, so a LATER commit on the same session cannot
