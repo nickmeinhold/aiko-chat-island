@@ -222,6 +222,19 @@ async def latest_ulid(session: AsyncSession, channel_id: str, viewer_id: str) ->
     so blocker and history agree and the loop converges. The durable fix is making
     B4 treat empty-page-before-fence as a benign re-sync (refetch the fence) rather
     than an assert — a CLIENT/protocol change tracked in the app repo, not here.
+
+    RETRACTION INSTANCE of the same class (cage-match Carnot/Tesla/Wu, #7): a
+    takedown-while-blocked strands its retraction below a monotonic watermark. If a
+    viewer synced message M, then a block forms with M's author, then M is taken down
+    (its retraction now hidden from this viewer), then the viewer advances past the
+    retraction's id on other content — a later UNBLOCK never replays the retraction
+    via ``id > after``, so M can resurface from the durable cache as taken-down
+    content. This is the SAME monotonic-watermark-across-visibility-epochs family as
+    the message case above (a blocked-then-unblocked author's below-watermark messages
+    already need the identical re-sync), and the heal is the SAME client/protocol move
+    (a visibility-change re-sync in the app repo), NOT a server change here — the
+    server correctly hides the retraction during the block. Named as an accepted
+    tradeoff so the app's unblock handling scopes the re-sync to cover retractions.
     """
     msg_result = await session.execute(
         select(func.max(Message.id)).where(

@@ -345,6 +345,33 @@ async def test_take_down_missing_message_fails_closed(session):
     assert orphan.resolved_at is None              # NOT stamped resolved
 
 
+async def test_ordering_violation_fails_clean_with_no_partial_mutation(session, monkeypatch):
+    """cage-match Wu: the retraction ordering guard must fail CLEAN — if it fires it
+    must leave NO partial mutation, so a LATER commit on the same session cannot
+    persist a `taken_down` resolution with no retraction (the exact un-catch-uppable
+    split the PR exists to prevent). RED-proves the validate-before-mutate ordering:
+    force new_ulid() below the target, then commit and assert nothing stuck."""
+    mod = await _user(session, "mod")
+    author = await _user(session, "author")
+    ch = await _channel(session)
+    msg = await _msg(session, mid=5, channel=ch, sender=author)
+    rep = await _report(session, rid=100, message=msg, reporter=author)
+    monkeypatch.setattr(moderation_service, "new_ulid", lambda: _ulid(1))  # id < target(5)
+
+    with pytest.raises(moderation_service.RetractionOrderingError):
+        await moderation_service.take_down_message(
+            session, report_id=rep.id, moderator_id=mod.id)
+
+    # Force the "later commit" the dirty-session harm depends on. Clean code has
+    # nothing pending, so this persists nothing.
+    await session.commit()
+    await session.refresh(msg)
+    await session.refresh(rep)
+    assert msg.deleted_at is None                    # NOT soft-deleted
+    assert rep.resolved_at is None                   # NOT stamped taken_down
+    assert await _all_retractions(session) == []
+
+
 async def test_resolve_route_excludes_blocked_subscriber_from_retraction_fanout(
         session, monkeypatch):
     """The live retraction fanout honours the block boundary (cage-match Carnot): a

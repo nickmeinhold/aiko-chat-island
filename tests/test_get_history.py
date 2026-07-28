@@ -143,6 +143,34 @@ async def test_retraction_interleaves_by_ulid_both_directions(session):
     assert [r.id for r in back] == [_ulid(20), _ulid(30), _ulid(35)]  # newest 3, interleaved
 
 
+async def test_interleave_merge_holds_when_both_streams_exceed_limit(session):
+    """Boundary case (cage-match Wu): BOTH streams independently exceed `limit`,
+    interleaved so the truncation cut lands mid-stream with a retraction exactly at
+    position `limit`. This is the adversarial input the other interleave tests never
+    hit (they use sub-`limit` streams) — it proves per-stream-limit + merge + truncate
+    drops no page-member. A naive "take limit from one stream then fill" would return
+    messages-only [10,20,30,40] and fail here."""
+    channel = Channel(id=_ulid(0), name="general", kind="standard", aiko_channel="general")
+    session.add(channel)
+    now = dt.datetime(2026, 6, 22, tzinfo=dt.timezone.utc)
+    for i in (10, 20, 30, 40, 50):                      # 5 messages (> limit)
+        session.add(Message(id=_ulid(i), channel_id=channel.id, sender_kind="human",
+                            body=f"m{i}", created_at=now + dt.timedelta(seconds=i)))
+    await session.commit()
+    for rid, tgt in ((15, 10), (25, 20), (35, 30), (45, 40)):   # 4 retractions (>= limit)
+        session.add(Retraction(
+            id=_ulid(rid), target_msg_id=_ulid(tgt), channel_id=channel.id))
+    await session.commit()
+
+    # Forward, limit=4: union ascending 10,15,20,25,30,... → first 4; the cut lands
+    # on the retraction at id 25 — mid-stream for BOTH streams.
+    fwd = await messages_service.get_history(session, channel.id, _VIEWER, after=_ulid(1), limit=4)
+    assert [r.id for r in fwd] == [_ulid(10), _ulid(15), _ulid(20), _ulid(25)]
+    # Backward, limit=4: newest 4 of the union → 35,40,45,50 ascending.
+    back = await messages_service.get_history(session, channel.id, _VIEWER, before=None, limit=4)
+    assert [r.id for r in back] == [_ulid(35), _ulid(40), _ulid(45), _ulid(50)]
+
+
 async def test_retraction_returned_even_when_its_target_is_soft_deleted(session):
     """A retraction is channel-scoped, not gated by its target's visibility: the
     target is ALWAYS soft-deleted (that's what a takedown does), yet the retraction

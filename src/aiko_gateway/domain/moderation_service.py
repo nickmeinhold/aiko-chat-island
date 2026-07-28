@@ -376,14 +376,11 @@ async def take_down_message(
         # is unreachable in practice — but raising beats stamping a `taken_down`
         # audit label for a state transition that never happened.
         raise MessageNotFound()
-    now = _utcnow()
-    if message.deleted_at is None:
-        message.deleted_at = now
-    report.resolved_at = now
-    report.resolution = ReportResolution.TAKEN_DOWN
-    report.resolved_by_user_id = moderator_id
-    # Forward-ULID retraction, atomic with the soft-delete. Scoped to the message's
-    # channel so get_history pages it on the same (channel_id, id) axis.
+    # Decide the retraction — the DEDUP query and the FALLIBLE ordering guard — BEFORE
+    # mutating report or message, so a fail-closed raise leaves the session clean
+    # (cage-match Wu): an exception whose whole purpose is protecting the
+    # catch-uppability invariant must not itself be able to leave a stamped
+    # `taken_down` with no retraction on a later commit of the same session.
     #
     # AT MOST ONE retraction per taken-down message (cage-match Tesla + Carnot): a
     # message can carry many reports, and resolving the 2nd+ must NOT mint a duplicate
@@ -392,7 +389,8 @@ async def take_down_message(
     # deleted_at but emits no retraction, so the first takedown of a husked message
     # still emits). SELECT-then-insert is race-free under the single-writer SQLite
     # deployment; the future-Postgres caveat is the same one the resolved-check above
-    # carries (a guarded insert / UNIQUE would harden it with that migration cluster).
+    # carries (a UNIQUE(target_msg_id) / guarded insert would harden it with that
+    # migration cluster — tracked, not done here).
     existing = (await session.execute(
         select(Retraction.id).where(Retraction.target_msg_id == message.id)
     )).first()
@@ -402,13 +400,22 @@ async def take_down_message(
         # (cage-match Carnot): new_ulid() is time-forward, so a retraction minted now
         # is always > a message minted earlier. A violation means a clock rollback
         # broke the shared ULID axis — fail closed rather than emit a retraction the
-        # forward cursor would never carry.
+        # forward cursor would never carry. Checked HERE, before any mutation.
         rid = new_ulid()
         if rid <= message.id:
             raise RetractionOrderingError(
                 f"retraction id {rid} not > target {message.id} — ULID axis regressed")
         retraction = Retraction(
             id=rid, target_msg_id=message.id, channel_id=message.channel_id)
+    # All fallible checks passed — now mutate and persist atomically (soft-delete +
+    # report resolution + retraction in one commit).
+    now = _utcnow()
+    if message.deleted_at is None:
+        message.deleted_at = now
+    report.resolved_at = now
+    report.resolution = ReportResolution.TAKEN_DOWN
+    report.resolved_by_user_id = moderator_id
+    if retraction is not None:
         session.add(retraction)
     await session.commit()
     return retraction
