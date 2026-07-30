@@ -76,7 +76,7 @@ async def require_agent_binding_admin(user: CurrentUser) -> User:
     families, MAJOR) flagged reusing the content-moderator role for identity minting,
     but this island has no role MORE privileged than moderator — so this is the
     smallest fail-closed hardening: a DISTINCT config allowlist
-    (settings.agent_binding_admin_ids, env AGENT_BINDING_ADMINS), fail-closed empty
+    (settings.agent_binding_admin_ids, env AGENT_BINDING_ADMIN_IDS), fail-closed empty
     (403 for everyone until an operator names an admin). A first-class admin role is a
     deferred decision (see the config comment). Depends on CurrentUser so auth + ban
     are already enforced; 403 for a non-admin — opaque, no existence leak."""

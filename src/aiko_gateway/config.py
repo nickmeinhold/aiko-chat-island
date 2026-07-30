@@ -121,8 +121,11 @@ class Settings(BaseSettings):
     # Fail-closed empty: an island with no configured binding-admin can provision NO
     # agents (require_agent_binding_admin 403s everyone), exactly like the moderator
     # gate. Config, not a role system (a first-class admin role is a follow-up
-    # decision); JSON array in the env (AGENT_BINDING_ADMINS), mirroring
-    # moderator_user_ids.
+    # decision); JSON array in the env AGENT_BINDING_ADMIN_IDS (pydantic-settings
+    # derives the env name from the field name, exactly like MODERATOR_USER_IDS ->
+    # moderator_user_ids above). Operators MUST set AGENT_BINDING_ADMIN_IDS — the
+    # earlier name AGENT_BINDING_ADMINS was never bound to this field and would be
+    # silently ignored (fail-closed => nobody could ever mint a binding).
     agent_binding_admin_ids: list[str] = []
     # Provisioning token TTL: a brand-new social user gets a short-lived signed
     # token (NOT a DB row) to carry (provider, sub, suggested name/email) from the

@@ -2,7 +2,7 @@
 
 Two doors over ``agents_service``:
 
-  * ``POST /v1/agents/bindings`` — gated behind the DEDICATED AGENT_BINDING_ADMINS
+  * ``POST /v1/agents/bindings`` — gated behind the DEDICATED AGENT_BINDING_ADMIN_IDS
     allowlist (require_agent_binding_admin), NOT the content-moderator set: minting a
     production agent identity is a higher-privilege act than moderation. "Config, not a
     role system" (fail-closed empty), mirroring require_moderator's shape.
@@ -60,7 +60,7 @@ async def create_binding(
     req: CreateBindingReq, admin: AgentBindingAdmin, session: DbSession,
 ) -> dict:
     """Admin provisions a new agent identity bound to a GitHub Actions workload.
-    Gated behind the AGENT_BINDING_ADMINS allowlist (see require_agent_binding_admin)
+    Gated behind the AGENT_BINDING_ADMIN_IDS allowlist (see require_agent_binding_admin)
     — minting a PRODUCTION agent identity is a higher-privilege act than content
     moderation, so it does NOT reuse the moderator set. 409 if the (repository, ref,
     workflow_ref) triple is already bound; 422 on a blank field."""

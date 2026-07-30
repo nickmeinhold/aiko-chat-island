@@ -258,7 +258,7 @@ async def test_binding_endpoint_admin_gated(client, session, monkeypatch):
 
 async def test_binding_endpoint_not_reused_moderator_role(client, session, monkeypatch):
     """Finding 6: minting a production agent identity does NOT reuse the content-
-    moderator role. A configured MODERATOR who is NOT in AGENT_BINDING_ADMINS is
+    moderator role. A configured MODERATOR who is NOT in AGENT_BINDING_ADMIN_IDS is
     forbidden; only the dedicated allowlist opens the door."""
     mod = await _user(session, "mod-only")
     monkeypatch.setattr(settings, "moderator_user_ids", [mod.id])  # a real moderator
@@ -508,3 +508,61 @@ async def test_banning_live_agent_drops_its_socket(session):
     # And the ban is durable: the agent row is now suspended.
     refreshed = await users_service.get_by_id(session, agent.id)
     assert users_service.is_banned(refreshed)
+
+
+# --- portable duplicate-binding classification (race backstop) ----------------
+# agents_service._is_binding_conflict classifies the UNIQUE-violation IntegrityError
+# ENGINE-PORTABLY (SQLSTATE 23505 + constraint name, with a SQLite column fallback),
+# not by a raw message substring — so a future Postgres concurrent insert maps to 409,
+# not an opaque 500. These unit tests pin that contract without needing a live Postgres.
+
+class _FakeOrig:
+    """Stand-in for a DB-API driver error: a str payload + optional sqlstate/pgcode."""
+    def __init__(self, text, sqlstate=None, pgcode=None):
+        self._text, self.sqlstate, self.pgcode = text, sqlstate, pgcode
+        if sqlstate is None and pgcode is None:  # SQLite drivers expose neither
+            del self.sqlstate, self.pgcode
+
+    def __str__(self):
+        return self._text
+
+
+def _err(orig):
+    return SimpleNamespace(orig=orig)
+
+
+def test_is_binding_conflict_postgres_unique_violation():
+    # Postgres: SQLSTATE 23505 + the constraint name in the message → our conflict.
+    orig = _FakeOrig(
+        'duplicate key value violates unique constraint '
+        '"uq_agent_bindings_repo_ref_workflow"', sqlstate="23505")
+    assert agents_service._is_binding_conflict(_err(orig)) is True
+
+
+def test_is_binding_conflict_postgres_other_unique_not_ours():
+    # A DIFFERENT unique constraint (23505 but not our index) must NOT be swallowed.
+    orig = _FakeOrig(
+        'duplicate key value violates unique constraint "uq_users_username"',
+        sqlstate="23505")
+    assert agents_service._is_binding_conflict(_err(orig)) is False
+
+
+def test_is_binding_conflict_postgres_non_unique_integrity_error():
+    # A non-unique IntegrityError (e.g. FK violation, 23503) is not a binding conflict.
+    orig = _FakeOrig("insert or update violates foreign key constraint",
+                     sqlstate="23503")
+    assert agents_service._is_binding_conflict(_err(orig)) is False
+
+
+def test_is_binding_conflict_sqlite_column_message():
+    # SQLite: no SQLSTATE; the message enumerates the constrained columns.
+    orig = _FakeOrig(
+        "UNIQUE constraint failed: agent_bindings.repository, "
+        "agent_bindings.ref, agent_bindings.workflow_ref")
+    assert agents_service._is_binding_conflict(_err(orig)) is True
+
+
+def test_is_binding_conflict_sqlite_other_column_not_ours():
+    # A SQLite unique failure on some OTHER table/column is not our conflict.
+    orig = _FakeOrig("UNIQUE constraint failed: users.username")
+    assert agents_service._is_binding_conflict(_err(orig)) is False

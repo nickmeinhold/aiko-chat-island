@@ -83,6 +83,15 @@ services:
       # (fail-closed), and the both-or-neither default keeps the XOR boot-guard happy.
       GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
       GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
+      # --- agent-binding admins (Citizenship H1, #2403). ULIDs permitted to MINT a
+      # production agent identity via POST /v1/agents/bindings. Fail-closed empty:
+      # with none set, NO agent can be provisioned (require_agent_binding_admin 403s
+      # everyone) — so this var MUST be forwarded or the feature is unturnable-on.
+      # JSON array (pydantic json-decodes list fields), like the *_CLIENT_IDS above.
+      # NOTE: MODERATOR_USER_IDS is the sibling admin allowlist and is NOT forwarded
+      # here either — same latent gap; wire it the same way if/when moderators are
+      # configured via compose rather than a per-container env.
+      AGENT_BINDING_ADMIN_IDS: ${AGENT_BINDING_ADMIN_IDS:-[]}
       # --- WebAuthn passkeys (#1471 / #29). The primary ingress now that social is
       # disabled (#1923). Default stays OFF (dark) at the TEMPLATE level on purpose:
       # advertising passkey requires THIS island to serve valid /.well-known

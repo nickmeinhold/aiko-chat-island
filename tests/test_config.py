@@ -338,3 +338,25 @@ def test_dev_passkey_rp_id_mismatch_boots():
                  gateway_base_url="https://chat.enspyr.co",
                  passkey_rp_id="chat.imagineering.cc")
     assert s.is_production is False
+
+
+# --- agent-binding admin allowlist env-name binding (#2403) ------------------
+# The env var pydantic-settings binds to `agent_binding_admin_ids` is derived from
+# the field name (AGENT_BINDING_ADMIN_IDS), exactly like MODERATOR_USER_IDS. An
+# earlier (wrong) name, AGENT_BINDING_ADMINS, was never bound to the field and is
+# silently ignored — leaving the allowlist empty (fail-closed) so no operator could
+# ever mint a binding. These pin the CANONICAL name so that regression can't recur.
+
+def test_agent_binding_admin_ids_env_name_populates(monkeypatch):
+    monkeypatch.setenv("AGENT_BINDING_ADMIN_IDS", '["01ADMIN0000000000000000AA"]')
+    s = Settings(_env_file=None, environment="dev")
+    assert s.agent_binding_admin_ids == ["01ADMIN0000000000000000AA"]
+
+
+def test_wrong_agent_binding_admins_env_name_is_ignored(monkeypatch):
+    # The OLD/wrong documented name must NOT silently populate the allowlist — if it
+    # did, docs and code would disagree and operators would be misled either way.
+    monkeypatch.delenv("AGENT_BINDING_ADMIN_IDS", raising=False)
+    monkeypatch.setenv("AGENT_BINDING_ADMINS", '["01WRONG000000000000000000"]')
+    s = Settings(_env_file=None, environment="dev")
+    assert s.agent_binding_admin_ids == []

@@ -33,6 +33,41 @@ from .ids import new_ulid
 from .models import AgentBinding, Kind, User
 
 
+# The UNIQUE constraint on (repository, ref, workflow_ref) — the single source of the
+# name is models.AgentBinding.__table_args__; kept in sync here for portable
+# classification (see _is_binding_conflict).
+_BINDING_UNIQUE_CONSTRAINT = "uq_agent_bindings_repo_ref_workflow"
+
+
+def _is_binding_conflict(err: IntegrityError) -> bool:
+    """True iff the IntegrityError is THIS binding's triple-UNIQUE violation, classified
+    ENGINE-PORTABLY rather than by a free-text message substring:
+
+      * SQLSTATE ``23505`` (unique_violation) is the standard code every DB-API driver
+        that reports SQLSTATE uses (Postgres via psycopg's ``sqlstate``/``pgcode``); it
+        distinguishes a UNIQUE violation from any other IntegrityError (FK/NOT NULL) on
+        ANY such engine. Postgres also names the CONSTRAINT in the error, so we confirm
+        it is our triple index, not some other future unique constraint on the table.
+      * SQLite (aiosqlite, dev+prod today, CLAUDE.md) exposes NO SQLSTATE and names the
+        COLUMNS not the constraint, so we fall back to matching the constrained columns
+        — this is the only path that must read the message, and only when there is no
+        SQLSTATE to key on. The explicit get_binding pre-check already handles the
+        non-racing duplicate on every engine; this backstop only fires on a true
+        concurrent insert, and now returns 409 (not an opaque 500) on Postgres too."""
+    orig = getattr(err, "orig", err)
+    sqlstate = getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
+    text = str(orig)
+    if sqlstate is not None:
+        # An engine that reports SQLSTATE: a unique_violation naming our constraint.
+        return sqlstate == "23505" and _BINDING_UNIQUE_CONSTRAINT in text
+    # SQLite fallback: no SQLSTATE; the message enumerates the constrained columns.
+    return (
+        "agent_bindings.repository" in text
+        and "agent_bindings.ref" in text
+        and "agent_bindings.workflow_ref" in text
+    )
+
+
 class BindingConflict(Exception):
     """A binding for this (repository, ref, workflow_ref) already exists. The caller
     maps this to 409 — a workload maps to exactly one agent (UNIQUE on the triple)."""
@@ -94,8 +129,9 @@ async def create_agent_binding(
     # PORTABLE duplicate detection: an explicit pre-check that returns BindingConflict
     # (→ 409) BEFORE the insert, independent of any engine's error-string format. The
     # try/except below stays as the RACE backstop for two concurrent creates that both
-    # pass this check; on SQLite (dev+prod) it classifies by column name. The pre-check
-    # is what keeps a duplicate from becoming a 500 on Postgres.
+    # pass this check; it classifies portably (SQLSTATE + constraint name, SQLite column
+    # fallback — see _is_binding_conflict). The pre-check is what keeps an ordinary
+    # duplicate from becoming a 500 on Postgres; the backstop now covers the race too.
     existing = await get_binding(
         session, repository=repository, ref=ref, workflow_ref=workflow_ref)
     if existing is not None:
@@ -131,13 +167,12 @@ async def create_agent_binding(
     except IntegrityError as e:
         await session.rollback()
         # RACE backstop (the pre-check above handles the ordinary duplicate). Classify
-        # from the SQLite message, which names the COLUMN(S), not the constraint name:
-        # a triple collision reads "UNIQUE constraint failed: agent_bindings.repository,
-        # agent_bindings.ref, agent_bindings.workflow_ref" (mirrors users_service.
-        # _is_credential_id_conflict's table.column match). SQLite is the sole engine in
-        # dev AND prod (CLAUDE.md); on any other engine the pre-check already caught the
-        # non-racing duplicate, so this path only fires on a true concurrent insert.
-        if "agent_bindings.repository" in str(getattr(e, "orig", e)):
+        # ENGINE-PORTABLY by SQLSTATE (23505) + constraint name on engines that report
+        # it, falling back to the SQLite column message only when there is no SQLSTATE
+        # — so a future Postgres concurrent insert becomes a clean 409, not an opaque
+        # 500. This path only fires on a true concurrent insert (the pre-check above
+        # caught every non-racing duplicate on every engine).
+        if _is_binding_conflict(e):
             raise BindingConflict() from e
         raise
     return user, binding
