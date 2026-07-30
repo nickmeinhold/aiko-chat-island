@@ -168,6 +168,47 @@ mode. Phase A is independently valuable even if Phase B never ships: it makes ev
 island's current operator-readability HONEST to users, which is a real safety/consent
 win on its own.
 
+## Re-Cast (post-Temper round 1 — folded cross-family findings)
+
+The cross-family Temper (TEMPER.md) returned REQUEST_CHANGES, convergent across three
+families. Folded corrections:
+
+1. **Room encryption policy is a signed, immutable join predicate (fixes the fatal
+   federation/downgrade flaw).** A room has exactly ONE encryption policy, fixed at
+   creation (or an explicit rekeyed epoch), **bound to room-id + creator signature +
+   membership epoch**. It is enforced as a **federation JOIN PREDICATE**: a member's
+   gateway either accepts the room's policy or cannot join; **no peer may flip
+   ciphertext→plaintext**; relays never re-encode content; the **client verifies the
+   room policy cryptographically before sending, fail-closed**. This replaces the vague
+   "channel mode = home-island mode" with a sealed room-level invariant. The four
+   concepts the original Cast conflated are now explicitly distinct:
+   *island-hosting-mode* (operator default + liability posture) ≠ *channel-effective-mode*
+   (the signed room policy) ≠ *per-peer-relay-policy* (who I federate with) ≠
+   *client-verified-send-mode* (what the client confirms before encrypting). Per-island
+   is the **liability atom**; the **room/epoch is the encryption atom** — one election
+   cannot be both.
+2. **Phase A ships `e2ee` as UNSELECTABLE / non-production.** The only honest Phase A
+   claim is "this island is Moderator/plaintext." E2EE becomes a selectable mode only
+   when MLS + client-verification + franking ship together (Phase B). No advertising a
+   referent that doesn't exist.
+3. **"Moderator = commitment" is rephrased to what it actually enforces:** report queue +
+   retraction present, CSAM-runbook acknowledged, and *cannot be disabled without a mode
+   change*. It kills the "plaintext with moderation deleted" config; it does NOT and
+   cannot guarantee a human reviews reports. Not sold as "Moderator means moderated."
+4. **Mode is a forward-only one-way ratchet, not frozen-immutable.** An operator may seal
+   a Moderator island to E2EE *going forward* (old plaintext history stays as-is, cannot
+   be retroactively encrypted); E2EE→Moderator is forbidden (can't retro-decrypt). Motion
+   is allowed, but only toward MORE privacy — sovereignty is continuous, the ratchet is
+   monotone.
+
+**Still blocking a re-Temper + Blade (two external gates):**
+- **Finding 2 — the product premise (Nick's call):** is aiko *one-community-per-island*
+  (per-island election is coherent) or *multi-community-federated-on-one-box* (per-island
+  fails; a solo op wanting a public square AND a private ops room can't "just run a second
+  island")? This decides whether per-island survives or the encryption atom must be the
+  room from day one.
+- **The legal axis (Matt / task #7):** both-modes-weakens-shield + affirmative-duty.
+
 ## Open variables (no silent TODOs)
 
 - Legal: both-modes-weakens-shield? affirmative-duty? → task #7 / Matt.
