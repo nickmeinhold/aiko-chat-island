@@ -522,6 +522,28 @@ CSAM"*, and you are liable wherever the content is available to end users.
    line with a buildable midpoint.** So question 6 is a genuine either/or, not a
    both-and awaiting cleverer crypto.
 
+   **RESOLUTION DIRECTION (decided 2026-07-30): make the either/or an explicit operator
+   election.** Rather than the project picking a side, each **island operator elects its
+   mode** — **E2EE** (client-encrypted channels the gateway cannot read: genuine
+   inability, legal carve-out, but no gateway moderation; relies on client-reporting +
+   metadata) **or Moderator** (plaintext gateway: the shipped takedown/retraction works,
+   but on the hook to scan, no shield). Sovereignty made concrete: the node that bears
+   the legal risk picks its point on the axis and owns the consequence. Full design in
+   crucible `docs/crucible/09-operator-mode-election/` (→ design note 08 if it survives
+   temper). Sub-decisions carried there:
+   - **"Moderator" is a commitment, not a capability** — kill the dangerous middle
+     (plaintext-but-not-moderating = liability without the safety work). Holding
+     plaintext commits you to moderate (report queue + CSAM runbook on).
+   - **Per-island granularity to start** (one clean legal story per node); per-channel
+     deferred — producing plaintext for *some* channels may weaken the genuine-inability
+     shield for E2EE ones (a lawyer question; binds task #7).
+   - **The peer allow-list (D1) becomes mode-aware** — a Moderator-island may refuse to
+     federate with E2EE-islands (can't inspect inbound content it is legally liable for),
+     or vice versa. Mode is a federation-trust property, not just local config.
+   - **Legibility:** the mode must be visible/verifiable to users before they speak.
+     Lucky asymmetry — client-side E2EE is self-verifying (the client knows it handed the
+     server only ciphertext), so no enclave-style attestation is needed.
+
 ## What we do **not** claim
 
 Two claims were tested and **refuted** by the verification pass; they are excluded
