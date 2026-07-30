@@ -202,19 +202,52 @@ families. Folded corrections:
    monotone.
 
 **Finding 2 — RESOLVED (Nick, 2026-07-30): aiko is ONE-COMMUNITY-PER-ISLAND.** An island
-IS a community with one posture. This validates per-island election as BOTH the liability
-atom AND the encryption atom (they coincide because island = community = one mode), and it
-*simplifies* finding 1: a channel's mode = its island's mode, with no intra-island per-room
-variation to negotiate. The signed join-predicate still governs the federation boundary (a
-cross-island member adopts + cryptographically verifies the target island's one signed mode
-on join, fail-closed), but the intra-island channel-mode ambiguity Tesla/Carnot hammered
-does not exist — there is nothing to mix within an island. The "spin a second island for a
-second posture" cost is accepted BY the product definition: a different posture is a
-different community, hence a different island, by design.
+IS a community with one posture. Per-island is validated as the right **administrative
+default and liability posture**. The "spin a second island for a second posture" cost is
+accepted BY the product definition: a different posture is a different community, hence a
+different island. **HARD CONSTRAINT (Tesla, re-Temper):** this holds ONLY with zero
+exceptions — no "except DMs", "except the admin room", "except the bridge". Any exception
+IS per-channel election wearing a hat, and reopens the fatal ambiguity.
 
-**Remaining external gate (one, not two):**
-- **The legal axis (Matt / task #7):** both-modes-weakens-shield + affirmative-duty. A
-  re-Temper can certify the architecture now; Blade (the plan) waits on this.
+## Re-Cast round 2 (post re-Temper — folded convergent findings)
+
+Re-Temper (Carnot + Tesla convergent, REQUEST_CHANGES-but-converging; both: "fix these →
+Blade-ready for Phase A"). Three folds:
+
+1. **CORRECTION of the finding-2 fold: per-island is the DEFAULT, NOT the encryption atom.**
+   The round-1 fold said per-island became "both liability AND encryption atom" — that
+   re-collapsed the very distinction that fixed the fatal flaw. Corrected: **per-island
+   mode is the administrative default that AUTO-CREATES a room's policy; the signed
+   room/epoch policy remains the ENFORCED cryptographic invariant.** A client MUST verify
+   the room policy before EVERY send, including remote joins — never infer it from the
+   island default. Per-island can set it; it can never replace it.
+2. **"E2EE is self-verifying" is narrowed and no longer load-bearing alone.** Replace with:
+   *"a trustworthy client can verify a message is encrypted to the displayed MLS group."*
+   That is NOT "the operator cannot read" — a malicious island can serve a modified client,
+   inject a ghost device/member, substitute MLS credentials, or open a silent epoch with a
+   compromised participant. Required design pieces (fold into Phase B): MLS credential
+   verification, **device/member transparency (binds directly to [`06-identity-and-trust`]'s
+   key-transparency log — the KT log IS the mechanism that makes membership auditable),**
+   fail-closed send path, and UI that surfaces unexpected member/device changes. So the
+   "no enclave attestation" claim is true ONLY for the server-side-compute claim, not for
+   user-facing E2EE assurance — that rests on client integrity + KT.
+3. **Phase A HARD-rejects `e2ee` (invariant, not a note):** production clients and peers
+   reject any `e2ee` mode value at handshake; it is schema-reserved / non-production until
+   MLS + client-verification + franking all ship. And **relay / bridge / export rules and
+   partition-healing are protocol invariants, not operator policy** (Tesla: the
+   silent-relay / liability-transfer attack stays live until they are).
+
+**Convergence status:** both re-Temper adversaries state the core dichotomy is sound and
+the design is APPROVE-ready for a **Phase A Blade** once these three are folded (done here).
+Phase B remains trigger-gated and MUST re-temper on federated-MLS + identity roots before
+any production `e2ee` bit.
+
+**Remaining external gate (one):**
+- **The legal axis (Matt / task #7):** both-modes-weakens-shield + affirmative-duty. The
+  architecture is now re-tempered to convergence; the **Phase A Blade (plan) waits only on
+  this** — Phase A is Moderator-only + the honest election framework, so the legal answer
+  shapes the runbook, not the Phase A mechanism. If the legal answer is benign, Phase A is
+  plan-ready as-is.
 
 ## Open variables (no silent TODOs)
 

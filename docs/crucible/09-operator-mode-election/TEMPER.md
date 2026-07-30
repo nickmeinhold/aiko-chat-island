@@ -66,3 +66,29 @@ decisions. Honest state: **strong ore, real fixes applied, two external gates op
 availability gap, not an approval). Convergence across three *different* families on
 finding 1 is the strongest possible signal that it's real, not a single instrument's
 bias.
+
+---
+
+## Re-Temper (round 2, 2026-07-30, neutral prompt — no steering)
+
+Verdict: **REQUEST_CHANGES but CONVERGING** — Carnot + Tesla (Kelvin SIGTERM'd by a
+2-min shell timeout; Wu still 403 quota-dead → 2-way + Maxwell). Both adversaries
+explicitly: "fix these three → APPROVE-ready for a Phase A Blade." Convergent findings,
+all folded into DESIGN.md Re-Cast round 2:
+
+1. The finding-2 fold OVERCORRECTED — saying per-island is "both liability AND encryption
+   atom" re-collapsed the round-1 fix. Correction: per-island = default that auto-creates
+   the room policy; the signed room/epoch policy stays the ENFORCED invariant, client-
+   verified before every send incl. remote joins.
+2. "E2EE self-verifying" overstated — narrowed to "a trustworthy client can verify
+   encryption to the displayed MLS group"; requires MLS credential verification + device/
+   member transparency (= note 06's KT log) + fail-closed send. Client integrity + KT, not
+   "self-evident".
+3. Phase A HARD-rejects e2ee at handshake (invariant); relay/bridge/export + partition-
+   healing are invariants not operator policy; one-community-one-posture holds only with
+   ZERO exceptions (no except-DMs/admin/bridge).
+
+**Architecture converged.** Both adversaries: core dichotomy sound, Phase A Blade-ready
+post-fold. Stopped at round 2 of ≤3 (diminishing, bounded, agreed findings). Blade waits
+only on the legal axis (Matt / task #7); Phase A is Moderator-only + the honest election
+framework, so the legal answer shapes the runbook, not the Phase A mechanism.
