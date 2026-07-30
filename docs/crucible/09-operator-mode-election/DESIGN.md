@@ -201,13 +201,20 @@ families. Folded corrections:
    is allowed, but only toward MORE privacy — sovereignty is continuous, the ratchet is
    monotone.
 
-**Still blocking a re-Temper + Blade (two external gates):**
-- **Finding 2 — the product premise (Nick's call):** is aiko *one-community-per-island*
-  (per-island election is coherent) or *multi-community-federated-on-one-box* (per-island
-  fails; a solo op wanting a public square AND a private ops room can't "just run a second
-  island")? This decides whether per-island survives or the encryption atom must be the
-  room from day one.
-- **The legal axis (Matt / task #7):** both-modes-weakens-shield + affirmative-duty.
+**Finding 2 — RESOLVED (Nick, 2026-07-30): aiko is ONE-COMMUNITY-PER-ISLAND.** An island
+IS a community with one posture. This validates per-island election as BOTH the liability
+atom AND the encryption atom (they coincide because island = community = one mode), and it
+*simplifies* finding 1: a channel's mode = its island's mode, with no intra-island per-room
+variation to negotiate. The signed join-predicate still governs the federation boundary (a
+cross-island member adopts + cryptographically verifies the target island's one signed mode
+on join, fail-closed), but the intra-island channel-mode ambiguity Tesla/Carnot hammered
+does not exist — there is nothing to mix within an island. The "spin a second island for a
+second posture" cost is accepted BY the product definition: a different posture is a
+different community, hence a different island, by design.
+
+**Remaining external gate (one, not two):**
+- **The legal axis (Matt / task #7):** both-modes-weakens-shield + affirmative-duty. A
+  re-Temper can certify the architecture now; Blade (the plan) waits on this.
 
 ## Open variables (no silent TODOs)
 

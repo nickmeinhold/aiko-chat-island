@@ -534,9 +534,13 @@ CSAM"*, and you are liable wherever the content is available to end users.
    - **"Moderator" is a commitment, not a capability** — kill the dangerous middle
      (plaintext-but-not-moderating = liability without the safety work). Holding
      plaintext commits you to moderate (report queue + CSAM runbook on).
-   - **Per-island granularity to start** (one clean legal story per node); per-channel
-     deferred — producing plaintext for *some* channels may weaken the genuine-inability
-     shield for E2EE ones (a lawyer question; binds task #7).
+   - **Per-island granularity — DECIDED (2026-07-30): aiko is one-community-per-island.**
+     An island is a community with one posture, so per-island mode is both the liability
+     atom and the encryption atom (they coincide). A different posture = a different
+     community = a different island, by design. This validated per-island against a
+     cross-family design temper (crucible 09) which had flagged per-island as possibly
+     the "wrong encryption atom" for a multi-community-per-box product — a shape aiko has
+     now explicitly rejected.
    - **The peer allow-list (D1) becomes mode-aware** — a Moderator-island may refuse to
      federate with E2EE-islands (can't inspect inbound content it is legally liable for),
      or vice versa. Mode is a federation-trust property, not just local config.
