@@ -113,20 +113,23 @@ class Settings(BaseSettings):
     # apple_client_ids. Config, not a role system: full role machinery (invite
     # co-mods, audit log) is deferred until there's a second moderator.
     moderator_user_ids: list[str] = []
-    # Agent-binding admins (Citizenship H1, #2403). User ids (ULIDs) permitted to MINT
-    # a production agent identity via POST /v1/agents/bindings. This is a HIGHER-
-    # privilege act than content moderation (it forges a first-class citizen that can
-    # post as an aiko agent), so it deliberately does NOT reuse moderator_user_ids —
-    # the cage-match flagged reusing the content-moderator role for identity minting.
-    # Fail-closed empty: an island with no configured binding-admin can provision NO
-    # agents (require_agent_binding_admin 403s everyone), exactly like the moderator
-    # gate. Config, not a role system (a first-class admin role is a follow-up
-    # decision); JSON array in the env AGENT_BINDING_ADMIN_IDS (pydantic-settings
-    # derives the env name from the field name, exactly like MODERATOR_USER_IDS ->
-    # moderator_user_ids above). Operators MUST set AGENT_BINDING_ADMIN_IDS — the
-    # earlier name AGENT_BINDING_ADMINS was never bound to this field and would be
-    # silently ignored (fail-closed => nobody could ever mint a binding).
-    agent_binding_admin_ids: list[str] = []
+    # Agent-admin BOOTSTRAP set (Citizenship H1, #2403). User ids (ULIDs) that are
+    # seeded as agent-admins at boot — the ONE-TIME chicken-and-egg solver for the
+    # first-class, DB-backed `users.is_agent_admin` role (which the agent-binding gate
+    # actually reads). This is NOT the allowlist the gate consults: the gate reads the
+    # persisted flag, granted/revoked at runtime by an existing agent-admin
+    # (agents_service.grant_agent_admin / revoke_agent_admin). At startup
+    # agents_service.reconcile_bootstrap_agent_admins grants the flag to every listed
+    # id that exists and does not yet have it — ADDITIVE ONLY (it never revokes), so a
+    # runtime grant survives a restart and removing an id here does NOT demote a live
+    # admin (use the revoke path). Minting a production agent identity is a HIGHER-
+    # privilege act than content moderation (it forges a first-class OIDC citizen), so
+    # this role is its OWN capability and never reuses moderator_user_ids — the
+    # cage-match flagged that reuse. Fail-closed empty: with no seeded admin AND no
+    # runtime grant, NOBODY can mint a binding (require_agent_binding_admin 403s
+    # everyone). JSON array in the env AGENT_ADMIN_BOOTSTRAP_IDS (pydantic-settings
+    # derives the env name from the field name, like MODERATOR_USER_IDS above).
+    agent_admin_bootstrap_ids: list[str] = []
     # Provisioning token TTL: a brand-new social user gets a short-lived signed
     # token (NOT a DB row) to carry (provider, sub, suggested name/email) from the
     # verify step to the handle-claim step. Short window — it's a one-step

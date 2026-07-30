@@ -194,6 +194,21 @@ class User(Base):
     # (no `gen` claim) read as 0 too, so a deploy doesn't mass-logout live sessions.
     token_generation: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0")
+    # Agent-provisioning admin capability (Citizenship H1, #2403). A FIRST-CLASS,
+    # DB-persisted role — NOT an env allowlist — that gates minting a production agent
+    # identity (POST /v1/agents/bindings, require_agent_binding_admin). Distinct from the
+    # content-moderator seat: forging a first-class OIDC citizen is a HIGHER-privilege act
+    # than moderation, so it is its own capability, never reusing moderator_user_ids (the
+    # cage-match flagged that reuse). Granted/revoked at runtime by an existing agent-admin
+    # (agents_service.grant_agent_admin / revoke_agent_admin); the first admin is seeded
+    # at boot from settings.agent_admin_bootstrap_ids (chicken-and-egg bootstrap, additive
+    # only). Modeled as a persisted flag — the same shape as banned_at / token_generation —
+    # so it folds into the island operator-seat role framework later. Server-authoritative:
+    # NO request model exposes this field, so an authed user can never self-promote. DEFAULT
+    # false (server_default "0") backfills existing rows as non-admins (fail-closed: an
+    # island with no seeded/granted admin can provision NO agents).
+    is_agent_admin: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="0")
 
 
 class SocialIdentity(Base):

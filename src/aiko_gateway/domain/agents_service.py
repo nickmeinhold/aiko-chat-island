@@ -28,6 +28,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ..config import settings
 from . import github_oidc, users_service
 from .ids import new_ulid
 from .models import AgentBinding, Kind, User
@@ -97,6 +98,98 @@ class AgentBanned(Exception):
     auth mutator (not only at the REST layer) so no caller — a future internal path
     included — can mint a token for a banned agent by skipping the REST ban gate. The
     caller maps this to 403 account_suspended, the same treatment a banned human gets."""
+
+
+# --- agent-admin role (the first-class, DB-backed provisioning capability) -----
+#
+# The role that gates create_agent_binding. A PERSISTED flag on the User row
+# (users.is_agent_admin), not an env allowlist — the gate reads the row, and the
+# holder set is mutated at runtime by an existing admin (grant/revoke below). The
+# env only SEEDS the first admin (reconcile_bootstrap_agent_admins). This mirrors the
+# moderator seat's shape (a predicate + a hard REST gate) so it folds into the island
+# operator-seat role framework later, while being genuinely persisted + revocable.
+
+
+class AdminTargetNotFound(Exception):
+    """grant/revoke_agent_admin was given a user_id that does not exist. The caller
+    maps this to 404 — the actor is already an authenticated admin, so there is no
+    existence-oracle concern (unlike the opaque auth doors)."""
+
+
+class AdminTargetNotHuman(Exception):
+    """A grant target is not a kind='human' user. An agent identity must never hold the
+    provisioning capability (it could self-mint more agents), so grant is human-only.
+    The caller maps this to 409."""
+
+
+class AdminSelfRevokeForbidden(Exception):
+    """An admin tried to revoke their OWN capability. Blocked so the acting admin can
+    never lock the island out of provisioning in one call — at least one admin (the
+    actor) always survives a revoke. The caller maps this to 409."""
+
+
+def is_agent_admin(user: User) -> bool:
+    """Whether `user` holds the persisted agent-provisioning role. Reads the DB flag
+    (NOT config) — the single source the require_agent_binding_admin gate consults, so
+    the enforced gate and any surfaced flag can never drift (mirrors
+    moderation_service.is_moderator's single-predicate shape, but DB-backed)."""
+    return bool(user.is_agent_admin)
+
+
+async def grant_agent_admin(
+    session: AsyncSession, *, target_user_id: str,
+) -> User:
+    """Grant the agent-admin role to a human user. Admin-gated at the REST layer
+    (an existing agent-admin only). Idempotent: granting an already-admin is a no-op
+    success. Raises AdminTargetNotFound (unknown id) / AdminTargetNotHuman (an agent
+    can never hold the provisioning capability)."""
+    target = await users_service.get_by_id(session, target_user_id)
+    if target is None:
+        raise AdminTargetNotFound()
+    if target.kind != Kind.HUMAN:
+        raise AdminTargetNotHuman()
+    if not target.is_agent_admin:
+        target.is_agent_admin = True
+        await session.commit()
+    return target
+
+
+async def revoke_agent_admin(
+    session: AsyncSession, *, actor_id: str, target_user_id: str,
+) -> User:
+    """Revoke the agent-admin role. Admin-gated at the REST layer. An admin may NOT
+    revoke themselves (AdminSelfRevokeForbidden) so a single call can never leave the
+    island with zero provisioners — the actor always survives. Idempotent on a target
+    that is not currently an admin (no-op success). Raises AdminTargetNotFound."""
+    if actor_id == target_user_id:
+        raise AdminSelfRevokeForbidden()
+    target = await users_service.get_by_id(session, target_user_id)
+    if target is None:
+        raise AdminTargetNotFound()
+    if target.is_agent_admin:
+        target.is_agent_admin = False
+        await session.commit()
+    return target
+
+
+async def reconcile_bootstrap_agent_admins(session: AsyncSession) -> int:
+    """Seed the first agent-admin(s) from settings.agent_admin_bootstrap_ids at boot.
+    ADDITIVE ONLY: grants the flag to every listed id that exists and does not yet hold
+    it; it NEVER revokes, so a runtime grant survives a restart and dropping an id from
+    the env does not demote a live admin (use revoke_agent_admin). Solves the chicken-
+    and-egg — a fresh island with no admin can name its first via the env, then manage
+    the rest at runtime. Returns the number newly granted. Skips ids that do not resolve
+    to a user (an operator may list an id before that account exists; the next boot picks
+    it up)."""
+    granted = 0
+    for uid in settings.agent_admin_bootstrap_ids:
+        user = await users_service.get_by_id(session, uid)
+        if user is not None and not user.is_agent_admin:
+            user.is_agent_admin = True
+            granted += 1
+    if granted:
+        await session.commit()
+    return granted
 
 
 async def create_agent_binding(

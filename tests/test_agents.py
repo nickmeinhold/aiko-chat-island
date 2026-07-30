@@ -87,6 +87,15 @@ async def _user(session, username: str, *, banned: bool = False) -> User:
     return u
 
 
+async def _admin(session, username: str) -> User:
+    """A user holding the persisted agent-admin role (users.is_agent_admin) — the
+    DB-backed capability the binding gate reads, in place of the old env allowlist."""
+    u = await _user(session, username)
+    u.is_agent_admin = True
+    await session.commit()
+    return u
+
+
 async def _bind(session, *, aud=_AUD, repository=_REPO, repository_id=_REPO_ID,
                 repository_owner_id=_REPO_OWNER_ID, ref=_REF,
                 workflow_ref=_WORKFLOW_REF) -> tuple[User, object]:
@@ -246,9 +255,8 @@ def _body(**overrides) -> dict:
     return b
 
 
-async def test_binding_endpoint_admin_gated(client, session, monkeypatch):
-    plain = await _user(session, "plain")
-    monkeypatch.setattr(settings, "agent_binding_admin_ids", [])  # nobody is admin
+async def test_binding_endpoint_admin_gated(client, session):
+    plain = await _user(session, "plain")  # a plain user has is_agent_admin=False
     body = _body()
     # unauthenticated → 401/403; authed non-admin → 403
     assert (await client.post("/v1/agents/bindings", json=body)).status_code in (401, 403)
@@ -258,18 +266,17 @@ async def test_binding_endpoint_admin_gated(client, session, monkeypatch):
 
 async def test_binding_endpoint_not_reused_moderator_role(client, session, monkeypatch):
     """Finding 6: minting a production agent identity does NOT reuse the content-
-    moderator role. A configured MODERATOR who is NOT in AGENT_BINDING_ADMIN_IDS is
-    forbidden; only the dedicated allowlist opens the door."""
+    moderator role. A configured MODERATOR who does NOT hold the persisted agent-admin
+    role is forbidden; only the dedicated role opens the door."""
     mod = await _user(session, "mod-only")
     monkeypatch.setattr(settings, "moderator_user_ids", [mod.id])  # a real moderator
-    monkeypatch.setattr(settings, "agent_binding_admin_ids", [])   # but not a binding admin
+    # ...but NOT an agent-admin (is_agent_admin stays False).
     r = await client.post("/v1/agents/bindings", json=_body(), headers=_auth(mod))
     assert r.status_code == 403
 
 
-async def test_admin_creates_binding_then_agent_mints_token(client, session, monkeypatch, wired):
-    mod = await _user(session, "mod")
-    monkeypatch.setattr(settings, "agent_binding_admin_ids", [mod.id])
+async def test_admin_creates_binding_then_agent_mints_token(client, session, wired):
+    mod = await _admin(session, "mod")
     body = _body()
 
     r = await client.post("/v1/agents/bindings", json=body, headers=_auth(mod))
@@ -288,12 +295,11 @@ async def test_admin_creates_binding_then_agent_mints_token(client, session, mon
     assert sub == agent_user_id
 
 
-async def test_duplicate_binding_endpoint_returns_409(client, session, monkeypatch):
+async def test_duplicate_binding_endpoint_returns_409(client, session):
     """Finding 5: the duplicate is caught by an explicit get_binding pre-check that
     returns a clean 409 BEFORE the insert — engine-portable, not dependent on parsing a
     raw SQLite error string (which would 500 on Postgres)."""
-    mod = await _user(session, "mod2")
-    monkeypatch.setattr(settings, "agent_binding_admin_ids", [mod.id])
+    mod = await _admin(session, "mod2")
     first = await client.post("/v1/agents/bindings", json=_body(), headers=_auth(mod))
     assert first.status_code == 201, first.text
     dup = await client.post("/v1/agents/bindings", json=_body(), headers=_auth(mod))
@@ -310,11 +316,10 @@ async def test_token_endpoint_malformed_aud_is_401_not_500(client, session, wire
     assert r.status_code == 401, r.text
 
 
-async def test_token_endpoint_wrong_repo_id_is_401(client, session, monkeypatch, wired):
+async def test_token_endpoint_wrong_repo_id_is_401(client, session, wired):
     """Finding 1 at the HTTP door: same repo NAME, different repository_id → opaque 401
     (indistinguishable from an unbound token)."""
-    mod = await _user(session, "mod3")
-    monkeypatch.setattr(settings, "agent_binding_admin_ids", [mod.id])
+    mod = await _admin(session, "mod3")
     r = await client.post("/v1/agents/bindings", json=_body(), headers=_auth(mod))
     assert r.status_code == 201, r.text
     tok = _oidc(wired, repository_id="111111111")
@@ -345,6 +350,158 @@ async def test_banned_agent_denied_token(client, session, wired):
     r = await client.post("/v1/agents/token", json={"oidc_token": _oidc(wired)})
     assert r.status_code == 403
     assert r.json()["error"] == "account_suspended"
+
+
+# ============================================================================
+# the agent-admin ROLE: persisted, admin-gated grant/revoke, bootstrap seed
+# ============================================================================
+
+async def test_agent_admin_role_defaults_false(session):
+    """A freshly created user does NOT hold the persisted role (fail-closed)."""
+    u = await _user(session, "fresh")
+    assert u.is_agent_admin is False
+    assert agents_service.is_agent_admin(u) is False
+
+
+async def test_admin_can_grant_role_and_grantee_can_bind(client, session, monkeypatch):
+    """A user WITH the role grants it to a plain user, who can THEN create a binding.
+    Proves the gate reads the persisted role end-to-end (grant → mint)."""
+    admin = await _admin(session, "granter")
+    plain = await _user(session, "grantee")
+    # Before the grant, the plain user is forbidden from minting.
+    assert (await client.post(
+        "/v1/agents/bindings", json=_body(), headers=_auth(plain))).status_code == 403
+
+    r = await client.post(
+        "/v1/agents/admins", json={"user_id": plain.id}, headers=_auth(admin))
+    assert r.status_code == 201, r.text
+    assert r.json() == {"user_id": plain.id, "is_agent_admin": True}
+
+    # Now the freshly-granted admin can mint (fresh triple so no 409).
+    monkeypatch.setattr(settings, "moderator_user_ids", [])
+    mb = await client.post("/v1/agents/bindings", json=_body(), headers=_auth(plain))
+    assert mb.status_code == 201, mb.text
+
+
+async def test_plain_moderator_cannot_grant_or_bind(client, session, monkeypatch):
+    """The separation the cage-match required: a plain MODERATOR (not an agent-admin)
+    is forbidden from BOTH minting a binding AND granting the role."""
+    mod = await _user(session, "modx")
+    monkeypatch.setattr(settings, "moderator_user_ids", [mod.id])
+    victim = await _user(session, "victim")
+    # cannot mint
+    assert (await client.post(
+        "/v1/agents/bindings", json=_body(), headers=_auth(mod))).status_code == 403
+    # cannot grant the role either
+    assert (await client.post(
+        "/v1/agents/admins", json={"user_id": victim.id},
+        headers=_auth(mod))).status_code == 403
+
+
+async def test_grant_is_admin_gated_and_revoke_restores_403(client, session):
+    """Grant/revoke are admin-gated; a revoked user loses minting access again."""
+    admin = await _admin(session, "boss")
+    u = await _user(session, "worker")
+    # non-admin cannot grant
+    assert (await client.post(
+        "/v1/agents/admins", json={"user_id": u.id}, headers=_auth(u))).status_code == 403
+    # admin grants
+    assert (await client.post(
+        "/v1/agents/admins", json={"user_id": u.id}, headers=_auth(admin))).status_code == 201
+    # revoke by the boss
+    rv = await client.delete(f"/v1/agents/admins/{u.id}", headers=_auth(admin))
+    assert rv.status_code == 200, rv.text
+    assert rv.json() == {"user_id": u.id, "is_agent_admin": False}
+    # and the revoked user is forbidden again
+    assert (await client.post(
+        "/v1/agents/bindings", json=_body(), headers=_auth(u))).status_code == 403
+
+
+async def test_admin_cannot_revoke_self(client, session):
+    """An admin cannot revoke their OWN role (409) — no single-call self-lockout; the
+    actor always survives so at least one provisioner remains."""
+    admin = await _admin(session, "solo")
+    r = await client.delete(f"/v1/agents/admins/{admin.id}", headers=_auth(admin))
+    assert r.status_code == 409, r.text
+    # still an admin
+    assert (await client.post(
+        "/v1/agents/bindings", json=_body(), headers=_auth(admin))).status_code == 201
+
+
+async def test_grant_unknown_user_404_and_agent_target_409(client, session):
+    admin = await _admin(session, "chief")
+    # unknown target
+    assert (await client.post(
+        "/v1/agents/admins", json={"user_id": "01NOPENOPENOPENOPENOPE0000"},
+        headers=_auth(admin))).status_code == 404
+    # an AGENT identity can never hold the provisioning capability
+    agent, _ = await _bind(session)
+    r = await client.post(
+        "/v1/agents/admins", json={"user_id": agent.id}, headers=_auth(admin))
+    assert r.status_code == 409, r.text
+    assert agent.is_agent_admin is False
+
+
+async def test_grant_is_idempotent(session):
+    """Granting an already-admin is a no-op success (no error, stays True)."""
+    admin = await _admin(session, "idem")
+    again = await agents_service.grant_agent_admin(session, target_user_id=admin.id)
+    assert again.is_agent_admin is True
+
+
+async def test_bootstrap_reconcile_seeds_first_admin_additively(session, monkeypatch):
+    """The boot reconcile grants the role to seeded ids that exist and lack it, and is
+    ADDITIVE ONLY — a runtime grant NOT in the seed survives; a seeded id already
+    granted is untouched; an unknown seeded id is skipped."""
+    seeded = await _user(session, "seed-me")
+    runtime = await _admin(session, "runtime-grant")  # granted at runtime, NOT seeded
+    monkeypatch.setattr(
+        settings, "agent_admin_bootstrap_ids",
+        [seeded.id, "01GHOST000000000000000000"])  # unknown id is skipped
+
+    granted = await agents_service.reconcile_bootstrap_agent_admins(session)
+    assert granted == 1  # only seeded (the ghost id resolves to no user)
+    assert seeded.is_agent_admin is True
+    assert runtime.is_agent_admin is True  # additive: runtime grant preserved
+
+    # Idempotent: a second reconcile grants nobody new.
+    assert await agents_service.reconcile_bootstrap_agent_admins(session) == 0
+
+
+def test_migration_0019_preserves_existing_rows(tmp_path, monkeypatch):
+    """Upgrading 0018 → 0019 backfills is_agent_admin=0 on existing rows (no data
+    loss, no row reclassified as admin). Drives the real alembic runner; env.py reads
+    the DB from settings.db_url (monkeypatched at a throwaway file), like test_migrations."""
+    import sqlalchemy as sa
+    from alembic import command
+
+    from aiko_gateway import migrate
+
+    db = tmp_path / "mig0019.db"
+    sync_url = f"sqlite:///{db}"
+    # env.py overrides alembic's url with settings.db_url — point THAT at the throwaway DB.
+    monkeypatch.setattr(settings, "db_url", f"sqlite+aiosqlite:///{db}")
+    cfg = migrate._alembic_config()
+
+    # Bring a DB to 0018 and insert a pre-existing user row (no is_agent_admin column).
+    command.upgrade(cfg, "0018")
+    eng = sa.create_engine(sync_url)
+    try:
+        with eng.begin() as conn:
+            conn.execute(sa.text(
+                "INSERT INTO users (id, kind, username, display_name, aiko_username, "
+                "created_at, token_generation) VALUES "
+                "('01OLDUSER0000000000000000A', 'human', 'old', 'Old', 'old', "
+                "'2026-01-01T00:00:00+00:00', 0)"))
+        # Upgrade across the new revision.
+        command.upgrade(cfg, "0019")
+        with eng.connect() as conn:
+            row = conn.execute(sa.text(
+                "SELECT is_agent_admin FROM users WHERE id='01OLDUSER0000000000000000A'"
+            )).scalar_one()
+    finally:
+        eng.dispose()
+    assert row == 0  # existing row preserved AND backfilled as a non-admin
 
 
 # ============================================================================

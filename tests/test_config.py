@@ -340,23 +340,22 @@ def test_dev_passkey_rp_id_mismatch_boots():
     assert s.is_production is False
 
 
-# --- agent-binding admin allowlist env-name binding (#2403) ------------------
-# The env var pydantic-settings binds to `agent_binding_admin_ids` is derived from
-# the field name (AGENT_BINDING_ADMIN_IDS), exactly like MODERATOR_USER_IDS. An
-# earlier (wrong) name, AGENT_BINDING_ADMINS, was never bound to the field and is
-# silently ignored — leaving the allowlist empty (fail-closed) so no operator could
-# ever mint a binding. These pin the CANONICAL name so that regression can't recur.
+# --- agent-admin BOOTSTRAP seed env-name binding (#2403) ---------------------
+# The env var pydantic-settings binds to `agent_admin_bootstrap_ids` is derived from
+# the field name (AGENT_ADMIN_BOOTSTRAP_IDS), exactly like MODERATOR_USER_IDS. This is
+# the one-time bootstrap seed for the FIRST-CLASS, DB-persisted users.is_agent_admin
+# role (the gate reads the row, not this env) — it names the first admin(s), then the
+# role is managed at runtime. Fail-closed empty. These pin the CANONICAL name.
 
-def test_agent_binding_admin_ids_env_name_populates(monkeypatch):
-    monkeypatch.setenv("AGENT_BINDING_ADMIN_IDS", '["01ADMIN0000000000000000AA"]')
+def test_agent_admin_bootstrap_ids_env_name_populates(monkeypatch):
+    monkeypatch.setenv("AGENT_ADMIN_BOOTSTRAP_IDS", '["01ADMIN0000000000000000AA"]')
     s = Settings(_env_file=None, environment="dev")
-    assert s.agent_binding_admin_ids == ["01ADMIN0000000000000000AA"]
+    assert s.agent_admin_bootstrap_ids == ["01ADMIN0000000000000000AA"]
 
 
-def test_wrong_agent_binding_admins_env_name_is_ignored(monkeypatch):
-    # The OLD/wrong documented name must NOT silently populate the allowlist — if it
-    # did, docs and code would disagree and operators would be misled either way.
-    monkeypatch.delenv("AGENT_BINDING_ADMIN_IDS", raising=False)
-    monkeypatch.setenv("AGENT_BINDING_ADMINS", '["01WRONG000000000000000000"]')
+def test_agent_admin_bootstrap_ids_default_empty_fail_closed(monkeypatch):
+    # No env set → empty seed. With no runtime grant either, the role is held by
+    # nobody and require_agent_binding_admin 403s everyone (fail-closed).
+    monkeypatch.delenv("AGENT_ADMIN_BOOTSTRAP_IDS", raising=False)
     s = Settings(_env_file=None, environment="dev")
-    assert s.agent_binding_admin_ids == []
+    assert s.agent_admin_bootstrap_ids == []

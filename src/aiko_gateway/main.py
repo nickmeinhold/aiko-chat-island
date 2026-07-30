@@ -168,6 +168,19 @@ async def lifespan(app: FastAPI):
     # creation/evolution; here we only VERIFY the live schema is migrated +
     # current, failing closed if not (#14).
     await verify_schema()
+    # Seed the first agent-admin(s) from AGENT_ADMIN_BOOTSTRAP_IDS into the persisted
+    # users.is_agent_admin role (#2403). ADDITIVE ONLY — grants the flag to listed ids
+    # that lack it, never revokes — so runtime grants survive a restart. Solves the
+    # chicken-and-egg (a fresh island names its first admin via the env, then manages
+    # the rest at runtime). Best-effort: a reconcile failure must not block boot.
+    from .domain import agents_service
+    try:
+        async with SessionLocal() as session:
+            granted = await agents_service.reconcile_bootstrap_agent_admins(session)
+        if granted:
+            log.info("agent-admin bootstrap: granted role to %d user(s)", granted)
+    except Exception:
+        log.exception("agent-admin bootstrap reconcile failed")
     # No independent seeding: channels are reconciled from the ChatServer
     # `channel_list` EC share once the bus client discovers it. An inbound
     # message for a not-yet-reconciled channel is upserted by persist_inbound

@@ -1,12 +1,18 @@
 """Agent-ingress endpoints (Citizenship for the Dreaming, H1 — claude-tasks#2403).
 
-Two doors over ``agents_service``:
+Doors over ``agents_service``:
 
-  * ``POST /v1/agents/bindings`` — gated behind the DEDICATED AGENT_BINDING_ADMIN_IDS
-    allowlist (require_agent_binding_admin), NOT the content-moderator set: minting a
-    production agent identity is a higher-privilege act than moderation. "Config, not a
-    role system" (fail-closed empty), mirroring require_moderator's shape.
-    Provisions a new ``kind='agent'`` identity bound to a GitHub Actions workload.
+  * ``POST /v1/agents/bindings`` — gated behind the FIRST-CLASS, DB-PERSISTED
+    ``users.is_agent_admin`` role (require_agent_binding_admin), NOT the content-
+    moderator set: minting a production agent identity is a higher-privilege act than
+    moderation. The role is a real persisted capability (fail-closed empty), mirroring
+    require_moderator's single-predicate gate shape. Provisions a new ``kind='agent'``
+    identity bound to a GitHub Actions workload.
+
+  * ``POST /v1/agents/admins`` / ``DELETE /v1/agents/admins/{user_id}`` — grant/revoke
+    the agent-admin role, themselves gated behind require_agent_binding_admin (an
+    existing agent-admin manages the role). The first admin is seeded at boot from
+    AGENT_ADMIN_BOOTSTRAP_IDS; everything after is runtime, DB-backed, and revocable.
 
   * ``POST /v1/agents/token`` — PUBLIC (the GitHub Actions OIDC token IS the
     credential; there is no prior aiko session). Rate-limited like the other public
@@ -14,8 +20,8 @@ Two doors over ``agents_service``:
     SHORT-LIVED aiko ACCESS token (no refresh — an agent re-auths via a fresh OIDC
     token each run, so no long-lived credential is ever issued or stored).
 
-This door NEVER creates a user (agents are admin-provisioned at binding time) and
-NEVER touches ``open_registration`` — it cannot be a self-onboarding bypass.
+The binding/token doors NEVER create a human user (agents are admin-provisioned at
+binding time) and NEVER touch ``open_registration`` — no self-onboarding bypass.
 """
 from __future__ import annotations
 
@@ -60,7 +66,7 @@ async def create_binding(
     req: CreateBindingReq, admin: AgentBindingAdmin, session: DbSession,
 ) -> dict:
     """Admin provisions a new agent identity bound to a GitHub Actions workload.
-    Gated behind the AGENT_BINDING_ADMIN_IDS allowlist (see require_agent_binding_admin)
+    Gated behind the persisted agent-admin role (see require_agent_binding_admin)
     — minting a PRODUCTION agent identity is a higher-privilege act than content
     moderation, so it does NOT reuse the moderator set. 409 if the (repository, ref,
     workflow_ref) triple is already bound; 422 on a blank field."""
@@ -91,6 +97,50 @@ async def create_binding(
         "workflow_ref": binding.workflow_ref,
         "aud": binding.aud,
     }
+
+
+class GrantAdminReq(BaseModel):
+    user_id: str = Field(min_length=1)
+
+
+@router.post("/admins", status_code=status.HTTP_201_CREATED)
+async def grant_admin(
+    req: GrantAdminReq, admin: AgentBindingAdmin, session: DbSession,
+) -> dict:
+    """Grant the agent-admin role to a (human) user. Gated behind
+    require_agent_binding_admin — an existing agent-admin manages the role. Idempotent
+    (granting an already-admin succeeds). 404 unknown user; 409 if the target is an
+    agent (an agent identity must never hold the provisioning capability)."""
+    try:
+        target = await agents_service.grant_agent_admin(
+            session, target_user_id=req.user_id)
+    except agents_service.AdminTargetNotFound:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "user not found")
+    except agents_service.AdminTargetNotHuman:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "an agent identity cannot be an agent-admin")
+    log.info("agent-admin granted by admin=%s target=%s", admin.id, target.id)
+    return {"user_id": target.id, "is_agent_admin": target.is_agent_admin}
+
+
+@router.delete("/admins/{user_id}")
+async def revoke_admin(
+    user_id: str, admin: AgentBindingAdmin, session: DbSession,
+) -> dict:
+    """Revoke the agent-admin role. Gated behind require_agent_binding_admin. An admin
+    may NOT revoke themselves (409) so a single call can never leave the island with no
+    provisioner — the actor always survives. Idempotent on a non-admin target. 404 for
+    an unknown user."""
+    try:
+        target = await agents_service.revoke_agent_admin(
+            session, actor_id=admin.id, target_user_id=user_id)
+    except agents_service.AdminSelfRevokeForbidden:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "an admin cannot revoke their own role")
+    except agents_service.AdminTargetNotFound:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "user not found")
+    log.info("agent-admin revoked by admin=%s target=%s", admin.id, target.id)
+    return {"user_id": target.id, "is_agent_admin": target.is_agent_admin}
 
 
 @router.post("/token", dependencies=[rate_limit("agent")])
