@@ -248,6 +248,52 @@ architecture. (The counter-move, if it ever came to that, is genuinely hard: E2E
 that hides content from the gateway would break the very moderation model we shipped.
 That trade is not resolved here; it is flagged as the deepest tension in the design.)
 
+### Who is on the hook: operator vs. author (and the content-blind-infra rule)
+
+Everything above is written about the **operator** — the person running an island.
+That is deliberate, but it hides a distinction that matters enormously as aiko moves
+from "two islands I run" to "a protocol strangers run":
+
+- **Today, the aiko project author is also the operator.** `chat.imagineering.cc`
+  and `chat.enspyr.co` run on boxes we control. For those islands there is no
+  author/operator gap — every operator obligation in this note lands on us directly.
+  This is the normal case and the reason the runbook is not hypothetical.
+- **In the federation future, a stranger running our code is the operator, not us.**
+  The question then becomes whether the *software author* is liable for content a
+  third party hosts. On the research, that hook is **much weaker**, for a structural
+  reason: every offence is a **verb the operator does and the author does not** —
+  *transmit / publish / make-available* (Criminal Code s 474.22), *possess or control
+  data* (s 474.22A), *host* content, be the *"provider"* of a service. An author who
+  ships a neutral, moderation-capable tool does none of those; they never touch the
+  content. Authorship of a general-purpose tool is not operation of a service. (The
+  narrow exception is *inducement* — actively designing-for or encouraging the illegal
+  use — which a moderation-first tool is the structural opposite of.)
+
+**The trap in the middle is a design decision, not a legal accident.** The moment the
+project author runs *shared infrastructure other islands depend on* — a registrar, a
+directory, a discovery seed, a relay — they become the operator **of that component**.
+And whether the operator hooks reattach turns on one property:
+
+> **The content-blind-infra rule: any shared infrastructure the author runs must
+> touch only *metadata* (island X exists at address Y), never *content* (a cached or
+> relayed message).** A directory that *lists* islands keeps the author clear; a
+> directory that *relays their traffic* makes the author an operator of a
+> content-carrying service, with every hook in this note attached.
+
+This is not a new constraint invented here — it is the liability reading of an
+existing architectural commitment ([`concept_directory_discovery_bootstrap_not_centralization`]:
+every gateway is a full directory, discovery is plural not central; and the HyperSpace
+layer is a *service-graph, not a datastore*). Keeping shared infra content-blind was
+always the elegant choice; it turns out to also be the line that keeps the author out
+of operator liability. Elegance and legal exposure point the same way — which is the
+kind of coincidence worth trusting.
+
+Caveat, honestly: the operator side of this line is exercised law; the author side is
+more settled (a neutral tool's author is generally not the operator), but the *exact*
+point at which running discovery/registrar infrastructure tips the author into
+operator is untested and design-dependent. That boundary is a specialist question,
+not something to assert from this note (see Open questions).
+
 ### Risks and trade-offs
 
 - **Allow-list peering kills frictionless federation.** Named in D1. Mitigated by
@@ -370,6 +416,13 @@ CSAM"*, and you are liable wherever the content is available to end users.
    statutory definitions are function-based and appear to capture it, but this is
    untested against an individual operator. This is a **one-time lawyer question**
    and it is the highest-value thing to resolve. Everything in Part B assumes "yes".
+
+1a. **The author/registrar boundary (companion to Q1): where does running federation
+   infrastructure tip the software author into being an "operator"/"provider"?** If
+   the project author runs a registrar, directory, discovery seed, or relay, at what
+   point do the operator hooks attach — and does the content-blind-infra rule
+   (metadata-only, never content) actually hold the line in law, or is *listing* an
+   island that turns out to host CSAM enough to draw exposure? Same specialist as Q1.
 
 2. **Does the DIS Industry Standard's proactive detect-and-remove tier actually bind
    a small island, and at which tier?** The Standard has no size exemption and
