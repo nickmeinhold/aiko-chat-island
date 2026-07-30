@@ -244,9 +244,63 @@ potentially obligated-to-scan* bucket, not the encrypted-carve-out bucket.
 This does not change D1–D4, but it sharpens what "future CSAM tooling" would cost and
 why it is separately scoped: if a regulator ever holds a small aiko island to the DIS
 Standard's proactive-detection tier, the encryption escape hatch is closed by our own
-architecture. (The counter-move, if it ever came to that, is genuinely hard: E2EE
-that hides content from the gateway would break the very moderation model we shipped.
-That trade is not resolved here; it is flagged as the deepest tension in the design.)
+architecture — *for as long as the gateway sees plaintext*. Which is exactly the
+assumption the next section puts under pressure.
+
+### E2EE vs. gateway moderation — a live fork, not a hypothetical
+
+The paragraph above assumed a plaintext gateway is settled. It is not. **E2EE is a
+roadmap item** — app-side design item **#25**, tied to islands (#24) and explored
+through a Veilid crossover (`aiko_chat_app/docs/design/11-veilid-crossover.html`,
+`07-notifications-federation-ready.html`, both flagging that with E2EE "the relay and
+the home gateway can't read" message bodies). It is an exploration, not a scheduled
+build — but it is on the roadmap, and it collides head-on with the moderation model
+this note is built on.
+
+First, dissolve a conflation. The gateway's *existing* crypto is **signing, not
+encryption**: the `signing_keys` roster, the message-signing envelope, sovereign-signing
+(#1816) authenticate *who wrote a message* and prove *it was not tampered*, while
+leaving the body **readable by the gateway**. That is *why* takedown and retraction
+work today. **E2EE (#25) is confidentiality** — it hides the body from the gateway.
+Signing and encryption are orthogonal; aiko has committed hard to the first and only
+flirted with the second. The collision is specifically: signing stays, encryption
+arrives.
+
+And it is a genuine collision, because **moderation-capability, scan-obligation, and
+E2EE are one axis, not three** — you pick a point on it *per channel*:
+
+- **Plaintext gateway** (today): gateway reads bodies → **can moderate** (takedown /
+  retraction / report queue all work) → but is *scannable* → **on the hook to scan**,
+  no encryption carve-out.
+- **E2EE gateway** (#25): gateway cannot read bodies → **cannot moderate** (gateway-side
+  takedown and retraction structurally break — the home gateway can't read what it is
+  asked to retract) → but is *unscannable* → **gets the legal carve-out**, the "we
+  can't see it, so we can't be expected to scan it" shield.
+
+The same property — gateway visibility — is what grants moderation AND what forfeits
+the legal shield. **E2EE does not resolve the plaintext-visibility tension; it walks to
+the other end of it.** You trade "I can moderate but I must scan" for "I can't moderate
+but I'm shielded." On a *single channel* you cannot have both server-side takedown and
+end-to-end confidentiality. This is, arguably, the real fork the whole moderation
+design has been circling.
+
+Two honest resolution shapes, neither free (neither is decided here):
+
+- **Per-channel exclusivity** — a channel is *either* moderatable-and-scannable (plaintext,
+  gateway-moderated) *or* E2EE-and-shielded-but-unmoderatable. You never get both on one
+  channel, and the island advertises which a channel is.
+- **Membership-based moderation in E2EE channels** — the retraction becomes a signed
+  *member* action other clients honour, not a gateway action (exactly the Veilid framing
+  in #11: "the bot is a member with a keypair, not a server reading"). This keeps *some*
+  moderation without gateway visibility, but loses server-side takedown and any scanning
+  entirely, and pushes the whole trust model client-side.
+
+This is the deepest unresolved question in the design, and it is upstream of D1–D4 (which
+hold regardless): D1 governs *which islands* federate; this governs *whether the gateway
+can see content at all*, which decides whether within-island moderation and the legal
+posture even exist in their current form. It binds directly to the open "what is aiko,
+given VeilidChat is the reference sovereign E2EE chat?" question in
+`aiko_chat_app` design #11.
 
 ### Who is on the hook: operator vs. author (and the content-blind-infra rule)
 
@@ -444,6 +498,14 @@ CSAM"*, and you are liable wherever the content is available to end users.
    retraction?** The user-visible effect is identical (monotonic remove), but the
    operator obligations (purge plaintext, refer to AFP, preserve) differ. This may
    argue for a separate incident path rather than reusing the ordinary takedown UI.
+
+6. **The E2EE fork (the deepest one): does aiko keep a plaintext, moderatable gateway,
+   adopt E2EE (#25) and move to membership-based moderation, or run both per-channel?**
+   Server-side takedown/retraction and end-to-end confidentiality cannot coexist on one
+   channel. This decision sits upstream of everything else here and of the "what is aiko
+   vs VeilidChat" question in `aiko_chat_app` design #11. It is an architecture call, not
+   a legal one — but it flips the legal posture (E2EE moves aiko into the encryption
+   carve-out at the cost of gateway moderation).
 
 ## What we do **not** claim
 
