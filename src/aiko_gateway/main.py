@@ -221,6 +221,7 @@ app.state.gw = state  # the WS endpoint reaches bus + hub via websocket.app.stat
 from .middleware import ContentSizeLimitMiddleware  # noqa: E402
 app.add_middleware(ContentSizeLimitMiddleware, max_bytes=settings.max_request_bytes)
 
+from .rest import agents as agent_routes  # noqa: E402
 from .rest import auth as auth_routes  # noqa: E402
 from .rest import channels as channel_routes  # noqa: E402
 from .rest import communities as community_routes  # noqa: E402
@@ -238,6 +239,7 @@ from .rest.errors import register_error_handlers  # noqa: E402
 register_error_handlers(app)  # structured ban-403 body (single door, mirrors tests)
 app.include_router(auth_routes.router)
 app.include_router(auth_routes.me_router)
+app.include_router(agent_routes.router)
 app.include_router(channel_routes.router)
 app.include_router(community_routes.router)
 app.include_router(device_routes.router)

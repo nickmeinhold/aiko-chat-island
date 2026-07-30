@@ -44,9 +44,9 @@ from aiko_gateway.domain import (
     accounts_service, devices_service, moderation_service,
     signing_keys_service, users_service)
 from aiko_gateway.domain.models import (
-    DEFAULT_COMMUNITY_ID, Channel, Community, CommunityMembership, Membership,
-    Message, MessageReport, PasskeyCredential, PendingRecovery, RecoveryApprover,
-    RecoveryPolicy, SigningKey, SocialIdentity, User)
+    DEFAULT_COMMUNITY_ID, AgentBinding, Channel, Community, CommunityMembership,
+    Membership, Message, MessageReport, PasskeyCredential, PendingRecovery,
+    RecoveryApprover, RecoveryPolicy, SigningKey, SocialIdentity, User)
 from aiko_gateway.domain.ids import new_ulid
 
 
@@ -97,6 +97,7 @@ EXPECTED_USERS_FK_COLUMNS: set[tuple[str, str]] = {
     ("recovery_policies", "user_id"),         # delete (Design 05)
     ("recovery_approvers", "user_id"),        # delete (Design 05)
     ("pending_recovery", "user_id"),          # delete (Design 05)
+    ("agent_bindings", "user_id"),            # delete (Citizenship H1)
 }
 
 
@@ -215,6 +216,16 @@ async def _seed_full_user_graph(session):
         veto_deadline=dt.datetime(2026, 7, 14, tzinfo=dt.timezone.utc),
         finalize_token_hash="0" * 64,
         created_at=dt.datetime(2026, 7, 11, tzinfo=dt.timezone.utc)))
+    # agent_bindings.user_id (Citizenship H1) — an AgentBinding is an FK child of
+    # users; deletion must tear it down (children-before-parent). Seeded against the
+    # primary user (the FK only requires a users.id target; kind is irrelevant to the
+    # cascade), so the precondition/post-condition loops cover this column too.
+    session.add(AgentBinding(
+        id="AB".ljust(26, "0"), user_id=user.id,
+        repository="owner/repo", ref="refs/heads/main",
+        workflow_ref="owner/repo/.github/workflows/x.yml@refs/heads/main",
+        aud="aiko-island",
+        created_at=dt.datetime(2026, 7, 30, tzinfo=dt.timezone.utc)))
     await session.commit()
     return user, other
 
