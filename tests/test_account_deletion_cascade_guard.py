@@ -222,7 +222,8 @@ async def _seed_full_user_graph(session):
     # cascade), so the precondition/post-condition loops cover this column too.
     session.add(AgentBinding(
         id="AB".ljust(26, "0"), user_id=user.id,
-        repository="owner/repo", ref="refs/heads/main",
+        repository="owner/repo", repository_id="1", repository_owner_id="2",
+        ref="refs/heads/main",
         workflow_ref="owner/repo/.github/workflows/x.yml@refs/heads/main",
         aud="aiko-island",
         created_at=dt.datetime(2026, 7, 30, tzinfo=dt.timezone.utc)))

@@ -42,6 +42,8 @@ _KID = "gh-test-key-1"
 _ISS = "https://token.actions.githubusercontent.com"
 _AUD = "aiko-island"
 _REPO = "nickmeinhold/aiko-chat-app"
+_REPO_ID = "638902173"
+_REPO_OWNER_ID = "9919"
 _REF = "refs/heads/main"
 _WORKFLOW_REF = "nickmeinhold/aiko-chat-app/.github/workflows/agent.yml@refs/heads/main"
 
@@ -66,8 +68,9 @@ def _now() -> int:
 def _oidc(rsa_key, **overrides) -> str:
     claims = {
         "iss": _ISS, "aud": _AUD, "sub": f"repo:{_REPO}:ref:{_REF}",
-        "repository": _REPO, "ref": _REF, "workflow_ref": _WORKFLOW_REF,
-        "iat": _now(), "exp": _now() + 600,
+        "repository": _REPO, "repository_id": _REPO_ID,
+        "repository_owner_id": _REPO_OWNER_ID, "ref": _REF,
+        "workflow_ref": _WORKFLOW_REF, "iat": _now(), "exp": _now() + 600,
     }
     claims.update(overrides)
     return jwt.encode(claims, rsa_key, algorithm="RS256", headers={"kid": _KID})
@@ -84,10 +87,13 @@ async def _user(session, username: str, *, banned: bool = False) -> User:
     return u
 
 
-async def _bind(session, *, aud=_AUD, repository=_REPO, ref=_REF,
+async def _bind(session, *, aud=_AUD, repository=_REPO, repository_id=_REPO_ID,
+                repository_owner_id=_REPO_OWNER_ID, ref=_REF,
                 workflow_ref=_WORKFLOW_REF) -> tuple[User, object]:
     return await agents_service.create_agent_binding(
-        session, repository=repository, ref=ref, workflow_ref=workflow_ref, aud=aud)
+        session, repository=repository, repository_id=repository_id,
+        repository_owner_id=repository_owner_id, ref=ref,
+        workflow_ref=workflow_ref, aud=aud)
 
 
 def _auth(user: User) -> dict:
@@ -133,10 +139,13 @@ async def test_duplicate_binding_conflicts(session):
 
 
 @pytest.mark.parametrize("bad", [
-    {"repository": " "}, {"ref": ""}, {"workflow_ref": "  "}, {"aud": ""},
+    {"repository": " "}, {"repository_id": ""}, {"repository_owner_id": "  "},
+    {"ref": ""}, {"workflow_ref": "  "}, {"aud": ""},
 ])
 async def test_blank_binding_field_rejected(session, bad):
-    kwargs = dict(repository=_REPO, ref=_REF, workflow_ref=_WORKFLOW_REF, aud=_AUD)
+    kwargs = dict(repository=_REPO, repository_id=_REPO_ID,
+                  repository_owner_id=_REPO_OWNER_ID, ref=_REF,
+                  workflow_ref=_WORKFLOW_REF, aud=_AUD)
     kwargs.update(bad)
     with pytest.raises(agents_service.InvalidBinding):
         await agents_service.create_agent_binding(session, **kwargs)
@@ -183,24 +192,85 @@ async def test_aud_as_list_matches(session, wired):
     assert resolved.kind == "agent"
 
 
+async def test_wrong_repository_id_rejected(session, wired):
+    """Finding 1: a token carrying the bound repo NAME but a DIFFERENT repository_id
+    (a recycled/transferred slug pointing at a different underlying repo) is REJECTED.
+    The immutable numeric id — not the mutable name — is the authorization root."""
+    await _bind(session, repository_id="638902173")
+    tok = _oidc(wired, repository_id="999999999")  # same NAME, different immutable id
+    with pytest.raises(agents_service.AgentNotBound):
+        await agents_service.authenticate_agent_oidc(session, tok)
+
+
+async def test_wrong_repository_owner_id_rejected(session, wired):
+    """Finding 1: same repo name + repo id story for the OWNER id — a transfer that
+    keeps the slug but changes the owner (fresh owner id) is rejected."""
+    await _bind(session, repository_owner_id="9919")
+    tok = _oidc(wired, repository_owner_id="424242")
+    with pytest.raises(agents_service.AgentNotBound):
+        await agents_service.authenticate_agent_oidc(session, tok)
+
+
+async def test_binding_to_non_agent_user_rejected(session, wired):
+    """Finding 3: defense-in-depth — if a binding's user_id points at a NON-agent row
+    (FK/data drift), the door fails closed rather than minting an aiko token for a
+    human identity. We simulate drift by re-pointing the binding at a human user."""
+    agent, binding = await _bind(session)
+    human = await _user(session, "a-human")
+    binding.user_id = human.id
+    await session.commit()
+    with pytest.raises(agents_service.AgentBindingDangling):
+        await agents_service.authenticate_agent_oidc(session, _oidc(wired))
+
+
+async def test_banned_agent_denied_at_service_layer(session, wired):
+    """Finding 4: the ban gate lives INSIDE the auth mutator, so a banned agent is
+    denied at the service layer (AgentBanned) — not only at the REST ban check. A
+    future internal caller of authenticate_agent_oidc can't skip it."""
+    agent, _ = await _bind(session)
+    agent.banned_at = dt.datetime.now(dt.timezone.utc)
+    await session.commit()
+    with pytest.raises(agents_service.AgentBanned):
+        await agents_service.authenticate_agent_oidc(session, _oidc(wired))
+
+
 # ============================================================================
 # HTTP: admin-gated binding + public token exchange
 # ============================================================================
 
+def _body(**overrides) -> dict:
+    b = {"repository": _REPO, "repository_id": _REPO_ID,
+         "repository_owner_id": _REPO_OWNER_ID, "ref": _REF,
+         "workflow_ref": _WORKFLOW_REF, "aud": _AUD}
+    b.update(overrides)
+    return b
+
+
 async def test_binding_endpoint_admin_gated(client, session, monkeypatch):
     plain = await _user(session, "plain")
-    monkeypatch.setattr(settings, "moderator_user_ids", [])  # nobody is admin
-    body = {"repository": _REPO, "ref": _REF, "workflow_ref": _WORKFLOW_REF, "aud": _AUD}
+    monkeypatch.setattr(settings, "agent_binding_admin_ids", [])  # nobody is admin
+    body = _body()
     # unauthenticated → 401/403; authed non-admin → 403
     assert (await client.post("/v1/agents/bindings", json=body)).status_code in (401, 403)
     r = await client.post("/v1/agents/bindings", json=body, headers=_auth(plain))
     assert r.status_code == 403
 
 
+async def test_binding_endpoint_not_reused_moderator_role(client, session, monkeypatch):
+    """Finding 6: minting a production agent identity does NOT reuse the content-
+    moderator role. A configured MODERATOR who is NOT in AGENT_BINDING_ADMINS is
+    forbidden; only the dedicated allowlist opens the door."""
+    mod = await _user(session, "mod-only")
+    monkeypatch.setattr(settings, "moderator_user_ids", [mod.id])  # a real moderator
+    monkeypatch.setattr(settings, "agent_binding_admin_ids", [])   # but not a binding admin
+    r = await client.post("/v1/agents/bindings", json=_body(), headers=_auth(mod))
+    assert r.status_code == 403
+
+
 async def test_admin_creates_binding_then_agent_mints_token(client, session, monkeypatch, wired):
     mod = await _user(session, "mod")
-    monkeypatch.setattr(settings, "moderator_user_ids", [mod.id])
-    body = {"repository": _REPO, "ref": _REF, "workflow_ref": _WORKFLOW_REF, "aud": _AUD}
+    monkeypatch.setattr(settings, "agent_binding_admin_ids", [mod.id])
+    body = _body()
 
     r = await client.post("/v1/agents/bindings", json=body, headers=_auth(mod))
     assert r.status_code == 201, r.text
@@ -216,6 +286,40 @@ async def test_admin_creates_binding_then_agent_mints_token(client, session, mon
     assert "refresh_token" not in tr.json()  # short-lived access only, no refresh
     sub, _gen = security.decode_token(access, expected_type="access")
     assert sub == agent_user_id
+
+
+async def test_duplicate_binding_endpoint_returns_409(client, session, monkeypatch):
+    """Finding 5: the duplicate is caught by an explicit get_binding pre-check that
+    returns a clean 409 BEFORE the insert — engine-portable, not dependent on parsing a
+    raw SQLite error string (which would 500 on Postgres)."""
+    mod = await _user(session, "mod2")
+    monkeypatch.setattr(settings, "agent_binding_admin_ids", [mod.id])
+    first = await client.post("/v1/agents/bindings", json=_body(), headers=_auth(mod))
+    assert first.status_code == 201, first.text
+    dup = await client.post("/v1/agents/bindings", json=_body(), headers=_auth(mod))
+    assert dup.status_code == 409, dup.text
+
+
+async def test_token_endpoint_malformed_aud_is_401_not_500(client, session, wired):
+    """Finding 2: a SIGNED token whose `aud` is a non-str/non-list value fails closed
+    as a 401 at the door (the verify boundary's type-guard), never a 500 from
+    `list(token_aud)` in the audience match."""
+    await _bind(session)
+    tok = _oidc(wired, aud={"weird": "object"})
+    r = await client.post("/v1/agents/token", json={"oidc_token": tok})
+    assert r.status_code == 401, r.text
+
+
+async def test_token_endpoint_wrong_repo_id_is_401(client, session, monkeypatch, wired):
+    """Finding 1 at the HTTP door: same repo NAME, different repository_id → opaque 401
+    (indistinguishable from an unbound token)."""
+    mod = await _user(session, "mod3")
+    monkeypatch.setattr(settings, "agent_binding_admin_ids", [mod.id])
+    r = await client.post("/v1/agents/bindings", json=_body(), headers=_auth(mod))
+    assert r.status_code == 201, r.text
+    tok = _oidc(wired, repository_id="111111111")
+    tr = await client.post("/v1/agents/token", json={"oidc_token": tok})
+    assert tr.status_code == 401, tr.text
 
 
 async def test_token_endpoint_unbound_is_401_and_creates_no_user(client, session, wired):

@@ -14,6 +14,7 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ..config import settings
 from ..db import SessionLocal
 from ..domain import auth_session, moderation_service
 from ..domain.models import User
@@ -65,3 +66,23 @@ async def require_moderator(user: CurrentUser) -> User:
 
 
 ModeratorUser = Annotated[User, Depends(require_moderator)]
+
+
+async def require_agent_binding_admin(user: CurrentUser) -> User:
+    """Gate for minting a PRODUCTION agent identity (POST /v1/agents/bindings).
+
+    A HIGHER-privilege act than content moderation: it forges a first-class citizen
+    that authenticates by OIDC and can post as an aiko agent. The cage-match (2/3
+    families, MAJOR) flagged reusing the content-moderator role for identity minting,
+    but this island has no role MORE privileged than moderator — so this is the
+    smallest fail-closed hardening: a DISTINCT config allowlist
+    (settings.agent_binding_admin_ids, env AGENT_BINDING_ADMINS), fail-closed empty
+    (403 for everyone until an operator names an admin). A first-class admin role is a
+    deferred decision (see the config comment). Depends on CurrentUser so auth + ban
+    are already enforced; 403 for a non-admin — opaque, no existence leak."""
+    if user.id not in settings.agent_binding_admin_ids:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "not an agent-binding admin")
+    return user
+
+
+AgentBindingAdmin = Annotated[User, Depends(require_agent_binding_admin)]

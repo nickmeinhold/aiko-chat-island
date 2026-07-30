@@ -113,6 +113,17 @@ class Settings(BaseSettings):
     # apple_client_ids. Config, not a role system: full role machinery (invite
     # co-mods, audit log) is deferred until there's a second moderator.
     moderator_user_ids: list[str] = []
+    # Agent-binding admins (Citizenship H1, #2403). User ids (ULIDs) permitted to MINT
+    # a production agent identity via POST /v1/agents/bindings. This is a HIGHER-
+    # privilege act than content moderation (it forges a first-class citizen that can
+    # post as an aiko agent), so it deliberately does NOT reuse moderator_user_ids —
+    # the cage-match flagged reusing the content-moderator role for identity minting.
+    # Fail-closed empty: an island with no configured binding-admin can provision NO
+    # agents (require_agent_binding_admin 403s everyone), exactly like the moderator
+    # gate. Config, not a role system (a first-class admin role is a follow-up
+    # decision); JSON array in the env (AGENT_BINDING_ADMINS), mirroring
+    # moderator_user_ids.
+    agent_binding_admin_ids: list[str] = []
     # Provisioning token TTL: a brand-new social user gets a short-lived signed
     # token (NOT a DB row) to carry (provider, sub, suggested name/email) from the
     # verify step to the handle-claim step. Short window — it's a one-step

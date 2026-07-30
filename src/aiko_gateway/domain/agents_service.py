@@ -51,26 +51,55 @@ class AgentNotBound(Exception):
 
 
 class AgentBindingDangling(Exception):
-    """The matched binding points at a user_id that no longer exists (should be
-    impossible — created in one txn, no agent-deletion path yet). Fail closed."""
+    """The matched binding points at a user_id that no longer exists, OR the resolved
+    user is not kind='agent' (should both be impossible — the agent User is created in
+    one txn with the binding and kind is server-authoritative). Fail closed: a data-
+    drift / FK anomaly must never mint a token, so this maps to the same opaque 401."""
+
+
+class AgentBanned(Exception):
+    """The resolved agent identity is suspended (``banned_at`` set). Raised INSIDE the
+    auth mutator (not only at the REST layer) so no caller — a future internal path
+    included — can mint a token for a banned agent by skipping the REST ban gate. The
+    caller maps this to 403 account_suspended, the same treatment a banned human gets."""
 
 
 async def create_agent_binding(
-    session: AsyncSession, *, repository: str, ref: str, workflow_ref: str,
+    session: AsyncSession, *, repository: str, repository_id: str,
+    repository_owner_id: str, ref: str, workflow_ref: str,
     aud: str, display_name: str = "",
 ) -> tuple[User, AgentBinding]:
     """Provision a NEW agent identity bound to a GitHub Actions workload. Admin-gated
     at the REST layer. Creates a ``kind='agent'`` User (auto handle ``agent-<hex>``,
     cosmetic — an agent authenticates by OIDC, never by name) and the binding row in
     ONE transaction, so a binding never dangles. Raises ``InvalidBinding`` on a blank
-    field and ``BindingConflict`` if the triple is already bound."""
+    field and ``BindingConflict`` if the triple is already bound.
+
+    ``repository_id`` / ``repository_owner_id`` are GitHub's IMMUTABLE numeric ids for
+    the repo and its owner (the admin reads them from the repo's API/OIDC sample). The
+    OIDC door authorizes on THESE, not on the mutable ``repository`` name — so a
+    recycled or transferred repo slug can never mint this identity."""
     repository = (repository or "").strip()
+    repository_id = (repository_id or "").strip()
+    repository_owner_id = (repository_owner_id or "").strip()
     ref = (ref or "").strip()
     workflow_ref = (workflow_ref or "").strip()
     aud = (aud or "").strip()
-    if not (repository and ref and workflow_ref and aud):
+    if not (repository and repository_id and repository_owner_id
+            and ref and workflow_ref and aud):
         raise InvalidBinding(
-            "repository, ref, workflow_ref, and aud are all required and non-blank")
+            "repository, repository_id, repository_owner_id, ref, workflow_ref, and "
+            "aud are all required and non-blank")
+
+    # PORTABLE duplicate detection: an explicit pre-check that returns BindingConflict
+    # (→ 409) BEFORE the insert, independent of any engine's error-string format. The
+    # try/except below stays as the RACE backstop for two concurrent creates that both
+    # pass this check; on SQLite (dev+prod) it classifies by column name. The pre-check
+    # is what keeps a duplicate from becoming a 500 on Postgres.
+    existing = await get_binding(
+        session, repository=repository, ref=ref, workflow_ref=workflow_ref)
+    if existing is not None:
+        raise BindingConflict()
 
     # A fresh agent handle. agent-<12 hex> against a near-empty users table — a genuine
     # username/aiko_username collision is vanishingly unlikely, and the UNIQUE
@@ -88,6 +117,8 @@ async def create_agent_binding(
     binding = AgentBinding(
         id=new_ulid(),
         repository=repository,
+        repository_id=repository_id,
+        repository_owner_id=repository_owner_id,
         ref=ref,
         workflow_ref=workflow_ref,
         aud=aud,
@@ -99,13 +130,13 @@ async def create_agent_binding(
         await session.commit()
     except IntegrityError as e:
         await session.rollback()
-        # Classify from the SQLite message, which names the COLUMN(S), not the
-        # constraint name: a triple collision reads "UNIQUE constraint failed:
-        # agent_bindings.repository, agent_bindings.ref, agent_bindings.workflow_ref"
-        # (mirrors users_service._is_credential_id_conflict's table.column match).
-        # SQLite is the sole engine in dev AND prod (CLAUDE.md), so this is safe. A
-        # users.username/aiko_username auto-handle clash names a DIFFERENT table, so
-        # it won't match here and re-raises — the admin retries (astronomically rare).
+        # RACE backstop (the pre-check above handles the ordinary duplicate). Classify
+        # from the SQLite message, which names the COLUMN(S), not the constraint name:
+        # a triple collision reads "UNIQUE constraint failed: agent_bindings.repository,
+        # agent_bindings.ref, agent_bindings.workflow_ref" (mirrors users_service.
+        # _is_credential_id_conflict's table.column match). SQLite is the sole engine in
+        # dev AND prod (CLAUDE.md); on any other engine the pre-check already caught the
+        # non-racing duplicate, so this path only fires on a true concurrent insert.
         if "agent_bindings.repository" in str(getattr(e, "orig", e)):
             raise BindingConflict() from e
         raise
@@ -156,6 +187,15 @@ async def authenticate_agent_oidc(session: AsyncSession, oidc_token: str) -> Use
         workflow_ref=claims.workflow_ref)
     if binding is None:
         raise AgentNotBound()
+    # IMMUTABLE-identity gate: the mutable repo NAME located the binding, but a rename /
+    # transfer / slug-recycle can point a DIFFERENT repo at that name. Authorize on the
+    # signature-verified numeric ids GitHub never reuses. A mismatch collapses into the
+    # SAME opaque AgentNotBound as an absent binding (no oracle about what's provisioned).
+    # constant-time compare: not secret, but the codebase compares auth strings this way.
+    if not (hmac.compare_digest(claims.repository_id, binding.repository_id)
+            and hmac.compare_digest(
+                claims.repository_owner_id, binding.repository_owner_id)):
+        raise AgentNotBound()
     # Audience: the token must carry the aud the operator declared for this binding.
     # A mismatch is collapsed into the SAME AgentNotBound as an absent binding — a
     # token minted for a different aud in a bound repo learns nothing (no oracle).
@@ -165,4 +205,16 @@ async def authenticate_agent_oidc(session: AsyncSession, oidc_token: str) -> Use
     user = await users_service.get_by_id(session, binding.user_id)
     if user is None:
         raise AgentBindingDangling()
+    # Defense-in-depth vs FK/data drift: the resolved row MUST be an agent. The binding
+    # only ever points at a kind='agent' User (created in one txn), so a non-agent here
+    # means a corrupted/re-pointed row — fail closed rather than mint an aiko token for
+    # a human identity via the agent door.
+    if user.kind != Kind.AGENT:
+        raise AgentBindingDangling()
+    # Ban gate INSIDE the mutator (not only at REST): a suspended agent is denied a
+    # fresh token here, so no caller — REST today, a future internal path tomorrow —
+    # can mint by skipping the REST ban check. Same banned_at the human ban machinery
+    # sets; the caller maps AgentBanned to 403 account_suspended.
+    if users_service.is_banned(user):
+        raise AgentBanned()
     return user

@@ -14,8 +14,11 @@ in the exact spirit of ``domain/oauth.py`` (the social-verify boundary):
   3. iss        — pinned MANUALLY to ``https://token.actions.githubusercontent.com``
                   after decode (version-robust; PyJWT multi-iss handling varies).
   4. exp/iat    — required and enforced by PyJWT.
-  5. claims     — ``repository``, ``ref``, ``workflow_ref``, ``sub``, ``aud`` are all
-                  REQUIRED; a token missing any of them is rejected (not a KeyError).
+  5. claims     — ``repository``, ``repository_id``, ``repository_owner_id``, ``ref``,
+                  ``workflow_ref``, ``sub``, ``aud`` are all REQUIRED; a token missing
+                  any of them is rejected (not a KeyError). ``aud`` is also TYPE-guarded
+                  (str or list[str]) so a malformed-but-signed aud fails closed at 401
+                  rather than 500-ing in the caller's audience match.
 
 WHAT THIS MODULE DOES NOT DO — the audience + binding decision lives one layer up
 (``agents_service``), and it MUST: the audience the token must carry is per-binding
@@ -93,11 +96,16 @@ class GitHubOidcClaims:
     """The signature-verified subset the agent door acts on. ``aud`` is the RAW claim
     (a str, or a list per the JWT spec) — NOT yet checked against any binding; the
     caller does that. ``sub`` is GitHub's ``repo:owner/repo:...`` subject, carried for
-    tracing/audit only."""
+    tracing/audit only. ``repository_id`` / ``repository_owner_id`` are GitHub's
+    IMMUTABLE numeric ids (emitted as strings) — the caller authorizes on THESE, not on
+    the mutable ``repository`` NAME, so a recycled/transferred slug cannot mint an old
+    identity."""
     repository: str
     ref: str
     workflow_ref: str
     sub: str
+    repository_id: str
+    repository_owner_id: str
     aud: str | list[str]
 
 
@@ -142,7 +150,8 @@ async def verify_github_oidc_token(token: str) -> GitHubOidcClaims:
             algorithms=["RS256"],
             options={
                 "require": ["exp", "iat", "sub", "aud", "iss",
-                            "repository", "ref", "workflow_ref"],
+                            "repository", "repository_id", "repository_owner_id",
+                            "ref", "workflow_ref"],
                 "verify_aud": False,
             },
         )
@@ -162,13 +171,28 @@ async def verify_github_oidc_token(token: str) -> GitHubOidcClaims:
     ref = claims.get("ref")
     workflow_ref = claims.get("workflow_ref")
     sub = claims.get("sub")
+    repository_id = claims.get("repository_id")
+    repository_owner_id = claims.get("repository_owner_id")
     aud = claims.get("aud")
     if not (isinstance(repository, str) and isinstance(ref, str)
-            and isinstance(workflow_ref, str) and isinstance(sub, str)):
+            and isinstance(workflow_ref, str) and isinstance(sub, str)
+            and isinstance(repository_id, str) and isinstance(repository_owner_id, str)):
         log.warning("agent.oidc: REJECT non-string identity claim")
         raise InvalidOidcToken("malformed identity claims")
+
+    # aud TYPE-GUARD: the caller does `list(token_aud)`/per-candidate compare, so a
+    # signed token with a non-str/non-list-of-str aud (e.g. a number or object) would
+    # crash there with a 500. Reject it fail-closed as a malformed token (401) HERE,
+    # at the verify boundary, rather than letting a malformed-but-signed shape reach
+    # the audience match. (`verify_aud=False` above only skips MATCHING aud, not
+    # validating its TYPE.)
+    if not (isinstance(aud, str)
+            or (isinstance(aud, list) and all(isinstance(a, str) for a in aud))):
+        log.warning("agent.oidc: REJECT malformed aud claim type %s", type(aud).__name__)
+        raise InvalidOidcToken("malformed aud claim")
 
     log.info("agent.oidc: OK repository=%s workflow_ref=%s sub=%s",
              _fingerprint(repository), _fingerprint(workflow_ref), _fingerprint(sub))
     return GitHubOidcClaims(
-        repository=repository, ref=ref, workflow_ref=workflow_ref, sub=sub, aud=aud)
+        repository=repository, ref=ref, workflow_ref=workflow_ref, sub=sub,
+        repository_id=repository_id, repository_owner_id=repository_owner_id, aud=aud)

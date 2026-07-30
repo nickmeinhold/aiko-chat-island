@@ -26,6 +26,8 @@ _KID = "gh-test-key-1"
 _ISS = "https://token.actions.githubusercontent.com"
 _AUD = "aiko-island"
 _REPO = "nickmeinhold/aiko-chat-app"
+_REPO_ID = "638902173"
+_REPO_OWNER_ID = "9919"
 _REF = "refs/heads/main"
 _WORKFLOW_REF = "nickmeinhold/aiko-chat-app/.github/workflows/agent.yml@refs/heads/main"
 
@@ -57,6 +59,8 @@ def _make_token(rsa_key, *, alg="RS256", kid=_KID, key=None, **overrides) -> str
         "aud": _AUD,
         "sub": f"repo:{_REPO}:ref:{_REF}",
         "repository": _REPO,
+        "repository_id": _REPO_ID,
+        "repository_owner_id": _REPO_OWNER_ID,
         "ref": _REF,
         "workflow_ref": _WORKFLOW_REF,
         "iat": _now(),
@@ -73,6 +77,8 @@ def _make_token(rsa_key, *, alg="RS256", kid=_KID, key=None, **overrides) -> str
 async def test_valid_token_returns_claims(wired):
     claims = await github_oidc.verify_github_oidc_token(_make_token(wired))
     assert claims.repository == _REPO
+    assert claims.repository_id == _REPO_ID
+    assert claims.repository_owner_id == _REPO_OWNER_ID
     assert claims.ref == _REF
     assert claims.workflow_ref == _WORKFLOW_REF
     assert claims.aud == _AUD
@@ -144,9 +150,34 @@ async def test_unknown_kid_rejected(wired):
         await github_oidc.verify_github_oidc_token(token)
 
 
-@pytest.mark.parametrize("missing", ["repository", "ref", "workflow_ref", "sub"])
+@pytest.mark.parametrize("missing", [
+    "repository", "repository_id", "repository_owner_id", "ref", "workflow_ref", "sub",
+])
 async def test_missing_required_claim_rejected(wired, missing):
     token = _make_token(wired, **{missing: ...})  # ... deletes the claim
+    with pytest.raises(github_oidc.InvalidOidcToken):
+        await github_oidc.verify_github_oidc_token(token)
+
+
+@pytest.mark.parametrize("bad_aud", [
+    123,                       # a number
+    {"x": 1},                  # an object
+    ["ok", 7],                 # a list with a non-string element
+    None,                      # explicit null (present but wrong type)
+])
+async def test_malformed_aud_rejected_not_500(wired, bad_aud):
+    """A SIGNED token whose `aud` is neither str nor list[str] must fail CLOSED as an
+    InvalidOidcToken (→ 401 at the caller), never reach the audience match and 500 on
+    `list(token_aud)`. The type-guard lives in the verify boundary."""
+    token = _make_token(wired, aud=bad_aud)
+    with pytest.raises(github_oidc.InvalidOidcToken):
+        await github_oidc.verify_github_oidc_token(token)
+
+
+async def test_non_string_repository_id_rejected(wired):
+    """repository_id present but a NUMBER (not GitHub's string form) is a malformed
+    identity claim — rejected, not silently coerced."""
+    token = _make_token(wired, repository_id=638902173)
     with pytest.raises(github_oidc.InvalidOidcToken):
         await github_oidc.verify_github_oidc_token(token)
 
