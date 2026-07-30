@@ -507,6 +507,21 @@ CSAM"*, and you are liable wherever the content is available to end users.
    a legal one — but it flips the legal posture (E2EE moves aiko into the encryption
    carve-out at the cost of gateway moderation).
 
+   **A "third point on the axis" was investigated and rejected** (crucible
+   `docs/crucible/08-confidential-moderation/`, 2026-07-30): an operator-blind
+   TEE/enclave LLM moderator that reads E2EE plaintext inside a hardware cage and emits
+   only signed verdicts, aiming for confidential-AND-moderatable. **Invalidated at
+   research:** a TEE does not protect a key from a motivated *host* with physical
+   access (BadRAM ~$10, TEE.Fail <$1k both extract keys and forge attestation on
+   SEV-SNP/TDX; vendors put physical attacks out of scope), credible attestation is a
+   large-org capability a solo self-hoster can't reproduce, and colluding parties defeat
+   any content-readable detector by layering their own encryption ("any scheme that can
+   detect the content could break encryption generally"). **Takeaway for this fork:
+   confidential-from-a-motivated-adversary AND readable-by-a-moderator is likely close
+   to information-theoretically impossible — the axis above is a *true* dichotomy, not a
+   line with a buildable midpoint.** So question 6 is a genuine either/or, not a
+   both-and awaiting cleverer crypto.
+
 ## What we do **not** claim
 
 Two claims were tested and **refuted** by the verification pass; they are excluded
