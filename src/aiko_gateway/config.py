@@ -357,7 +357,12 @@ class Settings(BaseSettings):
             # The island identity key is a trust root (it signs the self-manifest);
             # a prod boot on the dev default would let anyone who read this repo sign
             # a manifest for this island. Same fail-closed posture as jwt_secret.
-            if self.island_signing_seed.strip() == _DEV_ISLAND_SEED:
+            # Compare the decoded KEY BYTES, not the spelling: the guard's intent is
+            # "don't run on the dev KEY", and a byte compare is robust to any base64url
+            # aliasing independently of the (now canonical) decoder — the seed already
+            # decoded cleanly at the top of this validator, so decode_seed is safe here.
+            from .domain.island_identity import decode_seed as _decode_seed
+            if _decode_seed(self.island_signing_seed) == _decode_seed(_DEV_ISLAND_SEED):
                 raise ValueError(
                     "island_signing_seed is still the dev default in a production "
                     f"environment (environment={self.environment!r}). Refusing to "

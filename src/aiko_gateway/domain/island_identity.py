@@ -149,6 +149,12 @@ def _check_identity_tuple(
             raise IslandIdentityError(f"manifest {name} must be a string")
         if len(val) > cap:
             raise IslandIdentityError(f"manifest {name} too long ({len(val)} > {cap})")
+        # Non-empty (symmetric with peers_service.coerce_island, which rejects empty
+        # id/name/url for a directory peer): a hollow id/base_url is a vacuous
+        # navigation target, never a valid island — fail closed at the codec so the
+        # A4 door can't sign or accept one.
+        if not val:
+            raise IslandIdentityError(f"manifest {name} must be non-empty")
     if mode not in VALID_MODES:
         raise IslandIdentityError(
             f"manifest mode {mode!r} is not one of {sorted(VALID_MODES)}")

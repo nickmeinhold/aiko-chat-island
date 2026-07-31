@@ -288,6 +288,21 @@ def test_b64url_raw_rejects_overlong():
         signing.b64url_raw("a" * 500, expect_len=32, field="t")
 
 
+def test_verify_rejects_empty_identity_fields():
+    # A hollow id/base_url is a vacuous navigation target — reject at the codec so the
+    # A4 door can't accept one (symmetric with coerce_island's non-empty rule).
+    for field in ("id", "base_url", "display_name"):
+        m = _manifest()
+        m[field] = ""
+        with pytest.raises(ii.IslandIdentityError):
+            ii.verify_manifest(m)
+
+
+def test_build_rejects_empty_id():
+    with pytest.raises(ii.IslandIdentityError):
+        _manifest(id="")
+
+
 async def test_get_island_sets_no_store(client):
     r = await client.get("/v1/island")
     assert r.headers.get("cache-control") == "no-store"
