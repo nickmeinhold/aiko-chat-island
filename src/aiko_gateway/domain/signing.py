@@ -91,6 +91,31 @@ def _b58decode(s: str) -> bytes:
     return b"\x00" * pad + body
 
 
+def _b58encode(b: bytes) -> str:
+    """Minimal base58btc encode (no external dep) — the exact inverse of
+    ``_b58decode``. Preserves leading-zero bytes as leading '1's (the base58btc
+    convention ``_b58decode`` relies on to round-trip a Multikey's ``0xed01``
+    prefix, whose bytes are non-zero, plus any zero-leading raw key)."""
+    n_pad = len(b) - len(b.lstrip(b"\x00"))
+    num = int.from_bytes(b, "big")
+    out: list[str] = []
+    while num > 0:
+        num, rem = divmod(num, 58)
+        out.append(_B58_ALPHABET[rem])
+    return "1" * n_pad + "".join(reversed(out))
+
+
+def encode_multikey(raw: bytes) -> str:
+    """Encode a raw 32-byte ed25519 public key as a multibase-base58btc Multikey
+    (``z`` + base58btc(0xed01 ‖ 32 raw bytes)) — the inverse of ``decode_multikey``,
+    producing the SAME on-wire shape the app's message signer uses for user keys, so
+    an island's own identity key is one uniform format across the ecosystem. Raises
+    OriginError on a wrong-length input (fail closed — never emit a malformed key)."""
+    if len(raw) != PUBKEY_RAW_LEN:
+        raise OriginError(f"pubkey raw length {len(raw)} != {PUBKEY_RAW_LEN}")
+    return "z" + _b58encode(_MULTICODEC_ED25519 + raw)
+
+
 def decode_multikey(s: str) -> bytes:
     """Decode an ed25519 Multikey (`z` + base58btc(0xed01 ‖ 32 raw bytes)) to the
     raw 32-byte public key. The signed bytes use the RAW key, so this is what a

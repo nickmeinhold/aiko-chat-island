@@ -17,6 +17,13 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # guard below can never disagree (a prod boot with THIS value is rejected).
 _DEV_JWT_SECRET = "dev-insecure-change-me"
 
+# The dev-only island signing seed (unpadded base64url of the 32 bytes
+# b"aiko-dev-island-seed-DO-NOT-USE!"). Same posture as _DEV_JWT_SECRET: dev boots
+# on it frictionlessly; a production boot with THIS value is rejected (a real island
+# identity key must be operator-supplied via SOPS). Single source so the default and
+# the fail-closed guard can never disagree.
+_DEV_ISLAND_SEED = "YWlrby1kZXYtaXNsYW5kLXNlZWQtRE8tTk9ULVVTRSE"
+
 # Environments treated as non-production. Anything else (incl. unknown values
 # AND the absence of ENVIRONMENT, which defaults to "production" below) is
 # production-like — fail-closed: forgetting to declare the environment hardens
@@ -167,6 +174,32 @@ class Settings(BaseSettings):
     # How often the background gossip loop pulls each known peer's island directory and
     # merges. Takes effect only when gateway_gossip_enabled is true.
     gateway_gossip_interval_seconds: int = 300
+
+    # --- island identity + moderation mode (crucible-09 Phase A) ---
+    # The island's elected moderation posture, signed into its self-manifest
+    # (GET /v1/island) so it's HONEST and LEGIBLE to clients before a user speaks.
+    #   moderator = the shipped status quo made explicit: the gateway holds plaintext,
+    #              the report queue + #7 takedown/retraction machinery operate, and the
+    #              operator carries the scan/report duties (design note 07). Default,
+    #              because it matches both live islands' reality.
+    #   e2ee      = SCHEMA-RESERVED for Phase B (MLS client-side encryption). No
+    #              encryption exists yet, so advertising it would be the exact mislabel
+    #              this feature prevents (users believing E2EE while the operator reads
+    #              plaintext). It is HARD-REJECTED at boot in EVERY environment until
+    #              Phase B lands (see _harden_for_production) — the value is in the enum
+    #              only so the wire/type vocabulary is forward-stable, never selectable.
+    island_mode: Literal["moderator", "e2ee"] = "moderator"
+    # The island's long-lived Ed25519 identity key, as an unpadded-base64url 32-byte
+    # seed. Signs the self-manifest (island_identity.py). SECRET — supplied via the
+    # host .env (SOPS in deploy), NEVER committed. Dev default is _DEV_ISLAND_SEED; a
+    # production boot on that default is rejected (same fail-closed posture as
+    # jwt_secret). The private key never leaves the process; only the public Multikey
+    # + signatures are exposed.
+    island_signing_seed: str = _DEV_ISLAND_SEED
+    # The signing key's version, carried in the manifest for a future rotation
+    # lifecycle (#1865). Bumped when the seed is rotated so a verifier can tell keys
+    # apart. 1 until the first rotation.
+    island_key_version: int = 1
     # The app's Universal/App Link the browser is redirected back to after the
     # broker completes (carrying the handoff code, or an error indicator). This is
     # a FIXED config value — open-redirect defense: the final redirect target is
@@ -268,6 +301,34 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _harden_for_production(self) -> "Settings":
+        # A2 (crucible-09 Phase A): `e2ee` is schema-reserved for Phase B and
+        # HARD-REJECTED in EVERY environment until MLS lands. Advertising an
+        # unimplemented E2EE mode would be the exact mislabel this feature prevents
+        # (users believe E2EE while the gateway still holds plaintext). NOT
+        # prod-gated: a dev/test island advertising e2ee would lie to its client
+        # just the same (A3 reads the manifest in dev too). The value stays in the
+        # enum so the wire vocabulary is forward-stable — it is simply never bootable
+        # in Phase A. Phase B lifts this guard when real client-side encryption ships.
+        if self.island_mode == "e2ee":
+            raise ValueError(
+                "island_mode='e2ee' is not available in Phase A: no client-side "
+                "encryption is implemented yet, so advertising E2EE would mislead "
+                "users into believing their messages are unreadable by the operator "
+                "when the gateway still holds plaintext. The value is reserved for "
+                "Phase B (MLS). Refusing to boot — set ISLAND_MODE=moderator."
+            )
+        # The island identity seed must decode to a 32-byte Ed25519 seed in EVERY
+        # environment — a malformed key cannot sign the self-manifest, so fail closed
+        # at boot rather than 500 on the first GET /v1/island. Lazy import: this
+        # pulls in domain.island_identity -> domain.signing, and config is imported
+        # very early (peers_service imports it at module load); a top-level import
+        # would risk a config<->domain cycle.
+        from .domain.island_identity import IslandIdentityError, decode_seed
+        try:
+            decode_seed(self.island_signing_seed)
+        except IslandIdentityError as e:
+            raise ValueError(f"ISLAND_SIGNING_SEED is invalid: {e}") from e
+
         # Fail closed: a production boot must have a STRONG, non-default JWT
         # secret — otherwise anyone could mint valid tokens for any user_id.
         if self.is_production:
@@ -284,6 +345,19 @@ class Settings(BaseSettings):
                     f"(len={len(secret)} < {_MIN_PROD_SECRET_LEN}). Refusing to "
                     "boot — supply a JWT_SECRET of at least "
                     f"{_MIN_PROD_SECRET_LEN} chars."
+                )
+            # The island identity key is a trust root (it signs the self-manifest);
+            # a prod boot on the dev default would let anyone who read this repo sign
+            # a manifest for this island. Same fail-closed posture as jwt_secret.
+            if self.island_signing_seed.strip() == _DEV_ISLAND_SEED:
+                raise ValueError(
+                    "island_signing_seed is still the dev default in a production "
+                    f"environment (environment={self.environment!r}). Refusing to "
+                    "boot — supply a real ISLAND_SIGNING_SEED (32 random bytes as "
+                    "unpadded base64url, e.g. "
+                    "`python -c \"import os,base64; "
+                    "print(base64.urlsafe_b64encode(os.urandom(32)).rstrip(b'=').decode())\"`, "
+                    "via SOPS)."
                 )
             # No break-glass for open registration in prod: with I2 membership
             # not yet enforced, an open prod /register lets any self-created

@@ -35,6 +35,20 @@ os.environ.setdefault("ENVIRONMENT", "test")
 # still wins, mirroring the ENVIRONMENT handling above.
 os.environ.setdefault("JWT_SECRET", "test-secret-at-least-32-bytes-long!!")
 
+# Give the harness a real (non-dev) island signing seed, same posture as JWT_SECRET
+# above: config's _harden_for_production fail-closed-rejects the dev-default island
+# seed in a production-like environment (the seed is the island's manifest trust
+# root). Every prod-boot test would otherwise refuse boot on the dev default. A test
+# that specifically exercises the dev-seed rejection passes _DEV_ISLAND_SEED as an
+# explicit kwarg, which overrides this env value (init kwargs > env in
+# pydantic-settings). 32 bytes, unpadded base64url. setdefault so a CI-supplied seed
+# still wins.
+import base64 as _b64  # noqa: E402
+os.environ.setdefault(
+    "ISLAND_SIGNING_SEED",
+    _b64.urlsafe_b64encode(b"test-harness-island-seed-32byte!").rstrip(b"=").decode(),
+)
+
 import pytest_asyncio  # noqa: E402
 from sqlalchemy.ext.asyncio import (  # noqa: E402
     AsyncSession, async_sessionmaker, create_async_engine,
