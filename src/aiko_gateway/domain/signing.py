@@ -136,12 +136,17 @@ def decode_multikey(s: str) -> bytes:
     return raw
 
 
-def _b64url_raw(s: str, *, expect_len: int, field: str) -> bytes:
+def b64url_raw(s: str, *, expect_len: int, field: str) -> bytes:
     """Strictly decode UNPADDED base64url and assert an exact decoded length.
     Charset-gate before decoding — `base64.urlsafe_b64decode` is permissive
     (tolerates `=` padding and silently skips some junk), so without this an
     `=`-padded or standard-alphabet string could decode to the right length and
-    be echoed across the trust boundary as if canonical."""
+    be echoed across the trust boundary as if canonical.
+
+    Public so the island-identity trust boundary reuses the EXACT same strict
+    decoder (island seed = 32 bytes, island signature = 64 bytes) rather than a
+    private-regex reach or a permissive base64 call — one canonical-decode gate
+    across every Ed25519 boundary in the gateway."""
     if not _B64URL_UNPADDED_RE.match(s):
         raise OriginError(f"{field} must be unpadded base64url ([A-Za-z0-9_-], no '=')")
     try:
@@ -231,7 +236,7 @@ def validate_origin(raw: Any, *, frame_client_msg_id: str) -> dict | None:
     sig = raw["sig"]
     if not isinstance(sig, str) or len(sig) > _MAX_SIG_STR:
         raise OriginError("origin.sig must be a string within the size cap")
-    _b64url_raw(sig, expect_len=SIG_RAW_LEN, field="origin.sig")
+    b64url_raw(sig, expect_len=SIG_RAW_LEN, field="origin.sig")
 
     # Return a FRESH closed projection (exactly the required keys), not the
     # caller's dict — so the persisted/echoed JSON can't be mutated through a

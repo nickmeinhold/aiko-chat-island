@@ -157,3 +157,86 @@ async def test_get_island_is_public_no_auth(client):
     # Identity + mode are public discovery info (like /v1/islands) — no auth header.
     r = await client.get("/v1/island")
     assert r.status_code == 200
+
+
+async def test_get_island_503_when_no_self_identity(client, monkeypatch):
+    # No valid self identity configured → there is nothing authentic to sign, so the
+    # endpoint fails closed with 503 rather than emitting an unsigned/partial manifest.
+    from aiko_gateway.domain.peers_service import directory
+    monkeypatch.setattr(directory, "_self", None)
+    r = await client.get("/v1/island")
+    assert r.status_code == 503
+
+
+# --- verify is the strict mirror of validate_origin (fail-closed) ------------ #
+
+def test_verify_rejects_bad_alg_before_crypto():
+    # A forged manifest can carry a VALID signature over the identity tuple while
+    # advertising alg="none" (v/alg are outside the signed bytes) — the JWT
+    # alg-confusion class. Verify must refuse it, not return True/False from crypto.
+    m = _manifest()
+    m["alg"] = "none"
+    with pytest.raises(ii.IslandIdentityError):
+        ii.verify_manifest(m)
+
+
+def test_verify_rejects_bad_v():
+    m = _manifest()
+    m["v"] = 999
+    with pytest.raises(ii.IslandIdentityError):
+        ii.verify_manifest(m)
+
+
+def test_verify_rejects_extra_and_missing_keys():
+    m = _manifest()
+    m["surprise"] = "x"
+    with pytest.raises(ii.IslandIdentityError):
+        ii.verify_manifest(m)
+    m2 = _manifest()
+    del m2["base_url"]
+    with pytest.raises(ii.IslandIdentityError):
+        ii.verify_manifest(m2)
+
+
+def test_verify_rejects_wrong_length_signature():
+    # A 32-byte (not 64) signature must be a structural reject, not an uncaught
+    # ValueError out of Ed25519.verify.
+    m = _manifest()
+    m["signature"] = base64.urlsafe_b64encode(b"\x00" * 32).rstrip(b"=").decode()
+    with pytest.raises(ii.IslandIdentityError):
+        ii.verify_manifest(m)
+
+
+def test_verify_rejects_padded_signature():
+    # Permissive base64 would accept '='-padded / standard-alphabet; the strict
+    # decoder must not.
+    m = _manifest()
+    m["signature"] = base64.urlsafe_b64encode(b"\x00" * 64).decode()  # keeps '=' padding
+    with pytest.raises(ii.IslandIdentityError):
+        ii.verify_manifest(m)
+
+
+def test_verify_rejects_bool_and_oob_key_version():
+    # True is an int subclass that would pack as 1; an out-of-range int would raise
+    # struct.error. Both must be structural rejects.
+    for bad in (True, -1, 2**32):
+        m = _manifest()
+        m["key_version"] = bad
+        with pytest.raises(ii.IslandIdentityError):
+            ii.verify_manifest(m)
+
+
+def test_verify_rejects_bad_mode():
+    m = _manifest()
+    m["mode"] = "plaintext-lol"
+    with pytest.raises(ii.IslandIdentityError):
+        ii.verify_manifest(m)
+
+
+def test_build_rejects_bad_mode_and_key_version():
+    # The signing door itself refuses to mint a manifest for an unknown mode or an
+    # out-of-range key_version — a Phase B helper can't sign unvalidated vocabulary.
+    with pytest.raises(ii.IslandIdentityError):
+        _manifest(mode="bogus")
+    with pytest.raises(ii.IslandIdentityError):
+        _manifest(key_version=2**32)

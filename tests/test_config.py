@@ -393,6 +393,14 @@ def test_malformed_island_seed_rejected_all_env():
         Settings(_env_file=None, environment="dev", island_signing_seed="has spaces!")
 
 
+def test_island_key_version_out_of_u32_range_rejected_at_boot():
+    # The manifest packs key_version as a big-endian u32; an out-of-range value must
+    # fail closed at boot, not raise struct.error as a 500 on the first /v1/island.
+    for bad in (0, -1, 2**32):
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None, environment="dev", island_key_version=bad)
+
+
 def test_dev_accepts_the_dev_island_seed():
     # Local dev must stay frictionless: the dev-default seed boots in dev (only prod
     # rejects it). Passed explicitly because conftest seeds a real ISLAND_SIGNING_SEED

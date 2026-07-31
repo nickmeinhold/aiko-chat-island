@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Literal
 from urllib.parse import urlparse
 
-from pydantic import model_validator
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # The dev-only JWT secret. Single source so the default and the fail-closed
@@ -198,8 +198,11 @@ class Settings(BaseSettings):
     island_signing_seed: str = _DEV_ISLAND_SEED
     # The signing key's version, carried in the manifest for a future rotation
     # lifecycle (#1865). Bumped when the seed is rotated so a verifier can tell keys
-    # apart. 1 until the first rotation.
-    island_key_version: int = 1
+    # apart. 1 until the first rotation. Bounded to a u32 (ge=1): the manifest packs
+    # it as a big-endian u32 in the signing bytes, so an out-of-range value must fail
+    # CLOSED at boot (a clear ValidationError) rather than raising struct.error as a
+    # 500 on the first GET /v1/island.
+    island_key_version: int = Field(default=1, ge=1, le=2**32 - 1)
     # The app's Universal/App Link the browser is redirected back to after the
     # broker completes (carrying the handoff code, or an error indicator). This is
     # a FIXED config value — open-redirect defense: the final redirect target is

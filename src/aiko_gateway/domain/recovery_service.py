@@ -291,7 +291,7 @@ def _verify_quorum(
         # 64 raw bytes. Any decode failure = this approval doesn't count.
         try:
             raw_pub = signing.decode_multikey(pk)
-            sig = signing._b64url_raw(
+            sig = signing.b64url_raw(
                 sig_b64, expect_len=signing.SIG_RAW_LEN, field="approval.sig")
         except signing.OriginError:
             continue
