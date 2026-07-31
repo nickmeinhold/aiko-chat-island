@@ -255,7 +255,7 @@ def verify_manifest(manifest: dict) -> bool:
         sig_str = manifest["signature"]
         if not isinstance(pub_str, str) or not isinstance(sig_str, str):
             raise IslandIdentityError("island_pubkey and signature must be strings")
-        if len(pub_str) > signing._MAX_PUBKEY_STR:
+        if len(pub_str) > signing.MAX_PUBKEY_STR:
             raise IslandIdentityError("island_pubkey too long")
         pub_raw = signing.decode_multikey(pub_str)
         sig = signing.b64url_raw(sig_str, expect_len=SIG_LEN, field="signature")

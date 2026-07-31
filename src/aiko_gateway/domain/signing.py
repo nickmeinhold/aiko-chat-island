@@ -49,7 +49,11 @@ SIG_RAW_LEN = 64
 
 # Field caps (untrusted client input on a wire boundary). Generous but finite —
 # a Multikey pubkey is ~48 chars, a raw-64 sig is ~86 base64url chars.
-_MAX_PUBKEY_STR = 128
+# MAX_PUBKEY_STR is public: the island-identity trust boundary reuses the SAME cap
+# rather than reaching into a private name (a rename can't silently weaken a
+# cross-module cap on a trust boundary).
+MAX_PUBKEY_STR = 128
+_MAX_PUBKEY_STR = MAX_PUBKEY_STR  # backwards-compatible alias for in-module callers
 _MAX_SIG_STR = 128
 _MAX_CLIENT_MSG_ID = 64            # matches the messages.client_msg_id column width
 _MAX_SIGNED_AT_MS = 1 << 62        # sane u64-ish upper bound (well past any real clock)

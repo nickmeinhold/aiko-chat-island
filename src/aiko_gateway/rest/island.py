@@ -14,9 +14,11 @@ was signed by the key the island claims.
 
 The manifest is derived from the SAME canonical self identity the directory
 advertises (``directory.self_peer`` — id/display_name/base_url, post-coercion) plus
-the configured mode/key. Signing is per-request and cheap (Ed25519, ~tens of µs); the
-self identity is immutable at runtime, so there is nothing to cache and no staleness
-to manage.
+the configured mode/key. Signing is per-request: the manifest IS a pure function of
+boot constants and could be memoized, but Ed25519 signing is ~tens of µs and the
+endpoint is low-traffic, so per-request signing is a deliberate simplicity choice
+(no module cache state to reset in tests, no staleness to reason about), not an
+oversight — memoize only if `/v1/island` ever becomes hot.
 """
 from __future__ import annotations
 
@@ -51,11 +53,22 @@ async def get_island(response: Response) -> dict:
     # changes — a cached copy could then advertise the OLD posture). no-store keeps
     # the posture a client sees current with the running process.
     response.headers["Cache-Control"] = "no-store"
-    return island_identity.build_signed_manifest(
-        id=self_peer.id,
-        display_name=self_peer.display_name,
-        base_url=self_peer.base_url,
-        mode=settings.island_mode,
-        key_version=settings.island_key_version,
-        seed_b64url=settings.island_signing_seed,
-    )
+    # Map a codec refusal to 503, never a 500: this is the honesty endpoint, so an
+    # internal validation failure (e.g. a self identity that passed peers_service
+    # coercion but violates the manifest codec's stricter rules) must fail closed as
+    # "temporarily unavailable", not leak a stack trace. In practice coerce_island
+    # bounds id/name/url to the SAME caps the codec enforces, so this cannot fire
+    # today — it's a permanent guard against future cap drift on a trust surface.
+    try:
+        return island_identity.build_signed_manifest(
+            id=self_peer.id,
+            display_name=self_peer.display_name,
+            base_url=self_peer.base_url,
+            mode=settings.island_mode,
+            key_version=settings.island_key_version,
+            seed_b64url=settings.island_signing_seed,
+        )
+    except island_identity.IslandIdentityError as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"island self-manifest could not be built: {e}") from e
