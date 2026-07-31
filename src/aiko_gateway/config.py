@@ -13,6 +13,11 @@ from urllib.parse import urlparse
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# Leaf import (stdlib-only enum) — safe at module top, no config<->domain cycle. The
+# SINGLE source of truth for the mode vocabulary, shared with the signing codec so the
+# config field and the manifest verifier can never drift.
+from .domain.island_mode import IslandMode
+
 # The dev-only JWT secret. Single source so the default and the fail-closed
 # guard below can never disagree (a prod boot with THIS value is rejected).
 _DEV_JWT_SECRET = "dev-insecure-change-me"
@@ -188,7 +193,7 @@ class Settings(BaseSettings):
     #              plaintext). It is HARD-REJECTED at boot in EVERY environment until
     #              Phase B lands (see _harden_for_production) — the value is in the enum
     #              only so the wire/type vocabulary is forward-stable, never selectable.
-    island_mode: Literal["moderator", "e2ee"] = "moderator"
+    island_mode: IslandMode = IslandMode.MODERATOR
     # The island's long-lived Ed25519 identity key, as an unpadded-base64url 32-byte
     # seed. Signs the self-manifest (island_identity.py). SECRET — supplied via the
     # host .env (SOPS in deploy), NEVER committed. Dev default is _DEV_ISLAND_SEED; a
@@ -312,7 +317,7 @@ class Settings(BaseSettings):
         # just the same (A3 reads the manifest in dev too). The value stays in the
         # enum so the wire vocabulary is forward-stable — it is simply never bootable
         # in Phase A. Phase B lifts this guard when real client-side encryption ships.
-        if self.island_mode == "e2ee":
+        if self.island_mode == IslandMode.E2EE:
             raise ValueError(
                 "island_mode='e2ee' is not available in Phase A: no client-side "
                 "encryption is implemented yet, so advertising E2EE would mislead "

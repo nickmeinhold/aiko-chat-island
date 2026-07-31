@@ -377,6 +377,20 @@ def test_prod_with_dev_island_seed_raises():
                  passkey_enabled=True, island_signing_seed=_DEV_ISLAND_SEED)
 
 
+def test_prod_rejects_noncanonical_dev_seed_alias():
+    # Carnot HIGH: a non-canonical base64url alias of the dev seed decodes to the SAME
+    # (public) dev KEY but is a different string, so it would slip past the
+    # string-equality dev-seed guard and boot prod on the known key. The canonical
+    # decoder now rejects the alias at the seed-decode step, before the guard.
+    alias = _DEV_ISLAND_SEED[:-1] + ("F" if _DEV_ISLAND_SEED[-1] != "F" else "G")
+    import base64
+    assert alias != _DEV_ISLAND_SEED
+    assert base64.urlsafe_b64decode(alias + "=") == base64.urlsafe_b64decode(_DEV_ISLAND_SEED + "=")
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
+                 passkey_enabled=True, island_signing_seed=alias)
+
+
 def test_prod_with_real_island_seed_boots():
     s = Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
                  passkey_enabled=True, island_signing_seed=_REAL_ISLAND_SEED)

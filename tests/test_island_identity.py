@@ -240,3 +240,54 @@ def test_build_rejects_bad_mode_and_key_version():
         _manifest(mode="bogus")
     with pytest.raises(ii.IslandIdentityError):
         _manifest(key_version=2**32)
+
+
+def test_verify_rejects_bool_v():
+    # True == 1 would satisfy a bare `!= V` check; v must be a real int (the same
+    # bool-exclusion validate_origin applies to its discriminators).
+    m = _manifest()
+    m["v"] = True
+    with pytest.raises(ii.IslandIdentityError):
+        ii.verify_manifest(m)
+
+
+def test_verify_rejects_oversized_fields():
+    # The A4 peer door caps untrusted strings before crypto — an overlong base_url
+    # must be a structural reject, not fed into signing_bytes.
+    m = _manifest()
+    m["base_url"] = "https://" + "a" * 300
+    with pytest.raises(ii.IslandIdentityError):
+        ii.verify_manifest(m)
+
+
+def test_valid_modes_is_the_single_enum_vocabulary():
+    # VALID_MODES is DERIVED from IslandMode — one SoT shared with config, no drift.
+    from aiko_gateway.domain.island_mode import IslandMode
+    assert ii.VALID_MODES == frozenset(IslandMode)
+    assert "moderator" in ii.VALID_MODES  # StrEnum members compare by value
+
+
+# --- base64url canonicalization (dev-seed alias bypass, Carnot HIGH) --------- #
+
+def test_b64url_raw_rejects_noncanonical_alias():
+    # `…SE` and `…SF` decode to the SAME 32 bytes; only the canonical spelling is
+    # accepted. Without this, a non-canonical alias of the dev seed would decode to
+    # the dev KEY and slip past a string-equality prod guard.
+    canonical = base64.urlsafe_b64encode(b"x" * 32).rstrip(b"=").decode()
+    raw = signing.b64url_raw(canonical, expect_len=32, field="t")
+    assert len(raw) == 32
+    alias = canonical[:-1] + ("F" if canonical[-1] != "F" else "G")
+    # The alias decodes to the same bytes (malleable) but is non-canonical → rejected.
+    if base64.urlsafe_b64decode(alias + "=") == raw:
+        with pytest.raises(signing.OriginError):
+            signing.b64url_raw(alias, expect_len=32, field="t")
+
+
+def test_b64url_raw_rejects_overlong():
+    with pytest.raises(signing.OriginError):
+        signing.b64url_raw("a" * 500, expect_len=32, field="t")
+
+
+async def test_get_island_sets_no_store(client):
+    r = await client.get("/v1/island")
+    assert r.headers.get("cache-control") == "no-store"

@@ -146,7 +146,23 @@ def b64url_raw(s: str, *, expect_len: int, field: str) -> bytes:
     Public so the island-identity trust boundary reuses the EXACT same strict
     decoder (island seed = 32 bytes, island signature = 64 bytes) rather than a
     private-regex reach or a permissive base64 call — one canonical-decode gate
-    across every Ed25519 boundary in the gateway."""
+    across every Ed25519 boundary in the gateway.
+
+    CANONICAL, not merely valid: base64url is malleable — the unused low bits of the
+    final character are ignored on decode, so several distinct strings decode to the
+    SAME bytes (e.g. `…SE`, `…SF`, `…SG`, `…SH` all yield the same 32-byte value).
+    Accepting a non-canonical spelling is a real trust-boundary hole: a non-canonical
+    alias of the dev signing seed would decode to the dev KEY yet slip past a string
+    equality guard (booting prod on the public key), and a signature could be
+    re-spelled into a different-but-verifying envelope string. So after decoding we
+    re-encode and require the input to be EXACTLY the canonical unpadded form."""
+    # Cap the input length BEFORE the regex/decode: the canonical unpadded encoding of
+    # `expect_len` bytes has a fixed length, so anything longer is malformed by
+    # construction — reject it cheaply rather than regex-scan + decode an oversized
+    # peer-fed string (DoS bound on the untrusted A4 manifest path).
+    max_len = (expect_len * 8 + 5) // 6  # ceil(expect_len*8 / 6)
+    if len(s) > max_len:
+        raise OriginError(f"{field} too long ({len(s)} > {max_len} chars)")
     if not _B64URL_UNPADDED_RE.match(s):
         raise OriginError(f"{field} must be unpadded base64url ([A-Za-z0-9_-], no '=')")
     try:
@@ -155,6 +171,11 @@ def b64url_raw(s: str, *, expect_len: int, field: str) -> bytes:
         raise OriginError(f"{field} is not valid base64url") from e
     if len(raw) != expect_len:
         raise OriginError(f"{field} decoded length {len(raw)} != {expect_len}")
+    # Canonicalization gate (base64 malleability, above): the input must be the exact
+    # canonical unpadded base64url of the decoded bytes, so a non-canonical alias can
+    # never masquerade as canonical across a trust boundary.
+    if base64.urlsafe_b64encode(raw).rstrip(b"=").decode() != s:
+        raise OriginError(f"{field} is not canonical unpadded base64url")
     return raw
 
 

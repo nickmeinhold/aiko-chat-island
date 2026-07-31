@@ -20,7 +20,7 @@ to manage.
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Response, status
 
 from ..config import settings
 from ..domain import island_identity
@@ -30,7 +30,7 @@ router = APIRouter(prefix="/v1", tags=["island"])
 
 
 @router.get("/island")
-async def get_island() -> dict:
+async def get_island(response: Response) -> dict:
     """THIS island's signed self-manifest:
     ``{v, alg, id, display_name, base_url, mode, key_version, island_pubkey,
     signature}``. ``mode`` is the operator's elected moderation posture (Phase A:
@@ -46,6 +46,11 @@ async def get_island() -> dict:
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="island self-identity is not configured "
                    "(no valid GATEWAY_BASE_URL / GATEWAY_ID)")
+    # A signed trust document: never let a CDN/proxy freeze a stale mode/base_url
+    # across a redeploy (mode is immutable per boot, so a restart is the only way it
+    # changes — a cached copy could then advertise the OLD posture). no-store keeps
+    # the posture a client sees current with the running process.
+    response.headers["Cache-Control"] = "no-store"
     return island_identity.build_signed_manifest(
         id=self_peer.id,
         display_name=self_peer.display_name,

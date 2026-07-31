@@ -37,6 +37,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 )
 
 from . import signing
+from .island_mode import IslandMode
 
 # The domain tag: distinct from signing.DOMAIN_TAG so an island-manifest signature
 # is not a valid message signature under any circumstances (domain separation).
@@ -48,11 +49,23 @@ V = 1                  # manifest envelope version (a change is a v2, never a si
 SEED_LEN = 32
 SIG_LEN = 64
 
-# The modes the manifest may carry. `e2ee` is schema-reserved (Phase B) and refused
-# at BOOT by config._harden_for_production; it is still a *valid vocabulary* value a
-# signed manifest could name, so verify allowlists both and lets the boot guard — not
-# the codec — own the Phase-A-only policy. Anything else is a malformed manifest.
-VALID_MODES = frozenset({"moderator", "e2ee"})
+# The modes the manifest may carry — derived from the SINGLE vocabulary SoT
+# (island_mode.IslandMode) so this codec and config.Settings.island_mode can never
+# drift. `e2ee` is schema-reserved (Phase B) and refused at BOOT by
+# config._harden_for_production; it is still a *valid vocabulary* value a signed
+# manifest could name (so a Phase B peer is legible to verify), so verify allowlists
+# the whole enum and lets the boot guard — not the codec — own the Phase-A-only
+# policy. Anything outside the enum is a malformed manifest. (StrEnum members are str,
+# so `"moderator" in VALID_MODES` works by value.)
+VALID_MODES = frozenset(IslandMode)
+
+# Field caps on untrusted manifest strings (the A4 peer-federation door takes
+# attacker-influenceable input) — bound the work BEFORE crypto, mirroring
+# signing.validate_origin's per-field caps. Generous: an island id/name is a short
+# slug, a base_url a bounded URL.
+_MAX_ID_STR = 64
+_MAX_NAME_STR = 64
+_MAX_URL_STR = 255
 # key_version is packed as a big-endian u32 in the signing bytes.
 KEY_VERSION_MAX = 2**32 - 1
 # The exact key set of a v1 signed manifest (frozen; a change is a v2, never a silent
@@ -128,10 +141,14 @@ def _check_identity_tuple(
     (`True` is an int subclass that would otherwise pack as 1). Raises
     IslandIdentityError on any violation — the caller decides whether that is a boot
     refusal (build) or a rejected manifest (verify)."""
-    for name, val in (("id", id), ("display_name", display_name),
-                      ("base_url", base_url), ("mode", mode)):
+    for name, val, cap in (("id", id, _MAX_ID_STR),
+                           ("display_name", display_name, _MAX_NAME_STR),
+                           ("base_url", base_url, _MAX_URL_STR),
+                           ("mode", mode, _MAX_NAME_STR)):
         if not isinstance(val, str):
             raise IslandIdentityError(f"manifest {name} must be a string")
+        if len(val) > cap:
+            raise IslandIdentityError(f"manifest {name} too long ({len(val)} > {cap})")
     if mode not in VALID_MODES:
         raise IslandIdentityError(
             f"manifest mode {mode!r} is not one of {sorted(VALID_MODES)}")
@@ -214,9 +231,12 @@ def verify_manifest(manifest: dict) -> bool:
             f"manifest key set invalid (missing={sorted(missing)}, "
             f"unexpected={sorted(extra)})")
     # Allowlist the envelope discriminators BEFORE any crypto (they are outside the
-    # signed bytes, so the signature does not protect them — a verifier must).
-    if manifest["v"] != V:
-        raise IslandIdentityError(f"manifest v {manifest['v']!r} unsupported (expected {V})")
+    # signed bytes, so the signature does not protect them — a verifier must). `v` gets
+    # the bool-excluded int guard (True == 1 and 1.0 == 1 would otherwise satisfy
+    # `!= V`), the same discipline signing.validate_origin applies to its discriminators.
+    v = manifest["v"]
+    if isinstance(v, bool) or not isinstance(v, int) or v != V:
+        raise IslandIdentityError(f"manifest v {v!r} unsupported (expected int {V})")
     if manifest["alg"] != ALG:
         raise IslandIdentityError(
             f"manifest alg {manifest['alg']!r} not allowed (only {ALG!r})")
@@ -229,6 +249,8 @@ def verify_manifest(manifest: dict) -> bool:
         sig_str = manifest["signature"]
         if not isinstance(pub_str, str) or not isinstance(sig_str, str):
             raise IslandIdentityError("island_pubkey and signature must be strings")
+        if len(pub_str) > signing._MAX_PUBKEY_STR:
+            raise IslandIdentityError("island_pubkey too long")
         pub_raw = signing.decode_multikey(pub_str)
         sig = signing.b64url_raw(sig_str, expect_len=SIG_LEN, field="signature")
         msg = signing_bytes(
