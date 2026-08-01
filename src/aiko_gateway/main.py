@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from .aiko.client import AikoBusClient
 from .config import settings
 from .db import SessionLocal, verify_schema
+from .worker_guard import acquire_single_worker_lock, release_single_worker_lock
 from .domain import channels_service, echo, messages_service, moderation_service
 from .realtime.hub import Hub
 
@@ -164,53 +165,66 @@ async def _gossip_loop(interval: int) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     state.loop = asyncio.get_running_loop()
-    # Alembic (run by the container entrypoint before uvicorn) owns schema
-    # creation/evolution; here we only VERIFY the live schema is migrated +
-    # current, failing closed if not (#14).
-    await verify_schema()
-    # No independent seeding: channels are reconciled from the ChatServer
-    # `channel_list` EC share once the bus client discovers it. An inbound
-    # message for a not-yet-reconciled channel is upserted by persist_inbound
-    # (closes the startup window). See #1281 incr 2.
-    state._channel_events = asyncio.Queue()
-    state._channel_worker = asyncio.create_task(state._run_channel_worker())
-    # Lazy import: pulling aiko_services happens only at startup, never at
-    # module import time (see the import-block note above).
-    from .aiko.client import AikoBusClient
-    state.bus = AikoBusClient(
-        settings.aiko_channels, state.on_bus_message,
-        on_channel_add=state.on_channel_add,
-        on_channel_remove=state.on_channel_remove,
-    )
-    state.bus.start()
-    log.info("Gateway started; subscribed channels=%s (topology via channel_list share)",
-             settings.aiko_channels)
-    # Gateway directory gossip (#1546): converge the known-peer set by anti-entropy.
-    # FAIL-CLOSED: the fetch path is an SSRF surface (#1578), so it runs ONLY when
-    # explicitly enabled. Off by default, the directory still serves self +
-    # seed_peers with no network fetch — the safe operator-curated path.
+    # Enforce single-worker serving BEFORE any serving side-effect: the realtime Hub
+    # is per-process, so a ban/disconnect can't reach sockets on another worker until
+    # the #46 cross-worker sweep lands. A second worker fails to take the lock and
+    # refuses to boot (GATEWAY_ALLOW_MULTIWORKER=true lifts it). See worker_guard.
+    acquire_single_worker_lock()
+    # Everything after acquire is wrapped so the lock is released on ANY exit path,
+    # including a startup failure BEFORE `yield` (verify_schema / bus.start raising)
+    # or an exception during cleanup — otherwise the fd (and the lock) would leak in
+    # a non-exiting host (a test harness / embedded server). Kelvin+Carnot, PR#111.
     gossip_task: "asyncio.Task | None" = None
-    gi = settings.gateway_gossip_interval_seconds
-    if settings.gateway_gossip_enabled and gi > 0:
-        gossip_task = asyncio.create_task(_gossip_loop(gi))
-        log.info("gateway directory gossip ENABLED (interval=%ds, bootstrap_peers=%d)",
-                 gi, len(settings.gateway_bootstrap_peers))
-    else:
-        log.info("gateway directory gossip disabled; serving self + %d seed peer(s)",
-                 len(settings.gateway_seed_peers))
     try:
-        yield
+        # Alembic (run by the container entrypoint before uvicorn) owns schema
+        # creation/evolution; here we only VERIFY the live schema is migrated +
+        # current, failing closed if not (#14).
+        await verify_schema()
+        # No independent seeding: channels are reconciled from the ChatServer
+        # `channel_list` EC share once the bus client discovers it. An inbound
+        # message for a not-yet-reconciled channel is upserted by persist_inbound
+        # (closes the startup window). See #1281 incr 2.
+        state._channel_events = asyncio.Queue()
+        state._channel_worker = asyncio.create_task(state._run_channel_worker())
+        # Lazy import: pulling aiko_services happens only at startup, never at
+        # module import time (see the import-block note above).
+        from .aiko.client import AikoBusClient
+        state.bus = AikoBusClient(
+            settings.aiko_channels, state.on_bus_message,
+            on_channel_add=state.on_channel_add,
+            on_channel_remove=state.on_channel_remove,
+        )
+        state.bus.start()
+        log.info("Gateway started; subscribed channels=%s (topology via channel_list share)",
+                 settings.aiko_channels)
+        # Gateway directory gossip (#1546): converge the known-peer set by anti-entropy.
+        # FAIL-CLOSED: the fetch path is an SSRF surface (#1578), so it runs ONLY when
+        # explicitly enabled. Off by default, the directory still serves self +
+        # seed_peers with no network fetch — the safe operator-curated path.
+        gi = settings.gateway_gossip_interval_seconds
+        if settings.gateway_gossip_enabled and gi > 0:
+            gossip_task = asyncio.create_task(_gossip_loop(gi))
+            log.info("gateway directory gossip ENABLED (interval=%ds, bootstrap_peers=%d)",
+                     gi, len(settings.gateway_bootstrap_peers))
+        else:
+            log.info("gateway directory gossip disabled; serving self + %d seed peer(s)",
+                     len(settings.gateway_seed_peers))
+        try:
+            yield
+        finally:
+            if state.bus is not None:
+                state.bus.stop()
+            if state._channel_worker is not None:
+                state._channel_worker.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await state._channel_worker  # clean task ownership (Carnot r2)
+            if gossip_task is not None:
+                gossip_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await gossip_task
     finally:
-        if state.bus is not None:
-            state.bus.stop()
-        if state._channel_worker is not None:
-            state._channel_worker.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await state._channel_worker  # clean task ownership (Carnot r2)
-        if gossip_task is not None:
-            gossip_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await gossip_task
+        # Outermost: runs whether startup raised before yield or cleanup raised.
+        release_single_worker_lock()
 
 
 app = FastAPI(title="Aiko Chat Gateway", version="0.0.1", lifespan=lifespan)
