@@ -11,3 +11,6 @@ spike/devlogs/
 .pytest_cache/
 .ruff_cache/
 backups/
+
+# single-worker guard lock (worker_guard.py) — regenerable, never committed
+.aiko-worker.lock
