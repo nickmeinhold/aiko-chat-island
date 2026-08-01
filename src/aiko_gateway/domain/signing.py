@@ -56,7 +56,11 @@ MAX_PUBKEY_STR = 128
 _MAX_PUBKEY_STR = MAX_PUBKEY_STR  # backwards-compatible alias for in-module callers
 _MAX_SIG_STR = 128
 _MAX_CLIENT_MSG_ID = 64            # matches the messages.client_msg_id column width
-_MAX_SIGNED_AT_MS = 1 << 62        # sane u64-ish upper bound (well past any real clock)
+# MAX_SIGNED_AT_MS is public: the island-identity manifest reuses the SAME timestamp
+# bound (a rename can't silently weaken a cross-module cap on a trust boundary — the
+# MAX_PUBKEY_STR precedent). Both Ed25519 signers pack signed_at_ms as a u64.
+MAX_SIGNED_AT_MS = 1 << 62         # sane u64-ish upper bound (well past any real clock)
+_MAX_SIGNED_AT_MS = MAX_SIGNED_AT_MS  # backwards-compatible alias for in-module callers
 
 # Unpadded base64url charset — the spec pins sig to base64url-unpadded, so we
 # reject `=` padding and any non-[A-Za-z0-9_-] byte BEFORE decoding. Python's

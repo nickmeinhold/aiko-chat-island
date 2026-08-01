@@ -22,6 +22,8 @@ oversight — memoize only if `/v1/island` ever becomes hot.
 """
 from __future__ import annotations
 
+import time
+
 from fastapi import APIRouter, HTTPException, Response, status
 
 from ..config import settings
@@ -34,10 +36,12 @@ router = APIRouter(prefix="/v1", tags=["island"])
 @router.get("/island")
 async def get_island(response: Response) -> dict:
     """THIS island's signed self-manifest:
-    ``{v, alg, id, display_name, base_url, mode, key_version, island_pubkey,
-    signature}``. ``mode`` is the operator's elected moderation posture (Phase A:
-    always ``moderator``); ``island_pubkey`` is a ``z…`` ed25519 Multikey; the
-    signature covers the whole identity tuple (see domain/island_identity.py).
+    ``{v, alg, id, display_name, base_url, mode, key_version, signed_at_ms,
+    island_pubkey, signature}``. ``mode`` is the operator's elected moderation posture
+    (Phase A: always ``moderator``); ``signed_at_ms`` is the per-request freshness
+    stamp (v2, #2452); ``island_pubkey`` is a ``z…`` ed25519 Multikey; the signature
+    covers the whole identity tuple INCLUDING ``signed_at_ms`` (see
+    domain/island_identity.py).
 
     503 if the island has no valid self identity configured (a broken
     gateway_base_url/id) — there is nothing authentic to sign, so fail closed rather
@@ -66,6 +70,11 @@ async def get_island(response: Response) -> dict:
             base_url=self_peer.base_url,
             mode=settings.island_mode,
             key_version=settings.island_key_version,
+            # Stamp `now` per request: signing is per-request (see the module
+            # docstring), so the honest self-fetch path is always freshly-dated for
+            # free — the A4 peer door's is_fresh() check then has a live recency lever
+            # without any re-signing daemon (#2452).
+            signed_at_ms=int(time.time() * 1000),
             seed_b64url=settings.island_signing_seed,
         )
     except island_identity.IslandIdentityError as e:
