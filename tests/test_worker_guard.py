@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import fcntl
 import os
+import select
 import subprocess
 import sys
 from pathlib import Path
@@ -173,6 +174,11 @@ def test_real_cross_process_contention(_clean_guard_state):
         text=True,
     )
     try:
+        # Bounded read: on child death readline() returns "" at EOF (no hang), but a
+        # select timeout caps even a pathological silent child so CI can't wedge
+        # (cage-match PR#111, Tesla).
+        ready, _, _ = select.select([child.stdout], [], [], 15)
+        assert ready, "child did not signal readiness within 15s"
         assert child.stdout.readline().strip() == "HELD", "child failed to acquire"
         with pytest.raises(RuntimeError, match="already holds"):
             worker_guard.acquire_single_worker_lock()
