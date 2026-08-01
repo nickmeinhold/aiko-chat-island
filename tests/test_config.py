@@ -17,6 +17,12 @@ Invariants (all prod-only unless noted):
      per the WebAuthn rp_id rule). This catches an obviously-wrong rp_id but cannot
      prove a working ceremony — Settings can't see the real serving host (cage-match
      PR#97). Invariant 5 (an ingress is ENABLED) is the complete guarantee.
+  7. Every operator-settable env var (secrets, island identity/trust-root, operator
+     policy) is FORWARDED into the chat-island container by docker-compose with host
+     passthrough (`${VAR...}`) — a value in the host .env is otherwise inert. A
+     behavioral tripwire against the recurring "compose dropped the var" class
+     (PASSKEY_EXTRA_ORIGINS, MODERATOR_USER_IDS, ISLAND_SIGNING_SEED). Curated
+     surface, not a model_fields derivation (#26 orbit). Cage-match PR#110.
 
 `_env_file=None` disables the repo `.env` so these tests exercise the code
 defaults, not whatever a local `.env` happens to set.
@@ -503,14 +509,22 @@ def test_operator_settable_vars_are_forwarded_in_compose():
         f"var(s): {not_keyed}. A host .env value is INERT unless the service forwards "
         "it. See invariant 7."
     )
+    # Require `${VAR` followed by an interpolation boundary (`:`, `-`, or `}`), so a
+    # value forwarding a DIFFERENT host var whose name merely starts with this one
+    # (`JWT_SECRET: ${JWT_SECRET_EXTRA:-x}`) does NOT false-pass as forwarding VAR
+    # (cage-match PR#110, Tesla). re.escape guards names with regex metachars.
+    import re
+
     not_passthrough = sorted(
-        v for v in _MUST_FORWARD_ENV if f"${{{v}" not in env[v]
+        v
+        for v in _MUST_FORWARD_ENV
+        if not re.search(r"\$\{" + re.escape(v) + r"[-:}]", env[v])
     )
     assert not not_passthrough, (
-        "docker-compose.yml forwards these as a STATIC value, not a host "
-        f"interpolation: {not_passthrough}. Each must be `${{{{VAR...}}}}` so the "
-        "operator's host .env value reaches the container; a literal is inert. "
-        "See invariant 7."
+        "docker-compose.yml forwards these as a STATIC value (or a different host "
+        f"var), not a host interpolation of the var itself: {not_passthrough}. Each "
+        "must be `${VAR...}` so the operator's host .env value reaches the container; "
+        "a literal is inert. See invariant 7."
     )
 
 
