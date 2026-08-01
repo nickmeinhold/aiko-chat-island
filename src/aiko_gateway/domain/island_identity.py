@@ -41,6 +41,11 @@ from .island_mode import IslandMode
 
 # The domain tag: distinct from signing.DOMAIN_TAG so an island-manifest signature
 # is not a valid message signature under any circumstances (domain separation).
+# NOTE: the `v1` here is FROZEN and INDEPENDENT of the manifest envelope version `V`
+# (now 2) — the domain tag is a stable cryptographic domain-separation constant, not a
+# version counter. Do NOT bump it to track V: an A4 peer reconstructs signing_bytes
+# with this exact literal, so changing it would invalidate every existing signature.
+# Envelope evolution lives in `V` + `MANIFEST_KEYS`; the domain tag never moves.
 DOMAIN_TAG = "aikochat:island:v1:EdDSA"
 ALG = "EdDSA"          # the ONLY alg — allowlist, mirroring signing.ALG
 # v2 (#2452): added `signed_at_ms` to the signed bytes — a freshness binding so the A4
@@ -243,7 +248,7 @@ def verify_manifest(manifest: dict) -> bool:
 
     STRICT, FAIL-CLOSED — the mirror of signing.validate_origin, because this is the
     A4 peer-federation trust door and an inbound manifest is UNTRUSTED input:
-      * exactly the frozen v1 key set (no missing, no unexpected keys);
+      * exactly the frozen v2 key set (no missing, no unexpected keys);
       * `v` == V and `alg` == ALG, ALLOWLISTED and refused BEFORE any crypto — `v`
         and `alg` are outside the signed bytes (as with the message envelope), so a
         forged manifest can carry a valid Ed25519 signature over the identity tuple
@@ -330,9 +335,19 @@ def is_fresh(
     WHY recency and not strict monotonicity: recency needs no per-peer durable state
     (that store is A4's, and doesn't exist yet), and the per-request signing in
     ``rest/island.py`` makes the honest self-fetch path always-fresh for free. The
-    residual — a captured manifest can be replayed for up to ``max_age_ms`` after a
-    mode flip — is bounded and named; strict epoch monotonicity that kills it
-    permanently is a clean future v3 when the A4 high-water store lands (#2452)."""
+    residual — a captured manifest can be replayed for up to ``max_age_ms + skew_ms``
+    of wall time after issue (the freshness window PLUS the skew grace, not max_age
+    alone) after a mode flip — is bounded and named; strict epoch monotonicity that
+    kills it permanently is a clean future v3 when the A4 high-water store lands
+    (#2452).
+
+    FAIL-CLOSED on the policy knobs too: ``now_ms`` / ``max_age_ms`` / ``skew_ms`` get
+    the SAME bool-excluded, non-negative, bounded discipline as ``signed_at_ms`` — a
+    trust gate must not be assemblable from a typo. A config-fed ``max_age_ms=-1``
+    (rejects every honest peer), ``=True`` (a 1 ms window), or a float must RAISE at
+    the door, not silently invert or disable the replay boundary (Carnot/Tesla,
+    PR #108 cage-match). The codec bounds them for type-sanity; the A4 door still owns
+    the SEMANTIC tightness (a sane 5-minute window, not 146 million years)."""
     if not isinstance(manifest, dict) or "signed_at_ms" not in manifest:
         raise IslandIdentityError(
             "is_fresh requires a verified manifest with signed_at_ms "
@@ -341,5 +356,13 @@ def is_fresh(
     if isinstance(ts, bool) or not isinstance(ts, int) \
             or not (0 <= ts <= MAX_SIGNED_AT_MS):
         raise IslandIdentityError("manifest signed_at_ms is not a valid timestamp")
+    for pname, pval in (("now_ms", now_ms), ("max_age_ms", max_age_ms),
+                        ("skew_ms", skew_ms)):
+        if isinstance(pval, bool) or not isinstance(pval, int) \
+                or not (0 <= pval <= MAX_SIGNED_AT_MS):
+            raise IslandIdentityError(
+                f"is_fresh {pname} must be a non-negative int in "
+                f"[0, {MAX_SIGNED_AT_MS}] (a bad freshness knob must fail closed, "
+                f"not silently invert the replay boundary)")
     age = now_ms - ts
     return -skew_ms <= age <= max_age_ms

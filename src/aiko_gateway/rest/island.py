@@ -36,10 +36,12 @@ router = APIRouter(prefix="/v1", tags=["island"])
 @router.get("/island")
 async def get_island(response: Response) -> dict:
     """THIS island's signed self-manifest:
-    ``{v, alg, id, display_name, base_url, mode, key_version, island_pubkey,
-    signature}``. ``mode`` is the operator's elected moderation posture (Phase A:
-    always ``moderator``); ``island_pubkey`` is a ``z…`` ed25519 Multikey; the
-    signature covers the whole identity tuple (see domain/island_identity.py).
+    ``{v, alg, id, display_name, base_url, mode, key_version, signed_at_ms,
+    island_pubkey, signature}``. ``mode`` is the operator's elected moderation posture
+    (Phase A: always ``moderator``); ``signed_at_ms`` is the per-request freshness
+    stamp (v2, #2452); ``island_pubkey`` is a ``z…`` ed25519 Multikey; the signature
+    covers the whole identity tuple INCLUDING ``signed_at_ms`` (see
+    domain/island_identity.py).
 
     503 if the island has no valid self identity configured (a broken
     gateway_base_url/id) — there is nothing authentic to sign, so fail closed rather

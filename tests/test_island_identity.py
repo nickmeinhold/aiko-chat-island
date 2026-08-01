@@ -13,6 +13,7 @@ The trust-boundary guarantees pinned here:
 from __future__ import annotations
 
 import base64
+import time
 
 import pytest
 import pytest_asyncio
@@ -416,3 +417,51 @@ def test_is_fresh_raises_on_structurally_bad_manifest():
     # caller can't skip verify_manifest and get a false sense of a freshness verdict.
     with pytest.raises(ii.IslandIdentityError):
         ii.is_fresh({"no": "signed_at_ms"}, now_ms=1720000000000, max_age_ms=300_000)
+
+
+def test_is_fresh_boundaries_are_inclusive():
+    # Inclusive endpoints are load-bearing for federation interop — an off-by-one
+    # between two islands is a silent freshness-flake class (Tesla, PR#108). Pin both.
+    ts = _FIELDS["signed_at_ms"]
+    m = _manifest()
+    # age == max_age_ms exactly → still fresh (upper bound inclusive).
+    assert ii.is_fresh(m, now_ms=ts + 300_000, max_age_ms=300_000) is True
+    assert ii.is_fresh(m, now_ms=ts + 300_001, max_age_ms=300_000) is False
+    # age == -skew_ms exactly → still fresh (lower/future bound inclusive).
+    assert ii.is_fresh(m, now_ms=ts - 60_000, max_age_ms=300_000, skew_ms=60_000) is True
+    assert ii.is_fresh(m, now_ms=ts - 60_001, max_age_ms=300_000, skew_ms=60_000) is False
+
+
+@pytest.mark.parametrize("kw", [
+    {"now_ms": -1},
+    {"now_ms": True},
+    {"now_ms": 1.5},
+    {"max_age_ms": -1},          # would reject every honest peer — must fail closed
+    {"max_age_ms": True},        # a 1ms window smuggled in as a bool
+    {"skew_ms": -1},             # inverts the lower bound — must fail closed
+    {"skew_ms": "60000"},
+])
+def test_is_fresh_rejects_bad_policy_knobs(kw):
+    # A trust gate must not be assemblable from a typo: a bad freshness knob RAISES at
+    # the door rather than silently inverting/disabling the replay boundary (Carnot
+    # REQUEST_CHANGES + Tesla, PR#108). Same fail-closed discipline as signed_at_ms.
+    ts = _FIELDS["signed_at_ms"]
+    base = {"now_ms": ts, "max_age_ms": 300_000, "skew_ms": 60_000}
+    base.update(kw)
+    with pytest.raises(ii.IslandIdentityError):
+        ii.is_fresh(_manifest(), **base)
+
+
+async def test_get_island_manifest_is_freshly_stamped(client):
+    # The endpoint's "always-fresh for free" claim, pinned (Tesla, PR#108): the served
+    # manifest carries a live now stamp that verifies AND passes is_fresh against real
+    # wall-clock time — and a later memoize/cache regression that froze the stamp would
+    # break THIS test, not silently hand A4 a dead clock.
+    r = await client.get("/v1/island")
+    m = r.json()
+    now = int(time.time() * 1000)
+    assert ii.verify_manifest(m) is True
+    assert abs(now - m["signed_at_ms"]) < 5_000          # stamped within ~5s of now
+    assert ii.is_fresh(m, now_ms=now) is True
+    # And the anti-replay lever bites: the same manifest a window later is stale.
+    assert ii.is_fresh(m, now_ms=now + 10 * 60 * 1000) is False
