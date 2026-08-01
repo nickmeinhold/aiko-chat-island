@@ -423,3 +423,57 @@ def test_dev_accepts_the_dev_island_seed():
     assert s.island_mode == "moderator"
     assert s.island_signing_seed == _DEV_ISLAND_SEED
     assert s.is_production is False
+
+
+# --- invariant 7: operator-settable vars MUST be forwarded in docker-compose --
+#
+# The prod image reads config from the container env. docker-compose.yml only
+# injects a variable into the container if it REFERENCES that variable — a value
+# sitting in the host .env is otherwise inert. This class has bitten three times:
+#   - PASSKEY_EXTRA_ORIGINS (Android passkey CREATE silently failed until the
+#     compose forwarded it — verified live 2026-07-28),
+#   - MODERATOR_USER_IDS (operator seat #100 would be empty as deployed),
+#   - ISLAND_SIGNING_SEED (a signed-manifest image would crash-loop the crucible-09
+#     deploy on the dev-seed guard because the operator's seed never arrived).
+# A per-var comment is not enforcement (cf. the single-worker guard #46). This is
+# the behavioral tripwire: any config field an operator is expected to set per
+# island — every secret, the island identity/trust-root, and operator policy — must
+# appear in the chat-island service env block, or CI fails HERE the next time
+# someone adds one without the forward.
+
+# UPPER_SNAKE env names that MUST be forwarded. NOT every Settings field belongs
+# here — TTLs, host/port, and other code-defaulted knobs are deliberately omitted;
+# this list is the operator/secret/identity surface only. Adding an operator-facing
+# setting to config.py means adding it here AND to docker-compose.yml.
+_MUST_FORWARD_ENV = {
+    "JWT_SECRET",                    # secret — token forgery root
+    "ISLAND_SIGNING_SEED",           # secret — manifest signing trust-root
+    "ISLAND_KEY_VERSION",            # island identity — rotation lifecycle
+    "MODERATOR_USER_IDS",            # operator policy — the operator seat (#100)
+    "MODERATION_ALERT_WEBHOOK_URL",  # operator config — alert sink (#91)
+    "SOCIAL_SIGNIN_ENABLED",         # operator policy
+    "APPLE_CLIENT_IDS",              # per-island auth
+    "GOOGLE_CLIENT_IDS",             # per-island auth
+    "GITHUB_CLIENT_ID",              # per-island auth
+    "GITHUB_CLIENT_SECRET",          # secret
+    "PASSKEY_ENABLED",               # per-island auth
+    "PASSKEY_RP_ID",                 # per-island auth (domain-scoped)
+    "PASSKEY_EXTRA_ORIGINS",         # per-island auth (the original incident)
+    "GATEWAY_BASE_URL",              # per-island identity
+    "GATEWAY_ID",                    # per-island identity
+    "GATEWAY_DISPLAY_NAME",          # per-island identity
+    "GATEWAY_SEED_PEERS",            # operator-curated federation
+}
+
+
+def test_operator_settable_vars_are_forwarded_in_compose():
+    from pathlib import Path
+
+    compose = (Path(__file__).resolve().parent.parent / "docker-compose.yml").read_text()
+    missing = sorted(v for v in _MUST_FORWARD_ENV if f"{v}:" not in compose)
+    assert not missing, (
+        "docker-compose.yml does not forward operator-settable env var(s): "
+        f"{missing}. A host .env value for these is INERT in the container unless "
+        "compose references the var — add each to the chat-island `environment:` "
+        "block. See invariant 7 above."
+    )

@@ -99,6 +99,26 @@ services:
       GATEWAY_BASE_URL: ${GATEWAY_BASE_URL:-https://chat.imagineering.cc}
       GATEWAY_ID: ${GATEWAY_ID:-}
       GATEWAY_DISPLAY_NAME: ${GATEWAY_DISPLAY_NAME:-Aiko}
+      # --- ISLAND SIGNING IDENTITY (crucible-09). The Ed25519 seed that signs the
+      # self-manifest (island_identity.py) is the island's trust root. SECRET —
+      # supplied via the host .env (SOPS in deploy), NEVER committed. Absent → the
+      # container falls to config.py's _DEV_ISLAND_SEED, which _harden_for_production
+      # REJECTS at boot in prod (fail-closed, like JWT_SECRET). WITHOUT this line the
+      # host .env value was inert (the PASSKEY_EXTRA_ORIGINS / MODERATOR_USER_IDS
+      # trap): the operator would set a real seed, compose would drop it, and a
+      # signed-manifest image (>= #107) would crash-loop on the dev-seed guard.
+      # Default is config.py's _DEV_ISLAND_SEED (a PUBLIC "DO-NOT-USE" constant, not
+      # a secret) — chosen over an empty default on purpose: it makes this forward a
+      # ZERO-REGRESSION SUPERSET. When unset the container sees exactly what it sees
+      # today (the dev seed), so a prod boot without a real seed trips the FRIENDLY,
+      # actionable guard ("still the dev default — supply a real ISLAND_SIGNING_SEED
+      # via `python -c ...`") instead of a cryptic "must be unpadded base64url" from
+      # an empty string (the decode at config.py runs UNCONDITIONALLY). Keep this in
+      # sync with _DEV_ISLAND_SEED in config.py if that sentinel ever changes.
+      ISLAND_SIGNING_SEED: ${ISLAND_SIGNING_SEED:-YWlrby1kZXYtaXNsYW5kLXNlZWQtRE8tTk9ULVVTRSE}
+      # Signing key version carried in the manifest for the rotation lifecycle
+      # (#1865). Bumped when the seed is rotated. Defaults to config's 1.
+      ISLAND_KEY_VERSION: ${ISLAND_KEY_VERSION:-1}
       # Directory SEED peers (#1548) — operator-curated FULL peer entries, merged
       # with NO network fetch (authentic by construction). THIS is how islands list
       # each other today: JSON array of {"id","display_name","base_url"}. Island 1
@@ -136,6 +156,21 @@ services:
       # only once this reached the container — the compose previously never forwarded
       # this var, so a host .env alone was inert.)
       PASSKEY_EXTRA_ORIGINS: ${PASSKEY_EXTRA_ORIGINS:-["android:apk-key-hash:4X-Pyy5caiOFWCJxYkU2YhIdsfnYZqG57ETE7JFgi6A","android:apk-key-hash:jDaX5vI4HYYMxrQkOUtGeSK9hcTgeuP52fGEQaptSOc","android:apk-key-hash:r_tsz5JUp0Rq8qioELOr73CZt0IegpLHz3sw6aI_p3A"]}
+      # --- MODERATION (operator seat, #100). JSON array of user IDs granted the
+      # moderator capability (take-down / dismiss / ban); config.py reads it into
+      # settings.moderator_user_ids (fail-closed EMPTY — no moderators until set).
+      # Baked default is [] so a stock island has no moderators; the operator
+      # appoints them via a host .env MODERATOR_USER_IDS=["<uid>",...]. WITHOUT this
+      # line the var was inert in the container even when set in the host .env — the
+      # identical "compose never forwarded it" trap that made PASSKEY_EXTRA_ORIGINS
+      # silently useless until 2026-07-28. Pydantic json-decodes the list field, so
+      # the value MUST be a JSON array.
+      MODERATOR_USER_IDS: ${MODERATOR_USER_IDS:-[]}
+      # Operator alert webhook (#91): a URL the island POSTs to when a report is
+      # filed. Optional (config default None → feature no-ops). Same inert-var trap
+      # as MODERATOR_USER_IDS: a host .env value never reached the container without
+      # this line. Empty default = unset = no webhook.
+      MODERATION_ALERT_WEBHOOK_URL: ${MODERATION_ALERT_WEBHOOK_URL:-}
     volumes:
       # Persist the SQLite store across container recreates. External + stably named
       # so the store survives any project/service rename (see volumes: block).
