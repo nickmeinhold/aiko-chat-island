@@ -49,8 +49,33 @@ def _coerce_timestamp(value: object) -> float | None:
         return None
 
 
+def _structured(
+    fields: object, payload_in: str, fallback_channel: str | None,
+) -> InboundMessage | None:
+    """Build an InboundMessage from a decoded fields dict, or None if it is not a
+    usable chat payload. ONE door for both the S-expr and JSON tiers so they can't
+    drift: `message` MUST be present AND a str (a non-str/absent body is not a valid
+    message → fall through to an older tier), and `username`/`channel` — the
+    echo-dedupe + routing keys — are pinned to str-or-None rather than trusted to be
+    whatever a future serializer quirk hands back."""
+    if not isinstance(fields, dict):
+        return None
+    message = fields.get("message")
+    if not isinstance(message, str):
+        return None
+    username = fields.get("username")
+    channel = fields.get("channel")
+    return InboundMessage(
+        username=username if isinstance(username, str) else None,
+        channel=channel if isinstance(channel, str) else fallback_channel,
+        timestamp=_coerce_timestamp(fields.get("timestamp")),
+        message=message,
+        raw=payload_in,
+    )
+
+
 def parse_payload(payload_in: str, *, fallback_channel: str | None = None) -> InboundMessage:
-    """Parse a channel payload into an InboundMessage (never raises).
+    """Parse a channel payload into an InboundMessage (NEVER raises).
 
     Tier 1 — the current Aiko framework S-expression (`generate("message", {...})`).
     Tier 2 — legacy JSON. Tier 3 — a bare string. Newest-first so the live wire wins,
@@ -58,43 +83,29 @@ def parse_payload(payload_in: str, *, fallback_channel: str | None = None) -> In
     aiko_chat.protocol._decode_message)."""
     # Tier 1: framework S-expression. Import the serializer LAZILY so importing this
     # module stays free of aiko_services (clean-import isolation invariant); on the real
-    # bus path aiko_services is present. A missing dep or a decode failure just falls
-    # through to the legacy tiers — the parser is best-effort, never fatal.
+    # bus path aiko_services is present. This whole tier is BEST-EFFORT with two
+    # fallbacks below, so ANY failure — a missing dep, or the hand-rolled recursive
+    # parser raising something unforeseen (RecursionError on nested parens, a codec
+    # error on version skew) — must fall through, never escape parse_payload's
+    # never-raises contract that the bus on_message handler relies on.
     try:
         from aiko_services.main.utilities import parse as _aiko_parse
-    except ImportError:
-        _aiko_parse = None
-    if _aiko_parse is not None:
-        try:
-            command, fields = _aiko_parse(payload_in)
-            # Require the `message` field (as the JSON branch does) so a bodyless call
-            # like `(message username: nick)` falls through instead of rendering an
-            # empty-bodied structured message.
-            if command == _MESSAGE_COMMAND and isinstance(fields, dict) \
-                    and "message" in fields:
-                return InboundMessage(
-                    username=fields.get("username"),
-                    channel=fields.get("channel", fallback_channel),
-                    timestamp=_coerce_timestamp(fields.get("timestamp")),
-                    message=fields["message"],
-                    raw=payload_in,
-                )
-        except (ValueError, IndexError, TypeError):
-            pass  # not a well-formed framework call — try the legacy tiers
+        command, fields = _aiko_parse(payload_in)
+        if command == _MESSAGE_COMMAND:
+            structured = _structured(fields, payload_in, fallback_channel)
+            if structured is not None:
+                return structured
+    except Exception:  # noqa: BLE001 — best-effort tier; fall through to the legacy tiers
+        pass
 
     # Tier 2: legacy JSON payload from the previous wire format.
     try:
         data = json.loads(payload_in)
     except (TypeError, ValueError):
-        # Tier 3: neither S-expr nor JSON — a bare message string.
-        return InboundMessage(None, fallback_channel, None, payload_in, payload_in)
-    if isinstance(data, dict) and "message" in data:
-        return InboundMessage(
-            username=data.get("username"),
-            channel=data.get("channel", fallback_channel),
-            timestamp=_coerce_timestamp(data.get("timestamp")),
-            message=data["message"],
-            raw=payload_in,
-        )
-    # JSON, but not a chat payload shape — treat the raw text as the message.
+        data = None
+    structured = _structured(data, payload_in, fallback_channel)
+    if structured is not None:
+        return structured
+
+    # Tier 3: neither a framework call nor a JSON chat payload — a bare message string.
     return InboundMessage(None, fallback_channel, None, payload_in, payload_in)
