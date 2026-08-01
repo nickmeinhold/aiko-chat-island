@@ -31,6 +31,9 @@ _FIELDS = dict(
     base_url="https://test.example",
     mode="moderator",
     key_version=1,
+    # A fixed signed_at_ms so unit builds are deterministic (the endpoint stamps
+    # `now`; the codec takes it as an explicit field — see the freshness tests below).
+    signed_at_ms=1720000000000,
 )
 
 
@@ -48,7 +51,7 @@ def test_manifest_has_expected_shape():
     m = _manifest()
     assert m["v"] == ii.V and m["alg"] == ii.ALG
     assert set(m) == {"v", "alg", "id", "display_name", "base_url", "mode",
-                      "key_version", "island_pubkey", "signature"}
+                      "key_version", "signed_at_ms", "island_pubkey", "signature"}
     assert m["island_pubkey"].startswith("z6Mk")  # canonical ed25519 Multikey prefix
 
 
@@ -58,6 +61,7 @@ def test_manifest_has_expected_shape():
     ("id", "other-island"),
     ("display_name", "Impersonator"),
     ("key_version", 2),
+    ("signed_at_ms", 1720000000001),  # freshness IS signed — a replay can't re-date it
 ])
 def test_tamper_of_any_signed_field_fails_verification(field, bad):
     m = _manifest()
@@ -306,3 +310,109 @@ def test_build_rejects_empty_id():
 async def test_get_island_sets_no_store(client):
     r = await client.get("/v1/island")
     assert r.headers.get("cache-control") == "no-store"
+
+
+# --- signed_at_ms freshness binding (#2452, A4 anti-replay prerequisite) ------ #
+#
+# The manifest signature is ETERNAL over the identity tuple: an old signed
+# `moderator` manifest verifies forever under the same key even after the operator
+# flips mode. Phase A's honest self-fetch over TLS has no replay surface, but A4's
+# peer federation handshake does. Binding a signed_at_ms into the bytes gives the A4
+# door a recency lever (is_fresh); the per-request signing in rest/island.py makes
+# the honest path always-fresh for free. (Strict epoch monotonicity is a clean
+# future v3 when A4's per-peer high-water store lands — see the task.)
+
+def test_manifest_is_v2_envelope():
+    # Adding a field to the signed bytes is a v2 envelope, never a silent add — the
+    # module's own versioning discipline. A verifier pinning v==2 rejects any v1.
+    assert ii.V == 2
+    assert _manifest()["v"] == 2
+
+
+def test_v1_shaped_manifest_is_rejected():
+    # A pre-freshness (v1) manifest — no signed_at_ms, v=1 — must not verify against a
+    # v2 verifier: it fails BOTH the frozen key-set check and the pinned v check, so a
+    # downgrade to the eternal-signature format is a structural reject, not a fallback.
+    m = _manifest()
+    del m["signed_at_ms"]
+    m["v"] = 1
+    with pytest.raises(ii.IslandIdentityError):
+        ii.verify_manifest(m)
+
+
+def test_signed_at_ms_in_the_domain_separated_bytes():
+    # The freshness field is length-agnostic (fixed u64), so prove it changes the
+    # signed bytes: two manifests differing ONLY in signed_at_ms sign different bytes.
+    a = ii.signing_bytes(**_FIELDS)
+    b = ii.signing_bytes(**{**_FIELDS, "signed_at_ms": _FIELDS["signed_at_ms"] + 1})
+    assert a != b
+
+
+@pytest.mark.parametrize("bad", [
+    True,            # bool is an int subclass — must not pack as 1
+    -1,              # negative time is nonsense
+    "1720000000000", # a string is not an int
+    2**63,           # past the sane u64-ish upper bound
+    1.5,             # a float is not an int
+])
+def test_verify_rejects_bad_signed_at_ms(bad):
+    m = _manifest()
+    m["signed_at_ms"] = bad
+    with pytest.raises(ii.IslandIdentityError):
+        ii.verify_manifest(m)
+
+
+def test_build_rejects_bad_signed_at_ms():
+    # The signing door itself refuses to mint a manifest with a nonsense timestamp —
+    # symmetric with the mode/key_version build guards.
+    with pytest.raises(ii.IslandIdentityError):
+        _manifest(signed_at_ms=-1)
+    with pytest.raises(ii.IslandIdentityError):
+        _manifest(signed_at_ms=True)
+
+
+def test_signed_at_ms_cap_mirrors_the_message_signer():
+    # One cap across both Ed25519 signers (a rename can't silently weaken a shared
+    # trust-boundary bound — the MAX_PUBKEY_STR precedent).
+    assert ii.MAX_SIGNED_AT_MS == signing.MAX_SIGNED_AT_MS
+
+
+# --- is_fresh: the opt-in A4-door recency policy (pure; caller supplies the clock) - #
+
+def test_is_fresh_true_within_window():
+    ts = _FIELDS["signed_at_ms"]
+    m = _manifest()
+    # Signed 1 minute ago, window is 5 minutes → fresh.
+    assert ii.is_fresh(m, now_ms=ts + 60_000, max_age_ms=300_000) is True
+
+
+def test_is_fresh_false_when_too_old():
+    ts = _FIELDS["signed_at_ms"]
+    m = _manifest()
+    # Signed 10 minutes ago, window is 5 minutes → a stale posture, rejected.
+    assert ii.is_fresh(m, now_ms=ts + 600_000, max_age_ms=300_000) is False
+
+
+def test_is_fresh_false_when_too_far_future():
+    ts = _FIELDS["signed_at_ms"]
+    m = _manifest()
+    # Signed 10 minutes in the FUTURE, beyond clock skew → rejected (a manifest can't
+    # legitimately predate the verifier's clock by more than skew).
+    assert ii.is_fresh(m, now_ms=ts - 600_000, max_age_ms=300_000,
+                       skew_ms=60_000) is False
+
+
+def test_is_fresh_true_within_skew():
+    ts = _FIELDS["signed_at_ms"]
+    m = _manifest()
+    # A small clock skew (30s future) is tolerated within the 60s skew allowance.
+    assert ii.is_fresh(m, now_ms=ts - 30_000, max_age_ms=300_000,
+                       skew_ms=60_000) is True
+
+
+def test_is_fresh_raises_on_structurally_bad_manifest():
+    # is_fresh is a policy check on an ALREADY-verified manifest; a missing/bad
+    # signed_at_ms is a structural fault (raise), not a silent "not fresh" — so a
+    # caller can't skip verify_manifest and get a false sense of a freshness verdict.
+    with pytest.raises(ii.IslandIdentityError):
+        ii.is_fresh({"no": "signed_at_ms"}, now_ms=1720000000000, max_age_ms=300_000)
