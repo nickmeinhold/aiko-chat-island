@@ -427,24 +427,28 @@ def test_dev_accepts_the_dev_island_seed():
 
 # --- invariant 7: operator-settable vars MUST be forwarded in docker-compose --
 #
-# The prod image reads config from the container env. docker-compose.yml only
-# injects a variable into the container if it REFERENCES that variable — a value
-# sitting in the host .env is otherwise inert. This class has bitten three times:
-#   - PASSKEY_EXTRA_ORIGINS (Android passkey CREATE silently failed until the
-#     compose forwarded it — verified live 2026-07-28),
-#   - MODERATOR_USER_IDS (operator seat #100 would be empty as deployed),
-#   - ISLAND_SIGNING_SEED (a signed-manifest image would crash-loop the crucible-09
-#     deploy on the dev-seed guard because the operator's seed never arrived).
-# A per-var comment is not enforcement (cf. the single-worker guard #46). This is
-# the behavioral tripwire: any config field an operator is expected to set per
-# island — every secret, the island identity/trust-root, and operator policy — must
-# appear in the chat-island service env block, or CI fails HERE the next time
-# someone adds one without the forward.
-
-# UPPER_SNAKE env names that MUST be forwarded. NOT every Settings field belongs
-# here — TTLs, host/port, and other code-defaulted knobs are deliberately omitted;
-# this list is the operator/secret/identity surface only. Adding an operator-facing
-# setting to config.py means adding it here AND to docker-compose.yml.
+# The prod image reads config from the container env. docker-compose injects a
+# variable into the container ONLY if the chat-island service references it AND the
+# reference passes the host value through (`${VAR...}`); a value sitting in the host
+# .env is otherwise inert. This class has bitten repeatedly — PASSKEY_EXTRA_ORIGINS
+# (Android passkey CREATE silently failed until forwarded, verified live 2026-07-28),
+# MODERATOR_USER_IDS (operator seat #100 empty as deployed), ISLAND_SIGNING_SEED (a
+# signed-manifest image would crash-loop the crucible-09 deploy on the dev-seed guard
+# because the operator's seed never arrived). A per-var comment is not enforcement
+# (cf. the single-worker guard #46). This is the behavioral tripwire.
+#
+# STRENGTH (cage-match PR#110, Carnot HIGH + Tesla): the check parses the YAML and
+# inspects the chat-island `environment:` MAPPING, and requires each var's value to
+# be the interpolation form `${VAR...}` — so a bare `VAR:` in a comment, in another
+# service, or a static `VAR: literal` (which does NOT pass a host .env value through)
+# can no longer green CI. It measures forwarding, not ink.
+#
+# SCOPE (honest, per Carnot MEDIUM + Tesla): this is a CURATED operator-config
+# surface, NOT a proof that config.py has no un-forwarded operator field. A genuinely
+# complete derivation needs per-field "operator-settable" metadata on Settings
+# (follow-up #26 orbit). TTLs, host/port, and code-defaulted infra knobs are
+# deliberately excluded; DB_URL / AIKO_MQTT_* / ENVIRONMENT are static-by-design
+# (not host-overridable) so they are excluded too.
 _MUST_FORWARD_ENV = {
     "JWT_SECRET",                    # secret — token forgery root
     "ISLAND_SIGNING_SEED",           # secret — manifest signing trust-root
@@ -459,21 +463,76 @@ _MUST_FORWARD_ENV = {
     "PASSKEY_ENABLED",               # per-island auth
     "PASSKEY_RP_ID",                 # per-island auth (domain-scoped)
     "PASSKEY_EXTRA_ORIGINS",         # per-island auth (the original incident)
+    "PASSKEY_ANDROID_CERT_SHA256",   # per-island auth (Play signing certs)
     "GATEWAY_BASE_URL",              # per-island identity
     "GATEWAY_ID",                    # per-island identity
     "GATEWAY_DISPLAY_NAME",          # per-island identity
     "GATEWAY_SEED_PEERS",            # operator-curated federation
+    "GATEWAY_BOOTSTRAP_PEERS",       # operator-curated federation (gossip fetch)
+    "GATEWAY_GOSSIP_ENABLED",        # operator policy — gossip fetch gate
 }
 
 
-def test_operator_settable_vars_are_forwarded_in_compose():
+def _chat_island_environment() -> dict[str, str]:
+    """The parsed chat-island `environment:` mapping from docker-compose.yml."""
+    import yaml
     from pathlib import Path
 
-    compose = (Path(__file__).resolve().parent.parent / "docker-compose.yml").read_text()
-    missing = sorted(v for v in _MUST_FORWARD_ENV if f"{v}:" not in compose)
-    assert not missing, (
-        "docker-compose.yml does not forward operator-settable env var(s): "
-        f"{missing}. A host .env value for these is INERT in the container unless "
-        "compose references the var — add each to the chat-island `environment:` "
-        "block. See invariant 7 above."
+    compose = yaml.safe_load(
+        (Path(__file__).resolve().parent.parent / "docker-compose.yml").read_text()
+    )
+    env = compose["services"]["chat-island"]["environment"]
+    # Compose allows a list ("- VAR=val") or a map; this template uses a map. Assert
+    # it, so a future switch to list form fails LOUDLY here rather than silently
+    # neutering every check below (which assumes dict membership).
+    assert isinstance(env, dict), (
+        "chat-island `environment:` is not a mapping — the forwarding checks below "
+        "assume map form; update them if the compose switches to list syntax."
+    )
+    return {k: str(v) for k, v in env.items()}
+
+
+def test_operator_settable_vars_are_forwarded_in_compose():
+    env = _chat_island_environment()
+    # Each operator var must be a KEY under chat-island.environment (scoping) AND its
+    # value must interpolate the host var `${VAR...}` (host-passthrough), not a static
+    # literal that would leave the host .env inert.
+    not_keyed = sorted(v for v in _MUST_FORWARD_ENV if v not in env)
+    assert not not_keyed, (
+        "docker-compose.yml chat-island.environment is missing operator-settable "
+        f"var(s): {not_keyed}. A host .env value is INERT unless the service forwards "
+        "it. See invariant 7."
+    )
+    not_passthrough = sorted(
+        v for v in _MUST_FORWARD_ENV if f"${{{v}" not in env[v]
+    )
+    assert not not_passthrough, (
+        "docker-compose.yml forwards these as a STATIC value, not a host "
+        f"interpolation: {not_passthrough}. Each must be `${{{{VAR...}}}}` so the "
+        "operator's host .env value reaches the container; a literal is inert. "
+        "See invariant 7."
+    )
+
+
+def test_compose_island_signing_seed_default_matches_config_dev_seed():
+    # The signing-seed forward bakes config._DEV_ISLAND_SEED as the compose default
+    # so the forward is a zero-regression superset (unset → the friendly prod
+    # dev-seed guard, not a cryptic decode error). That default is a SECOND copy of
+    # the sentinel; if config.py rotates _DEV_ISLAND_SEED and compose keeps injecting
+    # the OLD base64url, a prod-unset boot would run on a repo-public key that the
+    # app-level guard no longer denylists (cage-match PR#110, Tesla). Enforce the
+    # sync with a test instead of a "keep in sync" comment.
+    import re
+
+    env = _chat_island_environment()
+    m = re.fullmatch(r"\$\{ISLAND_SIGNING_SEED:-(.*)\}", env["ISLAND_SIGNING_SEED"])
+    assert m, (
+        "ISLAND_SIGNING_SEED is not the expected `${ISLAND_SIGNING_SEED:-<default>}` "
+        f"form: {env['ISLAND_SIGNING_SEED']!r}"
+    )
+    assert m.group(1) == _DEV_ISLAND_SEED, (
+        "docker-compose.yml's ISLAND_SIGNING_SEED default has drifted from "
+        "config._DEV_ISLAND_SEED. A prod-unset boot would then miss the friendly "
+        "dev-seed guard (or, worse, run on published key material no longer "
+        "denylisted). Update the compose default to match config._DEV_ISLAND_SEED."
     )

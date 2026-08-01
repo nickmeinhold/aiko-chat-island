@@ -113,8 +113,19 @@ services:
       # today (the dev seed), so a prod boot without a real seed trips the FRIENDLY,
       # actionable guard ("still the dev default — supply a real ISLAND_SIGNING_SEED
       # via `python -c ...`") instead of a cryptic "must be unpadded base64url" from
-      # an empty string (the decode at config.py runs UNCONDITIONALLY). Keep this in
-      # sync with _DEV_ISLAND_SEED in config.py if that sentinel ever changes.
+      # an empty string (the decode at config.py runs UNCONDITIONALLY). The sync with
+      # _DEV_ISLAND_SEED is enforced by tests/test_config.py invariant 7, not this
+      # comment.
+      #
+      # NAMED TRADEOFF (2026-08-01, cage-match PR#110/Tesla): JWT_SECRET above uses
+      # compose-time refuse (`:?`) because it is ALWAYS required; the signing seed
+      # instead SOFT-defaults so the current pre-#107 image (0.2.4, no seed guard, no
+      # /v1/island) keeps redeploying without a seed in the host .env. Cost: once a
+      # signed-manifest image (>= #107) is live, a forgotten seed is a LATE app-boot
+      # crash-loop, not an early `compose config` refuse like JWT. REMOVAL CONDITION:
+      # when the crucible-09 A-phase deploys AND the seed is guaranteed in SOPS on both
+      # boxes, flip this to `${ISLAND_SIGNING_SEED:?ISLAND_SIGNING_SEED required...}`
+      # for JWT parity (fail at compose-time, not app boot). Tracked in task #26.
       ISLAND_SIGNING_SEED: ${ISLAND_SIGNING_SEED:-YWlrby1kZXYtaXNsYW5kLXNlZWQtRE8tTk9ULVVTRSE}
       # Signing key version carried in the manifest for the rotation lifecycle
       # (#1865). Bumped when the seed is rotated. Defaults to config's 1.
