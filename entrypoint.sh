@@ -19,4 +19,10 @@ echo "[entrypoint] starting uvicorn..."
 # that handled it — a banned or deleted user's live socket on another worker would
 # ride on until natural close. The tempered design for the cross-worker fix is
 # docs/crucible/46-cross-worker-disconnect/CAST.md; build it before going wide.
+#
+# This is now ENFORCED, not just documented: aiko_gateway.worker_guard makes each
+# booting process contend for an exclusive flock on the data volume, so a second
+# worker/replica FAILS to boot (see #46 guard). When #46 lands and you add
+# `--workers N` here, also `export GATEWAY_ALLOW_MULTIWORKER=true` on the line above
+# this exec to lift the guard.
 exec uvicorn aiko_gateway.main:app --host 0.0.0.0 --port 8095

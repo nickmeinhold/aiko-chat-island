@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from .aiko.client import AikoBusClient
 from .config import settings
 from .db import SessionLocal, verify_schema
+from .worker_guard import acquire_single_worker_lock, release_single_worker_lock
 from .domain import channels_service, echo, messages_service, moderation_service
 from .realtime.hub import Hub
 
@@ -164,6 +165,11 @@ async def _gossip_loop(interval: int) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     state.loop = asyncio.get_running_loop()
+    # Enforce single-worker serving BEFORE any serving side-effect: the realtime Hub
+    # is per-process, so a ban/disconnect can't reach sockets on another worker until
+    # the #46 cross-worker sweep lands. A second worker fails to take the lock and
+    # refuses to boot (GATEWAY_ALLOW_MULTIWORKER=true lifts it). See worker_guard.
+    acquire_single_worker_lock()
     # Alembic (run by the container entrypoint before uvicorn) owns schema
     # creation/evolution; here we only VERIFY the live schema is migrated +
     # current, failing closed if not (#14).
@@ -211,6 +217,7 @@ async def lifespan(app: FastAPI):
             gossip_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await gossip_task
+        release_single_worker_lock()
 
 
 app = FastAPI(title="Aiko Chat Gateway", version="0.0.1", lifespan=lifespan)
