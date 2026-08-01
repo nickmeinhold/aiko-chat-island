@@ -83,6 +83,17 @@ services:
       # (fail-closed), and the both-or-neither default keeps the XOR boot-guard happy.
       GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
       GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
+      # --- agent-admin BOOTSTRAP (Citizenship H1, #2403). ULIDs seeded at boot into
+      # the FIRST-CLASS, DB-persisted users.is_agent_admin role (the gate reads the
+      # row, not this env). One-time chicken-and-egg solver: names the first admin(s);
+      # everything after is granted/revoked at runtime by an existing admin. ADDITIVE
+      # ONLY — dropping an id here does NOT demote a live admin (use the revoke door).
+      # Fail-closed empty: with no seed AND no runtime grant, NO agent can be
+      # provisioned (require_agent_binding_admin 403s everyone). JSON array, like the
+      # *_CLIENT_IDS above. NOTE: MODERATOR_USER_IDS is the sibling admin allowlist and
+      # is likewise not forwarded here — wire it the same way if moderators move to
+      # compose config.
+      AGENT_ADMIN_BOOTSTRAP_IDS: ${AGENT_ADMIN_BOOTSTRAP_IDS:-[]}
       # --- WebAuthn passkeys (#1471 / #29). The primary ingress now that social is
       # disabled (#1923). Default stays OFF (dark) at the TEMPLATE level on purpose:
       # advertising passkey requires THIS island to serve valid /.well-known

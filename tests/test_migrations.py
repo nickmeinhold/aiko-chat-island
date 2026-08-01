@@ -37,6 +37,7 @@ _MODEL_TABLES = {
     "oauth_handoffs", "oauth_states", "social_nonces",
     "communities", "community_memberships",
     "recovery_policies", "recovery_approvers", "pending_recovery",
+    "agent_bindings",
 }
 
 
@@ -98,6 +99,8 @@ def test_fresh_db_upgrades_to_head(tmp_path, monkeypatch) -> None:
             ).scalar()
             report_sql = conn.exec_driver_sql(
                 "SELECT sql FROM sqlite_master WHERE name='message_reports'").scalar()
+            users_sql = conn.exec_driver_sql(
+                "SELECT sql FROM sqlite_master WHERE name='users'").scalar()
     finally:
         engine.dispose()
     assert _MODEL_TABLES <= tables
@@ -124,6 +127,12 @@ def test_fresh_db_upgrades_to_head(tmp_path, monkeypatch) -> None:
     # resolution write succeed — assert it structurally in the migrated DDL.
     assert "ck_message_reports_resolution" in report_sql
     assert "'taken_down'" in report_sql and "'dismissed'" in report_sql
+    # users.kind CHECK (Citizenship H1, migration 0017) enforces the closed Kind set.
+    # compare_metadata is CHECK-blind on SQLite, so a migration that dropped or
+    # mis-spelled the constraint would let a bogus kind write succeed — assert it
+    # structurally in the migrated DDL (the batch rebuild must carry it).
+    assert "ck_users_kind" in users_sql
+    assert "'human'" in users_sql and "'agent'" in users_sql
 
 
 def test_adopt_pre_alembic_db_stamps_baseline(tmp_path, monkeypatch) -> None:

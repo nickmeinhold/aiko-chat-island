@@ -44,7 +44,8 @@ from . import (
     signing_keys_service)
 from .memberships_service import ROLE_ADMIN
 from .models import (
-    Community, CommunityMembership, Membership, Message, SocialIdentity, User)
+    AgentBinding, Community, CommunityMembership, Membership, Message,
+    SocialIdentity, User)
 
 # What a tombstoned message's author label becomes once the account is gone.
 DELETED_USER_LABEL = "[deleted user]"
@@ -229,6 +230,14 @@ async def delete_user_account(session: AsyncSession, user_id: str) -> None:
         delete(SocialIdentity).where(SocialIdentity.user_id == user_id))
     await session.execute(
         delete(Membership).where(Membership.user_id == user_id))
+    # Agent identity bindings (Citizenship H1): an agent User (kind='agent') owns
+    # AgentBinding rows (FK child of users). Agents have no self-serve deletion path
+    # today, but delete_user_account is the SINGLE teardown door, so a binding must go
+    # children-before-parent here too (verify-the-neighbor: every new users-referencing
+    # table joins this cascade, exactly as the passkey/signing/recovery rows above did).
+    # The cascade guard now requires it.
+    await session.execute(
+        delete(AgentBinding).where(AgentBinding.user_id == user_id))
     # Finally the account row itself.
     # NO token_generation bump here (#1914): deletion HARD-removes the user row, and
     # every auth ingress (get_current_user, refresh, WS handshake) fails closed when

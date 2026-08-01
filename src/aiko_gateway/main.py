@@ -168,6 +168,19 @@ async def lifespan(app: FastAPI):
     # creation/evolution; here we only VERIFY the live schema is migrated +
     # current, failing closed if not (#14).
     await verify_schema()
+    # Seed the first agent-admin(s) from AGENT_ADMIN_BOOTSTRAP_IDS into the persisted
+    # users.is_agent_admin role (#2403). ADDITIVE ONLY — grants the flag to listed ids
+    # that lack it, never revokes — so runtime grants survive a restart. Solves the
+    # chicken-and-egg (a fresh island names its first admin via the env, then manages
+    # the rest at runtime). Best-effort: a reconcile failure must not block boot.
+    from .domain import agents_service
+    try:
+        async with SessionLocal() as session:
+            granted = await agents_service.reconcile_bootstrap_agent_admins(session)
+        if granted:
+            log.info("agent-admin bootstrap: granted role to %d user(s)", granted)
+    except Exception:
+        log.exception("agent-admin bootstrap reconcile failed")
     # No independent seeding: channels are reconciled from the ChatServer
     # `channel_list` EC share once the bus client discovers it. An inbound
     # message for a not-yet-reconciled channel is upserted by persist_inbound
@@ -221,6 +234,7 @@ app.state.gw = state  # the WS endpoint reaches bus + hub via websocket.app.stat
 from .middleware import ContentSizeLimitMiddleware  # noqa: E402
 app.add_middleware(ContentSizeLimitMiddleware, max_bytes=settings.max_request_bytes)
 
+from .rest import agents as agent_routes  # noqa: E402
 from .rest import auth as auth_routes  # noqa: E402
 from .rest import channels as channel_routes  # noqa: E402
 from .rest import communities as community_routes  # noqa: E402
@@ -238,6 +252,7 @@ from .rest.errors import register_error_handlers  # noqa: E402
 register_error_handlers(app)  # structured ban-403 body (single door, mirrors tests)
 app.include_router(auth_routes.router)
 app.include_router(auth_routes.me_router)
+app.include_router(agent_routes.router)
 app.include_router(channel_routes.router)
 app.include_router(community_routes.router)
 app.include_router(device_routes.router)

@@ -111,6 +111,21 @@ class PasskeyOperation(enum.StrEnum):
     RECOVER = "recover"
 
 
+class Kind(enum.StrEnum):
+    """Closed set of user KINDS (Citizenship for the Dreaming, H1). 'human' is the
+    default — every account created through a human ingress (password / social /
+    passkey / register) is a human. 'agent' is an aiko agent identity minted ONLY
+    through the admin-gated OIDC agent door (agents_service): a human can never
+    self-assign it (no request field sets kind), so the value is server-authoritative.
+    Same single-source-of-truth pattern as Role/Platform: drives the DB CHECK on
+    users.kind via _in_check, so the constraint can't drift from the Python closed set.
+    Adding a member here needs a matching migration that rebuilds the users.kind CHECK,
+    or the parity gate fails."""
+
+    HUMAN = "human"
+    AGENT = "agent"
+
+
 class ReportResolution(enum.StrEnum):
     """Closed set of moderator outcomes for a message report (Piece B, #7). Same
     single-source-of-truth pattern as Role/Platform: drives the DB CHECK on
@@ -133,7 +148,22 @@ def _in_check(column: str, values: type[enum.StrEnum]) -> str:
 
 class User(Base):
     __tablename__ = "users"
+    # DB-level closed-set enforcement on `kind` beyond the API boundary (#11 pattern):
+    # even a direct SQL write cannot store an out-of-set kind. First named constraint
+    # on `users` — migration 0017 rebuilds the table via batch to add it, so the ORM
+    # metadata and the migration must name it identically (parity gate).
+    __table_args__ = (
+        CheckConstraint(_in_check("kind", Kind), name="ck_users_kind"),
+    )
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=new_ulid)
+    # Actor kind (Citizenship for the Dreaming, H1). 'human' (default) for every
+    # account born through a human ingress; 'agent' ONLY for an aiko agent identity
+    # provisioned by the admin-gated OIDC door (agents_service.create_agent_binding).
+    # Server-authoritative: NO request model exposes this field, so an authed human
+    # can never self-promote to an agent. server_default 'human' backfills existing
+    # rows at migration time (they are all humans).
+    kind: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="human", server_default="human")
     username: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     display_name: Mapped[str] = mapped_column(String(128), nullable=False)
     # NULLABLE as of social sign-in (#13): a social-only account has no password.
@@ -164,6 +194,21 @@ class User(Base):
     # (no `gen` claim) read as 0 too, so a deploy doesn't mass-logout live sessions.
     token_generation: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0")
+    # Agent-provisioning admin capability (Citizenship H1, #2403). A FIRST-CLASS,
+    # DB-persisted role — NOT an env allowlist — that gates minting a production agent
+    # identity (POST /v1/agents/bindings, require_agent_binding_admin). Distinct from the
+    # content-moderator seat: forging a first-class OIDC citizen is a HIGHER-privilege act
+    # than moderation, so it is its own capability, never reusing moderator_user_ids (the
+    # cage-match flagged that reuse). Granted/revoked at runtime by an existing agent-admin
+    # (agents_service.grant_agent_admin / revoke_agent_admin); the first admin is seeded
+    # at boot from settings.agent_admin_bootstrap_ids (chicken-and-egg bootstrap, additive
+    # only). Modeled as a persisted flag — the same shape as banned_at / token_generation —
+    # so it folds into the island operator-seat role framework later. Server-authoritative:
+    # NO request model exposes this field, so an authed user can never self-promote. DEFAULT
+    # false (server_default "0") backfills existing rows as non-admins (fail-closed: an
+    # island with no seeded/granted admin can provision NO agents).
+    is_agent_admin: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="0")
 
 
 class SocialIdentity(Base):
@@ -184,6 +229,80 @@ class SocialIdentity(Base):
     user_id: Mapped[str] = mapped_column(
         ForeignKey("users.id"), nullable=False, index=True)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class AgentBinding(Base):
+    """An admin-gated allowlist entry: a GitHub Actions workload → an aiko agent
+    identity (Citizenship for the Dreaming, H1).
+
+    THE trust root of the OIDC agent door. An agent authenticates by presenting a
+    GitHub Actions OIDC token (never a stored long-lived secret); the token's
+    signature-protected claims (`repository`, `ref`, `workflow_ref`) are matched
+    against a binding an ISLAND ADMIN created out-of-band. Only a token whose
+    verified claims hit a binding — AND whose IMMUTABLE `repository_id` /
+    `repository_owner_id` equal the binding's, AND whose `aud` equals the binding's
+    declared audience — mints a short-lived aiko token for `user_id`. The name triple
+    LOCATES the binding; the immutable numeric ids AUTHORIZE it (a recycled repo name
+    on a fresh numeric id can never mint the old identity).
+
+    Why bind on (repository, ref, workflow_ref) — all three signature-protected by
+    GitHub — rather than the mutable `workflow` NAME: `workflow_ref` is the full
+    canonical path (`owner/repo/.github/workflows/x.yml@ref`), so a binding names an
+    EXACT workflow file on an EXACT ref, not a collision-prone display name. UNIQUE on
+    the triple means a given workload resolves to exactly one agent (no ambiguity at
+    the door).
+
+    `aud` is the audience the operator's workflow will request (`core.getIDToken(aud)`)
+    and is checked against the token's `aud` claim. Requiring a specific audience is a
+    real defense: a GitHub OIDC token minted for some OTHER purpose in the same repo
+    (default aud = the repo owner URL) must not authenticate here. NEVER empty (the
+    service rejects a blank aud at create time) — an empty expected aud would degrade
+    to "accept any audience".
+
+    `user_id` is the agent User (kind='agent') this workload acts as — created in the
+    SAME transaction as the binding, so a binding never dangles. Revoking the agent is
+    the ordinary moderation ban on that user row (`banned_at`): it blocks new token
+    mints at this door (is_banned gate) AND drops the agent's live WS socket, exactly
+    like a human ban — one revocation mechanism, no separate agent kill-switch.
+
+    No ON DELETE CASCADE (codebase convention): an agent's account deletion would tear
+    these down explicitly. Agents are not user-deletable today (no self-serve agent
+    account deletion), so no purge hook exists yet; when agent lifecycle lands it joins
+    the children-before-parent teardown the cascade guard requires.
+    """
+    __tablename__ = "agent_bindings"
+    __table_args__ = (
+        UniqueConstraint(
+            "repository", "ref", "workflow_ref",
+            name="uq_agent_bindings_repo_ref_workflow"),
+    )
+    id: Mapped[str] = mapped_column(String(26), primary_key=True, default=new_ulid)
+    # The GitHub `repository` claim, "owner/repo". MUTABLE — a repo can be renamed or
+    # transferred, and its name can later be recycled by a DIFFERENT owner. So the name
+    # is NOT the authorization root; it is matched (with ref/workflow_ref) to LOOK UP a
+    # binding, but the two IMMUTABLE numeric claims below are what actually authorize.
+    repository: Mapped[str] = mapped_column(String(255), nullable=False)
+    # The GitHub `repository_id` / `repository_owner_id` claims — GitHub's IMMUTABLE
+    # numeric ids for the repo and its owner. Unlike the NAME, these never change on a
+    # rename and are never reused if the name is recycled, so binding-authorization keys
+    # on them: a token carrying the bound repo NAME but a different repository_id (a
+    # recycled/transferred slug) is REJECTED. Stored as strings (GitHub emits them as
+    # JSON strings) to avoid any int coercion ambiguity.
+    repository_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    repository_owner_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    # The GitHub `ref` claim, e.g. "refs/heads/main".
+    ref: Mapped[str] = mapped_column(String(255), nullable=False)
+    # The GitHub `workflow_ref` claim: the full canonical workflow path
+    # "owner/repo/.github/workflows/file.yml@refs/heads/main".
+    workflow_ref: Mapped[str] = mapped_column(String(512), nullable=False)
+    # The expected OIDC audience (the operator's requested `aud`). Checked against the
+    # token's `aud` claim; never empty (enforced at the service create door).
+    aud: Mapped[str] = mapped_column(String(255), nullable=False)
+    # The agent identity this workload authenticates AS (kind='agent').
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id"), nullable=False, index=True)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow)
 
 
 class Channel(Base):
