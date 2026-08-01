@@ -139,8 +139,11 @@ def signing_bytes(
     """The canonical, domain-separated, length-prefixed bytes the island signature is
     computed over. Every variable-length field is preceded by a big-endian u32
     length; ``key_version`` is a fixed-width big-endian u32 and ``signed_at_ms`` a
-    fixed-width big-endian u64 (no length prefix — the SAME u64 layout the message
-    signer uses for its ``signed_at_ms``). A verifier reconstructing different bytes
+    fixed-width big-endian u64 LAYOUT (no length prefix — the SAME layout the message
+    signer uses for its ``signed_at_ms``). The wire is a full u64, but the ACCEPTED
+    range is bounded to ``[0, MAX_SIGNED_AT_MS]`` (~1<<62) by ``_check_identity_tuple``
+    — an external impl reading "u64" must not assume full 2**64 acceptance. A verifier
+    reconstructing different bytes
     for the same manifest is non-conformant — exactly what the manifest round-trip
     test guards. ``signed_at_ms`` is INSIDE the signed bytes, so a replayed manifest
     cannot be silently re-dated to look fresh (the whole point of #2452)."""
@@ -343,7 +346,11 @@ def is_fresh(
     named SUGGESTIONS the A4 door may pass explicitly. Fail-closed on every knob: each
     is a bool-excluded, non-negative, bounded int, so ``max_age_ms=-1`` (rejects every
     honest peer), ``=True`` (a 1 ms window), or a float RAISES rather than silently
-    inverting the replay boundary.
+    inverting the replay boundary. Those bounds are TYPE-sanity only (``[0,
+    MAX_SIGNED_AT_MS]``, i.e. up to ~1<<62 ms); they do NOT cap the window to a *sane*
+    value — a stressed A4 caller could still pass a cosmic ``max_age_ms`` and re-open
+    eternity-within-policy. The SEMANTIC ceiling (a 5-minute window, not 146M years)
+    is the A4 door's to impose and document (#12), not this mechanism's.
 
     WHY recency and not strict monotonicity: recency needs no per-peer durable state
     (that store is A4's, and doesn't exist yet), and the per-request signing in
