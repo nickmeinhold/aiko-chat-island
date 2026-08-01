@@ -26,12 +26,16 @@ os.environ.setdefault("ENVIRONMENT", "test")
 
 # Point the single-worker lock (worker_guard) at a temp path for the whole suite,
 # so lifespan-running tests (TestClient) don't create a `.aiko-worker.lock` beside
-# the repo's dev DB. test_worker_guard.py overrides this per-test with its own
-# tmp_path; setdefault so a real GATEWAY_WORKER_LOCK still wins.
+# the repo's dev DB. PER-PROCESS (os.getpid()) so a parallel run (pytest-xdist)
+# gives each worker its OWN lock — otherwise unrelated lifespan tests in separate
+# workers would contend on one shared path and flake (cage-match PR#111,
+# Carnot+Tesla). test_worker_guard.py overrides this per-test with its own tmp_path;
+# setdefault so a real GATEWAY_WORKER_LOCK still wins.
 import tempfile as _tempfile
 
 os.environ.setdefault(
-    "GATEWAY_WORKER_LOCK", os.path.join(_tempfile.gettempdir(), "aiko-test-worker.lock")
+    "GATEWAY_WORKER_LOCK",
+    os.path.join(_tempfile.gettempdir(), f"aiko-test-worker-{os.getpid()}.lock"),
 )
 
 # Give the test harness a >= 32-byte JWT secret. The dev default

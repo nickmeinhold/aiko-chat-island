@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import fcntl
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -149,3 +151,34 @@ def test_fork_child_is_not_fooled_by_inherited_globals(_clean_guard_state):
     assert worker_guard._lock_fd is None
     os.close(held_by_parent)
     worker_guard._lock_pid = None
+
+
+def test_real_cross_process_contention(_clean_guard_state):
+    # Faithful cross-process proof (the PR body's manual check, now committed): a
+    # real SECOND OS process holding the lock makes THIS process refuse, and the
+    # holder's death releases it so we can then acquire. flock is per open-file-
+    # description, so this is the genuine `--workers 2` geometry — two processes —
+    # not the in-process two-fd model the other tests use.
+    lock = str(_clean_guard_state)
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "from aiko_gateway import worker_guard as w; "
+            "w.acquire_single_worker_lock(); print('HELD', flush=True); "
+            "import time; time.sleep(30)",
+        ],
+        env={**os.environ, "GATEWAY_WORKER_LOCK": lock},
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert child.stdout.readline().strip() == "HELD", "child failed to acquire"
+        with pytest.raises(RuntimeError, match="already holds"):
+            worker_guard.acquire_single_worker_lock()
+    finally:
+        child.terminate()
+        child.wait(timeout=10)
+    # Holder is dead → the kernel released the flock → this process can now acquire.
+    worker_guard.acquire_single_worker_lock()
+    assert worker_guard._lock_fd is not None
