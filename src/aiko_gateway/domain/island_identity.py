@@ -4,8 +4,10 @@ Where ``domain/signing.py`` is the CARRIER for the *app's* per-user message
 signatures (the gateway never holds those keys), this module is the island signing
 with its OWN long-lived Ed25519 identity key. That key is the trust root for
 "who this island is and what moderation posture it runs": it signs a manifest
-{id, display_name, base_url, mode, key_version} that a client fetches at connect
-(``GET /v1/island``) and — later (A4) — a peer observes at federation handshake.
+{id, display_name, base_url, mode, key_version, signed_at_ms} (envelope v2) that a
+client fetches at connect (``GET /v1/island``) and — later (A4) — a peer observes at
+federation handshake. ``signed_at_ms`` is the freshness binding (#2452) that lets the
+A4 door reject a replayed stale posture; see ``is_fresh``.
 
 WHY sign the WHOLE self-entry, not just ``mode``: the directory entry
 (peers_service.Island) is unsigned today and defended only by an operator allowlist
@@ -313,56 +315,50 @@ def verify_manifest(manifest: dict) -> bool:
 
 
 def is_fresh(
-    manifest: dict, *, now_ms: int,
-    max_age_ms: int = DEFAULT_MAX_AGE_MS,
-    skew_ms: int = DEFAULT_CLOCK_SKEW_MS,
+    signed_at_ms: int, *, now_ms: int, max_age_ms: int, skew_ms: int = 0,
 ) -> bool:
-    """The A4 peer-federation RECENCY policy: is this manifest's ``signed_at_ms`` close
-    enough to ``now_ms`` to be a CURRENT posture rather than a replayed stale one?
+    """RECENCY bound on a ``signed_at_ms`` timestamp: is it close enough to ``now_ms``
+    to be a CURRENT posture rather than a replayed stale one?
 
-    Returns True iff ``-skew_ms <= (now_ms - signed_at_ms) <= max_age_ms`` — i.e. not
-    older than the freshness window AND not implausibly far in the future (a manifest
-    that predates the verifier's clock by more than the tolerated skew is rejected, so
-    a forged-future timestamp can't buy unbounded validity).
+    Returns True iff ``-skew_ms <= (now_ms - signed_at_ms) <= max_age_ms`` — not older
+    than the freshness window AND not implausibly far in the future (a stamp that
+    predates the verifier's clock by more than the tolerated skew is rejected, so a
+    forged-future timestamp can't buy unbounded validity).
 
-    A PURE function: the caller supplies ``now_ms`` (no clock inside), so it is
-    deterministic and testable and the codec keeps its no-I/O contract. It is a policy
-    layered ON TOP of ``verify_manifest`` — call verify FIRST; a structurally-bad
-    manifest here (missing / malformed ``signed_at_ms``) RAISES IslandIdentityError
-    rather than silently returning a freshness verdict, so a caller can never skip
-    signature verification and mistake "unusable" for "not fresh".
+    TAKES THE INTEGER, NOT THE MANIFEST — deliberately (PR #108 cage-match, Carnot +
+    Tesla). This function VERIFIES NOTHING and makes NO claim about signatures or
+    manifest shape; it is pure timestamp arithmetic. An earlier version took the whole
+    manifest and its docstring promised "a caller can't skip verification" — but the
+    True path happily blessed a naked ``{"signed_at_ms": now}`` dict, a safety property
+    the bytes never enforced. The fix removes the coupling instead of guarding it: a
+    recency check that accepts only an ``int`` CANNOT be mistaken for a trust gate and
+    CANNOT bless a non-manifest. The verify-THEN-fresh composition order is the A4
+    admission door's job (a single fail-closed ``verify_manifest`` → ``is_fresh``
+    path), tracked as its own task — NOT a promise smuggled into this helper.
+
+    NO DEFAULT WINDOW: ``max_age_ms`` is REQUIRED so a caller consciously chooses its
+    freshness policy rather than silently inheriting one (a forgotten default is
+    "eternity-lite" — Tesla). ``skew_ms`` defaults to 0 (no clock-skew grace unless
+    explicitly granted). ``DEFAULT_MAX_AGE_MS`` / ``DEFAULT_CLOCK_SKEW_MS`` remain as
+    named SUGGESTIONS the A4 door may pass explicitly. Fail-closed on every knob: each
+    is a bool-excluded, non-negative, bounded int, so ``max_age_ms=-1`` (rejects every
+    honest peer), ``=True`` (a 1 ms window), or a float RAISES rather than silently
+    inverting the replay boundary.
 
     WHY recency and not strict monotonicity: recency needs no per-peer durable state
     (that store is A4's, and doesn't exist yet), and the per-request signing in
     ``rest/island.py`` makes the honest self-fetch path always-fresh for free. The
     residual — a captured manifest can be replayed for up to ``max_age_ms + skew_ms``
-    of wall time after issue (the freshness window PLUS the skew grace, not max_age
-    alone) after a mode flip — is bounded and named; strict epoch monotonicity that
-    kills it permanently is a clean future v3 when the A4 high-water store lands
-    (#2452).
-
-    FAIL-CLOSED on the policy knobs too: ``now_ms`` / ``max_age_ms`` / ``skew_ms`` get
-    the SAME bool-excluded, non-negative, bounded discipline as ``signed_at_ms`` — a
-    trust gate must not be assemblable from a typo. A config-fed ``max_age_ms=-1``
-    (rejects every honest peer), ``=True`` (a 1 ms window), or a float must RAISE at
-    the door, not silently invert or disable the replay boundary (Carnot/Tesla,
-    PR #108 cage-match). The codec bounds them for type-sanity; the A4 door still owns
-    the SEMANTIC tightness (a sane 5-minute window, not 146 million years)."""
-    if not isinstance(manifest, dict) or "signed_at_ms" not in manifest:
-        raise IslandIdentityError(
-            "is_fresh requires a verified manifest with signed_at_ms "
-            "(call verify_manifest first)")
-    ts = manifest["signed_at_ms"]
-    if isinstance(ts, bool) or not isinstance(ts, int) \
-            or not (0 <= ts <= MAX_SIGNED_AT_MS):
-        raise IslandIdentityError("manifest signed_at_ms is not a valid timestamp")
-    for pname, pval in (("now_ms", now_ms), ("max_age_ms", max_age_ms),
-                        ("skew_ms", skew_ms)):
+    of wall time after issue (the window PLUS the skew grace) after a mode flip — is
+    bounded and named; strict epoch monotonicity that kills it permanently is a clean
+    future v3 when the A4 high-water store lands (#2452)."""
+    for pname, pval in (("signed_at_ms", signed_at_ms), ("now_ms", now_ms),
+                        ("max_age_ms", max_age_ms), ("skew_ms", skew_ms)):
         if isinstance(pval, bool) or not isinstance(pval, int) \
                 or not (0 <= pval <= MAX_SIGNED_AT_MS):
             raise IslandIdentityError(
                 f"is_fresh {pname} must be a non-negative int in "
-                f"[0, {MAX_SIGNED_AT_MS}] (a bad freshness knob must fail closed, "
+                f"[0, {MAX_SIGNED_AT_MS}] (a bad freshness input must fail closed, "
                 f"not silently invert the replay boundary)")
-    age = now_ms - ts
+    age = now_ms - signed_at_ms
     return -skew_ms <= age <= max_age_ms

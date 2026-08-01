@@ -378,61 +378,76 @@ def test_signed_at_ms_cap_mirrors_the_message_signer():
     assert ii.MAX_SIGNED_AT_MS == signing.MAX_SIGNED_AT_MS
 
 
-# --- is_fresh: the opt-in A4-door recency policy (pure; caller supplies the clock) - #
+# --- is_fresh: a PURE recency bound on the timestamp int (pure; caller supplies now) - #
+#
+# is_fresh takes the signed_at_ms INTEGER, not the manifest (PR#108 cage-match, Carnot
+# + Tesla): a recency check that never sees a manifest cannot be mistaken for a trust
+# gate nor bless a non-manifest. verify-THEN-fresh composition is the A4 door's job
+# (task #12). max_age_ms is REQUIRED (no silent default window); skew_ms defaults to 0.
 
 def test_is_fresh_true_within_window():
     ts = _FIELDS["signed_at_ms"]
-    m = _manifest()
     # Signed 1 minute ago, window is 5 minutes → fresh.
-    assert ii.is_fresh(m, now_ms=ts + 60_000, max_age_ms=300_000) is True
+    assert ii.is_fresh(ts, now_ms=ts + 60_000, max_age_ms=300_000) is True
 
 
 def test_is_fresh_false_when_too_old():
     ts = _FIELDS["signed_at_ms"]
-    m = _manifest()
     # Signed 10 minutes ago, window is 5 minutes → a stale posture, rejected.
-    assert ii.is_fresh(m, now_ms=ts + 600_000, max_age_ms=300_000) is False
+    assert ii.is_fresh(ts, now_ms=ts + 600_000, max_age_ms=300_000) is False
 
 
 def test_is_fresh_false_when_too_far_future():
     ts = _FIELDS["signed_at_ms"]
-    m = _manifest()
-    # Signed 10 minutes in the FUTURE, beyond clock skew → rejected (a manifest can't
+    # Signed 10 minutes in the FUTURE, beyond clock skew → rejected (a stamp can't
     # legitimately predate the verifier's clock by more than skew).
-    assert ii.is_fresh(m, now_ms=ts - 600_000, max_age_ms=300_000,
+    assert ii.is_fresh(ts, now_ms=ts - 600_000, max_age_ms=300_000,
                        skew_ms=60_000) is False
 
 
 def test_is_fresh_true_within_skew():
     ts = _FIELDS["signed_at_ms"]
-    m = _manifest()
     # A small clock skew (30s future) is tolerated within the 60s skew allowance.
-    assert ii.is_fresh(m, now_ms=ts - 30_000, max_age_ms=300_000,
+    assert ii.is_fresh(ts, now_ms=ts - 30_000, max_age_ms=300_000,
                        skew_ms=60_000) is True
 
 
-def test_is_fresh_raises_on_structurally_bad_manifest():
-    # is_fresh is a policy check on an ALREADY-verified manifest; a missing/bad
-    # signed_at_ms is a structural fault (raise), not a silent "not fresh" — so a
-    # caller can't skip verify_manifest and get a false sense of a freshness verdict.
-    with pytest.raises(ii.IslandIdentityError):
-        ii.is_fresh({"no": "signed_at_ms"}, now_ms=1720000000000, max_age_ms=300_000)
+def test_is_fresh_no_skew_grace_by_default():
+    # skew_ms defaults to 0 (fail-closed): a stamp even 1ms in the future is rejected
+    # unless the caller explicitly grants skew grace.
+    ts = _FIELDS["signed_at_ms"]
+    assert ii.is_fresh(ts, now_ms=ts - 1, max_age_ms=300_000) is False
+    assert ii.is_fresh(ts, now_ms=ts, max_age_ms=300_000) is True
+
+
+def test_is_fresh_will_not_bless_a_manifest_dict():
+    # THE adversarial composition case (Carnot REQUEST_CHANGES + Tesla, PR#108): the
+    # old is_fresh(manifest) returned True for a naked {"signed_at_ms": now} dict — a
+    # "fresh" verdict on forgery-shaped garbage that had never been signature-verified.
+    # The int-only signature makes that structurally impossible: a dict is not an int,
+    # so it fails the fail-closed type gate and RAISES rather than blessing garbage.
+    ts = _FIELDS["signed_at_ms"]
+    for garbage in ({"signed_at_ms": ts}, _manifest(), [ts], None):
+        with pytest.raises(ii.IslandIdentityError):
+            ii.is_fresh(garbage, now_ms=ts, max_age_ms=300_000)
 
 
 def test_is_fresh_boundaries_are_inclusive():
     # Inclusive endpoints are load-bearing for federation interop — an off-by-one
     # between two islands is a silent freshness-flake class (Tesla, PR#108). Pin both.
     ts = _FIELDS["signed_at_ms"]
-    m = _manifest()
     # age == max_age_ms exactly → still fresh (upper bound inclusive).
-    assert ii.is_fresh(m, now_ms=ts + 300_000, max_age_ms=300_000) is True
-    assert ii.is_fresh(m, now_ms=ts + 300_001, max_age_ms=300_000) is False
+    assert ii.is_fresh(ts, now_ms=ts + 300_000, max_age_ms=300_000) is True
+    assert ii.is_fresh(ts, now_ms=ts + 300_001, max_age_ms=300_000) is False
     # age == -skew_ms exactly → still fresh (lower/future bound inclusive).
-    assert ii.is_fresh(m, now_ms=ts - 60_000, max_age_ms=300_000, skew_ms=60_000) is True
-    assert ii.is_fresh(m, now_ms=ts - 60_001, max_age_ms=300_000, skew_ms=60_000) is False
+    assert ii.is_fresh(ts, now_ms=ts - 60_000, max_age_ms=300_000, skew_ms=60_000) is True
+    assert ii.is_fresh(ts, now_ms=ts - 60_001, max_age_ms=300_000, skew_ms=60_000) is False
 
 
 @pytest.mark.parametrize("kw", [
+    {"signed_at_ms": -1},        # negative time is nonsense
+    {"signed_at_ms": True},      # bool is an int subclass — must not pass
+    {"signed_at_ms": 1.5},       # a float is not an int
     {"now_ms": -1},
     {"now_ms": True},
     {"now_ms": 1.5},
@@ -441,15 +456,16 @@ def test_is_fresh_boundaries_are_inclusive():
     {"skew_ms": -1},             # inverts the lower bound — must fail closed
     {"skew_ms": "60000"},
 ])
-def test_is_fresh_rejects_bad_policy_knobs(kw):
-    # A trust gate must not be assemblable from a typo: a bad freshness knob RAISES at
-    # the door rather than silently inverting/disabling the replay boundary (Carnot
+def test_is_fresh_rejects_bad_inputs(kw):
+    # A trust input must not be assemblable from a typo: a bad int RAISES at the door
+    # rather than silently inverting/disabling the replay boundary (Carnot
     # REQUEST_CHANGES + Tesla, PR#108). Same fail-closed discipline as signed_at_ms.
     ts = _FIELDS["signed_at_ms"]
-    base = {"now_ms": ts, "max_age_ms": 300_000, "skew_ms": 60_000}
+    base = {"signed_at_ms": ts, "now_ms": ts, "max_age_ms": 300_000, "skew_ms": 60_000}
     base.update(kw)
+    sig = base.pop("signed_at_ms")
     with pytest.raises(ii.IslandIdentityError):
-        ii.is_fresh(_manifest(), **base)
+        ii.is_fresh(sig, **base)
 
 
 async def test_get_island_manifest_is_freshly_stamped(client):
@@ -460,8 +476,13 @@ async def test_get_island_manifest_is_freshly_stamped(client):
     r = await client.get("/v1/island")
     m = r.json()
     now = int(time.time() * 1000)
-    assert ii.verify_manifest(m) is True
+    assert ii.verify_manifest(m) is True                 # verify FIRST (the real gate)
     assert abs(now - m["signed_at_ms"]) < 5_000          # stamped within ~5s of now
-    assert ii.is_fresh(m, now_ms=now) is True
-    # And the anti-replay lever bites: the same manifest a window later is stale.
-    assert ii.is_fresh(m, now_ms=now + 10 * 60 * 1000) is False
+    # ...THEN freshness on the extracted timestamp (the verify-then-fresh order the A4
+    # door will formalize, #12). A 5-minute window with 1-minute skew grace.
+    assert ii.is_fresh(m["signed_at_ms"], now_ms=now,
+                       max_age_ms=ii.DEFAULT_MAX_AGE_MS,
+                       skew_ms=ii.DEFAULT_CLOCK_SKEW_MS) is True
+    # And the anti-replay lever bites: the same stamp a window later is stale.
+    assert ii.is_fresh(m["signed_at_ms"], now_ms=now + 10 * 60 * 1000,
+                       max_age_ms=ii.DEFAULT_MAX_AGE_MS) is False
