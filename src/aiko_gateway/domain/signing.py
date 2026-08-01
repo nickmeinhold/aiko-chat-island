@@ -49,7 +49,11 @@ SIG_RAW_LEN = 64
 
 # Field caps (untrusted client input on a wire boundary). Generous but finite —
 # a Multikey pubkey is ~48 chars, a raw-64 sig is ~86 base64url chars.
-_MAX_PUBKEY_STR = 128
+# MAX_PUBKEY_STR is public: the island-identity trust boundary reuses the SAME cap
+# rather than reaching into a private name (a rename can't silently weaken a
+# cross-module cap on a trust boundary).
+MAX_PUBKEY_STR = 128
+_MAX_PUBKEY_STR = MAX_PUBKEY_STR  # backwards-compatible alias for in-module callers
 _MAX_SIG_STR = 128
 _MAX_CLIENT_MSG_ID = 64            # matches the messages.client_msg_id column width
 _MAX_SIGNED_AT_MS = 1 << 62        # sane u64-ish upper bound (well past any real clock)
@@ -91,6 +95,31 @@ def _b58decode(s: str) -> bytes:
     return b"\x00" * pad + body
 
 
+def _b58encode(b: bytes) -> str:
+    """Minimal base58btc encode (no external dep) — the exact inverse of
+    ``_b58decode``. Preserves leading-zero bytes as leading '1's (the base58btc
+    convention ``_b58decode`` relies on to round-trip a Multikey's ``0xed01``
+    prefix, whose bytes are non-zero, plus any zero-leading raw key)."""
+    n_pad = len(b) - len(b.lstrip(b"\x00"))
+    num = int.from_bytes(b, "big")
+    out: list[str] = []
+    while num > 0:
+        num, rem = divmod(num, 58)
+        out.append(_B58_ALPHABET[rem])
+    return "1" * n_pad + "".join(reversed(out))
+
+
+def encode_multikey(raw: bytes) -> str:
+    """Encode a raw 32-byte ed25519 public key as a multibase-base58btc Multikey
+    (``z`` + base58btc(0xed01 ‖ 32 raw bytes)) — the inverse of ``decode_multikey``,
+    producing the SAME on-wire shape the app's message signer uses for user keys, so
+    an island's own identity key is one uniform format across the ecosystem. Raises
+    OriginError on a wrong-length input (fail closed — never emit a malformed key)."""
+    if len(raw) != PUBKEY_RAW_LEN:
+        raise OriginError(f"pubkey raw length {len(raw)} != {PUBKEY_RAW_LEN}")
+    return "z" + _b58encode(_MULTICODEC_ED25519 + raw)
+
+
 def decode_multikey(s: str) -> bytes:
     """Decode an ed25519 Multikey (`z` + base58btc(0xed01 ‖ 32 raw bytes)) to the
     raw 32-byte public key. The signed bytes use the RAW key, so this is what a
@@ -111,12 +140,33 @@ def decode_multikey(s: str) -> bytes:
     return raw
 
 
-def _b64url_raw(s: str, *, expect_len: int, field: str) -> bytes:
+def b64url_raw(s: str, *, expect_len: int, field: str) -> bytes:
     """Strictly decode UNPADDED base64url and assert an exact decoded length.
     Charset-gate before decoding — `base64.urlsafe_b64decode` is permissive
     (tolerates `=` padding and silently skips some junk), so without this an
     `=`-padded or standard-alphabet string could decode to the right length and
-    be echoed across the trust boundary as if canonical."""
+    be echoed across the trust boundary as if canonical.
+
+    Public so the island-identity trust boundary reuses the EXACT same strict
+    decoder (island seed = 32 bytes, island signature = 64 bytes) rather than a
+    private-regex reach or a permissive base64 call — one canonical-decode gate
+    across every Ed25519 boundary in the gateway.
+
+    CANONICAL, not merely valid: base64url is malleable — the unused low bits of the
+    final character are ignored on decode, so several distinct strings decode to the
+    SAME bytes (e.g. `…SE`, `…SF`, `…SG`, `…SH` all yield the same 32-byte value).
+    Accepting a non-canonical spelling is a real trust-boundary hole: a non-canonical
+    alias of the dev signing seed would decode to the dev KEY yet slip past a string
+    equality guard (booting prod on the public key), and a signature could be
+    re-spelled into a different-but-verifying envelope string. So after decoding we
+    re-encode and require the input to be EXACTLY the canonical unpadded form."""
+    # Cap the input length BEFORE the regex/decode: the canonical unpadded encoding of
+    # `expect_len` bytes has a fixed length, so anything longer is malformed by
+    # construction — reject it cheaply rather than regex-scan + decode an oversized
+    # peer-fed string (DoS bound on the untrusted A4 manifest path).
+    max_len = (expect_len * 8 + 5) // 6  # ceil(expect_len*8 / 6)
+    if len(s) > max_len:
+        raise OriginError(f"{field} too long ({len(s)} > {max_len} chars)")
     if not _B64URL_UNPADDED_RE.match(s):
         raise OriginError(f"{field} must be unpadded base64url ([A-Za-z0-9_-], no '=')")
     try:
@@ -125,6 +175,11 @@ def _b64url_raw(s: str, *, expect_len: int, field: str) -> bytes:
         raise OriginError(f"{field} is not valid base64url") from e
     if len(raw) != expect_len:
         raise OriginError(f"{field} decoded length {len(raw)} != {expect_len}")
+    # Canonicalization gate (base64 malleability, above): the input must be the exact
+    # canonical unpadded base64url of the decoded bytes, so a non-canonical alias can
+    # never masquerade as canonical across a trust boundary.
+    if base64.urlsafe_b64encode(raw).rstrip(b"=").decode() != s:
+        raise OriginError(f"{field} is not canonical unpadded base64url")
     return raw
 
 
@@ -206,7 +261,7 @@ def validate_origin(raw: Any, *, frame_client_msg_id: str) -> dict | None:
     sig = raw["sig"]
     if not isinstance(sig, str) or len(sig) > _MAX_SIG_STR:
         raise OriginError("origin.sig must be a string within the size cap")
-    _b64url_raw(sig, expect_len=SIG_RAW_LEN, field="origin.sig")
+    b64url_raw(sig, expect_len=SIG_RAW_LEN, field="origin.sig")
 
     # Return a FRESH closed projection (exactly the required keys), not the
     # caller's dict — so the persisted/echoed JSON can't be mutated through a

@@ -23,10 +23,16 @@ defaults, not whatever a local `.env` happens to set.
 """
 from __future__ import annotations
 
+import base64
+
 import pytest
 from pydantic import ValidationError
 
-from aiko_gateway.config import _DEV_JWT_SECRET, Settings
+from aiko_gateway.config import _DEV_ISLAND_SEED, _DEV_JWT_SECRET, Settings
+
+# A real (non-dev) island signing seed for prod-boot tests: 32 bytes, base64url.
+_REAL_ISLAND_SEED = base64.urlsafe_b64encode(
+    b"prod-island-seed-32-bytes-long!!").rstrip(b"=").decode()
 
 
 # --- invariant 1: fail-closed jwt_secret ------------------------------------
@@ -337,4 +343,83 @@ def test_dev_passkey_rp_id_mismatch_boots():
     s = Settings(_env_file=None, environment="dev", passkey_enabled=True,
                  gateway_base_url="https://chat.enspyr.co",
                  passkey_rp_id="chat.imagineering.cc")
+    assert s.is_production is False
+
+
+# --- island identity + mode (crucible-09 Phase A: A1 + A2) ------------------- #
+
+def test_e2ee_mode_rejected_in_production():
+    # A2: e2ee is schema-reserved for Phase B — no encryption exists, so advertising
+    # it would mislabel operator-readable plaintext as E2EE. Refuse boot.
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
+                 passkey_enabled=True, island_signing_seed=_REAL_ISLAND_SEED,
+                 island_mode="e2ee")
+
+
+def test_e2ee_mode_rejected_in_dev_too():
+    # A2 is NOT prod-gated: a dev/test island advertising e2ee would still lie to its
+    # client (A3 reads the manifest in dev). The mislabel is environment-independent.
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, environment="dev", island_mode="e2ee")
+
+
+def test_moderator_mode_is_the_default_and_boots():
+    s = Settings(_env_file=None, environment="dev")
+    assert s.island_mode == "moderator"
+
+
+def test_prod_with_dev_island_seed_raises():
+    # The island key is a trust root (signs the self-manifest); the dev default in
+    # prod would let anyone who read the repo sign a manifest for this island.
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
+                 passkey_enabled=True, island_signing_seed=_DEV_ISLAND_SEED)
+
+
+def test_prod_rejects_noncanonical_dev_seed_alias():
+    # Carnot HIGH: a non-canonical base64url alias of the dev seed decodes to the SAME
+    # (public) dev KEY but is a different string, so it would slip past the
+    # string-equality dev-seed guard and boot prod on the known key. The canonical
+    # decoder now rejects the alias at the seed-decode step, before the guard.
+    alias = _DEV_ISLAND_SEED[:-1] + ("F" if _DEV_ISLAND_SEED[-1] != "F" else "G")
+    import base64
+    assert alias != _DEV_ISLAND_SEED
+    assert base64.urlsafe_b64decode(alias + "=") == base64.urlsafe_b64decode(_DEV_ISLAND_SEED + "=")
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
+                 passkey_enabled=True, island_signing_seed=alias)
+
+
+def test_prod_with_real_island_seed_boots():
+    s = Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
+                 passkey_enabled=True, island_signing_seed=_REAL_ISLAND_SEED)
+    assert s.is_production is True
+
+
+def test_malformed_island_seed_rejected_all_env():
+    # A key that can't decode to 32 bytes can't sign — fail closed at boot in EVERY
+    # environment, not 500 on the first /v1/island fetch.
+    short = base64.urlsafe_b64encode(b"too-short").rstrip(b"=").decode()
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, environment="dev", island_signing_seed=short)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, environment="dev", island_signing_seed="has spaces!")
+
+
+def test_island_key_version_out_of_u32_range_rejected_at_boot():
+    # The manifest packs key_version as a big-endian u32; an out-of-range value must
+    # fail closed at boot, not raise struct.error as a 500 on the first /v1/island.
+    for bad in (0, -1, 2**32):
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None, environment="dev", island_key_version=bad)
+
+
+def test_dev_accepts_the_dev_island_seed():
+    # Local dev must stay frictionless: the dev-default seed boots in dev (only prod
+    # rejects it). Passed explicitly because conftest seeds a real ISLAND_SIGNING_SEED
+    # into the env, so a bare Settings() would read that, not the dev default.
+    s = Settings(_env_file=None, environment="dev", island_signing_seed=_DEV_ISLAND_SEED)
+    assert s.island_mode == "moderator"
+    assert s.island_signing_seed == _DEV_ISLAND_SEED
     assert s.is_production is False
