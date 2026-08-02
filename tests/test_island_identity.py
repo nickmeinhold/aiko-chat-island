@@ -486,3 +486,86 @@ async def test_get_island_manifest_is_freshly_stamped(client):
     # And the anti-replay lever bites: the same stamp a window later is stale.
     assert ii.is_fresh(m["signed_at_ms"], now_ms=now + 10 * 60 * 1000,
                        max_age_ms=ii.DEFAULT_MAX_AGE_MS) is False
+
+
+# --- admit_manifest: the A4 verify-THEN-fresh admission door (#12) ------------ #
+#
+# The single fail-closed door the A4 peer-federation path walks a peer's SIGNED
+# self-manifest through. It composes verify_manifest (real crypto gate) THEN is_fresh
+# (recency), pins the 5-minute SEMANTIC ceiling as its DEFAULT (is_fresh alone permits a
+# cosmic window — #12's mandate is to pin it here), and mirrors verify_manifest's
+# raise-vs-False contract: a forged/stale manifest returns None; a structurally-malformed
+# one RAISES, so a caller can still tell "not a manifest" from "bad signature / stale".
+
+def test_admit_returns_mode_for_valid_fresh_manifest():
+    now = int(time.time() * 1000)
+    assert ii.admit_manifest(_manifest(signed_at_ms=now), now_ms=now) == "moderator"
+
+
+def test_admit_pins_the_five_minute_default_ceiling():
+    # No caller-supplied window: the DEFAULT is the pin. A stamp 10 min old is stale
+    # under the default 5-min ceiling → None (never a cosmic-window silent accept).
+    now = int(time.time() * 1000)
+    m = _manifest(signed_at_ms=now - 10 * 60 * 1000)
+    assert ii.admit_manifest(m, now_ms=now) is None
+
+
+def test_admit_returns_none_for_forged_signature():
+    now = int(time.time() * 1000)
+    other = base64.urlsafe_b64encode(b"a-different-island-seed-32-byte!").rstrip(b"=").decode()
+    m = _manifest(signed_at_ms=now)
+    m["island_pubkey"] = ii.public_multikey(ii.private_key_from_seed(other))
+    assert ii.admit_manifest(m, now_ms=now) is None
+
+
+@pytest.mark.parametrize("field,bad", [
+    ("mode", "e2ee"),                      # a valid vocabulary value, but tampered post-sign
+    ("base_url", "https://evil.example"),
+    ("id", "other-island"),
+])
+def test_admit_returns_none_for_tampered_field(field, bad):
+    now = int(time.time() * 1000)
+    m = _manifest(signed_at_ms=now)
+    m[field] = bad
+    assert ii.admit_manifest(m, now_ms=now) is None
+
+
+def test_admit_returns_none_for_stale_but_genuinely_signed():
+    # A REAL signature that is simply too old: verified True, fresh False → not admitted.
+    now = int(time.time() * 1000)
+    m = _manifest(signed_at_ms=now - 6 * 60 * 1000)  # 6 min > 5 min window
+    assert ii.verify_manifest(m) is True             # the signature is genuine...
+    assert ii.admit_manifest(m, now_ms=now) is None  # ...but the posture is stale
+
+
+def test_admit_returns_none_for_future_stamp_beyond_skew():
+    now = int(time.time() * 1000)
+    m = _manifest(signed_at_ms=now + 10 * 60 * 1000)
+    assert ii.admit_manifest(m, now_ms=now) is None
+
+
+def test_admit_tolerates_small_future_skew():
+    now = int(time.time() * 1000)
+    m = _manifest(signed_at_ms=now + 30_000)  # 30s future, within the default 60s skew
+    assert ii.admit_manifest(m, now_ms=now) == "moderator"
+
+
+@pytest.mark.parametrize("bad", [
+    {"island_pubkey": "znope", "signature": "x"},  # wrong key set → verify raises
+    "not a dict",
+])
+def test_admit_raises_on_malformed_like_verify(bad):
+    now = int(time.time() * 1000)
+    with pytest.raises(ii.IslandIdentityError):
+        ii.admit_manifest(bad, now_ms=now)
+
+
+def test_admit_raises_on_wrong_v_or_alg():
+    # v/alg live OUTSIDE the signed bytes; verify_manifest allowlists them and RAISES,
+    # so admit propagates the raise (the JWT-alg-confusion-class guard survives the door).
+    now = int(time.time() * 1000)
+    for over in ({"v": 999}, {"alg": "none"}):
+        m = _manifest(signed_at_ms=now)
+        m.update(over)
+        with pytest.raises(ii.IslandIdentityError):
+            ii.admit_manifest(m, now_ms=now)

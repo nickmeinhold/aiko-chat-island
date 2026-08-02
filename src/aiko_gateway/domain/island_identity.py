@@ -369,3 +369,46 @@ def is_fresh(
                 f"not silently invert the replay boundary)")
     age = now_ms - signed_at_ms
     return -skew_ms <= age <= max_age_ms
+
+
+def admit_manifest(
+    manifest: object, *, now_ms: int,
+    max_age_ms: int = DEFAULT_MAX_AGE_MS, skew_ms: int = DEFAULT_CLOCK_SKEW_MS,
+) -> str | None:
+    """The A4 peer-federation ADMISSION DOOR (#12): the single fail-closed
+    verify-THEN-fresh gate a peer's signed self-manifest passes before this island will
+    trust its declared ``mode``. Returns the verified ``mode`` string iff BOTH:
+      1. ``verify_manifest(manifest)`` is True — the signature is valid for the manifest's
+         own declared ``island_pubkey`` (a forgery/tamper is a clean False), AND
+      2. ``is_fresh(signed_at_ms, ...)`` is True — the posture is recent, not a replayed
+         stale manifest captured before a mode flip.
+    Otherwise returns None.
+
+    RAISES IslandIdentityError ONLY on a structurally-malformed manifest (mirroring
+    ``verify_manifest``'s raise-vs-False contract), so a caller can still distinguish
+    "not a manifest at all" from "verified-false / stale".
+
+    THE 5-MINUTE SEMANTIC CEILING IS PINNED HERE. ``is_fresh`` deliberately takes an int
+    and REQUIRES an explicit ``max_age_ms`` — it will honor a cosmic window if handed one
+    (its docstring names imposing the SEMANTIC ceiling "the A4 door's job (#12)"). This
+    door supplies the sane default (``DEFAULT_MAX_AGE_MS`` = 5 min, ``DEFAULT_CLOCK_SKEW_MS``
+    = 1 min), so the common call ``admit_manifest(m, now_ms=now)`` gets the replay window
+    without any caller choosing it. A caller MAY tighten it per threat, but the default IS
+    the pin — no path silently inherits eternity.
+
+    SCOPE: a True result proves the manifest is internally consistent AND recent — it does
+    NOT establish that ``island_pubkey`` is the island you meant to reach (key distribution
+    / TOFU arrives with the A4 peer-trust store, not here). The caller (``gossip_once``)
+    additionally binds the verified mode only to the peer whose ``base_url`` it actually
+    contacted, so a manifest signed for a different identity can't bind mode to this peer."""
+    if verify_manifest(manifest) is not True:
+        # A forged/tampered signature is a clean False from verify_manifest → not admitted.
+        # (A structurally-malformed manifest already RAISED inside verify_manifest, so it
+        # propagates rather than masquerading as a plain "not admitted".)
+        return None
+    # verify_manifest validated the whole tuple incl. signed_at_ms's type and bounds, so
+    # this is a well-formed bounded int; is_fresh still re-checks every knob fail-closed.
+    if not is_fresh(manifest["signed_at_ms"], now_ms=now_ms,
+                    max_age_ms=max_age_ms, skew_ms=skew_ms):
+        return None
+    return manifest["mode"]

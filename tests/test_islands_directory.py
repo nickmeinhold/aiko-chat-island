@@ -8,10 +8,28 @@ authenticity.
 """
 from __future__ import annotations
 
+import base64
+import time
+
+from aiko_gateway.domain import island_identity as ii
 from aiko_gateway.domain.peers_service import (
     MAX_PEERS, Island, IslandDirectory, build_directory_from_settings,
     coerce_island, gossip_once,
 )
+
+# A fixed non-dev seed (32 bytes) for building signed peer manifests in gossip tests.
+_MANIFEST_SEED = base64.urlsafe_b64encode(b"gossip-test-island-seed-32-byte!").rstrip(b"=").decode()
+
+
+def _signed(id: str, base_url: str, *, mode: str = "moderator",
+            signed_at_ms: int | None = None, seed: str = _MANIFEST_SEED) -> dict:
+    """Build a peer's signed self-manifest as GET /v1/island would serve it. Defaults to
+    a live `now` stamp (mirroring the real per-request endpoint) so the A4 door's
+    freshness check passes; pass an explicit signed_at_ms for the stale/future cases."""
+    return ii.build_signed_manifest(
+        id=id, display_name=id.title(), base_url=base_url, mode=mode, key_version=1,
+        signed_at_ms=signed_at_ms if signed_at_ms is not None else int(time.time() * 1000),
+        seed_b64url=seed)
 
 
 # --- coerce_island: the untrusted-entry validator ---------------------------- #
@@ -200,6 +218,140 @@ async def test_gossip_swallows_unreachable_peer():
     learned = await gossip_once(d, client)  # must not raise
     assert learned == 0
     assert [p.id for p in d.known()] == ["home"]  # only self
+
+
+# --- A4: verified peer mode via the signed self-manifest -------------------- #
+#
+# A4 learns a peer's moderation posture ONLY from its SIGNED /v1/island manifest, walked
+# through admit_manifest (verify-then-fresh). The unsigned /v1/islands gossip stays
+# discovery-only; mode is never trusted from it. Every failure mode (forged, stale,
+# base_url mismatch, manifest fetch down) fails CLOSED — mode stays None — and never
+# breaks discovery.
+
+async def test_gossip_records_verified_mode_from_signed_manifest():
+    d = IslandDirectory(_self(), bootstrap_urls=["https://seed.example"])
+    now = int(time.time() * 1000)
+    client = _FakeClient({
+        "https://seed.example/v1/islands": {"islands": [
+            {"id": "seed", "displayName": "Seed", "baseURL": "https://seed.example"}]},
+        "https://seed.example/v1/island": _signed("seed", "https://seed.example",
+                                                  signed_at_ms=now),
+    })
+    await gossip_once(d, client)
+    seed = next(p for p in d.known() if p.id == "seed")
+    assert seed.mode == "moderator"
+
+
+async def test_gossip_observes_a_peers_e2ee_declaration_without_filtering():
+    # A4 is declaration-only: a peer may legitimately sign an `e2ee` manifest (a future
+    # Phase B island), and verify_manifest allowlists the whole IslandMode vocabulary so
+    # that posture is LEGIBLE. We OBSERVE it (record "e2ee"), we do NOT reject or filter
+    # it — that's the "no filtering" property. (This island's OWN e2ee boot is what A2
+    # hard-rejects; a peer declaring it is a valid observation, not a violation.)
+    d = IslandDirectory(_self(), bootstrap_urls=["https://beta.example"])
+    now = int(time.time() * 1000)
+    client = _FakeClient({
+        "https://beta.example/v1/islands": {"islands": [
+            {"id": "beta", "displayName": "Beta", "baseURL": "https://beta.example"}]},
+        "https://beta.example/v1/island": _signed("beta", "https://beta.example",
+                                                  mode="e2ee", signed_at_ms=now),
+    })
+    await gossip_once(d, client)
+    beta = next(p for p in d.known() if p.id == "beta")
+    assert beta.mode == "e2ee"
+
+
+async def test_gossip_does_not_record_mode_from_forged_manifest():
+    # A peer serves a valid-shaped, FRESH manifest whose pubkey is a different key's:
+    # the signature can't match → admit returns None → mode stays None.
+    d = IslandDirectory(_self(), bootstrap_urls=["https://liar.example"])
+    now = int(time.time() * 1000)
+    forged = _signed("liar", "https://liar.example", signed_at_ms=now)
+    other = base64.urlsafe_b64encode(b"another-liar-island-seed-32-byte").rstrip(b"=").decode()
+    forged["island_pubkey"] = ii.public_multikey(ii.private_key_from_seed(other))
+    client = _FakeClient({
+        "https://liar.example/v1/islands": {"islands": [
+            {"id": "liar", "displayName": "Liar", "baseURL": "https://liar.example"}]},
+        "https://liar.example/v1/island": forged,
+    })
+    await gossip_once(d, client)
+    liar = next(p for p in d.known() if p.id == "liar")
+    assert liar.mode is None
+
+
+async def test_gossip_does_not_record_mode_from_stale_manifest():
+    d = IslandDirectory(_self(), bootstrap_urls=["https://slow.example"])
+    old = int(time.time() * 1000) - 10 * 60 * 1000  # 10 min old > 5 min window
+    client = _FakeClient({
+        "https://slow.example/v1/islands": {"islands": [
+            {"id": "slow", "displayName": "Slow", "baseURL": "https://slow.example"}]},
+        "https://slow.example/v1/island": _signed("slow", "https://slow.example",
+                                                  signed_at_ms=old),
+    })
+    await gossip_once(d, client)
+    slow = next(p for p in d.known() if p.id == "slow")
+    assert slow.mode is None
+
+
+async def test_gossip_does_not_record_mode_on_base_url_mismatch():
+    # A VALID, FRESH manifest whose signed base_url != the peer we actually contacted
+    # must not bind mode to that peer (it's a manifest for a different identity).
+    d = IslandDirectory(_self(), bootstrap_urls=["https://a.example"])
+    now = int(time.time() * 1000)
+    client = _FakeClient({
+        "https://a.example/v1/islands": {"islands": [
+            {"id": "a", "displayName": "A", "baseURL": "https://a.example"}]},
+        # Served at a.example, but the signed manifest claims b.example → mismatch.
+        "https://a.example/v1/island": _signed("a", "https://b.example", signed_at_ms=now),
+    })
+    await gossip_once(d, client)
+    a = next(p for p in d.known() if p.id == "a")
+    assert a.mode is None
+
+
+async def test_gossip_survives_manifest_fetch_failure_but_still_learns_peer():
+    # The peer serves its directory but NOT /v1/island (manifest GET raises) → the peer
+    # is still learned; its mode just stays None. A manifest failure never breaks discovery.
+    d = IslandDirectory(_self(), bootstrap_urls=["https://seed.example"])
+    client = _FakeClient({
+        "https://seed.example/v1/islands": {"islands": [
+            {"id": "seed", "displayName": "Seed", "baseURL": "https://seed.example"}]},
+        # no /v1/island mapping → that GET raises
+    })
+    learned = await gossip_once(d, client)
+    assert learned == 1
+    seed = next(p for p in d.known() if p.id == "seed")
+    assert seed.mode is None
+
+
+# --- Island.mode is written ONLY through the verified door ------------------- #
+
+def test_coerce_island_never_sets_mode():
+    p = coerce_island({"id": "a", "display_name": "A", "base_url": "https://a.example"})
+    assert p is not None and p.mode is None
+
+
+def test_merge_never_sets_mode_from_unsigned_gossip():
+    d = IslandDirectory(_self())
+    d.merge([{"id": "a", "display_name": "A", "base_url": "https://a.example"}])
+    a = next(p for p in d.known() if p.id == "a")
+    assert a.mode is None
+
+
+def test_record_verified_mode_sets_only_the_named_peer():
+    d = IslandDirectory(_self())
+    d.merge([{"id": "a", "display_name": "A", "base_url": "https://a.example"}])
+    d.record_verified_mode("a", "moderator")
+    a = next(p for p in d.known() if p.id == "a")
+    assert a.mode == "moderator"
+
+
+def test_record_verified_mode_noops_on_unknown_and_self():
+    d = IslandDirectory(_self())
+    d.record_verified_mode("ghost", "moderator")  # unknown id → no-op, no raise
+    d.record_verified_mode("home", "moderator")   # self → no-op (self mode is config)
+    assert all(p.mode is None for p in d.known())
+    assert d.self_peer == _self()                 # self entry untouched
 
 
 # --- build_directory_from_settings: self-id fallback ----------------------- #

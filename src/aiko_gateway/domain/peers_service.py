@@ -31,8 +31,11 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, replace
 from typing import Iterable
+
+from . import island_identity
 
 log = logging.getLogger("aiko_gateway.peers")
 
@@ -59,6 +62,14 @@ class Island:
     id: str
     display_name: str
     base_url: str
+    # The peer's VERIFIED moderation posture (crucible-09 A4), learned ONLY through
+    # island_identity.admit_manifest (its signed /v1/island manifest) and written ONLY via
+    # IslandDirectory.record_verified_mode. None until verified — the unsigned gossip path
+    # (coerce_island/merge) NEVER sets it, so a forged directory entry can advertise a
+    # base_url but never a trusted mode. Deliberately NOT emitted by to_public(): re-serving
+    # an observed peer mode over our own /v1/islands would re-propagate it as OUR unsigned
+    # claim (an authenticity smear); mode stays internal until a signed peer-directory lands.
+    mode: str | None = None
 
     def to_public(self) -> dict:
         """The wire shape the app picker consumes: snake_case, matching the app's
@@ -173,6 +184,21 @@ class IslandDirectory:
             added += 1
         return added
 
+    def record_verified_mode(self, peer_id: str, mode: str) -> None:
+        """Record a peer's moderation posture LEARNED THROUGH THE VERIFIED DOOR
+        (island_identity.admit_manifest walked its signed /v1/island manifest). This is
+        the ONLY writer of Island.mode — the unsigned gossip path (coerce_island/merge)
+        never sets it, so a forged directory entry can advertise a base_url but never a
+        trusted mode. No-op if peer_id is unknown or is SELF (this island's own mode is
+        config, not an observed posture). Replaces the frozen Island in place with a copy
+        carrying the verified mode."""
+        if self._self is not None and peer_id == self._self.id:
+            return
+        peer = self._peers.get(peer_id)
+        if peer is None:
+            return
+        self._peers[peer_id] = replace(peer, mode=mode)
+
     def gossip_targets(self) -> list[str]:
         """The base URLs to pull this round: every known non-self peer plus the
         bootstrap contacts (deduped). Bootstrap is how a fresh island converges
@@ -219,6 +245,28 @@ async def gossip_once(directory: IslandDirectory, client, *, timeout: float = 5.
             if entries is None:
                 entries = body.get("gateways")
             learned += directory.merge(entries or [])
+            # A4 (crucible-09): additionally learn this peer's VERIFIED moderation posture
+            # from its SIGNED self-manifest (GET /v1/island), walked through the fail-closed
+            # verify-then-fresh admission door. The directory fetch above is UNSIGNED
+            # discovery (who/where); mode is NEVER trusted from it — the signed manifest is
+            # the authenticity channel. A manifest that is missing, forged, stale, or signed
+            # for a DIFFERENT base_url binds no mode, and (isolated in its own guard) never
+            # disturbs the discovery already merged above. NO filtering — Phase A has one
+            # mode; this only records the observed posture (declaration, the A4 foundation).
+            try:
+                mresp = await client.get(f"{base}/v1/island", timeout=timeout)
+                mresp.raise_for_status()
+                manifest = mresp.json()
+                mode = island_identity.admit_manifest(
+                    manifest, now_ms=int(time.time() * 1000))
+                # Bind the verified mode ONLY to the peer we actually contacted: the signed
+                # base_url must match this target, else it's a valid manifest for another
+                # island's identity and must not label THIS peer (fail-closed on mismatch).
+                if mode is not None and isinstance(manifest, dict) and \
+                        _normalize_base_url(str(manifest.get("base_url", ""))) == base:
+                    directory.record_verified_mode(str(manifest.get("id", "")), mode)
+            except Exception as exc:  # noqa: BLE001 — a bad manifest never breaks discovery
+                log.debug("gossip manifest verify skipped for %s: %s", base, exc)
         except Exception as exc:  # noqa: BLE001 — a bad target must never break the loop
             log.debug("gossip round dropped bad target %s: %s", base, exc)
     if learned:
