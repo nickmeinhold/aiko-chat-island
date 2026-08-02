@@ -31,8 +31,12 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, replace
 from typing import Iterable
+
+from . import island_identity
+from .island_mode import IslandMode
 
 log = logging.getLogger("aiko_gateway.peers")
 
@@ -59,6 +63,18 @@ class Island:
     id: str
     display_name: str
     base_url: str
+    # The peer's VERIFIED moderation posture (crucible-09 A4), learned ONLY through
+    # island_identity.admit_manifest (its signed /v1/island manifest) and written ONLY via
+    # IslandDirectory.record_verified_mode. None until verified — the unsigned gossip path
+    # (coerce_island/merge) NEVER sets it, so a forged directory entry can advertise a
+    # base_url but never a trusted mode. Deliberately NOT emitted by to_public(): re-serving
+    # an observed peer mode over our own /v1/islands would re-propagate it as OUR unsigned
+    # claim (an authenticity smear); mode stays internal until a signed peer-directory lands.
+    # Typed as the closed IslandMode vocabulary at REST (not a free str): the mutator converts
+    # + fail-closes on any non-member, so a bad string can never be stored (Carnot + Tesla,
+    # PR#112 cage-match: the SoT is IslandMode; the field and writer must honor it, not just
+    # the verify path). SEMANTICS: last-verified-mode-within-window — see record_verified_mode.
+    mode: IslandMode | None = None
 
     def to_public(self) -> dict:
         """The wire shape the app picker consumes: snake_case, matching the app's
@@ -173,6 +189,52 @@ class IslandDirectory:
             added += 1
         return added
 
+    def record_verified_mode(self, peer_id: str, mode: str, *,
+                             expected_base_url: str) -> None:
+        """Record a peer's moderation posture LEARNED THROUGH THE VERIFIED DOOR
+        (island_identity.admit_manifest walked its signed /v1/island manifest). This is
+        the ONLY writer of Island.mode — the unsigned gossip path (coerce_island/merge)
+        never sets it, so a forged directory entry can advertise a base_url but never a
+        trusted mode.
+
+        ENDPOINT-PROVENANCE BINDING (Carnot + Tesla, PR#112 cage-match): the write lands
+        ONLY on the peer whose stored ``base_url`` equals ``expected_base_url`` — the URL the
+        manifest was actually fetched from. A signed manifest proves (id, base_url, mode)
+        under SOME key but NOT that its ``id`` is the peer at that endpoint; without this
+        guard a contacted host could sign a manifest naming ANOTHER peer's id and poison that
+        peer's mode (every gossip target a mode-oracle against the whole known set). Binding
+        by endpoint, not by the manifest's claimed id, closes that.
+
+        ENUM SEAL: ``mode`` is validated against the closed IslandMode vocabulary and stored
+        as an IslandMode member; a non-member (e.g. a future caller passing "plaintext-lol")
+        is a fail-closed no-op, so single-door discipline is enforced at the writer, not left
+        to caller convention.
+
+        No-op if peer_id is unknown, is SELF (this island's own mode is config, not an
+        observed posture), the stored peer's base_url != expected_base_url, or mode is not a
+        known IslandMode. STICKY SEMANTICS: a recorded mode persists across later
+        failed/stale/down rounds until the next successful admit overwrites it — i.e.
+        last-verified-within-window, NOT continuous posture. Correct for the A4 declaration
+        foundation; a consumer that treats it as live commitment (A5) must add a
+        clear-on-failed-admit / re-admit policy first (tracked as an A5 follow-up)."""
+        if self._self is not None and peer_id == self._self.id:
+            return
+        peer = self._peers.get(peer_id)
+        if peer is None:
+            return
+        # Endpoint provenance: only the peer served FROM expected_base_url may have its mode
+        # set from a manifest fetched there (base_url is unique per directory, so this pins
+        # the write to exactly the contacted peer). Fail closed on mismatch.
+        if peer.base_url != expected_base_url:
+            return
+        # Enum seal: reject anything outside the closed vocabulary rather than storing a raw
+        # string. IslandMode(mode) raises ValueError on a non-member → fail-closed no-op.
+        try:
+            validated = IslandMode(mode)
+        except ValueError:
+            return
+        self._peers[peer_id] = replace(peer, mode=validated)
+
     def gossip_targets(self) -> list[str]:
         """The base URLs to pull this round: every known non-self peer plus the
         bootstrap contacts (deduped). Bootstrap is how a fresh island converges
@@ -219,6 +281,34 @@ async def gossip_once(directory: IslandDirectory, client, *, timeout: float = 5.
             if entries is None:
                 entries = body.get("gateways")
             learned += directory.merge(entries or [])
+            # A4 (crucible-09): additionally learn this peer's VERIFIED moderation posture
+            # from its SIGNED self-manifest (GET /v1/island), walked through the fail-closed
+            # verify-then-fresh admission door. The directory fetch above is UNSIGNED
+            # discovery (who/where); mode is NEVER trusted from it — the signed manifest is
+            # the authenticity channel. A manifest that is missing, forged, stale, or signed
+            # for a DIFFERENT base_url binds no mode, and (isolated in its own guard) never
+            # disturbs the discovery already merged above. NO filtering — Phase A has one
+            # mode; this only records the observed posture (declaration, the A4 foundation).
+            try:
+                mresp = await client.get(f"{base}/v1/island", timeout=timeout)
+                mresp.raise_for_status()
+                manifest = mresp.json()
+                mode = island_identity.admit_manifest(
+                    manifest, now_ms=int(time.time() * 1000))
+                # A non-None mode means admit_manifest verified a dict manifest, so manifest
+                # is a dict here (no isinstance guard needed — Kelvin, PR#112 cage-match).
+                # Bind by ENDPOINT PROVENANCE: the signed base_url must match the URL we
+                # actually contacted, AND record_verified_mode additionally pins the write to
+                # the peer stored at that base_url. Lowercase the signed id to match
+                # coerce_island's id normalization, so an honest peer that signs a mixed-case
+                # id (e.g. "Seed" vs stored "seed") is not a silent no-op (Tesla, PR#112).
+                if mode is not None and \
+                        _normalize_base_url(str(manifest.get("base_url", ""))) == base:
+                    directory.record_verified_mode(
+                        str(manifest.get("id", "")).strip().lower(), mode,
+                        expected_base_url=base)
+            except Exception as exc:  # noqa: BLE001 — a bad manifest never breaks discovery
+                log.debug("gossip manifest verify skipped for %s: %s", base, exc)
         except Exception as exc:  # noqa: BLE001 — a bad target must never break the loop
             log.debug("gossip round dropped bad target %s: %s", base, exc)
     if learned:
