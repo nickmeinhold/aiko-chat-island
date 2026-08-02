@@ -261,6 +261,46 @@ async def test_gossip_observes_a_peers_e2ee_declaration_without_filtering():
     assert beta.mode == "e2ee"
 
 
+async def test_gossip_does_not_poison_a_peers_mode_via_foreign_id():
+    # THE cross-peer poison (Carnot + Tesla, PR#112): 'alice' is known at alice.example. We
+    # ALSO gossip mallory.example, which serves a VALID, FRESH manifest signed by its OWN key
+    # but claiming id='alice' (base_url=mallory.example). admit_manifest succeeds (internally
+    # consistent) and the signed base_url matches the contacted target — but endpoint-provenance
+    # binding must REFUSE to write alice's mode, because alice's stored base_url is alice.example,
+    # not mallory.example. Mallory can only ever set the mode of the peer served AT mallory.example.
+    d = IslandDirectory(_self(), bootstrap_urls=["https://mallory.example"])
+    d.merge([{"id": "alice", "display_name": "Alice", "base_url": "https://alice.example"}])
+    now = int(time.time() * 1000)
+    poison = _signed("alice", "https://mallory.example", mode="e2ee", signed_at_ms=now)
+    client = _FakeClient({
+        "https://mallory.example/v1/islands": {"islands": [
+            {"id": "mallory", "displayName": "Mallory", "baseURL": "https://mallory.example"}]},
+        "https://mallory.example/v1/island": poison,
+    })
+    await gossip_once(d, client)
+    alice = next(p for p in d.known() if p.id == "alice")
+    assert alice.mode is None                       # NOT poisoned to e2ee by mallory
+    mallory = next((p for p in d.known() if p.id == "mallory"), None)
+    assert mallory is not None and mallory.mode is None  # foreign-id manifest labels nobody
+
+
+async def test_gossip_records_mode_for_mixed_case_signed_id():
+    # An honest peer stored under lowercased id 'seed' (coerce_island lowercases) that signs a
+    # mixed-case id 'Seed' must still bind — the signed id is normalized to match, so an honest
+    # case difference is not a silent no-op (Tesla, PR#112).
+    d = IslandDirectory(_self(), bootstrap_urls=["https://seed.example"])
+    now = int(time.time() * 1000)
+    client = _FakeClient({
+        "https://seed.example/v1/islands": {"islands": [
+            {"id": "seed", "displayName": "Seed", "baseURL": "https://seed.example"}]},
+        "https://seed.example/v1/island": _signed("Seed", "https://seed.example",
+                                                  signed_at_ms=now),
+    })
+    await gossip_once(d, client)
+    seed = next(p for p in d.known() if p.id == "seed")
+    assert seed.mode == "moderator"
+
+
 async def test_gossip_does_not_record_mode_from_forged_manifest():
     # A peer serves a valid-shaped, FRESH manifest whose pubkey is a different key's:
     # the signature can't match → admit returns None → mode stays None.
@@ -341,17 +381,40 @@ def test_merge_never_sets_mode_from_unsigned_gossip():
 def test_record_verified_mode_sets_only_the_named_peer():
     d = IslandDirectory(_self())
     d.merge([{"id": "a", "display_name": "A", "base_url": "https://a.example"}])
-    d.record_verified_mode("a", "moderator")
+    d.record_verified_mode("a", "moderator", expected_base_url="https://a.example")
     a = next(p for p in d.known() if p.id == "a")
     assert a.mode == "moderator"
 
 
 def test_record_verified_mode_noops_on_unknown_and_self():
     d = IslandDirectory(_self())
-    d.record_verified_mode("ghost", "moderator")  # unknown id → no-op, no raise
-    d.record_verified_mode("home", "moderator")   # self → no-op (self mode is config)
+    # unknown id → no-op, no raise
+    d.record_verified_mode("ghost", "moderator", expected_base_url="https://ghost.example")
+    # self → no-op (self mode is config, not observed)
+    d.record_verified_mode("home", "moderator", expected_base_url="https://home.example")
     assert all(p.mode is None for p in d.known())
     assert d.self_peer == _self()                 # self entry untouched
+
+
+def test_record_verified_mode_noop_on_base_url_provenance_mismatch():
+    # Endpoint provenance (Carnot + Tesla, PR#112): a mode fetched from URL X must not land on
+    # a peer stored at URL Y, even when the peer_id matches — the mutator half of the
+    # cross-peer poison guard. Without it a contacted host poisons any id's mode.
+    d = IslandDirectory(_self())
+    d.merge([{"id": "a", "display_name": "A", "base_url": "https://a.example"}])
+    d.record_verified_mode("a", "moderator", expected_base_url="https://evil.example")
+    a = next(p for p in d.known() if p.id == "a")
+    assert a.mode is None
+
+
+def test_record_verified_mode_rejects_unknown_vocabulary():
+    # Enum seal (Carnot + Tesla, PR#112): a non-IslandMode string is a fail-closed no-op, so
+    # single-door discipline lives at the writer, not caller convention.
+    d = IslandDirectory(_self())
+    d.merge([{"id": "a", "display_name": "A", "base_url": "https://a.example"}])
+    d.record_verified_mode("a", "plaintext-lol", expected_base_url="https://a.example")
+    a = next(p for p in d.known() if p.id == "a")
+    assert a.mode is None
 
 
 # --- build_directory_from_settings: self-id fallback ----------------------- #

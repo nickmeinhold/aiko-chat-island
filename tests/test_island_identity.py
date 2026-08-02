@@ -569,3 +569,23 @@ def test_admit_raises_on_wrong_v_or_alg():
         m.update(over)
         with pytest.raises(ii.IslandIdentityError):
             ii.admit_manifest(m, now_ms=now)
+
+
+def test_admit_rejects_a_widened_window():
+    # The ceiling is ENFORCED, not merely defaulted (Carnot + Tesla, PR#112): a caller cannot
+    # loosen the replay window or the skew grace past the door's semantic maximum.
+    now = int(time.time() * 1000)
+    m = _manifest(signed_at_ms=now)
+    with pytest.raises(ii.IslandIdentityError):
+        ii.admit_manifest(m, now_ms=now, max_age_ms=ii.DEFAULT_MAX_AGE_MS + 1)
+    with pytest.raises(ii.IslandIdentityError):
+        ii.admit_manifest(m, now_ms=now, skew_ms=ii.DEFAULT_CLOCK_SKEW_MS + 1)
+
+
+def test_admit_allows_tightening_the_window():
+    # Tightening is fine — only widening is rejected. A stricter window still admits a
+    # sufficiently fresh manifest and rejects one older than the tightened bound.
+    now = int(time.time() * 1000)
+    m = _manifest(signed_at_ms=now - 30_000)                      # 30s old
+    assert ii.admit_manifest(m, now_ms=now, max_age_ms=60_000) == "moderator"  # 1-min window OK
+    assert ii.admit_manifest(m, now_ms=now, max_age_ms=10_000) is None         # 10s window → stale

@@ -388,19 +388,38 @@ def admit_manifest(
     ``verify_manifest``'s raise-vs-False contract), so a caller can still distinguish
     "not a manifest at all" from "verified-false / stale".
 
-    THE 5-MINUTE SEMANTIC CEILING IS PINNED HERE. ``is_fresh`` deliberately takes an int
-    and REQUIRES an explicit ``max_age_ms`` — it will honor a cosmic window if handed one
-    (its docstring names imposing the SEMANTIC ceiling "the A4 door's job (#12)"). This
-    door supplies the sane default (``DEFAULT_MAX_AGE_MS`` = 5 min, ``DEFAULT_CLOCK_SKEW_MS``
-    = 1 min), so the common call ``admit_manifest(m, now_ms=now)`` gets the replay window
-    without any caller choosing it. A caller MAY tighten it per threat, but the default IS
-    the pin — no path silently inherits eternity.
+    THE 5-MINUTE SEMANTIC CEILING IS ENFORCED HERE, not merely defaulted. ``is_fresh``
+    deliberately takes an int and REQUIRES an explicit ``max_age_ms`` — it will honor a
+    cosmic window if handed one (its docstring names imposing the SEMANTIC ceiling "the A4
+    door's job (#12)"). This door supplies the sane default (``DEFAULT_MAX_AGE_MS`` = 5 min,
+    ``DEFAULT_CLOCK_SKEW_MS`` = 1 min) AND REJECTS any caller-supplied window WIDER than it
+    (raises IslandIdentityError). A caller may TIGHTEN per threat, but cannot widen — so the
+    ceiling is a real cap, not a suggestion the next caller can loosen. Widening the window
+    is a deliberate change to ``DEFAULT_MAX_AGE_MS``, the single authoritative knob.
 
     SCOPE: a True result proves the manifest is internally consistent AND recent — it does
     NOT establish that ``island_pubkey`` is the island you meant to reach (key distribution
     / TOFU arrives with the A4 peer-trust store, not here). The caller (``gossip_once``)
     additionally binds the verified mode only to the peer whose ``base_url`` it actually
-    contacted, so a manifest signed for a different identity can't bind mode to this peer."""
+    contacted, NOT by the manifest's claimed id — else a contacted host is a mode-oracle
+    against every peer id (Carnot + Tesla, PR#112 cage-match)."""
+    # Enforce the semantic ceiling HERE — not merely default it (#12). is_fresh will honor a
+    # cosmic window if handed one; making admit the ONE door means the ceiling must be a real
+    # CAP, not a suggestion a future caller can loosen (the prose claimed "ceiling" while the
+    # signature only "defaulted"). A caller may TIGHTEN (smaller window / less skew) but never
+    # widen past the sane maximum; widening is a deliberate change to DEFAULT_MAX_AGE_MS itself,
+    # the single authoritative knob, not a per-call override. Bad-TYPE knobs still fail closed
+    # inside is_fresh; here we cap the VALUE of a well-typed-but-too-wide window.
+    if isinstance(max_age_ms, int) and not isinstance(max_age_ms, bool) \
+            and max_age_ms > DEFAULT_MAX_AGE_MS:
+        raise IslandIdentityError(
+            f"admit_manifest max_age_ms={max_age_ms} exceeds the {DEFAULT_MAX_AGE_MS}ms "
+            f"semantic ceiling; the A4 door caps the replay window (tighten, never widen)")
+    if isinstance(skew_ms, int) and not isinstance(skew_ms, bool) \
+            and skew_ms > DEFAULT_CLOCK_SKEW_MS:
+        raise IslandIdentityError(
+            f"admit_manifest skew_ms={skew_ms} exceeds the {DEFAULT_CLOCK_SKEW_MS}ms "
+            f"clock-skew ceiling; the A4 door caps future-dating (tighten, never widen)")
     if verify_manifest(manifest) is not True:
         # A forged/tampered signature is a clean False from verify_manifest → not admitted.
         # (A structurally-malformed manifest already RAISED inside verify_manifest, so it
