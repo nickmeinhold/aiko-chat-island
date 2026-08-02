@@ -394,8 +394,10 @@ def test_moderator_mode_is_the_default_and_boots():
 def test_prod_moderator_mode_without_moderator_raises():
     # The disable-vector: a prod moderator island with an EMPTY moderator set has a
     # write-only report queue nobody can act on (require_moderator 403s everyone). Ack IS
-    # set, so this isolates the moderator-required cause.
-    with pytest.raises(ValidationError):
+    # set, so this isolates the moderator-required cause. `match=` pins the diagnostic
+    # contract so a future gate inserted after A5 can't let this green on the wrong error
+    # (Tesla, PR#113 cage-match).
+    with pytest.raises(ValidationError, match="MODERATOR_USER_IDS"):
         Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
                  passkey_enabled=True, island_signing_seed=_REAL_ISLAND_SEED,
                  csam_runbook_acknowledged=True, moderator_user_ids=[])
@@ -404,7 +406,7 @@ def test_prod_moderator_mode_without_moderator_raises():
 def test_prod_moderator_mode_with_whitespace_only_moderator_raises():
     # A whitespace-only id is not a real moderator — `.strip()` must not let it pass as
     # a configured seat.
-    with pytest.raises(ValidationError):
+    with pytest.raises(ValidationError, match="MODERATOR_USER_IDS"):
         Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
                  passkey_enabled=True, island_signing_seed=_REAL_ISLAND_SEED,
                  csam_runbook_acknowledged=True, moderator_user_ids=["   "])
@@ -414,7 +416,7 @@ def test_prod_moderator_mode_without_runbook_ack_raises():
     # A moderator is configured but the CSAM runbook is unacknowledged — electing
     # moderator mode is a commitment; refuse boot until acknowledged. Isolates the
     # ack-required cause (moderator IS set).
-    with pytest.raises(ValidationError):
+    with pytest.raises(ValidationError, match="CSAM_RUNBOOK_ACKNOWLEDGED"):
         Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
                  passkey_enabled=True, island_signing_seed=_REAL_ISLAND_SEED,
                  moderator_user_ids=["mod-user-01"], csam_runbook_acknowledged=False)

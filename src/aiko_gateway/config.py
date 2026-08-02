@@ -520,13 +520,22 @@ class Settings(BaseSettings):
             # LAST among the prod gates so a config that also trips an earlier invariant
             # (weak secret, no ingress, bad rp_id) surfaces THAT cause first.
             if self.island_mode == IslandMode.MODERATOR:
-                # (1) A moderator must exist. An empty moderator set is the concrete
-                # "plaintext with moderation deleted" state: the report queue still
-                # accepts reports, but require_moderator (rest/deps.py) 403s EVERYONE, so
-                # nobody can take anything down. `.strip()` so a whitespace-only entry
-                # can't masquerade as a configured moderator. This is the "cannot be
-                # disabled without a mode change" guarantee — you cannot run moderator
-                # mode with no moderator; to turn moderation off you must change the mode.
+                # (1) A moderator must be CONFIGURED. An empty moderator set is the
+                # concrete "plaintext with moderation deleted" state: the report queue
+                # still accepts reports, but require_moderator (rest/deps.py) 403s EVERYONE,
+                # so nobody can take anything down. `.strip()` so a whitespace-only entry
+                # can't masquerade as a configured moderator.
+                # SCOPE / KNOWN RESIDUAL (PR#113 cage-match, Tesla): this is a PRESENCE
+                # check on the id STRING, not a LIVENESS check on the account. A boot-time
+                # Settings validator has no DB, so it cannot confirm the id belongs to a
+                # real, registered, authenticatable user — a "ghost" id
+                # (MODERATOR_USER_IDS=["never-registered-ulid"]) satisfies this yet can
+                # never pass require_moderator, re-tuning the disable-vector rather than
+                # eliminating it. So the honest guarantee is "an EMPTY moderator set cannot
+                # boot moderator mode", NOT "a live moderator is guaranteed present."
+                # Seat LIVENESS/health is a runtime/ops invariant (a startup or periodic
+                # check that at least one configured id maps to a real user), tracked
+                # separately — this closes the empty-set vector, not the ghost-seat one.
                 if not any(uid.strip() for uid in self.moderator_user_ids):
                     raise ValueError(
                         "island_mode='moderator' in production requires at least one "

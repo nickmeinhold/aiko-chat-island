@@ -19,6 +19,13 @@ test_islands_directory.py, which builds a fresh FastAPI() rather than import mai
 we assert (a) the moderation ROUTER exposes the required routes, and (b) main.py includes
 that router at module level (unconditionally) via a source check — together they pin
 "the machinery exists AND is wired in" without the fragile import.
+
+CEILING (PR#113 cage-match, Tesla): this is a "don't strip the wire" guard, NOT a
+"commitment still has teeth" proof. It asserts route PATHS + the module-level include; it
+does NOT assert HTTP methods, that `resolve` still mints the #7 retraction, that
+`require_moderator` still guards the act-on-report routes, or that a rename/re-export
+keeps the include semantically live. Those are behavioural guarantees pinned by the
+moderation SERVICE/route tests, not this structural tripwire.
 """
 from __future__ import annotations
 
