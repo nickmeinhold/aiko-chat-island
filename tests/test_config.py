@@ -50,13 +50,21 @@ def test_prod_with_default_secret_raises():
 
 _STRONG_SECRET = "a-real-32-byte-minimum-secret-value"  # 35 chars >= 32
 
+# A5 (crucible-09): production moderator mode (the DEFAULT mode) refuses to boot without a
+# configured moderator AND the CSAM-runbook ack. Every "valid prod baseline" construction
+# spreads this so the A5 capstone gate is satisfied and the test isolates the invariant it
+# actually varies. A future prod requirement is added HERE once, not copy-pasted across
+# every boots test. (Negative/`raises` prod tests deliberately OMIT it — the A5 gate is the
+# last prod check, so those tests still surface their own earlier invariant's failure.)
+_PROD_MOD = dict(moderator_user_ids=["mod-user-01"], csam_runbook_acknowledged=True)
+
 
 def test_prod_with_real_secret_boots():
     # passkey_enabled makes this a joinable island — invariant 5 (below) now
     # requires a viable ingress in prod, so a password-only prod is a locked
     # island. This test is about the jwt_secret invariant, so give it an ingress.
     s = Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
-                 passkey_enabled=True)
+                 passkey_enabled=True, **_PROD_MOD)
     assert s.is_production is True
 
 
@@ -111,7 +119,7 @@ def test_open_registration_defaults_on_in_dev():
 
 def test_open_registration_defaults_off_in_prod():
     s = Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
-                 passkey_enabled=True)
+                 passkey_enabled=True, **_PROD_MOD)
     assert s.open_registration is False
 
 
@@ -145,7 +153,7 @@ def test_prod_social_enabled_with_client_ids_boots():
     # tradeoff is accepted) — as long as at least one provider client ID is set.
     s = Settings(_env_file=None, environment="production",
                  jwt_secret=_STRONG_SECRET, social_signin_enabled=True,
-                 google_client_ids=["my-client-id.apps.googleusercontent.com"])
+                 google_client_ids=["my-client-id.apps.googleusercontent.com"], **_PROD_MOD)
     assert s.social_signin_enabled is True
 
 
@@ -163,7 +171,7 @@ def test_prod_social_enabled_with_only_broker_boots():
     # provider, so it must boot.
     s = Settings(_env_file=None, environment="production",
                  jwt_secret=_STRONG_SECRET, social_signin_enabled=True,
-                 github_client_id="gh-id", github_client_secret="gh-secret")
+                 github_client_id="gh-id", github_client_secret="gh-secret", **_PROD_MOD)
     assert s.social_signin_enabled is True
 
 
@@ -197,14 +205,14 @@ def test_prod_broker_both_set_boots():
     # this test stays about the broker XOR invariant, not onboarding.
     s = Settings(_env_file=None, environment="production",
                  jwt_secret=_STRONG_SECRET, passkey_enabled=True,
-                 github_client_id="gh-id", github_client_secret="gh-secret")
+                 github_client_id="gh-id", github_client_secret="gh-secret", **_PROD_MOD)
     assert s.github_client_id == "gh-id"
 
 
 def test_prod_broker_neither_set_boots():
     # No broker provider configured at all is fine — the provider is simply absent.
     s = Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
-                 passkey_enabled=True)
+                 passkey_enabled=True, **_PROD_MOD)
     assert s.github_client_id == ""
 
 
@@ -230,7 +238,7 @@ def test_prod_no_ingress_raises():
 def test_prod_passkey_only_boots():
     # Passkey alone is a complete ingress (registration creates the account).
     s = Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
-                 passkey_enabled=True, social_signin_enabled=False)
+                 passkey_enabled=True, social_signin_enabled=False, **_PROD_MOD)
     assert s.passkey_enabled is True
 
 
@@ -238,7 +246,7 @@ def test_prod_social_only_boots():
     # Social alone (with a provider) is a complete ingress — passkey may stay dark.
     s = Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
                  passkey_enabled=False, social_signin_enabled=True,
-                 google_client_ids=["my-client-id.apps.googleusercontent.com"])
+                 google_client_ids=["my-client-id.apps.googleusercontent.com"], **_PROD_MOD)
     assert s.social_signin_enabled is True
 
 
@@ -248,7 +256,7 @@ def test_prod_both_ingresses_boot():
     # correct migration — only by turning BOTH off (the bug).
     s = Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
                  passkey_enabled=True, social_signin_enabled=True,
-                 google_client_ids=["my-client-id.apps.googleusercontent.com"])
+                 google_client_ids=["my-client-id.apps.googleusercontent.com"], **_PROD_MOD)
     assert s.passkey_enabled and s.social_signin_enabled
 
 
@@ -276,7 +284,7 @@ def test_prod_passkey_rp_id_mismatch_raises():
 def test_prod_passkey_rp_id_match_boots():
     s = Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
                  passkey_enabled=True, gateway_base_url="https://chat.enspyr.co",
-                 passkey_rp_id="chat.enspyr.co")
+                 passkey_rp_id="chat.enspyr.co", **_PROD_MOD)
     assert s.passkey_rp_id == "chat.enspyr.co"
 
 
@@ -285,7 +293,7 @@ def test_prod_passkey_rp_id_registrable_parent_boots():
     # credential scoped to example.com is usable on chat.example.com. Must boot.
     s = Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
                  passkey_enabled=True, gateway_base_url="https://chat.example.com",
-                 passkey_rp_id="example.com")
+                 passkey_rp_id="example.com", **_PROD_MOD)
     assert s.passkey_enabled is True
 
 
@@ -330,7 +338,7 @@ def test_prod_passkey_both_defaults_boot_is_known_limitation():
     # future change to the default-matching behavior is a conscious one. Full
     # passkey-config correctness belongs at deploy/runtime (#51).
     s = Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
-                 passkey_enabled=True)  # base_url + rp_id both default to chat.imagineering.cc
+                 passkey_enabled=True, **_PROD_MOD)  # base_url + rp_id both default to chat.imagineering.cc
     assert s.passkey_enabled is True
 
 
@@ -340,7 +348,7 @@ def test_prod_passkey_disabled_skips_rp_id_check():
                  passkey_enabled=False, social_signin_enabled=True,
                  gateway_base_url="https://chat.enspyr.co",
                  passkey_rp_id="chat.imagineering.cc",
-                 google_client_ids=["my-client-id.apps.googleusercontent.com"])
+                 google_client_ids=["my-client-id.apps.googleusercontent.com"], **_PROD_MOD)
     assert s.social_signin_enabled is True
 
 
@@ -375,6 +383,66 @@ def test_moderator_mode_is_the_default_and_boots():
     assert s.island_mode == "moderator"
 
 
+# --- A5 (crucible-09): "moderator = commitment" election gate ---------------- #
+#
+# In PRODUCTION, electing moderator mode (the default) requires BOTH a configured
+# moderator AND the CSAM-runbook ack, so the "plaintext with moderation deleted" config
+# is unbootable. Prod-only: dev runs moderator freely. Each `raises` test isolates ONE
+# cause by satisfying the other (the A5 gate is the LAST prod check, so these also clear
+# every earlier invariant first).
+
+def test_prod_moderator_mode_without_moderator_raises():
+    # The disable-vector: a prod moderator island with an EMPTY moderator set has a
+    # write-only report queue nobody can act on (require_moderator 403s everyone). Ack IS
+    # set, so this isolates the moderator-required cause.
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
+                 passkey_enabled=True, island_signing_seed=_REAL_ISLAND_SEED,
+                 csam_runbook_acknowledged=True, moderator_user_ids=[])
+
+
+def test_prod_moderator_mode_with_whitespace_only_moderator_raises():
+    # A whitespace-only id is not a real moderator — `.strip()` must not let it pass as
+    # a configured seat.
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
+                 passkey_enabled=True, island_signing_seed=_REAL_ISLAND_SEED,
+                 csam_runbook_acknowledged=True, moderator_user_ids=["   "])
+
+
+def test_prod_moderator_mode_without_runbook_ack_raises():
+    # A moderator is configured but the CSAM runbook is unacknowledged — electing
+    # moderator mode is a commitment; refuse boot until acknowledged. Isolates the
+    # ack-required cause (moderator IS set).
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
+                 passkey_enabled=True, island_signing_seed=_REAL_ISLAND_SEED,
+                 moderator_user_ids=["mod-user-01"], csam_runbook_acknowledged=False)
+
+
+def test_prod_moderator_mode_with_moderator_and_ack_boots():
+    # BOTH satisfied → the valid prod moderator election boots.
+    s = Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
+                 passkey_enabled=True, island_signing_seed=_REAL_ISLAND_SEED,
+                 moderator_user_ids=["mod-user-01"], csam_runbook_acknowledged=True)
+    assert s.csam_runbook_acknowledged is True and s.island_mode == "moderator"
+
+
+def test_dev_moderator_mode_exempt_from_commitment_gate():
+    # Prod-only: a dev island runs the default moderator mode with NO moderator and NO
+    # ack — the commitment gate must not fire (moderator is the default; an every-env
+    # gate would break every dev boot).
+    s = Settings(_env_file=None, environment="dev")
+    assert s.island_mode == "moderator"
+    assert s.moderator_user_ids == [] and s.csam_runbook_acknowledged is False
+
+
+def test_csam_runbook_ack_defaults_false():
+    # Fail-closed default: acknowledgement must be conscious, never an inherited truthy.
+    s = Settings(_env_file=None, environment="dev")
+    assert s.csam_runbook_acknowledged is False
+
+
 def test_prod_with_dev_island_seed_raises():
     # The island key is a trust root (signs the self-manifest); the dev default in
     # prod would let anyone who read the repo sign a manifest for this island.
@@ -399,7 +467,7 @@ def test_prod_rejects_noncanonical_dev_seed_alias():
 
 def test_prod_with_real_island_seed_boots():
     s = Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
-                 passkey_enabled=True, island_signing_seed=_REAL_ISLAND_SEED)
+                 passkey_enabled=True, island_signing_seed=_REAL_ISLAND_SEED, **_PROD_MOD)
     assert s.is_production is True
 
 
@@ -461,6 +529,7 @@ _MUST_FORWARD_ENV = {
     "ISLAND_KEY_VERSION",            # island identity — rotation lifecycle
     "MODERATOR_USER_IDS",            # operator policy — the operator seat (#100)
     "MODERATION_ALERT_WEBHOOK_URL",  # operator config — alert sink (#91)
+    "CSAM_RUNBOOK_ACKNOWLEDGED",     # A5 operator commitment — prod moderator-boot gate
     "SOCIAL_SIGNIN_ENABLED",         # operator policy
     "APPLE_CLIENT_IDS",              # per-island auth
     "GOOGLE_CLIENT_IDS",             # per-island auth

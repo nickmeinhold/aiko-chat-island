@@ -208,6 +208,17 @@ class Settings(BaseSettings):
     # CLOSED at boot (a clear ValidationError) rather than raising struct.error as a
     # 500 on the first GET /v1/island.
     island_key_version: int = Field(default=1, ge=1, le=2**32 - 1)
+    # A5 (crucible-09): electing `moderator` mode is a COMMITMENT, not just a label.
+    # In PRODUCTION, booting in moderator mode requires the operator to acknowledge the
+    # CSAM/illegal-content runbook (docs/design/07 Part B) by setting this True. This
+    # enforces the HONEST, bounded guarantee the crucible settled on (DESIGN.md §5):
+    # "machinery present + acknowledged", NOT "the operator actually reviews reports" —
+    # code cannot force a human to act, and this flag does not pretend to. Default False
+    # so a fresh prod island in the default (moderator) mode fails closed at boot until
+    # the operator consciously acknowledges; dev/test islands are exempt (see
+    # _harden_for_production — the check is prod-only because moderator is the DEFAULT
+    # mode and an every-env gate would break every dev boot). Env: CSAM_RUNBOOK_ACKNOWLEDGED.
+    csam_runbook_acknowledged: bool = False
     # The app's Universal/App Link the browser is redirected back to after the
     # broker completes (carrying the handoff code, or an error indicator). This is
     # a FIXED config value — open-redirect defense: the final redirect target is
@@ -496,6 +507,48 @@ class Settings(BaseSettings):
                     "Refusing to boot — enable at least one of PASSKEY_ENABLED or "
                     "SOCIAL_SIGNIN_ENABLED (with a configured provider)."
                 )
+            # A5 (crucible-09): "moderator = commitment" — the capstone prod gate.
+            # Electing `moderator` mode in production makes two capability guarantees
+            # structurally true at boot, so the dangerous "island advertises moderator
+            # while moderation is effectively off" config is UNBOOTABLE (not merely
+            # discouraged). Prod-only: moderator is the DEFAULT mode, so an every-env gate
+            # would refuse every dev/test boot — dev islands run moderator freely (no real
+            # election / legal exposure); the LIVE islands are is_production and carry the
+            # teeth (BLADE.md: "forbidden on the live islands"). HONEST LIMIT (DESIGN.md
+            # §5): this forces the machinery PRESENT + ACKNOWLEDGED; it CANNOT force a
+            # human to actually review reports, and deliberately does not claim to. Placed
+            # LAST among the prod gates so a config that also trips an earlier invariant
+            # (weak secret, no ingress, bad rp_id) surfaces THAT cause first.
+            if self.island_mode == IslandMode.MODERATOR:
+                # (1) A moderator must exist. An empty moderator set is the concrete
+                # "plaintext with moderation deleted" state: the report queue still
+                # accepts reports, but require_moderator (rest/deps.py) 403s EVERYONE, so
+                # nobody can take anything down. `.strip()` so a whitespace-only entry
+                # can't masquerade as a configured moderator. This is the "cannot be
+                # disabled without a mode change" guarantee — you cannot run moderator
+                # mode with no moderator; to turn moderation off you must change the mode.
+                if not any(uid.strip() for uid in self.moderator_user_ids):
+                    raise ValueError(
+                        "island_mode='moderator' in production requires at least one "
+                        "configured moderator (MODERATOR_USER_IDS): a moderator island "
+                        "with no moderator has a write-only report queue that "
+                        "require_moderator 403s everyone from acting on — the exact "
+                        "'plaintext with moderation deleted' config this mode forbids. "
+                        "Appoint a moderator, or change ISLAND_MODE."
+                    )
+                # (2) The operator must acknowledge the CSAM/illegal-content runbook.
+                # Electing moderator mode commits the operator to the scan/report/takedown
+                # duties (design note 07 Part B). Enforces acknowledgement at election —
+                # NOT that reports are reviewed (code can't force that; stated honestly).
+                if not self.csam_runbook_acknowledged:
+                    raise ValueError(
+                        "island_mode='moderator' in production requires "
+                        "CSAM_RUNBOOK_ACKNOWLEDGED=true — electing moderator mode is a "
+                        "commitment to the operator CSAM/illegal-content runbook "
+                        "(docs/design/07 Part B). This enforces machinery-present + "
+                        "acknowledged, NOT that reports are actually reviewed. "
+                        "Acknowledge the runbook, or change ISLAND_MODE."
+                    )
         # Resolve registration default by environment when not explicitly set:
         # open in dev, closed in prod.
         if self.open_registration is None:

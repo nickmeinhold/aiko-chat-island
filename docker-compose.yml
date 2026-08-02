@@ -182,6 +182,14 @@ services:
       # as MODERATOR_USER_IDS: a host .env value never reached the container without
       # this line. Empty default = unset = no webhook.
       MODERATION_ALERT_WEBHOOK_URL: ${MODERATION_ALERT_WEBHOOK_URL:-}
+      # A5 (crucible-09): operator acknowledgement of the CSAM/illegal-content runbook.
+      # In PRODUCTION, moderator mode (the default) refuses to boot until this is true
+      # (config.py _harden_for_production). Baked default false so a stock island fails
+      # closed; the operator flips it in the host .env once they've read the runbook.
+      # Same inert-var trap as MODERATOR_USER_IDS — without this line a host .env value
+      # never reaches the container and the crucible-09 image would crash-loop on the
+      # A5 boot guard. Forwarded here AND asserted by test_config.py invariant 7.
+      CSAM_RUNBOOK_ACKNOWLEDGED: ${CSAM_RUNBOOK_ACKNOWLEDGED:-false}
     volumes:
       # Persist the SQLite store across container recreates. External + stably named
       # so the store survives any project/service rename (see volumes: block).
