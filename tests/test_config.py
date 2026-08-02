@@ -404,12 +404,30 @@ def test_prod_moderator_mode_without_moderator_raises():
 
 
 def test_prod_moderator_mode_with_whitespace_only_moderator_raises():
-    # A whitespace-only id is not a real moderator — `.strip()` must not let it pass as
-    # a configured seat.
+    # A whitespace-only id is not a real moderator — boundary normalization compacts it to
+    # an empty set, which A5 then refuses (same path as an empty MODERATOR_USER_IDS).
     with pytest.raises(ValidationError, match="MODERATOR_USER_IDS"):
         Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
                  passkey_enabled=True, island_signing_seed=_REAL_ISLAND_SEED,
                  csam_runbook_acknowledged=True, moderator_user_ids=["   "])
+
+
+def test_moderator_user_ids_normalized_at_boundary():
+    # Asymmetric-strip fix (Tesla, PR#113): the STORED list is stripped + compacted at the
+    # Settings boundary, so it equals what runtime is_moderator matches against. A padded
+    # id keeps its identity (stripped), a whitespace-only entry is dropped.
+    s = Settings(_env_file=None, environment="dev",
+                 moderator_user_ids=["  mod-01  ", "   ", "mod-02"])
+    assert s.moderator_user_ids == ["mod-01", "mod-02"]
+
+
+def test_prod_moderator_padded_id_boots_with_stripped_value():
+    # A padded id must NOT be the empty-set vector in costume: it normalizes to a clean id
+    # that runtime is_moderator can actually match, and boots (moderator present + ack).
+    s = Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
+                 passkey_enabled=True, island_signing_seed=_REAL_ISLAND_SEED,
+                 moderator_user_ids=["  real-ulid  "], csam_runbook_acknowledged=True)
+    assert s.moderator_user_ids == ["real-ulid"]  # stored value is the clean, matchable id
 
 
 def test_prod_moderator_mode_without_runbook_ack_raises():

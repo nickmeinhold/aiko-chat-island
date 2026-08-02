@@ -320,6 +320,17 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _harden_for_production(self) -> "Settings":
+        # Normalize the moderator seat list at the Settings boundary (EVERY env): strip
+        # each id and drop empties, so the STORED value equals what require_moderator /
+        # is_moderator matches against at runtime (exact string membership,
+        # domain/moderation_service.py). Without this the A5 presence gate below and the
+        # runtime dep check would run on DIFFERENT strings — a PADDED id ("  real-ulid  ")
+        # would satisfy a strip-for-truthiness presence check yet never match a clean JWT
+        # user_id, 403-ing every real moderator: the empty-set disable-vector in costume
+        # (PR#113 cage-match, Tesla HIGH). Normalize ONCE here so the gate and the dep
+        # share one canonical string; a whitespace-only entry collapses to nothing and is
+        # then indistinguishable from an empty set (correctly refused by A5 in prod).
+        self.moderator_user_ids = [u.strip() for u in self.moderator_user_ids if u.strip()]
         # A2 (crucible-09 Phase A): `e2ee` is schema-reserved for Phase B and
         # HARD-REJECTED in EVERY environment until MLS lands. Advertising an
         # unimplemented E2EE mode would be the exact mislabel this feature prevents
@@ -523,8 +534,10 @@ class Settings(BaseSettings):
                 # (1) A moderator must be CONFIGURED. An empty moderator set is the
                 # concrete "plaintext with moderation deleted" state: the report queue
                 # still accepts reports, but require_moderator (rest/deps.py) 403s EVERYONE,
-                # so nobody can take anything down. `.strip()` so a whitespace-only entry
-                # can't masquerade as a configured moderator.
+                # so nobody can take anything down. The list was stripped+compacted at the
+                # top of this validator, so a whitespace-only or padded-to-empty entry has
+                # already collapsed to nothing — a plain emptiness check is exact here AND
+                # matches the runtime dep's string (no asymmetric strip; PR#113 Tesla HIGH).
                 # SCOPE / KNOWN RESIDUAL (PR#113 cage-match, Tesla): this is a PRESENCE
                 # check on the id STRING, not a LIVENESS check on the account. A boot-time
                 # Settings validator has no DB, so it cannot confirm the id belongs to a
@@ -536,7 +549,7 @@ class Settings(BaseSettings):
                 # Seat LIVENESS/health is a runtime/ops invariant (a startup or periodic
                 # check that at least one configured id maps to a real user), tracked
                 # separately — this closes the empty-set vector, not the ghost-seat one.
-                if not any(uid.strip() for uid in self.moderator_user_ids):
+                if not self.moderator_user_ids:
                     raise ValueError(
                         "island_mode='moderator' in production requires at least one "
                         "configured moderator (MODERATOR_USER_IDS): a moderator island "
