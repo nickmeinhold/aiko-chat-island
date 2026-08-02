@@ -430,6 +430,20 @@ def test_prod_moderator_padded_id_boots_with_stripped_value():
     assert s.moderator_user_ids == ["real-ulid"]  # stored value is the clean, matchable id
 
 
+def test_prod_moderator_ghost_seat_boots_known_residual():
+    # PINS THE SCOPE (Tesla + Carnot, PR#113): A5 closes the EMPTY-set + UNACKNOWLEDGED
+    # vectors, NOT the ghost-seat one. A boot-time Settings validator has no DB, so a
+    # well-formed-but-never-registered moderator id passes the presence gate and BOOTS —
+    # yet require_moderator would 403 it at runtime, leaving moderation effectively off.
+    # This is asserted (not just commented) so the honest scope is test-enforced and a
+    # future change to it is conscious; seat LIVENESS is a runtime invariant (task: runtime
+    # moderator seat-health), NOT something this boot gate can or claims to guarantee.
+    s = Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
+                 passkey_enabled=True, island_signing_seed=_REAL_ISLAND_SEED,
+                 moderator_user_ids=["never-registered-ulid"], csam_runbook_acknowledged=True)
+    assert s.island_mode == "moderator"  # boots: A5 does NOT (and cannot) verify liveness
+
+
 def test_prod_moderator_mode_without_runbook_ack_raises():
     # A moderator is configured but the CSAM runbook is unacknowledged — electing
     # moderator mode is a commitment; refuse boot until acknowledged. Isolates the
