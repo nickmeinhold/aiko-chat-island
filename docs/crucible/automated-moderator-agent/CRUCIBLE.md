@@ -60,3 +60,6 @@ strike (1) and (2) hardest — they are load-bearing, not details.
 `docs/crucible/automated-moderator-agent/` — issue-backed / cross-cutting ore (spans a new
 sidecar process + agent-ingress + moderation machinery, no single owning file). Matches the
 `reactive-deploy` unnumbered-slug precedent.
+
+## Temper correction (round 1, 2026-08-03)
+Unanimous cross-family REQUEST_CHANGES (Carnot/Tesla/Kelvin) downgraded the honest impact from **3 (removes the task)** to **2 (triage assist)** — FN recall ~0.47 means no current classifier delivers fully-hands-off, so the operator can't fully step away. Aliveness still 3. The 'removes a human task' impact claim was inflated; corrected. See DESIGN.md Temper section T1-T10.

@@ -197,3 +197,79 @@ Struck my own casting; these were slag I could see myself, now resolved into the
 
 Fold did NOT re-grade the ore (bot-as-moderator stands); it raised the design floor. Same-
 distribution blindness remains — Temper (cross-family) still required.
+
+## Temper — cross-family strike, round 1 (UNANIMOUS REQUEST_CHANGES) + re-cast
+
+PR #114. Carnot (GPT), Tesla (Grok), Kelvin (Gemini) all REQUEST_CHANGES (Wu pending). They
+struck PAST F1–F7 and found fatal flaws Fold missed. **These are folded into a re-cast below;
+the design is NOT plan-ready until re-tempered.** The ore is NOT slag — but its IMPACT is
+downgraded (see T4) and the ARCHITECTURE is corrected.
+
+- **T1 — FATAL: "sealed-sender without a seal" (Tesla + Carnot; the big one).** Reader + Judge
+  + credential-holding Actuator in ONE process defeats the caged-decider pattern the design
+  CITES. The msg_id cage muzzles the model's output but the mutator credential sits next to it;
+  an LLM-host compromise (sandbox escape, dep RCE, env scrape) calls quarantine/report directly
+  — no Judge, no cage. **RE-CAST: split into TWO principals/processes.** Judge holds NO creds,
+  emits `{dispatched_msg_id, risk, categories}` over a one-way pipe; a separate Actuator holds
+  the creds, accepts ONLY that pipe, ideally with a gateway-minted single-use action ticket
+  bound to msg_id at dispatch. Claims 1/4/5 were one theft from collapsing together.
+- **T2 — FATAL: Reader tap (C) is not isolation (Kelvin + Carnot + Tesla, all three).** In-
+  process emit is a "thermal bridge" from the attacker-facing sidecar to the trusted gateway
+  (privileged path for a sidecar RCE), plus plaintext-firehose + availability coupling. **RE-
+  CAST: tap (A/outbox), NOT (C)** — a separate bus consumer or durable append-only one-way
+  outbox, bounded async, authenticated, consumer ≠ the credentialed Actuator. My lean toward C
+  was wrong; remove the coupling, don't guard it.
+- **T3 — FATAL: reversibility is DATA-LAYER only (Kelvin + Tesla + Carnot).** A server row +
+  wire event does not deliver social/conversational/client-cache reversibility. A message
+  visible→gone→back-hours-later is a "ghost ripped from context"; replies go incoherent;
+  restore is costly social repair, screenshots/quote-replies/search-indexes stay irreversible.
+  Retraction (#7) was shaped for takedown/WIPE convergence, so old clients may treat quarantine
+  as death. **RE-CAST: restore is a full client state machine + capability bit + version floor
+  (old clients fail CLOSED: "unavailable, update", not permanent ghost); the "reuse the
+  retraction wire" line is withdrawn.** And conversational-repair is real labor (feeds T4).
+- **T4 — FATAL: false-NEGATIVE blindness downgrades the impact (Kelvin, unique).** The design
+  obsessed over FP (→quarantine) and was SILENT on FN: RESEARCH.md's own recall 0.47 means the
+  bot misses >HALF of violations → the operator can't stop patrolling → **the labor is NOT
+  removed.** The honest reframe: the bot is a **triage assist / force-multiplier / tip-line**,
+  NOT a moderation replacement. **RE-CAST: impact claim downgraded from "removes the human-
+  moderation task" to "reduces patrol load + gives real-time reversible response to the worst,
+  caught content."** THIS IS A PRODUCT DECISION FOR NICK (see Blade gate below) — is triage-
+  assist still worth building given "I don't want to moderate" can't be fully delivered by any
+  current classifier?
+- **T5 — numeric kill-criterion required before step 2 (Tesla + Carnot).** FP/precision is not
+  a labor model; with harm prevalence ≪1%, flags can nearly-all-be-wrong AND still drown a solo
+  op, OR risk-3 auto-hide becomes a time-critical restore PAGER. **RE-CAST: step 1's exit gate
+  is a written economic falsifier — max flags/hour, max wrongful-quarantine-minutes/week, max
+  restore-SLA — that can FAIL the ore after real-traffic measurement.**
+- **T6 — auth under-counts the token plane (Carnot + Tesla + Kelvin).** Scope-in-mutator is
+  necessary, not sufficient. **RE-CAST: distinct `principal_kind=machine` (NOT in
+  MODERATOR_USER_IDS, NOT reusing `is_moderator` — the "identity aperture" trap); per-verb
+  scope on every resource method; the bot CANNOT restore (human-only inverse, so a stolen token
+  can't un-hide/unmask); sender-constrained token (mTLS/DPoP), short TTL; token endpoint counts
+  as ingress; secret never colocated with the Judge.** Resolves the [OPEN] identity variable.
+- **T7 — stale-state binding (Carnot).** The moderated subject is `{msg_id, body revision,
+  visibility, author, channel}`; edit/delete/restore between Reader and Actuator makes the
+  verdict apply to stale state. **RE-CAST: bind + check `body_hash`/`message_version` at
+  actuation, not just msg_id.**
+- **T8 — NEW privacy/data-processor surface (Carnot).** "moderator mode = operator reads
+  plaintext" does NOT license exporting every message to Anthropic via OAuth — that's a new
+  processor / retention / subpoena boundary. **RE-CAST: either a LOCAL model, or third-party
+  LLM processing is named explicitly in island consent + privacy policy + deletion guarantees.**
+  (Interacts with #7 legal.)
+- **T9 — missing moderation-policy contract (Carnot).** risk 0–3 + categories[] can't be
+  automated without the target function: local rules, protected-speech/satire/quotation
+  handling, appeals semantics, a calibration set. **RE-CAST: the policy contract is a
+  prerequisite artifact; thresholds are meaningless without it.**
+- **T10 — media/CSAM boundary (Carnot) + audit hardening (Tesla).** If chat supports
+  attachments/links/images, the text Judge creates false confidence while the CSAM path is
+  absent. **RE-CAST: state media is disabled/out-of-scope until the hash-match design exists;
+  store STRUCTURED ENUMS ONLY in the audit artifact (model free-text is display-only, never
+  re-ingested, never a branch condition — confused-deputy defense); add a GLOBAL quarantine
+  budget, not just per-author (T-F5), to bound concurrent-hidden fraction / channel-darkening.**
+
+**Temper verdict: round 1 unanimous REQUEST_CHANGES — re-cast above, NOT yet re-tempered.**
+The forge is paused at the Blade gate for a Nick decision (T4): the crucible proved no current
+classifier can deliver "fully hands-off" (FN ~0.47), so the honest product is triage-assist.
+Is that worth building? If yes → re-temper the re-cast (round 2) then Blade. If the answer is
+"only fully-hands-off is worth it" → the ore is slag at current classifier quality (an honest
+negative result), park until models improve or a different instrument exists.
