@@ -190,6 +190,15 @@ services:
       # never reaches the container and the crucible-09 image would crash-loop on the
       # A5 boot guard. Forwarded here AND asserted by test_config.py invariant 7.
       CSAM_RUNBOOK_ACKNOWLEDGED: ${CSAM_RUNBOOK_ACKNOWLEDGED:-false}
+      # The channels this island bridges from the aiko bus (#2555). config default is
+      # ["general"] (config.py:59); the operator widens it in the host .env. Powers the
+      # app's app-bar channel switcher (aiko_chat_app PR#106), which only renders when
+      # GET /v1/channels returns >1 channel. Same inert-var trap as MODERATOR_USER_IDS —
+      # without this line a host .env AIKO_CHANNELS never reaches the container and the
+      # switcher stays dormant on a single "general" channel. Pydantic json-decodes the
+      # list[str] field, so the value MUST be a JSON array. Forwarded here AND asserted
+      # by test_config.py invariant 7.
+      AIKO_CHANNELS: ${AIKO_CHANNELS:-["general"]}
     volumes:
       # Persist the SQLite store across container recreates. External + stably named
       # so the store survives any project/service rename (see volumes: block).

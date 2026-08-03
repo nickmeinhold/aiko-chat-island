@@ -576,6 +576,7 @@ _MUST_FORWARD_ENV = {
     "GATEWAY_BASE_URL",              # per-island identity
     "GATEWAY_ID",                    # per-island identity
     "GATEWAY_DISPLAY_NAME",          # per-island identity
+    "AIKO_CHANNELS",                 # operator policy — bridged bus channels (#2555)
     "GATEWAY_SEED_PEERS",            # operator-curated federation
     "GATEWAY_BOOTSTRAP_PEERS",       # operator-curated federation (gossip fetch)
     "GATEWAY_GOSSIP_ENABLED",        # operator policy — gossip fetch gate
