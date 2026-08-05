@@ -227,6 +227,49 @@ def test_forward_migrated_db_is_served_not_upgraded(tmp_path, monkeypatch) -> No
         f"future alembic_version untouched, got {version!r}")
 
 
+def test_mixed_known_and_unknown_heads_skips(tmp_path, monkeypatch) -> None:
+    """A branched/merged version table carrying BOTH a known head and an unknown
+    revision must take the skip path (Wu cage-match, PR#116). This makes
+    "freeze on ANY unknown head" a deliberate decision, not accidental behaviour:
+    `command.upgrade(head)` would try to resolve the unknown row and die anyway, so
+    skipping is the safe posture — but assert it so a future topology change to
+    multi-head can't silently flip it. (The repo's single-head invariant means this
+    shouldn't arise in practice; the test pins the semantics regardless.)
+    """
+    from sqlalchemy import text
+
+    _, sync_url = _point_app_at(tmp_path, monkeypatch)
+    migrate.run()  # managed DB at head — alembic_version has the one real head row
+
+    # Add a SECOND version row naming a revision this image doesn't know, so the
+    # version table now carries {known_head, unknown}.
+    seed = create_engine(sync_url)
+    try:
+        with seed.begin() as conn:
+            conn.execute(
+                text("INSERT INTO alembic_version (version_num) VALUES (:r)"),
+                {"r": "9999_from_a_newer_image"},
+            )
+            rows_before = {r[0] for r in conn.exec_driver_sql(
+                "SELECT version_num FROM alembic_version").fetchall()}
+    finally:
+        seed.dispose()
+
+    migrate.run()  # must NOT raise, must NOT mutate the version table
+
+    engine = create_engine(sync_url)
+    try:
+        with engine.connect() as conn:
+            rows_after = {r[0] for r in conn.exec_driver_sql(
+                "SELECT version_num FROM alembic_version").fetchall()}
+    finally:
+        engine.dispose()
+    assert "9999_from_a_newer_image" in rows_before
+    assert rows_after == rows_before, (
+        "mixed known/unknown heads must skip untouched, got "
+        f"{rows_after!r} (was {rows_before!r})")
+
+
 def test_adopt_refuses_to_stamp_a_mismatched_db(tmp_path, monkeypatch) -> None:
     """A pre-alembic DB whose schema does NOT match the baseline (here: a table
     dropped) must be REFUSED, not falsely stamped current (Carnot cage-match,

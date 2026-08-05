@@ -11,8 +11,9 @@ already has it and abort. The fix is **stamp-or-upgrade**:
         existing schema matches the baseline, then ``stamp 0001``, then
         ``upgrade head`` applies anything after it
   * already-managed DB (``alembic_version`` present)     → ``upgrade head`` only
-  * DB stamped AHEAD of this image (``alembic_version`` names a revision this
-        image's ``alembic/versions/`` does not contain) → SERVE, do not upgrade
+  * DB stamped at a revision UNKNOWN to this image (``alembic_version`` names a
+        revision this image's ``alembic/versions/`` does not contain) → SERVE, do
+        not upgrade
 
 **Forward-revision tolerance (task #11 Temper — the boot-half of rollback safety).**
 The islands roll back by re-pinning an OLDER container IMAGE onto the SAME persistent
@@ -21,11 +22,26 @@ this runner fails closed, a plain ``upgrade head`` on that forward-migrated volu
 would die with "Can't locate revision …" (the old image's script directory has no
 such revision) and the entrypoint would refuse to serve — crash-looping the
 rolled-back island even though its schema is backward- (N-1) compatible. So when the
-DB is stamped ahead of this code we SERVE on the existing schema: no upgrade, no
-stamp-down, no mutation. The schema ratchets forward and stays; old code tolerating
-it is guaranteed by the expand/contract CI gate, NOT by this function. (This cannot
-co-occur with the adopt path: adopting means there is no ``alembic_version`` at all,
-hence no forward revision to find.)
+DB is stamped at a revision this image doesn't know, we SERVE on the existing schema:
+no upgrade, no stamp-down, no mutation. The schema ratchets forward and stays.
+
+**"Unknown to this image" is NOT the same set as "ahead of head" (Wu cage-match,
+PR#116).** An image rollback is the *intended and usual* cause, but the same detector
+fires on two others we CANNOT distinguish from the script directory alone: a
+squashed/removed past revision (routine alembic history hygiene → a volume stamped at
+the now-deleted revision), and a corrupt ``version_num``. In those two the volume is
+NOT ahead — it is behind or garbage — and serving-without-upgrading pins it below head
+*silently and permanently* (every boot re-takes this skip; ``upgrade head`` is never
+reached again), where the pre-fix code crash-looped *loudly*. We accept that cost
+because (a) rollback is the overwhelmingly common trigger, (b) distinguishing the
+cases needs information not in the script graph, and (c) the skip is emitted under a
+distinct, alertable log marker (``MIGRATE_SKIP_UNKNOWN_REVISION``) so an operator — and
+the reactive-deploy watcher (#10) — can catch a frozen volume. **If you squash or
+rebase migration history, stamp every live volume to the new baseline**, or those
+volumes will silently stop migrating. Safety of the served schema is guaranteed by the
+expand/contract CI gate — which is NOT yet built (task #11) — NOT by this function.
+(This cannot co-occur with the adopt path: adopting means there is no
+``alembic_version`` at all, hence no unknown revision to find.)
 
 **The adoption is fail-closed (Carnot cage-match, PR#23).** Stamping is an
 assertion that "the schema on disk already equals revision 0001". We do NOT take
@@ -60,6 +76,7 @@ from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.config import Config
 from alembic.runtime.migration import MigrationContext
+from alembic.script import ScriptDirectory
 from sqlalchemy import MetaData, create_engine, inspect
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
@@ -166,17 +183,16 @@ async def _diff_against(target: MetaData) -> list:
 
 async def _unknown_db_heads(cfg: Config) -> set[str]:
     """Revision(s) the DB is stamped at that this image's migration scripts do NOT
-    contain. A non-empty result means the DB is stamped AHEAD of this code — the
-    signature of an image rollback onto a volume a newer image already migrated
-    forward (see the module docstring's forward-revision tolerance).
+    contain. A non-empty result USUALLY means an image rollback onto a volume a newer
+    image already migrated forward — but "unknown" also covers a squashed/removed past
+    revision or a corrupt stamp, which this comparison cannot tell apart (see the
+    module docstring's forward-revision tolerance).
 
     ``get_current_heads()`` returns the raw ``alembic_version`` rows without
-    resolving them against the script directory, so a future revision id survives to
+    resolving them against the script directory, so an unknown revision id survives to
     be compared here (an empty tuple on a DB with no version table — a fresh or
     pre-alembic DB — which correctly yields no unknowns). Read over the async driver
     (the deploy has only aiosqlite)."""
-    from alembic.script import ScriptDirectory
-
     known = {rev.revision for rev in ScriptDirectory.from_config(cfg).walk_revisions()}
     engine = create_async_engine(settings.db_url, poolclass=NullPool)
     try:
@@ -211,17 +227,27 @@ def run() -> None:
         command.stamp(cfg, BASELINE_REVISION)
 
     # Forward-revision tolerance (task #11 Temper — see module docstring). If the DB
-    # is stamped at a revision this image doesn't know, it was migrated forward by a
-    # newer image and we are the rollback target: SERVE on the existing schema rather
-    # than dying fail-closed in `upgrade head`. Do NOT stamp down, do NOT mutate.
+    # is stamped at a revision this image doesn't know, the USUAL cause is an image
+    # rollback onto a forward-migrated volume and we are the rollback target: SERVE on
+    # the existing schema rather than dying fail-closed in `upgrade head`. Do NOT stamp
+    # down, do NOT mutate. NB "unknown" is not PROVABLY "ahead" (a squash/removed
+    # revision or corrupt stamp looks identical) — hence the distinct, alertable marker
+    # and the honest warning below (Wu cage-match, PR#116).
     unknown = asyncio.run(_unknown_db_heads(cfg))
     if unknown:
         log.warning(
-            "Database is stamped at revision(s) %s unknown to this image — the DB "
-            "is AHEAD of this code (image rollback onto a forward-migrated volume). "
-            "Serving on the EXISTING schema without upgrading; not stamping down, "
-            "not mutating. This is safe iff the schema is backward- (N-1) "
-            "compatible, which the expand/contract CI gate enforces.",
+            "MIGRATE_SKIP_UNKNOWN_REVISION: database is stamped at revision(s) %s not "
+            "present in this image's migration scripts. Usually an image rollback onto "
+            "a volume a newer image migrated forward (the DB is ahead of this code) — "
+            "then serving on the existing schema is correct. But an unknown revision "
+            "is NOT provably ahead: a squashed/removed past revision, or a corrupt "
+            "version stamp, is indistinguishable here and would leave this volume "
+            "silently pinned BELOW head (this skip re-fires every boot). Serving "
+            "WITHOUT upgrading; not stamping down, not mutating. Safe ONLY if the "
+            "schema is backward- (N-1) compatible — a property the expand/contract CI "
+            "gate WILL enforce once built (task #11); it is NOT yet enforced. If this "
+            "fired after a migration-history squash/rebase, stamp this volume to the "
+            "new baseline.",
             sorted(unknown))
         return
 
