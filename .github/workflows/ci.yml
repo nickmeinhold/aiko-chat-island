@@ -26,3 +26,41 @@ jobs:
       - run: pip install -e ".[dev]"
 
       - run: pytest
+
+  # Additive-only migration gate (task #11, A1). Structural half of rollback safety:
+  # every NEW migration's upgrade() must be backward- (N-1) compatible so an image
+  # rollback onto the forward-migrated volume serves (see tools/migration_lint.py and
+  # docs/crucible/11-expand-contract-migrations/). Runs ONLY on migrations changed in
+  # this PR/push — the gate applies going forward, not retroactively to shipped ones.
+  # Pure stdlib (ast) — no install needed.
+  migration-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # need history/tags to diff the changed migrations
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Lint changed migrations
+        run: |
+          set -euo pipefail
+          # Baseline: a PR diffs against its merge-base; a push to main diffs against
+          # the last release tag (the safety baseline is "N-1 relative to the last
+          # RELEASED schema"), falling back to the previous commit if no tag exists.
+          if [ -n "${{ github.event.pull_request.base.sha }}" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+          else
+            base=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || git rev-parse HEAD~1)
+          fi
+          echo "baseline: $base"
+          files=$(git diff --name-only --diff-filter=AM "$base"...HEAD -- 'alembic/versions/*.py' \
+                    | grep -v '__pycache__' || true)
+          if [ -z "$files" ]; then
+            echo "No migration changes since $base — nothing to lint."
+            exit 0
+          fi
+          echo "Linting: $files"
+          python tools/migration_lint.py $files
