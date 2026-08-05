@@ -176,6 +176,57 @@ def test_adopt_pre_alembic_db_stamps_baseline(tmp_path, monkeypatch) -> None:
     assert channels_sql.count("ck_channels_join_policy") == 1
 
 
+def test_forward_migrated_db_is_served_not_upgraded(tmp_path, monkeypatch) -> None:
+    """Image ROLLBACK onto a forward-migrated volume (task #11 Temper — the
+    CONVERGENT FATAL). The persistent volume was migrated by a NEWER image, so
+    ``alembic_version`` names a revision THIS image's ``alembic/versions/`` does not
+    contain. The old entrypoint migrator must recognise "the DB is ahead of me",
+    SKIP the upgrade, and serve on the existing schema — NOT die fail-closed on
+    alembic's "Can't locate revision" (which crash-loops the rolled-back island even
+    though the schema is N-1 compatible). It must not stamp down or otherwise mutate.
+
+    Schema N-1 compatibility (the expand/contract discipline) is useless if the boot
+    migrator refuses to start against a future ``alembic_version`` — this is the
+    boot-half of rollback safety, the flaw the cross-family Temper caught.
+    """
+    from sqlalchemy import text
+
+    _, sync_url = _point_app_at(tmp_path, monkeypatch)
+
+    # 1. Build a normal managed DB at head.
+    migrate.run()
+
+    # 2. Simulate a NEWER image having migrated the volume forward: stamp
+    #    alembic_version at a revision this image's scripts don't know.
+    future_rev = "9999_from_a_newer_image"
+    seed = create_engine(sync_url)
+    try:
+        with seed.begin() as conn:
+            conn.execute(
+                text("UPDATE alembic_version SET version_num = :r"),
+                {"r": future_rev},
+            )
+    finally:
+        seed.dispose()
+
+    # 3. The rolled-back image boots. This MUST NOT raise (the pre-fix behaviour is
+    #    `command.upgrade(head)` dying on the unknown current revision).
+    migrate.run()
+
+    # 4. Skipped, not mutated: the future revision is left exactly as-is (no
+    #    downgrade, no stamp).
+    engine = create_engine(sync_url)
+    try:
+        with engine.connect() as conn:
+            version = conn.exec_driver_sql(
+                "SELECT version_num FROM alembic_version").scalar()
+    finally:
+        engine.dispose()
+    assert version == future_rev, (
+        "forward-migrated DB was mutated — the boot migrator must leave a "
+        f"future alembic_version untouched, got {version!r}")
+
+
 def test_adopt_refuses_to_stamp_a_mismatched_db(tmp_path, monkeypatch) -> None:
     """A pre-alembic DB whose schema does NOT match the baseline (here: a table
     dropped) must be REFUSED, not falsely stamped current (Carnot cage-match,

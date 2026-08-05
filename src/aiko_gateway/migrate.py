@@ -11,6 +11,21 @@ already has it and abort. The fix is **stamp-or-upgrade**:
         existing schema matches the baseline, then ``stamp 0001``, then
         ``upgrade head`` applies anything after it
   * already-managed DB (``alembic_version`` present)     → ``upgrade head`` only
+  * DB stamped AHEAD of this image (``alembic_version`` names a revision this
+        image's ``alembic/versions/`` does not contain) → SERVE, do not upgrade
+
+**Forward-revision tolerance (task #11 Temper — the boot-half of rollback safety).**
+The islands roll back by re-pinning an OLDER container IMAGE onto the SAME persistent
+volume; the volume keeps whatever revision the newer image migrated it to. Because
+this runner fails closed, a plain ``upgrade head`` on that forward-migrated volume
+would die with "Can't locate revision …" (the old image's script directory has no
+such revision) and the entrypoint would refuse to serve — crash-looping the
+rolled-back island even though its schema is backward- (N-1) compatible. So when the
+DB is stamped ahead of this code we SERVE on the existing schema: no upgrade, no
+stamp-down, no mutation. The schema ratchets forward and stays; old code tolerating
+it is guaranteed by the expand/contract CI gate, NOT by this function. (This cannot
+co-occur with the adopt path: adopting means there is no ``alembic_version`` at all,
+hence no forward revision to find.)
 
 **The adoption is fail-closed (Carnot cage-match, PR#23).** Stamping is an
 assertion that "the schema on disk already equals revision 0001". We do NOT take
@@ -149,6 +164,30 @@ async def _diff_against(target: MetaData) -> list:
         await engine.dispose()
 
 
+async def _unknown_db_heads(cfg: Config) -> set[str]:
+    """Revision(s) the DB is stamped at that this image's migration scripts do NOT
+    contain. A non-empty result means the DB is stamped AHEAD of this code — the
+    signature of an image rollback onto a volume a newer image already migrated
+    forward (see the module docstring's forward-revision tolerance).
+
+    ``get_current_heads()`` returns the raw ``alembic_version`` rows without
+    resolving them against the script directory, so a future revision id survives to
+    be compared here (an empty tuple on a DB with no version table — a fresh or
+    pre-alembic DB — which correctly yields no unknowns). Read over the async driver
+    (the deploy has only aiosqlite)."""
+    from alembic.script import ScriptDirectory
+
+    known = {rev.revision for rev in ScriptDirectory.from_config(cfg).walk_revisions()}
+    engine = create_async_engine(settings.db_url, poolclass=NullPool)
+    try:
+        async with engine.connect() as conn:
+            heads = await conn.run_sync(
+                lambda c: MigrationContext.configure(c).get_current_heads())
+    finally:
+        await engine.dispose()
+    return set(heads) - known
+
+
 def run() -> None:
     tables = asyncio.run(_table_names())
     cfg = _alembic_config()
@@ -170,6 +209,22 @@ def run() -> None:
             "Adopting a pre-alembic database (schema matches baseline %s, no "
             "alembic_version) — stamping baseline.", BASELINE_REVISION)
         command.stamp(cfg, BASELINE_REVISION)
+
+    # Forward-revision tolerance (task #11 Temper — see module docstring). If the DB
+    # is stamped at a revision this image doesn't know, it was migrated forward by a
+    # newer image and we are the rollback target: SERVE on the existing schema rather
+    # than dying fail-closed in `upgrade head`. Do NOT stamp down, do NOT mutate.
+    unknown = asyncio.run(_unknown_db_heads(cfg))
+    if unknown:
+        log.warning(
+            "Database is stamped at revision(s) %s unknown to this image — the DB "
+            "is AHEAD of this code (image rollback onto a forward-migrated volume). "
+            "Serving on the EXISTING schema without upgrading; not stamping down, "
+            "not mutating. This is safe iff the schema is backward- (N-1) "
+            "compatible, which the expand/contract CI gate enforces.",
+            sorted(unknown))
+        return
+
     command.upgrade(cfg, "head")
     log.info("Database is at head.")
 
