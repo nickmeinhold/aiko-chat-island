@@ -936,6 +936,10 @@ async def me(user: CurrentUser) -> dict:
 @me_router.patch(
     "/me",
     response_model=MeView,
+    dependencies=[rate_limit("account")],  # authed, but an unbounded mutate surface
+    # (display_name has no cooldown) needs the same per-IP collar as register/login
+    # (cage-match #118, Tesla+Maxwell) — a trust-boundary write must not be a free
+    # DB-write-storm dial.
     responses={
         400: {"description": "neither handle nor display_name provided"},
         409: {"description": "handle already taken"},

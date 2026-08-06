@@ -208,6 +208,46 @@ async def test_combined_body_is_atomic_under_cooldown(client, session):
 
 
 @pytest.mark.asyncio
+async def test_cooldown_wins_over_taken_handle_during_window(client, session):
+    """Ordering: within the cooldown window, requesting a TAKEN handle returns 429
+    (the folded cooldown predicate rejects the write before the UNIQUE can fire),
+    never 409 — the cooldown is consulted first and leaks nothing extra."""
+    alice = await _make_user(session, username="alice")
+    await _make_user(session, username="bob")
+    hdr = _auth(alice)
+    r1 = await client.patch("/v1/me", json={"handle": "alice2"}, headers=hdr)
+    assert r1.status_code == 200  # starts the cooldown
+    # Now within cooldown, try to take bob's handle → cooldown wins (429, not 409).
+    r2 = await client.patch("/v1/me", json={"handle": "bob"}, headers=hdr)
+    assert r2.status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_handle_change_survives_concurrent_row_deletion(session):
+    """The rowcount==0 retry_after re-read must not 500 if the row vanished (a
+    concurrent self-account-deletion): scalar_one_or_none + a full-window fallback."""
+    from sqlalchemy import delete as _delete
+    from sqlalchemy import update as _update
+
+    from aiko_gateway.domain.models import User
+
+    user = await _make_user(session, username="alice")
+    # Fresh stamp so the cooldown predicate rejects, THEN delete the row out from
+    # under the update — the re-read finds nothing.
+    await session.execute(_update(User).where(User.id == user.id).values(
+        handle_changed_at=dt.datetime.now(dt.timezone.utc)))
+    await session.commit()
+    uid = user.id
+    # Simulate the delete landing between the failed UPDATE and the re-read by
+    # deleting now; update_profile's UPDATE matches 0 rows, re-read finds nothing.
+    await session.execute(_delete(User).where(User.id == uid))
+    await session.commit()
+    with pytest.raises(users_service.HandleChangeCooldown):
+        await users_service.update_profile(
+            session, user, handle="alice2", cooldown_seconds=30 * 24 * 3600)
+
+
+@pytest.mark.asyncio
 async def test_cooldown_predicate_beats_a_stale_read(session):
     """Regression for the folded-predicate fix (cage-match #118): the cooldown lives
     in the UPDATE's WHERE, not a pre-read. Simulate the concurrent race by giving the

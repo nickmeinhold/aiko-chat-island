@@ -336,10 +336,22 @@ async def update_profile(
     if handle is None or handle == user.username:
         # display_name-only, or a no-op same-handle write: no cooldown, no atomic
         # gate. A no-op handle does NOT stamp handle_changed_at (the form-resubmit
-        # lockout footgun stays closed).
+        # lockout footgun stays closed). ACCEPTED residual (cage-match #118, Tesla):
+        # the "same handle" test is against the request-loaded user.username, so in a
+        # narrow self-race (this user's handle was concurrently changed after load)
+        # a genuine change could read as a no-op and silently not apply. Outcome is
+        # benign — no wrong state persists, the user simply retries — so we don't
+        # fold this into the DB at the cost of tangling the no-op/cooldown semantics.
         if display_name is not None:
             user.display_name = display_name
         await session.commit()
+        # Symmetric with the handle path's post-commit refresh. Not strictly required
+        # today (SessionLocal is expire_on_commit=False — db.py:79 — so the ORM object
+        # stays live after commit), but making BOTH success paths end the same way
+        # removes the asymmetry cross-family reviewers repeatedly read as a
+        # MissingGreenlet risk, and keeps the door correct if expire_on_commit ever
+        # flips (cage-match #118, Tesla+Wu).
+        await session.refresh(user)
         return user
 
     # Handle CHANGE — fold the cooldown predicate into the write.
@@ -373,19 +385,31 @@ async def update_profile(
             raise HandleTaken() from e
         raise  # a non-handle constraint is NOT a taken handle — don't mislabel it
     if result.rowcount == 0:
-        # The cooldown predicate rejected the write. Re-read the CURRENT stamp (the
-        # DB value, not the possibly-stale in-memory one) to compute retry_after.
-        # Capture the id BEFORE rollback — rollback expires every instance
-        # unconditionally, so reading user.id afterwards would trigger a lazy load
-        # outside the async context (MissingGreenlet).
+        # The cooldown predicate rejected the write — the row's handle_changed_at is
+        # set AND newer than cutoff (a NULL stamp would have matched the WHERE, so
+        # rowcount==0 is never the never-changed case). Re-read the CURRENT stamp to
+        # compute retry_after. Capture the id BEFORE rollback — rollback expires every
+        # instance unconditionally, so reading user.id afterwards would trigger a lazy
+        # load outside the async context (MissingGreenlet).
         uid = user.id
         await session.rollback()
         last = (await session.execute(
-            select(User.handle_changed_at).where(User.id == uid))).scalar_one()
-        if last is not None and last.tzinfo is None:
+            select(User.handle_changed_at).where(User.id == uid))).scalar_one_or_none()
+        if last is None:
+            # The row vanished between the UPDATE and this read — a concurrent
+            # self-account-deletion. Don't scalar_one()-500 (cage-match #118,
+            # Carnot+Tesla); report the full window, non-crashing — the account is
+            # going away regardless.
+            raise HandleChangeCooldown(cooldown_seconds)
+        if last.tzinfo is None:
             last = last.replace(tzinfo=dt.timezone.utc)
-        elapsed = (now - last).total_seconds() if last is not None else float(cooldown_seconds)
-        raise HandleChangeCooldown(max(1, math.ceil(cooldown_seconds - elapsed)))
+        # Recompute now AFTER the read: under a concurrent race the request-start `now`
+        # can predate the winner's stamp, making elapsed negative and retry_after
+        # exceed the window. Cap at cooldown_seconds so Retry-After never over-promises
+        # (cage-match #118, Carnot).
+        elapsed = (dt.datetime.now(dt.timezone.utc) - last).total_seconds()
+        raise HandleChangeCooldown(
+            max(1, min(cooldown_seconds, math.ceil(cooldown_seconds - elapsed))))
     await session.commit()
     await session.refresh(user)  # Core UPDATE bypassed the ORM — reload the labels
     return user
