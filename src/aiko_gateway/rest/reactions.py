@@ -19,11 +19,14 @@ the SAME 404 as a non-existent message (existence-hiding). The emoji is validate
 BEFORE the message is resolved, so a malformed emoji is always a 422 regardless of
 whether the message is visible — the 422/404 split can't be used to probe existence.
 
-FANOUT VISIBILITY = the read predicate's live twin. The frame is excluded for any
-subscriber who could not see the target message: the reactor's block pairs (they
-can't see the reactor) UNION the message author's block pairs (they can't see the
-message). This matches what ``reactions_service.aggregate_for_messages`` would show
-that subscriber on a subsequent history read — one predicate, both paths.
+FANOUT respects the block on the IDENTITY the frame carries, not on the count. The
+``reaction`` frame carries the reactor's ``user_id``, so it is excluded for any
+subscriber in a block relationship with the reactor (they can't see the reactor) OR
+with the message author (they can't see the message at all). The ``count`` itself is
+a global anonymous tally (no reactor list in v2), so it is NOT block-filtered — same
+number on the frame, the mutate response, and the history aggregate; block-filtering
+it would only leak, via a count mismatch, that a hidden user reacted (the count
+oracle, cage-match round 2). See ``reactions_service`` for the full reasoning.
 """
 from __future__ import annotations
 
@@ -66,12 +69,11 @@ async def _fanout(
     action: ReactionAction, actor_id: str, author_id: str | None, count: int,
 ) -> None:
     """Best-effort live ``reaction`` frame to the channel's subscribers, excluding any
-    subscriber who could not see the target message: the reactor's block pairs UNION
-    the message author's block pairs. This is the live twin of the read predicate
-    (``aggregate_for_messages`` hides blocked reactors; history hides a blocked
-    author's message entirely), so the two paths never disagree. No-op if the hub
-    isn't wired (a minimal app / worker without realtime); the durable state is the
-    row, the frame is the optimisation."""
+    subscriber in a block relationship with the reactor (the frame names the reactor)
+    OR with the message author (they can't see the message). The ``count`` on the
+    frame is the global anonymous tally, matching history — only the identity-bearing
+    delivery is block-filtered. No-op if the hub isn't wired (a minimal app / worker
+    without realtime); the durable state is the row, the frame is the optimisation."""
     gw = getattr(request.app.state, "gw", None)
     if gw is None or getattr(gw, "hub", None) is None:
         return

@@ -18,13 +18,22 @@ and only forward-pages never re-reads the row, so its aggregate stays frozen unt
 it re-fetches). The live ``reaction`` WS frame (``envelopes.reaction_frame``) is a
 best-effort latency optimisation over that recomputed aggregate.
 
-BLOCK VISIBILITY IS ONE PREDICATE ON BOTH PATHS (cage-match Carnot/Tesla). A user
-never sees reactions authored by someone in a block relationship with them, and the
-live fanout never reaches a subscriber who cannot see the target message. The read
-half is enforced here (``aggregate_for_messages`` filters blocked reactors); the
-live half is enforced by the route's fanout exclusion (reactor's ∪ message author's
-block pairs). Same content-filter shape as messages (#7) — a delete/hide only ever
-removes what you see.
+COUNTS ARE ANONYMOUS GLOBAL AGGREGATES; BLOCK HIDES IDENTITY, NOT THE TALLY
+(cage-match Carnot/Tesla round 2). The v2 read API exposes NO reactor list — a
+reaction is an anonymous ``count`` + the viewer's own ``reacted_by_me``, never a
+"who reacted". So the COUNT is the same global number on every path — history
+aggregate, the mutate response, and the WS ``reaction`` frame — and is NOT
+block-filtered. Filtering it (an earlier attempt) created a *count oracle*: a
+viewer-dependent count that disagreed with the global frame count would reveal that
+a blocked user had reacted (only-a-blocked-user-holds-👍, a visible peer adds 👍,
+viewer's history says 1 but the frame says 2 → "someone I can't see reacted"). A
+blocked user shows as messages / identity, so what must respect the block is the
+IDENTITY-bearing live frame — it carries the reactor's ``user_id`` — which the
+route's fanout exclusion drops for the reactor's ∪ message author's block pairs.
+The anonymous count rides through unfiltered, exactly like Slack/Discord show a
+global reaction count regardless of who you've blocked. One number, all paths; the
+only viewer-dependent bits are ``reacted_by_me`` (self, always visible) and WHO
+receives the identity-bearing frame.
 
 CONCURRENCY: ``add_reaction`` uses ``INSERT ... ON CONFLICT DO NOTHING`` (SQLite
 dialect, matching dev+prod — CLAUDE.md), so a concurrent duplicate is a no-op AT THE
@@ -38,7 +47,6 @@ from sqlalchemy import Select, delete, func, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from . import moderation_service
 from .models import MessageReaction
 
 # Opaque-emoji length cap (defense-in-depth). A real emoji, incl. a ZWJ sequence
@@ -162,30 +170,27 @@ async def remove_reaction(
 async def aggregate_for_messages(
     session: AsyncSession, message_ids: list[str], viewer_id: str,
 ) -> dict[str, list[dict]]:
-    """Viewer-dependent reaction aggregate for a PAGE of messages, in ONE grouped
-    query (+ one for the viewer's own rows, + one small block-set read) — never N+1
-    per message. Returns ``{message_id: [{"emoji", "count", "reacted_by_me"}, ...]}``
-    with an entry only for messages that have at least one VISIBLE reaction (absent ==
-    none, so the serializer defaults to ``[]``).
+    """Reaction aggregate for a PAGE of messages, in ONE grouped query (+ one for the
+    viewer's own rows) — never N+1 per message. Returns ``{message_id: [{"emoji",
+    "count", "reacted_by_me"}, ...]}`` with an entry only for messages that have at
+    least one reaction (absent == none, so the serializer defaults to ``[]``).
 
-    BLOCK-FILTERED (cage-match Tesla): reactions authored by a user in a block
-    relationship with the viewer are excluded from both ``count`` and existence — the
-    same content-hiding a blocked author's MESSAGES get (#7), applied to their
-    reactions, so the read path and the live fanout enforce ONE visibility predicate
-    (the fanout half lives in the route's exclusion set). The viewer's own row is never
-    blocked (you cannot block yourself), so ``reacted_by_me`` is unaffected.
+    ``count`` is the GLOBAL anonymous tally — NOT block-filtered (cage-match round 2).
+    The v2 API exposes no reactor list, so a count reveals no identity; block-filtering
+    it only created a *count oracle* (a viewer-dependent count disagreeing with the
+    global WS-frame count would leak that a blocked user reacted). The identity a block
+    must hide rides the live ``reaction`` frame (its ``user_id``), which the route's
+    fanout exclusion drops — the count itself is global on every path (history, mutate
+    response, frame), exactly like Slack/Discord. Only ``reacted_by_me`` is
+    viewer-dependent, and the viewer can never block themselves.
 
     Per-emoji rows are ordered ``(-count, emoji)`` — most-reacted first, ties broken by
     the opaque emoji string for a stable, deterministic wire order."""
     if not message_ids:
         return {}
-    blocked = await moderation_service.blocked_pair_user_ids(session, viewer_id)
-    counts_where = [MessageReaction.message_id.in_(message_ids)]
-    if blocked:
-        counts_where.append(MessageReaction.user_id.notin_(blocked))
     counts = (await session.execute(
         select(MessageReaction.message_id, MessageReaction.emoji, func.count())
-        .where(*counts_where)
+        .where(MessageReaction.message_id.in_(message_ids))
         .group_by(MessageReaction.message_id, MessageReaction.emoji))).all()
     mine = {
         (m, e) for m, e in (await session.execute(

@@ -233,10 +233,13 @@ async def test_per_message_reaction_cap(session):
     assert (count, changed) == (1, False)
 
 
-async def test_aggregate_excludes_blocked_reactor(session):
-    """A reaction authored by a user the viewer has blocked is hidden from the
-    viewer's aggregate — the same content-filter a blocked author's messages get (#7),
-    applied to reactions so read + live fanout share ONE block predicate."""
+async def test_aggregate_count_is_global_anonymous_even_with_block(session):
+    """The count is a GLOBAL anonymous tally — NOT block-filtered (cage-match round 2).
+    Block-filtering the count would create a count oracle (a viewer-dependent count
+    disagreeing with the global WS-frame count leaks that a blocked user reacted). The
+    v2 API exposes no reactor list, so the count reveals no identity; what a block
+    hides is the identity-bearing live frame (covered by the fanout tests), not the
+    anonymous number. So me sees count 2 whether or not me has blocked a reactor."""
     author = await _user(session, "author")
     me = await _user(session, "me")
     troll = await _user(session, "troll")
@@ -246,14 +249,12 @@ async def test_aggregate_excludes_blocked_reactor(session):
         session, user_id=me.id, message_id=msg.id, emoji=THUMB)
     await reactions_service.add_reaction(
         session, user_id=troll.id, message_id=msg.id, emoji=THUMB)
-    # Unblocked: me sees count 2.
-    agg = await reactions_service.aggregate_for_messages(session, [msg.id], me.id)
-    assert agg[msg.id][0]["count"] == 2
 
-    # me blocks troll → troll's reaction vanishes from me's aggregate (count 1).
     await moderation_service.block_user(session, me.id, troll.id)
-    agg2 = await reactions_service.aggregate_for_messages(session, [msg.id], me.id)
-    assert agg2[msg.id] == [{"emoji": THUMB, "count": 1, "reacted_by_me": True}]
+    agg = await reactions_service.aggregate_for_messages(session, [msg.id], me.id)
+    # Count stays 2 (global) — the same number the WS frame + mutate response carry, so
+    # no path disagrees and no oracle exists.
+    assert agg[msg.id] == [{"emoji": THUMB, "count": 2, "reacted_by_me": True}]
 
 
 async def test_message_view_defaults_reactions_empty(session):

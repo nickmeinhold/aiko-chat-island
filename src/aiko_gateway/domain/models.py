@@ -533,6 +533,15 @@ class MessageReaction(Base):
     requires it), and channel hard-delete tears them down before its messages (they
     FK ``messages.id`` — verify-the-neighbor, like ``MessageReport`` in
     ``channels_service.hard_delete_channel``).
+
+    Message SOFT-DELETE (takedown, #7) deliberately does NOT purge reactions — the
+    same reason it preserves the message body/row: a soft-delete is REVERSIBLE, so its
+    children are preserved-and-hidden, not destroyed (a reversed takedown restores the
+    reactions with the message). The reactions are inert while hidden — ``get_history``
+    never returns a ``deleted_at`` row, so its reactions never surface in an aggregate,
+    and the visibility gate refuses a NEW reaction on a soft-deleted message. Only the
+    two IRREVERSIBLE deletes (channel hard-delete, account deletion) purge (cage-match
+    round 2, Tesla — the neighbor named so the next reader doesn't re-learn it).
     """
     __tablename__ = "message_reactions"
     __table_args__ = (
