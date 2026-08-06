@@ -90,6 +90,18 @@ class PatchMeReq(BaseModel):
             raise ValueError("handle must not be blank")
         return v
 
+    @field_validator("display_name")
+    @classmethod
+    def _display_name_nonempty_after_strip(cls, v: str | None) -> str | None:
+        # An empty display_name is unreachable via every CREATE path (they coerce
+        # `display_name or username`); the mutate path must not be the one door that
+        # can persist "" (cage-match #118, Wu's empty!=singleton catch). None (field
+        # omitted) stays legal; a provided-but-blank value is a 422 at the boundary,
+        # symmetric with handle.
+        if v is not None and not v:
+            raise ValueError("display_name must not be blank")
+        return v
+
 
 def _user_view(u: User) -> dict:
     return {"user_id": u.id, "username": u.username,
@@ -921,7 +933,22 @@ async def me(user: CurrentUser) -> dict:
     return _me_view(user)
 
 
-@me_router.patch("/me", response_model=MeView)
+@me_router.patch(
+    "/me",
+    response_model=MeView,
+    responses={
+        400: {"description": "neither handle nor display_name provided"},
+        409: {"description": "handle already taken"},
+        429: {
+            "description": "handle changed within the cooldown window",
+            "content": {"application/json": {"schema": {"type": "object", "properties": {
+                "detail": {"type": "string"},
+                "retry_after": {"type": "integer",
+                                "description": "whole seconds until the cooldown lifts"},
+            }}}},
+        },
+    },
+)
 async def patch_me(
     req: PatchMeReq, user: CurrentUser, session: DbSession,
 ) -> dict | JSONResponse:

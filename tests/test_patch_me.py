@@ -178,3 +178,57 @@ async def test_handle_change_allowed_after_cooldown_window(client, session):
     await session.commit()
     resp = await client.patch("/v1/me", json={"handle": "alice2"}, headers=_auth(user))
     assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_empty_display_name_422(client, session):
+    """A provided-but-blank display_name is a 422 — the mutate path must not be the
+    one door that persists "" (every CREATE path coerces display_name or username)."""
+    user = await _make_user(session, username="alice", display_name="Alice")
+    resp = await client.patch("/v1/me", json={"display_name": "   "}, headers=_auth(user))
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_combined_body_is_atomic_under_cooldown(client, session):
+    """A combined {handle, display_name} body is all-or-nothing: if the handle change
+    is refused by the cooldown, the display_name edit is NOT applied either."""
+    user = await _make_user(session, username="alice", display_name="Alice")
+    hdr = _auth(user)  # capture once — a 429 rollback expires `user` in the shared
+    # test session, so re-reading user.id afterwards (as _auth does) would lazy-load.
+    r1 = await client.patch("/v1/me", json={"handle": "alice2"}, headers=hdr)
+    assert r1.status_code == 200
+    # Within cooldown: combined change → 429, and NEITHER field applied.
+    r2 = await client.patch("/v1/me", json={"handle": "alice3", "display_name": "Zed"},
+                            headers=hdr)
+    assert r2.status_code == 429
+    me = (await client.get("/v1/me", headers=hdr)).json()
+    assert me["username"] == "alice2"       # handle unchanged
+    assert me["display_name"] == "Alice"    # display_name NOT applied (atomic)
+
+
+@pytest.mark.asyncio
+async def test_cooldown_predicate_beats_a_stale_read(session):
+    """Regression for the folded-predicate fix (cage-match #118): the cooldown lives
+    in the UPDATE's WHERE, not a pre-read. Simulate the concurrent race by giving the
+    DB row a fresh handle_changed_at while the in-memory user still reads None (what a
+    second concurrent request's snapshot would see) — the change must STILL be refused."""
+    from sqlalchemy import update as _update
+
+    from aiko_gateway.domain.models import User
+
+    user = await _make_user(session, username="alice")
+    # DB row: changed 'just now' (a concurrent winner's committed write). We do NOT
+    # touch user.handle_changed_at — leaving the in-memory attribute at its loaded
+    # value is exactly the stale snapshot a second concurrent request would hold. The
+    # folded predicate must consult the DB, not that in-memory value, and refuse.
+    await session.execute(_update(User).where(User.id == user.id).values(
+        handle_changed_at=dt.datetime.now(dt.timezone.utc)))
+    await session.commit()
+
+    with pytest.raises(users_service.HandleChangeCooldown):
+        await users_service.update_profile(
+            session, user, handle="alice2", cooldown_seconds=30 * 24 * 3600)
+    # And the row was not mutated by the refused write.
+    await session.refresh(user)
+    assert user.username == "alice"

@@ -135,7 +135,11 @@ class Settings(BaseSettings):
     # rapid churn would destabilise resolution. 30 days (confirmed with Nick).
     # display_name edits are NOT rate-limited by this. Config so an island MAY tune
     # it (forwarded in docker-compose); the default is correct for every island.
-    handle_change_cooldown_seconds: int = 30 * 24 * 3600  # 30 days
+    # ge=1: a trust-boundary throttle must not be silently disable-able by a
+    # malformed env (HANDLE_CHANGE_COOLDOWN_SECONDS=-1/0 would make `elapsed <
+    # cooldown` never true → no cooldown). Bounded like island_key_version; a boot
+    # with a non-positive value fails LOUD rather than fail-open (cage-match #118).
+    handle_change_cooldown_seconds: int = Field(default=30 * 24 * 3600, ge=1)  # 30 days
 
     # --- OAuth broker (#21: server-side authorization-code flow) ---
     # Increment 2 scope: the CORE broker flow + GitHub as the first provider.
