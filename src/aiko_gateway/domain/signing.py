@@ -41,6 +41,12 @@ import struct
 from typing import Any
 
 DOMAIN_TAG = "aikochat:msg:v1:EdDSA"
+# Reactions sign under a DISTINCT domain tag (#2634) so a message signature can
+# never be lifted and re-presented as a reaction endorsement, or vice versa
+# (cross-event replay). Same envelope shape + same carriage rules — only the
+# signed-byte prefix and the trailing content fields differ. See
+# docs/crucible/sovereign-reaction-signing/SIGNING-SPEC.md.
+REACT_DOMAIN_TAG = "aikochat:react:v1:EdDSA"
 ALG = "EdDSA"                       # the ONLY accepted alg — allowlist, never trust the envelope's claim
 SUPPORTED_V = 1
 _MULTICODEC_ED25519 = b"\xed\x01"  # varint multicodec prefix inside an ed25519 Multikey
@@ -208,6 +214,38 @@ def signing_bytes(
         struct.pack(">Q", signed_at_ms),
         lp(body.encode()),
         lp((reply_to or "").encode()),
+    ))
+
+
+def reaction_signing_bytes(
+    *, raw_pubkey: bytes, channel_id: str, client_msg_id: str,
+    signed_at_ms: int, target_msg_id: str, emoji: str, action: str,
+) -> bytes:
+    """The canonical bytes an Ed25519 reaction signature is computed over (#2634) —
+    a faithful mirror of ``signing_bytes`` with the message content fields
+    (``body``/``reply_to``) swapped for the reaction content (``target_msg_id``/
+    ``emoji``/``action``) and a DISTINCT domain tag. Fields 1-5 are byte-identical
+    in role/encoding to a signed message, so the app signer reuses its message
+    spine and only changes the tag + trailing fields.
+
+    ``action`` is signed too, so a ``remove`` (un-vouch) is its own non-repudiable
+    event. Like ``signing_bytes`` this is NOT used on the production carry path (the
+    gateway carries, does not verify) — it is the drift-guard exercised by the
+    golden-vector test so our reconstruction can never silently diverge from the
+    app's signer. PROPOSED layout pending app-tab confirmation; see
+    docs/crucible/sovereign-reaction-signing/SIGNING-SPEC.md."""
+    def lp(b: bytes) -> bytes:
+        return struct.pack(">I", len(b)) + b
+
+    return b"".join((
+        lp(REACT_DOMAIN_TAG.encode()),
+        lp(raw_pubkey),
+        lp(channel_id.encode()),
+        lp(client_msg_id.encode()),
+        struct.pack(">Q", signed_at_ms),
+        lp(target_msg_id.encode()),
+        lp(emoji.encode()),
+        lp(action.encode()),
     ))
 
 
