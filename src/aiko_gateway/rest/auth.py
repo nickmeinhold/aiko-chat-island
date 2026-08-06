@@ -946,6 +946,8 @@ async def me(user: CurrentUser) -> dict:
         429: {
             "description": "handle changed within the cooldown window",
             "content": {"application/json": {"schema": {"type": "object", "properties": {
+                "code": {"type": "string", "enum": ["handle_change_cooldown"],
+                         "description": "distinguishes this 429 from the rate-limit 429"},
                 "detail": {"type": "string"},
                 "retry_after": {"type": "integer",
                                 "description": "whole seconds until the cooldown lifts"},
@@ -985,7 +987,11 @@ async def patch_me(
         # bypasses response_model (intended — this is the error shape, not MeView).
         return JSONResponse(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            content={"detail": "handle change on cooldown",
+            # `code` disambiguates THIS 429 (handle cooldown) from the rate_limit
+            # dependency's 429 (per-IP collar) — both are 429, so a client keying only
+            # on status could confuse them (cage-match #118, Tesla). Key on `code`.
+            content={"code": "handle_change_cooldown",
+                     "detail": "handle change on cooldown",
                      "retry_after": e.retry_after},
             headers={"Retry-After": str(e.retry_after)},
         )

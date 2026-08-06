@@ -80,9 +80,10 @@ async def test_me_view_shape_stable(client, session):
     resp = await client.get("/v1/me", headers=_auth(user))
     assert resp.status_code == 200
     body = resp.json()
-    # is_moderator is an existing UI-only field on /me; assert the identity core.
-    for k in ("user_id", "username", "display_name", "aiko_username"):
-        assert k in body, f"missing {k}"
+    # Exact CLOSED key set (not just membership) — response_model=MeView is the real
+    # filter; the test must catch an accidental extra/removed field (append-only).
+    assert set(body) == {"user_id", "username", "display_name", "aiko_username",
+                         "is_moderator"}
     assert body["user_id"] == user.id
     assert body["username"] == "alice"
 
@@ -153,6 +154,7 @@ async def test_patch_handle_cooldown_429_with_retry_after(client, session):
     assert r1.status_code == 200
     r2 = await client.patch("/v1/me", json={"handle": "alice3"}, headers=_auth(user))
     assert r2.status_code == 429
+    assert r2.json()["code"] == "handle_change_cooldown"  # distinct from rate-limit 429
     assert r2.json()["retry_after"] > 0
     assert "Retry-After" in r2.headers
     # still ~30 days out (allow slack); expressed in whole seconds
@@ -220,6 +222,48 @@ async def test_cooldown_wins_over_taken_handle_during_window(client, session):
     # Now within cooldown, try to take bob's handle → cooldown wins (429, not 409).
     r2 = await client.patch("/v1/me", json={"handle": "bob"}, headers=hdr)
     assert r2.status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_idempotent_stale_set_returns_success_not_429(session):
+    """Seal for Carnot r4 (cage-match #118): setting the handle to a value the DB row
+    ALREADY holds is an idempotent no-op success, never a spurious cooldown 429 — even
+    when the in-memory username is a stale snapshot that makes it look like a change."""
+    from sqlalchemy import update as _update
+
+    from aiko_gateway.domain.models import User
+
+    user = await _make_user(session, username="alice")
+    # DB row is now 'bob' with a fresh cooldown stamp; in-memory user still says 'alice'.
+    await session.execute(_update(User).where(User.id == user.id).values(
+        username="bob", aiko_username="bob",
+        handle_changed_at=dt.datetime.now(dt.timezone.utc),
+    ).execution_options(synchronize_session=False))
+    await session.commit()
+    assert user.username == "alice"  # stale in-memory
+
+    # Request handle='bob' — a change vs the stale snapshot, but the DB is ALREADY 'bob'.
+    # Must be a 200 no-op (idempotent), not a 429 for a handle that's already set.
+    result = await users_service.update_profile(
+        session, user, handle="bob", display_name="X", cooldown_seconds=30 * 24 * 3600)
+    assert result.username == "bob"
+    assert result.display_name == "X"  # display applied on the idempotent path
+
+
+@pytest.mark.asyncio
+async def test_combined_body_atomic_on_taken_handle(session):
+    """Combined {handle, display_name} where the handle is TAKEN → HandleTaken (409),
+    and the display_name is NOT applied (all-or-nothing on the 409 arm too, not only
+    the 429 arm) — the failed Core UPDATE rolls back the whole write."""
+    alice = await _make_user(session, username="alice", display_name="Alice")
+    await _make_user(session, username="bob")
+    with pytest.raises(users_service.HandleTaken):
+        await users_service.update_profile(
+            session, alice, handle="bob", display_name="Zed",
+            cooldown_seconds=30 * 24 * 3600)
+    await session.refresh(alice)
+    assert alice.username == "alice"       # handle unchanged
+    assert alice.display_name == "Alice"   # display NOT applied (atomic)
 
 
 @pytest.mark.asyncio

@@ -392,23 +392,37 @@ async def update_profile(
             raise HandleTaken() from e
         raise  # a non-handle constraint is NOT a taken handle — don't mislabel it
     if result.rowcount == 0:
-        # The cooldown predicate rejected the write — the row's handle_changed_at is
-        # set AND newer than cutoff (a NULL stamp would have matched the WHERE, so
-        # rowcount==0 is never the never-changed case). Re-read the CURRENT stamp to
-        # compute retry_after. Capture the id BEFORE rollback — rollback expires every
-        # instance unconditionally, so reading user.id afterwards would trigger a lazy
-        # load outside the async context (MissingGreenlet).
+        # The conditional UPDATE matched no row for one of two reasons: the cooldown
+        # predicate rejected it (handle_changed_at set AND newer than cutoff — a NULL
+        # would have matched the WHERE, so this is never the never-changed case), OR
+        # the row already holds the requested handle (concurrent winner / idempotent
+        # retry). Re-read the current handle + stamp to tell them apart. Capture the
+        # id BEFORE rollback — rollback expires every instance unconditionally, so
+        # reading user.id afterwards would lazy-load outside the async context
+        # (MissingGreenlet).
         uid = user.id
         await session.rollback()
-        last = (await session.execute(
-            select(User.handle_changed_at).where(User.id == uid))).scalar_one_or_none()
-        if last is None:
+        row = (await session.execute(
+            select(User.username, User.handle_changed_at)
+            .where(User.id == uid))).one_or_none()
+        if row is None:
             # The row vanished between the UPDATE and this read — a concurrent
-            # self-account-deletion. Don't scalar_one()-500 (cage-match #118,
-            # Carnot+Tesla); report the full window, non-crashing — the account is
-            # going away regardless.
+            # self-account-deletion. Don't one()-500 (cage-match #118, Carnot+Tesla);
+            # report the full window, non-crashing — the account is going away anyway.
             raise HandleChangeCooldown(cooldown_seconds)
-        if last.tzinfo is None:
+        cur_username, last = row
+        if cur_username == handle:
+            # The row ALREADY holds the requested handle (a concurrent winner set it,
+            # or an idempotent retry). "Set my handle to X" when it is already X is a
+            # no-op success, NOT a cooldown rejection (cage-match #118 r4, Carnot) —
+            # apply any display_name and return rather than a spurious 429.
+            await session.refresh(user)
+            if display_name is not None:
+                user.display_name = display_name
+                await session.commit()
+                await session.refresh(user)
+            return user
+        if last is not None and last.tzinfo is None:
             last = last.replace(tzinfo=dt.timezone.utc)
         # Recompute now AFTER the read: under a concurrent race the request-start `now`
         # can predate the winner's stamp, making elapsed negative and retry_after
