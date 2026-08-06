@@ -2,9 +2,9 @@
 
 Hand-written SQLAlchemy 2.0 ORM (no codegen). This is the persistence half of
 the trust boundary: `messages.sender_user_id` is set server-side from the
-authenticated user (invariant I5), never from client input. Media,
-read_positions, message_edits arrive in later phases (each its own alembic
-revision); reactions (MessageReaction) and devices (DeviceToken) have since landed.
+authenticated user (invariant I5), never from client input. Reactions, media,
+read_positions, devices, message_edits arrive in later phases (each its own
+alembic revision).
 """
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import enum
 
 from sqlalchemy import (
     JSON, BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer,
-    PrimaryKeyConstraint, String, Text, UniqueConstraint,
+    String, Text, UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -486,76 +486,6 @@ class Retraction(Base):
     # (channel_id, id) axis as messages — covered by the composite index above.
     channel_id: Mapped[str] = mapped_column(
         ForeignKey("channels.id"), nullable=False)
-    created_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), default=_utcnow)
-
-
-class MessageReaction(Base):
-    """One user's emoji reaction to one message (#2634, v2 social layer).
-
-    STATE, NOT EVENT — the deliberate contrast with ``Retraction`` (#7). A
-    retraction needs its own forward-ULID row because a takedown mutates a message
-    *below* a client's watermark, and ``get_history`` catch-up (``id > after``) would
-    never replay it. A reaction changes an *aggregate* that ``message_view``
-    recomputes on every history read, so a client that misses the live ``reaction``
-    frame self-heals the moment it re-pages that message — no second event feed, no
-    forward-ULID row, just this table.
-
-    NAMED TRADEOFF (state-not-event, cage-match this): a reaction add/remove on a
-    message a client has ALREADY synced is not force-caught-up — the live ``reaction``
-    frame is best-effort and the ``id > after`` cursor doesn't advance for a reaction
-    (it mints no id on the message axis). It self-heals only when the client re-reads
-    that message ROW — scroll-up ``before`` paging, a cold reload, or a re-bind that
-    re-fetches history. NOT "on reconnect": a client that keeps synced messages
-    resident and only forward-pages from its watermark never re-reads the row, so its
-    aggregate stays frozen until it re-fetches (cage-match Tesla — the app contract
-    must say re-page/cold-reload, not lean on "reconnect"). This is ambient-signal
-    eventual consistency (Slack/Discord reactions behave the same). If perfect offline
-    catch-up is ever wanted, reserve a forward-ULID reaction-event log exactly like
-    ``Retraction`` — an additive change, not a reshape.
-
-    COMPOSITE PK ``(message_id, user_id, emoji)`` makes a repeat-react idempotent —
-    one row per (message, user, emoji), the same one-row-per-relationship shape as
-    ``Membership`` / ``CommunityMembership``. Re-adding the same emoji is a no-op
-    (INSERT-or-ignore in ``reactions_service``); a different emoji from the same user
-    is a NEW row (multi-emoji reactions are allowed). The PK's leading ``message_id``
-    covers the aggregation read (``WHERE message_id IN (...) GROUP BY message_id,
-    emoji``); ``user_id`` is separately indexed for the account-deletion purge and the
-    per-viewer ``reacted_by_me`` probe.
-
-    ``emoji`` is an OPAQUE client string (the gateway never renders it), bounded to 64
-    chars as defense-in-depth — a real emoji, incl. a ZWJ sequence (family, skin-tone,
-    flag) is well under that; the cap just stops an unbounded blob masquerading as an
-    emoji (mirrors the pubkey-length caps elsewhere).
-
-    No ON DELETE CASCADE (codebase convention): account deletion tears these down
-    explicitly via ``reactions_service.purge_user_reactions`` (the cascade guard
-    requires it), and channel hard-delete tears them down before its messages (they
-    FK ``messages.id`` — verify-the-neighbor, like ``MessageReport`` in
-    ``channels_service.hard_delete_channel``).
-
-    Message SOFT-DELETE (takedown, #7) deliberately does NOT purge reactions — the
-    same reason it preserves the message body/row: a soft-delete is REVERSIBLE, so its
-    children are preserved-and-hidden, not destroyed (a reversed takedown restores the
-    reactions with the message). The reactions are inert while hidden — ``get_history``
-    never returns a ``deleted_at`` row, so its reactions never surface in an aggregate,
-    and the visibility gate refuses a NEW reaction on a soft-deleted message. Only the
-    two IRREVERSIBLE deletes (channel hard-delete, account deletion) purge (cage-match
-    round 2, Tesla — the neighbor named so the next reader doesn't re-learn it).
-    """
-    __tablename__ = "message_reactions"
-    __table_args__ = (
-        # The composite PK IS the (message_id, user_id, emoji) uniqueness — declared
-        # here (not column-level) so the ORM metadata matches the hand-written 0018
-        # migration exactly (the parity gate diffs reflected constraints).
-        PrimaryKeyConstraint(
-            "message_id", "user_id", "emoji", name="pk_message_reactions"),
-    )
-    message_id: Mapped[str] = mapped_column(
-        ForeignKey("messages.id"), nullable=False)
-    user_id: Mapped[str] = mapped_column(
-        ForeignKey("users.id"), nullable=False, index=True)
-    emoji: Mapped[str] = mapped_column(String(64), nullable=False)
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow)
 

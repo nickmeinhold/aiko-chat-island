@@ -33,7 +33,6 @@ from __future__ import annotations
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from . import reactions_service
 from .models import Channel, Membership, Message, MessageReport, Retraction
 
 # Pure `channel_list` EC-share parsing (CHANNEL_LIST_KEY, parse_channel_names,
@@ -82,13 +81,10 @@ async def hard_delete_channel(session: AsyncSession, aiko_channel: str) -> bool:
     #   * Retractions (#7) FK both messages AND the channel.
     #   * MessageReports FK messages.id (cage-match Wu — the child the cascade missed;
     #     a report about a purged message in a purged channel has no referent left).
-    #   * MessageReactions (#2634) FK messages.id — same verify-the-neighbor: a
-    #     reaction on a purged message has no referent left, so it goes before them.
     channel_msg_ids = select(Message.id).where(Message.channel_id == channel.id)
     await session.execute(delete(Retraction).where(Retraction.channel_id == channel.id))
     await session.execute(
         delete(MessageReport).where(MessageReport.message_id.in_(channel_msg_ids)))
-    await reactions_service.purge_reactions_for_messages(session, channel_msg_ids)
     await session.execute(delete(Message).where(Message.channel_id == channel.id))
     await session.execute(delete(Channel).where(Channel.id == channel.id))
     await session.flush()  # caller owns commit (see module docstring)
