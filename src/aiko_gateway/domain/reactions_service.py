@@ -75,7 +75,10 @@ class ReactionLimitExceeded(Exception):
     The cap is a SPRAY BOUND, not a hard quota (cage-match Tesla): the check-then-insert
     is race-tolerant, so concurrent distinct adds can overshoot by a few. That is fine —
     it bounds a single-actor amplifier, it is NOT a correctness invariant, so do not
-    later "enforce exactly N" with a serialized counter / DB constraint at this layer."""
+    later "enforce exactly N" with a serialized counter / DB constraint at this layer.
+    The TEMPORAL fuse (rounds of add/remove toggling, concurrent-overshoot rate) is the
+    per-IP ``rate_limit("reactions")`` on the routes, not this distinct-count cap — the
+    two bound different axes (breadth vs rate; cage-match round 4 Carnot/Tesla)."""
 
 
 def validate_emoji(emoji: object) -> str:

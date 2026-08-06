@@ -2,9 +2,9 @@
 
 Hand-written SQLAlchemy 2.0 ORM (no codegen). This is the persistence half of
 the trust boundary: `messages.sender_user_id` is set server-side from the
-authenticated user (invariant I5), never from client input. Reactions, media,
-read_positions, devices, message_edits arrive in later phases (each its own
-alembic revision).
+authenticated user (invariant I5), never from client input. Media,
+read_positions, message_edits arrive in later phases (each its own alembic
+revision); reactions (MessageReaction) and devices (DeviceToken) have since landed.
 """
 from __future__ import annotations
 

@@ -30,6 +30,7 @@ import pytest_asyncio
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
+from aiko_gateway.config import settings
 from aiko_gateway.domain import (
     accounts_service, messages_service, moderation_service, reactions_service,
     security, users_service)
@@ -513,7 +514,10 @@ async def test_post_slash_emoji_422(app_ctx, session):
     assert resp.status_code == 422
 
 
-async def test_post_over_cap_429(app_ctx, session):
+async def test_post_over_cap_429(app_ctx, session, monkeypatch):
+    # Disable the per-IP rate limit so this test isolates the CAP-429 — the cap (20) and
+    # the rate limit (20/window) both trip on the 21st request otherwise, masking which.
+    monkeypatch.setattr(settings, "rate_limit_enabled", False)
     client, _ = app_ctx
     author = await _user(session, "author")
     reactor = await _user(session, "reactor")
@@ -527,6 +531,26 @@ async def test_post_over_cap_429(app_ctx, session):
     resp = await client.post(f"/v1/messages/{msg.id}/reactions",
                              json={"emoji": "over"}, headers=_auth(reactor))
     assert resp.status_code == 429
+
+
+async def test_reaction_rate_limit_bounds_toggle_thrash(app_ctx, session):
+    """The per-IP rate limit fuses toggle-thrash: re-posting the SAME emoji (never
+    hitting the distinct-emoji cap) still 429s once the window budget is spent — the
+    temporal bound the distinct-count cap can't provide (cage-match round 4)."""
+    client, _ = app_ctx
+    author = await _user(session, "author")
+    reactor = await _user(session, "reactor")
+    ch = await _channel(session)
+    msg = await _msg(session, mid=1, channel=ch, sender=author)
+    limit = settings.auth_rate_limit
+    saw_429 = False
+    for _ in range(limit + 2):
+        r = await client.post(f"/v1/messages/{msg.id}/reactions",
+                              json={"emoji": THUMB}, headers=_auth(reactor))
+        if r.status_code == 429:
+            saw_429 = True
+            break
+    assert saw_429  # a single actor cannot toggle unboundedly
 
 
 async def test_fanout_excludes_message_author_block_pairs(app_ctx, session):
@@ -618,12 +642,41 @@ async def test_remove_own_reaction_on_soft_deleted_message_succeeds(app_ctx, ses
     resp = await client.delete(
         f"/v1/messages/{msg.id}/reactions/{THUMB}", headers=_auth(reactor))
     assert resp.status_code == 200          # own row removed despite invisibility
-    assert resp.json()["count"] == 0
+    # count is NULL, not the live tally — no post-revocation count oracle for a message
+    # the caller can no longer see (cage-match round 4).
+    assert resp.json()["count"] is None
     # No live frame for a hidden message.
     assert [f for f in watcher.sent if f.get("type") == "reaction"] == []
-    # The row is actually gone.
+    # The row is actually gone (the mutation succeeded).
     assert await session.get(
         MessageReaction, (msg.id, reactor.id, THUMB)) is None
+
+
+async def test_remove_own_reaction_after_blocking_author_no_count_leak(app_ctx, session):
+    """Owned-remove after LOSING visibility via a block returns count=null and fires no
+    frame — the mutation succeeds (scar avoided) but the caller doesn't harvest the
+    current count of a message now hidden from them (cage-match round 4, the seam my
+    round-3 fix moved)."""
+    client, hub = app_ctx
+    author = await _user(session, "author")
+    reactor = await _user(session, "reactor")
+    ch = await _channel(session)
+    msg = await _msg(session, mid=1, channel=ch, sender=author)
+    # reactor reacts while it can see the message...
+    await reactions_service.add_reaction(
+        session, user_id=reactor.id, message_id=msg.id, emoji=THUMB)
+    # ...then blocks the author → the message (and its live count) is now hidden.
+    await moderation_service.block_user(session, reactor.id, author.id)
+    watcher = _RecordingConn(author.id)
+    watcher.subscribed.add(ch.id)
+    hub.register(watcher)
+
+    resp = await client.delete(
+        f"/v1/messages/{msg.id}/reactions/{THUMB}", headers=_auth(reactor))
+    assert resp.status_code == 200
+    assert resp.json()["count"] is None
+    assert [f for f in watcher.sent if f.get("type") == "reaction"] == []
+    assert await session.get(MessageReaction, (msg.id, reactor.id, THUMB)) is None
 
 
 async def test_remove_without_row_on_hidden_message_404(app_ctx, session):

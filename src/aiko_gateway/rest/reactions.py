@@ -35,6 +35,7 @@ from pydantic import BaseModel
 
 from ..domain import acl, messages_service, moderation_service, reactions_service
 from ..domain.models import Message
+from ..domain.rate_limit import rate_limit
 from ..realtime import envelopes
 from ..realtime.envelopes import ReactionAction
 from .deps import CurrentUser, DbSession
@@ -46,21 +47,32 @@ class ReactionBody(BaseModel):
     emoji: str
 
 
-async def _visible_message(session, viewer_id: str, message_id: str) -> Message:
-    """Resolve a message the viewer is allowed to react to, or raise 404. Same
-    visibility predicate as the history read (soft-delete + channel ACL + block),
-    collapsed into one existence-hiding 404."""
+async def _resolve_visible_message(
+    session, viewer_id: str, message_id: str,
+) -> Message | None:
+    """Return the message IFF the viewer may currently see it (exists, not
+    soft-deleted, channel readable, author not blocked) — else None. The single
+    visibility predicate, mirroring the history read; callers choose whether a miss
+    is a 404 (``_visible_message``) or a silent count/fanout suppression (remove)."""
     msg = await messages_service.get_message(session, message_id)
     if msg is None or msg.deleted_at is not None:
-        raise HTTPException(404, "message not found")
+        return None
     if await acl.readable_channel(session, viewer_id, msg.channel_id) is None:
-        raise HTTPException(404, "message not found")
-    # A blocked author's message is hidden from the viewer in the block relationship
-    # (same content filter as get_history) — so it is un-reactable, same 404.
+        return None
     if msg.sender_user_id is not None:
         blocked = await moderation_service.blocked_pair_user_ids(session, viewer_id)
         if msg.sender_user_id in blocked:
-            raise HTTPException(404, "message not found")
+            return None
+    return msg
+
+
+async def _visible_message(session, viewer_id: str, message_id: str) -> Message:
+    """Resolve a message the viewer may see, or raise the existence-hiding 404 (a
+    missing / soft-deleted / unreadable / blocked-author message all 404 identically,
+    so the boundary never confirms a message the viewer isn't allowed to see)."""
+    msg = await _resolve_visible_message(session, viewer_id, message_id)
+    if msg is None:
+        raise HTTPException(404, "message not found")
     return msg
 
 
@@ -87,7 +99,8 @@ async def _fanout(
         exclude_user_ids=exclude)
 
 
-@router.post("/messages/{message_id}/reactions")
+@router.post("/messages/{message_id}/reactions",
+             dependencies=[rate_limit("reactions")])
 async def add_reaction(
     message_id: str, body: ReactionBody, user: CurrentUser, session: DbSession,
     request: Request,
@@ -120,7 +133,8 @@ async def add_reaction(
             "reacted_by_me": True}
 
 
-@router.delete("/messages/{message_id}/reactions/{emoji}")
+@router.delete("/messages/{message_id}/reactions/{emoji}",
+               dependencies=[rate_limit("reactions")])
 async def remove_reaction(
     message_id: str, emoji: str, user: CurrentUser, session: DbSession,
     request: Request,
@@ -128,16 +142,18 @@ async def remove_reaction(
     """Remove the caller's ``emoji`` reaction from a message (idempotent). 422 if the
     emoji is malformed (checked before anything).
 
-    REMOVE IS GATED ON OWNERSHIP, NOT VISIBILITY (cage-match round 3, Tesla — the
-    resonant catch). Un-reacting your OWN row is a strictly-reducing, self-owned action,
-    so it must stay possible even after you lose sight of the message (a takedown, or a
-    private-channel kick) — otherwise your reaction is an un-deletable scar. So: if the
-    delete actually removed YOUR row (``changed``), it is always allowed; the frame
-    fans out only when the message is still live (a hidden message needs no live delta).
-    If NO row was removed (nothing was yours to delete), we fall back to the SAME
-    existence-hiding visibility gate ``add`` uses — so a caller with no row can't use
-    DELETE to probe a message they can't see (a 404, and the global ``count`` never
-    leaks for a message they neither authored a reaction on nor may read)."""
+    The MUTATION is gated on OWNERSHIP, the RESPONSE + FANOUT on current VISIBILITY
+    (cage-match rounds 3-4, Tesla + Carnot). Un-reacting your OWN row is a
+    strictly-reducing self-owned action, so it must stay possible even after you lose
+    sight of the message (takedown, private-channel kick, a new block) — otherwise your
+    reaction is an un-deletable scar. BUT the response must not become a post-revocation
+    count oracle: a caller who removed a row while no longer able to see the message
+    gets a MINIMAL body (``count: null``) and NO fanout — the row is gone, but the live
+    aggregate for a channel they've lost is not handed back, and no identity frame is
+    emitted into a channel they've left. If they CAN still see it (the common case),
+    the real count + a live frame flow. If NO row was removed, fall back to the same
+    existence-hiding 404 ``add`` uses, so a caller with no row can't probe a message
+    they can't see."""
     try:
         emoji = reactions_service.validate_emoji(emoji)
     except reactions_service.InvalidEmoji as exc:
@@ -145,20 +161,21 @@ async def remove_reaction(
     count, changed = await reactions_service.remove_reaction(
         session, user_id=user.id, message_id=message_id, emoji=emoji)
     if changed:
-        # Owned a row → always allowed. Resolve the message UNFILTERED only to fan out
-        # a live delta, and only if it's still visible-ish (exists + not soft-deleted);
-        # a hidden message has no live audience to update.
-        msg = await messages_service.get_message(session, message_id)
-        if msg is not None and msg.deleted_at is None:
+        # Owned a row → the mutation is always allowed. Gate the count + fanout on
+        # whether the caller can STILL see the message: if not, the row is gone but we
+        # return no fresh count (null) and emit no frame — no post-revocation oracle.
+        visible = await _resolve_visible_message(session, user.id, message_id)
+        if visible is not None:
             await _fanout(
-                request, session, channel_id=msg.channel_id, msg_id=message_id,
+                request, session, channel_id=visible.channel_id, msg_id=message_id,
                 emoji=emoji, action=ReactionAction.REMOVE, actor_id=user.id,
-                author_id=msg.sender_user_id, count=count)
-        return {"msg_id": message_id, "emoji": emoji, "count": count,
+                author_id=visible.sender_user_id, count=count)
+            return {"msg_id": message_id, "emoji": emoji, "count": count,
+                    "reacted_by_me": False}
+        return {"msg_id": message_id, "emoji": emoji, "count": None,
                 "reacted_by_me": False}
     # No row removed → enforce the visibility gate so a prober can't tell "no reaction
-    # here" from "message I can't see" (both 404 when not visible), and the count for a
-    # message the caller can't see never leaks.
+    # here" from "message I can't see" (both 404 when not visible).
     await _visible_message(session, user.id, message_id)
     return {"msg_id": message_id, "emoji": emoji, "count": count,
             "reacted_by_me": False}
