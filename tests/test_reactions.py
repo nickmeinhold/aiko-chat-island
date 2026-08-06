@@ -86,12 +86,12 @@ async def test_add_is_idempotent(session):
     ch = await _channel(session)
     msg = await _msg(session, mid=1, channel=ch, sender=author)
 
-    c1 = await reactions_service.add_reaction(
+    c1, changed1 = await reactions_service.add_reaction(
         session, user_id=reactor.id, message_id=msg.id, emoji=THUMB)
-    c2 = await reactions_service.add_reaction(
+    c2, changed2 = await reactions_service.add_reaction(
         session, user_id=reactor.id, message_id=msg.id, emoji=THUMB)
-    assert c1 == 1
-    assert c2 == 1  # re-add is a no-op, not a second row
+    assert (c1, changed1) == (1, True)
+    assert (c2, changed2) == (1, False)  # re-add is a no-op, not a second row
 
 
 async def test_distinct_emoji_are_distinct_rows(session):
@@ -102,9 +102,9 @@ async def test_distinct_emoji_are_distinct_rows(session):
 
     await reactions_service.add_reaction(
         session, user_id=reactor.id, message_id=msg.id, emoji=THUMB)
-    heart = await reactions_service.add_reaction(
+    heart, changed = await reactions_service.add_reaction(
         session, user_id=reactor.id, message_id=msg.id, emoji=HEART)
-    assert heart == 1  # a different emoji from the same user is its own reaction
+    assert (heart, changed) == (1, True)  # a different emoji is its own reaction
 
 
 async def test_two_users_same_emoji_counts_two(session):
@@ -116,9 +116,9 @@ async def test_two_users_same_emoji_counts_two(session):
 
     await reactions_service.add_reaction(
         session, user_id=a.id, message_id=msg.id, emoji=THUMB)
-    count = await reactions_service.add_reaction(
+    count, changed = await reactions_service.add_reaction(
         session, user_id=b.id, message_id=msg.id, emoji=THUMB)
-    assert count == 2
+    assert (count, changed) == (2, True)
 
 
 async def test_remove_is_idempotent(session):
@@ -129,12 +129,12 @@ async def test_remove_is_idempotent(session):
 
     await reactions_service.add_reaction(
         session, user_id=reactor.id, message_id=msg.id, emoji=THUMB)
-    c1 = await reactions_service.remove_reaction(
+    c1, changed1 = await reactions_service.remove_reaction(
         session, user_id=reactor.id, message_id=msg.id, emoji=THUMB)
-    c2 = await reactions_service.remove_reaction(
+    c2, changed2 = await reactions_service.remove_reaction(
         session, user_id=reactor.id, message_id=msg.id, emoji=THUMB)
-    assert c1 == 0
-    assert c2 == 0  # removing an absent reaction is not an error
+    assert (c1, changed1) == (0, True)
+    assert (c2, changed2) == (0, False)  # removing an absent reaction is a no-op
 
 
 async def test_aggregate_is_viewer_dependent_and_ordered(session):
@@ -179,7 +179,16 @@ async def test_aggregate_empty_ids_short_circuits(session):
     assert await reactions_service.aggregate_for_messages(session, [], "whoever") == {}
 
 
-@pytest.mark.parametrize("bad", ["", "   ", "x" * 65])
+@pytest.mark.parametrize("bad", [
+    "",                # empty
+    "   ",             # blank
+    "x" * 65,          # over length cap
+    " \U0001f44d",     # leading whitespace (lookalike of the stripped form)
+    "\U0001f44d ",     # trailing whitespace
+    "a/b",             # path separator — un-deletable via /reactions/{emoji}
+    "a\tb",            # control char (tab)
+    "a\x00b",          # NUL
+])
 async def test_validate_emoji_rejects(bad):
     with pytest.raises(reactions_service.InvalidEmoji):
         reactions_service.validate_emoji(bad)
@@ -188,6 +197,63 @@ async def test_validate_emoji_rejects(bad):
 async def test_validate_emoji_accepts_zwj_sequence():
     family = "\U0001f468‍\U0001f469‍\U0001f467"  # 👨‍👩‍👧
     assert reactions_service.validate_emoji(family) == family
+
+
+async def test_add_reaction_validates_at_the_door(session):
+    """The door validates even when the route didn't — an in-process caller can't
+    write a malformed emoji straight to the PK (cage-match Tesla: one door with a
+    real latch)."""
+    author = await _user(session, "author")
+    reactor = await _user(session, "reactor")
+    ch = await _channel(session)
+    msg = await _msg(session, mid=1, channel=ch, sender=author)
+    with pytest.raises(reactions_service.InvalidEmoji):
+        await reactions_service.add_reaction(
+            session, user_id=reactor.id, message_id=msg.id, emoji="a/b")
+
+
+async def test_per_message_reaction_cap(session):
+    """A user cannot spray more than MAX distinct emojis on one message (single-actor
+    payload/DoS bound), but may still re-toggle emojis already placed."""
+    author = await _user(session, "author")
+    reactor = await _user(session, "reactor")
+    ch = await _channel(session)
+    msg = await _msg(session, mid=1, channel=ch, sender=author)
+    cap = reactions_service.MAX_REACTIONS_PER_USER_PER_MESSAGE
+    for i in range(cap):
+        await reactions_service.add_reaction(
+            session, user_id=reactor.id, message_id=msg.id, emoji=f"e{i}")
+    # A NEW distinct emoji beyond the cap is refused...
+    with pytest.raises(reactions_service.ReactionLimitExceeded):
+        await reactions_service.add_reaction(
+            session, user_id=reactor.id, message_id=msg.id, emoji="over")
+    # ...but re-adding one already placed is still a no-op success, not a limit error.
+    count, changed = await reactions_service.add_reaction(
+        session, user_id=reactor.id, message_id=msg.id, emoji="e0")
+    assert (count, changed) == (1, False)
+
+
+async def test_aggregate_excludes_blocked_reactor(session):
+    """A reaction authored by a user the viewer has blocked is hidden from the
+    viewer's aggregate — the same content-filter a blocked author's messages get (#7),
+    applied to reactions so read + live fanout share ONE block predicate."""
+    author = await _user(session, "author")
+    me = await _user(session, "me")
+    troll = await _user(session, "troll")
+    ch = await _channel(session)
+    msg = await _msg(session, mid=1, channel=ch, sender=author)
+    await reactions_service.add_reaction(
+        session, user_id=me.id, message_id=msg.id, emoji=THUMB)
+    await reactions_service.add_reaction(
+        session, user_id=troll.id, message_id=msg.id, emoji=THUMB)
+    # Unblocked: me sees count 2.
+    agg = await reactions_service.aggregate_for_messages(session, [msg.id], me.id)
+    assert agg[msg.id][0]["count"] == 2
+
+    # me blocks troll → troll's reaction vanishes from me's aggregate (count 1).
+    await moderation_service.block_user(session, me.id, troll.id)
+    agg2 = await reactions_service.aggregate_for_messages(session, [msg.id], me.id)
+    assert agg2[msg.id] == [{"emoji": THUMB, "count": 1, "reacted_by_me": True}]
 
 
 async def test_message_view_defaults_reactions_empty(session):
@@ -394,6 +460,94 @@ async def test_fanout_excludes_reactor_block_pairs(app_ctx, session):
                              json={"emoji": THUMB}, headers=_auth(reactor))
     assert resp.status_code == 200
     # author (blocked by reactor) must NOT see the reactor's reaction frame.
+    assert [f for f in watcher.sent if f.get("type") == "reaction"] == []
+
+
+async def test_repost_same_emoji_fires_no_second_frame(app_ctx, session):
+    """A re-POST of an emoji the user already placed is a no-op (changed=False) and
+    must NOT rebroadcast — no free WS chatter (cage-match Tesla)."""
+    client, hub = app_ctx
+    author = await _user(session, "author")
+    reactor = await _user(session, "reactor")
+    ch = await _channel(session)
+    msg = await _msg(session, mid=1, channel=ch, sender=author)
+    watcher = _RecordingConn(author.id)
+    watcher.subscribed.add(ch.id)
+    hub.register(watcher)
+
+    await client.post(f"/v1/messages/{msg.id}/reactions",
+                      json={"emoji": THUMB}, headers=_auth(reactor))
+    await client.post(f"/v1/messages/{msg.id}/reactions",
+                      json={"emoji": THUMB}, headers=_auth(reactor))
+    # Exactly ONE reaction frame for two POSTs — the second was a no-op.
+    assert len([f for f in watcher.sent if f.get("type") == "reaction"]) == 1
+
+
+async def test_delete_absent_reaction_fires_no_frame(app_ctx, session):
+    client, hub = app_ctx
+    author = await _user(session, "author")
+    reactor = await _user(session, "reactor")
+    ch = await _channel(session)
+    msg = await _msg(session, mid=1, channel=ch, sender=author)
+    watcher = _RecordingConn(author.id)
+    watcher.subscribed.add(ch.id)
+    hub.register(watcher)
+
+    resp = await client.delete(
+        f"/v1/messages/{msg.id}/reactions/{THUMB}", headers=_auth(reactor))
+    assert resp.status_code == 200  # idempotent
+    assert [f for f in watcher.sent if f.get("type") == "reaction"] == []
+
+
+async def test_post_slash_emoji_422(app_ctx, session):
+    """An emoji with a '/' is rejected — it would be un-removable via the DELETE path
+    segment (cage-match Carnot)."""
+    client, _ = app_ctx
+    author = await _user(session, "author")
+    reactor = await _user(session, "reactor")
+    ch = await _channel(session)
+    msg = await _msg(session, mid=1, channel=ch, sender=author)
+    resp = await client.post(f"/v1/messages/{msg.id}/reactions",
+                             json={"emoji": "a/b"}, headers=_auth(reactor))
+    assert resp.status_code == 422
+
+
+async def test_post_over_cap_429(app_ctx, session):
+    client, _ = app_ctx
+    author = await _user(session, "author")
+    reactor = await _user(session, "reactor")
+    ch = await _channel(session)
+    msg = await _msg(session, mid=1, channel=ch, sender=author)
+    cap = reactions_service.MAX_REACTIONS_PER_USER_PER_MESSAGE
+    for i in range(cap):
+        r = await client.post(f"/v1/messages/{msg.id}/reactions",
+                              json={"emoji": f"e{i}"}, headers=_auth(reactor))
+        assert r.status_code == 200
+    resp = await client.post(f"/v1/messages/{msg.id}/reactions",
+                             json={"emoji": "over"}, headers=_auth(reactor))
+    assert resp.status_code == 429
+
+
+async def test_fanout_excludes_message_author_block_pairs(app_ctx, session):
+    """A subscriber who blocked the MESSAGE AUTHOR (but not the reactor) must NOT
+    receive the reaction frame — they can't see the message, so the live path must
+    hide its reactions too (the fanout twin of aggregate's block filter)."""
+    client, hub = app_ctx
+    author = await _user(session, "author")
+    reactor = await _user(session, "reactor")
+    ch = await _channel(session)
+    msg = await _msg(session, mid=1, channel=ch, sender=author)
+    # watcher blocked the author → can't see the message → must not see its reactions.
+    # (reactor is in NO block relationship, so it can still see + react to the message.)
+    blocker = await _user(session, "blocker")
+    await moderation_service.block_user(session, blocker.id, author.id)
+    watcher = _RecordingConn(blocker.id)
+    watcher.subscribed.add(ch.id)
+    hub.register(watcher)
+
+    resp = await client.post(f"/v1/messages/{msg.id}/reactions",
+                             json={"emoji": THUMB}, headers=_auth(reactor))
+    assert resp.status_code == 200
     assert [f for f in watcher.sent if f.get("type") == "reaction"] == []
 
 

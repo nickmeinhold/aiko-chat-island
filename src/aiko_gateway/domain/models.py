@@ -502,12 +502,15 @@ class MessageReaction(Base):
     forward-ULID row, just this table.
 
     NAMED TRADEOFF (state-not-event, cage-match this): a reaction add/remove on a
-    message a client has ALREADY synced is not force-caught-up on reconnect — the
-    live ``reaction`` frame is best-effort and the ``id > after`` cursor doesn't
-    advance for a reaction (it mints no id on the message axis). It self-heals only
-    when the client re-reads that message's history (scroll-up ``before`` paging
-    re-reads the row and its aggregate fresh). This is ambient-signal eventual
-    consistency (Slack/Discord reactions behave the same). If perfect offline
+    message a client has ALREADY synced is not force-caught-up — the live ``reaction``
+    frame is best-effort and the ``id > after`` cursor doesn't advance for a reaction
+    (it mints no id on the message axis). It self-heals only when the client re-reads
+    that message ROW — scroll-up ``before`` paging, a cold reload, or a re-bind that
+    re-fetches history. NOT "on reconnect": a client that keeps synced messages
+    resident and only forward-pages from its watermark never re-reads the row, so its
+    aggregate stays frozen until it re-fetches (cage-match Tesla — the app contract
+    must say re-page/cold-reload, not lean on "reconnect"). This is ambient-signal
+    eventual consistency (Slack/Discord reactions behave the same). If perfect offline
     catch-up is ever wanted, reserve a forward-ULID reaction-event log exactly like
     ``Retraction`` — an additive change, not a reshape.
 

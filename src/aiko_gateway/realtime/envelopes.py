@@ -7,7 +7,20 @@ change touches `aiko/payload.py`, never this file — the /v1 contract is frozen
 """
 from __future__ import annotations
 
+import enum
 from typing import Any
+
+
+class ReactionAction(enum.StrEnum):
+    """Closed set of reaction-frame actions (#2634). StrEnum (3.12) so the member's
+    value IS the wire string — the same closed-set-as-StrEnum idiom the persistence
+    layer uses for Role/Platform/etc. Typing the ``reaction_frame`` action against
+    this stops a stray ``"added"`` from fanning out with no type rail (cage-match
+    Tesla). Not persisted (reactions are STATE rows, the action is a live delta), so
+    it lives here at the wire layer, not in models.py with the DB-CHECK enums."""
+
+    ADD = "add"
+    REMOVE = "remove"
 
 
 # -- server -> client builders ----------------------------------------------
@@ -33,11 +46,13 @@ def retraction_frame(channel_id: str, retraction_id: str, target_msg_id: str) ->
 
 
 def reaction_frame(
-    channel_id: str, msg_id: str, emoji: str, action: str, user_id: str, count: int,
+    channel_id: str, msg_id: str, emoji: str, action: ReactionAction,
+    user_id: str, count: int,
 ) -> dict:
     """Server->client discrete reaction event (#2634): tells a live subscriber that
     ``user_id`` added/removed ``emoji`` on ``msg_id``, with the resulting server-truth
-    ``count`` for that emoji. ``action`` is ``"add"`` | ``"remove"``.
+    ``count`` for that emoji. ``action`` is a ``ReactionAction`` (its value — ``"add"``
+    | ``"remove"`` — rides the wire).
 
     Discrete on PURPOSE — NOT a re-serialised message. A reaction is STATE the
     history read recomputes (state-not-event, see the MessageReaction model), so a
