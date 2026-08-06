@@ -139,7 +139,7 @@ GET /v1/messages/{msg_id}   → 200 MessageView  |  404 if not visible to you
   quote can render "message removed".
 - Returns the same `MessageView` as history/WS (single serializer), so no new shape.
 
-## #2634 — emoji reactions wire **[shape final]**
+## #2634 — emoji reactions wire **[shape final + signing decided]**
 
 Island half only — the composer emoji *picker* is app-side. This is the reactions wire.
 
@@ -175,7 +175,7 @@ whether a `?reactors=1` expansion is added; assume absent for now.
 `ack`/`message`/`suback`/`retraction`/`error`:
 
 ```json
-{ "type": "reaction", "channel_id": "<cid>", "msg_id": "<mid>", "emoji": "👍", "user_id": "<reactor_key>", "action": "add" }
+{ "type": "reaction", "channel_id": "<cid>", "msg_id": "<mid>", "emoji": "👍", "user_id": "<reactor_key>", "action": "add", "origin": { ... } }
 ```
 
 `action` is `"add"` or `"remove"`. Apply it as a delta to that message's aggregate;
@@ -183,6 +183,34 @@ compute your own `reacted_by_me` by comparing `user_id` to yourself. This mirror
 discrete `retraction` frame rather than re-broadcasting the whole message (lighter, and
 it's the established pattern). Unknown-frame safe-degrade means you can ship optimistic
 toggle before consuming the frame.
+
+### Reactions are SIGNED from day one (decided 2026-08-06, Nick + app tab)
+
+A reaction is a **signed lightweight endorsement**, not throwaway UI sugar — the raw
+material the Carried Record (#2506) judgment-half can later ingest. Because you can't
+sign history retroactively, the signature is captured **from the first #2634 reaction**,
+not bolted on later. This is a wire/model decision; the UI can stay count-only.
+
+- **Envelope:** the reaction carries the SAME `origin` shape as a signed message
+  (#1816) — `{v, alg, key_version, sender_pubkey, client_msg_id, signed_at_ms, sig}`.
+  The gateway **carries it, does not verify** (identical to messages: validate shape +
+  bind `origin.client_msg_id` == the frame's `client_msg_id`, persist, echo verbatim;
+  absent/garbage = "unverified", never "invalid").
+- **Distinct domain tag (security-critical):** reactions sign under
+  `aikochat:react:v1:EdDSA`, NOT the message tag `aikochat:msg:v1:EdDSA`. Different
+  domain separation so a message signature can never be lifted and re-presented as a
+  reaction endorsement (cross-event replay), or vice versa.
+- **Canonical signed bytes** (mirror the message SIGNING-SPEC's length-prefixed layout):
+  `DOMAIN_TAG ‖ len(channel_id) ‖ len(target_msg_id) ‖ len(emoji) ‖ len(action) ‖ sender_pubkey(32 raw) ‖ client_msg_id ‖ signed_at_ms(u64)`.
+  `action` is signed too, so a `remove` (un-vouch) is its own non-repudiable event.
+- **Spec + golden vector:** co-authored `docs/crucible/sovereign-reaction-signing/
+  SIGNING-SPEC.md` (app-side, like the message spec), pinned by a golden vector; the
+  gateway ships a `reaction_signing_bytes()` reconstruction exercised by that vector so
+  the two signers can't drift.
+- **Reputation caveat:** like messages, a shape-valid signature attests "*some* key
+  signed these bytes", NOT "*this account's* key" — the pubkey→account binding is #1816
+  PR B (`signing_keys`), not yet landed. Signing now captures the bytes so they become
+  reputation-grade retroactively when that trust root lands.
 
 ---
 
@@ -294,8 +322,10 @@ every channel, so this is a real island change) and is not discoverable by anyon
 2. **#2633 unread** — not available island-side (no read-position store). Client-side
    for now, or scope a new island task?
 3. **#2633 self-DM** — allow (notes-to-self) or `400`?
-4. **#2634 `reactors` list** — needed for the aggregate, or is `count` + `reacted_by_me`
-   enough? Assuming enough (absent) unless you say otherwise.
+4. **#2634 `reactors` list** — RESOLVED (app tab): `count` + `reacted_by_me` is enough
+   for the UI; `?reactors=1` deferred (additive). Separately RESOLVED: reactions are
+   **signed from day one** (see the signing subsection above) — that was the
+   irreversible half hiding under this item.
 5. **#2632 directory result cap** — 20 assumed.
 
 Reply in-repo (a `HANDOFF-from-app-tab-*.md`) or in the tracker on #2631–2634.
