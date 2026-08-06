@@ -1,10 +1,12 @@
 """User creation + authentication."""
 from __future__ import annotations
 
+import datetime as dt
+import math
 import re
 import secrets
 
-from sqlalchemy import select
+from sqlalchemy import or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -268,3 +270,179 @@ async def link_passkey_credential(
     where a handle conflict with their OWN account orphaned the device credential."""
     session.add(_passkey_credential_row(user_id, material))
     await session.commit()
+
+
+class HandleTaken(Exception):
+    """The requested handle is already in use by another account (username or its
+    derived aiko_username UNIQUE constraint). The caller maps this to 409. Classified
+    from the IntegrityError rather than a pre-SELECT so a concurrent same-handle
+    winner can't slip through a TOCTOU gap — the UNIQUE constraint is the arbiter,
+    mirroring create_passkey_account's handling."""
+
+
+class HandleChangeCooldown(Exception):
+    """A handle change was refused because the previous change was within the
+    cooldown window (settings.handle_change_cooldown_seconds). Carries retry_after
+    (whole seconds until the window lifts) which the caller surfaces as 429 +
+    Retry-After. display_name-only edits and no-op same-handle writes never raise
+    this — only an ACTUAL handle change starts/consults the cooldown."""
+
+    def __init__(self, retry_after: int) -> None:
+        super().__init__("handle change on cooldown")
+        self.retry_after = retry_after
+
+
+async def update_profile(
+    session: AsyncSession, user: User, *,
+    handle: str | None = None, display_name: str | None = None,
+    cooldown_seconds: int, now: dt.datetime | None = None,
+) -> User:
+    """THE single mutate door for a user's own profile (PATCH /v1/me, #2631).
+
+    Route, in-process, and test paths all pass through here so the identity
+    invariants live in ONE place (the project's "seal the mutator, not the caller"
+    rule). Identity is the KEY (user.id) — this only ever rewrites the mutable
+    labels (username/aiko_username/display_name), never the id, so no @-mention or
+    DM bound to the key is ever orphaned.
+
+    Rules:
+      * At least one of handle/display_name must be provided (the caller 400s on
+        neither; asserted here as the single door's own guard).
+      * handle: applied ONLY when it differs from the current handle (`username`,
+        the user-VISIBLE handle — the label @-mentions/DMs render; a change that
+        merely re-sanitizes to the same wire `aiko_username`, e.g. "a b"->"a_b",
+        still changes the visible handle, so it legitimately consumes the cooldown).
+        A change is refused with HandleChangeCooldown while within cooldown_seconds
+        of the last change; on success username + aiko_username are rewritten
+        together and handle_changed_at is stamped. A UNIQUE clash → HandleTaken.
+      * display_name: applied whenever provided; never rate-limited on its OWN. In a
+        COMBINED body {handle, display_name} the whole update is ATOMIC — if the
+        handle change is refused (cooldown/taken) the display_name is NOT applied
+        either (the folded UPDATE below is all-or-nothing). A display_name-only
+        request is never gated.
+
+    Cooldown folded INTO the write (cage-match PR#118, Carnot+Tesla+Wu): the handle
+    change is a single conditional UPDATE whose WHERE carries the cooldown predicate,
+    so a concurrent double-change can't both pass a stale in-memory read of
+    handle_changed_at (the observe-then-write TOCTOU the project forbids —
+    concept_visibility_gate_atomic_with_write). rowcount==0 ⇒ the predicate rejected
+    the write; the row always exists (it is the authed user), so that is
+    unambiguously the cooldown, not a missing row (the SQLite rowcount==0 ambiguity
+    doesn't arise here)."""
+    if handle is None and display_name is None:
+        raise ValueError("update_profile requires handle and/or display_name")
+    now = now or dt.datetime.now(dt.timezone.utc)
+
+    if handle is not None and handle == user.username:
+        # The in-memory username can be a STALE snapshot — a concurrent self-change
+        # may have moved the DB handle after CurrentUser loaded. Confirm the no-op
+        # against the DB (one altitude of truth) so a stale read can't route a REAL
+        # handle change down the no-op path and silently drop it while a combined
+        # display_name still commits — the partial-apply the atomic-combined contract
+        # forbids (cage-match #118, Carnot+Tesla). A DB-confirmed no-op drops to the
+        # cheap display-only path; a mismatch falls through to the atomic change path,
+        # where the cooldown/UNIQUE arbitrate it correctly.
+        db_username = (await session.execute(
+            select(User.username).where(User.id == user.id))).scalar_one_or_none()
+        if db_username == handle:
+            handle = None  # genuine no-op — does NOT stamp handle_changed_at
+
+    if handle is None:
+        # display_name-only, or a DB-confirmed same-handle no-op: no cooldown, no
+        # atomic gate (a no-op never stamps handle_changed_at, so the form-resubmit
+        # lockout footgun stays closed).
+        if display_name is not None:
+            user.display_name = display_name
+        await session.commit()
+        # Symmetric with the handle path's post-commit refresh. Not strictly required
+        # today (SessionLocal is expire_on_commit=False — db.py:79), but making BOTH
+        # success paths end the same way removes the asymmetry cross-family reviewers
+        # read as a MissingGreenlet risk, and stays correct if that ever flips.
+        await session.refresh(user)
+        return user
+
+    # Handle CHANGE — fold the cooldown predicate into the write.
+    cutoff = now - dt.timedelta(seconds=cooldown_seconds)
+    values: dict = {
+        "username": handle,
+        "aiko_username": _sanitize_aiko_username(handle),
+        "handle_changed_at": now,
+    }
+    if display_name is not None:  # atomic with the handle change (all-or-nothing)
+        values["display_name"] = display_name
+    stmt = (
+        update(User)
+        .where(
+            User.id == user.id,
+            or_(User.handle_changed_at.is_(None), User.handle_changed_at <= cutoff),
+        )
+        .values(**values)
+        # synchronize_session=False: the cooldown predicate must be evaluated by the
+        # DB (the whole point of folding it into the write), NOT re-evaluated in
+        # Python against the loaded ORM object — that in-memory eval compares a
+        # SQLite-naive handle_changed_at against the tz-aware cutoff and TypeErrors,
+        # and would also defeat the atomicity. We refresh() the row after a hit.
+        .execution_options(synchronize_session=False)
+    )
+    try:
+        result = await session.execute(stmt)
+    except IntegrityError as e:
+        await session.rollback()
+        if _is_handle_conflict(e):
+            raise HandleTaken() from e
+        raise  # a non-handle constraint is NOT a taken handle — don't mislabel it
+    if result.rowcount == 0:
+        # The conditional UPDATE matched no row for one of two reasons: the cooldown
+        # predicate rejected it (handle_changed_at set AND newer than cutoff — a NULL
+        # would have matched the WHERE, so this is never the never-changed case), OR
+        # the row already holds the requested handle (concurrent winner / idempotent
+        # retry). Re-read the current handle + stamp to tell them apart. Capture the
+        # id BEFORE rollback — rollback expires every instance unconditionally, so
+        # reading user.id afterwards would lazy-load outside the async context
+        # (MissingGreenlet).
+        uid = user.id
+        await session.rollback()
+        row = (await session.execute(
+            select(User.username, User.handle_changed_at)
+            .where(User.id == uid))).one_or_none()
+        if row is None:
+            # The row vanished between the UPDATE and this read — a concurrent
+            # self-account-deletion. Don't one()-500 (cage-match #118, Carnot+Tesla);
+            # report the full window, non-crashing — the account is going away anyway.
+            raise HandleChangeCooldown(cooldown_seconds)
+        cur_username, last = row
+        if cur_username == handle:
+            # The row ALREADY holds the requested handle (a concurrent winner set it,
+            # or an idempotent retry). "Set my handle to X" when it is already X is a
+            # no-op success, NOT a cooldown rejection (cage-match #118 r4, Carnot) —
+            # apply any display_name and return rather than a spurious 429.
+            await session.refresh(user)
+            if display_name is not None:
+                user.display_name = display_name
+                await session.commit()
+                await session.refresh(user)
+            return user
+        if last is not None and last.tzinfo is None:
+            last = last.replace(tzinfo=dt.timezone.utc)
+        # Recompute now AFTER the read: under a concurrent race the request-start `now`
+        # can predate the winner's stamp, making elapsed negative and retry_after
+        # exceed the window. Cap at cooldown_seconds so Retry-After never over-promises
+        # (cage-match #118, Carnot).
+        elapsed = (dt.datetime.now(dt.timezone.utc) - last).total_seconds()
+        raise HandleChangeCooldown(
+            max(1, min(cooldown_seconds, math.ceil(cooldown_seconds - elapsed))))
+    await session.commit()
+    await session.refresh(user)  # Core UPDATE bypassed the ORM — reload the labels
+    return user
+
+
+def _is_handle_conflict(err: IntegrityError) -> bool:
+    """True iff the IntegrityError is the users.username / users.aiko_username UNIQUE
+    violation (the handle pair), vs any OTHER constraint that might later land on the
+    users row. SQLite names the column ('UNIQUE constraint failed: <table>.<col>'),
+    so we classify DETERMINISTICALLY from the constraint — the same discipline as
+    _is_credential_id_conflict. Today the handle pair is the only unique surface a
+    self-profile edit can hit; this makes a FUTURE unique column (e.g. users.email)
+    fail as itself rather than mis-singing as 'handle already taken'."""
+    msg = str(getattr(err, "orig", err))
+    return "users.username" in msg or "users.aiko_username" in msg

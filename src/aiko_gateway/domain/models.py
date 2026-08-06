@@ -164,6 +164,16 @@ class User(Base):
     # (no `gen` claim) read as 0 too, so a deploy doesn't mass-logout live sessions.
     token_generation: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0")
+    # Timestamp of the last handle (username) CHANGE (#2631). NULL = never changed
+    # since creation, so the first change is always allowed. Stamped server-side by
+    # the PATCH /v1/me mutate path ONLY when the handle actually changes; the mutate
+    # path refuses another change while (now - handle_changed_at) is within
+    # settings.handle_change_cooldown_seconds (429). display_name edits and a no-op
+    # same-handle write never touch it. Identity is the KEY (id); this only rate-
+    # limits churn on the mutable label so @-mentions/DMs that resolve key->handle
+    # stay stable (see project_identity_social_cluster).
+    handle_changed_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True)
 
 
 class SocialIdentity(Base):
