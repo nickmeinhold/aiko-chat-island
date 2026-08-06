@@ -223,6 +223,31 @@ async def test_cooldown_wins_over_taken_handle_during_window(client, session):
 
 
 @pytest.mark.asyncio
+async def test_combined_stale_noop_is_not_partially_applied(session):
+    """Seal for Carnot's finding (cage-match #118): a stale in-memory username must
+    not route a real handle change down the no-op path and drop it while a combined
+    display_name commits. DB handle is 'bob'; in-memory says 'alice' (stale); a
+    combined {handle:'alice', display_name:'X'} is a REAL change (bob->alice), applied
+    atomically, not a display-only partial write."""
+    from sqlalchemy import update as _update
+
+    from aiko_gateway.domain.models import User
+
+    user = await _make_user(session, username="alice", display_name="Alice")
+    # Move the DB handle without dirtying/syncing the ORM object (stale in-memory).
+    await session.execute(_update(User).where(User.id == user.id).values(
+        username="bob", aiko_username="bob").execution_options(synchronize_session=False))
+    await session.commit()
+    assert user.username == "alice"  # in-memory still stale
+
+    await users_service.update_profile(
+        session, user, handle="alice", display_name="X", cooldown_seconds=30 * 24 * 3600)
+    await session.refresh(user)
+    assert user.username == "alice"     # the handle change WAS applied (not dropped)
+    assert user.display_name == "X"     # display applied atomically with it
+
+
+@pytest.mark.asyncio
 async def test_handle_change_survives_concurrent_row_deletion(session):
     """The rowcount==0 retry_after re-read must not 500 if the row vanished (a
     concurrent self-account-deletion): scalar_one_or_none + a full-window fallback."""

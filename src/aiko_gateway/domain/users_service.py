@@ -333,24 +333,31 @@ async def update_profile(
         raise ValueError("update_profile requires handle and/or display_name")
     now = now or dt.datetime.now(dt.timezone.utc)
 
-    if handle is None or handle == user.username:
-        # display_name-only, or a no-op same-handle write: no cooldown, no atomic
-        # gate. A no-op handle does NOT stamp handle_changed_at (the form-resubmit
-        # lockout footgun stays closed). ACCEPTED residual (cage-match #118, Tesla):
-        # the "same handle" test is against the request-loaded user.username, so in a
-        # narrow self-race (this user's handle was concurrently changed after load)
-        # a genuine change could read as a no-op and silently not apply. Outcome is
-        # benign — no wrong state persists, the user simply retries — so we don't
-        # fold this into the DB at the cost of tangling the no-op/cooldown semantics.
+    if handle is not None and handle == user.username:
+        # The in-memory username can be a STALE snapshot — a concurrent self-change
+        # may have moved the DB handle after CurrentUser loaded. Confirm the no-op
+        # against the DB (one altitude of truth) so a stale read can't route a REAL
+        # handle change down the no-op path and silently drop it while a combined
+        # display_name still commits — the partial-apply the atomic-combined contract
+        # forbids (cage-match #118, Carnot+Tesla). A DB-confirmed no-op drops to the
+        # cheap display-only path; a mismatch falls through to the atomic change path,
+        # where the cooldown/UNIQUE arbitrate it correctly.
+        db_username = (await session.execute(
+            select(User.username).where(User.id == user.id))).scalar_one_or_none()
+        if db_username == handle:
+            handle = None  # genuine no-op — does NOT stamp handle_changed_at
+
+    if handle is None:
+        # display_name-only, or a DB-confirmed same-handle no-op: no cooldown, no
+        # atomic gate (a no-op never stamps handle_changed_at, so the form-resubmit
+        # lockout footgun stays closed).
         if display_name is not None:
             user.display_name = display_name
         await session.commit()
         # Symmetric with the handle path's post-commit refresh. Not strictly required
-        # today (SessionLocal is expire_on_commit=False — db.py:79 — so the ORM object
-        # stays live after commit), but making BOTH success paths end the same way
-        # removes the asymmetry cross-family reviewers repeatedly read as a
-        # MissingGreenlet risk, and keeps the door correct if expire_on_commit ever
-        # flips (cage-match #118, Tesla+Wu).
+        # today (SessionLocal is expire_on_commit=False — db.py:79), but making BOTH
+        # success paths end the same way removes the asymmetry cross-family reviewers
+        # read as a MissingGreenlet risk, and stays correct if that ever flips.
         await session.refresh(user)
         return user
 
