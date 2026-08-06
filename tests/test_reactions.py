@@ -729,6 +729,32 @@ async def test_aggregate_projection_caps_per_message_emojis(session):
     assert len(agg[msg.id]) == cap  # long tail truncated from the projection
 
 
+async def test_projection_keeps_viewers_own_reaction_past_cap(session):
+    """A raid can't truncate the VIEWER'S OWN reaction out of the authoritative re-page
+    (cage-match round 6, Tesla): mine ∪ top-N, so re-page never drops your own 👍."""
+    author = await _user(session, "author")
+    me = await _user(session, "me")
+    ch = await _channel(session)
+    msg = await _msg(session, mid=1, channel=ch, sender=author)
+    cap = reactions_service.MAX_EMOJIS_PROJECTED_PER_MESSAGE
+    # Raid: cap+10 high-count emojis (2 reactors each) that dominate the top band.
+    for i in range(cap + 10):
+        u1 = await _user(session, f"a{i}")
+        u2 = await _user(session, f"b{i}")
+        for u in (u1, u2):
+            await reactions_service.add_reaction(
+                session, user_id=u.id, message_id=msg.id, emoji=f"e{i:03d}")
+    # `me` places ONE unique low-count (count 1) emoji — would fall in the truncated tail.
+    await reactions_service.add_reaction(
+        session, user_id=me.id, message_id=msg.id, emoji="\U0001f984")  # 🦄, count 1
+
+    agg = await reactions_service.aggregate_for_messages(session, [msg.id], me.id)
+    mine = [e for e in agg[msg.id] if e["reacted_by_me"]]
+    assert mine == [{"emoji": "\U0001f984", "count": 1, "reacted_by_me": True}]
+    # Still bounded: top-N + my own tail.
+    assert len(agg[msg.id]) <= cap + reactions_service.MAX_REACTIONS_PER_USER_PER_MESSAGE
+
+
 async def test_remove_without_row_on_hidden_message_404(app_ctx, session):
     """A caller with NO reaction row can't use DELETE to probe a message they can't
     see — the no-row path falls back to the existence-hiding visibility gate (404),

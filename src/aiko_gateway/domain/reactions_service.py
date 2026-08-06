@@ -227,9 +227,17 @@ async def aggregate_for_messages(
     for message_id, entries in by_msg.items():
         entries.sort(key=lambda e: (-e["count"], e["emoji"]))
         # Truncate the long tail so a multi-user emoji raid can't bloat one message's
-        # wire array — top-N by count, the band anyone actually renders.
+        # wire array — top-N by count, the band anyone actually renders. BUT always keep
+        # the VIEWER'S OWN reactions even if a raid pushed them past N (cage-match round
+        # 6, Tesla): history is the authoritative re-page for this state-not-event
+        # signal, and dropping your own reaction on re-page is self-heal corruption, not
+        # tail polish. Bound stays finite: top-N ∪ mine ≤ N + per-user cap.
         if len(entries) > MAX_EMOJIS_PROJECTED_PER_MESSAGE:
-            by_msg[message_id] = entries[:MAX_EMOJIS_PROJECTED_PER_MESSAGE]
+            top = entries[:MAX_EMOJIS_PROJECTED_PER_MESSAGE]
+            top_emojis = {e["emoji"] for e in top}
+            mine_tail = [e for e in entries[MAX_EMOJIS_PROJECTED_PER_MESSAGE:]
+                         if e["reacted_by_me"] and e["emoji"] not in top_emojis]
+            by_msg[message_id] = top + mine_tail
     return by_msg
 
 

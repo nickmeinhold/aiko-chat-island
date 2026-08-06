@@ -1,7 +1,10 @@
 """Emoji-reaction endpoints (#2634, v2 social layer).
 
-POST   /v1/messages/{message_id}/reactions        body {emoji}   → add (idempotent)
-DELETE /v1/messages/{message_id}/reactions/{emoji}                → remove (idempotent)
+POST   /v1/messages/{message_id}/reactions        body {emoji}      → add (idempotent)
+DELETE /v1/messages/{message_id}/reactions        ?emoji=<encoded>  → remove (idempotent)
+
+(DELETE takes the emoji as a QUERY PARAM, not a path segment — an opaque token in the
+path is a URL-grammar hazard; see the remove handler's docstring for the full reasoning.)
 
 Both go through the ONE mutator door (``reactions_service``, which validates the
 emoji itself) and, on a REAL change, fan a discrete ``reaction`` frame to the
