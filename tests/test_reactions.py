@@ -729,6 +729,25 @@ async def test_aggregate_projection_caps_per_message_emojis(session):
     assert len(agg[msg.id]) == cap  # long tail truncated from the projection
 
 
+def test_reaction_frame_json_encodes_to_plain_strings():
+    """The `reaction` frame must survive `ws.send_json` (json.dumps) — the recorder-conn
+    tests compare the in-process dict, so this locks the WIRE encode: `action` is a
+    StrEnum that must serialize to its plain string value, not an enum repr (cage-match
+    round 7, Tesla — a future non-str enum would pass the dict tests but die on the
+    socket)."""
+    import json
+
+    from aiko_gateway.realtime import envelopes
+    frame = envelopes.reaction_frame(
+        "chan", "msg", "\U0001f44d", envelopes.ReactionAction.ADD, "user", 3)
+    decoded = json.loads(json.dumps(frame))
+    assert decoded["action"] == "add"
+    assert isinstance(decoded["action"], str)
+    assert decoded == {"type": "reaction", "channel_id": "chan", "msg_id": "msg",
+                       "emoji": "\U0001f44d", "action": "add", "user_id": "user",
+                       "count": 3}
+
+
 async def test_projection_keeps_viewers_own_reaction_past_cap(session):
     """A raid can't truncate the VIEWER'S OWN reaction out of the authoritative re-page
     (cage-match round 6, Tesla): mine ∪ top-N, so re-page never drops your own 👍."""

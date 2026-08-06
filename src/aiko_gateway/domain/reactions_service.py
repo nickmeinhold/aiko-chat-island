@@ -43,6 +43,8 @@ one line, same semantics — when that migration lands.
 """
 from __future__ import annotations
 
+import datetime as dt
+
 from sqlalchemy import Select, delete, func, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -99,9 +101,15 @@ def validate_emoji(emoji: object) -> str:
     * equal to its own ``strip()`` (cage-match Tesla: ``"👍"`` and ``" 👍 "`` must not
       be three distinct PKs / aggregate lines — reject the lookalikes rather than
       silently forking state);
-    * no ``/`` and no ASCII control chars (cage-match Carnot: DELETE addresses the
-      emoji as a single URL path segment, so a stored ``"a/b"`` would be un-removable
-      via ``/reactions/{emoji}`` — a row you can create but not delete).
+    * no ``/`` and no ASCII control chars — defence-in-depth on the opaque token
+      (neither belongs in a real emoji). NOTE: DELETE now addresses the emoji as a
+      QUERY PARAM (percent-encoded end-to-end), so path-grammar chars like ``#`` ``?``
+      ``%`` are transport-safe and NOT rejected — keycap emoji (``#️⃣`` contains ``#``)
+      round-trip. Lookalike multiplicity from invisible/format codepoints (ZWSP, bidi)
+      is a KNOWN, ACCEPTED residual: the token is opaque (the app owns rendering) and
+      precisely validating it is a rabbit hole (ZWJ/VS16 are essential, subdivision-flag
+      tag sequences are Cf), so distinct-but-glyph-identical rows are bounded by the
+      per-user + per-message caps rather than closed (cage-match rounds 5-7, Tesla).
     """
     if not isinstance(emoji, str):
         raise InvalidEmoji("emoji must be a string")
@@ -158,7 +166,12 @@ async def add_reaction(
             raise ReactionLimitExceeded()
     result = await session.execute(
         sqlite_insert(MessageReaction)
-        .values(message_id=message_id, user_id=user_id, emoji=emoji)
+        # created_at is pinned in .values() rather than left to the model's Python-side
+        # `default=` — a Core ins().values() is NOT guaranteed to apply the ORM column
+        # default the way session.add() does, and the column is NOT NULL with no
+        # server_default (cage-match round 7, Tesla). Explicit = engine-independent.
+        .values(message_id=message_id, user_id=user_id, emoji=emoji,
+                created_at=dt.datetime.now(dt.timezone.utc))
         .on_conflict_do_nothing())
     await session.commit()
     changed = result.rowcount > 0
