@@ -13,7 +13,7 @@ import enum
 
 from sqlalchemy import (
     JSON, BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer,
-    String, Text, UniqueConstraint,
+    PrimaryKeyConstraint, String, Text, UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -486,6 +486,64 @@ class Retraction(Base):
     # (channel_id, id) axis as messages — covered by the composite index above.
     channel_id: Mapped[str] = mapped_column(
         ForeignKey("channels.id"), nullable=False)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow)
+
+
+class MessageReaction(Base):
+    """One user's emoji reaction to one message (#2634, v2 social layer).
+
+    STATE, NOT EVENT — the deliberate contrast with ``Retraction`` (#7). A
+    retraction needs its own forward-ULID row because a takedown mutates a message
+    *below* a client's watermark, and ``get_history`` catch-up (``id > after``) would
+    never replay it. A reaction changes an *aggregate* that ``message_view``
+    recomputes on every history read, so a client that misses the live ``reaction``
+    frame self-heals the moment it re-pages that message — no second event feed, no
+    forward-ULID row, just this table.
+
+    NAMED TRADEOFF (state-not-event, cage-match this): a reaction add/remove on a
+    message a client has ALREADY synced is not force-caught-up on reconnect — the
+    live ``reaction`` frame is best-effort and the ``id > after`` cursor doesn't
+    advance for a reaction (it mints no id on the message axis). It self-heals only
+    when the client re-reads that message's history (scroll-up ``before`` paging
+    re-reads the row and its aggregate fresh). This is ambient-signal eventual
+    consistency (Slack/Discord reactions behave the same). If perfect offline
+    catch-up is ever wanted, reserve a forward-ULID reaction-event log exactly like
+    ``Retraction`` — an additive change, not a reshape.
+
+    COMPOSITE PK ``(message_id, user_id, emoji)`` makes a repeat-react idempotent —
+    one row per (message, user, emoji), the same one-row-per-relationship shape as
+    ``Membership`` / ``CommunityMembership``. Re-adding the same emoji is a no-op
+    (INSERT-or-ignore in ``reactions_service``); a different emoji from the same user
+    is a NEW row (multi-emoji reactions are allowed). The PK's leading ``message_id``
+    covers the aggregation read (``WHERE message_id IN (...) GROUP BY message_id,
+    emoji``); ``user_id`` is separately indexed for the account-deletion purge and the
+    per-viewer ``reacted_by_me`` probe.
+
+    ``emoji`` is an OPAQUE client string (the gateway never renders it), bounded to 64
+    chars as defense-in-depth — a real emoji, incl. a ZWJ sequence (family, skin-tone,
+    flag) is well under that; the cap just stops an unbounded blob masquerading as an
+    emoji (mirrors the pubkey-length caps elsewhere).
+
+    No ON DELETE CASCADE (codebase convention): account deletion tears these down
+    explicitly via ``reactions_service.purge_user_reactions`` (the cascade guard
+    requires it), and channel hard-delete tears them down before its messages (they
+    FK ``messages.id`` — verify-the-neighbor, like ``MessageReport`` in
+    ``channels_service.hard_delete_channel``).
+    """
+    __tablename__ = "message_reactions"
+    __table_args__ = (
+        # The composite PK IS the (message_id, user_id, emoji) uniqueness — declared
+        # here (not column-level) so the ORM metadata matches the hand-written 0018
+        # migration exactly (the parity gate diffs reflected constraints).
+        PrimaryKeyConstraint(
+            "message_id", "user_id", "emoji", name="pk_message_reactions"),
+    )
+    message_id: Mapped[str] = mapped_column(
+        ForeignKey("messages.id"), nullable=False)
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id"), nullable=False, index=True)
+    emoji: Mapped[str] = mapped_column(String(64), nullable=False)
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow)
 

@@ -45,8 +45,8 @@ from aiko_gateway.domain import (
     signing_keys_service, users_service)
 from aiko_gateway.domain.models import (
     DEFAULT_COMMUNITY_ID, Channel, Community, CommunityMembership, Membership,
-    Message, MessageReport, PasskeyCredential, PendingRecovery, RecoveryApprover,
-    RecoveryPolicy, SigningKey, SocialIdentity, User)
+    Message, MessageReaction, MessageReport, PasskeyCredential, PendingRecovery,
+    RecoveryApprover, RecoveryPolicy, SigningKey, SocialIdentity, User)
 from aiko_gateway.domain.ids import new_ulid
 
 
@@ -90,6 +90,7 @@ EXPECTED_USERS_FK_COLUMNS: set[tuple[str, str]] = {
     ("device_tokens", "user_id"),             # delete
     ("passkey_credentials", "user_id"),       # delete
     ("signing_keys", "user_id"),              # delete (#1816 PR B)
+    ("message_reactions", "user_id"),         # delete (#2634)
     ("social_identities", "user_id"),         # delete
     ("memberships", "user_id"),               # delete
     ("community_memberships", "user_id"),     # delete (#32)
@@ -199,6 +200,11 @@ async def _seed_full_user_graph(session):
     # record_signing_key does not commit (caller owns the txn), so commit here.
     await signing_keys_service.record_signing_key(
         session, user_id=user.id, pubkey="z-signing-primary", key_version=1)
+    # message_reactions.user_id (#2634) — primary reacts to other's message M2.
+    session.add(MessageReaction(
+        message_id="M2".ljust(26, "0"), user_id=user.id, emoji="\U0001f44d",
+        created_at=dt.datetime(2026, 8, 7, tzinfo=dt.timezone.utc)))
+    await session.commit()
     # Social-recovery footprint (Design 05): a policy + an approver + a pending row,
     # so all three new FK-to-users columns reference the user before deletion.
     session.add(RecoveryPolicy(
@@ -390,6 +396,11 @@ async def _seed_fk_safe(session):
     # since record_signing_key leaves the txn to the caller.
     await signing_keys_service.record_signing_key(
         session, user_id=user.id, pubkey="z-signing-primary", key_version=1)
+    # message_reactions.user_id (#2634) — FK-safe: M2 + user committed in layer 3.
+    session.add(MessageReaction(
+        message_id="M2".ljust(26, "0"), user_id=user.id, emoji="\U0001f44d",
+        created_at=dt.datetime(2026, 8, 7, tzinfo=dt.timezone.utc)))
+    await session.commit()
     # Social-recovery footprint (Design 05) — FK-safe (user committed above): a
     # policy + approver + pending row referencing all three new FK-to-users columns.
     session.add_all([

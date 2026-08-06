@@ -32,6 +32,26 @@ def retraction_frame(channel_id: str, retraction_id: str, target_msg_id: str) ->
             "id": retraction_id, "target_msg_id": target_msg_id}
 
 
+def reaction_frame(
+    channel_id: str, msg_id: str, emoji: str, action: str, user_id: str, count: int,
+) -> dict:
+    """Server->client discrete reaction event (#2634): tells a live subscriber that
+    ``user_id`` added/removed ``emoji`` on ``msg_id``, with the resulting server-truth
+    ``count`` for that emoji. ``action`` is ``"add"`` | ``"remove"``.
+
+    Discrete on PURPOSE — NOT a re-serialised message. A reaction is STATE the
+    history read recomputes (state-not-event, see the MessageReaction model), so a
+    live client applies this delta and an offline one self-heals on the next re-page;
+    there is no forward-ULID advance and no `retraction`-style catch-up row.
+
+    `reacted_by_me` is deliberately ABSENT — it is viewer-dependent and this one frame
+    fans out to every subscriber, so each client derives it locally: the reaction is
+    mine iff ``user_id`` is my own id. Carrying a per-viewer flag on a broadcast frame
+    would be wrong for every recipient but the actor."""
+    return {"type": "reaction", "channel_id": channel_id, "msg_id": msg_id,
+            "emoji": emoji, "action": action, "user_id": user_id, "count": count}
+
+
 def suback(channel_fences: dict[str, str]) -> dict:
     """Subscription-ack: confirms a `subscribe` and carries each channel's live/
     history *fence* — the newest persisted id at subscribe time (``""`` if the
