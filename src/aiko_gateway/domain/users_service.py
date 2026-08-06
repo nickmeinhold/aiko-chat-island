@@ -1,6 +1,8 @@
 """User creation + authentication."""
 from __future__ import annotations
 
+import datetime as dt
+import math
 import re
 import secrets
 
@@ -268,3 +270,79 @@ async def link_passkey_credential(
     where a handle conflict with their OWN account orphaned the device credential."""
     session.add(_passkey_credential_row(user_id, material))
     await session.commit()
+
+
+class HandleTaken(Exception):
+    """The requested handle is already in use by another account (username or its
+    derived aiko_username UNIQUE constraint). The caller maps this to 409. Classified
+    from the IntegrityError rather than a pre-SELECT so a concurrent same-handle
+    winner can't slip through a TOCTOU gap — the UNIQUE constraint is the arbiter,
+    mirroring create_passkey_account's handling."""
+
+
+class HandleChangeCooldown(Exception):
+    """A handle change was refused because the previous change was within the
+    cooldown window (settings.handle_change_cooldown_seconds). Carries retry_after
+    (whole seconds until the window lifts) which the caller surfaces as 429 +
+    Retry-After. display_name-only edits and no-op same-handle writes never raise
+    this — only an ACTUAL handle change starts/consults the cooldown."""
+
+    def __init__(self, retry_after: int) -> None:
+        super().__init__("handle change on cooldown")
+        self.retry_after = retry_after
+
+
+async def update_profile(
+    session: AsyncSession, user: User, *,
+    handle: str | None = None, display_name: str | None = None,
+    cooldown_seconds: int, now: dt.datetime | None = None,
+) -> User:
+    """THE single mutate door for a user's own profile (PATCH /v1/me, #2631).
+
+    Route, in-process, and test paths all pass through here so the identity
+    invariants live in ONE place (the project's "seal the mutator, not the caller"
+    rule). Identity is the KEY (user.id) — this only ever rewrites the mutable
+    labels (username/aiko_username/display_name), never the id, so no @-mention or
+    DM bound to the key is ever orphaned.
+
+    Rules:
+      * At least one of handle/display_name must be provided (the caller 400s on
+        neither; asserted here as the single door's own guard).
+      * handle: applied ONLY when it differs from the current handle. A change is
+        refused with HandleChangeCooldown while within cooldown_seconds of the last
+        change (handle_changed_at); on success username + aiko_username are rewritten
+        together and handle_changed_at is stamped. A UNIQUE clash → HandleTaken.
+      * display_name: applied whenever provided; never rate-limited.
+
+    Atomic-ish by construction: on SQLite (dev+prod) the writer is single, and the
+    UNIQUE constraint — not a pre-check — arbitrates a handle clash, so there is no
+    check-then-write race that could persist a duplicate."""
+    if handle is None and display_name is None:
+        raise ValueError("update_profile requires handle and/or display_name")
+    now = now or dt.datetime.now(dt.timezone.utc)
+
+    if handle is not None and handle != user.username:
+        # Cooldown gate — consult BEFORE mutating so a refused change is a pure
+        # read. handle_changed_at NULL = never changed → always allowed.
+        last = user.handle_changed_at
+        if last is not None:
+            if last.tzinfo is None:  # stored naive (SQLite round-trip) → assume UTC
+                last = last.replace(tzinfo=dt.timezone.utc)
+            elapsed = (now - last).total_seconds()
+            if elapsed < cooldown_seconds:
+                raise HandleChangeCooldown(math.ceil(cooldown_seconds - elapsed))
+        user.username = handle
+        user.aiko_username = _sanitize_aiko_username(handle)
+        user.handle_changed_at = now
+
+    if display_name is not None:
+        user.display_name = display_name
+
+    try:
+        await session.commit()
+    except IntegrityError as e:
+        await session.rollback()
+        # username / aiko_username UNIQUE is the only integrity surface reachable
+        # from a self-profile edit; classify it as a taken handle for the caller.
+        raise HandleTaken() from e
+    return user

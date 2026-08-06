@@ -12,7 +12,7 @@ import logging
 
 import jwt
 from fastapi import APIRouter, HTTPException, Request, Response, status
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -55,9 +55,51 @@ class RefreshReq(BaseModel):
     refresh_token: str
 
 
+class MeView(BaseModel):
+    """The profile view served by GET /v1/me and PATCH /v1/me (#2631). Declaring it
+    as the endpoints' response_model makes it the SINGLE source of the /me wire
+    shape in the emitted OpenAPI schema (response side, not just requests) — a
+    consumer reads exactly these fields, and a snapshot-diff of openapi.json catches
+    an accidental rename/removal (append-only /v1 discipline). `username` is the
+    handle; `aiko_username` is the derived bus-wire token; `is_moderator` is UI-only
+    (enforcement stays server-side in require_moderator)."""
+    user_id: str
+    username: str
+    display_name: str
+    aiko_username: str
+    is_moderator: bool
+
+
+class PatchMeReq(BaseModel):
+    """Body for PATCH /v1/me — handle and/or display_name, both optional (at least
+    one required, enforced in the handler as a 400). handle rules mirror
+    SocialClaimReq exactly (same charset/length/strip), so claim and mutate can't
+    drift apart."""
+    handle: str | None = Field(default=None, min_length=1, max_length=64)
+    display_name: str | None = Field(default=None, max_length=128)
+
+    @field_validator("handle", "display_name")
+    @classmethod
+    def _strip(cls, v: str | None) -> str | None:
+        return v.strip() if v is not None else v
+
+    @field_validator("handle")
+    @classmethod
+    def _handle_nonempty_after_strip(cls, v: str | None) -> str | None:
+        if v is not None and not v:
+            raise ValueError("handle must not be blank")
+        return v
+
+
 def _user_view(u: User) -> dict:
     return {"user_id": u.id, "username": u.username,
             "display_name": u.display_name, "aiko_username": u.aiko_username}
+
+
+def _me_view(u: User) -> dict:
+    """The full MeView dict (identity core + UI-only is_moderator). Shared by GET
+    and PATCH /me so the two can never drift."""
+    return {**_user_view(u), "is_moderator": moderation_service.is_moderator(u.id)}
 
 
 def _tokens(user: User) -> dict:
@@ -870,13 +912,53 @@ async def list_providers() -> dict:
 me_router = APIRouter(prefix="/v1", tags=["auth"])
 
 
-@me_router.get("/me")
+@me_router.get("/me", response_model=MeView)
 async def me(user: CurrentUser) -> dict:
     # is_moderator is UI-only (show/hide the moderation surface in the app);
     # enforcement stays server-side in require_moderator. Sourced from the SAME
     # moderation_service.is_moderator config lookup the gate uses, so the flag and
     # the gate can't disagree.
-    return {**_user_view(user), "is_moderator": moderation_service.is_moderator(user.id)}
+    return _me_view(user)
+
+
+@me_router.patch("/me", response_model=MeView)
+async def patch_me(
+    req: PatchMeReq, user: CurrentUser, session: DbSession,
+) -> dict | JSONResponse:
+    """Mutate the authenticated user's own handle and/or display_name (#2631).
+
+    The app's "change handle" + "edit display name" path (#2513). Identity is the
+    KEY (user.id); this rewrites only the mutable labels, so a rename never orphans
+    an @-mention or DM bound to the key. All mutation funnels through the single
+    users_service.update_profile door (route/in-process/test share one gate).
+
+      * 400 if neither field is provided.
+      * 409 if the requested handle is already taken.
+      * 429 (+ retry_after + Retry-After header) if the handle changed within the
+        cooldown window (settings.handle_change_cooldown_seconds). A no-op
+        same-handle write and any display_name edit never trip the cooldown.
+    """
+    if req.handle is None and req.display_name is None:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, "provide handle and/or display_name")
+    try:
+        await users_service.update_profile(
+            session, user, handle=req.handle, display_name=req.display_name,
+            cooldown_seconds=settings.handle_change_cooldown_seconds,
+        )
+    except users_service.HandleTaken:
+        raise HTTPException(status.HTTP_409_CONFLICT, "handle already taken")
+    except users_service.HandleChangeCooldown as e:
+        # Custom body carries retry_after alongside detail (HTTPException would only
+        # emit {"detail"}); the Retry-After header mirrors it. Returning a Response
+        # bypasses response_model (intended — this is the error shape, not MeView).
+        return JSONResponse(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            content={"detail": "handle change on cooldown",
+                     "retry_after": e.retry_after},
+            headers={"Retry-After": str(e.retry_after)},
+        )
+    return _me_view(user)
 
 
 @me_router.delete("/account", status_code=status.HTTP_204_NO_CONTENT)

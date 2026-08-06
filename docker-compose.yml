@@ -92,6 +92,12 @@ services:
       # cloned island with unconfigured well-known files would otherwise advertise a
       # sign-in path that dies mid-ceremony). Public, not a secret.
       PASSKEY_ENABLED: ${PASSKEY_ENABLED:-false}
+      # --- Handle-change cooldown (#2631). Min seconds between handle changes via
+      # PATCH /v1/me; the default (30 days) is correct for every island, forwarded
+      # so a host .env MAY tune it. Not host-dependent (unlike passkey origins), so
+      # not on the required-forwarding tripwire — just kept live to avoid the inert-
+      # var class (a Settings field silently not forwarded).
+      HANDLE_CHANGE_COOLDOWN_SECONDS: ${HANDLE_CHANGE_COOLDOWN_SECONDS:-2592000}
       # --- ISLAND IDENTITY (the compose is the island template). Each island sets
       # these in its host .env; the defaults are island 1 (chat.imagineering.cc) so
       # an imagineering deploy with no overrides is unchanged. Island 2 (enspyr)
