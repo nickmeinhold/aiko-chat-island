@@ -7,7 +7,20 @@ change touches `aiko/payload.py`, never this file — the /v1 contract is frozen
 """
 from __future__ import annotations
 
+import enum
 from typing import Any
+
+
+class ReactionAction(enum.StrEnum):
+    """Closed set of reaction-frame actions (#2634). StrEnum (3.12) so the member's
+    value IS the wire string — the same closed-set-as-StrEnum idiom the persistence
+    layer uses for Role/Platform/etc. Typing the ``reaction_frame`` action against
+    this stops a stray ``"added"`` from fanning out with no type rail (cage-match
+    Tesla). Not persisted (reactions are STATE rows, the action is a live delta), so
+    it lives here at the wire layer, not in models.py with the DB-CHECK enums."""
+
+    ADD = "add"
+    REMOVE = "remove"
 
 
 # -- server -> client builders ----------------------------------------------
@@ -30,6 +43,40 @@ def retraction_frame(channel_id: str, retraction_id: str, target_msg_id: str) ->
     shape as the history `retraction` item (messages_service.retraction_view)."""
     return {"type": "retraction", "channel_id": channel_id,
             "id": retraction_id, "target_msg_id": target_msg_id}
+
+
+def reaction_frame(
+    channel_id: str, msg_id: str, emoji: str, action: ReactionAction,
+    user_id: str, count: int,
+) -> dict:
+    """Server->client discrete reaction event (#2634): tells a live subscriber that
+    ``user_id`` added/removed ``emoji`` on ``msg_id``, with the resulting server-truth
+    ``count`` for that emoji. ``action`` is a ``ReactionAction`` (its value — ``"add"``
+    | ``"remove"`` — rides the wire).
+
+    Discrete on PURPOSE — NOT a re-serialised message. A reaction is STATE the
+    history read recomputes (state-not-event, see the MessageReaction model), so a
+    live client applies this delta and an offline one self-heals on the next re-page;
+    there is no forward-ULID advance and no `retraction`-style catch-up row.
+
+    `reacted_by_me` is deliberately ABSENT — it is viewer-dependent and this one frame
+    fans out to every subscriber, so each client derives it locally: the reaction is
+    mine iff ``user_id`` is my own id. Carrying a per-viewer flag on a broadcast frame
+    would be wrong for every recipient but the actor.
+
+    ``count`` is a server-sampled ABSOLUTE value, not a ±1 delta (cage-match Tesla):
+    the client SETS its displayed count to this, it does NOT add/subtract ``action``
+    from a local tally — so a lost or duplicated frame can't accumulate drift. But it is
+    a BEST-EFFORT LIVE HINT, NOT a linearizable truth (cage-match round 5, Carnot):
+    the count is sampled just after each mutation commits, and frames can be delivered
+    out of order, so under concurrent add/remove a client can transiently land on a
+    stale absolute value. That is acceptable precisely because reactions are
+    state-not-event — the AUTHORITATIVE count is the next history re-page of the message
+    row (``aggregate_for_messages``), which the frame only optimises latency over. The
+    app contract must treat the frame count as a hint and reconcile to the re-paged
+    aggregate, never as the last word."""
+    return {"type": "reaction", "channel_id": channel_id, "msg_id": msg_id,
+            "emoji": emoji, "action": action, "user_id": user_id, "count": count}
 
 
 def suback(channel_fences: dict[str, str]) -> dict:

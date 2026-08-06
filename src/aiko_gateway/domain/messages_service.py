@@ -18,14 +18,24 @@ from .ids import new_ulid
 from .models import Channel, Message, Retraction, User
 
 
-def message_view(m: Message) -> dict:
+def message_view(m: Message, *, reactions: list[dict] | None = None) -> dict:
     """The stable MessageView the client contract exposes (plan §A1).
 
     This is the SINGLE serializer — REST history, WS ack-fanout, and bus-ingest
     fanout all pass through here, so echoing the signing `origin` here carries it
     on every read path at once. `origin` is included ONLY when present (signed
     gateway-side messages); it is omitted for unsigned + bus-born rows so an
-    absent key reads as "unverified", per the app's verifier contract (#1816)."""
+    absent key reads as "unverified", per the app's verifier contract (#1816).
+
+    `reactions` (#2634) is the viewer-dependent aggregate [{emoji, count,
+    reacted_by_me}] for this message, computed ONCE per page by
+    reactions_service.aggregate_for_messages and injected by the history route.
+    It defaults to `[]` — so the WS ack/message-fanout and bus-ingest paths (a
+    FRESH message, which by construction has no reactions yet) serialize with an
+    empty list and never need to touch the reactions table. A reaction that lands
+    LATER rides its own discrete `reaction` frame (envelopes.reaction_frame), not a
+    re-serialised message; the aggregate here is what a subsequent history read
+    recomputes (state-not-event — see the MessageReaction model)."""
     view = {
         "msg_id": m.id,
         "channel_id": m.channel_id,
@@ -33,6 +43,7 @@ def message_view(m: Message) -> dict:
         "body": m.body,
         "created_at": m.created_at.isoformat(),
         "reply_to": m.reply_to,
+        "reactions": reactions or [],
     }
     if m.origin is not None:
         view["origin"] = m.origin
