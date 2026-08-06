@@ -33,7 +33,7 @@ from httpx import ASGITransport, AsyncClient
 from aiko_gateway.domain import (
     accounts_service, messages_service, moderation_service, reactions_service,
     security, users_service)
-from aiko_gateway.domain.models import Channel, Membership, Message
+from aiko_gateway.domain.models import Channel, Membership, Message, MessageReaction
 from aiko_gateway.realtime.hub import Connection, Hub
 from aiko_gateway.rest import messages as message_routes
 from aiko_gateway.rest import reactions as reaction_routes
@@ -574,6 +574,73 @@ async def test_history_reflects_reactions_viewer_dependently(app_ctx, session):
         f"/v1/channels/{ch.id}/messages", headers=_auth(author))
     item2 = next(m for m in resp2.json()["messages"] if m["msg_id"] == msg.id)
     assert item2["reactions"] == [{"emoji": THUMB, "count": 1, "reacted_by_me": False}]
+
+
+async def test_channel_hard_delete_purges_reactions(session):
+    """Channel hard-delete tears down its messages' reactions BEFORE the messages
+    (verify-the-neighbor: reactions FK messages.id). Proven end-to-end through
+    channels_service.hard_delete_channel, not just the service purge in isolation
+    (cage-match Tesla F6 — the neighbor probe account deletion already had)."""
+    from aiko_gateway.domain import channels_service
+    author = await _user(session, "author")
+    reactor = await _user(session, "reactor")
+    ch = await _channel(session, name="doomed")
+    msg = await _msg(session, mid=1, channel=ch, sender=author)
+    await reactions_service.add_reaction(
+        session, user_id=reactor.id, message_id=msg.id, emoji=THUMB)
+
+    removed = await channels_service.hard_delete_channel(session, "doomed")
+    await session.commit()
+    assert removed is True
+    # The reaction is gone with its message — no orphan pointing at a purged message.
+    agg = await reactions_service.aggregate_for_messages(session, [msg.id], author.id)
+    assert agg == {}
+
+
+async def test_remove_own_reaction_on_soft_deleted_message_succeeds(app_ctx, session):
+    """Ownership, not visibility, gates remove (cage-match Tesla F1): the reactor can
+    un-react even after the message is taken down — their own row is deletable, no
+    un-removable scar. No frame (the message is hidden, no live audience)."""
+    client, hub = app_ctx
+    author = await _user(session, "author")
+    reactor = await _user(session, "reactor")
+    ch = await _channel(session)
+    msg = await _msg(session, mid=1, channel=ch, sender=author)
+    await reactions_service.add_reaction(
+        session, user_id=reactor.id, message_id=msg.id, emoji=THUMB)
+    # Soft-delete the message (takedown) AFTER the reaction exists.
+    msg.deleted_at = dt.datetime.now(dt.timezone.utc)
+    await session.commit()
+    watcher = _RecordingConn(author.id)
+    watcher.subscribed.add(ch.id)
+    hub.register(watcher)
+
+    resp = await client.delete(
+        f"/v1/messages/{msg.id}/reactions/{THUMB}", headers=_auth(reactor))
+    assert resp.status_code == 200          # own row removed despite invisibility
+    assert resp.json()["count"] == 0
+    # No live frame for a hidden message.
+    assert [f for f in watcher.sent if f.get("type") == "reaction"] == []
+    # The row is actually gone.
+    assert await session.get(
+        MessageReaction, (msg.id, reactor.id, THUMB)) is None
+
+
+async def test_remove_without_row_on_hidden_message_404(app_ctx, session):
+    """A caller with NO reaction row can't use DELETE to probe a message they can't
+    see — the no-row path falls back to the existence-hiding visibility gate (404),
+    so the global count never leaks for an unreachable message."""
+    client, _ = app_ctx
+    author = await _user(session, "author")
+    outsider = await _user(session, "outsider")
+    ch = await _channel(session, private=True)
+    session.add(Membership(channel_id=ch.id, user_id=author.id, role="member"))
+    await session.commit()
+    msg = await _msg(session, mid=1, channel=ch, sender=author)
+    # outsider never reacted and can't read the private channel → 404, not a count.
+    resp = await client.delete(
+        f"/v1/messages/{msg.id}/reactions/{THUMB}", headers=_auth(outsider))
+    assert resp.status_code == 404
 
 
 async def test_account_deletion_purges_reactions(session):

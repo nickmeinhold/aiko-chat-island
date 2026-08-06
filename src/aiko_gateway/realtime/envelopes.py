@@ -62,7 +62,13 @@ def reaction_frame(
     `reacted_by_me` is deliberately ABSENT — it is viewer-dependent and this one frame
     fans out to every subscriber, so each client derives it locally: the reaction is
     mine iff ``user_id`` is my own id. Carrying a per-viewer flag on a broadcast frame
-    would be wrong for every recipient but the actor."""
+    would be wrong for every recipient but the actor.
+
+    ``count`` is SERVER TRUTH, not a ±1 delta (cage-match Tesla): the client sets its
+    displayed count to this value, it does NOT add/subtract ``action`` from a local
+    tally. So out-of-order frames on the same emoji converge (last write wins the true
+    count) instead of drifting — the app contract must reconcile to ``count``, never
+    accumulate the deltas."""
     return {"type": "reaction", "channel_id": channel_id, "msg_id": msg_id,
             "emoji": emoji, "action": action, "user_id": user_id, "count": count}
 

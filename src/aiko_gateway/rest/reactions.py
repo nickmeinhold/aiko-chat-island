@@ -125,21 +125,40 @@ async def remove_reaction(
     message_id: str, emoji: str, user: CurrentUser, session: DbSession,
     request: Request,
 ) -> dict:
-    """Remove the caller's ``emoji`` reaction from a message (idempotent — removing an
-    absent reaction returns the current count, fires no frame, and is not an error).
-    ``emoji`` is the percent-decoded path segment. 422 if the emoji is malformed
-    (checked before resolution); 404 if the message isn't visible."""
+    """Remove the caller's ``emoji`` reaction from a message (idempotent). 422 if the
+    emoji is malformed (checked before anything).
+
+    REMOVE IS GATED ON OWNERSHIP, NOT VISIBILITY (cage-match round 3, Tesla — the
+    resonant catch). Un-reacting your OWN row is a strictly-reducing, self-owned action,
+    so it must stay possible even after you lose sight of the message (a takedown, or a
+    private-channel kick) — otherwise your reaction is an un-deletable scar. So: if the
+    delete actually removed YOUR row (``changed``), it is always allowed; the frame
+    fans out only when the message is still live (a hidden message needs no live delta).
+    If NO row was removed (nothing was yours to delete), we fall back to the SAME
+    existence-hiding visibility gate ``add`` uses — so a caller with no row can't use
+    DELETE to probe a message they can't see (a 404, and the global ``count`` never
+    leaks for a message they neither authored a reaction on nor may read)."""
     try:
         emoji = reactions_service.validate_emoji(emoji)
     except reactions_service.InvalidEmoji as exc:
         raise HTTPException(422, str(exc))
-    msg = await _visible_message(session, user.id, message_id)
     count, changed = await reactions_service.remove_reaction(
         session, user_id=user.id, message_id=message_id, emoji=emoji)
     if changed:
-        await _fanout(
-            request, session, channel_id=msg.channel_id, msg_id=message_id,
-            emoji=emoji, action=ReactionAction.REMOVE, actor_id=user.id,
-            author_id=msg.sender_user_id, count=count)
+        # Owned a row → always allowed. Resolve the message UNFILTERED only to fan out
+        # a live delta, and only if it's still visible-ish (exists + not soft-deleted);
+        # a hidden message has no live audience to update.
+        msg = await messages_service.get_message(session, message_id)
+        if msg is not None and msg.deleted_at is None:
+            await _fanout(
+                request, session, channel_id=msg.channel_id, msg_id=message_id,
+                emoji=emoji, action=ReactionAction.REMOVE, actor_id=user.id,
+                author_id=msg.sender_user_id, count=count)
+        return {"msg_id": message_id, "emoji": emoji, "count": count,
+                "reacted_by_me": False}
+    # No row removed → enforce the visibility gate so a prober can't tell "no reaction
+    # here" from "message I can't see" (both 404 when not visible), and the count for a
+    # message the caller can't see never leaks.
+    await _visible_message(session, user.id, message_id)
     return {"msg_id": message_id, "emoji": emoji, "count": count,
             "reacted_by_me": False}

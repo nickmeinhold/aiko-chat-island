@@ -70,7 +70,12 @@ class InvalidEmoji(ValueError):
 
 class ReactionLimitExceeded(Exception):
     """The user already holds ``MAX_REACTIONS_PER_USER_PER_MESSAGE`` distinct emojis
-    on this message — a controlled 429 at the route, not an unbounded row spray."""
+    on this message — a controlled 429 at the route, not an unbounded row spray.
+
+    The cap is a SPRAY BOUND, not a hard quota (cage-match Tesla): the check-then-insert
+    is race-tolerant, so concurrent distinct adds can overshoot by a few. That is fine —
+    it bounds a single-actor amplifier, it is NOT a correctness invariant, so do not
+    later "enforce exactly N" with a serialized counter / DB constraint at this layer."""
 
 
 def validate_emoji(emoji: object) -> str:
@@ -216,7 +221,15 @@ async def purge_user_reactions(session: AsyncSession, user_id: str) -> None:
     """Delete every reaction authored by ``user_id`` — the account-deletion cascade
     teardown for this FK-to-``users`` child (children-before-parent, no ON DELETE
     CASCADE; the cascade guard requires it). Caller owns the transaction/commit,
-    like the other ``purge_user_*`` services."""
+    like the other ``purge_user_*`` services.
+
+    NO ``reaction`` frames are emitted for the purged rows (cage-match Tesla): account
+    deletion is a COLD-RELOAD event, the state-not-event tradeoff at N-message blast
+    radius. Live clients' counts on every message the deleted user touched self-heal on
+    the next re-page of each, exactly like any other reaction change — the app contract
+    treats reaction freshness as re-page-driven, never watermark/reconnect-driven, so
+    this needs no per-row repair delta (that would be a whole reactions-reset channel
+    for an ambient signal). Named, not silent."""
     await session.execute(
         delete(MessageReaction).where(MessageReaction.user_id == user_id))
 
