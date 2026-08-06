@@ -64,11 +64,17 @@ def reaction_frame(
     mine iff ``user_id`` is my own id. Carrying a per-viewer flag on a broadcast frame
     would be wrong for every recipient but the actor.
 
-    ``count`` is SERVER TRUTH, not a ±1 delta (cage-match Tesla): the client sets its
-    displayed count to this value, it does NOT add/subtract ``action`` from a local
-    tally. So out-of-order frames on the same emoji converge (last write wins the true
-    count) instead of drifting — the app contract must reconcile to ``count``, never
-    accumulate the deltas."""
+    ``count`` is a server-sampled ABSOLUTE value, not a ±1 delta (cage-match Tesla):
+    the client SETS its displayed count to this, it does NOT add/subtract ``action``
+    from a local tally — so a lost or duplicated frame can't accumulate drift. But it is
+    a BEST-EFFORT LIVE HINT, NOT a linearizable truth (cage-match round 5, Carnot):
+    the count is sampled just after each mutation commits, and frames can be delivered
+    out of order, so under concurrent add/remove a client can transiently land on a
+    stale absolute value. That is acceptable precisely because reactions are
+    state-not-event — the AUTHORITATIVE count is the next history re-page of the message
+    row (``aggregate_for_messages``), which the frame only optimises latency over. The
+    app contract must treat the frame count as a hint and reconcile to the re-paged
+    aggregate, never as the last word."""
     return {"type": "reaction", "channel_id": channel_id, "msg_id": msg_id,
             "emoji": emoji, "action": action, "user_id": user_id, "count": count}
 

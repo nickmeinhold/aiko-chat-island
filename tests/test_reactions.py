@@ -432,7 +432,7 @@ async def test_delete_removes_and_fans_out(app_ctx, session):
     hub.register(watcher)
 
     resp = await client.delete(
-        f"/v1/messages/{msg.id}/reactions/{THUMB}", headers=_auth(reactor))
+        f"/v1/messages/{msg.id}/reactions", params={"emoji": THUMB}, headers=_auth(reactor))
     assert resp.status_code == 200
     assert resp.json() == {"msg_id": msg.id, "emoji": THUMB, "count": 0,
                            "reacted_by_me": False}
@@ -496,7 +496,7 @@ async def test_delete_absent_reaction_fires_no_frame(app_ctx, session):
     hub.register(watcher)
 
     resp = await client.delete(
-        f"/v1/messages/{msg.id}/reactions/{THUMB}", headers=_auth(reactor))
+        f"/v1/messages/{msg.id}/reactions", params={"emoji": THUMB}, headers=_auth(reactor))
     assert resp.status_code == 200  # idempotent
     assert [f for f in watcher.sent if f.get("type") == "reaction"] == []
 
@@ -640,7 +640,7 @@ async def test_remove_own_reaction_on_soft_deleted_message_succeeds(app_ctx, ses
     hub.register(watcher)
 
     resp = await client.delete(
-        f"/v1/messages/{msg.id}/reactions/{THUMB}", headers=_auth(reactor))
+        f"/v1/messages/{msg.id}/reactions", params={"emoji": THUMB}, headers=_auth(reactor))
     assert resp.status_code == 200          # own row removed despite invisibility
     # count is NULL, not the live tally — no post-revocation count oracle for a message
     # the caller can no longer see (cage-match round 4).
@@ -652,31 +652,81 @@ async def test_remove_own_reaction_on_soft_deleted_message_succeeds(app_ctx, ses
         MessageReaction, (msg.id, reactor.id, THUMB)) is None
 
 
-async def test_remove_own_reaction_after_blocking_author_no_count_leak(app_ctx, session):
-    """Owned-remove after LOSING visibility via a block returns count=null and fires no
-    frame — the mutation succeeds (scar avoided) but the caller doesn't harvest the
-    current count of a message now hidden from them (cage-match round 4, the seam my
-    round-3 fix moved)."""
+async def test_remove_after_block_null_to_caller_but_peer_frame_fires(app_ctx, session):
+    """Owned-remove after LOSING visibility via a block: the CALLER gets count=null (no
+    post-revocation oracle) — but the message is still live for everyone else, so a
+    NEUTRAL peer STILL receives the removal frame and its count moves (cage-match round
+    5, Tesla P1 — the r4 fix wrongly froze peers' counts; fanout gates on message-live,
+    the response on caller-visibility)."""
     client, hub = app_ctx
+    author = await _user(session, "author")
+    reactor = await _user(session, "reactor")
+    peer = await _user(session, "peer")
+    ch = await _channel(session)
+    msg = await _msg(session, mid=1, channel=ch, sender=author)
+    await reactions_service.add_reaction(
+        session, user_id=reactor.id, message_id=msg.id, emoji=THUMB)
+    # reactor blocks the author → the message is now hidden from the REACTOR only.
+    await moderation_service.block_user(session, reactor.id, author.id)
+    # A neutral peer (no block relationship) subscribed to the channel.
+    peer_conn = _RecordingConn(peer.id)
+    peer_conn.subscribed.add(ch.id)
+    hub.register(peer_conn)
+    # The blocked author is also subscribed — must NOT get the reactor's frame.
+    author_conn = _RecordingConn(author.id)
+    author_conn.subscribed.add(ch.id)
+    hub.register(author_conn)
+
+    resp = await client.delete(
+        f"/v1/messages/{msg.id}/reactions", params={"emoji": THUMB},
+        headers=_auth(reactor))
+    assert resp.status_code == 200
+    assert resp.json()["count"] is None            # caller: no oracle
+    # Peer's count MUST move — the removal frame reaches them with the live count 0.
+    peer_frames = [f for f in peer_conn.sent if f.get("type") == "reaction"]
+    assert len(peer_frames) == 1
+    assert peer_frames[0]["action"] == "remove"
+    assert peer_frames[0]["count"] == 0
+    # The blocked author does NOT receive the reactor's frame.
+    assert [f for f in author_conn.sent if f.get("type") == "reaction"] == []
+    assert await session.get(MessageReaction, (msg.id, reactor.id, THUMB)) is None
+
+
+async def test_delete_roundtrips_hash_keycap_emoji_via_query(app_ctx, session):
+    """A keycap emoji legitimately contains '#' (#️⃣ = '#' + VS16 + keycap). Because the
+    emoji rides a QUERY PARAM, not a path segment, it round-trips cleanly — the exact
+    create-but-not-delete hazard a path '#' (URL fragment) would cause (cage-match
+    round 5, Tesla P2)."""
+    hash_keycap = "#️⃣"  # #️⃣
+    client, _ = app_ctx
     author = await _user(session, "author")
     reactor = await _user(session, "reactor")
     ch = await _channel(session)
     msg = await _msg(session, mid=1, channel=ch, sender=author)
-    # reactor reacts while it can see the message...
-    await reactions_service.add_reaction(
-        session, user_id=reactor.id, message_id=msg.id, emoji=THUMB)
-    # ...then blocks the author → the message (and its live count) is now hidden.
-    await moderation_service.block_user(session, reactor.id, author.id)
-    watcher = _RecordingConn(author.id)
-    watcher.subscribed.add(ch.id)
-    hub.register(watcher)
+    add = await client.post(f"/v1/messages/{msg.id}/reactions",
+                            json={"emoji": hash_keycap}, headers=_auth(reactor))
+    assert add.status_code == 200
+    # DELETE addresses it via ?emoji= — httpx percent-encodes the '#', so it survives.
+    rm = await client.delete(f"/v1/messages/{msg.id}/reactions",
+                             params={"emoji": hash_keycap}, headers=_auth(reactor))
+    assert rm.status_code == 200
+    assert rm.json()["count"] == 0  # actually removed, not stuck
 
-    resp = await client.delete(
-        f"/v1/messages/{msg.id}/reactions/{THUMB}", headers=_auth(reactor))
-    assert resp.status_code == 200
-    assert resp.json()["count"] is None
-    assert [f for f in watcher.sent if f.get("type") == "reaction"] == []
-    assert await session.get(MessageReaction, (msg.id, reactor.id, THUMB)) is None
+
+async def test_aggregate_projection_caps_per_message_emojis(session):
+    """The per-message projection is bounded (top-N by count) so a multi-user emoji
+    raid can't bloat one message's wire array (cage-match round 5, Tesla P3)."""
+    author = await _user(session, "author")
+    ch = await _channel(session)
+    msg = await _msg(session, mid=1, channel=ch, sender=author)
+    cap = reactions_service.MAX_EMOJIS_PROJECTED_PER_MESSAGE
+    # Distinct emojis from distinct users, well past the projection cap.
+    for i in range(cap + 10):
+        u = await _user(session, f"u{i}")
+        await reactions_service.add_reaction(
+            session, user_id=u.id, message_id=msg.id, emoji=f"e{i:03d}")
+    agg = await reactions_service.aggregate_for_messages(session, [msg.id], author.id)
+    assert len(agg[msg.id]) == cap  # long tail truncated from the projection
 
 
 async def test_remove_without_row_on_hidden_message_404(app_ctx, session):
@@ -692,7 +742,7 @@ async def test_remove_without_row_on_hidden_message_404(app_ctx, session):
     msg = await _msg(session, mid=1, channel=ch, sender=author)
     # outsider never reacted and can't read the private channel → 404, not a count.
     resp = await client.delete(
-        f"/v1/messages/{msg.id}/reactions/{THUMB}", headers=_auth(outsider))
+        f"/v1/messages/{msg.id}/reactions", params={"emoji": THUMB}, headers=_auth(outsider))
     assert resp.status_code == 404
 
 

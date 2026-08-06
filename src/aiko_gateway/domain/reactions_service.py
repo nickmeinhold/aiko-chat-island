@@ -61,6 +61,15 @@ MAX_EMOJI_LEN = 64
 # would a person add" while killing the amplifier.
 MAX_REACTIONS_PER_USER_PER_MESSAGE = 20
 
+# Max distinct emojis PROJECTED per message in a history page. The per-user cap bounds
+# ONE actor; this bounds the MESSAGE-level amplifier (cage-match round 5, Tesla — N
+# colluding users × 20 each would still bloat one message's reactions[]). Enforced at
+# the PROJECTION, not as a write cap: the top-N by count are returned (the rest are the
+# long tail nobody renders), so there is no first-emoji-wins write race and every
+# reaction still persists + counts toward its emoji if it's in the top band. 50 is far
+# above any real message's distinct-emoji count while capping the wire array.
+MAX_EMOJIS_PROJECTED_PER_MESSAGE = 50
+
 
 class InvalidEmoji(ValueError):
     """The supplied emoji is empty/blank, over-long, or carries a structural hazard
@@ -215,8 +224,12 @@ async def aggregate_for_messages(
             "count": count,
             "reacted_by_me": (message_id, emoji) in mine,
         })
-    for entries in by_msg.values():
+    for message_id, entries in by_msg.items():
         entries.sort(key=lambda e: (-e["count"], e["emoji"]))
+        # Truncate the long tail so a multi-user emoji raid can't bloat one message's
+        # wire array — top-N by count, the band anyone actually renders.
+        if len(entries) > MAX_EMOJIS_PROJECTED_PER_MESSAGE:
+            by_msg[message_id] = entries[:MAX_EMOJIS_PROJECTED_PER_MESSAGE]
     return by_msg
 
 

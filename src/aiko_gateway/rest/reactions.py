@@ -30,7 +30,7 @@ oracle, cage-match round 2). See ``reactions_service`` for the full reasoning.
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from ..domain import acl, messages_service, moderation_service, reactions_service
@@ -133,27 +133,35 @@ async def add_reaction(
             "reacted_by_me": True}
 
 
-@router.delete("/messages/{message_id}/reactions/{emoji}",
+@router.delete("/messages/{message_id}/reactions",
                dependencies=[rate_limit("reactions")])
 async def remove_reaction(
-    message_id: str, emoji: str, user: CurrentUser, session: DbSession,
-    request: Request,
+    message_id: str, user: CurrentUser, session: DbSession, request: Request,
+    emoji: str = Query(..., description="the reaction emoji to remove"),
 ) -> dict:
     """Remove the caller's ``emoji`` reaction from a message (idempotent). 422 if the
-    emoji is malformed (checked before anything).
+    emoji is malformed.
 
-    The MUTATION is gated on OWNERSHIP, the RESPONSE + FANOUT on current VISIBILITY
-    (cage-match rounds 3-4, Tesla + Carnot). Un-reacting your OWN row is a
-    strictly-reducing self-owned action, so it must stay possible even after you lose
-    sight of the message (takedown, private-channel kick, a new block) — otherwise your
-    reaction is an un-deletable scar. BUT the response must not become a post-revocation
-    count oracle: a caller who removed a row while no longer able to see the message
-    gets a MINIMAL body (``count: null``) and NO fanout — the row is gone, but the live
-    aggregate for a channel they've lost is not handed back, and no identity frame is
-    emitted into a channel they've left. If they CAN still see it (the common case),
-    the real count + a live frame flow. If NO row was removed, fall back to the same
-    existence-hiding 404 ``add`` uses, so a caller with no row can't probe a message
-    they can't see."""
+    The emoji rides a QUERY PARAM, not a path segment (cage-match round 5, Tesla): an
+    opaque token in the path is a URL-grammar hazard (``/`` ``#`` ``?`` ``%`` truncate
+    or fork the request, and keycap emoji like ``#️⃣`` legitimately CONTAIN ``#``), so
+    a path-stored reaction could be un-removable. A query value is percent-encoded
+    end-to-end and dissolves the whole class.
+
+    THREE audiences, THREE gates (cage-match rounds 3-5, Tesla + Carnot):
+    * MUTATION → OWNERSHIP. Un-reacting your OWN row is a strictly-reducing self-owned
+      action, allowed even after you lose sight of the message (takedown / kick / a new
+      block) — otherwise your reaction is an un-deletable scar.
+    * FANOUT → the MESSAGE being a live target (exists + not soft-deleted), NOT the
+      caller's visibility. The frame serves OTHER subscribers, who can still see the
+      message; their anonymous count must move on your removal even if YOU no longer
+      see it. (Gating fanout on the caller's visibility froze peers' counts — the r4
+      regression this fixes.)
+    * RESPONSE count → the CALLER's visibility. A caller who removed a row while no
+      longer able to see the message gets ``count: null`` — no post-revocation count
+      oracle for a channel they've lost.
+    If NO row was removed, fall back to the existence-hiding 404 ``add`` uses, so a
+    caller with no row can't probe a message they can't see."""
     try:
         emoji = reactions_service.validate_emoji(emoji)
     except reactions_service.InvalidEmoji as exc:
@@ -161,15 +169,17 @@ async def remove_reaction(
     count, changed = await reactions_service.remove_reaction(
         session, user_id=user.id, message_id=message_id, emoji=emoji)
     if changed:
-        # Owned a row → the mutation is always allowed. Gate the count + fanout on
-        # whether the caller can STILL see the message: if not, the row is gone but we
-        # return no fresh count (null) and emit no frame — no post-revocation oracle.
-        visible = await _resolve_visible_message(session, user.id, message_id)
-        if visible is not None:
+        # FANOUT: gate on the MESSAGE being a live target (unfiltered fetch), so peers'
+        # counts move even when the caller has lost visibility.
+        live = await messages_service.get_message(session, message_id)
+        if live is not None and live.deleted_at is None:
             await _fanout(
-                request, session, channel_id=visible.channel_id, msg_id=message_id,
+                request, session, channel_id=live.channel_id, msg_id=message_id,
                 emoji=emoji, action=ReactionAction.REMOVE, actor_id=user.id,
-                author_id=visible.sender_user_id, count=count)
+                author_id=live.sender_user_id, count=count)
+        # RESPONSE: gate the count on the CALLER's own visibility — null if they've lost
+        # it (no oracle), the real count if they can still see the message.
+        if await _resolve_visible_message(session, user.id, message_id) is not None:
             return {"msg_id": message_id, "emoji": emoji, "count": count,
                     "reacted_by_me": False}
         return {"msg_id": message_id, "emoji": emoji, "count": None,
