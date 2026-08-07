@@ -13,7 +13,7 @@ import enum
 
 from sqlalchemy import (
     JSON, BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer,
-    String, Text, UniqueConstraint,
+    PrimaryKeyConstraint, String, Text, UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -909,5 +909,97 @@ class PendingRecovery(Base):
         DateTime(timezone=True), nullable=False)
     # sha256 hex of the high-entropy finalize token (never the raw token).
     finalize_token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow)
+
+
+class MessageReaction(Base):
+    """One user's SIGNED emoji reaction to one message (#2634, v2 social layer).
+
+    IDENTITY-BEARING + SIGNED FROM DAY ONE (rebuild after the reverted anonymous
+    first cut). A reaction is a *signed lightweight endorsement* — raw material for
+    the Carried Record (#2506) — so it carries the reactor's ``user_id`` (exposed on
+    read, NOT an anonymous tally) and its Ed25519 ``origin`` envelope, captured at
+    birth (you cannot sign history retroactively). The gateway CARRIES the envelope,
+    it does not verify it (identical posture to a signed message — see
+    ``signing.validate_origin`` and the message ``origin`` column); an absent/garbage
+    origin reads as "unverified", never "invalid" (a legacy/degraded client may react
+    unsigned and is still carried). See
+    ``docs/crucible/sovereign-reaction-signing/SIGNING-SPEC.md``.
+
+    STATE, NOT EVENT — the deliberate contrast with ``Retraction`` (#7). A
+    retraction needs its own forward-ULID row because a takedown mutates a message
+    *below* a client's watermark, and ``get_history`` catch-up (``id > after``) would
+    never replay it. A reaction changes an *aggregate* that ``message_view``
+    recomputes on every history read, so a client that misses the live ``reaction``
+    frame self-heals the moment it re-pages that message — no second event feed, no
+    forward-ULID row, just this table. (A signed ``remove`` is authorised by row
+    OWNERSHIP here, not persisted as a second signed event; if a reputation trail ever
+    needs the signed-remove history, that is the additive forward-ULID upgrade, exactly
+    like ``Retraction``.)
+
+    NAMED TRADEOFF (state-not-event, cage-match this): a reaction add/remove on a
+    message a client has ALREADY synced is not force-caught-up — the live ``reaction``
+    frame is best-effort and the ``id > after`` cursor doesn't advance for a reaction
+    (it mints no id on the message axis). It self-heals only when the client re-reads
+    that message ROW — scroll-up ``before`` paging, a cold reload, or a re-bind that
+    re-fetches history. NOT "on reconnect": a client that keeps synced messages
+    resident and only forward-pages from its watermark never re-reads the row, so its
+    aggregate stays frozen until it re-fetches. Ambient-signal eventual consistency
+    (Slack/Discord reactions behave the same).
+
+    COMPOSITE PK ``(message_id, user_id, emoji)`` makes a repeat-react idempotent —
+    one row per (message, user, emoji), the same one-row-per-relationship shape as
+    ``Membership`` / ``CommunityMembership``, AND exactly the SIGNING-SPEC idempotency
+    key ``(user, target_msg_id, exact-emoji-bytes)`` (the emoji is stored as the exact
+    UTF-8 the client signed, never normalised — the spec's canonicalization rule). The
+    reaction's OWN ``client_msg_id`` (signing-bytes field #4) rides INSIDE ``origin``;
+    it is not a separate key, since the PK already pins uniqueness. Re-adding the same
+    emoji is a no-op (INSERT-or-ignore in ``reactions_service``); a different emoji from
+    the same user is a NEW row. The PK's leading ``message_id`` covers the aggregation
+    read (``WHERE message_id IN (...) GROUP BY message_id, emoji``); ``user_id`` is
+    separately indexed for the account-deletion purge and the per-viewer
+    ``reacted_by_me`` probe.
+
+    ``emoji`` is an OPAQUE client string (the gateway never renders or normalises it),
+    bounded to 64 chars as defense-in-depth — a real emoji, incl. a ZWJ sequence
+    (family, skin-tone, flag) is well under that; the cap just stops an unbounded blob
+    masquerading as an emoji (mirrors the pubkey-length caps elsewhere).
+
+    ``origin`` is the shape-validated sovereign-signing envelope (JSON), NULL for an
+    unsigned reaction — identical column semantics to ``Message.origin``.
+
+    No ON DELETE CASCADE (codebase convention): account deletion tears these down
+    explicitly via ``reactions_service.purge_user_reactions`` (the cascade guard
+    requires it), and channel hard-delete tears them down before its messages (they
+    FK ``messages.id`` — verify-the-neighbor, like ``MessageReport`` in
+    ``channels_service.hard_delete_channel``).
+
+    Message SOFT-DELETE (takedown, #7) deliberately does NOT purge reactions — the
+    same reason it preserves the message body/row: a soft-delete is REVERSIBLE, so its
+    children are preserved-and-hidden, not destroyed (a reversed takedown restores the
+    reactions with the message). The reactions are inert while hidden — ``get_history``
+    never returns a ``deleted_at`` row, so its reactions never surface in an aggregate,
+    and the visibility gate refuses a NEW reaction on a soft-deleted message. Only the
+    two IRREVERSIBLE deletes (channel hard-delete, account deletion) purge.
+    """
+    __tablename__ = "message_reactions"
+    __table_args__ = (
+        # The composite PK IS the (message_id, user_id, emoji) uniqueness — declared
+        # here (not column-level) so the ORM metadata matches the hand-written 0018
+        # migration exactly (the parity gate diffs reflected constraints).
+        PrimaryKeyConstraint(
+            "message_id", "user_id", "emoji", name="pk_message_reactions"),
+    )
+    message_id: Mapped[str] = mapped_column(
+        ForeignKey("messages.id"), nullable=False)
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id"), nullable=False, index=True)
+    emoji: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Sovereign-signing envelope (#1816/#2634): the client-supplied `origin` object,
+    # shape-validated at the trust boundary (domain/signing.validate_origin) and echoed
+    # verbatim on read so a client can verify the endorsement. NULL for an unsigned
+    # reaction — an absent origin reads as "unverified", never "invalid".
+    origin: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow)

@@ -7,7 +7,20 @@ change touches `aiko/payload.py`, never this file — the /v1 contract is frozen
 """
 from __future__ import annotations
 
+import enum
 from typing import Any
+
+
+class ReactionAction(enum.StrEnum):
+    """Closed set of reaction-frame actions (#2634). StrEnum (3.12) so the member's
+    value IS the wire string — the same closed-set-as-StrEnum idiom the persistence
+    layer uses for Role/Platform/etc. Typing the ``reaction_frame`` action against
+    this stops a stray ``"added"`` from fanning out with no type rail. Not persisted
+    (reactions are STATE rows; the action is a live delta + a signed field inside the
+    reaction's own ``origin``), so it lives here at the wire layer, not in models.py."""
+
+    ADD = "add"
+    REMOVE = "remove"
 
 
 # -- server -> client builders ----------------------------------------------
@@ -30,6 +43,46 @@ def retraction_frame(channel_id: str, retraction_id: str, target_msg_id: str) ->
     shape as the history `retraction` item (messages_service.retraction_view)."""
     return {"type": "retraction", "channel_id": channel_id,
             "id": retraction_id, "target_msg_id": target_msg_id}
+
+
+def reaction_frame(
+    channel_id: str, msg_id: str, emoji: str, action: ReactionAction,
+    user_id: str, origin: dict | None,
+) -> dict:
+    """Server->client discrete reaction event (#2634): tells a live subscriber that
+    ``user_id`` added/removed ``emoji`` on ``msg_id``, carrying the reactor's signed
+    ``origin`` envelope on an ``add`` (present iff the reaction was signed; omitted on
+    ``remove`` and for an unsigned add). ``action`` is a ``ReactionAction`` (its value
+    — ``"add"`` | ``"remove"`` — rides the wire).
+
+    IDENTITY-DELTA, NO COUNT (the honest fix for the anonymous model's count-oracle).
+    The frame names the REACTOR and the ACTION; it carries NO server-computed count.
+    A client applies it as a SET membership change on its own filtered aggregate —
+    ``add`` inserts ``user_id`` into that emoji's reactor set, ``remove`` drops it —
+    and derives the count as the set size. Set semantics make the frame idempotent and
+    order-tolerant for a given (user, emoji): a duplicated or reordered ``add`` is a
+    no-op, a lost frame self-heals on the next history re-page (state-not-event). This
+    is why a broadcast frame needs no absolute count: an anonymous global count on a
+    fan-out frame would disagree with each recipient's block-filtered history count and
+    leak that a hidden user reacted (the count oracle). Here every path — history
+    aggregate, this frame's delivery — is filtered by the SAME block predicate: a
+    subscriber in a block relationship with the reactor (or the message author) never
+    receives this frame (route-level fanout exclusion), so their count never moves for
+    someone they can't see. One predicate, all paths; no oracle by construction.
+
+    Discrete on PURPOSE — NOT a re-serialised message. A reaction is STATE the history
+    read recomputes (state-not-event, see the MessageReaction model), so a live client
+    applies this delta and an offline one self-heals on the next re-page; there is no
+    forward-ULID advance and no ``retraction``-style catch-up row.
+
+    ``reacted_by_me`` is deliberately ABSENT — it is viewer-dependent and this one
+    frame fans out to every eligible subscriber, so each client derives it locally: the
+    reaction is mine iff ``user_id`` is my own id."""
+    frame = {"type": "reaction", "channel_id": channel_id, "msg_id": msg_id,
+             "emoji": emoji, "action": action, "user_id": user_id}
+    if origin is not None:
+        frame["origin"] = origin
+    return frame
 
 
 def suback(channel_fences: dict[str, str]) -> dict:

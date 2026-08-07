@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Query
 
-from ..domain import acl, messages_service
+from ..domain import acl, messages_service, moderation_service, reactions_service
 from ..domain.models import Message
 from .deps import CurrentUser, DbSession
 
@@ -38,6 +38,15 @@ async def history(
     rows = await messages_service.get_history(
         session, channel_id, user.id, before=before, after=after, limit=limit
     )
+    # Reaction aggregate (#2634), block-filtered for THIS viewer. One block-pair probe
+    # + one grouped reactions query for the whole page (never N+1), injected into each
+    # message_view. The SAME block predicate that gates the live `reaction` frame's
+    # fanout, so history and live agree (no count oracle). Retraction items are
+    # content-less events with no reactions.
+    msg_ids = [r.id for r in rows if isinstance(r, Message)]
+    blocked = await moderation_service.blocked_pair_user_ids(session, user.id)
+    reactions = await reactions_service.aggregate_for_messages(
+        session, msg_ids, user.id, blocked_user_ids=blocked)
     # Heterogeneous stream (#7): message items AND takedown `retraction` items,
     # interleaved in ULID order. Both advance next_before/next_after (each row has an
     # `id` on the shared axis), so a client paging forward from its watermark receives
@@ -45,7 +54,8 @@ async def history(
     # (wire contract option A) so the app disambiguates by a single `type` field;
     # message_view stays untyped, keeping the WS/bus fanout shape unchanged.
     items = [
-        {"type": "message", **messages_service.message_view(r)}
+        {"type": "message",
+         **messages_service.message_view(r, reactions=reactions.get(r.id))}
         if isinstance(r, Message)
         else messages_service.retraction_view(r)
         for r in rows

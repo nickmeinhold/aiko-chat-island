@@ -45,8 +45,8 @@ from aiko_gateway.domain import (
     signing_keys_service, users_service)
 from aiko_gateway.domain.models import (
     DEFAULT_COMMUNITY_ID, Channel, Community, CommunityMembership, Membership,
-    Message, MessageReport, PasskeyCredential, PendingRecovery, RecoveryApprover,
-    RecoveryPolicy, SigningKey, SocialIdentity, User)
+    Message, MessageReaction, MessageReport, PasskeyCredential, PendingRecovery,
+    RecoveryApprover, RecoveryPolicy, SigningKey, SocialIdentity, User)
 from aiko_gateway.domain.ids import new_ulid
 
 
@@ -97,6 +97,7 @@ EXPECTED_USERS_FK_COLUMNS: set[tuple[str, str]] = {
     ("recovery_policies", "user_id"),         # delete (Design 05)
     ("recovery_approvers", "user_id"),        # delete (Design 05)
     ("pending_recovery", "user_id"),          # delete (Design 05)
+    ("message_reactions", "user_id"),         # delete (#2634)
 }
 
 
@@ -194,6 +195,12 @@ async def _seed_full_user_graph(session):
         reason="spam", resolution="dismissed",
         created_at=dt.datetime(2026, 7, 27, tzinfo=dt.timezone.utc),
         resolved_at=dt.datetime(2026, 7, 27, tzinfo=dt.timezone.utc)))
+    # message_reactions.user_id (#2634) — primary reacts to other's message M2, so
+    # deletion must purge it (children-before-parent) before the primary user row.
+    session.add(MessageReaction(
+        message_id="M2".ljust(26, "0"), user_id=user.id, emoji="👍",
+        origin=None,
+        created_at=dt.datetime(2026, 8, 8, tzinfo=dt.timezone.utc)))
     await session.commit()
     # signing_keys.user_id (#1816 PR B) — primary has an observed signing key.
     # record_signing_key does not commit (caller owns the txn), so commit here.
@@ -386,6 +393,10 @@ async def _seed_fk_safe(session):
     await moderation_service.block_user(session, other.id, user.id)
     await moderation_service.report_message(
         session, reporter_id=user.id, message_id="M2".ljust(26, "0"), reason="spam")
+    # message_reactions.user_id (#2634) — FK-safe: M2 + user committed in layer 3.
+    session.add(MessageReaction(
+        message_id="M2".ljust(26, "0"), user_id=user.id, emoji="👍", origin=None,
+        created_at=dt.datetime(2026, 8, 8, tzinfo=dt.timezone.utc)))
     # signing_keys.user_id (#1816 PR B) — FK-safe (user committed above); commit
     # since record_signing_key leaves the txn to the caller.
     await signing_keys_service.record_signing_key(
