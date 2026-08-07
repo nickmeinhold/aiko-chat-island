@@ -156,10 +156,15 @@ async def add_reaction(
                  "reactions per message")
     blocked = await moderation_service.blocked_pair_user_ids(session, user.id)
     if changed:
+        # Fan out the PERSISTED origin, not the request origin (cage-match Tesla r3):
+        # under first-signature-wins a concurrent add may have kept a different (still
+        # valid) signature, so the live frame must carry what history will recompute.
+        persisted = await reactions_service.persisted_origin(
+            session, message_id=message_id, user_id=user.id, emoji=emoji)
         await _fanout(
             request, session, channel_id=msg.channel_id, msg_id=message_id,
             emoji=emoji, action=ReactionAction.ADD, actor_id=user.id,
-            author_id=msg.sender_user_id, origin=origin)
+            author_id=msg.sender_user_id, origin=persisted)
     count = await reactions_service.emoji_count(
         session, message_id, emoji, blocked_user_ids=blocked)
     return {"msg_id": message_id, "emoji": emoji, "count": count,

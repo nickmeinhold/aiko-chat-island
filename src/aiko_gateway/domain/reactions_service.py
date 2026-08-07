@@ -223,6 +223,20 @@ async def add_reaction(
     return exists is None
 
 
+async def persisted_origin(
+    session: AsyncSession, *, message_id: str, user_id: str, emoji: str,
+) -> dict | None:
+    """The ``origin`` CURRENTLY STORED for a reaction row — the durable attestation a
+    history re-page will echo. The live ``reaction`` fanout frame carries THIS, not the
+    caller's request origin (cage-match Tesla r3): under first-signature-wins, a
+    concurrent signed add (or an unsigned add that lost to a signed row) would otherwise
+    fan out an ``origin`` the store discarded, so a subscriber's live delta would carry
+    a different (though still valid) signature than the one history recomputes. Reading
+    back the persisted value makes the live frame and the durable aggregate agree."""
+    row = await session.get(MessageReaction, (message_id, user_id, emoji))
+    return row.origin if row is not None else None
+
+
 async def remove_reaction(
     session: AsyncSession, *, user_id: str, message_id: str, emoji: str,
 ) -> bool:

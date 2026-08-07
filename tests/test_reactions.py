@@ -452,6 +452,11 @@ async def test_add_fans_out_identity_delta_no_count(app_ctx, session):
     assert frame["action"] == ReactionAction.ADD
     assert frame["user_id"] == reactor.id
     assert frame["origin"] == origin
+    # The frame carries the PERSISTED origin (durable truth history recomputes), not
+    # merely the echoed request — they coincide here (no race) but the frame is read
+    # back from the row (cage-match Tesla r3).
+    persisted = await session.get(MessageReaction, (msg.id, reactor.id, THUMB))
+    assert frame["origin"] == persisted.origin
     assert "count" not in frame  # identity delta, not a broadcast count
 
 
