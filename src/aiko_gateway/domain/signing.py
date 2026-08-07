@@ -232,8 +232,9 @@ def reaction_signing_bytes(
     event. Like ``signing_bytes`` this is NOT used on the production carry path (the
     gateway carries, does not verify) — it is the drift-guard exercised by the
     golden-vector test so our reconstruction can never silently diverge from the
-    app's signer. PROPOSED layout pending app-tab confirmation; see
-    docs/crucible/sovereign-reaction-signing/SIGNING-SPEC.md."""
+    app's signer. Layout GROUNDED against the app's shipped message signer
+    (message_signing.dart) — authoritative by construction via the shared-machinery
+    proof; see docs/crucible/sovereign-reaction-signing/SIGNING-SPEC.md."""
     def lp(b: bytes) -> bytes:
         return struct.pack(">I", len(b)) + b
 

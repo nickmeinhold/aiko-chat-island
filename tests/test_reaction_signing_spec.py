@@ -6,10 +6,13 @@ so the gateway's notion of "what was signed" can never silently drift from the a
 signer's. This is the drift-guard half of the co-authored interop contract in
 ``docs/crucible/sovereign-reaction-signing/SIGNING-SPEC.md``.
 
-STATUS: the golden vector below is the gateway's PROPOSED layout. When the app tab
-confirms its real signer reproduces these bytes, this vector becomes authoritative
-and a change to it is a v2 (never a silent edit) — identical discipline to the
-message golden vector in ``test_message_signing_carriage``.
+STATUS: the golden vector below is AUTHORITATIVE BY CONSTRUCTION. The layout is
+grounded against the app's shipped message signer (``message_signing.dart:69-102``),
+and the *message* golden vector already proves the gateway's Python encoding
+machinery and the app's Dart machinery emit byte-identical output — those primitives
+are field-agnostic, so the proof transfers to this layout. A change to this vector is
+a v2 (never a silent edit). The app pins the same hex in Dart as a cross-language
+drift backstop — identical discipline to ``test_message_signing_carriage``.
 
 Built from ``signing`` alone (no ``main`` import) to keep the suite's
 "never import aiko_services" isolation invariant.

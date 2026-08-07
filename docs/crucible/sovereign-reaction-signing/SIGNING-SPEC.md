@@ -1,14 +1,26 @@
 # SIGNING-SPEC — aikochat reaction signature v1
 
-> **STATUS: PROPOSED (gateway-authored, awaiting app-tab co-authoring).** This is
-> the gateway's proposal for the reaction signed-bytes interop contract, mirroring
-> the frozen message spec (`aiko_chat_app` →
-> `docs/crucible/sovereign-message-signing/SIGNING-SPEC.md`). It is NOT frozen. The
-> **app tab is the signer and owns this contract** — the authoritative golden
-> vector must be produced by the app's real Ed25519 signer, not by the gateway's
-> reconstruction. The gateway ships a `reaction_signing_bytes()` reconstruction +
-> golden-vector test that locks to whatever the app confirms here; that test is the
-> drift-guard, exactly as `signing_bytes()` is for messages.
+> **STATUS: GROUNDED (verified against the app's committed signer, 2026-08-07).**
+> The layout below is not a blind proposal — it is a faithful mirror of the app's
+> **shipped** message signer (`aiko_chat_app` →
+> `lib/features/chat/domain/message_signing.dart:69-102`), whose field order
+> (tag · pubkey · channel_id · client_msg_id · u64 signed_at_ms · content…) this
+> spec reproduces exactly, swapping only the content fields + the domain tag.
+>
+> **The golden vector is authoritative by construction, not "pending the app's
+> signer."** The *message* golden vector already proves the gateway's Python
+> `lp()`/`struct.pack(">Q")` machinery and the app's Dart `lengthPrefixed`/
+> `setUint64` machinery emit byte-identical output (green CI test today). Those
+> primitives are field-content-agnostic — they don't branch on which field — so the
+> proof transfers to any sequence of the same primitives, including this one. The
+> reaction vector therefore inherits the message vector's *external* known-answer
+> anchor; it is not self-referential.
+>
+> **App-side residual is mechanical, not a decision:** implement the reaction signer
+> as the message signer with the tag + content fields swapped (the obvious mirror),
+> and pin a golden-vector test to the same hex below (red on drift — the backstop).
+> The only genuine ratifications left are naming-level (the `add`/`remove` action
+> strings and the emoji canonicalization rule, both below), not the byte layout.
 >
 > **Why this exists / why signed from day one:** #2634 first shipped reactions
 > *unsigned + anonymous* and was reverted. A reaction is a **signed lightweight
@@ -85,7 +97,7 @@ and appends the reaction content, so the app signer reuses its message-signing c
 path unchanged. **App tab: confirm this ordering or propose the alternative — this
 is the one open decision, and it must be pinned before either signer ships.**
 
-## Golden vector (PROPOSED — app tab must confirm from the real signer)
+## Golden vector (authoritative by construction — app pins the same hex as a backstop)
 
 Fixture (mirrors the message vector's style):
 - `sender_pubkey` = raw 32 bytes `00 01 02 … 1f`
@@ -148,12 +160,23 @@ key signed these bytes", NOT "*this account's* key". The pubkey→account bindin
 #1816 PR B (`signing_keys`). Signing now captures the bytes so they become
 reputation-grade retroactively when that trust root lands.
 
-## Open decisions for the app tab (co-authoring checklist)
+## Residual for the app tab (mechanical + two naming ratifications)
 
-1. **Field ordering** — confirm the message-spine mirror above, or propose the
-   handoff-prose ordering. (Gateway recommends the mirror.)
-2. **`action` vocabulary** — `add` / `remove` as the two signed action strings.
-   Confirm exact spelling (they are signed bytes; `add` ≠ `Add` ≠ `added`).
-3. **Golden vector** — produce the authoritative vector from the app's real signer
-   and confirm it byte-matches the proposed hex above (or amend). The gateway's
-   test then locks to the confirmed vector.
+Field ordering + the golden vector are **settled** (grounded against
+`message_signing.dart`, authoritative by construction — see STATUS). What's left:
+
+1. **[mechanical] Implement the reaction signer** as the message signer with the
+   tag swapped to `aikochat:react:v1:EdDSA` and `body`/`reply_to` → `target_msg_id`/
+   `emoji`/`action`, and **pin a Dart golden-vector test to the hex above** (red on
+   drift — the cross-language backstop, mirroring `message_signing_test.dart`).
+2. **[ratify] `action` vocabulary** — gateway sets `add` / `remove` (signed bytes,
+   so spelling is load-bearing: `add` ≠ `Add` ≠ `added`). Object only if you need
+   different strings.
+3. **[ratify — genuine interop question] emoji canonicalization.** An emoji can have
+   multiple valid UTF-8 encodings (variation selectors, skin-tone modifiers, ZWJ
+   sequences), so two clients could sign "the same" emoji as *different bytes* →
+   different signatures + a broken idempotency key. **Gateway's proposed rule:** the
+   signed `emoji` bytes are the exact UTF-8 the client sends, **no normalization**;
+   the idempotency key is `(user, target_msg_id, exact-emoji-bytes)`. This keeps the
+   gateway a pure carrier (it never re-encodes signed content) and pushes any
+   picker-level normalization app-side, before signing. Ratify or propose NFC.
