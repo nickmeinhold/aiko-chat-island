@@ -48,7 +48,7 @@ from __future__ import annotations
 
 import datetime as dt
 
-from sqlalchemy import Select, delete, func, select
+from sqlalchemy import Select, delete, func, select, tuple_
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -227,70 +227,122 @@ async def aggregate_for_messages(
     session: AsyncSession, message_ids: list[str], viewer_id: str, *,
     blocked_user_ids: set[str],
 ) -> dict[str, list[dict]]:
-    """Reaction aggregate for a PAGE of messages, in ONE query — never N+1 per message.
-    Returns ``{message_id: [{"emoji", "count", "reacted_by_me", "reactors": [...]},
-    ...]}`` with an entry only for messages that have at least one (visible) reaction
-    (absent == none, so the serializer defaults to ``[]``).
+    """Reaction aggregate for a PAGE of messages. Returns ``{message_id: [{"emoji",
+    "count", "reacted_by_me", "reactors": [...]}, ...]}`` with an entry only for
+    messages that have at least one (visible) reaction (absent == none, so the
+    serializer defaults to ``[]``).
 
     IDENTITY-BEARING + BLOCK-FILTERED (bounded-A). Each emoji entry carries the reactor
     list — ``reactors`` is ``[{"user_id", "origin"?}, ...]`` (``origin`` present iff the
     reaction was signed) — bounded to ``MAX_REACTORS_PROJECTED_PER_EMOJI`` while
     ``count`` stays the FULL filtered tally (count authoritative, faces a bounded
     sample). Every viewer-dependent bit — ``count``, ``reactors``, ``reacted_by_me`` —
-    is filtered by the SAME block predicate: a reaction from a user in
-    ``blocked_user_ids`` (the viewer's block pairs, computed once by the caller) is
-    dropped entirely. Since the live ``reaction`` frame is also block-filtered (fanout
-    exclusion) and carries no count, all paths agree — no count oracle.
+    is filtered by the SAME block predicate (``blocked_user_ids``, the viewer's block
+    pairs, computed once by the caller). Since the live ``reaction`` frame is also
+    block-filtered (fanout exclusion) and carries no count, all paths agree — no oracle.
 
-    Per-emoji rows are ordered ``(-count, emoji)`` — most-reacted first, ties broken by
-    the opaque emoji string for a stable, deterministic wire order. Reactors within a
-    group preserve insertion order (created_at, then user_id) for a stable sample."""
+    BOUNDED AT THE DB, NOT JUST THE WIRE (cage-match: Carnot REQUEST_CHANGES + Tesla —
+    a hot message must not force full-table materialization of every reactor's origin
+    JSON on a history read). Three cheap queries, none of which materializes all rows:
+      1. ``counts`` — ``GROUP BY (message_id, emoji) COUNT(*)``, block-filtered. The
+         authoritative tally, and it never loads an ``origin`` blob.
+      2. ``mine`` — the viewer's OWN (message_id, emoji, origin) rows only. Drives
+         ``reacted_by_me`` reliably (the viewer may fall past the sample) and lets the
+         projection keep the viewer's own emoji groups + pin the viewer's own face.
+      3. ``sample`` — a windowed ``ROW_NUMBER() <= N`` fetch of reactor identities +
+         origin, restricted to the (message_id, emoji) groups that actually survive the
+         per-message projection. So the only rows whose ``origin`` is loaded are the
+         ≤N faces of the ≤MAX_EMOJIS groups per message that the wire will carry.
+
+    Per-emoji rows are ordered ``(-count, emoji)``; reactor samples preserve insertion
+    order (created_at, then user_id) for a stable, deterministic wire order."""
     if not message_ids:
         return {}
-    rows = (await session.execute(
-        select(
-            MessageReaction.message_id, MessageReaction.emoji,
-            MessageReaction.user_id, MessageReaction.origin,
-        )
-        .where(MessageReaction.message_id.in_(message_ids))
-        .order_by(MessageReaction.created_at, MessageReaction.user_id))).all()
 
-    # Group by (message_id, emoji), dropping blocked reactors (identity AND count).
-    grouped: dict[tuple[str, str], list[dict]] = {}
-    for message_id, emoji, user_id, origin in rows:
-        if user_id in blocked_user_ids:
-            continue
-        reactor: dict = {"user_id": user_id}
-        if origin is not None:
-            reactor["origin"] = origin
-        grouped.setdefault((message_id, emoji), []).append(reactor)
+    def _blocked(stmt):
+        return stmt.where(MessageReaction.user_id.notin_(blocked_user_ids)) \
+            if blocked_user_ids else stmt
+
+    # (1) Authoritative, block-filtered counts — no origin materialized.
+    counts = {
+        (m, e): c for m, e, c in (await session.execute(_blocked(
+            select(MessageReaction.message_id, MessageReaction.emoji, func.count())
+            .where(MessageReaction.message_id.in_(message_ids)))
+            .group_by(MessageReaction.message_id, MessageReaction.emoji))).all()
+    }
+    if not counts:
+        return {}
+    # (2) The viewer's OWN rows (never block-filtered — you can't block yourself).
+    mine = {
+        (m, e): origin for m, e, origin in (await session.execute(
+            select(MessageReaction.message_id, MessageReaction.emoji,
+                   MessageReaction.origin)
+            .where(MessageReaction.message_id.in_(message_ids),
+                   MessageReaction.user_id == viewer_id))).all()
+    }
+
+    # Project the emoji groups per message FIRST (top-N by count ∪ the viewer's own),
+    # so the reactor sample below fetches origins only for groups the wire will carry.
+    projected: dict[str, list[str]] = {}
+    for (message_id, emoji), _c in counts.items():
+        projected.setdefault(message_id, []).append(emoji)
+    wanted: list[tuple[str, str]] = []
+    for message_id, emojis in projected.items():
+        emojis.sort(key=lambda e: (-counts[(message_id, e)], e))
+        keep = emojis[:MAX_EMOJIS_PROJECTED_PER_MESSAGE]
+        # Keep the viewer's own emoji groups even past the cap: dropping an emoji the
+        # viewer reacted with would zero its reacted_by_me on re-page (self-heal
+        # corruption for a rare glyph). Bound stays finite: top-N ∪ mine.
+        kept = set(keep)
+        keep += [e for e in emojis[MAX_EMOJIS_PROJECTED_PER_MESSAGE:]
+                 if (message_id, e) in mine and e not in kept]
+        projected[message_id] = keep
+        wanted += [(message_id, e) for e in keep]
+
+    # (3) Windowed reactor sample — only the projected groups, ≤N faces each. This is
+    # the ONLY query that loads `origin`, and it is bounded to
+    # MAX_REACTORS_PROJECTED_PER_EMOJI × (≤MAX_EMOJIS groups) × page size.
+    sample: dict[tuple[str, str], list[dict]] = {}
+    if wanted:
+        rn = func.row_number().over(
+            partition_by=(MessageReaction.message_id, MessageReaction.emoji),
+            order_by=(MessageReaction.created_at, MessageReaction.user_id),
+        ).label("rn")
+        sub = _blocked(
+            select(MessageReaction.message_id, MessageReaction.emoji,
+                   MessageReaction.user_id, MessageReaction.origin, rn)
+            .where(MessageReaction.message_id.in_(message_ids))).subquery()
+        rows = (await session.execute(
+            select(sub.c.message_id, sub.c.emoji, sub.c.user_id, sub.c.origin)
+            .where(sub.c.rn <= MAX_REACTORS_PROJECTED_PER_EMOJI,
+                   tuple_(sub.c.message_id, sub.c.emoji).in_(wanted)))).all()
+        for m, e, user_id, origin in rows:
+            reactor: dict = {"user_id": user_id}
+            if origin is not None:
+                reactor["origin"] = origin
+            sample.setdefault((m, e), []).append(reactor)
 
     by_msg: dict[str, list[dict]] = {}
-    for (message_id, emoji), reactors in grouped.items():
-        # count is the FULL filtered tally; reactors[] is a bounded sample of it. The
-        # viewer's own participation rides reacted_by_me, so truncating the sample past
-        # the viewer's own identity never loses their "you reacted" signal.
-        by_msg.setdefault(message_id, []).append({
-            "emoji": emoji,
-            "count": len(reactors),
-            "reacted_by_me": any(r["user_id"] == viewer_id for r in reactors),
-            "reactors": reactors[:MAX_REACTORS_PROJECTED_PER_EMOJI],
-        })
-
-    for message_id, entries in by_msg.items():
-        entries.sort(key=lambda e: (-e["count"], e["emoji"]))
-        # Truncate the long tail so a multi-user emoji raid can't bloat one message's
-        # wire array — top-N by count. BUT always keep the VIEWER'S OWN emoji groups
-        # even past N: dropping an emoji the viewer reacted with would zero its
-        # reacted_by_me on re-page (self-heal corruption for a rare emoji), unlike the
-        # reactor-sample truncation above which reacted_by_me survives. Bound stays
-        # finite: top-N ∪ mine ≤ N + per-user cap.
-        if len(entries) > MAX_EMOJIS_PROJECTED_PER_MESSAGE:
-            top = entries[:MAX_EMOJIS_PROJECTED_PER_MESSAGE]
-            top_emojis = {e["emoji"] for e in top}
-            mine_tail = [e for e in entries[MAX_EMOJIS_PROJECTED_PER_MESSAGE:]
-                         if e["reacted_by_me"] and e["emoji"] not in top_emojis]
-            by_msg[message_id] = top + mine_tail
+    for message_id, emojis in projected.items():
+        for emoji in emojis:
+            reactors = sample.get((message_id, emoji), [])
+            reacted_by_me = (message_id, emoji) in mine
+            # Pin the viewer's OWN face in the sample if the window pushed it past N
+            # (Tesla: flag · count · sample is a triad — a faces-only client must still
+            # render "me"). reacted_by_me already carries it, but pinning keeps the
+            # rendered faces honest. Bound stays finite (≤ N+1 for the one own face).
+            if reacted_by_me and not any(r["user_id"] == viewer_id for r in reactors):
+                own: dict = {"user_id": viewer_id}
+                if mine[(message_id, emoji)] is not None:
+                    own["origin"] = mine[(message_id, emoji)]
+                reactors = reactors + [own]
+            by_msg.setdefault(message_id, []).append({
+                "emoji": emoji,
+                "count": counts[(message_id, emoji)],
+                "reacted_by_me": reacted_by_me,
+                "reactors": reactors,
+            })
+        by_msg[message_id].sort(key=lambda e: (-e["count"], e["emoji"]))
     return by_msg
 
 

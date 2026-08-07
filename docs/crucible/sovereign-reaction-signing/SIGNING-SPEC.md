@@ -72,7 +72,15 @@ fixed:
 - **channel_id** stops cross-channel replay of the same reaction.
 - **client_msg_id** is the reaction's own stable, verifier-reconstructable id
   (distinct from `target_msg_id`). It is what the gateway binds `origin.client_msg_id`
-  against and what the reaction is stored under (idempotency key).
+  against, and it rides **inside the stored `origin` envelope** for signature
+  reconstruction — it is NOT a separate storage key. The reaction's **idempotency /
+  storage key is `(channel_id-scoped target_msg_id, user, exact-emoji-bytes)`**,
+  realized as the gateway's composite PK `(message_id, user_id, emoji)`; an unsigned
+  reaction (no `origin`) therefore carries no `client_msg_id` at all and is keyed
+  solely by that PK. Note this means `client_msg_id` is NOT globally unique across a
+  user's reactions (two emojis on one message could embed the same id) — fine for the
+  carrier MVP, but a reputation indexer keying on it must combine it with the PK
+  fields, not treat it as a standalone primary key.
 - **signed_at_ms** is the compose-time clock, persisted independently of the
   server-side timestamp (identical role to messages).
 - **target_msg_id** binds *which message* was endorsed — the reaction's content.

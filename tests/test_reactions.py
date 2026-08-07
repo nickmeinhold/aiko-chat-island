@@ -252,6 +252,30 @@ async def test_reactor_sample_bounded_but_count_authoritative(session):
     assert len(entry["reactors"]) == reactions_service.MAX_REACTORS_PROJECTED_PER_EMOJI
 
 
+async def test_viewer_face_pinned_when_past_sample_window(session):
+    """Tesla's triad (flag · count · sample): when the viewer reacted but the windowed
+    sample (ordered by created_at) pushed their face past N, the viewer is still pinned
+    into reactors[] so a faces-only client renders 'me' — count stays authoritative."""
+    author = await _user(session, "author")
+    ch = await _channel(session)
+    msg = await _msg(session, mid=1, channel=ch, sender=author)
+    # N earlier reactors, THEN the viewer last → viewer is row N+1 in created order.
+    for i in range(reactions_service.MAX_REACTORS_PROJECTED_PER_EMOJI):
+        u = await _user(session, f"early{i}")
+        await reactions_service.add_reaction(
+            session, user_id=u.id, message_id=msg.id, emoji=THUMB)
+    viewer = await _user(session, "viewer")
+    await reactions_service.add_reaction(
+        session, user_id=viewer.id, message_id=msg.id, emoji=THUMB)
+
+    agg = await reactions_service.aggregate_for_messages(
+        session, [msg.id], viewer_id=viewer.id, blocked_user_ids=NO_BLOCK)
+    entry = agg[msg.id][0]
+    assert entry["count"] == reactions_service.MAX_REACTORS_PROJECTED_PER_EMOJI + 1
+    assert entry["reacted_by_me"] is True
+    assert viewer.id in {r["user_id"] for r in entry["reactors"]}  # pinned in
+
+
 async def test_own_emoji_group_survives_projection_truncation(session):
     """A rare emoji the viewer reacted with is kept even past the per-message
     projection cap — else reacted_by_me would vanish on re-page (self-heal
