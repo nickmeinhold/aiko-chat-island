@@ -85,9 +85,19 @@ fixed:
   server-side timestamp (identical role to messages).
 - **target_msg_id** binds *which message* was endorsed — the reaction's content.
 - **emoji** is the endorsement itself.
-- **action** is signed too, so a `remove` (un-vouch) is its **own non-repudiable
-  event**, not an unsigned retraction of a signed one. A signed add + a signed
-  remove are two independently-attestable facts.
+- **action** is signed too, so a `remove` (un-vouch) *can be* its **own
+  non-repudiable event**, not an unsigned retraction of a signed one. A signed add + a
+  signed remove are two independently-attestable facts.
+  - **Gateway implementation status (MVP, honest scope):** the current gateway
+    carries a signed `add` and stores its `origin`, but a **`remove` is authorised by
+    row OWNERSHIP** (the authenticated user deletes only their own row) and is recorded
+    as **row absence**, not a stored signed event — the DELETE endpoint accepts no
+    `origin`. So `action=remove` is defined in these bytes for clients that wish to
+    sign un-vouches, but the gateway does not yet persist or attest them. Carrying the
+    signed `remove` as a first-class forward-ULID event (so the Carried Record #2506
+    can attest un-vouches from gateway state) is the additive upgrade, exactly parallel
+    to the takedown-retraction log (#7). Until then, treat gateway-side remove as
+    ownership-scoped state, and do not read "signed remove" as gateway-attested.
 
 **Length-prefixing is load-bearing** (same argument as messages): without it,
 `emoji="👍", action="add"` and `emoji="👍a", action="dd"` would sign identical

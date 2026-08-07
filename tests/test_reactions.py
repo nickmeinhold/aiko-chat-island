@@ -147,6 +147,49 @@ async def test_resend_keeps_first_origin(session):
     assert row.origin == o1  # first signature wins; o2 discarded
 
 
+async def test_unsigned_row_upgrades_to_signed(session):
+    """An UNSIGNED reaction that raced ahead must be upgradable to signed — an unsigned
+    squatter can't permanently lock out the endorsement (cage-match Tesla r2 P1). But a
+    second signed add never overwrites the first signature."""
+    author = await _user(session, "author")
+    reactor = await _user(session, "reactor")
+    ch = await _channel(session)
+    msg = await _msg(session, mid=1, channel=ch, sender=author)
+    priv = Ed25519PrivateKey.generate()
+    signed = _signed_origin(priv, channel_id=ch.id, client_msg_id="rxn-1",
+                            target_msg_id=msg.id, emoji=THUMB)
+
+    # unsigned first
+    ch1 = await reactions_service.add_reaction(
+        session, user_id=reactor.id, message_id=msg.id, emoji=THUMB, origin=None)
+    assert ch1 is True
+    assert (await session.get(MessageReaction, (msg.id, reactor.id, THUMB))).origin is None
+    # signed second → UPGRADES the row (but it's not a NEW reaction → changed False)
+    ch2 = await reactions_service.add_reaction(
+        session, user_id=reactor.id, message_id=msg.id, emoji=THUMB, origin=signed)
+    assert ch2 is False
+    assert (await session.get(MessageReaction, (msg.id, reactor.id, THUMB))).origin == signed
+    # a THIRD signed add with a different sig must NOT overwrite the first signature
+    priv2 = Ed25519PrivateKey.generate()
+    other = _signed_origin(priv2, channel_id=ch.id, client_msg_id="rxn-1",
+                           target_msg_id=msg.id, emoji=THUMB, signed_at_ms=999)
+    await reactions_service.add_reaction(
+        session, user_id=reactor.id, message_id=msg.id, emoji=THUMB, origin=other)
+    assert (await session.get(MessageReaction, (msg.id, reactor.id, THUMB))).origin == signed
+
+
+async def test_blocked_pair_is_symmetric(session):
+    """The reaction block-dual (history/mutate filter by VIEWER set; fanout excludes by
+    ACTOR∪AUTHOR set) is a correct single predicate ONLY if blocked_pair_user_ids is
+    symmetric (cage-match Tesla r2 P4). Pin that invariant so a future moderation change
+    can't silently reopen the oracle at the WS/history seam."""
+    a = await _user(session, "aaa")
+    b = await _user(session, "bbb")
+    await moderation_service.block_user(session, a.id, b.id)  # a blocks b (one direction)
+    assert b.id in await moderation_service.blocked_pair_user_ids(session, a.id)
+    assert a.id in await moderation_service.blocked_pair_user_ids(session, b.id)
+
+
 async def test_aggregate_exposes_reactor_identity_and_origin(session):
     """Bounded-A: the aggregate carries reactors[] with user_id + the signed origin,
     NOT an anonymous count."""
@@ -274,6 +317,8 @@ async def test_viewer_face_pinned_when_past_sample_window(session):
     assert entry["count"] == reactions_service.MAX_REACTORS_PROJECTED_PER_EMOJI + 1
     assert entry["reacted_by_me"] is True
     assert viewer.id in {r["user_id"] for r in entry["reactors"]}  # pinned in
+    # Pinning must NOT breach the advertised bound — replace, don't append.
+    assert len(entry["reactors"]) <= reactions_service.MAX_REACTORS_PROJECTED_PER_EMOJI
 
 
 async def test_own_emoji_group_survives_projection_truncation(session):
@@ -477,6 +522,24 @@ async def test_origin_client_msg_id_must_bind(app_ctx, session):
     resp = await client.post(
         f"/v1/messages/{msg.id}/reactions",
         json={"emoji": THUMB, "client_msg_id": "rxn-DIFFERENT", "origin": origin},
+        headers=_auth(reactor))
+    assert resp.status_code == 422
+
+
+async def test_signed_origin_without_client_msg_id_is_422(app_ctx, session):
+    """A signed origin with no outer client_msg_id to bind against is rejected — a
+    degenerate empty id must never satisfy the binding (cage-match Carnot r2)."""
+    client, _ = app_ctx
+    author = await _user(session, "author")
+    reactor = await _user(session, "reactor")
+    ch = await _channel(session)
+    msg = await _msg(session, mid=1, channel=ch, sender=author)
+    priv = Ed25519PrivateKey.generate()
+    origin = _signed_origin(priv, channel_id=ch.id, client_msg_id="",
+                            target_msg_id=msg.id, emoji=THUMB)
+    resp = await client.post(
+        f"/v1/messages/{msg.id}/reactions",
+        json={"emoji": THUMB, "origin": origin},  # no client_msg_id
         headers=_auth(reactor))
     assert resp.status_code == 422
 

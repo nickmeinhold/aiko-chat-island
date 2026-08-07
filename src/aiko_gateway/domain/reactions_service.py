@@ -36,13 +36,14 @@ hidden user had reacted). The live ``reaction`` frame carries the identity delta
 NO server count; a subscriber in a block relationship with the reactor never receives
 it, so their count never moves for someone they can't see. One predicate, all paths.
 
-CONCURRENCY: ``add_reaction`` uses ``INSERT ... ON CONFLICT DO NOTHING`` (SQLite
-dialect, matching dev+prod — CLAUDE.md), so a concurrent duplicate is a no-op AT THE
-DB, not a check-then-insert race. A re-add of an emoji the user already placed keeps
-the FIRST row's ``origin`` (the insert is ignored), exactly like a message resend
-keeps the first row's origin — the idempotency key already pins the endorsement. The
-Postgres path (deferred, #14) swaps to
-``postgresql.insert(...).on_conflict_do_nothing()`` when that migration lands.
+CONCURRENCY: ``add_reaction`` uses ``INSERT ... ON CONFLICT`` (SQLite dialect,
+matching dev+prod — CLAUDE.md), so a concurrent duplicate is a no-op AT THE DB, not a
+check-then-insert race. The conflict rule is asymmetric on ``origin``: the FIRST
+SIGNATURE wins (a second signed add no-ops), but an existing UNSIGNED row is UPGRADED
+to signed (``DO UPDATE ... WHERE origin IS NULL``) so an unsigned client racing ahead
+can't permanently lock out the endorsement — "captured from the first attestation,
+not the first vacuum" (cage-match Tesla). The Postgres path (deferred, #14) swaps to
+``postgresql.insert(...)`` with the same conditional upgrade when that migration lands.
 """
 from __future__ import annotations
 
@@ -167,10 +168,14 @@ async def add_reaction(
     first). ``origin`` is shape-validated upstream (``signing.validate_origin``); it is
     persisted verbatim to be echoed on read — the gateway carries, does not verify.
 
-    Idempotency is DB-enforced (``INSERT ... ON CONFLICT DO NOTHING``): a concurrent
-    duplicate is a no-op at the database — not a check-then-insert race — and a re-add
-    keeps the FIRST row's ``origin``, since the conflicting insert (with a fresh
-    signature) is ignored. The idempotency key already pins the endorsement."""
+    Idempotency is DB-enforced (``INSERT ... ON CONFLICT``): a concurrent duplicate is
+    a no-op at the database — not a check-then-insert race. The conflict rule is
+    asymmetric on ``origin`` (cage-match Tesla r2): a signed add UPGRADES an existing
+    UNSIGNED row to signed (``DO UPDATE ... WHERE origin IS NULL``) but never overwrites
+    an existing signature; an unsigned add is a plain ``DO NOTHING``. So the FIRST
+    SIGNATURE wins (a second signed POST no-ops), yet an unsigned row that raced ahead
+    can still be upgraded to signed — "captured from the first attestation, not the
+    first vacuum"."""
     emoji = validate_emoji(emoji)
     # Cap only gates a NEW distinct emoji: re-adding an emoji the user already placed
     # is always allowed (idempotent no-op), so a user at the cap can still toggle their
@@ -184,17 +189,38 @@ async def add_reaction(
             ))).scalar_one()
         if distinct >= MAX_REACTIONS_PER_USER_PER_MESSAGE:
             raise ReactionLimitExceeded()
-    result = await session.execute(
-        sqlite_insert(MessageReaction)
+    base = sqlite_insert(MessageReaction).values(
         # created_at is pinned in .values() rather than left to the model's Python-side
         # `default=` — a Core ins().values() is NOT guaranteed to apply the ORM column
         # default the way session.add() does, and the column is NOT NULL with no
         # server_default. Explicit = engine-independent.
-        .values(message_id=message_id, user_id=user_id, emoji=emoji, origin=origin,
-                created_at=dt.datetime.now(dt.timezone.utc))
-        .on_conflict_do_nothing())
+        message_id=message_id, user_id=user_id, emoji=emoji, origin=origin,
+        created_at=dt.datetime.now(dt.timezone.utc))
+    if origin is not None:
+        # UPGRADE an unsigned row to signed on conflict — but NEVER overwrite an
+        # existing signature (cage-match Tesla r2 P1). "Captured from the first
+        # reaction or never" means the first ATTESTATION, not the first vacuum: a
+        # degraded/racing client that POSTs UNSIGNED first must not permanently lock
+        # out the endorsement, or "signed from day one" is defeated by an unsigned
+        # squatter. `WHERE origin IS NULL` makes the upgrade idempotent + one-way
+        # (NULL→signature only); a second signed POST hits a non-NULL row and no-ops,
+        # so the first signature still wins.
+        stmt = base.on_conflict_do_update(
+            index_elements=["message_id", "user_id", "emoji"],
+            set_={"origin": base.excluded.origin},
+            where=MessageReaction.origin.is_(None))
+    else:
+        # Unsigned add: never downgrade or churn an existing row.
+        stmt = base.on_conflict_do_nothing()
+    await session.execute(stmt)
     await session.commit()
-    return result.rowcount > 0
+    # `changed` == "a NEW reaction row was created" (fire the ADD fanout), keyed on the
+    # pre-insert existence probe rather than rowcount: a NULL→signed UPGRADE also
+    # touches a row (rowcount>0) but is NOT a new reaction, so rowcount would spuriously
+    # report it as one. Under a concurrent first-insert this can over-report changed by
+    # a hair (a duplicate ADD frame), which is harmless — the client applies the frame
+    # as an idempotent set-add — and matches the layer's accepted race tolerance.
+    return exists is None
 
 
 async def remove_reaction(
@@ -250,9 +276,14 @@ async def aggregate_for_messages(
          ``reacted_by_me`` reliably (the viewer may fall past the sample) and lets the
          projection keep the viewer's own emoji groups + pin the viewer's own face.
       3. ``sample`` — a windowed ``ROW_NUMBER() <= N`` fetch of reactor identities +
-         origin, restricted to the (message_id, emoji) groups that actually survive the
-         per-message projection. So the only rows whose ``origin`` is loaded are the
-         ≤N faces of the ≤MAX_EMOJIS groups per message that the wire will carry.
+         origin, restricted (the ``wanted`` filter sits INSIDE the subquery, before the
+         window) to the (message_id, emoji) groups that survive the per-message
+         projection. So the only rows whose ``origin`` is loaded are the ≤N faces of the
+         ≤MAX_EMOJIS groups per message that the wire will carry. NAMED RESIDUAL (Tesla):
+         this bounds the WIRE and the rows returned to Python, but within a projected
+         hot emoji the engine still orders that group's full partition to mint ranks —
+         bounded by that one emoji's reactor count, not free. Acceptable pre-Postgres;
+         the write-side per-message breadth cap is the further lever (#2658 / #14).
 
     Per-emoji rows are ordered ``(-count, emoji)``; reactor samples preserve insertion
     order (created_at, then user_id) for a stable, deterministic wire order."""
@@ -308,14 +339,19 @@ async def aggregate_for_messages(
             partition_by=(MessageReaction.message_id, MessageReaction.emoji),
             order_by=(MessageReaction.created_at, MessageReaction.user_id),
         ).label("rn")
+        # Restrict to the `wanted` (projected) groups BEFORE the window (cage-match
+        # Carnot r2): a WHERE is evaluated before window functions in SQL, so the
+        # ROW_NUMBER ranks only the projected groups' rows, never the long tail of
+        # non-projected emoji on a hot message.
         sub = _blocked(
             select(MessageReaction.message_id, MessageReaction.emoji,
                    MessageReaction.user_id, MessageReaction.origin, rn)
-            .where(MessageReaction.message_id.in_(message_ids))).subquery()
+            .where(MessageReaction.message_id.in_(message_ids),
+                   tuple_(MessageReaction.message_id,
+                          MessageReaction.emoji).in_(wanted))).subquery()
         rows = (await session.execute(
             select(sub.c.message_id, sub.c.emoji, sub.c.user_id, sub.c.origin)
-            .where(sub.c.rn <= MAX_REACTORS_PROJECTED_PER_EMOJI,
-                   tuple_(sub.c.message_id, sub.c.emoji).in_(wanted)))).all()
+            .where(sub.c.rn <= MAX_REACTORS_PROJECTED_PER_EMOJI))).all()
         for m, e, user_id, origin in rows:
             reactor: dict = {"user_id": user_id}
             if origin is not None:
@@ -330,12 +366,14 @@ async def aggregate_for_messages(
             # Pin the viewer's OWN face in the sample if the window pushed it past N
             # (Tesla: flag · count · sample is a triad — a faces-only client must still
             # render "me"). reacted_by_me already carries it, but pinning keeps the
-            # rendered faces honest. Bound stays finite (≤ N+1 for the one own face).
+            # rendered faces honest. Replace the LAST sampled face (not append) so the
+            # sample stays exactly ≤ N (cage-match Carnot r2 — pinning must not break
+            # the advertised MAX_REACTORS_PROJECTED_PER_EMOJI bound).
             if reacted_by_me and not any(r["user_id"] == viewer_id for r in reactors):
                 own: dict = {"user_id": viewer_id}
                 if mine[(message_id, emoji)] is not None:
                     own["origin"] = mine[(message_id, emoji)]
-                reactors = reactors + [own]
+                reactors = reactors[:MAX_REACTORS_PROJECTED_PER_EMOJI - 1] + [own]
             by_msg.setdefault(message_id, []).append({
                 "emoji": emoji,
                 "count": counts[(message_id, emoji)],

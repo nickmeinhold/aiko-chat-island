@@ -1000,6 +1000,9 @@ class MessageReaction(Base):
     # shape-validated at the trust boundary (domain/signing.validate_origin) and echoed
     # verbatim on read so a client can verify the endorsement. NULL for an unsigned
     # reaction — an absent origin reads as "unverified", never "invalid".
-    origin: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # none_as_null=True persists an unsigned reaction as SQL NULL (not the JSON text
+    # 'null'), so the add_reaction upgrade guard `WHERE origin IS NULL` correctly
+    # matches an unsigned row and can upgrade it to signed (cage-match Tesla r2 P1).
+    origin: Mapped[dict | None] = mapped_column(JSON(none_as_null=True), nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow)

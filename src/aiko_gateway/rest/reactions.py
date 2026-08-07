@@ -130,6 +130,13 @@ async def add_reaction(
         emoji = reactions_service.validate_emoji(body.emoji)
     except reactions_service.InvalidEmoji as exc:
         raise HTTPException(422, str(exc))
+    # A signed reaction MUST carry a non-empty outer client_msg_id to bind against
+    # (cage-match Carnot r2): otherwise `frame_client_msg_id=""` would let an origin
+    # with an embedded EMPTY client_msg_id satisfy the binding — a degenerate id must
+    # never authenticate. Reject before validate_origin so the 422 is unambiguous.
+    if body.origin is not None and not body.client_msg_id:
+        raise HTTPException(
+            422, "origin: a signed reaction requires a non-empty client_msg_id")
     # Shape-validate the sovereign-signing envelope at the trust boundary (the gateway
     # carries, does not verify). Binds origin.client_msg_id to the request's
     # client_msg_id — the reaction's own id. None origin → returns None (unsigned).
