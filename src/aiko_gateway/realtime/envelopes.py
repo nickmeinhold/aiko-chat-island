@@ -1,9 +1,10 @@
 """WSS wire envelopes — the stable client-facing frame contract (plan §A1).
 
-Phase 1 implements the text-message subset: client sends `subscribe` + `send`;
-server emits `ack`, `message`, `error`. Reactions/typing/presence/edits/deletes
-extend this in later phases. Keeping all wire DTOs here means an aiko protocol
-change touches `aiko/payload.py`, never this file — the /v1 contract is frozen.
+The text-message subset (client sends `subscribe` + `send`; server emits `ack`,
+`message`, `error`, `suback`), takedown `retraction` frames (#7), and emoji
+`reaction` frames (#2634) all ship here; typing/presence/edits extend it later.
+Keeping all wire DTOs here means an aiko protocol change touches `aiko/payload.py`,
+never this file — the /v1 contract is frozen.
 """
 from __future__ import annotations
 
