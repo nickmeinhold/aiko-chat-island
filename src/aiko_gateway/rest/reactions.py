@@ -165,8 +165,17 @@ async def add_reaction(
             request, session, channel_id=msg.channel_id, msg_id=message_id,
             emoji=emoji, action=ReactionAction.ADD, actor_id=user.id,
             author_id=msg.sender_user_id, origin=persisted)
-    count = await reactions_service.emoji_count(
-        session, message_id, emoji, blocked_user_ids=blocked)
+    # Gate the response count on the caller's CURRENT visibility, re-checked AFTER the
+    # mutation — symmetric with DELETE's post-revocation gate (cage-match Carnot r5).
+    # The visibility precheck above authorized the add, but a concurrent takedown / kick
+    # / block can land between the add commit and here; without this recheck the caller
+    # would still harvest a concrete count for a message they may no longer see (the
+    # same post-revocation count oracle DELETE closes). reacted_by_me stays True — that
+    # is the caller's own just-committed fact, not an oracle about others.
+    count = None
+    if await _resolve_visible_message(session, user.id, message_id) is not None:
+        count = await reactions_service.emoji_count(
+            session, message_id, emoji, blocked_user_ids=blocked)
     return {"msg_id": message_id, "emoji": emoji, "count": count,
             "reacted_by_me": True}
 
