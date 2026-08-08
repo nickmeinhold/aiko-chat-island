@@ -40,8 +40,8 @@ from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from . import (
-    devices_service, moderation_service, passkey_service, recovery_service,
-    signing_keys_service)
+    devices_service, moderation_service, passkey_service, reactions_service,
+    recovery_service, signing_keys_service)
 from .memberships_service import ROLE_ADMIN
 from .models import (
     Community, CommunityMembership, Membership, Message, SocialIdentity, User)
@@ -174,6 +174,12 @@ async def delete_user_account(session: AsyncSession, user_id: str) -> None:
     # rows (verify-the-neighbor: the just-shipped deletion cascade must learn
     # about every new table that references users).
     await moderation_service.purge_user_moderation_rows(session, user_id)
+    # Emoji reactions (#2634) are another FK child of `users` — the caller's reactions
+    # on OTHER people's surviving messages must be torn down before the user row (the
+    # same children-before-parent discipline as the moderation rows above). The cascade
+    # guard now requires it. A reaction on the caller's OWN messages needs no separate
+    # message-side teardown — the reaction row goes here, keyed on user_id.
+    await reactions_service.purge_user_reactions(session, user_id)
     # Push-notification tokens (#16) are another FK child of `users` — they must
     # go before the user row too (verify-the-neighbor: every new users-referencing
     # table must join this cascade, exactly as the moderation rows above did).
