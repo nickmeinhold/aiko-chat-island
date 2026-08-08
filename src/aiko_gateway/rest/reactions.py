@@ -228,9 +228,11 @@ async def remove_reaction(
         return {"msg_id": message_id, "emoji": emoji, "count": None,
                 "reacted_by_me": False}
     # No row removed → enforce the visibility gate so a prober can't tell "no reaction
-    # here" from "message I can't see" (both 404 when not visible).
+    # here" from "message I can't see" (both 404 when not visible). Return count: null,
+    # NOT the emoji's tally (cage-match Carnot r6): the caller changed nothing, and
+    # emitting a count for an arbitrary caller-supplied emoji would turn DELETE into a
+    # per-emoji count-lookup for long-tail groups the bounded history projection
+    # deliberately omits. A no-op reports no count.
     await _visible_message(session, user.id, message_id)
-    count = await reactions_service.emoji_count(
-        session, message_id, emoji, blocked_user_ids=blocked)
-    return {"msg_id": message_id, "emoji": emoji, "count": count,
+    return {"msg_id": message_id, "emoji": emoji, "count": None,
             "reacted_by_me": False}

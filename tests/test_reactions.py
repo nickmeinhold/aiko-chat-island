@@ -127,8 +127,10 @@ async def test_add_is_idempotent(session):
 
 
 async def test_resend_keeps_first_origin(session):
-    """A re-add with a DIFFERENT signature keeps the FIRST row's origin (ON CONFLICT
-    DO NOTHING) — the idempotency key already pins the endorsement."""
+    """A re-add with a DIFFERENT signature keeps the FIRST row's origin (first
+    signature wins: the signed path is ON CONFLICT DO UPDATE ... WHERE origin IS NULL,
+    so a second signed add hits a non-NULL row and no-ops) — the idempotency key
+    already pins the endorsement."""
     author = await _user(session, "author")
     reactor = await _user(session, "reactor")
     ch = await _channel(session)
