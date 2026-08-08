@@ -105,15 +105,23 @@ bytes.
 
 ### Field-ordering note (resolves a drift in the v2-social handoff prose)
 
-The `HANDOFF-to-app-tab-v2-social-wire.md` prose sketched the reaction bytes as
-`DOMAIN_TAG ‖ channel_id ‖ target_msg_id ‖ emoji ‖ action ‖ pubkey ‖ client_msg_id
-‖ signed_at_ms`. **This spec deliberately does NOT follow that ordering** — it puts
-the pubkey near the end and the timestamp last, which diverges from the message
-spec it claims to mirror. This spec instead preserves the message spec's exact
-spine (tag, pubkey, channel_id, client_msg_id, signed_at_ms first, in that order)
-and appends the reaction content, so the app signer reuses its message-signing code
-path unchanged. **App tab: confirm this ordering or propose the alternative — this
-is the one open decision, and it must be pinned before either signer ships.**
+Two orderings are in play; this spec adopts exactly ONE. To be unambiguous:
+
+- **REJECTED (the `HANDOFF-to-app-tab-v2-social-wire.md` prose):**
+  `DOMAIN_TAG ‖ channel_id ‖ target_msg_id ‖ emoji ‖ action ‖ pubkey ‖ client_msg_id
+  ‖ signed_at_ms`. That handoff sketch puts the **pubkey near the end** and the
+  **timestamp last**, which diverges from the message spec it claimed to mirror. This
+  spec does **NOT** use it.
+- **ADOPTED (this spec, and the field table above):** the message spec's exact spine
+  — `tag ‖ pubkey ‖ channel_id ‖ client_msg_id ‖ signed_at_ms` first, in that order —
+  then the reaction content (`target_msg_id ‖ emoji ‖ action`). This is what
+  `signing.reaction_signing_bytes` implements and what the golden vector below pins.
+  The app signer reuses its message-signing code path unchanged.
+
+The ADOPTED ordering is **grounded, not open** (see STATUS — it is a faithful mirror
+of the app's shipped `message_signing.dart`, authoritative by construction). The
+app-tab step is a **ratification + a golden-vector backstop**, not a live design
+decision; an app signer that reproduces the golden hex below is conformant.
 
 ## Golden vector (authoritative by construction — app pins the same hex as a backstop)
 

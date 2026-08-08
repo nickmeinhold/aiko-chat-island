@@ -59,16 +59,25 @@ def reaction_frame(
     The frame names the REACTOR and the ACTION; it carries NO server-computed count.
     A client applies it as a SET membership change on its own filtered aggregate —
     ``add`` inserts ``user_id`` into that emoji's reactor set, ``remove`` drops it —
-    and derives the count as the set size. Set semantics make the frame idempotent and
-    order-tolerant for a given (user, emoji): a duplicated or reordered ``add`` is a
-    no-op, a lost frame self-heals on the next history re-page (state-not-event). This
-    is why a broadcast frame needs no absolute count: an anonymous global count on a
-    fan-out frame would disagree with each recipient's block-filtered history count and
-    leak that a hidden user reacted (the count oracle). Here every path — history
-    aggregate, this frame's delivery — is filtered by the SAME block predicate: a
-    subscriber in a block relationship with the reactor (or the message author) never
-    receives this frame (route-level fanout exclusion), so their count never moves for
-    someone they can't see. One predicate, all paths; no oracle by construction.
+    and derives the count as the set size. Set semantics make a REPEATED same-action
+    frame idempotent (a duplicated ``add`` is a no-op). It does NOT make the live path
+    fully convergent, and this frame does not claim to be — it is a BEST-EFFORT live
+    hint whose authoritative reconciliation is the history re-page (state-not-event):
+      * ``add`` and ``remove`` are NOT commutative, so a REORDERED add/remove for the
+        same (user, emoji) can transiently leave the live set disagreeing with the DB;
+      * a signed UPGRADE of an unsigned row (``add_reaction`` NULL→signed) does not
+        re-strike a frame, so a peer that saw the unsigned ``add`` keeps an origin-less
+        delta until it re-pages.
+    Both self-heal on the next history read of that message row — the durable aggregate
+    is truth, this frame only optimises latency over it.
+
+    A broadcast frame needs no absolute count: an anonymous global count on a fan-out
+    frame would disagree with each recipient's block-filtered history count and leak
+    that a hidden user reacted (the count oracle). Here every path — history aggregate,
+    this frame's delivery — is filtered by the SAME block predicate: a subscriber in a
+    block relationship with the reactor (or the message author) never receives this
+    frame (route-level fanout exclusion), so their count never moves for someone they
+    can't see. One predicate, all paths; no oracle by construction.
 
     Discrete on PURPOSE — NOT a re-serialised message. A reaction is STATE the history
     read recomputes (state-not-event, see the MessageReaction model), so a live client
