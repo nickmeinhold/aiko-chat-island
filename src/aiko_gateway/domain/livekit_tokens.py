@@ -25,7 +25,21 @@ revocation is a separate, not-yet-built gate.)
     the message/reaction write paths use.
 
 This is the single door: the route and any future in-process caller mint through
-``mint_room_token`` so the grant policy lives in exactly one place.
+``mint_room_token`` so the grant policy lives in exactly one place — and because the
+DEFAULTS are least-privilege (subscribe-only), a caller widens the grant only by an
+explicit, visible kwarg.
+
+Named residuals (cage-match #122, honest scope, NOT closed here):
+  * **Shared-key = one compromise domain (Tesla).** The imagineering SFU is shared
+    across islands on ONE HS256 API secret. ``gateway_id`` namespacing prevents
+    *accidental* room/identity collision, but it is NOT a cryptographic tenant
+    boundary: whoever holds one island's secret can forge tokens for any island's
+    rooms on that SFU. Per-island LiveKit API keys would make it a real boundary;
+    until then, the isolation is operator discipline + shared-secret topology.
+  * **``name`` is a mutable, non-unique label (Wu).** ``sub`` is the ULID identity
+    (sound), but ``name`` = ``display_name``, which is not rate-limited — so any UI
+    that renders ``name`` inherits the same impersonation surface as the chat line.
+    A video room is a higher-trust context; treat rendered ``name`` accordingly.
 """
 from __future__ import annotations
 
@@ -59,6 +73,13 @@ def is_configured() -> bool:
     return bool(settings.livekit_api_key and settings.livekit_api_secret)
 
 
+# The only track sources a publish grant permits: camera + mic. LiveKit's
+# ``canPublishSources`` SUPERSEDES ``canPublish`` when set, so restricting it to A/V
+# denies screen-share and other sources for the social skeleton (cage-match #122
+# Carnot). Widening (e.g. screen-share) is a deliberate future kwarg, not a default.
+_AV_PUBLISH_SOURCES = ["camera", "microphone"]
+
+
 def mint_room_token(
     *,
     identity: str,
@@ -68,11 +89,6 @@ def mint_room_token(
     can_subscribe: bool = True,
     can_publish_data: bool = False,
 ) -> str:
-    # LEAST-PRIVILEGE DEFAULTS (cage-match #122 rd2, Tesla+Wu F1): the safe grant is
-    # the DEFAULT, so a future in-process caller doing the natural three-kwarg mint
-    # gets subscribe-only — never full A/V + a data side-channel — unless it EXPLICITLY
-    # opts up. This is what makes "the grant policy lives in one place" actually true:
-    # the door is safe, and widening it is a deliberate, visible kwarg at each caller.
     """Mint a LiveKit join token for participant ``identity`` scoped to ``room``.
 
     ``iss`` is the API key, ``sub`` the participant identity, ``video`` the grant.
@@ -81,28 +97,42 @@ def mint_room_token(
     island has no credentials, so the capability is disabled cleanly rather than
     signing with an empty secret.
 
-    The grant is deliberately the CALLER'S powers, not an admin grant: no
-    ``roomCreate``/``roomAdmin``/``roomList`` — a participant token can join and
-    (by default) publish+subscribe in exactly one room, nothing else.
+    LEAST-PRIVILEGE DEFAULTS (cage-match #122 rd2, Tesla+Wu): a bare three-kwarg mint
+    is SUBSCRIBE-ONLY — never publish, never the data side-channel — so a future
+    in-process caller must EXPLICITLY opt up. When ``can_publish`` is set, the grant
+    restricts track sources to camera+mic (no screen-share). The grant is never an
+    admin grant: no ``roomCreate``/``roomAdmin``/``roomList``.
+
+    Fails closed on an empty/whitespace ``identity`` or ``room`` (Tesla #6): the door
+    never signs a live capability for a blank participant or an unscoped room, even if
+    a future caller forgets to validate — the route already passes DB-backed ids.
     """
     if not is_configured():
         raise LiveKitNotConfigured("LiveKit API key/secret not set on this island")
+    if not identity or not identity.strip():
+        raise ValueError("mint_room_token: identity must be non-empty")
+    if not room or not room.strip():
+        raise ValueError("mint_room_token: room must be non-empty")
 
     now = dt.datetime.now(dt.timezone.utc)
+    grant = {
+        "room": room,
+        "roomJoin": True,
+        "canPublish": can_publish,
+        "canSubscribe": can_subscribe,
+        "canPublishData": can_publish_data,
+    }
+    # Restrict publishable sources to A/V only when publishing is allowed (supersedes
+    # canPublish for source selection). Omitted when not publishing — canPublish=False
+    # already denies all sources, and an empty list would be ambiguous.
+    if can_publish:
+        grant["canPublishSources"] = _AV_PUBLISH_SOURCES
     payload = {
         "iss": settings.livekit_api_key,
         "sub": identity,
         "name": display_name,
         "nbf": int(now.timestamp()) - _NBF_LEEWAY_SECONDS,
         "exp": int((now + dt.timedelta(seconds=settings.livekit_token_ttl_seconds)).timestamp()),
-        # LiveKit's VideoGrant claim. Scoped to ONE room; only join + the requested
-        # publish/subscribe powers, never room-admin.
-        "video": {
-            "room": room,
-            "roomJoin": True,
-            "canPublish": can_publish,
-            "canSubscribe": can_subscribe,
-            "canPublishData": can_publish_data,
-        },
+        "video": grant,  # LiveKit VideoGrant — one room, participant powers, never admin
     }
     return jwt.encode(payload, settings.livekit_api_secret, algorithm=_LIVEKIT_ALG)

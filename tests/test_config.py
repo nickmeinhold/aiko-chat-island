@@ -629,6 +629,10 @@ _MUST_FORWARD_ENV = {
     "GATEWAY_SEED_PEERS",            # operator-curated federation
     "GATEWAY_BOOTSTRAP_PEERS",       # operator-curated federation (gossip fetch)
     "GATEWAY_GOSSIP_ENABLED",        # operator policy — gossip fetch gate
+    "LIVEKIT_API_KEY",               # per-island video (#122) — inert-in-container class
+    "LIVEKIT_API_SECRET",            # secret — token forgery root for the SFU (#122)
+    "LIVEKIT_URL",                   # per-island video — the SFU clients connect to
+    "LIVEKIT_TOKEN_TTL_SECONDS",     # operator policy — join-token window
 }
 
 

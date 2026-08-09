@@ -12,12 +12,13 @@ Trust-boundary properties, from the codebase's established patterns:
     "no such channel" and "private channel you're not a member of" into the SAME
     ``None`` → identical 404, so probing ids leaks nothing. The token is never issued
     for a room the caller can't enter.
-  * **READ ≠ PUBLISH (cage-match #122, 4-reviewer consensus).** Read access must not
-    mint a broadcast capability. Publish (camera/mic) is gated on ``acl.can_post`` —
-    the SAME predicate the message write path uses — so a read-only member
-    (``can_post=False``) or a public-channel non-member gets a SUBSCRIBE-ONLY token,
-    never ``canPublish``. The data channel is off by default (not needed for A/V; it
-    is an undesigned side-channel — Tesla+Wu).
+  * **READ ≠ PUBLISH (cage-match #122).** Read access must not mint a broadcast
+    capability. Publish (camera/mic) is gated on ``acl.is_posting_member`` — an
+    EXPLICIT posting membership on both public and private channels — so a read-only
+    member (``can_post=False``) OR a public-channel non-member gets a SUBSCRIBE-ONLY
+    token, never ``canPublish``. Live broadcast is a higher-trust medium than a text
+    line, so it is deliberately stricter than ``can_post`` (which is post-open for
+    public channels). The data channel is off by default (undesigned side-channel).
   * **Server-derived identity.** The LiveKit participant identity is ``user.id`` from
     ``CurrentUser`` — never a request field (I5).
 
@@ -64,11 +65,13 @@ async def create_video_token(
     if channel is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "channel not found")
 
-    # READ ≠ PUBLISH: publish (camera/mic) only for a caller who may post here; a
-    # read-only member or public-channel reader gets subscribe-only. Derive the room
-    # from the RESOLVED row (channel.id), not the raw path param, so an ACL
-    # alias/normalization can never authorize one channel and mint for another.
-    can_publish = await acl.can_post(session, user.id, channel)
+    # READ ≠ PUBLISH: publish (live camera/mic) requires an EXPLICIT posting
+    # membership (acl.is_posting_member) on BOTH public and private channels — a
+    # read-only member OR a public-channel non-member gets subscribe-only. Broadcast
+    # is a higher-trust medium than a text line, so it is NOT open to every reader of
+    # a post-open public channel (cage-match #122 Wu/Tesla blast-radius). Derive the
+    # room from the RESOLVED row (channel.id), never the raw path param.
+    can_publish = await acl.is_posting_member(session, user.id, channel)
     # Namespace BOTH room and participant identity by island id on the SHARED SFU
     # (cage-match #122 Tesla): islands mint against one imagineering SFU + one API key,
     # so prefix with gateway_id to keep rooms AND identities from colliding across

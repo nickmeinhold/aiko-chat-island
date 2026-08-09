@@ -74,9 +74,25 @@ def test_mint_binds_identity_room_and_scopes_grant(livekit_configured):
     assert grant["roomJoin"] is True
     assert grant["canPublish"] is True       # explicitly opted up
     assert grant["canSubscribe"] is True
+    assert grant["canPublishSources"] == ["camera", "microphone"]  # A/V only, no screen-share
     # NO admin powers ever leak into a participant token.
     for admin in ("roomCreate", "roomAdmin", "roomList", "canUpdateOwnMetadata"):
         assert admin not in grant
+
+
+def test_mint_subscribe_only_omits_publish_sources(livekit_configured):
+    # Not publishing → canPublishSources omitted (canPublish=False already denies all).
+    grant = _decode(livekit_tokens.mint_room_token(
+        identity="u", display_name="U", room="r"))["video"]
+    assert grant["canPublish"] is False
+    assert "canPublishSources" not in grant
+
+
+def test_mint_rejects_empty_identity_or_room(livekit_configured):
+    with pytest.raises(ValueError, match="identity"):
+        livekit_tokens.mint_room_token(identity="  ", display_name="U", room="r")
+    with pytest.raises(ValueError, match="room"):
+        livekit_tokens.mint_room_token(identity="u", display_name="U", room="")
 
 
 def test_mint_defaults_are_least_privilege(livekit_configured):
@@ -153,6 +169,13 @@ async def _private_channel(session, *, cid: int = 10, name: str = "dm") -> Chann
     return ch
 
 
+async def _public_channel(session, *, cid: int = 20, name: str = "general") -> Channel:
+    ch = Channel(id=_ulid(cid), name=name, kind="standard", aiko_channel=name, is_private=False)
+    session.add(ch)
+    await session.commit()
+    return ch
+
+
 async def _join(session, channel: Channel, user, *, can_post: bool = True) -> None:
     session.add(Membership(channel_id=channel.id, user_id=user.id, can_post=can_post))
     await session.commit()
@@ -224,6 +247,24 @@ async def test_gateway_id_namespaces_room_and_identity(
     claims = _decode(body["token"])
     assert claims["sub"] == f"island-a:{alice.id}"       # identity namespaced too
     assert claims["video"]["room"] == f"island-a:{ch.id}"
+
+
+async def test_public_channel_non_member_is_subscribe_only(client, session, livekit_configured):
+    # cage-match #122 rd3 (Wu #3): a public channel is READABLE by any signed-in user,
+    # but live broadcast must NOT be open to every non-member — publish requires an
+    # explicit posting membership. So a non-member reader gets a subscribe-only token
+    # (200, can_publish False), NOT a 404 and NOT canPublish.
+    randomer = await _user(session, "randomer")
+    pub = await _public_channel(session)  # no membership row for randomer
+
+    resp = await client.post(
+        f"/v1/channels/{pub.id}/video-token", headers=_headers(randomer))
+    assert resp.status_code == 200                 # public → readable → can join
+    body = resp.json()
+    assert body["can_publish"] is False            # ...but subscribe-only
+    claims = _decode(body["token"])
+    assert claims["video"]["canPublish"] is False
+    assert claims["video"]["canSubscribe"] is True
 
 
 async def test_non_member_of_private_channel_is_404(client, session, livekit_configured):
