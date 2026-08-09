@@ -131,10 +131,12 @@ async def create_outbound(
         client_msg_id=client_msg_id,
         aiko_origin=False,
         origin=origin,
-        # Normalize empty→None so storage holds ONE representation of "no mentions"
-        # (message_view's `is not None` echo then can't disagree with an accidental
-        # stored `[]` — a client that sends `mentions: []` is stored identically to
-        # one that omits the key).
+        # Normalize empty→None so storage holds ONE representation of "no mentions".
+        # This is the WRITE half of the defense; message_view's echo uses TRUTHINESS
+        # (`if m.mentions:`), so even a stray stored `[]` from another writer is
+        # omitted at READ — the two together make "no mentions omits" an invariant,
+        # not a single-writer convention. (Do NOT switch the view to `is not None`:
+        # that would re-admit a stored `[]` onto the wire.)
         mentions=mentions or None,
     )
     session.add(row)

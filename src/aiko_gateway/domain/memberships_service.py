@@ -224,14 +224,23 @@ async def add_member(
     and an unknown target user (controlled NotAMember rather than an FK
     IntegrityError at commit — cage-match PR#10: Carnot)."""
     await _require_admin(session, channel_id, actor_id)
-    existing = await _membership(session, channel_id, target_user_id)
+    # Idempotent-existing check as ONE joined query (not membership-lookup + a
+    # separate User fetch): returns (Membership, User) together, the same JOIN shape
+    # list_members uses. The INNER JOIN also fuses the no-orphan invariant — a
+    # membership whose User row is somehow missing (FK-off corruption) does NOT match,
+    # so it falls through to the validate-then-insert path below and 404s cleanly
+    # rather than returning a None User that would 500 in the caller's member view.
+    existing = (await session.execute(
+        select(Membership, User)
+        .join(User, Membership.user_id == User.id)
+        .where(Membership.channel_id == channel_id,
+               Membership.user_id == target_user_id)
+    )).first()
     if existing is not None:
-        # Already a member → their User row exists by the no-orphan-membership
-        # invariant (account deletion tears down memberships children-first).
-        return existing, await session.get(User, target_user_id)
-    # Validate the target user up front so a nonexistent user is a controlled
-    # rejection, not an FK violation surfacing as a 500 at commit time — and REUSE
-    # the loaded row as the returned User (no separate fetch).
+        return existing[0], existing[1]
+    # Not a current member → validate the target user up front so a nonexistent user
+    # is a controlled rejection, not an FK violation surfacing as a 500 at commit
+    # time — and REUSE the loaded row as the returned User (no separate fetch).
     target = await session.get(User, target_user_id)
     if target is None:
         raise NotAMember(target_user_id)
