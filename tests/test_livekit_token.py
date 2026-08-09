@@ -44,6 +44,10 @@ def livekit_configured(monkeypatch):
     is needed; monkeypatch restores the originals afterward."""
     monkeypatch.setattr(settings, "livekit_api_key", _LK_KEY)
     monkeypatch.setattr(settings, "livekit_api_secret", _LK_SECRET)
+    # Pin gateway_id="" so domain tests asserting un-namespaced sub/room don't break if
+    # the harness ever seeds GATEWAY_ID (cage-match #122 rd6 Wu #6). Namespaced-branch
+    # tests set it explicitly.
+    monkeypatch.setattr(settings, "gateway_id", "")
     return settings
 
 
@@ -299,6 +303,28 @@ async def test_missing_channel_is_same_404(client, session, livekit_configured):
         f"/v1/channels/{_ulid(999)}/video-token", headers=_headers(alice))
     # Identical to the non-member case — no existence leak.
     assert resp.status_code == 404
+
+
+async def test_dm_block_denies_video_token(client, session, livekit_configured):
+    # cage-match #122 rd6 (Wu #1): the block layer must traverse the video path. In a
+    # 2-party DM, a block in either direction denies the join (existence-hiding 404) so
+    # a blocked user can't watch the blocker's live camera — mirroring message fanout.
+    from aiko_gateway.domain import moderation_service
+    alice = await _user(session, "alice")
+    bob = await _user(session, "bob")
+    dm = await _private_channel(session)  # kind='dm'
+    await _join(session, dm, alice)
+    await _join(session, dm, bob)
+    await moderation_service.block_user(session, blocker_id=alice.id, blocked_id=bob.id)
+
+    # Bob (blocked by Alice) is refused — same 404 as a non-member, no camera access.
+    resp = await client.post(
+        f"/v1/channels/{dm.id}/video-token", headers=_headers(bob))
+    assert resp.status_code == 404
+    # ...and symmetrically, Alice (the blocker) is also refused the shared room.
+    resp2 = await client.post(
+        f"/v1/channels/{dm.id}/video-token", headers=_headers(alice))
+    assert resp2.status_code == 404
 
 
 async def test_banned_user_cannot_mint(client, session, livekit_configured):

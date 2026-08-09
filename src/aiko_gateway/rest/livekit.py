@@ -31,13 +31,17 @@ credential that must not be cached by any intermediary (Wu).
 """
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, HTTPException, Response, status
 from pydantic import BaseModel
 
 from ..config import settings
-from ..domain import acl, livekit_tokens
+from ..domain import acl, livekit_tokens, memberships_service, moderation_service
 from ..domain.rate_limit import rate_limit
 from .deps import CurrentUser, DbSession
+
+log = logging.getLogger("aiko_gateway.video")
 
 router = APIRouter(prefix="/v1", tags=["video"])
 
@@ -76,6 +80,23 @@ async def create_video_token(
     if channel is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "channel not found")
 
+    # BLOCK LAYER (cage-match #122 rd6 Wu #1): readability is NECESSARY, not
+    # SUFFICIENT — the block primitive must traverse the video path exactly as it
+    # traverses message delivery (main.py fanout excludes blocked pairs). For a 2-party
+    # DM, a block in EITHER direction denies the join outright — same existence-hiding
+    # 404 as a non-member — so a blocked user can't watch the blocker's live camera.
+    # is_blocked_between is the single door the reaction/mention surfaces also pass.
+    # MULTI-PARTY residual (named, #2731): a pairwise block in a group room can't be
+    # enforced at a room-level token (all-or-nothing subscription) — it needs selective
+    # per-track subscription, the analog of per-recipient fanout exclusion (increment 2).
+    if channel.kind == "dm":
+        members = await memberships_service.list_members(
+            session, channel_id=channel.id, actor_id=user.id)
+        for m, _u in members:
+            if m.user_id != user.id and await moderation_service.is_blocked_between(
+                    session, user.id, m.user_id):
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "channel not found")
+
     # READ ≠ PUBLISH: publish (live camera/mic) requires an EXPLICIT posting
     # membership (acl.is_posting_member) on BOTH public and private channels — a
     # read-only member OR a public-channel non-member gets subscribe-only. Broadcast
@@ -100,6 +121,12 @@ async def create_video_token(
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE, "video is not enabled on this island"
         )
+
+    # Audit the capability mint (cage-match #122 rd6 Wu #4): a trust-boundary that
+    # issues bearer grants must be answerable to "who held a publish grant for room X
+    # at time T?". No token/secret in the log — just who, where, and the grant power.
+    log.info("video-token mint user=%s channel=%s can_publish=%s",
+             user.id, channel.id, can_publish)
 
     # A bearer credential — never cache it in a proxy/browser store.
     response.headers["Cache-Control"] = "no-store"

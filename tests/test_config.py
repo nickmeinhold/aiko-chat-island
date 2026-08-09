@@ -160,6 +160,14 @@ def test_livekit_url_empty_host_raises():
         _prod_lk(livekit_url="wss://")
 
 
+def test_prod_loopback_sfu_is_not_exempt():
+    # Carnot rd6: the loopback exemption must NOT reach production. A prod island on
+    # ws://localhost is misconfigured (mobile clients resolve localhost to the device)
+    # or a hardening bypass — so prod gets the full guards regardless of host.
+    with pytest.raises(ValidationError):
+        _prod_lk(livekit_url="ws://localhost:7880")
+
+
 def test_unknown_environment_is_treated_as_production():
     # Fail-closed: an unrecognized environment is production-like, so the dev
     # default secret must still be rejected.

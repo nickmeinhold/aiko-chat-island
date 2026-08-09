@@ -397,8 +397,13 @@ class Settings(BaseSettings):
                 raise ValueError(
                     f"livekit_url has no host (got {self.livekit_url!r}). Refusing to boot."
                 )
+            # Exempt a loopback SFU ONLY in a non-prod env (dev convenience). A loopback
+            # URL in PRODUCTION is either misconfigured (mobile clients resolve
+            # `localhost` to the DEVICE, not the island) or a hardening bypass — so a
+            # prod island gets the full guards regardless of host (cage-match #122 rd6
+            # Carnot: the rd5 loopback exemption must not reach prod).
             is_loopback = host in {"localhost", "127.0.0.1", "::1"}
-            if not is_loopback:
+            if not (is_loopback and not self.is_production):
                 if urlparse(self.livekit_url).scheme != "wss":
                     raise ValueError(
                         f"livekit_url must be wss:// for a remote SFU (got {self.livekit_url!r}) "
