@@ -92,8 +92,17 @@ def _is_int(v: Any) -> bool:
 # contains: Control, Format (bidi/zero-width — the spoof vector isprintable() MISSES),
 # Surrogate, Private-Use, and Unassigned (a future Unicode version could reclassify a
 # Cn codepoint under a stored id's feet). Rejecting the whole set closes the
-# smuggling/garbage channel without dictating the id's script or format — charset
-# shape hygiene (like origin validating sig is base64url), not content resolution.
+# smuggling/injection channel without dictating the id's script or format.
+#
+# This is a category DENYLIST, deliberately NOT an alphabet allowlist. Unlike origin's
+# `sig` (a fixed base64url alphabet), a mention target_id is an OPAQUE identifier whose
+# concrete format is the app's to choose (ULID today; a future federated identity id
+# may use other characters), so pinning an alphabet here would couple the gateway to
+# that choice — against the pure-carrier contract. The consequence, accepted by
+# design: a "clean" but non-resolving id (e.g. whitespace, a confusable) still
+# validates and is carried inert — the roster simply never matches it, exactly like
+# any other unresolvable span. We block the DANGEROUS categories, not all nonsense;
+# resolvability is the client's concern, not the carrier's.
 _FORBIDDEN_ID_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co", "Cn"})
 
 
