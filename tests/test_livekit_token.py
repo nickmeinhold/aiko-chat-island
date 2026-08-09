@@ -253,37 +253,17 @@ async def test_gateway_id_namespaces_room_and_identity(
     assert claims["video"]["room"] == f"island-a:{ch.id}"
 
 
-async def test_public_channel_non_member_is_subscribe_only(client, session, livekit_configured):
-    # cage-match #122 rd3 (Wu #3): a public channel is READABLE by any signed-in user,
-    # but live broadcast must NOT be open to every non-member — publish requires an
-    # explicit posting membership. So a non-member reader gets a subscribe-only token
-    # (200, can_publish False), NOT a 404 and NOT canPublish.
-    randomer = await _user(session, "randomer")
-    pub = await _public_channel(session)  # no membership row for randomer
-
-    resp = await client.post(
-        f"/v1/channels/{pub.id}/video-token", headers=_headers(randomer))
-    assert resp.status_code == 200                 # public → readable → can join
-    body = resp.json()
-    assert body["can_publish"] is False            # ...but subscribe-only
-    claims = _decode(body["token"])
-    assert claims["video"]["canPublish"] is False
-    assert claims["video"]["canSubscribe"] is True
-
-
-async def test_public_channel_posting_member_can_publish(client, session, livekit_configured):
-    # cage-match #122 rd4 (Wu #3): the positive public path — a public-channel member
-    # WITH a can_post=True row DOES get canPublish. Proves the feature works on a
-    # public channel once memberships are provisioned (not only on private DMs).
+async def test_non_dm_channel_is_forbidden(client, session, livekit_configured):
+    # cage-match #122 rd7 (Carnot): increment 1 is DM-ONLY. A group/public channel —
+    # even one the caller can read and post in — is 403, because pairwise blocks can't
+    # be enforced at a room-level token for unbounded participants (#2731). Fail closed.
     speaker = await _user(session, "speaker")
     pub = await _public_channel(session)
     await _join(session, pub, speaker, can_post=True)
 
     resp = await client.post(
         f"/v1/channels/{pub.id}/video-token", headers=_headers(speaker))
-    assert resp.status_code == 200
-    assert resp.json()["can_publish"] is True
-    assert _decode(resp.json()["token"])["video"]["canPublish"] is True
+    assert resp.status_code == 403                 # video is DM-only in increment 1
 
 
 async def test_non_member_of_private_channel_is_404(client, session, livekit_configured):

@@ -1,24 +1,24 @@
 """Video/audio (LiveKit) endpoints — the island as room-token authorizer.
 
 ``POST /v1/channels/{channel_id}/video-token`` mints a LiveKit JOIN token for the
-authenticated caller, scoped to the channel-as-room, IFF the caller may read that
-channel. The room is the resolved ``channel.id``, so a LiveKit room is namespaced to
-an aiko channel and the membership gate is meaningful: a private DM's video room is
-joinable only by its members.
+authenticated caller, scoped to the channel-as-room. Increment 1 is **DM-ONLY**.
 
 Trust-boundary properties, from the codebase's established patterns:
 
   * **ACL gate before mint (existence-hiding).** ``acl.readable_channel`` collapses
     "no such channel" and "private channel you're not a member of" into the SAME
-    ``None`` → identical 404, so probing ids leaks nothing. The token is never issued
-    for a room the caller can't enter.
-  * **READ ≠ PUBLISH (cage-match #122).** Read access must not mint a broadcast
-    capability. Publish (camera/mic) is gated on ``acl.is_posting_member`` — an
-    EXPLICIT posting membership on both public and private channels — so a read-only
-    member (``can_post=False``) OR a public-channel non-member gets a SUBSCRIBE-ONLY
-    token, never ``canPublish``. Live broadcast is a higher-trust medium than a text
-    line, so it is deliberately stricter than ``can_post`` (which is post-open for
-    public channels). The data channel is off by default (undesigned side-channel).
+    ``None`` → identical 404, so probing ids leaks nothing.
+  * **DM-only (cage-match #122 rd7).** Only ``kind='dm'`` channels get video: a
+    group/public room can't enforce pairwise BLOCKS at a room-level token (unbounded
+    participants, all-or-nothing subscription), which would widen block semantics on a
+    safety boundary. A readable non-DM channel is a clean 403; group video waits on
+    selective subscription (#2731).
+  * **BLOCK layer.** In a DM, a block in either direction denies the join (404) via
+    ``moderation_service.is_blocked_between`` — the block primitive traverses the video
+    path like it traverses message fanout.
+  * **READ ≠ PUBLISH.** Publish (camera/mic) is gated on ``acl.is_posting_member`` (an
+    explicit posting membership), so a read-only DM member is subscribe-only; the data
+    channel is off by default (undesigned side-channel).
   * **Server-derived identity.** The LiveKit participant identity is ``user.id`` from
     ``CurrentUser`` — never a request field (I5).
 
@@ -80,22 +80,30 @@ async def create_video_token(
     if channel is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "channel not found")
 
-    # BLOCK LAYER (cage-match #122 rd6 Wu #1): readability is NECESSARY, not
-    # SUFFICIENT — the block primitive must traverse the video path exactly as it
-    # traverses message delivery (main.py fanout excludes blocked pairs). For a 2-party
-    # DM, a block in EITHER direction denies the join outright — same existence-hiding
-    # 404 as a non-member — so a blocked user can't watch the blocker's live camera.
+    # DM-ONLY in increment 1 (cage-match #122 rd7 Carnot). Group/public rooms cannot
+    # enforce pairwise BLOCKS at a room-level token: participants are unbounded (public
+    # readers with no membership row) and LiveKit subscription is all-or-nothing, so a
+    # blocked user could watch the blocker's live camera — silently widening block
+    # semantics on a SAFETY boundary. Fail closed to DMs (2-party, where blocks ARE
+    # enforceable) until selective per-track subscription lands (#2731). The channel is
+    # already readable here, so revealing "video is DM-only" leaks nothing.
+    if channel.kind != "dm":
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "video is only available in direct messages")
+
+    # BLOCK LAYER (cage-match #122 rd6 Wu #1): readability is NECESSARY, not SUFFICIENT —
+    # the block primitive must traverse the video path exactly as it traverses message
+    # delivery (main.py fanout excludes blocked pairs; concept invariant-must-traverse-
+    # all-layers). In a 2-party DM a block in EITHER direction denies the join outright
+    # (existence-hiding 404), so a blocked user can't watch the blocker's live camera.
     # is_blocked_between is the single door the reaction/mention surfaces also pass.
-    # MULTI-PARTY residual (named, #2731): a pairwise block in a group room can't be
-    # enforced at a room-level token (all-or-nothing subscription) — it needs selective
-    # per-track subscription, the analog of per-recipient fanout exclusion (increment 2).
-    if channel.kind == "dm":
-        members = await memberships_service.list_members(
-            session, channel_id=channel.id, actor_id=user.id)
-        for m, _u in members:
-            if m.user_id != user.id and await moderation_service.is_blocked_between(
-                    session, user.id, m.user_id):
-                raise HTTPException(status.HTTP_404_NOT_FOUND, "channel not found")
+    members = await memberships_service.list_members(
+        session, channel_id=channel.id, actor_id=user.id)
+    for m, _u in members:
+        if m.user_id != user.id and await moderation_service.is_blocked_between(
+                session, user.id, m.user_id):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "channel not found")
 
     # READ ≠ PUBLISH: publish (live camera/mic) requires an EXPLICIT posting
     # membership (acl.is_posting_member) on BOTH public and private channels — a
