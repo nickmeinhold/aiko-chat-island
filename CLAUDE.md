@@ -57,6 +57,23 @@ file is the working-context that isn't obvious from the code.
   `aiko_services`/`aiko_chat`; his answers are gold but verify against the actual
   checkout (`../aiko_chat`) before building on them — delight is the signal to
   verify, not permission to assert.
+- **Cross-tab grounding — read the APP TAB's design record BEFORE implementing
+  any shared-contract feature.** The client is a peer repo (`../aiko_chat_app`,
+  its own Claude tab) that co-owns every wire the two share. Before building
+  anything on the v2 social contract (mentions, DMs, reactions, profile,
+  notifications) or any feature the app consumes, open the app tab's record and
+  build against THAT — the ticket is intent, the other tab's design is the other
+  half of the binding contract. Read, in order: the app's `HANDOFF-from-app-tab-*`
+  answers + the matching `nickmeinhold/claude-tasks` issue comments (the app
+  tab's *locked* replies), then `../aiko_chat_app/docs/adr/` (numbered ADR
+  outcomes), `docs/design/`, `docs/crucible/`. This is the **#2634 lesson**: that
+  build came off the ticket + a narrow app answer, never checked against the
+  recorded design, and the cage-match then hardened the wrong premise for 7
+  rounds (a design-blind adversary confirms the author's frame, it doesn't
+  question it). When the record and your memory disagree, that's a finding —
+  surface it, don't tie-break. Reciprocal: the app tab has the mirror directive
+  to read THIS repo's `HANDOFF-to-app-tab-*` + published `/openapi.json` before
+  its wire work.
 
 ## Where things live
 
