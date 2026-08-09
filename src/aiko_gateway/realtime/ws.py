@@ -13,7 +13,8 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
 
 from ..db import SessionLocal
 from ..domain import (
-    acl, auth_session, echo, messages_service, moderation_service, signing,
+    acl, auth_session, echo, mentions, messages_service, moderation_service,
+    signing,
 )
 from . import envelopes
 from .hub import Connection
@@ -152,10 +153,18 @@ async def _handle_send(gw, conn: Connection, user, frame: dict) -> None:
         except signing.OriginError as e:
             await conn.send(envelopes.error("bad_origin", str(e), frame["client_msg_id"]))
             return
+        # Key-bound @-mention spans (#2632): SHAPE+caps validated at the trust
+        # boundary, then carried verbatim. Fail-closed — a malformed array is
+        # rejected, never persisted, exactly like a bad origin. Absent is legal.
+        try:
+            spans = mentions.validate_mentions(frame.get("mentions"))
+        except mentions.MentionError as e:
+            await conn.send(envelopes.error("bad_mentions", str(e), frame["client_msg_id"]))
+            return
         row, created = await messages_service.create_outbound(
             session, user=user, channel=channel,
             body=frame["body"], client_msg_id=frame["client_msg_id"],
-            reply_to=reply_to, origin=origin,
+            reply_to=reply_to, origin=origin, mentions=spans,
         )
         view = messages_service.message_view(row)
         # Block exclusion for live fanout: everyone in a block relationship with

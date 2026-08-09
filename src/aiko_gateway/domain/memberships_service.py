@@ -332,8 +332,19 @@ async def leave(
 
 async def list_members(
     session: AsyncSession, *, channel_id: str, actor_id: str
-) -> list[Membership]:
-    """Members of a channel, for a caller who may see it.
+) -> list[tuple[Membership, User]]:
+    """Members of a channel, for a caller who may see it — each paired with the
+    member's ``User`` so the route can surface ``handle`` + ``display_name``.
+
+    This is the roster the app's @-mention composer autocompletes from (#2632):
+    ADR-0004 dropped the central ``/v1/mentions`` directory in favour of "a
+    federated per-island member roster you browse", so member discovery IS this
+    endpoint. Returning the handle/display_name here is what lets the client
+    prefix-match locally instead of hitting a server-side user search.
+
+    One INNER JOIN, not an N+1: a Membership always has a real User (FK), so the
+    join can never drop or duplicate a member row. Ordered by ``user_id`` for a
+    stable roster (unchanged from before).
 
     EXISTENCE-HIDING (case (c)): a non-member of a private channel gets
     ``ChannelNotFound`` (404) — the members list of a private channel is
@@ -345,12 +356,13 @@ async def list_members(
         raise ChannelNotFound(channel_id)
     rows = (
         await session.execute(
-            select(Membership)
+            select(Membership, User)
+            .join(User, Membership.user_id == User.id)
             .where(Membership.channel_id == channel_id)
             .order_by(Membership.user_id)
         )
-    ).scalars()
-    return list(rows)
+    ).all()
+    return [(m, u) for m, u in rows]
 
 
 async def create_channel(

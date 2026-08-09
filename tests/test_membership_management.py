@@ -217,6 +217,28 @@ async def test_member_can_list_members(client, session):
     assert [m["user_id"] for m in resp.json()["members"]] == [admin.id]
 
 
+async def test_members_roster_carries_handle_and_display_name(client, session):
+    """#2632: the roster the @-mention composer autocompletes from carries each
+    member's handle + display_name (ADR-0004 dropped the central directory, so
+    this endpoint IS the mention lookup). One joined row per member, no N+1."""
+    admin = await _user(session, "admin")
+    bob = await _user(session, "bob")
+    ch = await _channel(session, cid=10, name="secret", is_private=True)
+    await _member(session, ch, admin, role="admin")
+    await _member(session, ch, bob, role="member")
+    resp = await client.get(f"/v1/channels/{ch.id}/members",
+                            headers=await _headers(admin))
+    assert resp.status_code == 200
+    by_id = {m["user_id"]: m for m in resp.json()["members"]}
+    # handle == the #2631 handle (users.username); display_name is title-cased by _user.
+    assert by_id[admin.id]["handle"] == "admin"
+    assert by_id[admin.id]["display_name"] == "Admin"
+    assert by_id[bob.id]["handle"] == "bob"
+    assert by_id[bob.id]["display_name"] == "Bob"
+    # existing fields preserved
+    assert by_id[bob.id]["role"] == "member" and by_id[bob.id]["can_post"] is True
+
+
 # --- bypass case (a): non-admin add/remove --------------------------------
 
 async def test_non_admin_cannot_add_member(client, session):

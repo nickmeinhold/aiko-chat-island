@@ -47,6 +47,13 @@ def message_view(m: Message, *, reactions: list[dict] | None = None) -> dict:
     }
     if m.origin is not None:
         view["origin"] = m.origin
+    # Key-bound @-mention spans (#2632), carried verbatim. Included ONLY when the
+    # message actually has mentions — an absent key reads as "no mentions", the
+    # same omit-when-empty contract as `origin`. The client re-resolves each
+    # span's key->current-handle at render time (targets key off the opaque
+    # identity, so a rename never orphans the mention — app tab ADR-0004).
+    if m.mentions:
+        view["mentions"] = m.mentions
     return view
 
 
@@ -69,7 +76,7 @@ def retraction_view(r: Retraction) -> dict:
 async def create_outbound(
     session: AsyncSession, *, user: User, channel: Channel,
     body: str, client_msg_id: str, reply_to: str | None = None,
-    origin: dict | None = None,
+    origin: dict | None = None, mentions: list[dict] | None = None,
 ) -> tuple[Message, bool]:
     """Persist a user's outgoing message (server ULID, server-derived sender —
     invariant I5). Idempotent on (channel, client_msg_id): a resend returns the
@@ -81,6 +88,12 @@ async def create_outbound(
     resend keeps the FIRST row's origin — the idempotency key already pins the
     stored message, so a differing re-signed envelope on a retry is ignored, not a
     second row (consistent with the existing client_msg_id no-op contract).
+
+    `mentions` is the SHAPE+caps-validated list of key-bound @-mention spans
+    (already checked by domain/mentions.validate_mentions at the call site).
+    Carried verbatim, resolver-free, and — like `origin` — a resend keeps the
+    FIRST row's spans (the early-return above never reaches this insert on a
+    resend). See the Message.mentions model note for the carrier contract.
 
     When `origin` is present, the sender's pubkey->account binding is observed at
     send time through the single door `signing_keys_service.record_signing_key`
@@ -113,6 +126,7 @@ async def create_outbound(
         client_msg_id=client_msg_id,
         aiko_origin=False,
         origin=origin,
+        mentions=mentions,
     )
     session.add(row)
     await session.commit()

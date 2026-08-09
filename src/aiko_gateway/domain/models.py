@@ -368,6 +368,18 @@ class Message(Base):
     # unsigned messages and every bus-born message (not signed through here);
     # absent origin means "unverified", never "invalid".
     origin: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # Key-bound @-mention spans (#2632): a list of discriminated-target spans
+    # [{target_type, target_id, offset, length}], SHAPE+caps validated at the
+    # trust boundary (domain/mentions.validate_mentions) then carried VERBATIM —
+    # the gateway is a carrier, not a resolver. `target_id` is the mentioned
+    # KEY/opaque id, never a home-qualified string (ADR-0004: mention targets key
+    # off the opaque identity, so a rename never orphans a mention — the client
+    # re-resolves key->current-handle at render time). `offset`/`length` index
+    # `body` in the client's declared basis (UTF-16) and are round-tripped
+    # OPAQUELY; the gateway never re-derives that basis. NULL for a message with
+    # no mentions and every bus-born message; message_view omits the key when
+    # NULL (absent == "no mentions", mirroring origin's absent == "unverified").
+    mentions: Mapped[list | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     edited_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     deleted_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

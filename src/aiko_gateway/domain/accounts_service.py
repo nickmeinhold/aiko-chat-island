@@ -161,11 +161,18 @@ async def delete_user_account(session: AsyncSession, user_id: str) -> None:
     # now-gone user, and the UNIQUE(channel_id, client_msg_id) treats NULLs as
     # distinct (SQLite + Postgres), so many tombstones can share NULL.
     # Scoped to this user's messages only — co-participants' rows are untouched.
+    # `mentions` (#2632) is wiped too: the spans index the body we just replaced
+    # (so they'd dangle past "[deleted]") AND they record WHO this user @'d — part
+    # of the person's interaction footprint, destroyed with the body. It follows
+    # `body`, NOT `origin`: origin is the sender's own signature (kept so a
+    # tombstone stays authorship-verifiable), while mentions point at OTHERS and
+    # are meaningless once the body is gone. (verify-the-neighbor: this cascade
+    # must learn about every new user-referencing column — the note below.)
     await session.execute(
         update(Message)
         .where(Message.sender_user_id == user_id)
         .values(sender_user_id=None, sender_label=DELETED_USER_LABEL,
-                body=DELETED_BODY, client_msg_id=None))
+                body=DELETED_BODY, client_msg_id=None, mentions=None))
     # Moderation footprint (#7): delete this user's blocks (either direction) and
     # anonymize their reports (reporter → NULL, audit trail kept). Both are FK
     # children of `users`, so they must go before the user row — the SAME

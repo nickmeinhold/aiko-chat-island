@@ -19,6 +19,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from ..domain import memberships_service as svc
+from ..domain.models import User
 from .deps import CurrentUser, DbSession
 
 router = APIRouter(prefix="/v1", tags=["members"])
@@ -51,8 +52,19 @@ def _channel_view(c) -> dict:
     }
 
 
-def _member_view(m) -> dict:
-    return {"user_id": m.user_id, "role": m.role, "can_post": m.can_post}
+def _member_view(m, u) -> dict:
+    # `handle` (the mutable, rename-able display alias) and `display_name` are
+    # surfaced so the app's @-mention composer can autocomplete from this roster
+    # (#2632) — ADR-0004 dropped the central /v1/mentions directory in favour of
+    # browsing the per-island member roster, so this endpoint IS the mention
+    # lookup. `handle` is the user's `username` column (the #2631 handle).
+    return {
+        "user_id": m.user_id,
+        "role": m.role,
+        "can_post": m.can_post,
+        "handle": u.username,
+        "display_name": u.display_name,
+    }
 
 
 @router.post("/channels", status_code=201)
@@ -75,7 +87,7 @@ async def list_members(channel_id: str, user: CurrentUser, session: DbSession) -
         # Existence-hiding: a non-member of a private channel gets the SAME 404
         # as a nonexistent channel — never a confirmation it exists.
         raise HTTPException(404, "channel not found")
-    return {"channel_id": channel_id, "members": [_member_view(m) for m in members]}
+    return {"channel_id": channel_id, "members": [_member_view(m, u) for m, u in members]}
 
 
 @router.post("/channels/{channel_id}/members", status_code=201)
@@ -100,7 +112,7 @@ async def add_member(
     except svc.NotAMember:
         # Target user does not exist — controlled 404, not an FK 500 at commit.
         raise HTTPException(404, "user not found")
-    return _member_view(m)
+    return _member_view(m, await session.get(User, m.user_id))
 
 
 @router.delete("/channels/{channel_id}/members/{user_id}", status_code=204)
@@ -129,7 +141,7 @@ async def join_channel(channel_id: str, user: CurrentUser, session: DbSession) -
         # Both "no such channel" AND "private invite_only channel you can't see"
         # land here — indistinguishable by design (existence-hiding).
         raise HTTPException(404, "channel not found")
-    return _member_view(m)
+    return _member_view(m, await session.get(User, m.user_id))
 
 
 @router.delete("/channels/{channel_id}/leave", status_code=204)
