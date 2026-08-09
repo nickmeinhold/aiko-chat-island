@@ -301,6 +301,22 @@ async def test_missing_channel_is_same_404(client, session, livekit_configured):
     assert resp.status_code == 404
 
 
+async def test_banned_user_cannot_mint(client, session, livekit_configured):
+    # cage-match #122 rd5 (Wu F5/Tesla #8): a banned caller must not mint a live
+    # broadcast capability. get_current_user 403s a banned user (banned_at set) before
+    # the route body runs — pin it so the ban gate can't silently regress.
+    import datetime as _dt
+    alice = await _user(session, "alice")
+    ch = await _private_channel(session)
+    await _join(session, ch, alice)
+    alice.banned_at = _dt.datetime.now(_dt.timezone.utc)
+    await session.commit()
+
+    resp = await client.post(
+        f"/v1/channels/{ch.id}/video-token", headers=_headers(alice))
+    assert resp.status_code == 403                 # suspended, no token minted
+
+
 async def test_unauthenticated_is_rejected(client, session, livekit_configured):
     ch = await _private_channel(session)
     resp = await client.post(f"/v1/channels/{ch.id}/video-token")

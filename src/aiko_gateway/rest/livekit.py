@@ -59,8 +59,19 @@ class VideoTokenResponse(BaseModel):
 async def create_video_token(
     channel_id: str, user: CurrentUser, session: DbSession, response: Response
 ) -> VideoTokenResponse:
-    # Membership/existence gate FIRST — a non-member of a private channel (or a
-    # missing channel) is the same existence-hiding 404 as everywhere else.
+    # Capability gate FIRST (cage-match #122 rd5 Wu F4): is_configured() is a pure
+    # settings read, and EVERY island returns 503 until the creds deploy — so short-
+    # circuit before the ACL queries rather than doing two DB lookups for a guaranteed
+    # 503. Existence-hiding is preserved: the 503 is channel-independent (it never
+    # depends on whether the channel exists or the caller is a member), so it leaks
+    # nothing the 404 path protects.
+    if not livekit_tokens.is_configured():
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "video is not enabled on this island"
+        )
+
+    # Membership/existence gate — a non-member of a private channel (or a missing
+    # channel) is the same existence-hiding 404 as everywhere else.
     channel = await acl.readable_channel(session, user.id, channel_id)
     if channel is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "channel not found")

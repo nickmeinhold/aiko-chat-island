@@ -380,37 +380,45 @@ class Settings(BaseSettings):
         # same asymmetric-strip fix already applied to moderator_user_ids and the creds.
         self.gateway_id = self.gateway_id.strip()
         # LiveKit is OPTIONAL, but WHEN configured it mints bearer capabilities to a
-        # SHARED SFU (one API key across islands) — so in PRODUCTION it earns the same
-        # fail-closed guards as the other trust-boundary dials (cage-match #122 rd2:
-        # Carnot secret-strength, Tesla+Wu gateway_id fail-open, Tesla half-config +
-        # wss). Un-configured islands are wholly unaffected (the whole block is skipped).
-        if self.is_production and (self.livekit_api_key or self.livekit_api_secret):
+        # SHARED SFU (one API key across islands). The forgery + cross-island-collision
+        # risk is a function of pointing at a REMOTE/shared SFU, NOT of ENVIRONMENT
+        # (cage-match #122 rd5 Wu F1 — gating on is_production let a non-prod box with
+        # the real shared creds + no gateway_id merge its users into prod's rooms). So
+        # these guards fire whenever LiveKit is configured against a non-loopback SFU,
+        # in EVERY environment; a loopback dev SFU (ws://localhost) is exempt.
+        if self.livekit_api_key or self.livekit_api_secret:
             if not (self.livekit_api_key and self.livekit_api_secret):
                 raise ValueError(
                     "LiveKit is half-configured: set BOTH livekit_api_key and "
                     "livekit_api_secret, or NEITHER. Refusing to boot."
                 )
-            if len(self.livekit_api_secret) < _MIN_PROD_SECRET_LEN:
+            host = urlparse(self.livekit_url).hostname or ""
+            if not host:  # e.g. "wss://" — a prefix check would pass it (Wu F3)
                 raise ValueError(
-                    f"livekit_api_secret is too weak for production "
-                    f"(len={len(self.livekit_api_secret)} < {_MIN_PROD_SECRET_LEN}). A "
-                    "weak-but-non-empty secret makes every minted room token forgeable "
-                    "(entropy leaving the trust boundary as forgeability). Refusing to boot."
+                    f"livekit_url has no host (got {self.livekit_url!r}). Refusing to boot."
                 )
-            if not self.gateway_id:
-                raise ValueError(
-                    "gateway_id is required when LiveKit is configured in production: "
-                    "the SFU is shared across islands on ONE API key, so rooms and "
-                    "participant identities MUST be namespaced by gateway_id or they "
-                    "collide across islands (the empty default is the fail-open case). "
-                    "Refusing to boot — set GATEWAY_ID."
-                )
-            if not self.livekit_url.startswith("wss://"):
-                raise ValueError(
-                    f"livekit_url must be wss:// in production (got {self.livekit_url!r}) "
-                    "— it is handed to every client as the SFU to connect to; a plaintext "
-                    "or wrong-scheme URL is a client-redirect footgun. Refusing to boot."
-                )
+            is_loopback = host in {"localhost", "127.0.0.1", "::1"}
+            if not is_loopback:
+                if urlparse(self.livekit_url).scheme != "wss":
+                    raise ValueError(
+                        f"livekit_url must be wss:// for a remote SFU (got {self.livekit_url!r}) "
+                        "— it is handed to every client; a plaintext/wrong-scheme URL is a "
+                        "client-redirect footgun. Refusing to boot."
+                    )
+                if len(self.livekit_api_secret) < _MIN_PROD_SECRET_LEN:
+                    raise ValueError(
+                        f"livekit_api_secret is too weak (len={len(self.livekit_api_secret)} "
+                        f"< {_MIN_PROD_SECRET_LEN}) for a remote SFU. A weak-but-non-empty "
+                        "secret makes every minted room token forgeable. Refusing to boot."
+                    )
+                if not self.gateway_id:
+                    raise ValueError(
+                        "gateway_id is required when LiveKit is configured against a "
+                        "REMOTE/shared SFU (in ANY environment): the SFU is shared across "
+                        "islands on ONE API key, so rooms/identities MUST be namespaced by "
+                        "gateway_id or they collide across islands (the empty default is the "
+                        "fail-open case). Refusing to boot — set GATEWAY_ID."
+                    )
         # A2 (crucible-09 Phase A): `e2ee` is schema-reserved for Phase B and
         # HARD-REJECTED in EVERY environment until MLS lands. Advertising an
         # unimplemented E2EE mode would be the exact mislabel this feature prevents

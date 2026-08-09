@@ -164,7 +164,7 @@ def mint_room_token(
         "iss": settings.livekit_api_key,
         "sub": _namespaced(identity),   # door-enforced island namespace (Wu #1)
         "name": display_name,
-        "jti": uuid.uuid4().hex,        # per-mint id — audit + future revocation hook (Wu #4)
+        "jti": uuid.uuid4().hex,        # per-mint id — audit correlation only; no consumer/revocation yet (Wu #4)
         "nbf": int(now.timestamp()) - _NBF_LEEWAY_SECONDS,
         "exp": int((now + dt.timedelta(seconds=settings.livekit_token_ttl_seconds)).timestamp()),
         "video": grant,  # LiveKit VideoGrant — one room, participant powers, never admin

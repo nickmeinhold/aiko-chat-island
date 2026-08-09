@@ -135,6 +135,31 @@ def test_prod_without_livekit_boots_unaffected():
     assert s.livekit_api_key == "" and s.is_production is True
 
 
+def test_nonprod_livekit_remote_sfu_without_gateway_id_raises():
+    # Wu F1: the shared-SFU guard is NOT gated on ENVIRONMENT. A test/dev box with the
+    # real shared creds pointed at the remote SFU + no gateway_id would merge its users
+    # into prod's rooms — so it must fail closed in a NON-prod env too.
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, environment="test", jwt_secret=_STRONG_SECRET,
+                 livekit_api_key="APIabc", livekit_api_secret=_LK_SECRET_STRONG,
+                 livekit_url="wss://livekit.imagineering.cc", gateway_id="")
+
+
+def test_livekit_loopback_sfu_is_exempt():
+    # A loopback dev SFU carries no cross-island collision / forgery risk, so the
+    # gateway_id / wss / secret-strength guards relax (ws://localhost, short secret ok).
+    s = Settings(_env_file=None, environment="dev", jwt_secret=_DEV_JWT_SECRET,
+                 livekit_api_key="devkey", livekit_api_secret="short-dev",
+                 livekit_url="ws://localhost:7880", gateway_id="")
+    assert s.livekit_api_key == "devkey" and s.gateway_id == ""
+
+
+def test_livekit_url_empty_host_raises():
+    # Wu F3: "wss://" passes a startswith check but has no host — reject it.
+    with pytest.raises(ValidationError):
+        _prod_lk(livekit_url="wss://")
+
+
 def test_unknown_environment_is_treated_as_production():
     # Fail-closed: an unrecognized environment is production-like, so the dev
     # default secret must still be rejected.
