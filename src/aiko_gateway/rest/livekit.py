@@ -35,9 +35,11 @@ import logging
 
 from fastapi import APIRouter, HTTPException, Response, status
 from pydantic import BaseModel
+from sqlalchemy import select
 
 from ..config import settings
-from ..domain import acl, livekit_tokens, memberships_service, moderation_service
+from ..domain import acl, livekit_tokens, moderation_service
+from ..domain.models import Membership
 from ..domain.rate_limit import rate_limit
 from .deps import CurrentUser, DbSession
 
@@ -87,22 +89,30 @@ async def create_video_token(
     # semantics on a SAFETY boundary. Fail closed to DMs (2-party, where blocks ARE
     # enforceable) until selective per-track subscription lands (#2731). The channel is
     # already readable here, so revealing "video is DM-only" leaks nothing.
-    if channel.kind != "dm":
+    # DM must ALSO be private (cage-match #122 rd8 Carnot): kind='dm' is not fully
+    # DB-constrained to is_private, so assert both — a malformed public kind='dm' row
+    # must not leak a subscribe token to any reader.
+    if channel.kind != "dm" or not channel.is_private:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
             "video is only available in direct messages")
 
-    # BLOCK LAYER (cage-match #122 rd6 Wu #1): readability is NECESSARY, not SUFFICIENT —
-    # the block primitive must traverse the video path exactly as it traverses message
-    # delivery (main.py fanout excludes blocked pairs; concept invariant-must-traverse-
-    # all-layers). In a 2-party DM a block in EITHER direction denies the join outright
-    # (existence-hiding 404), so a blocked user can't watch the blocker's live camera.
-    # is_blocked_between is the single door the reaction/mention surfaces also pass.
-    members = await memberships_service.list_members(
-        session, channel_id=channel.id, actor_id=user.id)
-    for m, _u in members:
-        if m.user_id != user.id and await moderation_service.is_blocked_between(
-                session, user.id, m.user_id):
+    # BLOCK LAYER (cage-match #122 rd6 Wu #1 / rd8 Tesla): readability is NECESSARY, not
+    # SUFFICIENT — the block primitive must traverse the video path exactly as it does
+    # message fanout (concept invariant-must-traverse-all-layers). Resolve the DM peer(s)
+    # from RAW Membership rows — NOT list_members, which is the visibility-shaped @-mention
+    # roster: if it ever hides blocked/soft-deleted peers, a list-based check would see
+    # only self and fail OPEN on the exact safety surface DM-only exists to protect
+    # (rd8 Tesla F1 — a safety gate must read ground truth, not a social proxy). A block
+    # in EITHER direction denies the join (existence-hiding 404).
+    peer_ids = (await session.execute(
+        select(Membership.user_id).where(
+            Membership.channel_id == channel.id,
+            Membership.user_id != user.id,
+        )
+    )).scalars().all()
+    for pid in peer_ids:
+        if await moderation_service.is_blocked_between(session, user.id, pid):
             raise HTTPException(status.HTTP_404_NOT_FOUND, "channel not found")
 
     # READ ≠ PUBLISH: publish (live camera/mic) requires an EXPLICIT posting
