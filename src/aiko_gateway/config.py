@@ -373,6 +373,12 @@ class Settings(BaseSettings):
         # silently sign a different byte string than the operator set.
         self.livekit_api_key = self.livekit_api_key.strip()
         self.livekit_api_secret = self.livekit_api_secret.strip()
+        # Strip gateway_id too (cage-match #122 rd3 Tesla+Wu): it namespaces LiveKit
+        # rooms/identities, so a padded "  island-a  " would mint under a non-canonical
+        # prefix AND slip past the `if not self.gateway_id` prod gate below. Normalize
+        # once here so the stored value is what actually prefixes the room string — the
+        # same asymmetric-strip fix already applied to moderator_user_ids and the creds.
+        self.gateway_id = self.gateway_id.strip()
         # LiveKit is OPTIONAL, but WHEN configured it mints bearer capabilities to a
         # SHARED SFU (one API key across islands) — so in PRODUCTION it earns the same
         # fail-closed guards as the other trust-boundary dials (cage-match #122 rd2:
