@@ -44,10 +44,29 @@ Named residuals (cage-match #122, honest scope, NOT closed here):
 from __future__ import annotations
 
 import datetime as dt
+import uuid
 
 import jwt
 
 from ..config import settings
+
+
+def _namespaced(value: str) -> str:
+    """Prefix a room name / participant identity with the island's ``gateway_id`` on
+    the SHARED SFU. Applied INSIDE the door (cage-match #122 rd4 Wu #1) so isolation is
+    enforced by construction — a future in-process caller (the robot loop) cannot mint
+    an un-namespaced token by forgetting to prefix. ``gateway_id`` is stripped at the
+    Settings boundary and REQUIRED in prod when LiveKit is configured, so the
+    empty-prefix branch is dev/single-island only."""
+    gid = settings.gateway_id
+    return f"{gid}:{value}" if gid else value
+
+
+def room_for_channel(channel_id: str) -> str:
+    """The namespaced LiveKit room name for a channel. Public so a caller (the route)
+    can put the SAME string in its response that the minted token carries — one source
+    of truth for the namespace, no route/door drift."""
+    return _namespaced(channel_id)
 
 # LiveKit REQUIRES HS256 (the token is validated with the shared API secret). This
 # is a hard constant, not ``settings.jwt_algorithm``: the island's *own* auth alg
@@ -106,6 +125,20 @@ def mint_room_token(
     Fails closed on an empty/whitespace ``identity`` or ``room`` (Tesla #6): the door
     never signs a live capability for a blank participant or an unscoped room, even if
     a future caller forgets to validate — the route already passes DB-backed ids.
+
+    NAMESPACING IS DOOR-ENFORCED (cage-match #122 rd4 Wu #1): ``identity`` and ``room``
+    are passed as the BARE ids (user_id / channel_id); the door prefixes both with
+    ``gateway_id`` via ``_namespaced`` so no caller can mint an un-namespaced token on
+    the shared SFU. A ``jti`` is stamped for audit/future-revocation correlation.
+
+    RESIDUALS this token does NOT close (honest scope): (a) it is a bearer valid for
+    ``ttl + nbf_leeway`` with no per-use revocation — theft within the window = a live
+    grant until ``exp`` (short TTL + TLS + no-store mitigate); (b) a stable per-user
+    ``sub`` means LiveKit REPLACES a prior connection on re-join — correct for the
+    network-flap reconnect flow, but one user on TWO devices at once will contend
+    (multi-device is a named residual, not supported by the skeleton); (c) a channel
+    hard-deleted after mint leaves a joinable ghost room until ``exp`` (same class as
+    ban-after-connect, TTL-bounded).
     """
     if not is_configured():
         raise LiveKitNotConfigured("LiveKit API key/secret not set on this island")
@@ -116,7 +149,7 @@ def mint_room_token(
 
     now = dt.datetime.now(dt.timezone.utc)
     grant = {
-        "room": room,
+        "room": _namespaced(room),
         "roomJoin": True,
         "canPublish": can_publish,
         "canSubscribe": can_subscribe,
@@ -129,8 +162,9 @@ def mint_room_token(
         grant["canPublishSources"] = _AV_PUBLISH_SOURCES
     payload = {
         "iss": settings.livekit_api_key,
-        "sub": identity,
+        "sub": _namespaced(identity),   # door-enforced island namespace (Wu #1)
         "name": display_name,
+        "jti": uuid.uuid4().hex,        # per-mint id — audit + future revocation hook (Wu #4)
         "nbf": int(now.timestamp()) - _NBF_LEEWAY_SECONDS,
         "exp": int((now + dt.timedelta(seconds=settings.livekit_token_ttl_seconds)).timestamp()),
         "video": grant,  # LiveKit VideoGrant — one room, participant powers, never admin

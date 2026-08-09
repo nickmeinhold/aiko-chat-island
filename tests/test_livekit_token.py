@@ -267,6 +267,21 @@ async def test_public_channel_non_member_is_subscribe_only(client, session, live
     assert claims["video"]["canSubscribe"] is True
 
 
+async def test_public_channel_posting_member_can_publish(client, session, livekit_configured):
+    # cage-match #122 rd4 (Wu #3): the positive public path — a public-channel member
+    # WITH a can_post=True row DOES get canPublish. Proves the feature works on a
+    # public channel once memberships are provisioned (not only on private DMs).
+    speaker = await _user(session, "speaker")
+    pub = await _public_channel(session)
+    await _join(session, pub, speaker, can_post=True)
+
+    resp = await client.post(
+        f"/v1/channels/{pub.id}/video-token", headers=_headers(speaker))
+    assert resp.status_code == 200
+    assert resp.json()["can_publish"] is True
+    assert _decode(resp.json()["token"])["video"]["canPublish"] is True
+
+
 async def test_non_member_of_private_channel_is_404(client, session, livekit_configured):
     alice = await _user(session, "alice")
     bob = await _user(session, "bob")

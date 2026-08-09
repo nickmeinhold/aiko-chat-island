@@ -72,19 +72,15 @@ async def create_video_token(
     # a post-open public channel (cage-match #122 Wu/Tesla blast-radius). Derive the
     # room from the RESOLVED row (channel.id), never the raw path param.
     can_publish = await acl.is_posting_member(session, user.id, channel)
-    # Namespace BOTH room and participant identity by island id on the SHARED SFU
-    # (cage-match #122 Tesla): islands mint against one imagineering SFU + one API key,
-    # so prefix with gateway_id to keep rooms AND identities from colliding across
-    # islands (webhooks/egress/ops see a flat space otherwise). In production gateway_id
-    # is REQUIRED when LiveKit is configured (config fail-closes), so the empty-prefix
-    # branch is dev/single-island only. Transparent to the app (reads `room` from resp).
-    ns = f"{settings.gateway_id}:" if settings.gateway_id else ""
-    room = f"{ns}{channel.id}"
+    # Pass the BARE ids — the door (mint_room_token) namespaces room AND identity by
+    # gateway_id on the shared SFU, so isolation is enforced in one place, not per
+    # caller (cage-match #122 rd4 Wu #1). The response echoes the SAME namespaced room
+    # via room_for_channel (one source of truth, no route/door drift).
     try:
         token = livekit_tokens.mint_room_token(
-            identity=f"{ns}{user.id}",
+            identity=user.id,
             display_name=user.display_name,
-            room=room,
+            room=channel.id,
             can_publish=can_publish,
             can_subscribe=True,
             can_publish_data=False,  # undesigned side-channel — off until moderation semantics exist
@@ -97,5 +93,6 @@ async def create_video_token(
     # A bearer credential — never cache it in a proxy/browser store.
     response.headers["Cache-Control"] = "no-store"
     return VideoTokenResponse(
-        token=token, url=settings.livekit_url, room=room, can_publish=can_publish
+        token=token, url=settings.livekit_url,
+        room=livekit_tokens.room_for_channel(channel.id), can_publish=can_publish,
     )
