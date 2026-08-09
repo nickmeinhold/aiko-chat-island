@@ -19,7 +19,6 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from ..domain import memberships_service as svc
-from ..domain.models import User
 from .deps import CurrentUser, DbSession
 
 router = APIRouter(prefix="/v1", tags=["members"])
@@ -102,7 +101,7 @@ async def add_member(
     channel_id: str, req: AddMemberReq, user: CurrentUser, session: DbSession
 ) -> dict:
     try:
-        m = await svc.add_member(
+        m, added = await svc.add_member(
             session,
             channel_id=channel_id,
             actor_id=user.id,
@@ -119,11 +118,8 @@ async def add_member(
     except svc.NotAMember:
         # Target user does not exist — controlled 404, not an FK 500 at commit.
         raise HTTPException(404, "user not found")
-    added = await session.get(User, m.user_id)
-    if added is None:
-        # The user row vanished between add_member's validation and here (a
-        # concurrent account deletion) — a controlled 404, never a None.username 500.
-        raise HTTPException(404, "user not found")
+    # The service returns the target's User loaded in the same transaction — no
+    # second post-commit fetch (no response-only TOCTOU), same shape as list_members.
     return _member_view(m, added)
 
 

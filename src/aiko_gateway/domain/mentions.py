@@ -88,14 +88,17 @@ def _is_int(v: Any) -> bool:
     return isinstance(v, int) and not isinstance(v, bool)
 
 
+# The "not real text" Unicode categories an opaque MACHINE id never legitimately
+# contains: Control, Format (bidi/zero-width — the spoof vector isprintable() MISSES),
+# Surrogate, Private-Use, and Unassigned (a future Unicode version could reclassify a
+# Cn codepoint under a stored id's feet). Rejecting the whole set closes the
+# smuggling/garbage channel without dictating the id's script or format — charset
+# shape hygiene (like origin validating sig is base64url), not content resolution.
+_FORBIDDEN_ID_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co", "Cn"})
+
+
 def _is_clean_id(s: str) -> bool:
-    # Opaque, but not a smuggling channel. Reject Unicode CONTROL (Cc) and FORMAT
-    # (Cf) categories — the latter is the one `str.isprintable()` MISSES: bidi
-    # overrides (U+202E …) and zero-width joiners are "printable" yet are the modern
-    # log-line / UI spoofing vector. A real user id (ULID / opaque token) has none of
-    # these. This is charset shape hygiene (like origin validating sig is base64url),
-    # not content resolution — the id's value stays opaque.
-    return all(unicodedata.category(ch) not in ("Cc", "Cf") for ch in s)
+    return all(unicodedata.category(ch) not in _FORBIDDEN_ID_CATEGORIES for ch in s)
 
 
 def validate_mentions(raw: Any) -> list[MentionSpan] | None:

@@ -382,6 +382,12 @@ class Message(Base):
     # NULL (absent == "no mentions", mirroring origin's absent == "unverified").
     mentions: Mapped[list[dict] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    # NEIGHBOR CONSTRAINT for a future edit mutator (#2706): `mentions` offsets index
+    # `body`. Any path that REWRITES `body` (an edit endpoint keyed on this column)
+    # MUST re-validate or clear `mentions`, or spans dangle into the new text — the
+    # same reasoning the account-deletion tombstone applies when it replaces body.
+    # No edit route exists yet; this constraint travels with the column so the next
+    # edit PR inherits it.
     edited_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     deleted_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 

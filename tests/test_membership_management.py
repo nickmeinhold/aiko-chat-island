@@ -89,15 +89,18 @@ async def test_add_member_is_idempotent(session):
     target = await _user(session, "target")
     ch = await _channel(session, cid=10, name="secret", is_private=True)
     await _member(session, ch, admin, role=svc.ROLE_ADMIN)
-    first = await svc.add_member(
+    first, first_user = await svc.add_member(
         session, channel_id=ch.id, actor_id=admin.id, target_user_id=target.id,
         role=svc.ROLE_MEMBER, can_post=True)
     # Re-add with DIFFERENT params: must NOT flip the existing row.
-    second = await svc.add_member(
+    second, second_user = await svc.add_member(
         session, channel_id=ch.id, actor_id=admin.id, target_user_id=target.id,
         role=svc.ROLE_ADMIN, can_post=False)
     assert second.role == first.role == svc.ROLE_MEMBER
     assert await _count_members(session, ch.id) == 2  # admin + target, no dupe
+    # (Membership, User) shape: the User is returned on both the insert and the
+    # idempotent-existing path, and it's the target.
+    assert first_user.id == second_user.id == target.id
 
 
 async def test_self_join_open_private_channel_succeeds(session):

@@ -208,6 +208,11 @@ async def test_resend_keeps_first_mentions(session):
 # -- 3. bus-born messages never carry mentions -------------------------------
 @pytest.mark.asyncio
 async def test_bus_born_message_never_carries_mentions(session):
+    """Also pins the FEDERATION BOUNDARY (#2707): the bus frame carries only body
+    text, so a message crossing to a bus-linked peer arrives mention-less — spans
+    are gateway-local metadata delivered via WS fanout, not bus payload. Same
+    silent-loss precedent as `origin`; cross-gateway mention delivery is a tracked
+    follow-up, not a guarantee this layer makes."""
     from aiko_gateway.aiko.payload import InboundMessage
     msg = InboundMessage(username="someone", channel="general",
                          timestamp=1720000000.0, message="from the bus", raw="{}")

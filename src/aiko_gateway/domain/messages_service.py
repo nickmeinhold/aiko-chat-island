@@ -49,13 +49,15 @@ def message_view(m: Message, *, reactions: list[dict] | None = None) -> dict:
         view["origin"] = m.origin
     # Key-bound @-mention spans (#2632), carried verbatim. Included ONLY when the
     # message actually has mentions — an absent key reads as "no mentions", the
-    # same omit-when-empty contract as `origin`. `is not None` (not truthiness) is
-    # exact: create_outbound normalizes an empty list to NULL at write, so storage
-    # never holds `[]` and there is ONE representation of "no mentions" across
-    # storage/view/wire. The client re-resolves each span's key->current-handle at
-    # render time (targets key off the opaque identity, so a rename never orphans
-    # the mention — app tab ADR-0004).
-    if m.mentions is not None:
+    # same omit-when-empty contract as `origin`. Truthiness (not `is not None`) is
+    # defense AT READ: create_outbound normalizes empty→NULL at write, but a truthy
+    # check ALSO omits a stray stored `[]` (from a direct ORM insert / future
+    # writer), so `mentions: []` can never reach the wire regardless of which door
+    # wrote the row — one representation of "no mentions" as an invariant, not a
+    # single-writer convention. The client re-resolves each span's id->current-handle
+    # at render (targets key off the opaque identity, so a rename never orphans the
+    # mention — app tab ADR-0004).
+    if m.mentions:
         view["mentions"] = m.mentions
     return view
 

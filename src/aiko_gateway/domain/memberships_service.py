@@ -209,10 +209,16 @@ async def add_member(
     target_user_id: str,
     role: str = Role.MEMBER,
     can_post: bool = True,
-) -> Membership:
+) -> tuple[Membership, User]:
     """Admin adds ``target_user_id`` to a channel. Idempotent: re-adding an
     existing member returns the existing row unchanged (case (e)), including
     under a concurrent double-add (the composite PK is the authority).
+
+    Returns ``(Membership, User)`` — the target's User row is loaded IN this
+    transaction (the same one that wrote/validated the membership), so the caller
+    renders a member view WITHOUT a second, post-commit fetch that could 404 after a
+    committed write (the response-only TOCTOU that route-level get had). Matches
+    ``list_members``' ``(Membership, User)`` shape.
 
     Rejects: non-admin actor (a, via _require_admin), unseeable channel (404),
     and an unknown target user (controlled NotAMember rather than an FK
@@ -220,10 +226,14 @@ async def add_member(
     await _require_admin(session, channel_id, actor_id)
     existing = await _membership(session, channel_id, target_user_id)
     if existing is not None:
-        return existing  # idempotent — do not silently flip role/can_post
+        # Already a member → their User row exists by the no-orphan-membership
+        # invariant (account deletion tears down memberships children-first).
+        return existing, await session.get(User, target_user_id)
     # Validate the target user up front so a nonexistent user is a controlled
-    # rejection, not an FK violation surfacing as a 500 at commit time.
-    if await session.get(User, target_user_id) is None:
+    # rejection, not an FK violation surfacing as a 500 at commit time — and REUSE
+    # the loaded row as the returned User (no separate fetch).
+    target = await session.get(User, target_user_id)
+    if target is None:
         raise NotAMember(target_user_id)
     role = role if role in (Role.ADMIN, Role.MEMBER) else Role.MEMBER
     m = Membership(
@@ -232,7 +242,7 @@ async def add_member(
         role=role,
         can_post=can_post,
     )
-    return await _insert_idempotent(session, m, channel_id, target_user_id)
+    return await _insert_idempotent(session, m, channel_id, target_user_id), target
 
 
 async def self_join(
