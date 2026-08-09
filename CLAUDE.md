@@ -57,23 +57,28 @@ file is the working-context that isn't obvious from the code.
   `aiko_services`/`aiko_chat`; his answers are gold but verify against the actual
   checkout (`../aiko_chat`) before building on them — delight is the signal to
   verify, not permission to assert.
-- **Cross-tab grounding — read the APP TAB's design record BEFORE implementing
-  any shared-contract feature.** The client is a peer repo (`../aiko_chat_app`,
-  its own Claude tab) that co-owns every wire the two share. Before building
-  anything on the v2 social contract (mentions, DMs, reactions, profile,
-  notifications) or any feature the app consumes, open the app tab's record and
-  build against THAT — the ticket is intent, the other tab's design is the other
-  half of the binding contract. Read, in order: the app's `HANDOFF-from-app-tab-*`
-  answers + the matching `nickmeinhold/claude-tasks` issue comments (the app
-  tab's *locked* replies), then `../aiko_chat_app/docs/adr/` (numbered ADR
-  outcomes), `docs/design/`, `docs/crucible/`. This is the **#2634 lesson**: that
+- **Cross-tab grounding — read the APP TAB's design record BEFORE ANY
+  implementation, not just wire work.** The client is a peer repo
+  (`../aiko_chat_app`, its own Claude tab) that co-owns far more than the wire:
+  the identity model, moderation, federation, signing, community semantics,
+  recovery. Any of these can be decided in the app tab's docs and silently
+  contradicted by a gateway change with **no wire touched at all** (ADR-0004 is
+  an identity-model decision, not a wire one, yet it reversed the mentions
+  build). So **before starting any non-trivial build, first check whether the app
+  tab's record bears on it**, and if it does, build against THAT — the ticket is
+  intent, the other tab's design is the other half of the binding contract. Read:
+  `../aiko_chat_app/docs/adr/` (numbered ADR **outcomes** — decisions of record,
+  these win), then `docs/design/`, `docs/crucible/`, the `HANDOFF-from-app-tab-*`
+  answers, the matching `nickmeinhold/claude-tasks` issue comments, and (for wire
+  specifically) the published `/openapi.json`. This is the **#2634 lesson**: that
   build came off the ticket + a narrow app answer, never checked against the
   recorded design, and the cage-match then hardened the wrong premise for 7
   rounds (a design-blind adversary confirms the author's frame, it doesn't
-  question it). When the record and your memory disagree, that's a finding —
-  surface it, don't tie-break. Reciprocal: the app tab has the mirror directive
-  to read THIS repo's `HANDOFF-to-app-tab-*` + published `/openapi.json` before
-  its wire work.
+  question it). **A tab's own later ADR outranks an earlier cross-repo handoff
+  answer** (ADR-0004 "no central directory" superseded the Aug-6 mentions-directory
+  lock). When the record and your memory disagree, that's a finding — surface it,
+  don't tie-break. Reciprocal: the app tab has the mirror directive to read THIS
+  repo's record before its builds.
 
 ## Where things live
 
