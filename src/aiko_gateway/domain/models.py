@@ -379,7 +379,7 @@ class Message(Base):
     # OPAQUELY; the gateway never re-derives that basis. NULL for a message with
     # no mentions and every bus-born message; message_view omits the key when
     # NULL (absent == "no mentions", mirroring origin's absent == "unverified").
-    mentions: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    mentions: Mapped[list[dict] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     edited_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     deleted_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

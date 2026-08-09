@@ -161,17 +161,27 @@ async def _handle_send(gw, conn: Connection, user, frame: dict) -> None:
         except mentions.MentionError as e:
             await conn.send(envelopes.error("bad_mentions", str(e), frame["client_msg_id"]))
             return
+        # The block set (either-direction) for this sender — computed ONCE and used
+        # for BOTH the mention gate here and the live-fanout exclusion below.
+        blocked = await moderation_service.blocked_pair_user_ids(session, user.id)
+        # NO-INTERACTION across a block extends to mentions (#7 / the reply_to gate's
+        # own note: "future interaction surfaces (DMs, mentions) must also pass
+        # is_blocked_between"). A mention span NAMES a target, unlike the sender's own
+        # `origin` envelope, so the moderation door opens here — strip user-typed spans
+        # targeting a blocked user (see mentions.strip_blocked_user_mentions for the
+        # carrier-preserving rationale). Reuses the `blocked` set computed above.
+        spans = mentions.strip_blocked_user_mentions(spans, blocked)
         row, created = await messages_service.create_outbound(
             session, user=user, channel=channel,
             body=frame["body"], client_msg_id=frame["client_msg_id"],
             reply_to=reply_to, origin=origin, mentions=spans,
         )
         view = messages_service.message_view(row)
-        # Block exclusion for live fanout: everyone in a block relationship with
-        # the sender must NOT receive this frame (the live twin of the history
-        # visibility filter). Computed inside the session; applied in-memory by
-        # the hub so fanout stays one query, not one-per-connection.
-        exclude = await moderation_service.blocked_pair_user_ids(session, user.id)
+        # Block exclusion for live fanout: everyone in a block relationship with the
+        # sender must NOT receive this frame (the live twin of the history visibility
+        # filter). Reuses the `blocked` set computed above; applied in-memory by the
+        # hub so fanout stays one query, not one-per-connection.
+        exclude = blocked
 
     # Ack the sender (optimistic-send reconciliation: client_msg_id -> server id).
     await conn.send(envelopes.ack(frame["client_msg_id"], row.id, view["created_at"]))

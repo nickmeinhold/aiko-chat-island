@@ -112,7 +112,12 @@ async def add_member(
     except svc.NotAMember:
         # Target user does not exist — controlled 404, not an FK 500 at commit.
         raise HTTPException(404, "user not found")
-    return _member_view(m, await session.get(User, m.user_id))
+    added = await session.get(User, m.user_id)
+    if added is None:
+        # The user row vanished between add_member's validation and here (a
+        # concurrent account deletion) — a controlled 404, never a None.username 500.
+        raise HTTPException(404, "user not found")
+    return _member_view(m, added)
 
 
 @router.delete("/channels/{channel_id}/members/{user_id}", status_code=204)
@@ -141,7 +146,9 @@ async def join_channel(channel_id: str, user: CurrentUser, session: DbSession) -
         # Both "no such channel" AND "private invite_only channel you can't see"
         # land here — indistinguishable by design (existence-hiding).
         raise HTTPException(404, "channel not found")
-    return _member_view(m, await session.get(User, m.user_id))
+    # The joiner IS the authenticated CurrentUser (a User row already in hand), so
+    # no second fetch — self-join's member view reuses it directly.
+    return _member_view(m, user)
 
 
 @router.delete("/channels/{channel_id}/leave", status_code=204)

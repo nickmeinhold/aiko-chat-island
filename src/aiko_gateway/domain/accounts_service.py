@@ -168,6 +168,17 @@ async def delete_user_account(session: AsyncSession, user_id: str) -> None:
     # tombstone stays authorship-verifiable), while mentions point at OTHERS and
     # are meaningless once the body is gone. (verify-the-neighbor: this cascade
     # must learn about every new user-referencing column — the note below.)
+    #
+    # SCOPE IS THE OUTBOUND HALF ONLY (named, not overclaimed). This wipes mentions
+    # on messages the departing user AUTHORED. It does NOT scrub the INBOUND half:
+    # a co-participant's surviving message that @'d this user keeps a span whose
+    # `target_id` is this user's now-deleted id. That id is an opaque ULID (never a
+    # handle/PII) that resolves to nothing post-deletion, and it parallels how a
+    # `reply_to` reference to this user's tombstone likewise persists — we tombstone
+    # the departing user's OWN rows, never rewrite everyone else's. Full inbound-span
+    # scrubbing (a JSON rewrite across all messages targeting the id) is tracked as a
+    # follow-up, not done here; the residual is a dangling opaque pointer, not exposed
+    # content. See test_delete_wipes_mention_spans (outbound) + its inbound sibling.
     await session.execute(
         update(Message)
         .where(Message.sender_user_id == user_id)

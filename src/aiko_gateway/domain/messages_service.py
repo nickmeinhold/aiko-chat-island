@@ -49,10 +49,13 @@ def message_view(m: Message, *, reactions: list[dict] | None = None) -> dict:
         view["origin"] = m.origin
     # Key-bound @-mention spans (#2632), carried verbatim. Included ONLY when the
     # message actually has mentions — an absent key reads as "no mentions", the
-    # same omit-when-empty contract as `origin`. The client re-resolves each
-    # span's key->current-handle at render time (targets key off the opaque
-    # identity, so a rename never orphans the mention — app tab ADR-0004).
-    if m.mentions:
+    # same omit-when-empty contract as `origin`. `is not None` (not truthiness) is
+    # exact: create_outbound normalizes an empty list to NULL at write, so storage
+    # never holds `[]` and there is ONE representation of "no mentions" across
+    # storage/view/wire. The client re-resolves each span's key->current-handle at
+    # render time (targets key off the opaque identity, so a rename never orphans
+    # the mention — app tab ADR-0004).
+    if m.mentions is not None:
         view["mentions"] = m.mentions
     return view
 
@@ -126,7 +129,11 @@ async def create_outbound(
         client_msg_id=client_msg_id,
         aiko_origin=False,
         origin=origin,
-        mentions=mentions,
+        # Normalize empty→None so storage holds ONE representation of "no mentions"
+        # (message_view's `is not None` echo then can't disagree with an accidental
+        # stored `[]` — a client that sends `mentions: []` is stored identically to
+        # one that omits the key).
+        mentions=mentions or None,
     )
     session.add(row)
     await session.commit()
