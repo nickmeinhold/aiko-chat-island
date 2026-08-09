@@ -209,21 +209,40 @@ async def add_member(
     target_user_id: str,
     role: str = Role.MEMBER,
     can_post: bool = True,
-) -> Membership:
+) -> tuple[Membership, User]:
     """Admin adds ``target_user_id`` to a channel. Idempotent: re-adding an
     existing member returns the existing row unchanged (case (e)), including
     under a concurrent double-add (the composite PK is the authority).
+
+    Returns ``(Membership, User)`` — the target's User row is loaded IN this
+    transaction (the same one that wrote/validated the membership), so the caller
+    renders a member view WITHOUT a second, post-commit fetch that could 404 after a
+    committed write (the response-only TOCTOU that route-level get had). Matches
+    ``list_members``' ``(Membership, User)`` shape.
 
     Rejects: non-admin actor (a, via _require_admin), unseeable channel (404),
     and an unknown target user (controlled NotAMember rather than an FK
     IntegrityError at commit — cage-match PR#10: Carnot)."""
     await _require_admin(session, channel_id, actor_id)
-    existing = await _membership(session, channel_id, target_user_id)
+    # Idempotent-existing check as ONE joined query (not membership-lookup + a
+    # separate User fetch): returns (Membership, User) together, the same JOIN shape
+    # list_members uses. The INNER JOIN also fuses the no-orphan invariant — a
+    # membership whose User row is somehow missing (FK-off corruption) does NOT match,
+    # so it falls through to the validate-then-insert path below and 404s cleanly
+    # rather than returning a None User that would 500 in the caller's member view.
+    existing = (await session.execute(
+        select(Membership, User)
+        .join(User, Membership.user_id == User.id)
+        .where(Membership.channel_id == channel_id,
+               Membership.user_id == target_user_id)
+    )).first()
     if existing is not None:
-        return existing  # idempotent — do not silently flip role/can_post
-    # Validate the target user up front so a nonexistent user is a controlled
-    # rejection, not an FK violation surfacing as a 500 at commit time.
-    if await session.get(User, target_user_id) is None:
+        return existing[0], existing[1]
+    # Not a current member → validate the target user up front so a nonexistent user
+    # is a controlled rejection, not an FK violation surfacing as a 500 at commit
+    # time — and REUSE the loaded row as the returned User (no separate fetch).
+    target = await session.get(User, target_user_id)
+    if target is None:
         raise NotAMember(target_user_id)
     role = role if role in (Role.ADMIN, Role.MEMBER) else Role.MEMBER
     m = Membership(
@@ -232,7 +251,7 @@ async def add_member(
         role=role,
         can_post=can_post,
     )
-    return await _insert_idempotent(session, m, channel_id, target_user_id)
+    return await _insert_idempotent(session, m, channel_id, target_user_id), target
 
 
 async def self_join(
@@ -332,8 +351,19 @@ async def leave(
 
 async def list_members(
     session: AsyncSession, *, channel_id: str, actor_id: str
-) -> list[Membership]:
-    """Members of a channel, for a caller who may see it.
+) -> list[tuple[Membership, User]]:
+    """Members of a channel, for a caller who may see it — each paired with the
+    member's ``User`` so the route can surface ``handle`` + ``display_name``.
+
+    This is the roster the app's @-mention composer autocompletes from (#2632):
+    ADR-0004 dropped the central ``/v1/mentions`` directory in favour of "a
+    federated per-island member roster you browse", so member discovery IS this
+    endpoint. Returning the handle/display_name here is what lets the client
+    prefix-match locally instead of hitting a server-side user search.
+
+    One INNER JOIN, not an N+1: a Membership always has a real User (FK), so the
+    join can never drop or duplicate a member row. Ordered by ``user_id`` for a
+    stable roster (unchanged from before).
 
     EXISTENCE-HIDING (case (c)): a non-member of a private channel gets
     ``ChannelNotFound`` (404) — the members list of a private channel is
@@ -345,12 +375,13 @@ async def list_members(
         raise ChannelNotFound(channel_id)
     rows = (
         await session.execute(
-            select(Membership)
+            select(Membership, User)
+            .join(User, Membership.user_id == User.id)
             .where(Membership.channel_id == channel_id)
             .order_by(Membership.user_id)
         )
-    ).scalars()
-    return list(rows)
+    ).all()
+    return [(m, u) for m, u in rows]
 
 
 async def create_channel(

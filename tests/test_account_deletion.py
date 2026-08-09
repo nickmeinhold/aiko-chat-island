@@ -115,6 +115,60 @@ async def test_delete_tombstones_body_keeping_message_slot(session):
     assert refreshed.sender_label == accounts_service.DELETED_USER_LABEL
 
 
+async def test_delete_wipes_mention_spans(session):
+    """#2632: a tombstone drops the message's `mentions` too — the spans index the
+    now-replaced body (they'd dangle) AND record who the departing user @'d (their
+    interaction footprint). Follows `body`, not `origin`."""
+    from aiko_gateway.domain.models import Message
+    user = await _social_user(session, handle="bob", sub="g-bob")
+    ch = await _channel(session, cid=1, name="general")
+    msg = Message(
+        id=_ulid(10), channel_id=ch.id, sender_user_id=user.id,
+        sender_kind="human", sender_label=user.display_name, body="hi @alice",
+        mentions=[{"target_type": "user", "target_id": "alice-key",
+                   "offset": 3, "length": 6}],
+        created_at=dt.datetime(2026, 6, 28, tzinfo=dt.timezone.utc))
+    session.add(msg)
+    await session.commit()
+
+    await accounts_service.delete_user_account(session, user.id)
+
+    refreshed = await session.get(Message, msg.id)
+    assert refreshed is not None
+    assert refreshed.mentions is None          # spans destroyed with the body
+    assert refreshed.body == accounts_service.DELETED_BODY
+
+
+async def test_delete_leaves_inbound_mention_spans_intact(session):
+    """#2632 (documented residual, Wu's parity catch): the tombstone wipes the
+    departing user's OUTBOUND mentions, NOT the inbound half — a co-participant's
+    surviving message that @'d the departing user keeps its span (a dangling opaque
+    id, not exposed content). This pins the ACCEPTED asymmetry so narrowing it later
+    is a deliberate change, not an accident. Parallels how a reply_to ref to a
+    tombstone persists — we never rewrite everyone else's rows."""
+    from aiko_gateway.domain.models import Message
+    departing = await _social_user(session, handle="bob", sub="g-bob")
+    stayer = await _social_user(session, handle="ann", sub="g-ann")
+    ch = await _channel(session, cid=1, name="general")
+    # Ann's message mentions Bob (inbound reference to the departing user).
+    anns = Message(
+        id=_ulid(20), channel_id=ch.id, sender_user_id=stayer.id,
+        sender_kind="human", sender_label=stayer.display_name, body="hey @bob",
+        mentions=[{"target_type": "user", "target_id": departing.id,
+                   "offset": 4, "length": 4}],
+        created_at=dt.datetime(2026, 6, 28, tzinfo=dt.timezone.utc))
+    session.add(anns)
+    await session.commit()
+
+    await accounts_service.delete_user_account(session, departing.id)
+
+    refreshed = await session.get(Message, anns.id)
+    assert refreshed is not None
+    # Ann's span survives (accepted residual — inbound scrub is a tracked follow-up).
+    assert refreshed.mentions == [
+        {"target_type": "user", "target_id": departing.id, "offset": 4, "length": 4}]
+
+
 async def test_delete_does_not_tombstone_other_users_messages(session):
     """The body wipe is scoped to the departing user: a co-participant's message
     in the same channel is left fully intact (guards against an over-broad UPDATE

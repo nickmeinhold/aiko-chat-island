@@ -47,6 +47,18 @@ def message_view(m: Message, *, reactions: list[dict] | None = None) -> dict:
     }
     if m.origin is not None:
         view["origin"] = m.origin
+    # Key-bound @-mention spans (#2632), carried verbatim. Included ONLY when the
+    # message actually has mentions — an absent key reads as "no mentions", the
+    # same omit-when-empty contract as `origin`. Truthiness (not `is not None`) is
+    # defense AT READ: create_outbound normalizes empty→NULL at write, but a truthy
+    # check ALSO omits a stray stored `[]` (from a direct ORM insert / future
+    # writer), so `mentions: []` can never reach the wire regardless of which door
+    # wrote the row — one representation of "no mentions" as an invariant, not a
+    # single-writer convention. The client re-resolves each span's id->current-handle
+    # at render (targets key off the opaque identity, so a rename never orphans the
+    # mention — app tab ADR-0004).
+    if m.mentions:
+        view["mentions"] = m.mentions
     return view
 
 
@@ -69,7 +81,7 @@ def retraction_view(r: Retraction) -> dict:
 async def create_outbound(
     session: AsyncSession, *, user: User, channel: Channel,
     body: str, client_msg_id: str, reply_to: str | None = None,
-    origin: dict | None = None,
+    origin: dict | None = None, mentions: list[dict] | None = None,
 ) -> tuple[Message, bool]:
     """Persist a user's outgoing message (server ULID, server-derived sender —
     invariant I5). Idempotent on (channel, client_msg_id): a resend returns the
@@ -81,6 +93,12 @@ async def create_outbound(
     resend keeps the FIRST row's origin — the idempotency key already pins the
     stored message, so a differing re-signed envelope on a retry is ignored, not a
     second row (consistent with the existing client_msg_id no-op contract).
+
+    `mentions` is the SHAPE+caps-validated list of key-bound @-mention spans
+    (already checked by domain/mentions.validate_mentions at the call site).
+    Carried verbatim, resolver-free, and — like `origin` — a resend keeps the
+    FIRST row's spans (the early-return above never reaches this insert on a
+    resend). See the Message.mentions model note for the carrier contract.
 
     When `origin` is present, the sender's pubkey->account binding is observed at
     send time through the single door `signing_keys_service.record_signing_key`
@@ -113,6 +131,13 @@ async def create_outbound(
         client_msg_id=client_msg_id,
         aiko_origin=False,
         origin=origin,
+        # Normalize empty→None so storage holds ONE representation of "no mentions".
+        # This is the WRITE half of the defense; message_view's echo uses TRUTHINESS
+        # (`if m.mentions:`), so even a stray stored `[]` from another writer is
+        # omitted at READ — the two together make "no mentions omits" an invariant,
+        # not a single-writer convention. (Do NOT switch the view to `is not None`:
+        # that would re-admit a stored `[]` onto the wire.)
+        mentions=mentions or None,
     )
     session.add(row)
     await session.commit()

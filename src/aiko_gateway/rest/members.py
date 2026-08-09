@@ -51,8 +51,26 @@ def _channel_view(c) -> dict:
     }
 
 
-def _member_view(m) -> dict:
-    return {"user_id": m.user_id, "role": m.role, "can_post": m.can_post}
+def _member_view(m, u) -> dict:
+    # `handle` (the mutable, rename-able display alias) and `display_name` are
+    # surfaced so the app's @-mention composer can autocomplete from this roster
+    # (#2632) — ADR-0004 dropped the central /v1/mentions directory in favour of
+    # browsing the per-island member roster, so this endpoint IS the mention
+    # lookup. `handle` is the user's `username` column (the #2631 handle).
+    #
+    # NOT a central directory (ADR-0004): this is the "federated per-island member
+    # roster you browse", scoped to ONE channel and gated by list_members' read
+    # check (a private channel's roster is existence-hidden from non-members). A
+    # public channel's roster is enumerable by any member who can read it — public
+    # channels are public by definition, so exposing member handles there is the
+    # roster working as designed, not a global user-search surface.
+    return {
+        "user_id": m.user_id,
+        "role": m.role,
+        "can_post": m.can_post,
+        "handle": u.username,
+        "display_name": u.display_name,
+    }
 
 
 @router.post("/channels", status_code=201)
@@ -75,7 +93,7 @@ async def list_members(channel_id: str, user: CurrentUser, session: DbSession) -
         # Existence-hiding: a non-member of a private channel gets the SAME 404
         # as a nonexistent channel — never a confirmation it exists.
         raise HTTPException(404, "channel not found")
-    return {"channel_id": channel_id, "members": [_member_view(m) for m in members]}
+    return {"channel_id": channel_id, "members": [_member_view(m, u) for m, u in members]}
 
 
 @router.post("/channels/{channel_id}/members", status_code=201)
@@ -83,7 +101,7 @@ async def add_member(
     channel_id: str, req: AddMemberReq, user: CurrentUser, session: DbSession
 ) -> dict:
     try:
-        m = await svc.add_member(
+        m, added = await svc.add_member(
             session,
             channel_id=channel_id,
             actor_id=user.id,
@@ -100,7 +118,9 @@ async def add_member(
     except svc.NotAMember:
         # Target user does not exist — controlled 404, not an FK 500 at commit.
         raise HTTPException(404, "user not found")
-    return _member_view(m)
+    # The service returns the target's User loaded in the same transaction — no
+    # second post-commit fetch (no response-only TOCTOU), same shape as list_members.
+    return _member_view(m, added)
 
 
 @router.delete("/channels/{channel_id}/members/{user_id}", status_code=204)
@@ -129,7 +149,9 @@ async def join_channel(channel_id: str, user: CurrentUser, session: DbSession) -
         # Both "no such channel" AND "private invite_only channel you can't see"
         # land here — indistinguishable by design (existence-hiding).
         raise HTTPException(404, "channel not found")
-    return _member_view(m)
+    # The joiner IS the authenticated CurrentUser (a User row already in hand), so
+    # no second fetch — self-join's member view reuses it directly.
+    return _member_view(m, user)
 
 
 @router.delete("/channels/{channel_id}/leave", status_code=204)

@@ -13,7 +13,8 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
 
 from ..db import SessionLocal
 from ..domain import (
-    acl, auth_session, echo, messages_service, moderation_service, signing,
+    acl, auth_session, echo, mentions, messages_service, moderation_service,
+    signing,
 )
 from . import envelopes
 from .hub import Connection
@@ -152,16 +153,40 @@ async def _handle_send(gw, conn: Connection, user, frame: dict) -> None:
         except signing.OriginError as e:
             await conn.send(envelopes.error("bad_origin", str(e), frame["client_msg_id"]))
             return
+        # Key-bound @-mention spans (#2632): SHAPE+caps validated at the trust
+        # boundary, then carried VERBATIM. Fail-closed — a malformed array is
+        # rejected, never persisted, exactly like a bad origin. Absent is legal.
+        #
+        # WHY NO BLOCK GATE HERE (deliberate layering, not an oversight): a mention
+        # span is INERT carrier metadata, and the block invariant is enforced where
+        # the INTERACTION happens, not at carriage. The message body carrying the
+        # span is ALREADY block-excluded from every delivery path — the live fanout
+        # `exclude` below and `get_history`'s block predicate both drop a blocked
+        # party's view — so a stored span never reaches a blocked user through any
+        # read path. The ONE surface that could reach them is a "you were @'d"
+        # NOTIFICATION, which does not exist yet (#2526) and MUST block-filter at
+        # THAT layer (tracked). Enforcing at carriage instead would force the gateway
+        # to resolve `target_id`'s identity + recognize a reserved `target_type`
+        # value — breaking the value-opaque, resolver-free carrier contract that
+        # keeps the /v1 wire append-only. Block enforcement lives at the interaction
+        # layer; carriage stays a pure carrier. (Blocking does not un-name a person:
+        # a third party may still see "@someone" — it governs interaction, not
+        # nameability.)
+        try:
+            spans = mentions.validate_mentions(frame.get("mentions"))
+        except mentions.MentionError as e:
+            await conn.send(envelopes.error("bad_mentions", str(e), frame["client_msg_id"]))
+            return
         row, created = await messages_service.create_outbound(
             session, user=user, channel=channel,
             body=frame["body"], client_msg_id=frame["client_msg_id"],
-            reply_to=reply_to, origin=origin,
+            reply_to=reply_to, origin=origin, mentions=spans,
         )
         view = messages_service.message_view(row)
-        # Block exclusion for live fanout: everyone in a block relationship with
-        # the sender must NOT receive this frame (the live twin of the history
-        # visibility filter). Computed inside the session; applied in-memory by
-        # the hub so fanout stays one query, not one-per-connection.
+        # Block exclusion for live fanout: everyone in a block relationship with the
+        # sender must NOT receive this frame (the live twin of the history visibility
+        # filter). Computed inside the session; applied in-memory by the hub so
+        # fanout stays one query, not one-per-connection.
         exclude = await moderation_service.blocked_pair_user_ids(session, user.id)
 
     # Ack the sender (optimistic-send reconciliation: client_msg_id -> server id).
