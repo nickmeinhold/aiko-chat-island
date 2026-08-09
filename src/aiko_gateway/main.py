@@ -243,6 +243,7 @@ from .rest import island as island_self_routes  # noqa: E402
 from .rest import islands as island_routes  # noqa: E402
 from .rest import keys as key_routes  # noqa: E402
 from .rest import legal as legal_routes  # noqa: E402
+from .rest import livekit as livekit_routes  # noqa: E402
 from .rest import members as member_routes  # noqa: E402
 from .rest import messages as message_routes  # noqa: E402
 from .rest import reactions as reaction_routes  # noqa: E402
@@ -261,6 +262,7 @@ app.include_router(island_self_routes.router)
 app.include_router(island_routes.router)
 app.include_router(key_routes.router)
 app.include_router(legal_routes.router)
+app.include_router(livekit_routes.router)
 app.include_router(member_routes.router)
 app.include_router(message_routes.router)
 app.include_router(moderation_routes.router)

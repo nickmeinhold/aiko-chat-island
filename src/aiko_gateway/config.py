@@ -78,6 +78,21 @@ class Settings(BaseSettings):
     jwt_access_ttl_seconds: int = 15 * 60        # 15 min
     jwt_refresh_ttl_seconds: int = 30 * 24 * 3600  # 30 days
 
+    # --- LiveKit (video/audio transport) ---
+    # The island is the AUTHORIZER of who may join a LiveKit room and with what
+    # powers; it mints short-lived HS256 join tokens and never proxies media. The
+    # SFU is self-hosted (imagineering); clients connect to `livekit_url` directly.
+    # Video is an OPTIONAL capability: absent api key/secret => the endpoint returns
+    # 503, it does NOT fail-closed the boot (unlike jwt_secret / island seed, which
+    # are core). A misconfigured secret only yields tokens LiveKit itself rejects —
+    # no data-plane risk — so endpoint-level 503-when-unconfigured is the right gate.
+    livekit_url: str = "wss://livekit.imagineering.cc"
+    livekit_api_key: str = ""       # LiveKit API key id (goes in the token `iss`)
+    livekit_api_secret: str = ""    # SECRET — host .env / SOPS, signs the token (HS256)
+    # Join-token TTL. The token is validated only at CONNECT; the media session
+    # outlives it, so a short TTL is safe. Generous enough for a demo/join retry.
+    livekit_token_ttl_seconds: int = Field(default=3600, ge=60)
+
     # Self-service registration. None → resolved by environment in the validator
     # (open in dev, closed in prod); set OPEN_REGISTRATION to override either way.
     open_registration: bool | None = None
