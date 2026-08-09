@@ -111,9 +111,17 @@ async def create_video_token(
             Membership.user_id != user.id,
         )
     )).scalars().all()
-    for pid in peer_ids:
-        if await moderation_service.is_blocked_between(session, user.id, pid):
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "channel not found")
+    # Assert 2-PARTY cardinality from ground truth (cage-match #122 rd9 Carnot):
+    # DM-only's block safety rests on the room being exactly {caller, one peer}. A
+    # malformed / migration-created private kind='dm' with 3+ members would reintroduce
+    # the multi-party pairwise-block gap DM-only closes; a singleton is an empty-room
+    # capability outside the model. Fail closed unless there is exactly one peer.
+    if len(peer_ids) != 1:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "video is only available in direct messages")
+    if await moderation_service.is_blocked_between(session, user.id, peer_ids[0]):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "channel not found")
 
     # READ ≠ PUBLISH: publish (live camera/mic) requires an EXPLICIT posting
     # membership (acl.is_posting_member) on BOTH public and private channels — a

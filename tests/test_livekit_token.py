@@ -193,8 +193,10 @@ async def test_member_gets_token_scoped_to_channel_under_own_identity(
     client, session, livekit_configured
 ):
     alice = await _user(session, "alice")
+    peer = await _user(session, "peer")
     ch = await _private_channel(session)
     await _join(session, ch, alice)
+    await _join(session, ch, peer)                            # a DM is 2-party
 
     resp = await client.post(
         f"/v1/channels/{ch.id}/video-token", headers=_headers(alice))
@@ -218,8 +220,10 @@ async def test_read_only_member_gets_subscribe_only_token(
     # a publish capability. A member with can_post=False can read but not post text —
     # so the video token must be subscribe-only, never canPublish.
     mute = await _user(session, "mute")
+    peer = await _user(session, "peer")
     ch = await _private_channel(session)
     await _join(session, ch, mute, can_post=False)
+    await _join(session, ch, peer)                            # a DM is 2-party
 
     resp = await client.post(
         f"/v1/channels/{ch.id}/video-token", headers=_headers(mute))
@@ -240,8 +244,10 @@ async def test_gateway_id_namespaces_room_and_identity(
     # they can't collide across islands sharing one SFU/API key.
     monkeypatch.setattr(settings, "gateway_id", "island-a")
     alice = await _user(session, "alice")
+    peer = await _user(session, "peer")
     ch = await _private_channel(session)
     await _join(session, ch, alice)
+    await _join(session, ch, peer)                            # a DM is 2-party
 
     resp = await client.post(
         f"/v1/channels/{ch.id}/video-token", headers=_headers(alice))
@@ -251,6 +257,22 @@ async def test_gateway_id_namespaces_room_and_identity(
     claims = _decode(body["token"])
     assert claims["sub"] == f"island-a:{alice.id}"       # identity namespaced too
     assert claims["video"]["room"] == f"island-a:{ch.id}"
+
+
+async def test_malformed_multiparty_dm_is_forbidden(client, session, livekit_configured):
+    # cage-match #122 rd9 (Carnot): DM-only safety rests on 2-party cardinality. A
+    # malformed private kind='dm' with 3+ members would reintroduce the multi-party
+    # pairwise-block gap — fail closed unless there is exactly one peer.
+    a = await _user(session, "a")
+    b = await _user(session, "b")
+    c = await _user(session, "c")
+    dm = await _private_channel(session)  # kind='dm'
+    for u in (a, b, c):
+        await _join(session, dm, u)
+
+    resp = await client.post(
+        f"/v1/channels/{dm.id}/video-token", headers=_headers(a))
+    assert resp.status_code == 403        # 3-party "dm" rejected (not a real DM)
 
 
 async def test_non_dm_channel_is_forbidden(client, session, livekit_configured):
