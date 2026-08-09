@@ -64,7 +64,7 @@ def _decode(token: str) -> dict:
 
 def test_mint_binds_identity_room_and_scopes_grant(livekit_configured):
     tok = livekit_tokens.mint_room_token(
-        identity="user-123", display_name="Robin", room="chan-abc")
+        identity="user-123", display_name="Robin", room="chan-abc", can_publish=True)
     claims = _decode(tok)
     assert claims["iss"] == _LK_KEY          # SFU keys the secret off iss
     assert claims["sub"] == "user-123"       # participant identity == the id we passed
@@ -72,11 +72,23 @@ def test_mint_binds_identity_room_and_scopes_grant(livekit_configured):
     grant = claims["video"]
     assert grant["room"] == "chan-abc"       # scoped to exactly one room
     assert grant["roomJoin"] is True
-    assert grant["canPublish"] is True
+    assert grant["canPublish"] is True       # explicitly opted up
     assert grant["canSubscribe"] is True
     # NO admin powers ever leak into a participant token.
     for admin in ("roomCreate", "roomAdmin", "roomList", "canUpdateOwnMetadata"):
         assert admin not in grant
+
+
+def test_mint_defaults_are_least_privilege(livekit_configured):
+    # THE cage-match #122 rd2 finding (Tesla+Wu F1): the DEFAULT grant — a bare
+    # three-kwarg mint by any future caller — must be subscribe-only, never full A/V
+    # + data. Safe by default in the door, opt UP explicitly.
+    claims = _decode(livekit_tokens.mint_room_token(
+        identity="u", display_name="U", room="r"))
+    grant = claims["video"]
+    assert grant["canSubscribe"] is True
+    assert grant["canPublish"] is False       # NOT broadcasting by default
+    assert grant["canPublishData"] is False   # data side-channel closed by default
 
 
 def test_mint_ttl_is_bounded_and_future(livekit_configured):
@@ -191,6 +203,27 @@ async def test_read_only_member_gets_subscribe_only_token(
     assert claims["video"]["canPublish"] is False             # cannot broadcast
     assert claims["video"]["canSubscribe"] is True            # can still watch/listen
     assert claims["video"]["canPublishData"] is False
+
+
+async def test_gateway_id_namespaces_room_and_identity(
+    client, session, livekit_configured, monkeypatch
+):
+    # cage-match #122 rd2 (Tesla+Wu F2): the prefixed branch was never exercised. With
+    # gateway_id set, BOTH room and participant identity carry the island prefix so
+    # they can't collide across islands sharing one SFU/API key.
+    monkeypatch.setattr(settings, "gateway_id", "island-a")
+    alice = await _user(session, "alice")
+    ch = await _private_channel(session)
+    await _join(session, ch, alice)
+
+    resp = await client.post(
+        f"/v1/channels/{ch.id}/video-token", headers=_headers(alice))
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["room"] == f"island-a:{ch.id}"
+    claims = _decode(body["token"])
+    assert claims["sub"] == f"island-a:{alice.id}"       # identity namespaced too
+    assert claims["video"]["room"] == f"island-a:{ch.id}"
 
 
 async def test_non_member_of_private_channel_is_404(client, session, livekit_configured):

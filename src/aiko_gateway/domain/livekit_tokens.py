@@ -64,10 +64,15 @@ def mint_room_token(
     identity: str,
     display_name: str,
     room: str,
-    can_publish: bool = True,
+    can_publish: bool = False,
     can_subscribe: bool = True,
-    can_publish_data: bool = True,
+    can_publish_data: bool = False,
 ) -> str:
+    # LEAST-PRIVILEGE DEFAULTS (cage-match #122 rd2, Tesla+Wu F1): the safe grant is
+    # the DEFAULT, so a future in-process caller doing the natural three-kwarg mint
+    # gets subscribe-only — never full A/V + a data side-channel — unless it EXPLICITLY
+    # opts up. This is what makes "the grant policy lives in one place" actually true:
+    # the door is safe, and widening it is a deliberate, visible kwarg at each caller.
     """Mint a LiveKit join token for participant ``identity`` scoped to ``room``.
 
     ``iss`` is the API key, ``sub`` the participant identity, ``video`` the grant.

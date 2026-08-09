@@ -95,7 +95,11 @@ class Settings(BaseSettings):
     # an env typo (`LIVEKIT_TOKEN_TTL_SECONDS=31536000`) must NOT silently mint
     # year-long join capabilities (cage-match #122 Carnot+Tesla+Wu HIGH — a config
     # dial that widened the trust boundary). Default 10 min (ample to click "join"),
-    # hard ceiling 1h; both directions bounded, mirroring island_key_version.
+    # hard ceiling 1h; both directions bounded, mirroring island_key_version. NOTE the
+    # EFFECTIVE validity window is `ttl + livekit_tokens._NBF_LEEWAY_SECONDS` (a ~10s
+    # nbf backdate for SFU clock skew), so the real ceiling is 3600+10s (cage-match
+    # #122 rd2 Wu F3 — the bound stated here and the window the minter enforces differ
+    # by exactly the leeway; naming it keeps that from drifting).
     livekit_token_ttl_seconds: int = Field(default=600, ge=60, le=3600)
 
     # Self-service registration. None → resolved by environment in the validator
@@ -369,6 +373,38 @@ class Settings(BaseSettings):
         # silently sign a different byte string than the operator set.
         self.livekit_api_key = self.livekit_api_key.strip()
         self.livekit_api_secret = self.livekit_api_secret.strip()
+        # LiveKit is OPTIONAL, but WHEN configured it mints bearer capabilities to a
+        # SHARED SFU (one API key across islands) — so in PRODUCTION it earns the same
+        # fail-closed guards as the other trust-boundary dials (cage-match #122 rd2:
+        # Carnot secret-strength, Tesla+Wu gateway_id fail-open, Tesla half-config +
+        # wss). Un-configured islands are wholly unaffected (the whole block is skipped).
+        if self.is_production and (self.livekit_api_key or self.livekit_api_secret):
+            if not (self.livekit_api_key and self.livekit_api_secret):
+                raise ValueError(
+                    "LiveKit is half-configured: set BOTH livekit_api_key and "
+                    "livekit_api_secret, or NEITHER. Refusing to boot."
+                )
+            if len(self.livekit_api_secret) < _MIN_PROD_SECRET_LEN:
+                raise ValueError(
+                    f"livekit_api_secret is too weak for production "
+                    f"(len={len(self.livekit_api_secret)} < {_MIN_PROD_SECRET_LEN}). A "
+                    "weak-but-non-empty secret makes every minted room token forgeable "
+                    "(entropy leaving the trust boundary as forgeability). Refusing to boot."
+                )
+            if not self.gateway_id:
+                raise ValueError(
+                    "gateway_id is required when LiveKit is configured in production: "
+                    "the SFU is shared across islands on ONE API key, so rooms and "
+                    "participant identities MUST be namespaced by gateway_id or they "
+                    "collide across islands (the empty default is the fail-open case). "
+                    "Refusing to boot — set GATEWAY_ID."
+                )
+            if not self.livekit_url.startswith("wss://"):
+                raise ValueError(
+                    f"livekit_url must be wss:// in production (got {self.livekit_url!r}) "
+                    "— it is handed to every client as the SFU to connect to; a plaintext "
+                    "or wrong-scheme URL is a client-redirect footgun. Refusing to boot."
+                )
         # A2 (crucible-09 Phase A): `e2ee` is schema-reserved for Phase B and
         # HARD-REJECTED in EVERY environment until MLS lands. Advertising an
         # unimplemented E2EE mode would be the exact mislabel this feature prevents

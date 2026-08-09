@@ -86,6 +86,55 @@ def test_dev_with_default_secret_boots():
     assert s.is_production is False
 
 
+# --- LiveKit prod fail-closed (cage-match #122 rd2) --------------------------
+# WHEN configured, LiveKit mints bearer capabilities to a SHARED SFU, so prod boots
+# demand a strong secret + a gateway_id namespace + wss + both-or-neither creds.
+
+_LK_SECRET_STRONG = "livekit-prod-secret-32-bytes-plus!"  # 34 chars >= 32
+
+
+def _prod_lk(**over):
+    base = dict(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
+                passkey_enabled=True, livekit_api_key="APIabc123",
+                livekit_api_secret=_LK_SECRET_STRONG, gateway_id="island-a", **_PROD_MOD)
+    base.update(over)
+    return Settings(**base)
+
+
+def test_prod_livekit_fully_configured_boots():
+    s = _prod_lk()
+    assert s.livekit_api_key == "APIabc123" and s.gateway_id == "island-a"
+
+
+def test_prod_livekit_without_gateway_id_raises():
+    # Empty gateway_id on a shared SFU = fail-open cross-island room/identity collision.
+    with pytest.raises(ValidationError):
+        _prod_lk(gateway_id="")
+
+
+def test_prod_livekit_weak_secret_raises():
+    with pytest.raises(ValidationError):
+        _prod_lk(livekit_api_secret="short")
+
+
+def test_prod_livekit_half_configured_raises():
+    # Key set, secret empty (or vice versa) → refuse rather than silently 503-at-runtime.
+    with pytest.raises(ValidationError):
+        _prod_lk(livekit_api_secret="")
+
+
+def test_prod_livekit_non_wss_url_raises():
+    with pytest.raises(ValidationError):
+        _prod_lk(livekit_url="ws://livekit.example.cc")
+
+
+def test_prod_without_livekit_boots_unaffected():
+    # The guard is skipped entirely when LiveKit is unconfigured — no gateway_id needed.
+    s = Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
+                 passkey_enabled=True, **_PROD_MOD)
+    assert s.livekit_api_key == "" and s.is_production is True
+
+
 def test_unknown_environment_is_treated_as_production():
     # Fail-closed: an unrecognized environment is production-like, so the dev
     # default secret must still be rejected.

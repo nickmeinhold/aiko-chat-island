@@ -69,15 +69,17 @@ async def create_video_token(
     # from the RESOLVED row (channel.id), not the raw path param, so an ACL
     # alias/normalization can never authorize one channel and mint for another.
     can_publish = await acl.can_post(session, user.id, channel)
-    # Namespace the room by island id on the SHARED SFU (cage-match #122 Tesla): two
-    # islands mint against one imagineering SFU + one API key, so prefix with
-    # gateway_id when set to keep rooms/identities from ever colliding across islands.
-    # channel.id is already a globally-unique ULID (collision negligible), so this is
-    # defense-in-depth; transparent to the app, which reads `room` from the response.
-    room = f"{settings.gateway_id}:{channel.id}" if settings.gateway_id else channel.id
+    # Namespace BOTH room and participant identity by island id on the SHARED SFU
+    # (cage-match #122 Tesla): islands mint against one imagineering SFU + one API key,
+    # so prefix with gateway_id to keep rooms AND identities from colliding across
+    # islands (webhooks/egress/ops see a flat space otherwise). In production gateway_id
+    # is REQUIRED when LiveKit is configured (config fail-closes), so the empty-prefix
+    # branch is dev/single-island only. Transparent to the app (reads `room` from resp).
+    ns = f"{settings.gateway_id}:" if settings.gateway_id else ""
+    room = f"{ns}{channel.id}"
     try:
         token = livekit_tokens.mint_room_token(
-            identity=user.id,
+            identity=f"{ns}{user.id}",
             display_name=user.display_name,
             room=room,
             can_publish=can_publish,
