@@ -58,6 +58,13 @@ def _member_view(m, u) -> dict:
     # (#2632) — ADR-0004 dropped the central /v1/mentions directory in favour of
     # browsing the per-island member roster, so this endpoint IS the mention
     # lookup. `handle` is the user's `username` column (the #2631 handle).
+    #
+    # NOT a central directory (ADR-0004): this is the "federated per-island member
+    # roster you browse", scoped to ONE channel and gated by list_members' read
+    # check (a private channel's roster is existence-hidden from non-members). A
+    # public channel's roster is enumerable by any member who can read it — public
+    # channels are public by definition, so exposing member handles there is the
+    # roster working as designed, not a global user-search surface.
     return {
         "user_id": m.user_id,
         "role": m.role,

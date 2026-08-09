@@ -371,10 +371,11 @@ class Message(Base):
     # Key-bound @-mention spans (#2632): a list of discriminated-target spans
     # [{target_type, target_id, offset, length}], SHAPE+caps validated at the
     # trust boundary (domain/mentions.validate_mentions) then carried VERBATIM —
-    # the gateway is a carrier, not a resolver. `target_id` is the mentioned
-    # KEY/opaque id, never a home-qualified string (ADR-0004: mention targets key
-    # off the opaque identity, so a rename never orphans a mention — the client
-    # re-resolves key->current-handle at render time). `offset`/`length` index
+    # the gateway is a pure carrier, not a resolver or filter. `target_id` for a
+    # user target is the gateway's OPAQUE user id (the `user_id` the member roster
+    # exposes), NOT the raw signing key and never a home-qualified string (ADR-0004:
+    # targets key off the opaque identity, so a rename never orphans a mention — the
+    # client re-resolves id->current-handle at render). `offset`/`length` index
     # `body` in the client's declared basis (UTF-16) and are round-tripped
     # OPAQUELY; the gateway never re-derives that basis. NULL for a message with
     # no mentions and every bus-born message; message_view omits the key when

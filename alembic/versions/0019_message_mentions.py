@@ -6,9 +6,10 @@ Adds the column the v2 @-mention feature stores its spans in:
     ``[{target_type, target_id, offset, length}]`` the client sends on the WS
     ``send`` frame (validated for SHAPE + caps at the trust boundary in
     domain/mentions.validate_mentions, then CARRIED verbatim — the gateway is a
-    carrier, not a resolver). ``target_id`` is the mentioned KEY/opaque id, never
-    a home-qualified string (ADR-0004 in aiko_chat_app: mention targets key off
-    the opaque identity); ``offset``/``length`` index ``body`` in the client's
+    pure carrier, not a resolver). ``target_id`` for a user target is the gateway's
+    OPAQUE user id (the ``user_id`` the member roster exposes), never a raw signing
+    key or a home-qualified string (ADR-0004 in aiko_chat_app: targets key off the
+    opaque identity); ``offset``/``length`` index ``body`` in the client's
     declared basis (UTF-16, per the app) and are round-tripped OPAQUELY — the
     gateway never re-derives that indexing basis.
 

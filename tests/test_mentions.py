@@ -101,56 +101,39 @@ def test_validate_mentions_strips_unexpected_nothing_but_keeps_order():
     assert list(out[0].keys()) == ["target_type", "target_id", "offset", "length"]
 
 
-def test_validate_mentions_dedupes_identical_spans():
-    """64 identical spans collapse to one (a mention set is a set); the cap is not
-    the only wall against duplicate-span bloat."""
-    out = mentions.validate_mentions([_span(target_id="bob", offset=0, length=3)] * 5)
-    assert out == [_span(target_id="bob", offset=0, length=3)]
+def test_validate_mentions_carries_identical_spans_verbatim():
+    """A pure carrier does NOT dedup: exact-duplicate spans are carried through
+    unchanged (mentions mirror `origin`, which never rewrites the client's bytes).
+    The _MAX_MENTIONS cap is the wall against bloat, not a dedup pass."""
+    raw = [_span(target_id="bob", offset=0, length=3)] * 5
+    assert mentions.validate_mentions(raw) == raw
 
 
 def test_validate_mentions_keeps_same_target_distinct_offsets():
     """Same target at DIFFERENT offsets is legitimately distinct (mentioning one
-    person twice) — dedup must not collapse these."""
+    person twice) — carried verbatim."""
     raw = [_span(target_id="bob", offset=0, length=3),
            _span(target_id="bob", offset=10, length=3)]
     assert mentions.validate_mentions(raw) == raw
 
 
-@pytest.mark.parametrize("bad_id", ["has\nnewline", "tab\there", "ctrl\x00null", "esc\x1b["])
-def test_validate_mentions_rejects_control_chars_in_target_id(bad_id):
-    """target_id is opaque but not a smuggling channel — control/non-printable chars
-    (log/UI injection) are rejected, mirroring origin's charset discipline."""
+@pytest.mark.parametrize("bad_id", [
+    "has\nnewline", "tab\there", "ctrl\x00null", "esc\x1b[",
+    "bidi‮override", "zero​width",   # Cf category — printable but a spoof vector
+])
+def test_validate_mentions_rejects_control_and_format_chars_in_target_id(bad_id):
+    """target_id is opaque but not a smuggling channel — control (Cc) AND format
+    (Cf: bidi overrides, zero-width) chars are rejected. `isprintable()` would MISS
+    the Cf class, which is the modern log/UI spoofing vector."""
     with pytest.raises(mentions.MentionError):
         mentions.validate_mentions([_span(target_id=bad_id)])
 
 
-# -- block gate: strip_blocked_user_mentions ---------------------------------
-def test_strip_blocked_removes_user_span_targeting_blocked():
-    spans = [_span(target_type="user", target_id="blocked-uid"),
-             _span(target_type="user", target_id="ok-uid", offset=20)]
-    out = mentions.strip_blocked_user_mentions(spans, {"blocked-uid"})
-    assert out == [_span(target_type="user", target_id="ok-uid", offset=20)]
-
-
-def test_strip_blocked_keeps_non_user_targets():
-    """channel/everyone targets have no user to block against — never stripped even
-    if their (channel) id happens to collide with a blocked user id set."""
-    spans = [_span(target_type="channel", target_id="blocked-uid"),
-             _span(target_type="everyone", target_id="blocked-uid", offset=9)]
-    assert mentions.strip_blocked_user_mentions(spans, {"blocked-uid"}) == spans
-
-
-def test_strip_blocked_collapses_all_stripped_to_none():
-    """If every span was a blocked user mention, the result is None (nothing to
-    store) — feeds the empty→NULL normalization cleanly, no stored []."""
-    spans = [_span(target_type="user", target_id="blocked-uid")]
-    assert mentions.strip_blocked_user_mentions(spans, {"blocked-uid"}) is None
-
-
-def test_strip_blocked_passthrough_when_none_or_empty_block_set():
-    assert mentions.strip_blocked_user_mentions(None, {"x"}) is None
-    keep = [_span(target_type="user", target_id="ok")]
-    assert mentions.strip_blocked_user_mentions(keep, set()) == keep
+def test_validate_mentions_rejects_joint_offset_length_overflow():
+    """offset and length each in-range, but their SUM past the cap is absurd geometry
+    — rejected as shape hygiene (not a body-relative bounds check)."""
+    with pytest.raises(mentions.MentionError):
+        mentions.validate_mentions([_span(offset=(1 << 20) - 1, length=1000)])
 
 
 # -- 2. carriage is faithful end-to-end --------------------------------------
@@ -185,8 +168,9 @@ async def test_message_view_omits_mentions_when_absent(session):
 
 @pytest.mark.asyncio
 async def test_message_view_omits_mentions_when_empty_list(session):
-    """An empty spans list is stored but reads as 'no mentions' — the key is
-    omitted, so an empty array never reaches the wire as `mentions: []`."""
+    """An empty spans list is NORMALIZED to NULL at write (not stored as []) and
+    reads as 'no mentions' — the key is omitted, so an empty array never reaches the
+    wire as `mentions: []` and storage holds one representation."""
     channel = Channel(id="0" * 26, name="general", kind="standard", aiko_channel="general")
     user = User(id="u" * 26, username="ada", display_name="Ada", aiko_username="ada")
     session.add_all([channel, user])
