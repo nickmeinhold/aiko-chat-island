@@ -141,8 +141,8 @@ async def _private_channel(session, *, cid: int = 10, name: str = "dm") -> Chann
     return ch
 
 
-async def _join(session, channel: Channel, user) -> None:
-    session.add(Membership(channel_id=channel.id, user_id=user.id, can_post=True))
+async def _join(session, channel: Channel, user, *, can_post: bool = True) -> None:
+    session.add(Membership(channel_id=channel.id, user_id=user.id, can_post=can_post))
     await session.commit()
 
 
@@ -160,12 +160,37 @@ async def test_member_gets_token_scoped_to_channel_under_own_identity(
     resp = await client.post(
         f"/v1/channels/{ch.id}/video-token", headers=_headers(alice))
     assert resp.status_code == 200
+    assert resp.headers.get("cache-control") == "no-store"   # bearer credential, never cached
     body = resp.json()
     assert body["room"] == ch.id
     assert body["url"] == settings.livekit_url
+    assert body["can_publish"] is True                        # a posting member may publish
     claims = _decode(body["token"])
     assert claims["sub"] == alice.id           # server-derived identity (I5)
     assert claims["video"]["room"] == ch.id
+    assert claims["video"]["canPublish"] is True
+    assert claims["video"]["canPublishData"] is False         # data side-channel off by default
+
+
+async def test_read_only_member_gets_subscribe_only_token(
+    client, session, livekit_configured
+):
+    # THE cage-match #122 finding (Carnot/Tesla/Wu/Maxwell): read access must NOT mint
+    # a publish capability. A member with can_post=False can read but not post text —
+    # so the video token must be subscribe-only, never canPublish.
+    mute = await _user(session, "mute")
+    ch = await _private_channel(session)
+    await _join(session, ch, mute, can_post=False)
+
+    resp = await client.post(
+        f"/v1/channels/{ch.id}/video-token", headers=_headers(mute))
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["can_publish"] is False
+    claims = _decode(body["token"])
+    assert claims["video"]["canPublish"] is False             # cannot broadcast
+    assert claims["video"]["canSubscribe"] is True            # can still watch/listen
+    assert claims["video"]["canPublishData"] is False
 
 
 async def test_non_member_of_private_channel_is_404(client, session, livekit_configured):

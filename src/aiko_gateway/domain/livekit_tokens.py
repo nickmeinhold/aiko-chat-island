@@ -6,7 +6,13 @@ they hold (publish / subscribe / publish-data). LiveKit validates ``iss`` == the
 API key and the signature, then honors the grant verbatim — so whoever mints the
 token decides the access. That authorizer is this island.
 
-Two invariants make the token unable to out-scope the caller's real access:
+Two invariants bound the token to the caller's real access AT MINT TIME. (Scope
+honestly, cage-match #122 Tesla+Wu: this is mint-time authorization, NOT continuous.
+A LiveKit join token is checked only at CONNECT and the media session outlives it, so
+a ban/kick/leave AFTER connect does not revoke an already-joined session — that needs
+the LiveKit room API (disconnect-on-ban) and is increment 2. So: the token can never
+out-scope the caller's access *at the moment it is minted*; session-lifetime
+revocation is a separate, not-yet-built gate.)
 
   * **Server-derived identity (I5).** The participant ``identity`` (the token
     ``sub``) is ALWAYS the authenticated user's id, passed in by the route from
@@ -34,6 +40,11 @@ from ..config import settings
 # and LiveKit's are independent contracts, and pinning it here means an env change
 # to the island's JWT alg can never silently change how a LiveKit token is signed.
 _LIVEKIT_ALG = "HS256"
+
+# A small backdating of `nbf` so a fresh token isn't rejected by an SFU whose clock
+# trails the island's by a second or two (cage-match #122 Tesla). Bounded and tiny —
+# it does not meaningfully widen the token's validity window.
+_NBF_LEEWAY_SECONDS = 10
 
 
 class LiveKitNotConfigured(RuntimeError):
@@ -77,7 +88,7 @@ def mint_room_token(
         "iss": settings.livekit_api_key,
         "sub": identity,
         "name": display_name,
-        "nbf": int(now.timestamp()),
+        "nbf": int(now.timestamp()) - _NBF_LEEWAY_SECONDS,
         "exp": int((now + dt.timedelta(seconds=settings.livekit_token_ttl_seconds)).timestamp()),
         # LiveKit's VideoGrant claim. Scoped to ONE room; only join + the requested
         # publish/subscribe powers, never room-admin.

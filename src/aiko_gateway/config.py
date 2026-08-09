@@ -90,8 +90,13 @@ class Settings(BaseSettings):
     livekit_api_key: str = ""       # LiveKit API key id (goes in the token `iss`)
     livekit_api_secret: str = ""    # SECRET — host .env / SOPS, signs the token (HS256)
     # Join-token TTL. The token is validated only at CONNECT; the media session
-    # outlives it, so a short TTL is safe. Generous enough for a demo/join retry.
-    livekit_token_ttl_seconds: int = Field(default=3600, ge=60)
+    # outlives it, so a SHORT TTL is the point — a real join window is minutes, not
+    # days. BOUNDED ABOVE (`le`), not just below: a token is a bearer capability, so
+    # an env typo (`LIVEKIT_TOKEN_TTL_SECONDS=31536000`) must NOT silently mint
+    # year-long join capabilities (cage-match #122 Carnot+Tesla+Wu HIGH — a config
+    # dial that widened the trust boundary). Default 10 min (ample to click "join"),
+    # hard ceiling 1h; both directions bounded, mirroring island_key_version.
+    livekit_token_ttl_seconds: int = Field(default=600, ge=60, le=3600)
 
     # Self-service registration. None → resolved by environment in the validator
     # (open in dev, closed in prod); set OPEN_REGISTRATION to override either way.
@@ -356,6 +361,14 @@ class Settings(BaseSettings):
         # share one canonical string; a whitespace-only entry collapses to nothing and is
         # then indistinguishable from an empty set (correctly refused by A5 in prod).
         self.moderator_user_ids = [u.strip() for u in self.moderator_user_ids if u.strip()]
+        # Normalize the LiveKit creds at the Settings boundary (EVERY env): a
+        # whitespace-only key/secret ("  ") would otherwise read as "configured" in
+        # is_configured() and mint tokens the SFU rejects instead of the honest 503
+        # (cage-match #122 Carnot). Strip once here so the STORED value equals what
+        # is_configured() tests AND what signs the token — a padded secret can't
+        # silently sign a different byte string than the operator set.
+        self.livekit_api_key = self.livekit_api_key.strip()
+        self.livekit_api_secret = self.livekit_api_secret.strip()
         # A2 (crucible-09 Phase A): `e2ee` is schema-reserved for Phase B and
         # HARD-REJECTED in EVERY environment until MLS lands. Advertising an
         # unimplemented E2EE mode would be the exact mislabel this feature prevents
