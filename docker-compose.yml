@@ -105,6 +105,15 @@ services:
       GATEWAY_BASE_URL: ${GATEWAY_BASE_URL:-https://chat.imagineering.cc}
       GATEWAY_ID: ${GATEWAY_ID:-}
       GATEWAY_DISPLAY_NAME: ${GATEWAY_DISPLAY_NAME:-Aiko}
+      # --- LiveKit (video/audio). Operator-settable; forwarded so a host .env value
+      # is NOT inert in the container (the PASSKEY_EXTRA_ORIGINS/ISLAND_SIGNING_SEED
+      # incident class — cage-match #122 Carnot+Tesla+Wu 3-way HIGH). API_SECRET is a
+      # REAL secret; when set in prod, config.py demands >=32 chars + GATEWAY_ID + wss.
+      # Absent => video is disabled (endpoint 503), NOT a boot failure.
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-}
+      LIVEKIT_URL: ${LIVEKIT_URL:-wss://livekit.imagineering.cc}
+      LIVEKIT_TOKEN_TTL_SECONDS: ${LIVEKIT_TOKEN_TTL_SECONDS:-600}
       # --- ISLAND SIGNING IDENTITY (crucible-09). The Ed25519 seed that signs the
       # self-manifest (island_identity.py) is the island's trust root. SECRET —
       # supplied via the host .env (SOPS in deploy), NEVER committed. Absent → the

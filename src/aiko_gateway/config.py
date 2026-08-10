@@ -78,6 +78,30 @@ class Settings(BaseSettings):
     jwt_access_ttl_seconds: int = 15 * 60        # 15 min
     jwt_refresh_ttl_seconds: int = 30 * 24 * 3600  # 30 days
 
+    # --- LiveKit (video/audio transport) ---
+    # The island is the AUTHORIZER of who may join a LiveKit room and with what
+    # powers; it mints short-lived HS256 join tokens and never proxies media. The
+    # SFU is self-hosted (imagineering); clients connect to `livekit_url` directly.
+    # Video is an OPTIONAL capability: absent api key/secret => the endpoint returns
+    # 503, it does NOT fail-closed the boot (unlike jwt_secret / island seed, which
+    # are core). A misconfigured secret only yields tokens LiveKit itself rejects —
+    # no data-plane risk — so endpoint-level 503-when-unconfigured is the right gate.
+    livekit_url: str = "wss://livekit.imagineering.cc"
+    livekit_api_key: str = ""       # LiveKit API key id (goes in the token `iss`)
+    livekit_api_secret: str = ""    # SECRET — host .env / SOPS, signs the token (HS256)
+    # Join-token TTL. The token is validated only at CONNECT; the media session
+    # outlives it, so a SHORT TTL is the point — a real join window is minutes, not
+    # days. BOUNDED ABOVE (`le`), not just below: a token is a bearer capability, so
+    # an env typo (`LIVEKIT_TOKEN_TTL_SECONDS=31536000`) must NOT silently mint
+    # year-long join capabilities (cage-match #122 Carnot+Tesla+Wu HIGH — a config
+    # dial that widened the trust boundary). Default 10 min (ample to click "join"),
+    # hard ceiling 1h; both directions bounded, mirroring island_key_version. NOTE the
+    # EFFECTIVE validity window is `ttl + livekit_tokens._NBF_LEEWAY_SECONDS` (a ~10s
+    # nbf backdate for SFU clock skew), so the real ceiling is 3600+10s (cage-match
+    # #122 rd2 Wu F3 — the bound stated here and the window the minter enforces differ
+    # by exactly the leeway; naming it keeps that from drifting).
+    livekit_token_ttl_seconds: int = Field(default=600, ge=60, le=3600)
+
     # Self-service registration. None → resolved by environment in the validator
     # (open in dev, closed in prod); set OPEN_REGISTRATION to override either way.
     open_registration: bool | None = None
@@ -341,6 +365,65 @@ class Settings(BaseSettings):
         # share one canonical string; a whitespace-only entry collapses to nothing and is
         # then indistinguishable from an empty set (correctly refused by A5 in prod).
         self.moderator_user_ids = [u.strip() for u in self.moderator_user_ids if u.strip()]
+        # Normalize the LiveKit creds at the Settings boundary (EVERY env): a
+        # whitespace-only key/secret ("  ") would otherwise read as "configured" in
+        # is_configured() and mint tokens the SFU rejects instead of the honest 503
+        # (cage-match #122 Carnot). Strip once here so the STORED value equals what
+        # is_configured() tests AND what signs the token — a padded secret can't
+        # silently sign a different byte string than the operator set.
+        self.livekit_api_key = self.livekit_api_key.strip()
+        self.livekit_api_secret = self.livekit_api_secret.strip()
+        # Strip gateway_id too (cage-match #122 rd3 Tesla+Wu): it namespaces LiveKit
+        # rooms/identities, so a padded "  island-a  " would mint under a non-canonical
+        # prefix AND slip past the `if not self.gateway_id` prod gate below. Normalize
+        # once here so the stored value is what actually prefixes the room string — the
+        # same asymmetric-strip fix already applied to moderator_user_ids and the creds.
+        self.gateway_id = self.gateway_id.strip()
+        # LiveKit is OPTIONAL, but WHEN configured it mints bearer capabilities to a
+        # SHARED SFU (one API key across islands). The forgery + cross-island-collision
+        # risk is a function of pointing at a REMOTE/shared SFU, NOT of ENVIRONMENT
+        # (cage-match #122 rd5 Wu F1 — gating on is_production let a non-prod box with
+        # the real shared creds + no gateway_id merge its users into prod's rooms). So
+        # these guards fire whenever LiveKit is configured against a non-loopback SFU,
+        # in EVERY environment; a loopback dev SFU (ws://localhost) is exempt.
+        if self.livekit_api_key or self.livekit_api_secret:
+            if not (self.livekit_api_key and self.livekit_api_secret):
+                raise ValueError(
+                    "LiveKit is half-configured: set BOTH livekit_api_key and "
+                    "livekit_api_secret, or NEITHER. Refusing to boot."
+                )
+            host = urlparse(self.livekit_url).hostname or ""
+            if not host:  # e.g. "wss://" — a prefix check would pass it (Wu F3)
+                raise ValueError(
+                    f"livekit_url has no host (got {self.livekit_url!r}). Refusing to boot."
+                )
+            # Exempt a loopback SFU ONLY in a non-prod env (dev convenience). A loopback
+            # URL in PRODUCTION is either misconfigured (mobile clients resolve
+            # `localhost` to the DEVICE, not the island) or a hardening bypass — so a
+            # prod island gets the full guards regardless of host (cage-match #122 rd6
+            # Carnot: the rd5 loopback exemption must not reach prod).
+            is_loopback = host in {"localhost", "127.0.0.1", "::1"}
+            if not (is_loopback and not self.is_production):
+                if urlparse(self.livekit_url).scheme != "wss":
+                    raise ValueError(
+                        f"livekit_url must be wss:// for a remote SFU (got {self.livekit_url!r}) "
+                        "— it is handed to every client; a plaintext/wrong-scheme URL is a "
+                        "client-redirect footgun. Refusing to boot."
+                    )
+                if len(self.livekit_api_secret) < _MIN_PROD_SECRET_LEN:
+                    raise ValueError(
+                        f"livekit_api_secret is too weak (len={len(self.livekit_api_secret)} "
+                        f"< {_MIN_PROD_SECRET_LEN}) for a remote SFU. A weak-but-non-empty "
+                        "secret makes every minted room token forgeable. Refusing to boot."
+                    )
+                if not self.gateway_id:
+                    raise ValueError(
+                        "gateway_id is required when LiveKit is configured against a "
+                        "REMOTE/shared SFU (in ANY environment): the SFU is shared across "
+                        "islands on ONE API key, so rooms/identities MUST be namespaced by "
+                        "gateway_id or they collide across islands (the empty default is the "
+                        "fail-open case). Refusing to boot — set GATEWAY_ID."
+                    )
         # A2 (crucible-09 Phase A): `e2ee` is schema-reserved for Phase B and
         # HARD-REJECTED in EVERY environment until MLS lands. Advertising an
         # unimplemented E2EE mode would be the exact mislabel this feature prevents

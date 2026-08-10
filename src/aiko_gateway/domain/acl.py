@@ -73,6 +73,21 @@ async def readable_channel(
     ).scalar_one_or_none()
 
 
+async def is_posting_member(session: AsyncSession, user_id: str, channel: Channel) -> bool:
+    """STRICTER than ``can_post``: requires an EXPLICIT membership row with
+    ``can_post=True`` on BOTH public and private channels.
+
+    ``can_post`` treats a public channel as post-open-by-default (no row → allowed),
+    which is right for *text*. But a higher-trust medium (live camera/mic broadcast to
+    a room — cage-match #122 Wu/Tesla) should not be open to every signed-in
+    non-member of a public channel: that is a broadcast blast radius, not a text line.
+    So video PUBLISH is gated on this predicate — an explicit posting membership —
+    while read/subscribe stays governed by ``readable_channel``. A public-channel
+    reader with no membership row is therefore subscribe-only, matching the promise."""
+    m = await _membership(session, channel.id, user_id)
+    return m is not None and m.can_post
+
+
 async def can_post(session: AsyncSession, user_id: str, channel: Channel) -> bool:
     """Post access: honouring ``Membership.can_post`` on both public and private channels.
 

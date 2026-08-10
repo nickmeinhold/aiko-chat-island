@@ -86,6 +86,88 @@ def test_dev_with_default_secret_boots():
     assert s.is_production is False
 
 
+# --- LiveKit prod fail-closed (cage-match #122 rd2) --------------------------
+# WHEN configured, LiveKit mints bearer capabilities to a SHARED SFU, so prod boots
+# demand a strong secret + a gateway_id namespace + wss + both-or-neither creds.
+
+_LK_SECRET_STRONG = "livekit-prod-secret-32-bytes-plus!"  # 34 chars >= 32
+
+
+def _prod_lk(**over):
+    base = dict(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
+                passkey_enabled=True, livekit_api_key="APIabc123",
+                livekit_api_secret=_LK_SECRET_STRONG, gateway_id="island-a", **_PROD_MOD)
+    base.update(over)
+    return Settings(**base)
+
+
+def test_prod_livekit_fully_configured_boots():
+    s = _prod_lk()
+    assert s.livekit_api_key == "APIabc123" and s.gateway_id == "island-a"
+
+
+def test_prod_livekit_without_gateway_id_raises():
+    # Empty gateway_id on a shared SFU = fail-open cross-island room/identity collision.
+    with pytest.raises(ValidationError):
+        _prod_lk(gateway_id="")
+
+
+def test_prod_livekit_weak_secret_raises():
+    with pytest.raises(ValidationError):
+        _prod_lk(livekit_api_secret="short")
+
+
+def test_prod_livekit_half_configured_raises():
+    # Key set, secret empty (or vice versa) → refuse rather than silently 503-at-runtime.
+    with pytest.raises(ValidationError):
+        _prod_lk(livekit_api_secret="")
+
+
+def test_prod_livekit_non_wss_url_raises():
+    with pytest.raises(ValidationError):
+        _prod_lk(livekit_url="ws://livekit.example.cc")
+
+
+def test_prod_without_livekit_boots_unaffected():
+    # The guard is skipped entirely when LiveKit is unconfigured — no gateway_id needed.
+    s = Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
+                 passkey_enabled=True, **_PROD_MOD)
+    assert s.livekit_api_key == "" and s.is_production is True
+
+
+def test_nonprod_livekit_remote_sfu_without_gateway_id_raises():
+    # Wu F1: the shared-SFU guard is NOT gated on ENVIRONMENT. A test/dev box with the
+    # real shared creds pointed at the remote SFU + no gateway_id would merge its users
+    # into prod's rooms — so it must fail closed in a NON-prod env too.
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, environment="test", jwt_secret=_STRONG_SECRET,
+                 livekit_api_key="APIabc", livekit_api_secret=_LK_SECRET_STRONG,
+                 livekit_url="wss://livekit.imagineering.cc", gateway_id="")
+
+
+def test_livekit_loopback_sfu_is_exempt():
+    # A loopback dev SFU carries no cross-island collision / forgery risk, so the
+    # gateway_id / wss / secret-strength guards relax (ws://localhost, short secret ok).
+    s = Settings(_env_file=None, environment="dev", jwt_secret=_DEV_JWT_SECRET,
+                 livekit_api_key="devkey", livekit_api_secret="short-dev",
+                 livekit_url="ws://localhost:7880", gateway_id="")
+    assert s.livekit_api_key == "devkey" and s.gateway_id == ""
+
+
+def test_livekit_url_empty_host_raises():
+    # Wu F3: "wss://" passes a startswith check but has no host — reject it.
+    with pytest.raises(ValidationError):
+        _prod_lk(livekit_url="wss://")
+
+
+def test_prod_loopback_sfu_is_not_exempt():
+    # Carnot rd6: the loopback exemption must NOT reach production. A prod island on
+    # ws://localhost is misconfigured (mobile clients resolve localhost to the device)
+    # or a hardening bypass — so prod gets the full guards regardless of host.
+    with pytest.raises(ValidationError):
+        _prod_lk(livekit_url="ws://localhost:7880")
+
+
 def test_unknown_environment_is_treated_as_production():
     # Fail-closed: an unrecognized environment is production-like, so the dev
     # default secret must still be rejected.
@@ -580,6 +662,10 @@ _MUST_FORWARD_ENV = {
     "GATEWAY_SEED_PEERS",            # operator-curated federation
     "GATEWAY_BOOTSTRAP_PEERS",       # operator-curated federation (gossip fetch)
     "GATEWAY_GOSSIP_ENABLED",        # operator policy — gossip fetch gate
+    "LIVEKIT_API_KEY",               # per-island video (#122) — inert-in-container class
+    "LIVEKIT_API_SECRET",            # secret — token forgery root for the SFU (#122)
+    "LIVEKIT_URL",                   # per-island video — the SFU clients connect to
+    "LIVEKIT_TOKEN_TTL_SECONDS",     # operator policy — join-token window
 }
 
 
