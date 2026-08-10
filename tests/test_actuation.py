@@ -22,7 +22,12 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from aiko_gateway.domain import actuation
-from aiko_gateway.domain.actuation import ActuationError, SeqHighWater, verify_actuation
+from aiko_gateway.domain.actuation import (
+    ActuationError,
+    SeqHighWater,
+    verify_actuation,
+    verify_and_advance,
+)
 from aiko_gateway.domain.signing import encode_multikey
 
 # A DETERMINISTIC commander keypair from a fixed 32-byte seed — reproducible vector,
@@ -172,3 +177,163 @@ def test_corrupt_store_fails_closed(tmp_path):
     p.write_text("{ this is not json")
     with pytest.raises(ActuationError, match="corrupt"):
         SeqHighWater(str(p))
+
+
+# ---- store: valid-JSON-but-wrong-shape must ALSO fail closed (the untested mirror) ----
+# The old guard only caught JSONDecodeError, so a parseable-but-wrong store silently reset
+# the high-water to empty — reopening the exact replay window the store exists to close.
+
+@pytest.mark.parametrize("body", ["[]", "null", "42", '"oops"', "[1, 2, 3]"])
+def test_store_valid_json_non_object_fails_closed(tmp_path, body):
+    p = tmp_path / "seq.json"
+    p.write_text(body)
+    with pytest.raises(ActuationError, match="not a JSON object"):
+        SeqHighWater(str(p))
+
+
+@pytest.mark.parametrize("body", [
+    '{"arm-1": "5"}',      # string value — must not be silently dropped
+    '{"arm-1": true}',     # JSON true must NOT decay to int 1
+    '{"arm-1": 5.0}',      # float is not an int seq
+    '{"arm-1": -1}',       # negative out of u64 range
+    '{"arm-1": 10, "arm-2": "bad"}',  # partial drift: one good, one bad → reject WHOLE file
+])
+def test_store_wrong_typed_value_fails_closed(tmp_path, body):
+    p = tmp_path / "seq.json"
+    p.write_text(body)
+    with pytest.raises(ActuationError, match="non-u64-int mark"):
+        SeqHighWater(str(p))
+
+
+def test_store_empty_object_is_valid(tmp_path):
+    # An empty dict is a legitimate fresh store — not corruption.
+    p = tmp_path / "seq.json"
+    p.write_text("{}")
+    hw = SeqHighWater(str(p))
+    assert hw.check_and_advance("arm-1", 1) is True
+
+
+# ---- exception contract: every wire-parse failure surfaces as ActuationError ----
+
+def test_malformed_pubkey_raises_actuation_error():
+    env = _envelope()
+    env["sender_pubkey"] = "not-a-multikey"  # decode_multikey raises OriginError internally
+    with pytest.raises(ActuationError, match="sender_pubkey malformed"):
+        verify_actuation(env, allowed_pubkeys=_ALLOW, now_ms=_NOW)
+
+
+def test_malformed_sig_raises_actuation_error():
+    env = _envelope()
+    env["sig"] = "!!! not base64url !!!"  # b64url_raw raises OriginError internally
+    with pytest.raises(ActuationError, match="sig malformed"):
+        verify_actuation(env, allowed_pubkeys=_ALLOW, now_ms=_NOW)
+
+
+# ---- freshness edges ----
+
+def test_freshness_exactly_at_max_age_accepted():
+    env = _envelope(signed_at_ms=_NOW - actuation.DEFAULT_MAX_AGE_MS)  # age == max_age
+    parsed = verify_actuation(env, allowed_pubkeys=_ALLOW, now_ms=_NOW)
+    assert parsed["seq"] == 1
+
+
+def test_freshness_one_ms_past_max_age_rejected():
+    env = _envelope(signed_at_ms=_NOW - actuation.DEFAULT_MAX_AGE_MS - 1)
+    with pytest.raises(ActuationError, match="stale"):
+        verify_actuation(env, allowed_pubkeys=_ALLOW, now_ms=_NOW)
+
+
+def test_freshness_at_max_forward_skew_accepted():
+    env = _envelope(signed_at_ms=_NOW + actuation._MAX_FWD_SKEW_MS)  # age == -skew (boundary)
+    parsed = verify_actuation(env, allowed_pubkeys=_ALLOW, now_ms=_NOW)
+    assert parsed["seq"] == 1
+
+
+def test_freshness_one_ms_past_forward_skew_rejected():
+    env = _envelope(signed_at_ms=_NOW + actuation._MAX_FWD_SKEW_MS + 1)
+    with pytest.raises(ActuationError, match="future"):
+        verify_actuation(env, allowed_pubkeys=_ALLOW, now_ms=_NOW)
+
+
+# ---- identity binding ----
+
+def test_expected_robot_id_match_accepted():
+    env = _envelope(robot_id="arm-1")
+    parsed = verify_actuation(env, allowed_pubkeys=_ALLOW, now_ms=_NOW, expected_robot_id="arm-1")
+    assert parsed["robot_id"] == "arm-1"
+
+
+def test_expected_robot_id_mismatch_rejected():
+    # A validly-signed command for arm-2 must be rejected by a bridge that owns arm-1.
+    env = _envelope(robot_id="arm-2")
+    with pytest.raises(ActuationError, match="does not match"):
+        verify_actuation(env, allowed_pubkeys=_ALLOW, now_ms=_NOW, expected_robot_id="arm-1")
+
+
+# ---- the sealed door: verify_and_advance ----
+
+def test_verify_and_advance_happy_path(tmp_path):
+    hw = SeqHighWater(str(tmp_path / "seq.json"))
+    parsed = verify_and_advance(_envelope(seq=1), allowed_pubkeys=_ALLOW, seq_store=hw, now_ms=_NOW)
+    assert parsed["command"] == "wave"
+
+
+def test_verify_and_advance_replay_raises(tmp_path):
+    hw = SeqHighWater(str(tmp_path / "seq.json"))
+    verify_and_advance(_envelope(seq=5), allowed_pubkeys=_ALLOW, seq_store=hw, now_ms=_NOW)
+    # a fresh, validly-signed envelope reusing seq=5 is a replay → ActuationError, not False
+    with pytest.raises(ActuationError, match="replay or stale"):
+        verify_and_advance(_envelope(seq=5), allowed_pubkeys=_ALLOW, seq_store=hw, now_ms=_NOW)
+
+
+def test_verify_and_advance_does_not_advance_on_bad_signature(tmp_path):
+    # The catastrophic order made impossible: an UNVERIFIED envelope must NOT touch the
+    # high-water, so a later legitimate low seq still works (the DoS wedge cannot happen).
+    hw = SeqHighWater(str(tmp_path / "seq.json"))
+    forged = _envelope(seq=2**64 - 1)
+    forged["command"] = "terminate"  # breaks the signature
+    with pytest.raises(ActuationError, match="does not verify"):
+        verify_and_advance(forged, allowed_pubkeys=_ALLOW, seq_store=hw, now_ms=_NOW)
+    # high-water untouched → a normal seq=1 still actuates
+    assert verify_and_advance(_envelope(seq=1), allowed_pubkeys=_ALLOW, seq_store=hw, now_ms=_NOW)["seq"] == 1
+
+
+def test_verify_and_advance_unallowlisted_key_does_not_advance(tmp_path):
+    hw = SeqHighWater(str(tmp_path / "seq.json"))
+    other = Ed25519PrivateKey.from_private_bytes(bytes(range(1, 33)))
+    other_pub_raw = other.public_key().public_bytes_raw()
+    other_pub = encode_multikey(other_pub_raw)
+
+    def lp(b):
+        return struct.pack(">I", len(b)) + b
+    msg = b"".join((lp(b"aikochat:actuate:v1:EdDSA"), lp(other_pub_raw), lp(b"arm-1"),
+                    lp(b"wave"), struct.pack(">Q", 2**64 - 1), struct.pack(">Q", _NOW)))
+    env = {"v": 1, "alg": "EdDSA", "robot_id": "arm-1", "command": "wave", "seq": 2**64 - 1,
+           "signed_at_ms": _NOW, "sender_pubkey": other_pub,
+           "sig": base64.urlsafe_b64encode(other.sign(msg)).rstrip(b"=").decode()}
+    with pytest.raises(ActuationError, match="allowlisted"):
+        verify_and_advance(env, allowed_pubkeys=_ALLOW, seq_store=hw, now_ms=_NOW)
+    # store never advanced by an unauthorized max-seq envelope
+    assert verify_and_advance(_envelope(seq=1), allowed_pubkeys=_ALLOW, seq_store=hw, now_ms=_NOW)["seq"] == 1
+
+
+def test_concurrent_check_and_advance_admits_one(tmp_path):
+    # Under concurrent callers with the SAME next seq, exactly one may win — the lock
+    # serializes the read-modify-write so two handlers can't both actuate.
+    import threading
+    hw = SeqHighWater(str(tmp_path / "seq.json"))
+    hw.check_and_advance("arm-1", 0)  # high-water = 0
+    results = []
+    barrier = threading.Barrier(8)
+
+    def race():
+        barrier.wait()
+        results.append(hw.check_and_advance("arm-1", 1))
+
+    threads = [threading.Thread(target=race) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert results.count(True) == 1  # exactly one winner
+    assert results.count(False) == 7

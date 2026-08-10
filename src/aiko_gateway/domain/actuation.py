@@ -29,14 +29,30 @@ Two defenses, both required, because each covers a gap the other can't:
   * **Freshness deadline** (``max_age_ms``, default a TIGHT 2s) — a SEPARATE timeliness
     gate, only trustworthy under asserted NTP discipline; it is defense-in-depth on top
     of the seq guard, never the primary replay defense (cross-host clocks disagree).
+
+The blessed actuation path is ``verify_and_advance`` — the SEALED door that runs verify
+THEN seq-advance in the only safe order (advancing before verifying is a permanent-DoS
+footgun; the sealed door makes that order unrepresentable). ``verify_actuation`` stays
+public for pure, side-effect-free verification.
+
+Caller / operational contract this boundary DEPENDS ON but cannot itself enforce (the
+commander + the LiveKit transport are out of this repo — tracked as follow-ups):
+  * The **commander** must mint a strictly-increasing per-robot ``seq`` from DURABLE state:
+    if the commander restarts and its counter resets, envelopes are rejected until seq
+    climbs back past the bridge's persisted high-water (a self-inflicted denial of
+    actuation), so commander-side seq durability is a hard requirement.
+  * The seq guard is **at-most-once, not exactly-once**: a reordered delivery (``seq=5``
+    arriving before ``seq=4``) drops the lower seq permanently. That is the correct bias
+    for a physical actuator (better a missed wave than a double/late one), but the
+    commander should not rely on every envelope landing.
 """
 from __future__ import annotations
 
-import base64
 import json
 import os
 import struct
 import tempfile
+import threading
 from typing import Any
 
 from cryptography.exceptions import InvalidSignature
@@ -45,6 +61,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from .signing import (
     MAX_PUBKEY_STR,
     MAX_SIGNED_AT_MS,
+    OriginError,
     SIG_RAW_LEN,
     b64url_raw,
     decode_multikey,
@@ -65,6 +82,9 @@ _MAX_SIG_STR = 128
 # default — a servo command that aged in the mailbox is stale. Explicit, NEVER inherit a
 # minutes-long default (a 5-min window on a physical device is the crucible's rejected footgun).
 DEFAULT_MAX_AGE_MS = 2000
+# A small forward skew tolerated because cross-host clocks lead as well as lag. Module-level
+# so the timeliness contract is visible with the other boundary constants, not buried in a fn.
+_MAX_FWD_SKEW_MS = 1000
 
 # Exactly these keys, no more (frozen v1 shape; a change is a v2, never a silent add).
 _REQUIRED_KEYS = frozenset(
@@ -106,6 +126,7 @@ def verify_actuation(
     allowed_pubkeys: set[str],
     now_ms: int,
     max_age_ms: int = DEFAULT_MAX_AGE_MS,
+    expected_robot_id: str | None = None,
 ) -> dict:
     """Verify an inbound actuation envelope at the robot's trust boundary and return
     the validated dict, or raise ``ActuationError``. Fail-closed at every step, in this
@@ -120,9 +141,19 @@ def verify_actuation(
          the load-bearing check this whole feature exists for);
       6. **freshness**: ``signed_at_ms`` within ``[now_ms - max_age_ms, now_ms + skew]``.
 
+    ``ActuationError`` is the SOLE exception this raises for a bad envelope — malformed
+    ``sender_pubkey``/``sig`` (which the primitives in ``signing`` report as ``OriginError``)
+    are normalized here, so a caller's ``except ActuationError`` fail-closed handler catches
+    every deviation, not just the signature miss.
+
+    If ``expected_robot_id`` is given, the envelope's ``robot_id`` MUST equal it — a signed
+    command addressed to another robot is rejected at this boundary rather than relying on
+    the call site to compare (identity binding; an actuator-agnostic codec still needs it).
+
     Does NOT check the ``seq`` high-water — that is stateful and belongs to
     ``SeqHighWater.check_and_advance`` at the call site, so verification stays pure and
-    the durable replay guard is a single explicit gate. The caller MUST run BOTH.
+    the durable replay guard is a single explicit gate. The caller MUST run BOTH — or, better,
+    call ``verify_and_advance``, the SEALED door that runs them in the only safe order.
     """
     if not isinstance(raw, dict):
         raise ActuationError("actuation envelope must be a JSON object")
@@ -142,6 +173,8 @@ def verify_actuation(
     robot_id = raw["robot_id"]
     if not isinstance(robot_id, str) or not robot_id or len(robot_id) > _MAX_ROBOT_ID:
         raise ActuationError("robot_id must be a non-empty string within the size cap")
+    if expected_robot_id is not None and robot_id != expected_robot_id:
+        raise ActuationError(f"robot_id {robot_id!r} does not match this bridge's {expected_robot_id!r}")
 
     command = raw["command"]
     if not isinstance(command, str) or not command or len(command) > _MAX_COMMAND:
@@ -160,14 +193,22 @@ def verify_actuation(
         raise ActuationError("sender_pubkey must be a string within the size cap")
     # Authorization BEFORE crypto: an un-allowlisted key never reaches signature verify.
     # Compare the canonical string form; decode_multikey also guarantees it is well-formed.
-    raw_pubkey = decode_multikey(pubkey_str)  # raises OriginError (ValueError) if malformed
+    # Normalize the primitive's OriginError to ActuationError so the caller's fail-closed
+    # `except ActuationError` catches a malformed key, not just a bad signature.
+    try:
+        raw_pubkey = decode_multikey(pubkey_str)
+    except OriginError as e:
+        raise ActuationError(f"sender_pubkey malformed: {e}") from e
     if pubkey_str not in allowed_pubkeys:
         raise ActuationError("sender_pubkey is not an allowlisted commander key")
 
     sig_str = raw["sig"]
     if not isinstance(sig_str, str) or len(sig_str) > _MAX_SIG_STR:
         raise ActuationError("sig must be a string within the size cap")
-    sig = b64url_raw(sig_str, expect_len=SIG_RAW_LEN, field="sig")
+    try:
+        sig = b64url_raw(sig_str, expect_len=SIG_RAW_LEN, field="sig")
+    except OriginError as e:
+        raise ActuationError(f"sig malformed: {e}") from e
 
     # The load-bearing check: Ed25519 over the canonical bytes. Fail closed on ANY
     # verification error (bad sig, tampered field → reconstructed bytes differ → invalid).
@@ -181,7 +222,6 @@ def verify_actuation(
 
     # Freshness (defense in depth on top of the seq guard). A small forward skew is
     # tolerated (clocks lead); a packet older than max_age_ms is stale → dropped.
-    _MAX_FWD_SKEW_MS = 1000
     age = now_ms - ts
     if age > max_age_ms:
         raise ActuationError(f"stale: signed {age}ms ago > max_age {max_age_ms}ms — check clocks")
@@ -202,29 +242,52 @@ class SeqHighWater:
     the mark — a corrupted store that reset to 0 would re-open the replay window.
 
     Single-process reference implementation (the bridge is one process). Not safe across
-    processes; the bridge owns exactly one.
+    processes; the bridge owns exactly one. Within the process ``check_and_advance`` IS
+    safe under concurrent callers (a lock serializes the read-modify-write) — LiveKit data
+    handlers can fire concurrently, and an unguarded RMW would let two callers both observe
+    ``seq > high_water`` and both actuate (a double wave).
     """
 
     def __init__(self, path: str) -> None:
         self._path = path
+        self._lock = threading.Lock()
         self._marks: dict[str, int] = {}
         if os.path.exists(path):
             try:
                 with open(path, encoding="utf-8") as f:
                     data = json.load(f)
-                if isinstance(data, dict):
-                    self._marks = {str(k): int(v) for k, v in data.items() if isinstance(v, int)}
-            except (json.JSONDecodeError, ValueError, OSError):
+            except (json.JSONDecodeError, ValueError, OSError) as e:
                 # A corrupt store must NOT silently reset to an empty (replay-open) state:
                 # fail closed so the operator sees it, rather than accepting old seqs again.
-                raise ActuationError(f"seq high-water store at {path} is corrupt — refusing to start")
+                raise ActuationError(f"seq high-water store at {path} is corrupt — refusing to start") from e
+            # Corruption that still JSON-parses (a list, a scalar, a null, a wrong-typed
+            # value) is corruption too — the ONLY safe recovery is fail-closed, never a
+            # silent filter (dropping one robot's mark reopens ITS replay window). Validate
+            # the whole shape: a dict of str→(non-bool int in u64 range), or refuse to start.
+            if not isinstance(data, dict):
+                raise ActuationError(
+                    f"seq high-water store at {path} is not a JSON object (got {type(data).__name__}) — refusing to start"
+                )
+            marks: dict[str, int] = {}
+            for k, v in data.items():
+                if not isinstance(k, str):
+                    raise ActuationError(f"seq high-water store at {path} has a non-string robot_id key — refusing to start")
+                # bool is an int subclass — a persisted JSON `true` must NOT decay to 1.
+                if isinstance(v, bool) or not isinstance(v, int) or v < 0 or v > (1 << 64) - 1:
+                    raise ActuationError(
+                        f"seq high-water store at {path} has a non-u64-int mark for {k!r} ({v!r}) — refusing to start"
+                    )
+                marks[k] = v
+            self._marks = marks
 
     def check_and_advance(self, robot_id: str, seq: int) -> bool:
-        if seq <= self._marks.get(robot_id, -1):
-            return False
-        self._marks[robot_id] = seq
-        self._persist()
-        return True
+        # Serialize the read-modify-write: concurrent LiveKit handlers must not both pass.
+        with self._lock:
+            if seq <= self._marks.get(robot_id, -1):
+                return False
+            self._marks[robot_id] = seq
+            self._persist()
+            return True
 
     def _persist(self) -> None:
         d = os.path.dirname(self._path) or "."
@@ -235,9 +298,58 @@ class SeqHighWater:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, self._path)  # atomic on POSIX
+            # fsync the DIRECTORY so the rename itself survives power loss — without this the
+            # replace can be lost on a crash and resurrect the OLD high-water (replay reopens).
+            # A robot host loses power precisely when things go wrong, so this is load-bearing.
+            dir_fd = os.open(d, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
         except BaseException:
             try:
                 os.unlink(tmp)
             except OSError:
                 pass
             raise
+
+
+def verify_and_advance(
+    raw: Any,
+    *,
+    allowed_pubkeys: set[str],
+    seq_store: SeqHighWater,
+    now_ms: int,
+    max_age_ms: int = DEFAULT_MAX_AGE_MS,
+    expected_robot_id: str | None = None,
+) -> dict:
+    """The SEALED door a bridge should call: verify the envelope, THEN advance the seq —
+    in that order, atomically from the caller's view — and return the validated dict, or
+    raise ``ActuationError``.
+
+    Why a single door: ``verify_actuation`` and ``SeqHighWater.check_and_advance`` are two
+    gates, and running them in the WRONG order is catastrophic — ``check_and_advance``
+    mutates and PERSISTS the high-water for whatever seq it is handed, with no proof
+    attached, so advancing BEFORE verifying lets any room participant (no key needed)
+    submit ``seq = 2**64 - 1`` and permanently wedge the robot. This function makes that
+    order unrepresentable: the seq is advanced ONLY after a valid, allowlisted, fresh
+    signature over that exact ``(robot_id, command, seq, signed_at_ms)`` is proven. A
+    replay/stale seq raises ``ActuationError`` (not a bare ``False``), so the caller's
+    fail-closed ``except ActuationError`` handles replay identically to a bad signature.
+
+    ``verify_actuation`` remains public for pure, side-effect-free verification (tests,
+    dry-runs); but the actuation path should reach for THIS.
+    """
+    parsed = verify_actuation(
+        raw,
+        allowed_pubkeys=allowed_pubkeys,
+        now_ms=now_ms,
+        max_age_ms=max_age_ms,
+        expected_robot_id=expected_robot_id,
+    )
+    # Only a verified envelope can advance the durable replay guard.
+    if not seq_store.check_and_advance(parsed["robot_id"], parsed["seq"]):
+        raise ActuationError(
+            f"seq {parsed['seq']} for {parsed['robot_id']!r} is a replay or stale (<= high-water) — dropped"
+        )
+    return parsed
