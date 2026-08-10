@@ -58,6 +58,17 @@ commander + the LiveKit transport are out of this repo — tracked as follow-ups
     map (first run), so anyone who can delete ``seq.json`` and restart the bridge reopens the
     replay window (bounded to ``max_age_ms`` by the freshness gate). If the bridge user is not
     the host root, the store's file mode + directory permissions are part of this boundary.
+  * The high-water is keyed by ``robot_id`` ALONE, but the allowlist is a SET of commander
+    keys — so the seq space is shared across all allowlisted commanders for a robot. Two
+    commanders are therefore assumed to be one logical single-writer per robot: if commander A
+    reaches ``seq=100`` and commander B (also allowlisted) then sends a valid ``seq=50``, B's
+    command is dropped. For increment 1 (one commander per robot) this holds; a genuine
+    multi-commander deployment must key the store by ``(robot_id, sender_pubkey)`` instead.
+  * A persist failure keeps the in-memory mark advanced (fail-safe) but leaves DISK at the old
+    mark. On a bridge RESTART after such a failure the store reloads the lower mark, so a
+    still-fresh, previously memory-only-burned envelope can actuate ONCE (bounded by
+    ``max_age_ms`` and still requiring a valid signature) — "spent" is process-lifetime, not
+    crash-lifetime. Treat a persist failure as an operator-visible fault, not a soft skip.
 """
 from __future__ import annotations
 
@@ -189,6 +200,10 @@ def verify_actuation(
         raise ActuationError("now_ms must be an int (ms since epoch)")
     if not isinstance(allowed_pubkeys, (set, frozenset)):
         raise ActuationError("allowed_pubkeys must be a set of commander Multikey strings")
+    # allowed_commands MUST be a set when given — a bare str would make `command in ...`
+    # a SUBSTRING match ("wa" in "wave"), silently widening admission on a physical boundary.
+    if allowed_commands is not None and not isinstance(allowed_commands, (set, frozenset)):
+        raise ActuationError("allowed_commands must be a set of command strings (or None)")
     # The freshness floor is not caller-optional: reject an out-of-range max_age_ms rather
     # than let a bridge kwarg reopen the crucible-rejected minutes window (or invert it).
     if isinstance(max_age_ms, bool) or not isinstance(max_age_ms, int) \
@@ -255,9 +270,16 @@ def verify_actuation(
 
     # The load-bearing check: Ed25519 over the canonical bytes. Fail closed on ANY
     # verification error (bad sig, tampered field → reconstructed bytes differ → invalid).
-    message = actuation_signing_bytes(
-        raw_pubkey=raw_pubkey, robot_id=robot_id, command=command,
-        seq=seq, signed_at_ms=ts)
+    # Wrap the construction too: a lone-surrogate str (json can materialize "\ud800") makes
+    # .encode() raise UnicodeEncodeError, and an out-of-u64 field would make struct.pack raise
+    # struct.error — both would escape `except ActuationError`, breaking the SOLE-exception
+    # contract. Normalize them here so no bad envelope leaves this function as another type.
+    try:
+        message = actuation_signing_bytes(
+            raw_pubkey=raw_pubkey, robot_id=robot_id, command=command,
+            seq=seq, signed_at_ms=ts)
+    except (UnicodeEncodeError, struct.error) as e:
+        raise ActuationError(f"envelope fields are not canonically encodable: {e}") from e
     try:
         Ed25519PublicKey.from_public_bytes(raw_pubkey).verify(sig, message)
     except (InvalidSignature, ValueError) as e:
@@ -266,8 +288,13 @@ def verify_actuation(
         # contract holds even if an upstream guarantee ever weakens (cheap insurance).
         raise ActuationError("signature does not verify") from e
 
-    # Freshness (defense in depth on top of the seq guard). A small forward skew is
-    # tolerated (clocks lead); a packet older than max_age_ms is stale → dropped.
+    # Freshness (defense in depth on top of the seq guard). The window is ASYMMETRIC by
+    # design: the stale side is caller-tunable up to _MAX_ALLOWED_AGE_MS (a slightly-old
+    # servo command is a routine, low-suspicion event), but the FUTURE side is a small fixed
+    # skew — a command timestamped ahead of now is anomalous (clock fault or forgery attempt),
+    # so it stays tight and non-tunable. Under the asserted NTP discipline both bridge and
+    # commander sit well inside _MAX_FWD_SKEW_MS; a bridge clock lagging > 1s is a fault to fix
+    # at the host, not a knob to widen here.
     age = now_ms - ts
     if age > max_age_ms:
         raise ActuationError(f"stale: signed {age}ms ago > max_age {max_age_ms}ms — check clocks")
@@ -420,6 +447,10 @@ def verify_and_advance(
     ``verify_actuation`` remains public for pure, side-effect-free verification (tests,
     dry-runs); but the actuation path should reach for THIS.
     """
+    # Caller-surface guard: a wrong seq_store would raise AttributeError below, escaping the
+    # sole-exception contract this door also sells.
+    if not isinstance(seq_store, SeqHighWater):
+        raise ActuationError("seq_store must be a SeqHighWater instance")
     parsed = verify_actuation(
         raw,
         allowed_pubkeys=allowed_pubkeys,

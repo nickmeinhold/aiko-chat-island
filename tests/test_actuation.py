@@ -417,8 +417,9 @@ def test_private_advance_rejects_empty_robot_id(tmp_path):
 # ---- seq interop ceiling (2**53-1, JS Number.MAX_SAFE_INTEGER) ----
 
 def test_seq_above_js_safe_integer_rejected():
+    # _envelope signs over this seq; the cap is checked before signature verify, so the
+    # rejection is the CAP, not a signature miss.
     env = _envelope(seq=(1 << 53))  # one past MAX_SAFE_INTEGER — JS would lose precision
-    # re-sign at that seq so it's the CAP, not the signature, that rejects
     with pytest.raises(ActuationError, match="2\\*\\*53"):
         verify_actuation(env, allowed_pubkeys=_ALLOW, now_ms=_NOW)
 
@@ -493,3 +494,36 @@ def test_persist_failure_surfaces_as_actuation_error(tmp_path):
             hw._check_and_advance("arm-1", 1)
     finally:
         os.chmod(d, 0o700)  # restore so tmp cleanup can remove it
+
+
+# ---- sole-exception contract: encode failures normalize to ActuationError ----
+
+def test_surrogate_robot_id_raises_actuation_error():
+    # json can materialize a lone surrogate; .encode() would raise UnicodeEncodeError,
+    # which must NOT escape the sole-exception contract.
+    env = _envelope()
+    env["robot_id"] = "arm-\ud800"  # lone surrogate, passes isinstance(str)
+    with pytest.raises(ActuationError):
+        verify_actuation(env, allowed_pubkeys=_ALLOW, now_ms=_NOW)
+
+
+def test_surrogate_command_raises_actuation_error():
+    env = _envelope()
+    env["command"] = "wave\ud800"
+    with pytest.raises(ActuationError):
+        verify_actuation(env, allowed_pubkeys=_ALLOW, now_ms=_NOW)
+
+
+# ---- caller-surface type guards keep the sole-exception contract total ----
+
+def test_allowed_commands_non_set_rejected():
+    # A bare str would make `command in allowed_commands` a substring match.
+    with pytest.raises(ActuationError, match="allowed_commands"):
+        verify_actuation(_envelope(command="wave"), allowed_pubkeys=_ALLOW, now_ms=_NOW,
+                         allowed_commands="wave")
+
+
+def test_verify_and_advance_bad_seq_store_rejected():
+    with pytest.raises(ActuationError, match="seq_store"):
+        verify_and_advance(_envelope(), allowed_pubkeys=_ALLOW, seq_store=object(),
+                           now_ms=_NOW, expected_robot_id="arm-1")
