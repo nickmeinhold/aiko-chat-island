@@ -104,10 +104,18 @@ async def can_post(session: AsyncSession, user_id: str, channel: Channel) -> boo
 
 
 async def visible_channels(session: AsyncSession, user_id: str) -> list[Channel]:
-    """Every public channel + every private channel the user belongs to, id asc."""
+    """Every public channel + every private channel the user belongs to, id asc —
+    EXCLUDING DMs (``kind="dm"``, #2633). A DM is a private channel the user belongs to,
+    so it would otherwise appear in this flat list; the contract keeps DMs out of
+    ``GET /v1/channels`` and surfaces them only through ``GET /v1/dm`` (the client learns
+    its DM ids there). This exclusion is CONFINED to the listing: ``readable_channel`` /
+    ``filter_readable_ids`` are untouched, so a member can still subscribe to and read
+    their DM over WS — the DM is hidden from the roster, not from its own members."""
     rows = (
         await session.execute(
-            select(Channel).where(_readable_predicate(user_id)).order_by(Channel.id)
+            select(Channel)
+            .where(_readable_predicate(user_id), Channel.kind != "dm")
+            .order_by(Channel.id)
         )
     ).scalars()
     return list(rows)
@@ -122,11 +130,18 @@ async def visible_channels_in_community(
     Reuses ``_readable_predicate`` so the community detail / join read path shares
     the SAME channel-visibility rule as ``visible_channels`` and the WS subscribe
     path — the rule can't drift between the flat channel list and the per-community
-    one. Only the ``community_id`` scope is added."""
+    one. Only the ``community_id`` scope is added.
+
+    DMs are excluded (``kind != 'dm'``, #2633) exactly as in ``visible_channels`` — a
+    DM is community-less by the DB CHECK, so it can never match ``community_id == X``
+    anyway, but the explicit carve-out is belt-and-braces against a future writer that
+    smuggles a DM into a community (cage-match PR#124 Carnot: the leak is closed at BOTH
+    the DB CHECK and every community read path)."""
     rows = (
         await session.execute(
             select(Channel)
-            .where(Channel.community_id == community_id, _readable_predicate(user_id))
+            .where(Channel.community_id == community_id, _readable_predicate(user_id),
+                   Channel.kind != "dm")
             .order_by(Channel.id)
         )
     ).scalars()

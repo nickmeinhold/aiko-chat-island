@@ -13,9 +13,18 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..aiko.payload import InboundMessage
-from . import channels_service, moderation_service, signing_keys_service
+from . import acl, channels_service, dm_service, moderation_service, signing_keys_service
 from .ids import new_ulid
-from .models import Channel, Message, Retraction, User
+from .models import Channel, ChannelKind, Message, Retraction, User
+
+
+class BlockedDmSend(Exception):
+    """A send to a DM channel where the sender is in a block relationship with the DM
+    peer (#2633, design 11 §Decision 5). Raised from the SINGLE mutator door
+    (``create_outbound``) so EVERY send path — the WS route today, any REST/bot/in-process
+    writer tomorrow — enforces the refuse-under-block rule, not just the transport adapter
+    (cage-match PR#124 Tesla: seal the mutator, not the route). The WS route maps this to
+    the existence-hiding ``no_channel`` error."""
 
 
 def message_view(m: Message, *, reactions: list[dict] | None = None) -> dict:
@@ -78,6 +87,18 @@ def retraction_view(r: Retraction) -> dict:
     }
 
 
+def should_federate(channel: Channel) -> bool:
+    """Whether a message on ``channel`` may be PUBLISHED to the shared aiko bus. FALSE for
+    a DM — dual-gated on BOTH ``kind != 'dm'`` AND the ``dm:`` prefix (#2633, design 11
+    §Decision 3), so a lone kind retint can't re-federate a private room. This lives in the
+    DOMAIN (not the ws route) so EVERY send path shares the one privacy decision — the same
+    mutator-door law Decision 5's block gate follows (cage-match PR#124 round 12 Tesla P1:
+    federation-egress and block-refuse are one trust class; both must live behind one door,
+    not one sealed at the mutator and one at the transport)."""
+    return channel.kind != ChannelKind.DM and not dm_service.is_dm_channel_name(
+        channel.aiko_channel)
+
+
 async def create_outbound(
     session: AsyncSession, *, user: User, channel: Channel,
     body: str, client_msg_id: str, reply_to: str | None = None,
@@ -85,7 +106,10 @@ async def create_outbound(
 ) -> tuple[Message, bool]:
     """Persist a user's outgoing message (server ULID, server-derived sender —
     invariant I5). Idempotent on (channel, client_msg_id): a resend returns the
-    existing row. Returns (row, created).
+    existing row. Returns (row, created). The caller decides bus federation via the
+    shared domain predicate ``should_federate(channel)`` (never its own) — cage-match
+    PR#124 round 12 Tesla P1: the DM egress decision lives in ONE domain function so a
+    second send path can't forget it.
 
     `origin` is the SHAPE-validated sovereign-signing envelope (already checked by
     domain/signing.validate_origin at the call site, incl. that its client_msg_id
@@ -108,6 +132,11 @@ async def create_outbound(
     this function's ONE commit — atomic, so a signed message can never persist
     without its binding. A resend short-circuits above and does not re-record (the
     binding already exists from the first send)."""
+    # IDEMPOTENCY FIRST (cage-match PR#124 Carnot F2): a resend of an already-persisted
+    # (channel, client_msg_id) returns the existing row — even if a block was established
+    # AFTER the original send. The block must stop NEW residue, not break reconciliation of
+    # a message legitimately sent before the block (returning the existing row leaks no new
+    # content — it is already block-filtered from the peer's reads).
     existing = (await session.execute(
         select(Message).where(
             Message.channel_id == channel.id,
@@ -116,6 +145,25 @@ async def create_outbound(
     )).scalar_one_or_none()
     if existing is not None:
         return existing, False
+    # DM SEND UNDER A BLOCK → REFUSE, at the MUTATOR door so every send path enforces it
+    # (#2633, design 11 §Decision 5; cage-match PR#124 Tesla P1a) — but only for a NEW
+    # write (after the idempotency return above). The peer is resolved from the CANONICAL
+    # PAIR (the dm: key), NOT live membership (cage-match PR#124 round 9 Tesla/Carnot P0):
+    # a peer who BLOCKED then LEFT would vanish from the membership census, silently
+    # disabling the block and letting the remaining member accumulate residue the leaver
+    # sees on re-open. The pair is immutable, so it is the stable identity to block against.
+    # DM-only; public/community block stays a read-only content filter.
+    if channel.kind == ChannelKind.DM:
+        peer_ids = dm_service.canonical_peer_ids(channel.aiko_channel, user.id)
+        if peer_ids is None:
+            # Malformed dm: key (anomalous kind='dm' row) — can't resolve the peer to
+            # check the block, so FAIL CLOSED rather than skip Decision 5 (cage-match
+            # PR#124 round 10 Carnot). A well-formed DM never hits this.
+            raise BlockedDmSend()
+        if peer_ids:
+            blocked = await moderation_service.blocked_pair_user_ids(session, user.id)
+            if any(p in blocked for p in peer_ids):
+                raise BlockedDmSend()
     if origin is not None:
         await signing_keys_service.record_signing_key(
             session, user_id=user.id,
@@ -181,7 +229,13 @@ async def persist_inbound(session: AsyncSession, msg: InboundMessage) -> Message
     atomic, no orphan-channel-on-message-failure (cage-match PR#12, Carnot P1b)."""
     if not msg.channel:
         return None
-    channel = await channels_service.upsert_channel(session, msg.channel)
+    try:
+        channel = await channels_service.upsert_channel(session, msg.channel)
+    except channels_service.ReservedDmChannel:
+        # A bus message named a reserved dm: channel (anomalous — a DM never rides the
+        # bus). DROP it: never persist bus traffic into a private DM (#2633, cage-match
+        # PR#124 Tesla). Returning None mirrors the no-channel drop above.
+        return None
 
     sender_user = None
     if msg.username:
@@ -214,6 +268,92 @@ async def get_message(session: AsyncSession, message_id: str) -> Message | None:
     message. Does NOT filter on visibility — the caller decides what to do with
     a soft-deleted or otherwise-hidden target."""
     return await session.get(Message, message_id)
+
+
+async def visible_message(
+    session: AsyncSession, viewer_id: str, message_id: str
+) -> Message | None:
+    """The message IFF ``viewer_id`` may currently SEE it — exists, not soft-deleted
+    (taken-down), its channel is readable by the viewer (ACL), and its author is not in
+    a block relationship with the viewer — else None. This is the SINGLE message-
+    visibility predicate, mirroring ``get_history``'s filters; ``GET /v1/messages/{id}``
+    (reply-parent resolution, #2633) and the reaction routes both delegate here so a
+    "can I see this message?" answer can never drift between call sites. Callers choose
+    whether a None is a 404 (existence-hiding) or a silent suppression.
+
+    Deliberately does NOT resurrect a taken-down parent's body — a soft-deleted message
+    is None (a 404 for the fetch-by-id path), never its content, so a reply preview can
+    never leak retracted text (the retraction-leak the #2633 contract warns about)."""
+    msg = await get_message(session, message_id)
+    if msg is None or msg.deleted_at is not None:
+        return None
+    if await acl.readable_channel(session, viewer_id, msg.channel_id) is None:
+        return None
+    if msg.sender_user_id is not None:
+        blocked = await moderation_service.blocked_pair_user_ids(session, viewer_id)
+        if msg.sender_user_id in blocked:
+            return None
+    return msg
+
+
+async def last_visible_message(
+    session: AsyncSession, channel_id: str, viewer_id: str
+) -> Message | None:
+    """The newest message in ``channel_id`` VISIBLE to ``viewer_id`` (not soft-deleted,
+    author not blocked), or None. Uses the SAME message-visibility filters as
+    ``get_history`` / ``latest_ulid`` (block + soft-delete), so a preview never shows a
+    line the channel read would hide. Retractions are not messages, so they never
+    surface as a ``last_message`` (a channel whose only newer event is a takedown shows
+    the last still-visible line).
+
+    ACL PRECONDITION (same contract as ``get_history``): this does NOT check whether the
+    viewer may READ ``channel_id`` — it applies only the block + soft-delete content
+    filters. The caller MUST have already authorized the channel (``list_dms`` scopes to
+    the viewer's OWN membership; a route serving a client-supplied channel_id must gate
+    with ``acl.readable_channel`` first, exactly as the history route does). Named to
+    stop a future caller from mistaking the "visible" in the name for an access check —
+    it is a content filter, not a trust boundary."""
+    return (await session.execute(
+        select(Message)
+        .where(
+            Message.channel_id == channel_id,
+            Message.deleted_at.is_(None),
+            moderation_service.not_blocked_predicate(viewer_id),
+        )
+        .order_by(Message.id.desc())
+        .limit(1)
+    )).scalar_one_or_none()
+
+
+async def last_visible_messages(
+    session: AsyncSession, channel_ids: list[str], viewer_id: str
+) -> dict[str, Message]:
+    """Batched ``last_visible_message`` for many channels — ``{channel_id: newest visible
+    Message}`` (channels with no visible message are absent). Collapses ``GET /v1/dm``'s
+    per-channel N+1 (cage-match PR#124: Kelvin/Carnot/Tesla) into TWO queries: the max
+    visible id per channel, then those message rows. Applies the IDENTICAL block +
+    soft-delete predicate as the singular ``last_visible_message`` (so the batched and
+    single paths agree), and carries the SAME ACL PRECONDITION — the caller must have
+    already authorized every id in ``channel_ids`` (``list_dms`` passes only the viewer's
+    own DM channels)."""
+    if not channel_ids:
+        return {}
+    # Newest visible id per channel (ULIDs are monotonic, so MAX(id) == newest).
+    max_ids = [mid for (mid,) in (await session.execute(
+        select(func.max(Message.id))
+        .where(
+            Message.channel_id.in_(channel_ids),
+            Message.deleted_at.is_(None),
+            moderation_service.not_blocked_predicate(viewer_id),
+        )
+        .group_by(Message.channel_id)
+    )).all() if mid is not None]
+    if not max_ids:
+        return {}
+    rows = (await session.execute(
+        select(Message).where(Message.id.in_(max_ids))
+    )).scalars()
+    return {m.channel_id: m for m in rows}
 
 
 async def latest_ulid(session: AsyncSession, channel_id: str, viewer_id: str) -> str:

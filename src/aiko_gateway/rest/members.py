@@ -118,6 +118,9 @@ async def add_member(
     except svc.NotAMember:
         # Target user does not exist — controlled 404, not an FK 500 at commit.
         raise HTTPException(404, "user not found")
+    except svc.DmMembershipImmutable:
+        # A DM's membership is fixed at its two creators — never grown via this API.
+        raise HTTPException(409, "a direct message cannot add members")
     # The service returns the target's User loaded in the same transaction — no
     # second post-commit fetch (no response-only TOCTOU), same shape as list_members.
     return _member_view(m, added)
@@ -139,6 +142,8 @@ async def remove_member(
         raise HTTPException(404, "member not found")
     except svc.LastAdmin:
         raise HTTPException(409, "cannot remove the last admin of a channel")
+    except svc.DmMembershipImmutable:
+        raise HTTPException(409, "a direct message's membership is fixed")
 
 
 @router.post("/channels/{channel_id}/join", status_code=201)
@@ -149,6 +154,9 @@ async def join_channel(channel_id: str, user: CurrentUser, session: DbSession) -
         # Both "no such channel" AND "private invite_only channel you can't see"
         # land here — indistinguishable by design (existence-hiding).
         raise HTTPException(404, "channel not found")
+    except svc.DmMembershipImmutable:
+        # A DM is never self-joinable — its membership is fixed at creation.
+        raise HTTPException(409, "a direct message cannot add members")
     # The joiner IS the authenticated CurrentUser (a User row already in hand), so
     # no second fetch — self-join's member view reuses it directly.
     return _member_view(m, user)

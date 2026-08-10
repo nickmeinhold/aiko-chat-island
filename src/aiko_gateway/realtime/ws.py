@@ -13,8 +13,8 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
 
 from ..db import SessionLocal
 from ..domain import (
-    acl, auth_session, echo, mentions, messages_service, moderation_service,
-    signing,
+    acl, auth_session, echo, mentions, messages_service,
+    moderation_service, signing,
 )
 from . import envelopes
 from .hub import Connection
@@ -135,7 +135,18 @@ async def _handle_send(gw, conn: Connection, user, frame: dict) -> None:
                     "no_reply_target", "reply target not found in this channel",
                     frame["client_msg_id"]))
                 return
-            if (target.sender_user_id is not None
+            # BLOCK gate on the reply — NON-DM channels ONLY (#2633; cage-match PR#124
+            # round 7 Carnot/Tesla P0). For a DM, the block refusal is owned by the
+            # mutator (create_outbound: idempotency-first, then DM peer-block →
+            # BlockedDmSend → no_channel). Doing it HERE would short-circuit BEFORE that
+            # idempotency check, so a reply RETRY-after-block would get no_channel instead
+            # of reconciling the already-persisted row — the exact idempotency break the
+            # plain-send fix removed, hiding in the reply arm. A DM has only the peer to
+            # reply to, so create_outbound's peer-block gate covers the reply case
+            # uniformly (new → no_channel; retry → ack). The reply-target validation above
+            # (no_reply_target) still runs for DMs — only this block sub-check is deferred.
+            if (channel.kind != "dm"
+                    and target.sender_user_id is not None
                     and await moderation_service.is_blocked_between(
                         session, user.id, target.sender_user_id)):
                 await conn.send(envelopes.error(
@@ -177,11 +188,20 @@ async def _handle_send(gw, conn: Connection, user, frame: dict) -> None:
         except mentions.MentionError as e:
             await conn.send(envelopes.error("bad_mentions", str(e), frame["client_msg_id"]))
             return
-        row, created = await messages_service.create_outbound(
-            session, user=user, channel=channel,
-            body=frame["body"], client_msg_id=frame["client_msg_id"],
-            reply_to=reply_to, origin=origin, mentions=spans,
-        )
+        try:
+            row, created = await messages_service.create_outbound(
+                session, user=user, channel=channel,
+                body=frame["body"], client_msg_id=frame["client_msg_id"],
+                reply_to=reply_to, origin=origin, mentions=spans,
+            )
+        except messages_service.BlockedDmSend:
+            # DM send refused under a block (design 11 §Decision 5, enforced at the mutator
+            # door). Collapse into the SAME existence-hiding no_channel as a missing /
+            # unreadable channel (Nick's approved shape) so the refusal doesn't add a
+            # distinct "blocked" code — symmetric in both block directions.
+            await conn.send(envelopes.error("no_channel", "channel not found",
+                                            frame["client_msg_id"]))
+            return
         view = messages_service.message_view(row)
         # Block exclusion for live fanout: everyone in a block relationship with the
         # sender must NOT receive this frame (the live twin of the history visibility
@@ -193,9 +213,16 @@ async def _handle_send(gw, conn: Connection, user, frame: dict) -> None:
     await conn.send(envelopes.ack(frame["client_msg_id"], row.id, view["created_at"]))
 
     if created:
-        # Mark our publish so its bus echo is dropped by ingest (Phase 0 payoff).
-        echo.mark_sent(channel.aiko_channel, user.aiko_username, frame["body"])
-        gw.bus.send(user.aiko_username, channel.aiko_channel, frame["body"])
-        # Fan the persisted message out to channel subscribers.
+        # A DM NEVER FEDERATES ON THE BUS (#2633, design 11 §Decision 3). The federate
+        # decision is the DOMAIN's (messages_service.should_federate), NOT a predicate this
+        # route re-derives — so a second send path can't forget the DM gate and leak a
+        # private room (cage-match PR#124 round 12 Tesla P1: egress lives behind the same
+        # single domain door as the block gate). It is False for a DM (dual-gated on kind
+        # AND the dm: prefix, so a lone kind retint can't re-open it).
+        if messages_service.should_federate(channel):
+            # Mark our publish so its bus echo is dropped by ingest (Phase 0 payoff).
+            echo.mark_sent(channel.aiko_channel, user.aiko_username, frame["body"])
+            gw.bus.send(user.aiko_username, channel.aiko_channel, frame["body"])
+        # Fan the persisted message out to channel subscribers (local; both DM members).
         await gw.hub.fanout(channel.id, envelopes.message_frame(view),
                             exclude_user_ids=exclude)

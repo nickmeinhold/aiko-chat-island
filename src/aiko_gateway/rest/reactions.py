@@ -37,7 +37,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from ..domain import (
-    acl, messages_service, moderation_service, reactions_service, signing,
+    messages_service, moderation_service, reactions_service, signing,
 )
 from ..domain.models import Message
 from ..domain.rate_limit import rate_limit
@@ -62,19 +62,12 @@ async def _resolve_visible_message(
     session, viewer_id: str, message_id: str,
 ) -> Message | None:
     """Return the message IFF the viewer may currently see it (exists, not
-    soft-deleted, channel readable, author not blocked) — else None. The single
-    visibility predicate, mirroring the history read; callers choose whether a miss
-    is a 404 or a silent count/fanout suppression."""
-    msg = await messages_service.get_message(session, message_id)
-    if msg is None or msg.deleted_at is not None:
-        return None
-    if await acl.readable_channel(session, viewer_id, msg.channel_id) is None:
-        return None
-    if msg.sender_user_id is not None:
-        blocked = await moderation_service.blocked_pair_user_ids(session, viewer_id)
-        if msg.sender_user_id in blocked:
-            return None
-    return msg
+    soft-deleted, channel readable, author not blocked) — else None. Delegates to the
+    SINGLE message-visibility predicate ``messages_service.visible_message`` so the
+    reaction visibility gate and ``GET /v1/messages/{id}`` (reply-parent resolution,
+    #2633) share one door and can never drift; callers choose whether a miss is a 404 or
+    a silent count/fanout suppression."""
+    return await messages_service.visible_message(session, viewer_id, message_id)
 
 
 async def _visible_message(session, viewer_id: str, message_id: str) -> Message:

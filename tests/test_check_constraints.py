@@ -143,14 +143,15 @@ def test_community_required_check_allows_dm_null_community(tmp_path, monkeypatch
     """The other half of the same CHECK: a DM channel (kind='dm') IS allowed to be
     community-less (community_id NULL) — DMs live outside the community hierarchy.
     This is the near-term-DM accommodation the partial CHECK was chosen for; if it
-    regressed to a blanket NOT NULL this insert would fail."""
+    regressed to a blanket NOT NULL this insert would fail. is_private=1 because a DM
+    must be private (ck_channels_dm_private, #2633 cage-match PR#124)."""
     engine = _fresh_at_head(tmp_path, monkeypatch)
     try:
         with engine.begin() as c:
             c.execute(text(
                 "INSERT INTO channels (id, name, kind, aiko_channel, is_private, "
                 "join_policy, created_at) VALUES "
-                "('dm1', 'dm', 'dm', 'aiko/dm1', 0, 'invite_only', '" + _TS + "')"))
+                "('dm1', 'dm', 'dm', 'dm:1', 1, 'invite_only', '" + _TS + "')"))
             kind = c.execute(text(
                 "SELECT kind FROM channels WHERE id='dm1'")).scalar()
         assert kind == "dm"

@@ -53,6 +53,35 @@ class JoinPolicy(enum.StrEnum):
     OPEN = "open"
 
 
+class ChannelKind(enum.StrEnum):
+    """Closed set of channel kinds (#2633). SECURITY-RELEVANT since DMs: the WS send
+    path gates bus federation on ``kind != DM`` (a DM never crosses the shared
+    ChatServer — design 11 §Decision 3), so a channel whose kind is not a trusted
+    member of this set could silently bypass that routing. Same single-source pattern
+    as Role/JoinPolicy/Visibility: drives the DB CHECK on channels.kind via _in_check,
+    so the constraint can't drift from the Python closed set and a direct SQL / buggy
+    writer cannot store an out-of-set kind (cage-match PR#124 Carnot+Tesla: the privacy
+    gate must not rest on an unenforced open string).
+
+    Members: 'standard' = an ordinary bus-reconciled channel (the only kind any writer
+    produces today — verified against live prod: all channels are 'standard'); 'llm' /
+    'robot' = aiko actor channels (mapped to sender_kind by messages_service._kind_for);
+    'dm' = a 1:1 direct-message channel (island-local, never federated).
+
+    'group' is deliberately NOT pre-permitted (cage-match PR#124 Tesla): the member-set
+    model keeps groups additive, but a group is ALSO community-less, and
+    ck_channels_community_required only exempts 'dm'. Pre-permitting the kind without the
+    matching community rule would let a future group ship into Aiko by default (the exact
+    footgun this PR closes for DMs). So the group PR adds 'group' to THIS enum AND its
+    community-exemption in ONE migration — a small, correct step, not a pre-committed
+    half-invariant."""
+
+    STANDARD = "standard"
+    LLM = "llm"
+    ROBOT = "robot"
+    DM = "dm"
+
+
 class Visibility(enum.StrEnum):
     """Closed set of community visibility levels (#32). 'public' = listed in the
     discovery directory and joinable by anyone; 'unlisted' = joinable via a direct
@@ -204,19 +233,76 @@ class Channel(Base):
     __table_args__ = (
         CheckConstraint(_in_check("join_policy", JoinPolicy),
                         name="ck_channels_join_policy"),
-        # Every NON-DM channel belongs to a community (#32, Phase B1). A DM is
-        # between two users, not in a server, so it is exempt (community_id NULL).
-        # This is the handoff's invariant ("a non-DM channel with null community_id
-        # is a migration bug") turned from a prose hope into an enforced DB valve.
-        # DMs are near-term planned; their creation path MUST set community_id=None
-        # explicitly (the model default below would otherwise place them in Aiko).
-        CheckConstraint("kind = 'dm' OR community_id IS NOT NULL",
-                        name="ck_channels_community_required"),
+        # Closed set for the channel kind (#2633, cage-match PR#124). SECURITY-relevant:
+        # the WS send path gates bus federation on kind != 'dm', so an out-of-set kind
+        # must be unrepresentable at the DB, not merely by convention (migration 0020).
+        CheckConstraint(_in_check("kind", ChannelKind), name="ck_channels_kind"),
+        # Community membership is now BIDIRECTIONAL by kind (#2633, cage-match PR#124
+        # Carnot): a NON-DM channel MUST have a community, AND a DM channel MUST NOT
+        # (community_id IS NULL). The first half is #32's original invariant ("a non-DM
+        # channel with null community_id is a migration bug"); the second half is the
+        # DM-privacy half — without it a buggy/direct writer could store a DM WITH the
+        # default Aiko community, and visible_channels_in_community would then leak that
+        # DM into the community channel listing (the exact footgun the DM-creation path
+        # dodges with null(), now enforced at the DB so no future writer must remember
+        # the compensating change). Verified safe vs live prod: every channel is
+        # 'standard' with a community (satisfies the non-DM arm); no DM exists yet.
+        CheckConstraint(
+            "(kind = 'dm' AND community_id IS NULL) "
+            "OR (kind != 'dm' AND community_id IS NOT NULL)",
+            name="ck_channels_community_required"),
+        # A DM MUST be private (#2633, cage-match PR#124 Carnot/Tesla). The DM privacy
+        # invariant has TWO DB legs: 'dm' suppresses bus federation (ck_channels_kind +
+        # the dual ws gate), AND is_private gates READ access — acl.readable_channel
+        # treats is_private=false as world-readable, so a non-private DM would leak to
+        # every authed user who knows the id. dm_service always sets is_private=True;
+        # this makes "public DM" unrepresentable rather than merely conventional (the
+        # same "unrepresentable when wrong" lesson as the community CHECK). Non-DM
+        # channels are unconstrained here (public channels are legitimately
+        # is_private=false). Bare `is_private` (NOT `= 1`) so the predicate is
+        # boolean-portable (cage-match PR#124 Carnot): SQLite reads the 0/1 column as
+        # truthy, Postgres reads the boolean directly — `= 1` would not compile against a
+        # Postgres boolean if #1544 ever flips the backend.
+        CheckConstraint("kind != 'dm' OR is_private",
+                        name="ck_channels_dm_private"),
+        # The 'dm:' prefix ⟺ kind='dm', BIDIRECTIONAL and CASE-SENSITIVE (#2633,
+        # cage-match PR#124 Carnot+Tesla). Completes the DM DB-invariant set (null
+        # community, private, dm: prefix). Two legs, both load-bearing:
+        #   * kind='dm' ⇒ dm: prefix — the prefix leg of the dual bus gate is guaranteed
+        #     present, so a mutator retinting 'dm'->'standard' still can't re-federate.
+        #   * a dm: prefix ⇒ kind='dm' — the dm: namespace is TOTALLY reserved at the DB,
+        #     so NO writer (create_channel, a direct INSERT, any future path) can squat a
+        #     non-DM channel on the private keyspace and block a real pair's DM. This is
+        #     the "remove the coupling" version of sealing every aiko_channel writer.
+        # substr(...)='dm:' (NOT LIKE): SQLite LIKE case-folds ASCII, so `LIKE 'dm:%'`
+        # would admit 'DM:a:b' — which the CASE-SENSITIVE Python gate (is_dm_channel_name
+        # / startswith) does NOT recognize, re-opening the exact federation hole the CHECK
+        # exists to close. substr comparison is case-sensitive, matching Python's alphabet.
+        CheckConstraint(
+            "(kind = 'dm' AND substr(aiko_channel, 1, 3) = 'dm:') "
+            "OR (kind != 'dm' AND substr(aiko_channel, 1, 3) <> 'dm:')",
+            name="ck_channels_dm_prefix"),
+        # A DM MUST be invite_only (#2633, cage-match PR#124 Tesla). self_join treats a
+        # PRIVATE+OPEN channel as joinable-without-membership; an open-policy DM would let
+        # a stranger's POST /join reach the DmMembershipImmutable seal (409) — an existence
+        # oracle (409 on a real DM vs 404 on a random id) the seal itself would create. A
+        # DM is never join-managed (membership is fixed at creation), so pinning
+        # invite_only makes that oracle unrepresentable. dm_service leaves the model
+        # default ('invite_only'), so this holds today; the CHECK stops a direct/future
+        # write from opening it.
+        CheckConstraint("kind != 'dm' OR join_policy = 'invite_only'",
+                        name="ck_channels_dm_invite_only"),
     )
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=new_ulid)
     name: Mapped[str] = mapped_column(String(128), nullable=False)
-    # 'standard' | 'llm' | 'robot' | 'dm' — maps to an aiko recipient string.
-    kind: Mapped[str] = mapped_column(String(16), nullable=False, default="standard")
+    # Closed set (ChannelKind): 'standard' | 'llm' | 'robot' | 'dm' ('group' is NOT yet a
+    # member — added with its community-exemption when groups ship; see ChannelKind).
+    # Stored as the StrEnum's string value so the column stays a plain VARCHAR; the DB
+    # CHECK (ck_channels_kind, above) enforces membership. SECURITY: 'dm' suppresses bus
+    # federation (ws.py), so this is a trust-bearing field — the CHECK is what keeps a
+    # bad writer from minting a kind that bypasses that gate.
+    kind: Mapped[str] = mapped_column(
+        String(16), nullable=False, default=ChannelKind.STANDARD)
     aiko_channel: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     is_private: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     # Self-join policy for PRIVATE channels (#46). 'invite_only' (default) = a
@@ -235,8 +321,13 @@ class Channel(Base):
     # the seeded Aiko community, so every channel born from the bus reconcile
     # (upsert_channel) or constructed directly lands in Aiko with no extra code —
     # this is also why existing channels need no per-row decision in the migration.
-    # FOOTGUN: a future DM-creation path must pass community_id=None EXPLICITLY,
-    # or this default silently places the DM in Aiko (see #35).
+    # FOOTGUN (sharper than first documented, verified #2633): passing
+    # `community_id=None` does NOT bypass this default — SQLAlchemy applies a
+    # Python-side scalar `default=` whenever the bound value is None, so `None`
+    # SILENTLY stores DEFAULT_COMMUNITY_ID and places the DM in Aiko (→ it would leak
+    # into visible_channels_in_community). The DM-creation path (dm_service) uses
+    # `sqlalchemy.null()`, the ONLY value that overrides a column default with a real
+    # SQL NULL. Any future community-less channel creation must do the same.
     community_id: Mapped[str | None] = mapped_column(
         ForeignKey("communities.id"), nullable=True, index=True,
         default=DEFAULT_COMMUNITY_ID)
@@ -248,6 +339,11 @@ class Membership(Base):
     # DB-level role closed-set enforcement beyond the API boundary (#11).
     __table_args__ = (
         CheckConstraint(_in_check("role", Role), name="ck_memberships_role"),
+        # USER-centric index (#2633, cage-match PR#124 Carnot). The composite PK is
+        # (channel_id, user_id) — leading with channel_id — so a query filtering on
+        # user_id alone (GET /v1/dm: "my DM channels", list_dms) cannot use it and would
+        # table-scan as memberships grow. This index covers the user-first access path.
+        Index("ix_memberships_user_id", "user_id"),
     )
     channel_id: Mapped[str] = mapped_column(ForeignKey("channels.id"), primary_key=True)
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), primary_key=True)

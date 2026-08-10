@@ -17,6 +17,26 @@ from .deps import CurrentUser, DbSession
 router = APIRouter(prefix="/v1", tags=["messages"])
 
 
+@router.get("/messages/{message_id}")
+async def get_message(
+    message_id: str, user: CurrentUser, session: DbSession
+) -> dict:
+    """One message by id — reply-parent resolution, deep-links, jump-to-message
+    (#2633). Applies the SAME visibility predicate as history
+    (``messages_service.visible_message``): a missing / soft-deleted / unreadable /
+    blocked-author message all 404 IDENTICALLY (existence-hiding), and a taken-down
+    parent is a 404 (its body is never resurrected — no retraction leak). Returns the
+    SAME enriched ``MessageView`` as the history read (the reaction aggregate injected
+    with the SAME block-filter), so there is no new wire shape."""
+    msg = await messages_service.visible_message(session, user.id, message_id)
+    if msg is None:
+        raise HTTPException(404, "message not found")
+    blocked = await moderation_service.blocked_pair_user_ids(session, user.id)
+    aggregate = await reactions_service.aggregate_for_messages(
+        session, [msg.id], user.id, blocked_user_ids=blocked)
+    return messages_service.message_view(msg, reactions=aggregate.get(msg.id))
+
+
 @router.get("/channels/{channel_id}/messages")
 async def history(
     channel_id: str,
