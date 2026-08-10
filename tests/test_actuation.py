@@ -92,7 +92,6 @@ def test_unallowlisted_key_rejected_even_if_signature_valid():
     other = Ed25519PrivateKey.from_private_bytes(bytes(range(1, 33)))
     other_pub_raw = other.public_key().public_bytes_raw()
     other_pub = encode_multikey(other_pub_raw)
-    msg = _independent_signing_bytes(robot_id="arm-1", command="wave", seq=1, signed_at_ms=_NOW)
     # sign with OTHER key over bytes that name OTHER's pubkey (so the sig itself is valid)
     def lp(b): return struct.pack(">I", len(b)) + b
     msg2 = b"".join((lp(b"aikochat:actuate:v1:EdDSA"), lp(other_pub_raw), lp(b"arm-1"),
@@ -148,28 +147,28 @@ def test_extra_key_rejected():
 
 def test_seq_monotonic_accept_then_replay_rejected(tmp_path):
     hw = SeqHighWater(str(tmp_path / "seq.json"))
-    assert hw.check_and_advance("arm-1", 1) is True
-    assert hw.check_and_advance("arm-1", 2) is True
-    assert hw.check_and_advance("arm-1", 2) is False   # exact replay
-    assert hw.check_and_advance("arm-1", 1) is False   # older
-    assert hw.check_and_advance("arm-1", 3) is True
+    assert hw._check_and_advance("arm-1", 1) is True
+    assert hw._check_and_advance("arm-1", 2) is True
+    assert hw._check_and_advance("arm-1", 2) is False   # exact replay
+    assert hw._check_and_advance("arm-1", 1) is False   # older
+    assert hw._check_and_advance("arm-1", 3) is True
 
 
 def test_seq_high_water_survives_restart(tmp_path):
     p = str(tmp_path / "seq.json")
     hw = SeqHighWater(p)
-    hw.check_and_advance("arm-1", 5)
+    hw._check_and_advance("arm-1", 5)
     # a fresh instance (bridge restart) must still reject a replay of seq<=5
     hw2 = SeqHighWater(p)
-    assert hw2.check_and_advance("arm-1", 5) is False
-    assert hw2.check_and_advance("arm-1", 6) is True
+    assert hw2._check_and_advance("arm-1", 5) is False
+    assert hw2._check_and_advance("arm-1", 6) is True
 
 
 def test_seq_per_robot_independent(tmp_path):
     hw = SeqHighWater(str(tmp_path / "seq.json"))
-    assert hw.check_and_advance("arm-1", 10) is True
-    assert hw.check_and_advance("arm-2", 1) is True     # different robot, own counter
-    assert hw.check_and_advance("arm-1", 10) is False
+    assert hw._check_and_advance("arm-1", 10) is True
+    assert hw._check_and_advance("arm-2", 1) is True     # different robot, own counter
+    assert hw._check_and_advance("arm-1", 10) is False
 
 
 def test_corrupt_store_fails_closed(tmp_path):
@@ -210,7 +209,7 @@ def test_store_empty_object_is_valid(tmp_path):
     p = tmp_path / "seq.json"
     p.write_text("{}")
     hw = SeqHighWater(str(p))
-    assert hw.check_and_advance("arm-1", 1) is True
+    assert hw._check_and_advance("arm-1", 1) is True
 
 
 # ---- exception contract: every wire-parse failure surfaces as ActuationError ----
@@ -322,13 +321,13 @@ def test_concurrent_check_and_advance_admits_one(tmp_path):
     # serializes the read-modify-write so two handlers can't both actuate.
     import threading
     hw = SeqHighWater(str(tmp_path / "seq.json"))
-    hw.check_and_advance("arm-1", 0)  # high-water = 0
+    hw._check_and_advance("arm-1", 0)  # high-water = 0
     results = []
     barrier = threading.Barrier(8)
 
     def race():
         barrier.wait()
-        results.append(hw.check_and_advance("arm-1", 1))
+        results.append(hw._check_and_advance("arm-1", 1))
 
     threads = [threading.Thread(target=race) for _ in range(8)]
     for t in threads:
@@ -337,3 +336,64 @@ def test_concurrent_check_and_advance_admits_one(tmp_path):
         t.join()
     assert results.count(True) == 1  # exactly one winner
     assert results.count(False) == 7
+
+
+# ---- max_age_ms is a bounded floor, not a caller-optional footgun ----
+
+def test_max_age_ms_above_ceiling_rejected():
+    # A bridge cannot widen the freshness window into the crucible-rejected minutes range.
+    env = _envelope()
+    with pytest.raises(ActuationError, match="freshness floor is not caller-optional"):
+        verify_actuation(env, allowed_pubkeys=_ALLOW, now_ms=_NOW, max_age_ms=300_000)
+
+
+def test_max_age_ms_negative_rejected():
+    env = _envelope()
+    with pytest.raises(ActuationError, match="freshness floor"):
+        verify_actuation(env, allowed_pubkeys=_ALLOW, now_ms=_NOW, max_age_ms=-1)
+
+
+def test_max_age_ms_at_ceiling_accepted():
+    # Exactly at the ceiling is allowed; an envelope within that window verifies.
+    env = _envelope(signed_at_ms=_NOW - 10_000)
+    parsed = verify_actuation(env, allowed_pubkeys=_ALLOW, now_ms=_NOW,
+                              max_age_ms=actuation._MAX_ALLOWED_AGE_MS)
+    assert parsed["seq"] == 1
+
+
+# ---- the private advance primitive still validates (store-poisoning defense) ----
+
+def test_private_advance_rejects_bool_seq(tmp_path):
+    # bool is an int subclass — a persisted JSON `true` would wedge the next restart.
+    hw = SeqHighWater(str(tmp_path / "seq.json"))
+    with pytest.raises(ActuationError, match="u64-range"):
+        hw._check_and_advance("arm-1", True)
+
+
+def test_private_advance_rejects_oversized_seq(tmp_path):
+    hw = SeqHighWater(str(tmp_path / "seq.json"))
+    with pytest.raises(ActuationError, match="u64-range"):
+        hw._check_and_advance("arm-1", 1 << 64)
+
+
+def test_private_advance_rejects_empty_robot_id(tmp_path):
+    hw = SeqHighWater(str(tmp_path / "seq.json"))
+    with pytest.raises(ActuationError, match="robot_id"):
+        hw._check_and_advance("", 1)
+
+
+def test_persist_failure_surfaces_as_actuation_error(tmp_path):
+    # A store in a read-only directory can't persist — the failure must surface as
+    # ActuationError (not a raw OSError) so the caller's fail-closed handler catches it.
+    import os
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("running as root — directory mode does not block writes")
+    d = tmp_path / "ro"
+    d.mkdir()
+    hw = SeqHighWater(str(d / "seq.json"))
+    os.chmod(d, 0o500)  # read+execute, no write
+    try:
+        with pytest.raises(ActuationError, match="persist failed"):
+            hw._check_and_advance("arm-1", 1)
+    finally:
+        os.chmod(d, 0o700)  # restore so tmp cleanup can remove it

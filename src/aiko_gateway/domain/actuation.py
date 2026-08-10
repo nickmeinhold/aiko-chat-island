@@ -45,6 +45,19 @@ commander + the LiveKit transport are out of this repo — tracked as follow-ups
     arriving before ``seq=4``) drops the lower seq permanently. That is the correct bias
     for a physical actuator (better a missed wave than a double/late one), but the
     commander should not rely on every envelope landing.
+  * ``verify_and_advance`` BURNS the seq at verify time. If the bridge re-checks freshness
+    again at dequeue (recommended) and a mailbox delay exceeds ``max_age_ms``, the envelope
+    is dropped with its seq already spent — the commander must mint a NEW seq to retry, never
+    reuse the burned one. Prefer checking freshness immediately before ``verify_and_advance``
+    so admit and actuate are adjacent.
+  * The allowlist is AUTHORIZATION, not DoS resistance: ``sender_pubkey`` is public, so any
+    room participant can name the allowlisted key and make the bridge burn verify-CPU on
+    garbage signatures. Rate-limiting / admission control belongs at the transport, OUTSIDE
+    this pure verifier.
+  * The store's authority is FILESYSTEM permissions: a missing store file is a clean empty
+    map (first run), so anyone who can delete ``seq.json`` and restart the bridge reopens the
+    replay window (bounded to ``max_age_ms`` by the freshness gate). If the bridge user is not
+    the host root, the store's file mode + directory permissions are part of this boundary.
 """
 from __future__ import annotations
 
@@ -82,6 +95,10 @@ _MAX_SIG_STR = 128
 # default — a servo command that aged in the mailbox is stale. Explicit, NEVER inherit a
 # minutes-long default (a 5-min window on a physical device is the crucible's rejected footgun).
 DEFAULT_MAX_AGE_MS = 2000
+# A HARD ceiling on any caller-supplied max_age_ms: the crucible rejected minutes-on-a-servo,
+# so the freshness floor must NOT be caller-optional — a bridge cannot widen the window into
+# the rejected footgun via a kwarg. 30s is generous for skew yet nowhere near "minutes".
+_MAX_ALLOWED_AGE_MS = 30_000
 # A small forward skew tolerated because cross-host clocks lead as well as lag. Module-level
 # so the timeliness contract is visible with the other boundary constants, not buried in a fn.
 _MAX_FWD_SKEW_MS = 1000
@@ -155,6 +172,13 @@ def verify_actuation(
     the durable replay guard is a single explicit gate. The caller MUST run BOTH — or, better,
     call ``verify_and_advance``, the SEALED door that runs them in the only safe order.
     """
+    # The freshness floor is not caller-optional: reject an out-of-range max_age_ms rather
+    # than let a bridge kwarg reopen the crucible-rejected minutes window (or invert it).
+    if isinstance(max_age_ms, bool) or not isinstance(max_age_ms, int) \
+            or max_age_ms < 0 or max_age_ms > _MAX_ALLOWED_AGE_MS:
+        raise ActuationError(
+            f"max_age_ms {max_age_ms!r} outside [0, {_MAX_ALLOWED_AGE_MS}] — the servo freshness floor is not caller-optional")
+
     if not isinstance(raw, dict):
         raise ActuationError("actuation envelope must be a JSON object")
     keys = set(raw.keys())
@@ -217,7 +241,10 @@ def verify_actuation(
         seq=seq, signed_at_ms=ts)
     try:
         Ed25519PublicKey.from_public_bytes(raw_pubkey).verify(sig, message)
-    except InvalidSignature as e:
+    except (InvalidSignature, ValueError) as e:
+        # InvalidSignature = bad sig; ValueError = a non-32-byte key slipping past
+        # decode_multikey. Both normalize to ActuationError so the SOLE-exception
+        # contract holds even if an upstream guarantee ever weakens (cheap insurance).
         raise ActuationError("signature does not verify") from e
 
     # Freshness (defense in depth on top of the seq guard). A small forward skew is
@@ -235,17 +262,20 @@ class SeqHighWater:
     """Durable per-robot monotonic sequence high-water mark — the replay + staleness
     guard, clock-independent and restart-surviving.
 
-    ``check_and_advance(robot_id, seq)`` returns True and persists the new high-water iff
-    ``seq`` is STRICTLY greater than the stored one; otherwise returns False (a replay or
-    an out-of-order/stale packet) and actuation MUST be skipped. Persistence is atomic
-    (temp file + ``os.replace``) so a crash mid-write can never corrupt the store or lose
-    the mark — a corrupted store that reset to 0 would re-open the replay window.
+    The advance primitive (``_check_and_advance``) advances iff ``seq`` is STRICTLY greater
+    than the stored one; otherwise it does not, and actuation is skipped. It is PRIVATE — the
+    only caller is ``verify_and_advance``, so an unverified seq can never advance the guard.
+    Persistence is atomic (temp file + ``os.replace`` + directory fsync) so a crash mid-write
+    can never corrupt the store or lose the mark — a corrupted store that reset to 0 would
+    re-open the replay window.
 
     Single-process reference implementation (the bridge is one process). Not safe across
-    processes; the bridge owns exactly one. Within the process ``check_and_advance`` IS
-    safe under concurrent callers (a lock serializes the read-modify-write) — LiveKit data
-    handlers can fire concurrently, and an unguarded RMW would let two callers both observe
-    ``seq > high_water`` and both actuate (a double wave).
+    processes; the bridge owns exactly one. Within the process the advance IS safe under
+    concurrent callers (a lock serializes the read-modify-write) — LiveKit data handlers can
+    fire concurrently, and an unguarded RMW would let two callers both observe
+    ``seq > high_water`` and both actuate (a double wave). On a persist failure the in-memory
+    mark stays advanced (fail-safe: rejects more, never actuates more) and the error surfaces
+    as ``ActuationError``.
     """
 
     def __init__(self, path: str) -> None:
@@ -280,13 +310,30 @@ class SeqHighWater:
                 marks[k] = v
             self._marks = marks
 
-    def check_and_advance(self, robot_id: str, seq: int) -> bool:
+    def _check_and_advance(self, robot_id: str, seq: int) -> bool:
+        """PRIVATE — the ONLY caller is ``verify_and_advance``. Kept off the public API on
+        purpose: a proof-free advance is a permanent-DoS footgun (advancing to seq=2**64-1
+        with no signature wedges the robot), so the exported path MUST demand a verified
+        envelope. Inputs are re-validated even though the sealed door passes clean ints —
+        this is the durable safety store, and a poisoned mark would fail the next restart.
+        """
+        if not isinstance(robot_id, str) or not robot_id:
+            raise ActuationError("robot_id must be a non-empty string")
+        if isinstance(seq, bool) or not isinstance(seq, int) or seq < 0 or seq > (1 << 64) - 1:
+            raise ActuationError("seq must be a u64-range non-negative integer")
         # Serialize the read-modify-write: concurrent LiveKit handlers must not both pass.
         with self._lock:
             if seq <= self._marks.get(robot_id, -1):
                 return False
             self._marks[robot_id] = seq
-            self._persist()
+            try:
+                self._persist()
+            except OSError as e:
+                # The mark stays advanced in memory — that is the FAIL-SAFE direction (it only
+                # ever rejects MORE, never actuates more). Surface as ActuationError (not a raw
+                # OSError) so the caller's `except ActuationError` catches it and does NOT
+                # actuate on a mark we could not durably commit.
+                raise ActuationError(f"seq high-water persist failed: {e} — refusing to actuate") from e
             return True
 
     def _persist(self) -> None:
@@ -324,18 +371,22 @@ def verify_and_advance(
     expected_robot_id: str | None = None,
 ) -> dict:
     """The SEALED door a bridge should call: verify the envelope, THEN advance the seq —
-    in that order, atomically from the caller's view — and return the validated dict, or
-    raise ``ActuationError``.
+    in that order — and return the validated dict, or raise ``ActuationError``.
 
-    Why a single door: ``verify_actuation`` and ``SeqHighWater.check_and_advance`` are two
-    gates, and running them in the WRONG order is catastrophic — ``check_and_advance``
-    mutates and PERSISTS the high-water for whatever seq it is handed, with no proof
-    attached, so advancing BEFORE verifying lets any room participant (no key needed)
-    submit ``seq = 2**64 - 1`` and permanently wedge the robot. This function makes that
-    order unrepresentable: the seq is advanced ONLY after a valid, allowlisted, fresh
-    signature over that exact ``(robot_id, command, seq, signed_at_ms)`` is proven. A
-    replay/stale seq raises ``ActuationError`` (not a bare ``False``), so the caller's
-    fail-closed ``except ActuationError`` handles replay identically to a bad signature.
+    Why a single door: advancing the durable high-water is a state mutation with no proof
+    attached — ``SeqHighWater._check_and_advance`` persists whatever seq it is handed — so
+    running it BEFORE verification would let any room participant (no key needed) submit
+    ``seq = 2**64 - 1`` and permanently wedge the robot. This function makes that order
+    unrepresentable: the advance primitive is PRIVATE, and the seq is advanced ONLY after a
+    valid, allowlisted, fresh signature over that exact ``(robot_id, command, seq,
+    signed_at_ms)`` is proven. A replay/stale seq raises ``ActuationError`` (not a bare
+    ``False``), so the caller's fail-closed ``except ActuationError`` handles replay
+    identically to a bad signature.
+
+    Ordering, not atomicity: verify and advance are not one atomic critical section. Under
+    concurrent envelopes the advance is serialized (the store's lock), and a reordered lower
+    seq that loses the race is simply dropped — the safe, monotonic bias for a physical
+    actuator, never a double actuation.
 
     ``verify_actuation`` remains public for pure, side-effect-free verification (tests,
     dry-runs); but the actuation path should reach for THIS.
@@ -347,8 +398,8 @@ def verify_and_advance(
         max_age_ms=max_age_ms,
         expected_robot_id=expected_robot_id,
     )
-    # Only a verified envelope can advance the durable replay guard.
-    if not seq_store.check_and_advance(parsed["robot_id"], parsed["seq"]):
+    # Only a verified envelope can advance the durable replay guard (private primitive).
+    if not seq_store._check_and_advance(parsed["robot_id"], parsed["seq"]):
         raise ActuationError(
             f"seq {parsed['seq']} for {parsed['robot_id']!r} is a replay or stale (<= high-water) — dropped"
         )
