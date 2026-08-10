@@ -181,7 +181,13 @@ async def persist_inbound(session: AsyncSession, msg: InboundMessage) -> Message
     atomic, no orphan-channel-on-message-failure (cage-match PR#12, Carnot P1b)."""
     if not msg.channel:
         return None
-    channel = await channels_service.upsert_channel(session, msg.channel)
+    try:
+        channel = await channels_service.upsert_channel(session, msg.channel)
+    except channels_service.ReservedDmChannel:
+        # A bus message named a reserved dm: channel (anomalous — a DM never rides the
+        # bus). DROP it: never persist bus traffic into a private DM (#2633, cage-match
+        # PR#124 Tesla). Returning None mirrors the no-channel drop above.
+        return None
 
     sender_user = None
     if msg.username:
@@ -246,11 +252,19 @@ async def last_visible_message(
     session: AsyncSession, channel_id: str, viewer_id: str
 ) -> Message | None:
     """The newest message in ``channel_id`` VISIBLE to ``viewer_id`` (not soft-deleted,
-    author not blocked), or None. Powers ``GET /v1/dm``'s ``last_message`` preview. Uses
-    the SAME message-visibility filters as ``get_history`` / ``latest_ulid`` (block +
-    soft-delete), so the DM switcher preview never shows a line the channel read would
-    hide. Retractions are not messages, so they never surface as a ``last_message`` (a
-    DM whose only newer event is a takedown shows the last still-visible line)."""
+    author not blocked), or None. Uses the SAME message-visibility filters as
+    ``get_history`` / ``latest_ulid`` (block + soft-delete), so a preview never shows a
+    line the channel read would hide. Retractions are not messages, so they never
+    surface as a ``last_message`` (a channel whose only newer event is a takedown shows
+    the last still-visible line).
+
+    ACL PRECONDITION (same contract as ``get_history``): this does NOT check whether the
+    viewer may READ ``channel_id`` — it applies only the block + soft-delete content
+    filters. The caller MUST have already authorized the channel (``list_dms`` scopes to
+    the viewer's OWN membership; a route serving a client-supplied channel_id must gate
+    with ``acl.readable_channel`` first, exactly as the history route does). Named to
+    stop a future caller from mistaking the "visible" in the name for an access check —
+    it is a content filter, not a trust boundary."""
     return (await session.execute(
         select(Message)
         .where(
@@ -261,6 +275,37 @@ async def last_visible_message(
         .order_by(Message.id.desc())
         .limit(1)
     )).scalar_one_or_none()
+
+
+async def last_visible_messages(
+    session: AsyncSession, channel_ids: list[str], viewer_id: str
+) -> dict[str, Message]:
+    """Batched ``last_visible_message`` for many channels — ``{channel_id: newest visible
+    Message}`` (channels with no visible message are absent). Collapses ``GET /v1/dm``'s
+    per-channel N+1 (cage-match PR#124: Kelvin/Carnot/Tesla) into TWO queries: the max
+    visible id per channel, then those message rows. Applies the IDENTICAL block +
+    soft-delete predicate as the singular ``last_visible_message`` (so the batched and
+    single paths agree), and carries the SAME ACL PRECONDITION — the caller must have
+    already authorized every id in ``channel_ids`` (``list_dms`` passes only the viewer's
+    own DM channels)."""
+    if not channel_ids:
+        return {}
+    # Newest visible id per channel (ULIDs are monotonic, so MAX(id) == newest).
+    max_ids = [mid for (mid,) in (await session.execute(
+        select(func.max(Message.id))
+        .where(
+            Message.channel_id.in_(channel_ids),
+            Message.deleted_at.is_(None),
+            moderation_service.not_blocked_predicate(viewer_id),
+        )
+        .group_by(Message.channel_id)
+    )).all() if mid is not None]
+    if not max_ids:
+        return {}
+    rows = (await session.execute(
+        select(Message).where(Message.id.in_(max_ids))
+    )).scalars()
+    return {m.channel_id: m for m in rows}
 
 
 async def latest_ulid(session: AsyncSession, channel_id: str, viewer_id: str) -> str:

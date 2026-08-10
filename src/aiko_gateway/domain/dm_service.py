@@ -40,14 +40,23 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from . import users_service
 from .ids import new_ulid
-from .models import Channel, Membership, User
+from .models import Channel, ChannelKind, Membership, User
 
 # The deterministic aiko_channel prefix for a DM. A DM never rides the bus (ws.py gates
 # the publish on kind), so this string is a LOCAL idempotency key, not a real aiko
 # recipient — but it must still be UNIQUE + non-null (the channels schema), which is
 # exactly what makes it the find-or-create key. `dm:` + two 26-char ULIDs + one ':' = 56
-# chars, comfortably under channels.aiko_channel's String(64).
-_DM_PREFIX = "dm:"
+# chars, comfortably under channels.aiko_channel's String(64). PUBLIC + single-source:
+# channels_service imports this to RESERVE the prefix at the bus-reconcile boundary
+# (a bus channel_list must never mint/route/delete a dm: channel — cage-match PR#124).
+DM_CHANNEL_PREFIX = "dm:"
+
+
+def is_dm_channel_name(aiko_channel: str) -> bool:
+    """True iff ``aiko_channel`` is in the reserved local DM namespace. Used by
+    ``channels_service`` to fail-closed on any bus attempt to reconcile a ``dm:`` name,
+    so the DM privacy invariant does not rest on the bus operator never naming one."""
+    return aiko_channel.startswith(DM_CHANNEL_PREFIX)
 
 
 def _canonical_aiko_channel(a_id: str, b_id: str) -> str:
@@ -56,7 +65,7 @@ def _canonical_aiko_channel(a_id: str, b_id: str) -> str:
     self-DM (a == b) collapses to a single-id key (notes-to-self). ULIDs sort
     lexicographically, so ``sorted`` gives a stable canonical order."""
     lo, hi = sorted({a_id, b_id}) if a_id != b_id else (a_id, a_id)
-    return f"{_DM_PREFIX}{lo}:{hi}"
+    return f"{DM_CHANNEL_PREFIX}{lo}:{hi}"
 
 
 def _member_ids(me_id: str, target_id: str) -> list[str]:
@@ -85,9 +94,38 @@ async def members_of(session: AsyncSession, channel_id: str) -> list[str]:
     return sorted(rows)
 
 
+async def members_of_many(
+    session: AsyncSession, channel_ids: list[str]
+) -> dict[str, list[str]]:
+    """Batched ``members_of`` — ``{channel_id: [member ids, sorted]}`` in ONE query.
+    Collapses ``GET /v1/dm``'s per-channel membership N+1 (cage-match PR#124)."""
+    if not channel_ids:
+        return {}
+    result: dict[str, list[str]] = {cid: [] for cid in channel_ids}
+    rows = (await session.execute(
+        select(Membership.channel_id, Membership.user_id).where(
+            Membership.channel_id.in_(channel_ids))
+    )).all()
+    for cid, uid in rows:
+        result[cid].append(uid)
+    return {cid: sorted(uids) for cid, uids in result.items()}
+
+
 class TargetNotFound(Exception):
     """``target_user_id`` does not resolve to a real user. The route maps this to the
     contract's 404 (same code the app expects for a bad target)."""
+
+
+class DmKeyCollision(Exception):
+    """The deterministic ``dm:<lo>:<hi>`` key is already held by a channel that is NOT
+    a DM (kind != 'dm'). FAIL CLOSED (cage-match PR#124 Carnot+Tesla): ``aiko_channel``
+    is a namespace shared with bus-reconciled channels, so — however unlikely, since the
+    key embeds two unguessable 26-char ULIDs — a non-DM channel squatting the key must
+    NOT be adopted as a DM. Adopting it would (a) return a non-DM channel from
+    POST /v1/dm whose sends then FEDERATE on the bus (ws.py gates on kind), leaking
+    "DM" content, and (b) grant the pair membership on an unrelated channel. Refusing is
+    a DoS on that one pair (deniable, requires squatting their exact ULIDs) — never a
+    privacy leak. The route maps this to a 409/500-class error, not a silent success."""
 
 
 async def get_or_create_dm(
@@ -123,8 +161,12 @@ async def get_or_create_dm(
         select(Channel).where(Channel.aiko_channel == aiko_channel)
     )).scalar_one_or_none()
     if existing is not None:
-        # Already created by a prior call (or a concurrent winner). Ensure my own
-        # membership(s) exist and return — never a second channel for the same pair.
+        # Already created by a prior call (or a concurrent winner). FAIL CLOSED if the
+        # key is somehow held by a non-DM channel (see DmKeyCollision) — never adopt or
+        # federate a foreign channel as a DM. Otherwise ensure my own membership(s) exist
+        # and return — never a second channel for the same pair.
+        if existing.kind != ChannelKind.DM:
+            raise DmKeyCollision(aiko_channel)
         await _ensure_memberships(session, existing.id, member_ids)
         await session.commit()
         return existing, member_ids
@@ -132,7 +174,7 @@ async def get_or_create_dm(
     channel = Channel(
         id=new_ulid(),
         name=aiko_channel,          # cosmetic for a DM (client renders member handles)
-        kind="dm",                  # ws.py reads this to keep the message off the bus
+        kind=ChannelKind.DM,        # ws.py reads this to keep the message off the bus
         aiko_channel=aiko_channel,
         is_private=True,            # → acl.readable_predicate requires a membership row
         # SQL NULL, not None: a DM is community-less. The Channel.community_id model
@@ -163,6 +205,11 @@ async def get_or_create_dm(
         winner = (await session.execute(
             select(Channel).where(Channel.aiko_channel == aiko_channel)
         )).scalar_one()
+        # Same fail-closed guard as the adopt path: the winner of the UNIQUE race must
+        # itself be a DM (it is, when the race is two POST /v1/dm) — never adopt a
+        # non-DM channel that squats the key.
+        if winner.kind != ChannelKind.DM:
+            raise DmKeyCollision(aiko_channel)
         await _ensure_memberships(session, winner.id, member_ids)
         await session.commit()
         return winner, member_ids
@@ -172,9 +219,16 @@ async def get_or_create_dm(
 async def _ensure_memberships(
     session: AsyncSession, channel_id: str, member_ids: list[str]
 ) -> None:
-    """Add any missing ``Membership`` rows for ``member_ids`` on ``channel_id`` —
-    idempotent (the composite PK makes a re-add a no-op, so a concurrent path that
-    already inserted a row is fine). FLUSH only; the caller owns the commit."""
+    """Add any missing ``Membership`` rows for ``member_ids`` on ``channel_id``,
+    idempotently and RACE-SAFELY. FLUSH only; the caller owns the commit.
+
+    Each missing row is inserted inside its OWN SAVEPOINT so a concurrent path that
+    inserts the same (channel_id, user_id) first raises ``IntegrityError`` on the
+    composite PK — which we swallow (the row now exists, which is the goal) without
+    poisoning the caller's outer transaction. (Correcting an earlier comment that
+    claimed a plain ORM re-insert is a silent no-op — it is NOT; a duplicate composite
+    PK raises, exactly the concurrent-repair 500 cage-match PR#124 Carnot+Tesla flagged.
+    The savepoint converts that raise into the intended idempotent no-op.)"""
     present = set((await session.execute(
         select(Membership.user_id).where(
             Membership.channel_id == channel_id,
@@ -182,9 +236,14 @@ async def _ensure_memberships(
         )
     )).scalars())
     for uid in member_ids:
-        if uid not in present:
-            session.add(Membership(channel_id=channel_id, user_id=uid,
-                                   role="member", can_post=True))
+        if uid in present:
+            continue
+        try:
+            async with session.begin_nested():   # SAVEPOINT — rolls back just this row
+                session.add(Membership(channel_id=channel_id, user_id=uid,
+                                       role="member", can_post=True))
+        except IntegrityError:
+            pass  # a concurrent inserter won the PK — the row exists; idempotent success
     await session.flush()
 
 

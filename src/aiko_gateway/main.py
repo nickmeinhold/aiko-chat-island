@@ -133,6 +133,12 @@ class GatewayState:
                             log.warning(
                                 "channel reconcile: HARD-DELETED %s "
                                 "(+ its messages + memberships)", aiko_channel)
+            except channels_service.ReservedDmChannel:
+                # A bus channel_list named a reserved dm: channel — anomalous (a DM never
+                # federates). Skip cleanly (not a stack-trace error): the dm: namespace is
+                # reserved for island-local DMs (#2633, cage-match PR#124 Tesla).
+                log.warning("channel reconcile: refused reserved dm: name %s (%s)",
+                            aiko_channel, action)
             except Exception:
                 log.exception("channel reconcile failed: %s %s", action, aiko_channel)
             finally:

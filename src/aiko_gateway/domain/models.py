@@ -53,6 +53,31 @@ class JoinPolicy(enum.StrEnum):
     OPEN = "open"
 
 
+class ChannelKind(enum.StrEnum):
+    """Closed set of channel kinds (#2633). SECURITY-RELEVANT since DMs: the WS send
+    path gates bus federation on ``kind != DM`` (a DM never crosses the shared
+    ChatServer — design 11 §Decision 3), so a channel whose kind is not a trusted
+    member of this set could silently bypass that routing. Same single-source pattern
+    as Role/JoinPolicy/Visibility: drives the DB CHECK on channels.kind via _in_check,
+    so the constraint can't drift from the Python closed set and a direct SQL / buggy
+    writer cannot store an out-of-set kind (cage-match PR#124 Carnot+Tesla: the privacy
+    gate must not rest on an unenforced open string).
+
+    Members: 'standard' = an ordinary bus-reconciled channel (the only kind any writer
+    produces today — verified against live prod: all channels are 'standard'); 'llm' /
+    'robot' = aiko actor channels (mapped to sender_kind by messages_service._kind_for);
+    'dm' = a 1:1 direct-message channel (island-local, never federated); 'group' =
+    RESERVED for the additive group-chat generalization the app tab asked us not to
+    foreclose (a group is the same member-set object with N members) — pre-permitted
+    here so the group build is additive (no new migration), per the member-set design."""
+
+    STANDARD = "standard"
+    LLM = "llm"
+    ROBOT = "robot"
+    DM = "dm"
+    GROUP = "group"
+
+
 class Visibility(enum.StrEnum):
     """Closed set of community visibility levels (#32). 'public' = listed in the
     discovery directory and joinable by anyone; 'unlisted' = joinable via a direct
@@ -204,6 +229,10 @@ class Channel(Base):
     __table_args__ = (
         CheckConstraint(_in_check("join_policy", JoinPolicy),
                         name="ck_channels_join_policy"),
+        # Closed set for the channel kind (#2633, cage-match PR#124). SECURITY-relevant:
+        # the WS send path gates bus federation on kind != 'dm', so an out-of-set kind
+        # must be unrepresentable at the DB, not merely by convention (migration 0020).
+        CheckConstraint(_in_check("kind", ChannelKind), name="ck_channels_kind"),
         # Every NON-DM channel belongs to a community (#32, Phase B1). A DM is
         # between two users, not in a server, so it is exempt (community_id NULL).
         # This is the handoff's invariant ("a non-DM channel with null community_id
@@ -215,8 +244,13 @@ class Channel(Base):
     )
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=new_ulid)
     name: Mapped[str] = mapped_column(String(128), nullable=False)
-    # 'standard' | 'llm' | 'robot' | 'dm' — maps to an aiko recipient string.
-    kind: Mapped[str] = mapped_column(String(16), nullable=False, default="standard")
+    # Closed set (ChannelKind): 'standard' | 'llm' | 'robot' | 'dm' | 'group'. Stored as
+    # the StrEnum's string value so the column stays a plain VARCHAR; the DB CHECK
+    # (ck_channels_kind, above) enforces membership. SECURITY: 'dm' suppresses bus
+    # federation (ws.py), so this is a trust-bearing field — the CHECK is what keeps a
+    # bad writer from minting a kind that bypasses that gate.
+    kind: Mapped[str] = mapped_column(
+        String(16), nullable=False, default=ChannelKind.STANDARD)
     aiko_channel: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     is_private: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     # Self-join policy for PRIVATE channels (#46). 'invite_only' (default) = a

@@ -118,5 +118,50 @@ GET  /v1/messages/{msg_id}                     → 200 MessageView | 404 (existe
 ```
 
 `last_message` is the newest message VISIBLE to the caller (not soft-deleted, author not
-blocked) or `null`. No `unread` (Decision 4).
+blocked) or `null`. No `unread` (Decision 4). `GET /v1/messages/{id}` lives in the
+**messages** router (a general messages surface, not DM-specific).
+
+## Cage-match hardening (PR#124, Carnot + Tesla)
+
+The adversarial review surfaced that the privacy invariant, as first built, rested on
+two unenforced assumptions. Both are now enforced, not merely documented:
+
+1. **`dm:` namespace collision — fail closed.** `aiko_channel` is shared with
+   bus-reconciled channels, so a non-DM channel could (however improbably — the key
+   embeds two unguessable ULIDs) hold a `dm:<lo>:<hi>` key. `get_or_create_dm` now
+   **raises `DmKeyCollision` (→ 409)** rather than adopting a non-DM channel as a DM
+   (which would federate its sends and graft membership onto an unrelated channel).
+
+2. **`dm:` is reserved at the bus-reconcile boundary.** `channels_service.upsert_channel`
+   raises `ReservedDmChannel` and `hard_delete_channel` no-ops for any `dm:`-prefixed
+   name, and `persist_inbound` drops a bus message named for one. So the bus can never
+   mint, route into, or hard-delete a private DM — the invariant no longer depends on
+   the bus operator never naming a `dm:` channel. The prefix is a single source of truth
+   (`dm_service.DM_CHANNEL_PREFIX` / `is_dm_channel_name`).
+
+3. **`kind` is a closed set at the DB.** The privacy gate keys on `channel.kind == "dm"`,
+   so `kind` is now a `ChannelKind` StrEnum with a `ck_channels_kind` DB CHECK (migration
+   0020) — the same closed-set-at-the-DB posture Role/JoinPolicy/Visibility already have.
+   An out-of-set kind is unrepresentable, so a bad writer can't mint a kind that bypasses
+   the gate. (Verified safe against live prod: every existing channel is `standard`.)
+
+4. **`_ensure_memberships` is race-safe.** Each missing membership insert is wrapped in a
+   SAVEPOINT so a concurrent repair converges (idempotent) instead of 500-ing on the
+   composite PK — correcting an earlier comment that wrongly claimed a plain ORM re-insert
+   is a silent no-op.
+
+5. **`GET /v1/dm` is batched** — members + last-message resolve in a constant number of
+   queries (`members_of_many` + `last_visible_messages`), not per-channel, so the switcher
+   endpoint has no N+1.
+
+### Still open for Nick — Decision 5 (block posture) revisited
+
+Tesla's sharpest non-mechanical point: block-as-content-filter means a DM channel under a
+block is *readable-inert* but not *storage-inert* — the blocked party can still open the
+channel and write rows the other never sees, and an **unblock resurfaces that backlog**.
+That is a real moderation-semantics fork, not a bug: the shipped default (content filter,
+no creation/send gate) matches the mentions precedent and never leaks the block direction,
+but the alternative (refuse the DM *send* under a block, same 404 as a missing target, so
+no residue accrues) is a stronger anti-harassment posture. This is a product call, flagged
+for Nick — not decided unilaterally in the build.
 </content>

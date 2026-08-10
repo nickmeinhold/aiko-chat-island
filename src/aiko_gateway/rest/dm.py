@@ -2,7 +2,6 @@
 
     POST /v1/dm    { "target_user_id": "<key>" }   → find-or-create the 1:1 channel
     GET  /v1/dm                                     → my DM channels (+ last_message)
-    GET  /v1/messages/{msg_id}                      → one message by id (reply-parent)
 
 I1 (auth): every route takes ``CurrentUser`` so an unauthenticated caller is rejected
 before any row is touched. The find-or-create + list rules live in the single mutator
@@ -12,15 +11,16 @@ this layer only translates typed outcomes into HTTP.
 A DM is an ordinary private channel, so it inherits the whole enforcement stack — auth,
 membership visibility, existence-hiding, block content-filter — through the SAME doors
 the rest of the API uses. Design of record: ``docs/design/11-direct-messages.md``.
+
+(``GET /v1/messages/{id}`` — reply-parent resolution — lives in the MESSAGES router,
+not here: it is a general messages surface, not DM-specific (cage-match PR#124 Tesla).)
 """
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from ..domain import (
-    dm_service, messages_service, moderation_service, reactions_service,
-)
+from ..domain import dm_service, messages_service
 from ..domain.rate_limit import rate_limit
 from .deps import CurrentUser, DbSession
 
@@ -46,6 +46,12 @@ async def open_dm(body: OpenDmReq, user: CurrentUser, session: DbSession) -> dic
         # path, which makes a DM under a block inert without a creation gate, and a
         # creation-time refusal would leak the block direction.)
         raise HTTPException(404, "user not found")
+    except dm_service.DmKeyCollision:
+        # The deterministic dm:<lo>:<hi> key is held by a non-DM channel — fail closed
+        # (never adopt/federate a foreign channel as a DM). 409: the pair cannot get a
+        # DM while the key is squatted (near-impossible; the key embeds two unguessable
+        # ULIDs). See dm_service.DmKeyCollision.
+        raise HTTPException(409, "cannot open a direct message with this user right now")
     return dm_service.dm_channel_view(channel, member_ids)
 
 
@@ -54,33 +60,25 @@ async def list_dms(user: CurrentUser, session: DbSession) -> dict:
     """My DM channels for the switcher. Each carries ``last_message`` — the newest
     message VISIBLE to me (not soft-deleted, author not blocked), or ``null`` if none
     yet. NO ``unread`` (client-side per the contract — the island has no read-position
-    store). ``last_message`` is the full ``MessageView`` (a superset of the contract's
-    example, additive-safe) so the client renders it exactly like a history row."""
+    store). ``last_message`` is a ``MessageView`` (block/soft-delete-filtered, no
+    reaction aggregate — a switcher preview needs the line, not its reactions) so the
+    client renders it like a history row.
+
+    BATCHED (cage-match PR#124): members + last-message are resolved for ALL my DM
+    channels in a constant number of queries (``members_of_many`` + the two-query
+    ``last_visible_messages``), not per-channel — no N+1 on the switcher endpoint. Both
+    batch reads are scoped to my OWN DM channels, which satisfies the ACL precondition
+    the ``last_visible_messages`` content filter carries."""
     channels = await dm_service.list_dms(session, user.id)
+    channel_ids = [ch.id for ch in channels]
+    members_by_channel = await dm_service.members_of_many(session, channel_ids)
+    last_by_channel = await messages_service.last_visible_messages(
+        session, channel_ids, user.id)
     items = []
     for ch in channels:
-        last = await messages_service.last_visible_message(session, ch.id, user.id)
-        member_ids = await dm_service.members_of(session, ch.id)
-        view = dm_service.dm_channel_view(ch, member_ids)
+        view = dm_service.dm_channel_view(ch, members_by_channel.get(ch.id, []))
+        last = last_by_channel.get(ch.id)
         view["last_message"] = (
             messages_service.message_view(last) if last is not None else None)
         items.append(view)
     return {"channels": items}
-
-
-@router.get("/messages/{message_id}")
-async def get_message(message_id: str, user: CurrentUser, session: DbSession) -> dict:
-    """One message by id — reply-parent resolution, deep-links, jump-to-message
-    (#2633). Applies the SAME visibility predicate as history
-    (``messages_service.visible_message``): a missing / soft-deleted / unreadable /
-    blocked-author message all 404 IDENTICALLY (existence-hiding), and a taken-down
-    parent is a 404 (its body is never resurrected — no retraction leak). Returns the
-    SAME enriched ``MessageView`` as the history read (the reaction aggregate injected
-    with the SAME block-filter), so there is no new wire shape."""
-    msg = await messages_service.visible_message(session, user.id, message_id)
-    if msg is None:
-        raise HTTPException(404, "message not found")
-    blocked = await moderation_service.blocked_pair_user_ids(session, user.id)
-    aggregate = await reactions_service.aggregate_for_messages(
-        session, [msg.id], user.id, blocked_user_ids=blocked)
-    return messages_service.message_view(msg, reactions=aggregate.get(msg.id))

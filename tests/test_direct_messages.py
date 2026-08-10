@@ -25,10 +25,14 @@ import pytest_asyncio
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
+from sqlalchemy.exc import IntegrityError
+
+from aiko_gateway.aiko.payload import InboundMessage
 from aiko_gateway.domain import (
-    acl, dm_service, messages_service, moderation_service, security, users_service,
+    acl, channels_service, dm_service, messages_service, moderation_service,
+    security, users_service,
 )
-from aiko_gateway.domain.models import Channel, Membership, Message
+from aiko_gateway.domain.models import Channel, ChannelKind, Membership, Message
 from aiko_gateway.realtime.hub import Connection, Hub
 from aiko_gateway.realtime.ws import _handle_send
 from aiko_gateway.rest import channels as channel_routes
@@ -304,6 +308,83 @@ async def test_dm_message_hidden_from_blocked_peer(app_ctx, session):
         f"/v1/channels/{channel.id}/messages", headers=_auth(b))
     assert hist.status_code == 200
     assert hist.json()["messages"] == [], "a blocked peer's DM line is filtered from view"
+
+
+# ------------- namespace-collision + reconcile reservation ----------------- #
+
+async def test_dm_key_collision_fails_closed(session):
+    """If the deterministic dm:<lo>:<hi> key is squatted by a NON-DM channel,
+    get_or_create_dm FAILS CLOSED (never adopts/federates a foreign channel as a DM)."""
+    a = await _user(session, "alice")
+    b = await _user(session, "bob")
+    lo, hi = sorted([a.id, b.id])
+    squat = Channel(id=_ulid(1), name="squat", kind="standard",
+                    aiko_channel=f"dm:{lo}:{hi}", is_private=False)
+    session.add(squat)
+    await session.commit()
+    with pytest.raises(dm_service.DmKeyCollision):
+        await dm_service.get_or_create_dm(session, me=a, target_user_id=b.id)
+    # The squatting channel was NOT mutated — no DM members grafted onto it.
+    members = await dm_service.members_of(session, squat.id)
+    assert members == []
+
+
+async def test_post_dm_key_collision_returns_409(app_ctx, session):
+    a = await _user(session, "alice")
+    b = await _user(session, "bob")
+    lo, hi = sorted([a.id, b.id])
+    session.add(Channel(id=_ulid(1), name="squat", kind="standard",
+                        aiko_channel=f"dm:{lo}:{hi}", is_private=False))
+    await session.commit()
+    resp = await app_ctx.post("/v1/dm", json={"target_user_id": b.id}, headers=_auth(a))
+    assert resp.status_code == 409
+
+
+async def test_reconcile_refuses_to_mint_dm_channel(session):
+    """A bus channel_list naming a dm: channel must NOT be minted (upsert raises), so
+    the bus can never create a channel that would shadow / collide a local DM."""
+    with pytest.raises(channels_service.ReservedDmChannel):
+        await channels_service.upsert_channel(session, "dm:aaa:bbb")
+
+
+async def test_reconcile_refuses_to_hard_delete_dm_channel(session):
+    """A bus `remove` naming a dm: channel is a safe no-op — it must NEVER hard-delete a
+    private DM (+ its messages + memberships)."""
+    a = await _user(session, "alice")
+    b = await _user(session, "bob")
+    channel, _ = await dm_service.get_or_create_dm(session, me=a, target_user_id=b.id)
+    deleted = await channels_service.hard_delete_channel(session, channel.aiko_channel)
+    assert deleted is False
+    # The DM channel + its membership survive.
+    assert (await session.get(Channel, channel.id)) is not None
+    assert await dm_service.members_of(session, channel.id) == sorted([a.id, b.id])
+
+
+async def test_bus_message_for_dm_channel_is_dropped(session):
+    """persist_inbound drops a bus message named for a reserved dm: channel — never
+    persist federated traffic into a private DM."""
+    row = await messages_service.persist_inbound(session, InboundMessage(
+        username="someone", channel="dm:aaa:bbb", timestamp=None, message="leak?",
+        raw="(message ...)"))
+    assert row is None
+
+
+async def test_channel_kind_check_constraint_rejects_bogus_kind(session):
+    """The ck_channels_kind DB CHECK makes an out-of-set kind unrepresentable — the
+    privacy gate (kind != 'dm') can't be bypassed by a bad writer storing a novel kind."""
+    session.add(Channel(id=_ulid(2), name="x", kind="totally_bogus",
+                        aiko_channel="x", is_private=False))
+    with pytest.raises(IntegrityError):
+        await session.commit()
+    await session.rollback()
+
+
+async def test_channel_kind_enum_values(session):
+    """ChannelKind is the closed set backing the CHECK; 'dm' and 'standard' are members
+    (guards against the enum silently drifting from the migration literal)."""
+    assert ChannelKind.DM == "dm"
+    assert ChannelKind.STANDARD == "standard"
+    assert {"standard", "llm", "robot", "dm", "group"} == {k.value for k in ChannelKind}
 
 
 # ============================ PRIVACY (the crux) =========================== #
