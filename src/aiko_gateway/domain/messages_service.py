@@ -13,9 +13,9 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..aiko.payload import InboundMessage
-from . import acl, channels_service, moderation_service, signing_keys_service
+from . import acl, channels_service, dm_service, moderation_service, signing_keys_service
 from .ids import new_ulid
-from .models import Channel, ChannelKind, Membership, Message, Retraction, User
+from .models import Channel, ChannelKind, Message, Retraction, User
 
 
 class BlockedDmSend(Exception):
@@ -132,14 +132,14 @@ async def create_outbound(
         return existing, False
     # DM SEND UNDER A BLOCK → REFUSE, at the MUTATOR door so every send path enforces it
     # (#2633, design 11 §Decision 5; cage-match PR#124 Tesla P1a) — but only for a NEW
-    # write (after the idempotency return above). DM membership is IMMUTABLE (memberships_
-    # service), so the live member set always equals the canonical pair — resolving the
-    # peer from memberships is topology-stable, not the mutable census Tesla P2 warned of.
+    # write (after the idempotency return above). The peer is resolved from the CANONICAL
+    # PAIR (the dm: key), NOT live membership (cage-match PR#124 round 9 Tesla/Carnot P0):
+    # a peer who BLOCKED then LEFT would vanish from the membership census, silently
+    # disabling the block and letting the remaining member accumulate residue the leaver
+    # sees on re-open. The pair is immutable, so it is the stable identity to block against.
     # DM-only; public/community block stays a read-only content filter.
     if channel.kind == ChannelKind.DM:
-        peer_ids = [uid for uid in (await session.execute(
-            select(Membership.user_id).where(Membership.channel_id == channel.id)
-        )).scalars() if uid != user.id]
+        peer_ids = dm_service.canonical_peer_ids(channel.aiko_channel, user.id)
         if peer_ids:
             blocked = await moderation_service.blocked_pair_user_ids(session, user.id)
             if any(p in blocked for p in peer_ids):

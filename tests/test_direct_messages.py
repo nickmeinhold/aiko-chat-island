@@ -421,6 +421,28 @@ async def test_channel_kind_enum_values(session):
     assert {"standard", "llm", "robot", "dm"} == {k.value for k in ChannelKind}
 
 
+async def test_blocked_dm_send_refused_even_after_peer_leaves(session):
+    """The block-send gate resolves the peer from the CANONICAL PAIR, not live membership
+    (cage-match PR#124 round 9 Tesla/Carnot P0): a peer who BLOCKED then LEFT still blocks
+    the remaining member's sends — otherwise leave would silently reopen residue the leaver
+    sees on re-open. This is the exact leave-after-block bypass."""
+    from aiko_gateway.domain import memberships_service
+    a = await _user(session, "alice")
+    b = await _user(session, "bob")
+    channel, _ = await dm_service.get_or_create_dm(session, me=a, target_user_id=b.id)
+    await moderation_service.block_user(session, blocker_id=b.id, blocked_id=a.id)
+    # B leaves (now a permitted dismiss) → live membership no longer contains B.
+    await memberships_service.leave(session, channel_id=channel.id, actor_id=b.id)
+    assert b.id not in await dm_service.members_of(session, channel.id)
+    # A's send must STILL be refused (canonical peer B is blocked), not accumulate residue.
+    with pytest.raises(messages_service.BlockedDmSend):
+        await messages_service.create_outbound(
+            session, user=a, channel=channel, body="sneak", client_msg_id="x1")
+    rows = (await session.execute(
+        Message.__table__.select().where(Message.channel_id == channel.id))).all()
+    assert rows == [], "no residue accrues into a dismissed-under-block DM"
+
+
 async def test_create_outbound_refuses_blocked_dm_at_mutator_door(session):
     """The DM-block-send gate lives in the MUTATOR (create_outbound), not the route — so
     ANY send path is sealed (cage-match PR#124 Tesla P1a). Calling it directly for a

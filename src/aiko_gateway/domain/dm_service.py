@@ -71,6 +71,22 @@ def is_dm_channel_name(aiko_channel: str) -> bool:
     return aiko_channel.startswith(DM_CHANNEL_PREFIX)
 
 
+def canonical_peer_ids(aiko_channel: str, me_id: str) -> list[str]:
+    """The DM's peer ids (the canonical pair MINUS ``me_id``), parsed from the
+    ``dm:<lo>:<hi>`` key — NOT from live membership (cage-match PR#124 round 9 Tesla/Carnot
+    P0). The block-send gate MUST key off the canonical pair, because live membership is
+    mutable (a peer can LEAVE): if it resolved the peer from memberships, a peer who
+    blocked then left would vanish from the census, silently disabling the block and
+    letting the remaining member accumulate residue the leaver sees on re-open. The pair
+    is immutable (the key is UNIQUE + write-once), so it is the stable identity to check.
+    A self-DM (``dm:<me>:<me>``) yields no peer. ULIDs contain no ``:``, so the split is
+    unambiguous; a non-``dm:`` name (never passed here) yields no peer."""
+    if not aiko_channel.startswith(DM_CHANNEL_PREFIX):
+        return []
+    ids = aiko_channel[len(DM_CHANNEL_PREFIX):].split(":")
+    return sorted({uid for uid in ids if uid and uid != me_id})
+
+
 def _canonical_aiko_channel(a_id: str, b_id: str) -> str:
     """The deterministic DM channel key for the UNORDERED pair {a, b}. Sort so
     ``{me, target}`` and ``{target, me}`` map to the SAME string (idempotency), and a
