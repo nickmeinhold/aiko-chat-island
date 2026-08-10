@@ -576,3 +576,40 @@ def test_verify_and_advance_bad_seq_store_rejected():
     with pytest.raises(ActuationError, match="seq_store"):
         verify_and_advance(_envelope(), allowed_pubkeys=_ALLOW, seq_store=object(),
                            now_ms=_NOW, expected_robot_id="arm-1", allowed_commands={"wave", "terminate"})
+
+
+# ---- post-replace dir-fsync failure must NOT roll back (no double-actuate) ----
+
+def test_dir_fsync_failure_after_replace_does_not_rollback(tmp_path, monkeypatch):
+    # The commit point is os.replace; a dir-fsync failure AFTER it must leave the seq
+    # committed (memory == disk), never roll back — a rollback would let a retry re-admit the
+    # same seq and double-actuate the arm. Fail fsync ONLY on the directory fd.
+    import os
+    import stat
+    p = str(tmp_path / "seq.json")
+    hw = SeqHighWater(p)
+    real_fsync = os.fsync
+
+    def fsync_fail_on_dir(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError("directory fsync unsupported")
+        return real_fsync(fd)
+    monkeypatch.setattr(os, "fsync", fsync_fail_on_dir)
+
+    # The advance commits (os.replace succeeded) despite the dir-fsync failure — returns True,
+    # no ActuationError, mark stays advanced.
+    assert hw._check_and_advance("arm-1", 1) is True
+    monkeypatch.undo()
+    # Same seq is now a replay in-process (no double-advance) ...
+    assert hw._check_and_advance("arm-1", 1) is False
+    # ... and the commit is durable: a fresh instance (restart) reloads the mark.
+    hw2 = SeqHighWater(p)
+    assert hw2._check_and_advance("arm-1", 1) is False
+    assert hw2._check_and_advance("arm-1", 2) is True
+
+
+def test_store_empty_robot_id_key_fails_closed(tmp_path):
+    p = tmp_path / "seq.json"
+    p.write_text('{"": 5}')  # empty robot_id key — the advance path would never write it
+    with pytest.raises(ActuationError, match="invalid robot_id key"):
+        SeqHighWater(str(p))

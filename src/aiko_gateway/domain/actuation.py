@@ -363,8 +363,10 @@ class SeqHighWater:
                 )
             marks: dict[str, int] = {}
             for k, v in data.items():
-                if not isinstance(k, str):
-                    raise ActuationError(f"seq high-water store at {path} has a non-string robot_id key — refusing to start")
+                # Match the advance path's robot_id caps (non-empty, within size) so a
+                # hand-crafted store can't hold a key the writer would never accept.
+                if not isinstance(k, str) or not k or len(k) > _MAX_ROBOT_ID:
+                    raise ActuationError(f"seq high-water store at {path} has an invalid robot_id key {k!r} — refusing to start")
                 # bool is an int subclass — a persisted JSON `true` must NOT decay to 1.
                 if isinstance(v, bool) or not isinstance(v, int) or v < 0 or v > _MAX_SEQ:
                     raise ActuationError(
@@ -406,6 +408,12 @@ class SeqHighWater:
             return True
 
     def _persist(self) -> None:
+        # The COMMIT POINT is os.replace. Anything that raises BEFORE it means the store was
+        # not modified — the caller rolls memory back and no seq is consumed. The directory
+        # fsync AFTER a successful replace is best-effort power-loss insurance: the rename is
+        # already committed, so its failure must NOT propagate (a post-commit raise would make
+        # the caller roll memory back below a seq that IS on disk — a retry would then re-admit
+        # the same seq and DOUBLE-ACTUATE). So this method only ever raises pre-commit.
         d = os.path.dirname(self._path) or "."
         fd, tmp = tempfile.mkstemp(dir=d, prefix=".seq-", suffix=".tmp")
         try:
@@ -413,21 +421,24 @@ class SeqHighWater:
                 json.dump(self._marks, f)
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp, self._path)  # atomic on POSIX
-            # fsync the DIRECTORY so the rename itself survives power loss — without this the
-            # replace can be lost on a crash and resurrect the OLD high-water (replay reopens).
-            # A robot host loses power precisely when things go wrong, so this is load-bearing.
-            dir_fd = os.open(d, os.O_RDONLY)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
+            os.replace(tmp, self._path)  # atomic on POSIX — the durable commit
         except BaseException:
             try:
                 os.unlink(tmp)
             except OSError:
                 pass
             raise
+        # Post-commit: fsync the DIRECTORY so the rename survives power loss. Best-effort — the
+        # replace already stands, so a failure here degrades power-loss durability but does NOT
+        # undo the commit and must not trigger a rollback.
+        try:
+            dir_fd = os.open(d, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
 
 
 def verify_and_advance(
