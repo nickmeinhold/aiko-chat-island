@@ -58,19 +58,33 @@ _COMMUNITY_CHECK_NEW = (
     "(kind = 'dm' AND community_id IS NULL) "
     "OR (kind != 'dm' AND community_id IS NOT NULL)")
 
+# A DM must be private (cage-match PR#124 Carnot/Tesla) — is_private gates READ access,
+# so a non-private DM would be world-readable. Safe vs live prod: all channels are
+# 'standard' (kind != 'dm' arm passes regardless of is_private).
+_DM_PRIVATE_CHECK = "kind != 'dm' OR is_private = 1"
+# A DM's aiko_channel must carry the reserved 'dm:' prefix — completes the DM invariant
+# trio so a kind-retint can't strip the prefix leg of the dual bus gate. Safe vs prod:
+# all channels are 'standard' (kind != 'dm' arm passes).
+_DM_PREFIX_CHECK = "kind != 'dm' OR aiko_channel LIKE 'dm:%'"
+
 
 def upgrade() -> None:
-    # One batch rebuild of `channels` applies both constraint changes (add the kind
-    # CHECK, tighten the community CHECK) in a single table copy.
+    # One batch rebuild of `channels` applies all four constraint changes (add the kind
+    # CHECK, tighten the community CHECK, add the DM-private + DM-prefix CHECKs) in a
+    # single table copy.
     with op.batch_alter_table("channels", schema=None) as batch_op:
         batch_op.create_check_constraint("ck_channels_kind", _KIND_CHECK)
         batch_op.drop_constraint("ck_channels_community_required", type_="check")
         batch_op.create_check_constraint(
             "ck_channels_community_required", _COMMUNITY_CHECK_NEW)
+        batch_op.create_check_constraint("ck_channels_dm_private", _DM_PRIVATE_CHECK)
+        batch_op.create_check_constraint("ck_channels_dm_prefix", _DM_PREFIX_CHECK)
 
 
 def downgrade() -> None:
     with op.batch_alter_table("channels", schema=None) as batch_op:
+        batch_op.drop_constraint("ck_channels_dm_prefix", type_="check")
+        batch_op.drop_constraint("ck_channels_dm_private", type_="check")
         batch_op.drop_constraint("ck_channels_community_required", type_="check")
         batch_op.create_check_constraint(
             "ck_channels_community_required", _COMMUNITY_CHECK_OLD)

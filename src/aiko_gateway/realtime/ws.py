@@ -110,21 +110,6 @@ async def _handle_send(gw, conn: Connection, user, frame: dict) -> None:
             await conn.send(envelopes.error("no_channel", "channel not found",
                                             frame["client_msg_id"]))
             return
-        # DM-block refusal, EARLY + UNIFORM (#2633 §Decision 5; cage-match PR#124 Tesla P1).
-        # The block gate is ALSO enforced at the mutator (create_outbound → BlockedDmSend),
-        # but doing it here — BEFORE the reply_to block check below, which emits a distinct
-        # "blocked" code — means a DM send refuses with the SAME existence-hiding
-        # "no_channel" whether or not it carries reply_to. Otherwise a reply-under-block
-        # would leak a different error surface than a plain send-under-block. DM-only.
-        if channel.kind == "dm":
-            peers = [m for m in await dm_service.members_of(session, channel.id)
-                     if m != user.id]
-            if peers:
-                blocked = await moderation_service.blocked_pair_user_ids(session, user.id)
-                if any(p in blocked for p in peers):
-                    await conn.send(envelopes.error("no_channel", "channel not found",
-                                                    frame["client_msg_id"]))
-                    return
         # A member who exists but lacks can_post already knows the channel is real,
         # so this is an honest 'forbidden' (no existence leak) rather than collapse.
         if not await acl.can_post(session, user.id, channel):
@@ -153,9 +138,20 @@ async def _handle_send(gw, conn: Connection, user, frame: dict) -> None:
             if (target.sender_user_id is not None
                     and await moderation_service.is_blocked_between(
                         session, user.id, target.sender_user_id)):
+                # For a DM, collapse the reply-block into the SAME existence-hiding
+                # no_channel as a plain DM send-under-block (create_outbound →
+                # BlockedDmSend), so reply_to doesn't split the error surface with a
+                # distinct "blocked" code (#2633 §Decision 5; cage-match PR#124
+                # Carnot F1/Tesla P1). Public/community channels keep the honest
+                # "blocked" reply code. Crucially this does NOT short-circuit a
+                # PLAIN DM send before create_outbound's idempotency-first check —
+                # only a reply carrying a blocked target reaches here (Tesla P0: the
+                # early gate that broke retry-after-block idempotency is removed).
+                code = "no_channel" if channel.kind == "dm" else "blocked"
+                detail = ("channel not found" if channel.kind == "dm"
+                          else "cannot reply to a blocked user")
                 await conn.send(envelopes.error(
-                    "blocked", "cannot reply to a blocked user",
-                    frame["client_msg_id"]))
+                    code, detail, frame["client_msg_id"]))
                 return
         # Sovereign-signing carriage (#1816): shape-validate the `origin` envelope
         # at the trust boundary (never trust its claimed alg; its client_msg_id must

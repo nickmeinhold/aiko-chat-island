@@ -171,7 +171,8 @@ async def _private_channel(session, *, cid: int = 10, name: str = "dm") -> Chann
     # tightened in #2633 — a DM must not sit in a community). null() overrides the Aiko
     # model default, exactly as dm_service does.
     from sqlalchemy import null
-    ch = Channel(id=_ulid(cid), name=name, kind="dm", aiko_channel=name,
+    # aiko_channel MUST carry the reserved dm: prefix (ck_channels_dm_prefix, #2633).
+    ch = Channel(id=_ulid(cid), name=name, kind="dm", aiko_channel=f"dm:{cid}",
                  is_private=True, community_id=null())
     session.add(ch)
     await session.commit()

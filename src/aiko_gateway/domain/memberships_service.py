@@ -201,15 +201,22 @@ async def _insert_idempotent(
 
 
 async def _require_admin(
-    session: AsyncSession, channel_id: str, actor_id: str
+    session: AsyncSession, channel_id: str, actor_id: str,
+    channel: Channel | None = None,
 ) -> Channel:
     """Resolve the channel for an ADMIN-only operation, or raise.
 
     Existence-hiding: an actor who cannot even READ the channel gets
     ``ChannelNotFound`` (same as nonexistent) — never a signal it exists. A
     member who is not an admin gets ``NotChannelAdmin`` (they already know it
-    exists, so that's an honest forbidden, no leak)."""
-    channel = await acl.readable_channel(session, actor_id, channel_id)
+    exists, so that's an honest forbidden, no leak).
+
+    ``channel`` may be passed pre-resolved (by a caller that already ran
+    ``readable_channel`` for an earlier DM-seal check) to avoid a second identical
+    query (cage-match PR#124 Kelvin) — it must be the SAME existence+access resolution,
+    so a non-None pre-resolved channel is trusted as already-readable."""
+    if channel is None:
+        channel = await acl.readable_channel(session, actor_id, channel_id)
     if channel is None:
         raise ChannelNotFound(channel_id)
     actor = await _membership(session, channel_id, actor_id)
@@ -263,7 +270,7 @@ async def add_member(
         raise ChannelNotFound(channel_id)  # existence-hiding (missing OR unseeable)
     if channel.kind == ChannelKind.DM:
         raise DmMembershipImmutable(channel_id)  # DM membership is fixed at creation
-    await _require_admin(session, channel_id, actor_id)
+    await _require_admin(session, channel_id, actor_id, channel=channel)  # reuse resolve
     # Idempotent-existing check as ONE joined query (not membership-lookup + a
     # separate User fetch): returns (Membership, User) together, the same JOIN shape
     # list_members uses. The INNER JOIN also fuses the no-orphan invariant — a
@@ -365,7 +372,7 @@ async def remove_member(
         raise ChannelNotFound(channel_id)
     if channel.kind == ChannelKind.DM:
         raise DmMembershipImmutable(channel_id)
-    await _require_admin(session, channel_id, actor_id)
+    await _require_admin(session, channel_id, actor_id, channel=channel)  # reuse resolve
     target = await _membership(session, channel_id, target_user_id)
     if target is None:
         raise NotAMember(target_user_id)

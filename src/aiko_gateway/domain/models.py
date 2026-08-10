@@ -251,6 +251,27 @@ class Channel(Base):
             "(kind = 'dm' AND community_id IS NULL) "
             "OR (kind != 'dm' AND community_id IS NOT NULL)",
             name="ck_channels_community_required"),
+        # A DM MUST be private (#2633, cage-match PR#124 Carnot/Tesla). The DM privacy
+        # invariant has TWO DB legs: 'dm' suppresses bus federation (ck_channels_kind +
+        # the dual ws gate), AND is_private gates READ access — acl.readable_channel
+        # treats is_private=false as world-readable, so a non-private DM would leak to
+        # every authed user who knows the id. dm_service always sets is_private=True;
+        # this makes "public DM" unrepresentable rather than merely conventional (the
+        # same "unrepresentable when wrong" lesson as the community CHECK). is_private
+        # is stored 0/1 on SQLite. Non-DM channels are unconstrained here (public
+        # channels are legitimately is_private=false).
+        CheckConstraint("kind != 'dm' OR is_private = 1",
+                        name="ck_channels_dm_private"),
+        # A DM's aiko_channel MUST carry the reserved 'dm:' prefix (#2633, cage-match
+        # PR#124 Tesla). Completes the DM DB-invariant trio (null community, private,
+        # dm: prefix). The dual bus-federation gate suppresses a DM on EITHER kind=='dm'
+        # OR the dm: prefix, so pinning the prefix at the DB means a mutator that retints
+        # kind='dm'->'standard' (still leaving the dm: aiko_channel) can never re-federate
+        # the room — the prefix leg of the gate is guaranteed present for a DM. aiko_channel
+        # has no UPDATE path (UNIQUE, set once at creation), so this is write-once by
+        # construction; the CHECK makes it unrepresentable-when-wrong, not merely so.
+        CheckConstraint("kind != 'dm' OR aiko_channel LIKE 'dm:%'",
+                        name="ck_channels_dm_prefix"),
     )
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=new_ulid)
     name: Mapped[str] = mapped_column(String(128), nullable=False)

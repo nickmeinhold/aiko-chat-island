@@ -455,23 +455,54 @@ async def test_self_join_refuses_dm(session):
             session, channel_id=channel.id, actor_id=a.id)
 
 
-async def test_dm_retry_after_block_returns_existing_row(ws_ctx):
-    """Idempotency survives a block established AFTER the original send (cage-match PR#124
-    Carnot F2): a legitimately-sent message resent with the same client_msg_id returns the
-    existing row (reconciles the ack), NOT BlockedDmSend — the block stops NEW residue,
-    not reconciliation of an already-sent message."""
+async def test_dm_retry_after_block_returns_existing_row_over_ws(ws_ctx):
+    """Idempotency survives a block established AFTER the original send, ON THE LIVE WS
+    PATH (cage-match PR#124 Carnot F2 / Tesla P0 — the early ws gate that short-circuited
+    before create_outbound's idempotency check re-broke this; it is removed). A resend of
+    the same client_msg_id after a block gets an ACK (existing row), NOT no_channel."""
     session = ws_ctx
     a = await _user(session, "alice")
     b = await _user(session, "bob")
     channel, _ = await dm_service.get_or_create_dm(session, me=a, target_user_id=b.id)
-    first, created = await messages_service.create_outbound(
-        session, user=a, channel=channel, body="hi", client_msg_id="c1")
-    assert created
+    conn = _RecordingConn(a.id)
+    gw = SimpleNamespace(bus=_FakeBus(), hub=Hub())
+    send = {"type": "send", "channel_id": channel.id, "client_msg_id": "c1", "body": "hi"}
+    await _handle_send(gw, conn, a, send)
+    acks = [f for f in conn.sent if f.get("type") == "ack"]
+    assert len(acks) == 1
+    server_id = acks[0]["msg_id"] if "msg_id" in acks[0] else acks[0].get("id")
+    # Block, then RETRY the same client_msg_id over WS.
     await moderation_service.block_user(session, blocker_id=b.id, blocked_id=a.id)
-    # Retry of the SAME client_msg_id after the block → existing row, not BlockedDmSend.
-    again, created2 = await messages_service.create_outbound(
-        session, user=a, channel=channel, body="hi", client_msg_id="c1")
-    assert again.id == first.id and created2 is False
+    conn2 = _RecordingConn(a.id)
+    await _handle_send(gw, conn2, a, send)
+    # Must be an ACK reconciling the SAME server id — never a no_channel refusal.
+    assert not any(f.get("type") == "error" for f in conn2.sent), \
+        "retry-after-block must reconcile, not refuse (idempotency-first)"
+    retry_acks = [f for f in conn2.sent if f.get("type") == "ack"]
+    assert len(retry_acks) == 1
+
+
+async def test_dm_must_be_private_check(session):
+    """ck_channels_dm_private: a DM must be private (#2633 cage-match) — a non-private DM
+    would be world-readable via acl.readable_channel. Storing one is rejected at the DB."""
+    from sqlalchemy import null
+    session.add(Channel(id=_ulid(4), name="pub-dm", kind="dm", aiko_channel="dm:pub",
+                        is_private=False, community_id=null()))
+    with pytest.raises(IntegrityError):
+        await session.commit()
+    await session.rollback()
+
+
+async def test_dm_must_carry_dm_prefix_check(session):
+    """ck_channels_dm_prefix (#2633 cage-match): a DM's aiko_channel MUST start with
+    'dm:' — the prefix leg of the dual bus gate. A DM with a non-dm: name is rejected at
+    the DB, so a kind-retint can't strip the prefix and re-federate the room."""
+    from sqlalchemy import null
+    session.add(Channel(id=_ulid(5), name="badname", kind="dm", aiko_channel="general",
+                        is_private=True, community_id=null()))
+    with pytest.raises(IntegrityError):
+        await session.commit()
+    await session.rollback()
 
 
 # ============================ PRIVACY (the crux) =========================== #
