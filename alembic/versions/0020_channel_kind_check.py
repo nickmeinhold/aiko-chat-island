@@ -43,7 +43,10 @@ branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
 # Must match _in_check("kind", ChannelKind) in domain/models.py exactly (parity gate).
-_KIND_CHECK = "kind IN ('standard', 'llm', 'robot', 'dm', 'group')"
+# 'group' is deliberately NOT included — the group PR adds it with its matching
+# community-exemption in one migration (cage-match PR#124 Tesla; see the ChannelKind
+# docstring). Pre-permitting it here without that rule reopens the community footgun.
+_KIND_CHECK = "kind IN ('standard', 'llm', 'robot', 'dm')"
 
 # Bidirectional community-membership CHECK (cage-match PR#124 Carnot): tightens the
 # original 0001 `kind = 'dm' OR community_id IS NOT NULL` so a DM must ALSO have a NULL

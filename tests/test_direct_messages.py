@@ -409,7 +409,37 @@ async def test_channel_kind_enum_values(session):
     (guards against the enum silently drifting from the migration literal)."""
     assert ChannelKind.DM == "dm"
     assert ChannelKind.STANDARD == "standard"
-    assert {"standard", "llm", "robot", "dm", "group"} == {k.value for k in ChannelKind}
+    # 'group' is deliberately NOT pre-permitted (added with its community rule when
+    # groups ship — cage-match PR#124 Tesla).
+    assert {"standard", "llm", "robot", "dm"} == {k.value for k in ChannelKind}
+
+
+async def test_create_outbound_refuses_blocked_dm_at_mutator_door(session):
+    """The DM-block-send gate lives in the MUTATOR (create_outbound), not the route — so
+    ANY send path is sealed (cage-match PR#124 Tesla P1a). Calling it directly for a
+    blocked DM raises BlockedDmSend and persists nothing."""
+    a = await _user(session, "alice")
+    b = await _user(session, "bob")
+    channel, _ = await dm_service.get_or_create_dm(session, me=a, target_user_id=b.id)
+    await moderation_service.block_user(session, blocker_id=b.id, blocked_id=a.id)
+    with pytest.raises(messages_service.BlockedDmSend):
+        await messages_service.create_outbound(
+            session, user=a, channel=channel, body="x", client_msg_id="c1")
+    rows = (await session.execute(
+        Message.__table__.select().where(Message.channel_id == channel.id))).all()
+    assert rows == []
+
+
+async def test_self_join_refuses_dm(session):
+    """A DM is never self-joinable — its membership is fixed at creation (hard seal,
+    cage-match PR#124 Tesla P2), independent of the 'DMs are invite_only' convention."""
+    from aiko_gateway.domain import memberships_service
+    a = await _user(session, "alice")
+    b = await _user(session, "bob")
+    channel, _ = await dm_service.get_or_create_dm(session, me=a, target_user_id=b.id)
+    with pytest.raises(memberships_service.DmNotExpandable):
+        await memberships_service.self_join(
+            session, channel_id=channel.id, actor_id=a.id)
 
 
 # ============================ PRIVACY (the crux) =========================== #

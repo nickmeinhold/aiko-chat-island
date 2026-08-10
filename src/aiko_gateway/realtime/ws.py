@@ -110,23 +110,6 @@ async def _handle_send(gw, conn: Connection, user, frame: dict) -> None:
             await conn.send(envelopes.error("no_channel", "channel not found",
                                             frame["client_msg_id"]))
             return
-        # DM SEND UNDER A BLOCK → REFUSE (#2633, design 11 §Decision 5; Nick's ruling
-        # 2026-08-10). In a 1:1 room a blocked sender's message reaches NOBODY (the peer
-        # filters it), so — unlike a public channel where block stays a read-only content
-        # filter — a persisted DM row is pure dead storage that an unblock would resurface
-        # ("inbox of ghosts"). So for a DM we refuse the send outright, and collapse it
-        # into the SAME existence-hiding "no_channel" as a missing/unreadable channel, so
-        # the refusal never leaks the block DIRECTION (B blocking A is indistinguishable
-        # from "no such channel"). Public/community channels are unaffected — block there
-        # is still the read filter (get_history + fanout exclude). DM-only, by kind.
-        if channel.kind == "dm":
-            peers = [m for m in await dm_service.members_of(session, channel.id)
-                     if m != user.id]
-            blocked = await moderation_service.blocked_pair_user_ids(session, user.id)
-            if any(p in blocked for p in peers):
-                await conn.send(envelopes.error("no_channel", "channel not found",
-                                                frame["client_msg_id"]))
-                return
         # A member who exists but lacks can_post already knows the channel is real,
         # so this is an honest 'forbidden' (no existence leak) rather than collapse.
         if not await acl.can_post(session, user.id, channel):
@@ -194,11 +177,20 @@ async def _handle_send(gw, conn: Connection, user, frame: dict) -> None:
         except mentions.MentionError as e:
             await conn.send(envelopes.error("bad_mentions", str(e), frame["client_msg_id"]))
             return
-        row, created = await messages_service.create_outbound(
-            session, user=user, channel=channel,
-            body=frame["body"], client_msg_id=frame["client_msg_id"],
-            reply_to=reply_to, origin=origin, mentions=spans,
-        )
+        try:
+            row, created = await messages_service.create_outbound(
+                session, user=user, channel=channel,
+                body=frame["body"], client_msg_id=frame["client_msg_id"],
+                reply_to=reply_to, origin=origin, mentions=spans,
+            )
+        except messages_service.BlockedDmSend:
+            # DM send refused under a block (design 11 §Decision 5, enforced at the mutator
+            # door). Collapse into the SAME existence-hiding no_channel as a missing /
+            # unreadable channel (Nick's approved shape) so the refusal doesn't add a
+            # distinct "blocked" code — symmetric in both block directions.
+            await conn.send(envelopes.error("no_channel", "channel not found",
+                                            frame["client_msg_id"]))
+            return
         view = messages_service.message_view(row)
         # Block exclusion for live fanout: everyone in a block relationship with the
         # sender must NOT receive this frame (the live twin of the history visibility

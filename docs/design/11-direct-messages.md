@@ -101,6 +101,24 @@ reaches nobody, so a persisted-but-filtered row is pure dead storage that an **u
 would resurface** ("inbox of ghosts"). Refusing the send means no residue accrues.
 DM-specific (keyed on `kind == "dm"`) — public/community block semantics are unchanged.
 
+Enforced at the **mutator door** (`messages_service.create_outbound`, which raises
+`BlockedDmSend`), not the WS route — so *every* send path (the WS route today, any future
+REST/bot/in-process writer) honours it (repo law: seal the shared writer, not each caller;
+PR#124 Tesla P1a). The WS route maps `BlockedDmSend` to `no_channel`.
+
+**Named tradeoff (PR#124 Tesla P1b):** the refusal reuses the existence-hiding
+`no_channel` code, but for a DM the *channel* existence is not actually hidden — the
+client just created/listed it, so it holds the id. `no_channel` here is chosen for
+symmetry (identical in both block directions — no distinct "blocked" code) and to avoid a
+new error variant, *not* to hide the channel. A blocked-by party who holds the DM id can
+infer a block exists (as on any platform), but not, from the code alone, its direction.
+We accept that over adding a directional `blocked` code.
+
+**Write-once invariant (PR#124 Tesla P3):** the bus-federation suppression rests on BOTH
+`kind == "dm"` AND the `dm:` `aiko_channel` prefix (the dual gate). Both are set once at
+DM creation and never mutated — `kind` is closed by `ck_channels_kind`, the prefix is
+reserved from the bus. A future mutator must treat both as immutable for a DM row.
+
 ## Exclusion from `GET /v1/channels`
 
 A DM is `is_private=True`, so it would otherwise appear in `acl.visible_channels` (the

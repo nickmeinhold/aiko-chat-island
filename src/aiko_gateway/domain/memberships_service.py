@@ -34,7 +34,7 @@ from .ids import new_ulid
 # set is the single source of truth for the column default AND the DB CHECK
 # constraint (#11). Re-exported here so the long-standing `memberships_service.Role`
 # / `.JoinPolicy` call sites (rest/members.py, tests) are unchanged.
-from .models import Channel, JoinPolicy, Membership, Role, User  # noqa: F401
+from .models import Channel, ChannelKind, JoinPolicy, Membership, Role, User  # noqa: F401
 
 
 # Back-compat string aliases — the model defaults and existing call sites use
@@ -67,6 +67,16 @@ class NotAMember(MembershipError):
 class LastAdmin(MembershipError):
     """Refused: the operation would remove the channel's last admin, orphaning
     it (no one could ever manage membership again)."""
+
+
+class DmNotExpandable(MembershipError):
+    """Refused: membership of a DM channel (kind=='dm') cannot be grown via the members
+    API (#2633, cage-match PR#124 Tesla). 2-ness lives ONLY at POST /v1/dm; a DM is
+    exactly its creation members. This is a HARD seal (not the incidental "DMs have no
+    admin + are invite_only" convention) so a future admin-grant / open-join path can't
+    silently turn a 1:1 into a multiparty channel while the wire kind still says 'dm'.
+    The route maps this to 409 (the caller sees the channel — no existence-hiding needed;
+    it is refused AFTER visibility is confirmed, so a non-member still gets 404)."""
 
 
 async def _membership(
@@ -201,6 +211,16 @@ async def _require_admin(
     return channel
 
 
+async def _reject_dm_expansion(session: AsyncSession, channel_id: str) -> None:
+    """Raise ``DmNotExpandable`` if ``channel_id`` is a DM (#2633). The hard seal on
+    DM 2-ness — called only AFTER the caller has confirmed the actor may see the channel
+    (so it never leaks a DM's existence to a non-member). ``session.get`` hits the
+    identity map when the channel was already loaded upstream (no extra round-trip)."""
+    channel = await session.get(Channel, channel_id)
+    if channel is not None and channel.kind == ChannelKind.DM:
+        raise DmNotExpandable(channel_id)
+
+
 async def add_member(
     session: AsyncSession,
     *,
@@ -222,8 +242,13 @@ async def add_member(
 
     Rejects: non-admin actor (a, via _require_admin), unseeable channel (404),
     and an unknown target user (controlled NotAMember rather than an FK
-    IntegrityError at commit — cage-match PR#10: Carnot)."""
+    IntegrityError at commit — cage-match PR#10: Carnot).
+
+    A DM (kind=='dm') is refused expansion (DmNotExpandable) — checked AFTER visibility
+    (via _require_admin's readable_channel) so a non-member still gets existence-hiding
+    404, not a DM-exists signal."""
     await _require_admin(session, channel_id, actor_id)
+    await _reject_dm_expansion(session, channel_id)
     # Idempotent-existing check as ONE joined query (not membership-lookup + a
     # separate User fetch): returns (Membership, User) together, the same JOIN shape
     # list_members uses. The INNER JOIN also fuses the no-orphan invariant — a
@@ -295,6 +320,11 @@ async def self_join(
         # Not found, OR private+invite_only and the actor is not already in it —
         # indistinguishable by design (same single-None as the read path).
         raise ChannelNotFound(channel_id)
+    # Hard-seal DM 2-ness (#2633, cage-match PR#124 Tesla): a DM is never self-joinable,
+    # even if a future path opens its policy. Checked AFTER the visibility resolve above,
+    # so a non-member still gets the existence-hiding 404, not a DM-exists signal.
+    if channel.kind == ChannelKind.DM:
+        raise DmNotExpandable(channel_id)
 
     existing = await _membership(session, channel_id, actor_id)
     if existing is not None:

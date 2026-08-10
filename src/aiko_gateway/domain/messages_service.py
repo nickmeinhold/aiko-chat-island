@@ -15,7 +15,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..aiko.payload import InboundMessage
 from . import acl, channels_service, moderation_service, signing_keys_service
 from .ids import new_ulid
-from .models import Channel, Message, Retraction, User
+from .models import Channel, ChannelKind, Membership, Message, Retraction, User
+
+
+class BlockedDmSend(Exception):
+    """A send to a DM channel where the sender is in a block relationship with the DM
+    peer (#2633, design 11 §Decision 5). Raised from the SINGLE mutator door
+    (``create_outbound``) so EVERY send path — the WS route today, any REST/bot/in-process
+    writer tomorrow — enforces the refuse-under-block rule, not just the transport adapter
+    (cage-match PR#124 Tesla: seal the mutator, not the route). The WS route maps this to
+    the existence-hiding ``no_channel`` error."""
 
 
 def message_view(m: Message, *, reactions: list[dict] | None = None) -> dict:
@@ -108,6 +117,18 @@ async def create_outbound(
     this function's ONE commit — atomic, so a signed message can never persist
     without its binding. A resend short-circuits above and does not re-record (the
     binding already exists from the first send)."""
+    # DM SEND UNDER A BLOCK → REFUSE, at the MUTATOR door so every send path enforces it
+    # (#2633, design 11 §Decision 5; cage-match PR#124 Tesla). Checked BEFORE the
+    # idempotency early-return so even a resend can't slip a row through under a block.
+    # DM-only (kind == 'dm'); public/community block stays a read-only content filter.
+    if channel.kind == ChannelKind.DM:
+        peer_ids = [uid for uid in (await session.execute(
+            select(Membership.user_id).where(Membership.channel_id == channel.id)
+        )).scalars() if uid != user.id]
+        if peer_ids:
+            blocked = await moderation_service.blocked_pair_user_ids(session, user.id)
+            if any(p in blocked for p in peer_ids):
+                raise BlockedDmSend()
     existing = (await session.execute(
         select(Message).where(
             Message.channel_id == channel.id,

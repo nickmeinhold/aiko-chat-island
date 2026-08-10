@@ -66,16 +66,20 @@ class ChannelKind(enum.StrEnum):
     Members: 'standard' = an ordinary bus-reconciled channel (the only kind any writer
     produces today — verified against live prod: all channels are 'standard'); 'llm' /
     'robot' = aiko actor channels (mapped to sender_kind by messages_service._kind_for);
-    'dm' = a 1:1 direct-message channel (island-local, never federated); 'group' =
-    RESERVED for the additive group-chat generalization the app tab asked us not to
-    foreclose (a group is the same member-set object with N members) — pre-permitted
-    here so the group build is additive (no new migration), per the member-set design."""
+    'dm' = a 1:1 direct-message channel (island-local, never federated).
+
+    'group' is deliberately NOT pre-permitted (cage-match PR#124 Tesla): the member-set
+    model keeps groups additive, but a group is ALSO community-less, and
+    ck_channels_community_required only exempts 'dm'. Pre-permitting the kind without the
+    matching community rule would let a future group ship into Aiko by default (the exact
+    footgun this PR closes for DMs). So the group PR adds 'group' to THIS enum AND its
+    community-exemption in ONE migration — a small, correct step, not a pre-committed
+    half-invariant."""
 
     STANDARD = "standard"
     LLM = "llm"
     ROBOT = "robot"
     DM = "dm"
-    GROUP = "group"
 
 
 class Visibility(enum.StrEnum):
@@ -293,6 +297,11 @@ class Membership(Base):
     # DB-level role closed-set enforcement beyond the API boundary (#11).
     __table_args__ = (
         CheckConstraint(_in_check("role", Role), name="ck_memberships_role"),
+        # USER-centric index (#2633, cage-match PR#124 Carnot). The composite PK is
+        # (channel_id, user_id) — leading with channel_id — so a query filtering on
+        # user_id alone (GET /v1/dm: "my DM channels", list_dms) cannot use it and would
+        # table-scan as memberships grow. This index covers the user-first access path.
+        Index("ix_memberships_user_id", "user_id"),
     )
     channel_id: Mapped[str] = mapped_column(ForeignKey("channels.id"), primary_key=True)
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), primary_key=True)
