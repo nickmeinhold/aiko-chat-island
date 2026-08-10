@@ -71,7 +71,7 @@ def is_dm_channel_name(aiko_channel: str) -> bool:
     return aiko_channel.startswith(DM_CHANNEL_PREFIX)
 
 
-def canonical_peer_ids(aiko_channel: str, me_id: str) -> list[str]:
+def canonical_peer_ids(aiko_channel: str, me_id: str) -> list[str] | None:
     """The DM's peer ids (the canonical pair MINUS ``me_id``), parsed from the
     ``dm:<lo>:<hi>`` key — NOT from live membership (cage-match PR#124 round 9 Tesla/Carnot
     P0). The block-send gate MUST key off the canonical pair, because live membership is
@@ -79,12 +79,20 @@ def canonical_peer_ids(aiko_channel: str, me_id: str) -> list[str]:
     blocked then left would vanish from the census, silently disabling the block and
     letting the remaining member accumulate residue the leaver sees on re-open. The pair
     is immutable (the key is UNIQUE + write-once), so it is the stable identity to check.
-    A self-DM (``dm:<me>:<me>``) yields no peer. ULIDs contain no ``:``, so the split is
-    unambiguous; a non-``dm:`` name (never passed here) yields no peer."""
+
+    Returns ``None`` for a MALFORMED key — FAIL CLOSED (cage-match PR#124 round 10 Carnot):
+    the DB CHECK reserves the ``dm:`` prefix but does not (cannot, on SQLite) validate the
+    full ``dm:<id>:<id>`` shape, so an anomalous ``kind='dm'`` row like ``dm:bad`` could
+    reach here. Rather than let a mis-parse silently skip the block gate, an unparseable
+    key returns None and the caller refuses the send. A valid key is exactly two
+    colon-separated ids after the prefix (a self-DM is ``dm:<me>:<me>`` — 2 parts, deduped
+    to no peer). ULIDs contain no ``:``, so the split is unambiguous."""
     if not aiko_channel.startswith(DM_CHANNEL_PREFIX):
-        return []
+        return None
     ids = aiko_channel[len(DM_CHANNEL_PREFIX):].split(":")
-    return sorted({uid for uid in ids if uid and uid != me_id})
+    if len(ids) != 2 or not all(ids):
+        return None  # malformed dm: key — fail closed
+    return sorted({uid for uid in ids if uid != me_id})
 
 
 def _canonical_aiko_channel(a_id: str, b_id: str) -> str:

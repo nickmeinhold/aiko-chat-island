@@ -132,15 +132,35 @@ parties' switchers. That is consistent with unread being client-side — **the c
 a conversation**; the island keeps the channel. Blocking freezes new content at the
 switcher too (no new `last_message`), but does not tombstone the shell.
 
-**DM lifecycle — leave is the server-side dismiss (PR#124 Tesla P0):** `leave` is NOT
-sealed for a DM. A member may drop their own membership (`DELETE /v1/channels/{id}/leave`
-→ 204), which removes the DM from their `GET /v1/dm` and is a real *server-side* dismiss,
-not just a client hide. Re-injection is impossible because the *other* end
-(`get_or_create_dm`'s adopt path) ensures only the caller's membership — it never re-adds a
-peer who left. Only GROWING the set (`add_member`/`self_join`) and removing the *other*
-party are sealed (`DmMembershipImmutable` → 409). An earlier revision sealed leave too, on
-a re-inject theory that the adopt-self-only fix retired; keeping it sealed only removed the
-one mutator that implements dismiss, so it was unsealed.
+**Two distinct tools — leave (resumable hide) vs block (stop-contact):** these are not the
+same and the contract must not conflate them (PR#124 Tesla P0/P1a).
+- **`leave` = a resumable roster/read hide.** A member may drop their own membership
+  (`DELETE /v1/channels/{id}/leave` → 204): the DM leaves their `GET /v1/dm`, and history +
+  send-ACL stop for them. It is NOT a permanent cutoff — re-opening (`POST /v1/dm`) resumes
+  the conversation *including messages sent while away* (unarchive semantics), and the
+  peer is never re-injected (adopt is self-only). Two honest caveats: (1) a message the
+  leaver had *already live-subscribed* to on an open WS socket keeps arriving until the
+  socket re-subscribes — a **pre-existing** hub-subscription-lifecycle property affecting
+  every private-channel leave, not DM-specific (tracked as a follow-up: drop the sub on
+  leave / re-check membership at fanout for private rooms); (2) re-open shows the backlog,
+  by design. So leave is "hide/archive," never "they can never reach me."
+- **`block` = the stop-contact tool.** Refuses the blocked party's *sends* (Decision 5),
+  enforced against the **canonical pair** so it holds even after a leave — a blocked peer
+  cannot accumulate residue. Use block to stop someone; use leave to tidy your switcher.
+
+Only GROWING the DM set (`add_member`/`self_join`) and removing the *other* party are
+sealed (`DmMembershipImmutable` → 409); a DM is also never created via the generic
+`create_channel` (it refuses `kind='dm'` / `dm:` names — the single door is
+`get_or_create_dm`).
+
+**Cardinality is a deferred DB invariant (PR#124 Tesla P1b).** A DM's N ∈ {1, 2} is held
+by CONSTRUCTION — `get_or_create_dm` adds exactly the pair, the membership mutators are
+sealed, `create_channel` refuses DMs, and the `dm:<lo>:<hi>` key names two ids — NOT by a
+DB `CHECK` (a per-row CHECK cannot count rows; a trigger is out of scope). The block-send
+gate keys off the canonical pair (fail-closed on a malformed key), and LiveKit fails closed
+on N≠2; the residual is a direct-SQL third `Membership` row (outside the API threat model),
+which message-read ACL would honor. Named here as the accepted deferred invariant; a future
+group PR must key its own semantics off `kind='group'`, never `kind='dm'` with N>2.
 
 **Known gap — richer DM consent (PR#124 Tesla, app-tab-owned):** `POST /v1/dm` is still
 consentless (anyone who knows your `user_id` can open a DM shell; block stops speech, and

@@ -140,6 +140,11 @@ async def create_outbound(
     # DM-only; public/community block stays a read-only content filter.
     if channel.kind == ChannelKind.DM:
         peer_ids = dm_service.canonical_peer_ids(channel.aiko_channel, user.id)
+        if peer_ids is None:
+            # Malformed dm: key (anomalous kind='dm' row) — can't resolve the peer to
+            # check the block, so FAIL CLOSED rather than skip Decision 5 (cage-match
+            # PR#124 round 10 Carnot). A well-formed DM never hits this.
+            raise BlockedDmSend()
         if peer_ids:
             blocked = await moderation_service.blocked_pair_user_ids(session, user.id)
             if any(p in blocked for p in peer_ids):

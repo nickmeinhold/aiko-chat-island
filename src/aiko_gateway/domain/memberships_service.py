@@ -468,7 +468,17 @@ async def create_channel(
     can manage membership — this seeds the admin invariant the remove/leave
     paths protect (no channel is born adminless). ``aiko_channel`` defaults to a
     unique generated token so two channels with the same display name don't
-    collide on the unique aiko_channel constraint."""
+    collide on the unique aiko_channel constraint.
+
+    DMs are NOT created here — the single door for a DM is ``dm_service.get_or_create_dm``
+    (POST /v1/dm), which owns the canonical ``dm:<lo>:<hi>`` key, the pair membership, and
+    the community-less/private/invite_only shape. This generic creator refuses ``kind='dm'``
+    OR a ``dm:``-prefixed ``aiko_channel`` (cage-match PR#124 round 10 Carnot/Tesla): a
+    generic creator minting a DM — especially a MALFORMED one like ``dm:bad`` — would sit
+    on the private keyspace with an unparseable pair key, so it is refused up front."""
+    if kind == "dm" or (aiko_channel is not None
+                        and aiko_channel.startswith("dm:")):
+        raise ValueError("DMs are created via dm_service.get_or_create_dm, not create_channel")
     policy = (
         join_policy if join_policy in (JoinPolicy.OPEN, JoinPolicy.INVITE_ONLY)
         else JoinPolicy.INVITE_ONLY

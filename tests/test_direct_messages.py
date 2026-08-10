@@ -443,6 +443,34 @@ async def test_blocked_dm_send_refused_even_after_peer_leaves(session):
     assert rows == [], "no residue accrues into a dismissed-under-block DM"
 
 
+async def test_canonical_peer_ids_fails_closed_on_malformed_key(session):
+    """canonical_peer_ids returns None (→ create_outbound fails closed) for a malformed
+    dm: key, so a mis-parse can't silently skip the block gate (cage-match PR#124 round 10
+    Carnot). A well-formed pair/self-DM parses normally."""
+    a = _ulid(1)
+    b = _ulid(2)
+    assert dm_service.canonical_peer_ids(f"dm:{a}:{b}", a) == [b]      # pair
+    assert dm_service.canonical_peer_ids(f"dm:{a}:{a}", a) == []       # self-DM
+    assert dm_service.canonical_peer_ids("dm:bad", a) is None          # malformed → None
+    assert dm_service.canonical_peer_ids("dm:a:b:c", a) is None        # too many parts
+    assert dm_service.canonical_peer_ids("general", a) is None         # not a dm: key
+
+
+async def test_create_channel_refuses_dm(session):
+    """The generic create_channel refuses to mint a DM (kind='dm' or a dm: name) — the
+    single door for a DM is dm_service.get_or_create_dm (cage-match PR#124 round 10)."""
+    from aiko_gateway.domain import memberships_service
+    a = await _user(session, "alice")
+    with pytest.raises(ValueError):
+        await memberships_service.create_channel(
+            session, creator_id=a.id, name="sneaky", is_private=True, kind="dm",
+            aiko_channel="dm:x:y")
+    with pytest.raises(ValueError):
+        await memberships_service.create_channel(
+            session, creator_id=a.id, name="sneaky2", is_private=True,
+            aiko_channel="dm:malformed")
+
+
 async def test_create_outbound_refuses_blocked_dm_at_mutator_door(session):
     """The DM-block-send gate lives in the MUTATOR (create_outbound), not the route — so
     ANY send path is sealed (cage-match PR#124 Tesla P1a). Calling it directly for a
