@@ -613,3 +613,8 @@ def test_store_empty_robot_id_key_fails_closed(tmp_path):
     p.write_text('{"": 5}')  # empty robot_id key — the advance path would never write it
     with pytest.raises(ActuationError, match="invalid robot_id key"):
         SeqHighWater(str(p))
+
+
+def test_seqhighwater_bad_path_type_fails_closed():
+    with pytest.raises(ActuationError, match="path must be a non-empty string"):
+        SeqHighWater(None)  # type: ignore[arg-type]

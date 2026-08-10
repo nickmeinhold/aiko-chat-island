@@ -68,6 +68,15 @@ commander + the LiveKit transport are out of this repo — tracked as follow-ups
     ``ActuationError`` without actuating — so the seq is not consumed and can be retried once
     the store is writable. A persist failure is still an operator-visible fault (the store is
     unwritable), but it no longer burns a seq or opens a restart-replay window.
+  * NAMED TRADEOFF — the post-commit directory fsync is BEST-EFFORT. The commit point is
+    ``os.replace`` (the mark is on disk and visible after it); the directory fsync that follows
+    only hardens the rename against power loss. Its failure is swallowed rather than raised,
+    because raising after a successful replace would force a memory rollback below a seq that IS
+    committed and let a retry double-actuate. Failure scenario: on an exotic/denied filesystem
+    where dir-fsync fails, an immediate power loss in the same instant could lose the rename and
+    reopen a ``max_age_ms``-bounded replay window. Severity: low (dir-fsync failure after a
+    successful replace is near-impossible on the Linux/macOS island hosts). Mitigation is the
+    bridge's: run the store on a normal local filesystem and monitor disk health.
   * ``SeqHighWater`` uses ONE lock across all robots (not per-robot) and fsyncs inside it, so a
     slow disk head-of-line-blocks every robot's admit. Correct for a command-rate wave loop;
     a high-frequency or many-robot bridge should move to per-robot locks. It is also
@@ -342,6 +351,10 @@ class SeqHighWater:
     """
 
     def __init__(self, path: str) -> None:
+        # Normalize a bad path (None / non-str config) to ActuationError rather than a raw
+        # TypeError from os.path.exists — the store is part of the sealed-door boundary.
+        if not isinstance(path, str) or not path:
+            raise ActuationError("SeqHighWater path must be a non-empty string")
         self._path = path
         self._lock = threading.Lock()
         self._marks: dict[str, int] = {}
