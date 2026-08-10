@@ -304,10 +304,9 @@ async def test_dm_with_community_rejected_by_check(session):
 # ---------------- feature-interaction safety properties -------------------- #
 
 async def test_dm_cannot_be_expanded_via_members_api(app_ctx, session):
-    """A DM is a member-SET channel underneath, but it must not be silently turned into
-    a group by the admin members API: DM members are plain 'member' (no admin), so
-    add_member is rejected (NotChannelAdmin) — the ONLY way to grow membership is a
-    future explicit group endpoint, keeping 2-ness confined to POST /v1/dm."""
+    """A DM's membership is a HARD-sealed pair: add_member is refused with 409
+    (DmMembershipImmutable), checked BEFORE the admin gate so the seal is reachable and
+    not dead code behind NotChannelAdmin (cage-match PR#124 Tesla P1b)."""
     a = await _user(session, "alice")
     b = await _user(session, "bob")
     intruder = await _user(session, "mallory")
@@ -315,15 +314,29 @@ async def test_dm_cannot_be_expanded_via_members_api(app_ctx, session):
     resp = await app_ctx.post(
         f"/v1/channels/{channel.id}/members",
         json={"user_id": intruder.id}, headers=_auth(a))
-    assert resp.status_code in (403, 404), "a DM member is not an admin; can't add a 3rd"
+    assert resp.status_code == 409, "a DM's membership is fixed — 409, not a growable set"
     members = await dm_service.members_of(session, channel.id)
     assert intruder.id not in members
 
 
+async def test_dm_cannot_be_left(app_ctx, session):
+    """Leaving a DM is refused (409) — DM membership is permanent, so the peer's next
+    POST /v1/dm can't re-inject a member who left (the forced-re-add vector, Tesla P0)."""
+    a = await _user(session, "alice")
+    b = await _user(session, "bob")
+    channel, _ = await dm_service.get_or_create_dm(session, me=a, target_user_id=b.id)
+    resp = await app_ctx.delete(
+        f"/v1/channels/{channel.id}/leave", headers=_auth(b))
+    assert resp.status_code == 409
+    # b is still a member (couldn't leave) — no shell, no re-inject race.
+    assert b.id in await dm_service.members_of(session, channel.id)
+
+
 async def test_dm_message_hidden_from_blocked_peer(app_ctx, session):
-    """A DM under a block is INERT (design §Decision 5): block is a content filter on the
-    shared read path, so B never sees A's DM line once B blocks A — no creation gate
-    needed. Proves the message-level block filter covers the DM channel too."""
+    """The READ-side block filter still covers a DM: a message already in the channel
+    (here inserted directly, bypassing the send gate) is hidden from a peer who blocks its
+    author. Complements the SEND-side refusal (test_dm_send_under_block_is_refused) — the
+    read filter remains the backstop for anything persisted before a block."""
     a = await _user(session, "alice")
     b = await _user(session, "bob")
     channel, _ = await dm_service.get_or_create_dm(session, me=a, target_user_id=b.id)
@@ -437,9 +450,28 @@ async def test_self_join_refuses_dm(session):
     a = await _user(session, "alice")
     b = await _user(session, "bob")
     channel, _ = await dm_service.get_or_create_dm(session, me=a, target_user_id=b.id)
-    with pytest.raises(memberships_service.DmNotExpandable):
+    with pytest.raises(memberships_service.DmMembershipImmutable):
         await memberships_service.self_join(
             session, channel_id=channel.id, actor_id=a.id)
+
+
+async def test_dm_retry_after_block_returns_existing_row(ws_ctx):
+    """Idempotency survives a block established AFTER the original send (cage-match PR#124
+    Carnot F2): a legitimately-sent message resent with the same client_msg_id returns the
+    existing row (reconciles the ack), NOT BlockedDmSend — the block stops NEW residue,
+    not reconciliation of an already-sent message."""
+    session = ws_ctx
+    a = await _user(session, "alice")
+    b = await _user(session, "bob")
+    channel, _ = await dm_service.get_or_create_dm(session, me=a, target_user_id=b.id)
+    first, created = await messages_service.create_outbound(
+        session, user=a, channel=channel, body="hi", client_msg_id="c1")
+    assert created
+    await moderation_service.block_user(session, blocker_id=b.id, blocked_id=a.id)
+    # Retry of the SAME client_msg_id after the block → existing row, not BlockedDmSend.
+    again, created2 = await messages_service.create_outbound(
+        session, user=a, channel=channel, body="hi", client_msg_id="c1")
+    assert again.id == first.id and created2 is False
 
 
 # ============================ PRIVACY (the crux) =========================== #
@@ -540,6 +572,25 @@ async def test_dm_send_under_block_is_refused(ws_ctx):
         "client_msg_id": "c2", "body": "also refused"})
     assert any(f.get("type") == "error" and f.get("code") == "no_channel"
                for f in conn2.sent)
+
+
+async def test_dm_reply_under_block_uses_no_channel_not_blocked(ws_ctx):
+    """A DM reply under a block refuses with the SAME existence-hiding no_channel as a
+    plain send — NOT the distinct 'blocked' code the generic reply-block path emits
+    (cage-match PR#124 Carnot F1/Tesla P1: one input, reply_to, must not split the error
+    surface Decision 5 promised was uniform)."""
+    session = ws_ctx
+    a = await _user(session, "alice")
+    b = await _user(session, "bob")
+    channel, _ = await dm_service.get_or_create_dm(session, me=a, target_user_id=b.id)
+    m1 = await _post_msg(session, channel_id=channel.id, sender=a, body="earlier", mid=5)
+    await moderation_service.block_user(session, blocker_id=b.id, blocked_id=a.id)
+    conn = _RecordingConn(b.id)
+    await _handle_send(SimpleNamespace(bus=_FakeBus(), hub=Hub()), conn, b, {
+        "type": "send", "channel_id": channel.id, "client_msg_id": "c1",
+        "body": "reply under block", "reply_to": m1.id})
+    codes = [f.get("code") for f in conn.sent if f.get("type") == "error"]
+    assert codes == ["no_channel"], f"reply-under-block must be no_channel, got {codes}"
 
 
 async def test_standard_channel_send_still_publishes_to_bus(ws_ctx):

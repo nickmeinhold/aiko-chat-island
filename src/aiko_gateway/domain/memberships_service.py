@@ -69,14 +69,23 @@ class LastAdmin(MembershipError):
     it (no one could ever manage membership again)."""
 
 
-class DmNotExpandable(MembershipError):
-    """Refused: membership of a DM channel (kind=='dm') cannot be grown via the members
-    API (#2633, cage-match PR#124 Tesla). 2-ness lives ONLY at POST /v1/dm; a DM is
-    exactly its creation members. This is a HARD seal (not the incidental "DMs have no
-    admin + are invite_only" convention) so a future admin-grant / open-join path can't
-    silently turn a 1:1 into a multiparty channel while the wire kind still says 'dm'.
-    The route maps this to 409 (the caller sees the channel — no existence-hiding needed;
-    it is refused AFTER visibility is confirmed, so a non-member still gets 404)."""
+class DmMembershipImmutable(MembershipError):
+    """Refused: the membership of a DM channel (kind=='dm') is FIXED at its two creation
+    members and cannot be mutated via the membership API — not grown (add/self-join), not
+    shrunk (leave/remove) (#2633, cage-match PR#124 Tesla P0+P2). 2-ness lives ONLY at
+    POST /v1/dm; a DM is exactly its pair, permanently.
+
+    WHY permanent, not just non-growable: if a member could LEAVE, then the other's next
+    POST /v1/dm re-injects them (find-or-create ensures the pair) — a forced re-add of a
+    party who exited, which no send-refuse can compensate (the harassment is the thread
+    RESURFACING). Making membership immutable removes that whole class: the live member
+    set always equals the canonical pair, so every DM special-case (block-send peer
+    resolution, the switcher listing) keys off a stable set, not mutable topology. A user
+    who wants a DM gone hides it CLIENT-side (there is no server DM-leave in the contract).
+
+    A HARD seal, not the incidental "DMs have no admin + are invite_only" convention, so a
+    future admin-grant / open-join path can't bypass it. Refused AFTER visibility is
+    confirmed (so a non-member still gets existence-hiding 404); the route maps it to 409."""
 
 
 async def _membership(
@@ -211,14 +220,14 @@ async def _require_admin(
     return channel
 
 
-async def _reject_dm_expansion(session: AsyncSession, channel_id: str) -> None:
-    """Raise ``DmNotExpandable`` if ``channel_id`` is a DM (#2633). The hard seal on
-    DM 2-ness — called only AFTER the caller has confirmed the actor may see the channel
-    (so it never leaks a DM's existence to a non-member). ``session.get`` hits the
-    identity map when the channel was already loaded upstream (no extra round-trip)."""
+async def _reject_dm_membership_change(session: AsyncSession, channel_id: str) -> None:
+    """Raise ``DmMembershipImmutable`` if ``channel_id`` is a DM (#2633). The hard seal on
+    DM membership (add/self-join/leave/remove) — called only AFTER the caller has confirmed
+    the actor may see the channel (so it never leaks a DM's existence to a non-member).
+    ``session.get`` hits the identity map when the channel was already loaded upstream."""
     channel = await session.get(Channel, channel_id)
     if channel is not None and channel.kind == ChannelKind.DM:
-        raise DmNotExpandable(channel_id)
+        raise DmMembershipImmutable(channel_id)
 
 
 async def add_member(
@@ -244,11 +253,17 @@ async def add_member(
     and an unknown target user (controlled NotAMember rather than an FK
     IntegrityError at commit — cage-match PR#10: Carnot).
 
-    A DM (kind=='dm') is refused expansion (DmNotExpandable) — checked AFTER visibility
-    (via _require_admin's readable_channel) so a non-member still gets existence-hiding
-    404, not a DM-exists signal."""
+    A DM (kind=='dm') is refused (DmMembershipImmutable) — checked AFTER visibility but
+    BEFORE the admin gate, so a normal DM member (no admin) gets the DM seal (409), not a
+    misleading NotChannelAdmin, and the seal is reachable even for a hypothetical DM-admin
+    (cage-match PR#124 Tesla P1b — the seal must not be dead code behind the admin check).
+    A non-member still gets existence-hiding 404 (the seal runs after readable_channel)."""
+    channel = await acl.readable_channel(session, actor_id, channel_id)
+    if channel is None:
+        raise ChannelNotFound(channel_id)  # existence-hiding (missing OR unseeable)
+    if channel.kind == ChannelKind.DM:
+        raise DmMembershipImmutable(channel_id)  # DM membership is fixed at creation
     await _require_admin(session, channel_id, actor_id)
-    await _reject_dm_expansion(session, channel_id)
     # Idempotent-existing check as ONE joined query (not membership-lookup + a
     # separate User fetch): returns (Membership, User) together, the same JOIN shape
     # list_members uses. The INNER JOIN also fuses the no-orphan invariant — a
@@ -320,11 +335,11 @@ async def self_join(
         # Not found, OR private+invite_only and the actor is not already in it —
         # indistinguishable by design (same single-None as the read path).
         raise ChannelNotFound(channel_id)
-    # Hard-seal DM 2-ness (#2633, cage-match PR#124 Tesla): a DM is never self-joinable,
+    # Hard-seal DM membership (#2633, cage-match PR#124 Tesla): a DM is never self-joinable,
     # even if a future path opens its policy. Checked AFTER the visibility resolve above,
     # so a non-member still gets the existence-hiding 404, not a DM-exists signal.
     if channel.kind == ChannelKind.DM:
-        raise DmNotExpandable(channel_id)
+        raise DmMembershipImmutable(channel_id)
 
     existing = await _membership(session, channel_id, actor_id)
     if existing is not None:
@@ -343,7 +358,13 @@ async def remove_member(
     session: AsyncSession, *, channel_id: str, actor_id: str, target_user_id: str
 ) -> None:
     """Admin removes ``target_user_id``. Rejects: non-admin (a), unseeable
-    channel (404), removing a non-member (f), and removing the last admin (d)."""
+    channel (404), removing a non-member (f), removing the last admin (d), and ANY member
+    of a DM (kind=='dm' membership is immutable — #2633 Tesla P0)."""
+    channel = await acl.readable_channel(session, actor_id, channel_id)
+    if channel is None:
+        raise ChannelNotFound(channel_id)
+    if channel.kind == ChannelKind.DM:
+        raise DmMembershipImmutable(channel_id)
     await _require_admin(session, channel_id, actor_id)
     target = await _membership(session, channel_id, target_user_id)
     if target is None:
@@ -366,7 +387,16 @@ async def leave(
     last admin raises ``LastAdmin`` (d), same invariant as an admin removing
     the last admin. Note this does not leak existence: a non-member who was
     never in the channel gets NotAMember, which the REST layer also maps to 404
-    (so a private channel they can't see still answers 404)."""
+    (so a private channel they can't see still answers 404).
+
+    A DM (kind=='dm') refuses leave (DmMembershipImmutable, #2633 Tesla P0): DM membership
+    is permanent, so the other party's next POST /v1/dm can't re-inject a peer who left
+    (the forced-re-add harassment vector). A user hides a DM CLIENT-side, not via leave."""
+    channel = await acl.readable_channel(session, actor_id, channel_id)
+    if channel is not None and channel.kind == ChannelKind.DM:
+        # After visibility: a member sees the DM, so this honest 409 leaks nothing; a
+        # non-member falls through to NotAMember below (→ 404, existence-hiding).
+        raise DmMembershipImmutable(channel_id)
     mine = await _membership(session, channel_id, actor_id)
     if mine is None:
         raise NotAMember(actor_id)

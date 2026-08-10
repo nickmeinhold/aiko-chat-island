@@ -117,18 +117,11 @@ async def create_outbound(
     this function's ONE commit — atomic, so a signed message can never persist
     without its binding. A resend short-circuits above and does not re-record (the
     binding already exists from the first send)."""
-    # DM SEND UNDER A BLOCK → REFUSE, at the MUTATOR door so every send path enforces it
-    # (#2633, design 11 §Decision 5; cage-match PR#124 Tesla). Checked BEFORE the
-    # idempotency early-return so even a resend can't slip a row through under a block.
-    # DM-only (kind == 'dm'); public/community block stays a read-only content filter.
-    if channel.kind == ChannelKind.DM:
-        peer_ids = [uid for uid in (await session.execute(
-            select(Membership.user_id).where(Membership.channel_id == channel.id)
-        )).scalars() if uid != user.id]
-        if peer_ids:
-            blocked = await moderation_service.blocked_pair_user_ids(session, user.id)
-            if any(p in blocked for p in peer_ids):
-                raise BlockedDmSend()
+    # IDEMPOTENCY FIRST (cage-match PR#124 Carnot F2): a resend of an already-persisted
+    # (channel, client_msg_id) returns the existing row — even if a block was established
+    # AFTER the original send. The block must stop NEW residue, not break reconciliation of
+    # a message legitimately sent before the block (returning the existing row leaks no new
+    # content — it is already block-filtered from the peer's reads).
     existing = (await session.execute(
         select(Message).where(
             Message.channel_id == channel.id,
@@ -137,6 +130,20 @@ async def create_outbound(
     )).scalar_one_or_none()
     if existing is not None:
         return existing, False
+    # DM SEND UNDER A BLOCK → REFUSE, at the MUTATOR door so every send path enforces it
+    # (#2633, design 11 §Decision 5; cage-match PR#124 Tesla P1a) — but only for a NEW
+    # write (after the idempotency return above). DM membership is IMMUTABLE (memberships_
+    # service), so the live member set always equals the canonical pair — resolving the
+    # peer from memberships is topology-stable, not the mutable census Tesla P2 warned of.
+    # DM-only; public/community block stays a read-only content filter.
+    if channel.kind == ChannelKind.DM:
+        peer_ids = [uid for uid in (await session.execute(
+            select(Membership.user_id).where(Membership.channel_id == channel.id)
+        )).scalars() if uid != user.id]
+        if peer_ids:
+            blocked = await moderation_service.blocked_pair_user_ids(session, user.id)
+            if any(p in blocked for p in peer_ids):
+                raise BlockedDmSend()
     if origin is not None:
         await signing_keys_service.record_signing_key(
             session, user_id=user.id,

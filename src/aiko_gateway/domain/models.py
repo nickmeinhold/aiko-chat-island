@@ -254,9 +254,10 @@ class Channel(Base):
     )
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=new_ulid)
     name: Mapped[str] = mapped_column(String(128), nullable=False)
-    # Closed set (ChannelKind): 'standard' | 'llm' | 'robot' | 'dm' | 'group'. Stored as
-    # the StrEnum's string value so the column stays a plain VARCHAR; the DB CHECK
-    # (ck_channels_kind, above) enforces membership. SECURITY: 'dm' suppresses bus
+    # Closed set (ChannelKind): 'standard' | 'llm' | 'robot' | 'dm' ('group' is NOT yet a
+    # member — added with its community-exemption when groups ship; see ChannelKind).
+    # Stored as the StrEnum's string value so the column stays a plain VARCHAR; the DB
+    # CHECK (ck_channels_kind, above) enforces membership. SECURITY: 'dm' suppresses bus
     # federation (ws.py), so this is a trust-bearing field — the CHECK is what keeps a
     # bad writer from minting a kind that bypasses that gate.
     kind: Mapped[str] = mapped_column(
