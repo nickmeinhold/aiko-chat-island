@@ -171,7 +171,3 @@ async def leave_channel(channel_id: str, user: CurrentUser, session: DbSession) 
         raise HTTPException(404, "channel not found")
     except svc.LastAdmin:
         raise HTTPException(409, "cannot leave as the last admin of a channel")
-    except svc.DmMembershipImmutable:
-        # A DM's membership is permanent — leaving would let the peer re-inject you
-        # on their next open (#2633). Hide the conversation client-side instead.
-        raise HTTPException(409, "a direct message cannot be left")

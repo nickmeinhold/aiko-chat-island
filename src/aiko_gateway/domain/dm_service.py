@@ -9,7 +9,19 @@ A DM is an ORDINARY channel — ``kind="dm"``, ``is_private=True``, ``community_
 one ``Membership`` per participant — so it inherits the whole channel/message machinery
 (auth I1, membership visibility I2 via ``acl``, existence-hiding, signed ``origin``,
 mentions, reply-to integrity, takedown retractions, reactions, the block content-filter)
-through the same enforcement doors. There is NO new table and NO migration.
+through the same enforcement doors. NO new table and NO new column — but the cage-match
+added two additive migrations on `channels`/`memberships` (0020 DM CHECK constraints,
+0021 a `memberships.user_id` index); see `docs/design/11-direct-messages.md`.
+
+CARDINALITY (why the 1:1 special-cases are sound on a member-SET model): a DM (kind='dm')
+always has N ∈ {1 (self-DM / after a leave), 2 (the pair)} members — NOT by a DB
+`CHECK(count=2)` (a per-row CHECK cannot count rows) but by construction: creation adds
+exactly the canonical pair, `add_member`/`self_join` are sealed (no 3rd party), and the
+`dm:<lo>:<hi>` key names exactly two ids. GROUPS are a DISTINCT kind ('group', future),
+never kind='dm' with N>2 — so the "member-set, not 2-capped" SCHEMA choice (no
+member_a/member_b, no cardinality column) keeps groups additive WITHOUT making a DM's
+2-ness a lie: every `kind=='dm'` special-case (block-any-peer, LiveKit one-peer, pair key)
+is correct for N∈{1,2}, and a future group PR keys its own semantics off 'group'.
 
 THREE gateway decisions live here (the reviewer-facing reasoning is in the design note):
 
@@ -179,7 +191,11 @@ async def get_or_create_dm(
         # class immutability is meant to close), so the adopt path touches only `me`.
         await _ensure_memberships(session, existing.id, [me.id])
         await session.commit()
-        return existing, member_ids
+        # Return the LIVE membership (cage-match PR#124 Tesla P1) — never the aspirational
+        # canonical pair. On re-open after an out-of-band peer removal the live set may be
+        # just [me]; POST /v1/dm's `members` must agree with GET /v1/dm (members_of_many),
+        # not advertise a peer the ACL no longer has.
+        return existing, await members_of(session, existing.id)
 
     channel = Channel(
         id=new_ulid(),
@@ -207,6 +223,9 @@ async def get_or_create_dm(
         # NULL community_id (in-memory it currently holds the null() construct, not
         # None) — callers get a faithful object, not a SQL expression.
         await session.refresh(channel)
+        # Live membership (== member_ids on a fresh create, but keep the one source of
+        # truth — the DB rows — for the return, matching the adopt path and GET /v1/dm).
+        return channel, await members_of(session, channel.id)
     except IntegrityError:
         # A concurrent POST for the same pair won the UNIQUE(aiko_channel) race. Roll
         # back our half-built channel, adopt the winner's, and make sure our memberships
@@ -230,8 +249,8 @@ async def get_or_create_dm(
         # Only the caller's membership (never re-inject the peer) — see the adopt path.
         await _ensure_memberships(session, winner.id, [me.id])
         await session.commit()
-        return winner, member_ids
-    return channel, member_ids
+        return winner, await members_of(session, winner.id)
+    # (unreachable — the try returns on success, the except returns on the race)
 
 
 async def _ensure_memberships(

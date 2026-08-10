@@ -1,6 +1,6 @@
 # Design 11 — Direct messages as 1:1 (member-set) channels (#2633)
 
-**Status:** built, awaiting cage-match. **Contract of record:**
+**Status:** built + cage-matched (PR#124, 9 adversarial rounds). **Contract of record:**
 `HANDOFF-to-app-tab-v2-social-wire.md` §#2633 + the app-tab replies on tracker
 `nickmeinhold/claude-tasks#2633` (2026-08-06). This note records the *gateway-side*
 decisions that are NOT in the ticket — the ones a reviewer needs the reasoning for.
@@ -132,12 +132,21 @@ parties' switchers. That is consistent with unread being client-side — **the c
 a conversation**; the island keeps the channel. Blocking freezes new content at the
 switcher too (no new `last_message`), but does not tombstone the shell.
 
-**Known gap — DM consent semantics (PR#124 Tesla P3, app-tab-owned):** `POST /v1/dm` is
-consentless find-or-create + immutable membership — anyone who knows your `user_id` mints a
-permanent co-membership edge; block stops speech, not presence; there is no
-accept/request/dismiss state server-side. Island-local privacy is solid; **social**
-consent is a v2 product decision the app tab owns (client-side hide is the current answer).
-Tracked as a follow-up so the group PR doesn't rediscover it — see the tracker.
+**DM lifecycle — leave is the server-side dismiss (PR#124 Tesla P0):** `leave` is NOT
+sealed for a DM. A member may drop their own membership (`DELETE /v1/channels/{id}/leave`
+→ 204), which removes the DM from their `GET /v1/dm` and is a real *server-side* dismiss,
+not just a client hide. Re-injection is impossible because the *other* end
+(`get_or_create_dm`'s adopt path) ensures only the caller's membership — it never re-adds a
+peer who left. Only GROWING the set (`add_member`/`self_join`) and removing the *other*
+party are sealed (`DmMembershipImmutable` → 409). An earlier revision sealed leave too, on
+a re-inject theory that the adopt-self-only fix retired; keeping it sealed only removed the
+one mutator that implements dismiss, so it was unsealed.
+
+**Known gap — richer DM consent (PR#124 Tesla, app-tab-owned):** `POST /v1/dm` is still
+consentless (anyone who knows your `user_id` can open a DM shell; block stops speech, and
+leave dismisses, but there is no *accept/request* gate before first contact). That request/
+accept inbox is a v2 product decision the app tab owns. Tracked (#11) so the group PR
+generalizes the block-refuse posture by topology rather than rediscovering it.
 
 ## Exclusion from `GET /v1/channels`
 

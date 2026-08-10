@@ -257,10 +257,13 @@ class Channel(Base):
         # treats is_private=false as world-readable, so a non-private DM would leak to
         # every authed user who knows the id. dm_service always sets is_private=True;
         # this makes "public DM" unrepresentable rather than merely conventional (the
-        # same "unrepresentable when wrong" lesson as the community CHECK). is_private
-        # is stored 0/1 on SQLite. Non-DM channels are unconstrained here (public
-        # channels are legitimately is_private=false).
-        CheckConstraint("kind != 'dm' OR is_private = 1",
+        # same "unrepresentable when wrong" lesson as the community CHECK). Non-DM
+        # channels are unconstrained here (public channels are legitimately
+        # is_private=false). Bare `is_private` (NOT `= 1`) so the predicate is
+        # boolean-portable (cage-match PR#124 Carnot): SQLite reads the 0/1 column as
+        # truthy, Postgres reads the boolean directly — `= 1` would not compile against a
+        # Postgres boolean if #1544 ever flips the backend.
+        CheckConstraint("kind != 'dm' OR is_private",
                         name="ck_channels_dm_private"),
         # The 'dm:' prefix ⟺ kind='dm', BIDIRECTIONAL and CASE-SENSITIVE (#2633,
         # cage-match PR#124 Carnot+Tesla). Completes the DM DB-invariant set (null

@@ -61,7 +61,7 @@ _COMMUNITY_CHECK_NEW = (
 # A DM must be private (cage-match PR#124 Carnot/Tesla) — is_private gates READ access,
 # so a non-private DM would be world-readable. Safe vs live prod: all channels are
 # 'standard' (kind != 'dm' arm passes regardless of is_private).
-_DM_PRIVATE_CHECK = "kind != 'dm' OR is_private = 1"
+_DM_PRIVATE_CHECK = "kind != 'dm' OR is_private"  # bare boolean: SQLite + Postgres portable
 # 'dm:' prefix ⟺ kind='dm', BIDIRECTIONAL + CASE-SENSITIVE (cage-match PR#124
 # Carnot+Tesla): a DM must be dm:-prefixed AND the dm: namespace is totally reserved (no
 # non-DM may wear it, at any writer). substr(...) not LIKE — SQLite LIKE case-folds ASCII

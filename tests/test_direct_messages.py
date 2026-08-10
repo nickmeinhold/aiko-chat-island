@@ -319,17 +319,23 @@ async def test_dm_cannot_be_expanded_via_members_api(app_ctx, session):
     assert intruder.id not in members
 
 
-async def test_dm_cannot_be_left(app_ctx, session):
-    """Leaving a DM is refused (409) — DM membership is permanent, so the peer's next
-    POST /v1/dm can't re-inject a member who left (the forced-re-add vector, Tesla P0)."""
+async def test_dm_leave_is_dismiss_and_not_re_injected(app_ctx, session):
+    """Leaving a DM SUCCEEDS — it is the server-side dismiss (cage-match PR#124 round 8
+    Tesla P0). And the peer's later POST /v1/dm does NOT re-inject the leaver (adopt is
+    self-only), so a leave sticks. This is why leave no longer needs sealing."""
     a = await _user(session, "alice")
     b = await _user(session, "bob")
     channel, _ = await dm_service.get_or_create_dm(session, me=a, target_user_id=b.id)
     resp = await app_ctx.delete(
         f"/v1/channels/{channel.id}/leave", headers=_auth(b))
-    assert resp.status_code == 409
-    # b is still a member (couldn't leave) — no shell, no re-inject race.
-    assert b.id in await dm_service.members_of(session, channel.id)
+    assert resp.status_code == 204, "leaving a DM is the server-side dismiss"
+    assert b.id not in await dm_service.members_of(session, channel.id)
+    # A re-opens the DM → must NOT re-inject B (who dismissed it).
+    await dm_service.get_or_create_dm(session, me=a, target_user_id=b.id)
+    assert b.id not in await dm_service.members_of(session, channel.id)
+    # B's POST /v1/dm re-opens it FOR B (their choice), re-adding only B.
+    _, members = await dm_service.get_or_create_dm(session, me=b, target_user_id=a.id)
+    assert set(members) == {a.id, b.id}
 
 
 async def test_dm_message_hidden_from_blocked_peer(app_ctx, session):

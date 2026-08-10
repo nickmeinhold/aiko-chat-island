@@ -70,18 +70,18 @@ class LastAdmin(MembershipError):
 
 
 class DmMembershipImmutable(MembershipError):
-    """Refused: the membership of a DM channel (kind=='dm') is FIXED at its two creation
-    members and cannot be mutated via the membership API — not grown (add/self-join), not
-    shrunk (leave/remove) (#2633, cage-match PR#124 Tesla P0+P2). 2-ness lives ONLY at
-    POST /v1/dm; a DM is exactly its pair, permanently.
+    """Refused: a DM channel (kind=='dm') cannot be GROWN or have the PEER removed via the
+    membership API — no add_member, no self_join, no admin remove_member of the other party
+    (#2633, cage-match PR#124). 2-ness lives ONLY at POST /v1/dm; a DM never exceeds its
+    creation pair.
 
-    WHY permanent, not just non-growable: if a member could LEAVE, then the other's next
-    POST /v1/dm re-injects them (find-or-create ensures the pair) — a forced re-add of a
-    party who exited, which no send-refuse can compensate (the harassment is the thread
-    RESURFACING). Making membership immutable removes that whole class: the live member
-    set always equals the canonical pair, so every DM special-case (block-send peer
-    resolution, the switcher listing) keys off a stable set, not mutable topology. A user
-    who wants a DM gone hides it CLIENT-side (there is no server DM-leave in the contract).
+    LEAVE (self-removal) IS ALLOWED — it is the server-side DISMISS (cage-match PR#124
+    round 8 Tesla P0). An earlier revision ALSO sealed leave, on the theory that the peer's
+    next POST /v1/dm would re-inject a member who left. That theory is now dead: the adopt
+    path of get_or_create_dm ensures ONLY the caller's membership (never re-adds the peer),
+    so a leave sticks. Keeping leave sealed would have removed the only mutator that lets a
+    user drop a DM server-side, forcing client-only hide — so leave is unsealed and this
+    seal covers only the GROW / remove-the-other directions.
 
     A HARD seal, not the incidental "DMs have no admin + are invite_only" convention, so a
     future admin-grant / open-join path can't bypass it. Refused AFTER visibility is
@@ -400,14 +400,11 @@ async def leave(
     never in the channel gets NotAMember, which the REST layer also maps to 404
     (so a private channel they can't see still answers 404).
 
-    A DM (kind=='dm') refuses leave (DmMembershipImmutable, #2633 Tesla P0): DM membership
-    is permanent, so the other party's next POST /v1/dm can't re-inject a peer who left
-    (the forced-re-add harassment vector). A user hides a DM CLIENT-side, not via leave."""
-    channel = await acl.readable_channel(session, actor_id, channel_id)
-    if channel is not None and channel.kind == ChannelKind.DM:
-        # After visibility: a member sees the DM, so this honest 409 leaks nothing; a
-        # non-member falls through to NotAMember below (→ 404, existence-hiding).
-        raise DmMembershipImmutable(channel_id)
+    LEAVE IS ALLOWED for a DM (cage-match PR#124 round 8 Tesla P0) — it is the server-side
+    DISMISS. Re-injection is prevented at the OTHER end (get_or_create_dm's adopt path
+    ensures only the caller, never re-adds a departed peer), so a leave sticks without
+    sealing this mutator. A DM has no admins, so the last-admin guard below never trips for
+    it — a DM member simply drops their own row."""
     mine = await _membership(session, channel_id, actor_id)
     if mine is None:
         raise NotAMember(actor_id)
