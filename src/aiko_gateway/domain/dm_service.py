@@ -90,7 +90,13 @@ def canonical_peer_ids(aiko_channel: str, me_id: str) -> list[str] | None:
     if not aiko_channel.startswith(DM_CHANNEL_PREFIX):
         return None
     ids = aiko_channel[len(DM_CHANNEL_PREFIX):].split(":")
-    if len(ids) != 2 or not all(ids):
+    # A valid key is exactly two 26-char ULID ids (user ids are ULIDs — String(26)).
+    # Validate LENGTH, not just part-count (cage-match PR#124 round 11 Carnot): a
+    # structurally-2-part but content-bogus key like `dm:not-ulid:not-ulid` must ALSO
+    # fail closed, else its bogus tokens are treated as peers and never match a real
+    # blocked user, silently skipping the gate. A well-formed DM (dm_service-minted)
+    # always has 26-char ULID ids; anything else is an anomalous (direct-SQL) row.
+    if len(ids) != 2 or not all(len(uid) == 26 for uid in ids):
         return None  # malformed dm: key — fail closed
     return sorted({uid for uid in ids if uid != me_id})
 

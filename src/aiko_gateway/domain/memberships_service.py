@@ -28,7 +28,7 @@ from sqlalchemy import delete, exists, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from . import acl
+from . import acl, dm_service
 from .ids import new_ulid
 # Role / JoinPolicy are defined in models.py (the persistence layer) so the closed
 # set is the single source of truth for the column default AND the DB CHECK
@@ -225,16 +225,6 @@ async def _require_admin(
     if actor is None or actor.role != ROLE_ADMIN:
         raise NotChannelAdmin(channel_id)
     return channel
-
-
-async def _reject_dm_membership_change(session: AsyncSession, channel_id: str) -> None:
-    """Raise ``DmMembershipImmutable`` if ``channel_id`` is a DM (#2633). The hard seal on
-    DM membership (add/self-join/leave/remove) — called only AFTER the caller has confirmed
-    the actor may see the channel (so it never leaks a DM's existence to a non-member).
-    ``session.get`` hits the identity map when the channel was already loaded upstream."""
-    channel = await session.get(Channel, channel_id)
-    if channel is not None and channel.kind == ChannelKind.DM:
-        raise DmMembershipImmutable(channel_id)
 
 
 async def add_member(
@@ -476,8 +466,8 @@ async def create_channel(
     OR a ``dm:``-prefixed ``aiko_channel`` (cage-match PR#124 round 10 Carnot/Tesla): a
     generic creator minting a DM — especially a MALFORMED one like ``dm:bad`` — would sit
     on the private keyspace with an unparseable pair key, so it is refused up front."""
-    if kind == "dm" or (aiko_channel is not None
-                        and aiko_channel.startswith("dm:")):
+    if kind == ChannelKind.DM or (
+            aiko_channel is not None and dm_service.is_dm_channel_name(aiko_channel)):
         raise ValueError("DMs are created via dm_service.get_or_create_dm, not create_channel")
     policy = (
         join_policy if join_policy in (JoinPolicy.OPEN, JoinPolicy.INVITE_ONLY)

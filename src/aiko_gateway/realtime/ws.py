@@ -13,7 +13,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
 
 from ..db import SessionLocal
 from ..domain import (
-    acl, auth_session, dm_service, echo, mentions, messages_service,
+    acl, auth_session, echo, mentions, messages_service,
     moderation_service, signing,
 )
 from . import envelopes
@@ -213,17 +213,13 @@ async def _handle_send(gw, conn: Connection, user, frame: dict) -> None:
     await conn.send(envelopes.ack(frame["client_msg_id"], row.id, view["created_at"]))
 
     if created:
-        # A DM NEVER FEDERATES ON THE BUS (#2633, design 11 §Decision 3). The bus is the
-        # shared ChatServer backbone; publishing a private DM there would broadcast it
-        # off-island — a content leak. So the bus publish + its echo-suppression
-        # bookkeeping are gated: a DM is island-local, delivered only by the LOCAL fanout
-        # below. DUAL PREDICATE (cage-match PR#124 Tesla): federate only if the channel is
-        # neither kind 'dm' NOR carries the reserved dm: aiko_channel prefix. The CHECK
-        # closes the kind SET but not a kind TRANSITION — a direct SQL / future mutator
-        # retinting a DM 'dm'->'standard' would otherwise re-open federation of private
-        # bodies. The dm: prefix is write-once at creation and reserved from the bus, so
-        # requiring BOTH to say "not a DM" means a lone kind mutation can't leak the room.
-        if channel.kind != "dm" and not dm_service.is_dm_channel_name(channel.aiko_channel):
+        # A DM NEVER FEDERATES ON THE BUS (#2633, design 11 §Decision 3). The federate
+        # decision is the DOMAIN's (messages_service.should_federate), NOT a predicate this
+        # route re-derives — so a second send path can't forget the DM gate and leak a
+        # private room (cage-match PR#124 round 12 Tesla P1: egress lives behind the same
+        # single domain door as the block gate). It is False for a DM (dual-gated on kind
+        # AND the dm: prefix, so a lone kind retint can't re-open it).
+        if messages_service.should_federate(channel):
             # Mark our publish so its bus echo is dropped by ingest (Phase 0 payoff).
             echo.mark_sent(channel.aiko_channel, user.aiko_username, frame["body"])
             gw.bus.send(user.aiko_username, channel.aiko_channel, frame["body"])

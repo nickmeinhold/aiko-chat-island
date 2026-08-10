@@ -87,6 +87,18 @@ def retraction_view(r: Retraction) -> dict:
     }
 
 
+def should_federate(channel: Channel) -> bool:
+    """Whether a message on ``channel`` may be PUBLISHED to the shared aiko bus. FALSE for
+    a DM — dual-gated on BOTH ``kind != 'dm'`` AND the ``dm:`` prefix (#2633, design 11
+    §Decision 3), so a lone kind retint can't re-federate a private room. This lives in the
+    DOMAIN (not the ws route) so EVERY send path shares the one privacy decision — the same
+    mutator-door law Decision 5's block gate follows (cage-match PR#124 round 12 Tesla P1:
+    federation-egress and block-refuse are one trust class; both must live behind one door,
+    not one sealed at the mutator and one at the transport)."""
+    return channel.kind != ChannelKind.DM and not dm_service.is_dm_channel_name(
+        channel.aiko_channel)
+
+
 async def create_outbound(
     session: AsyncSession, *, user: User, channel: Channel,
     body: str, client_msg_id: str, reply_to: str | None = None,
@@ -94,7 +106,10 @@ async def create_outbound(
 ) -> tuple[Message, bool]:
     """Persist a user's outgoing message (server ULID, server-derived sender —
     invariant I5). Idempotent on (channel, client_msg_id): a resend returns the
-    existing row. Returns (row, created).
+    existing row. Returns (row, created). The caller decides bus federation via the
+    shared domain predicate ``should_federate(channel)`` (never its own) — cage-match
+    PR#124 round 12 Tesla P1: the DM egress decision lives in ONE domain function so a
+    second send path can't forget it.
 
     `origin` is the SHAPE-validated sovereign-signing envelope (already checked by
     domain/signing.validate_origin at the call site, incl. that its client_msg_id

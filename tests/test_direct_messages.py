@@ -451,9 +451,26 @@ async def test_canonical_peer_ids_fails_closed_on_malformed_key(session):
     b = _ulid(2)
     assert dm_service.canonical_peer_ids(f"dm:{a}:{b}", a) == [b]      # pair
     assert dm_service.canonical_peer_ids(f"dm:{a}:{a}", a) == []       # self-DM
-    assert dm_service.canonical_peer_ids("dm:bad", a) is None          # malformed → None
+    assert dm_service.canonical_peer_ids("dm:bad", a) is None          # 1 part → None
     assert dm_service.canonical_peer_ids("dm:a:b:c", a) is None        # too many parts
+    assert dm_service.canonical_peer_ids("dm:not-ulid:not-ulid", a) is None  # 2 parts but non-ULID
     assert dm_service.canonical_peer_ids("general", a) is None         # not a dm: key
+
+
+async def test_should_federate_domain_decision(session):
+    """should_federate is the ONE domain-owned bus-egress predicate (cage-match PR#124
+    round 12 Tesla P1): False for a DM (dual-gated on kind AND dm: prefix), True for a
+    normal channel. Every send path uses this, never its own predicate."""
+    from sqlalchemy import null
+    dm = Channel(id=_ulid(7), name="d", kind="dm", aiko_channel="dm:x:y",
+                 is_private=True, community_id=null())
+    std = Channel(id=_ulid(8), name="general", kind="standard", aiko_channel="general",
+                  is_private=False)
+    assert messages_service.should_federate(dm) is False
+    assert messages_service.should_federate(std) is True
+    # A kind retint alone can't re-open federation — the dm: prefix leg still gates.
+    dm.kind = "standard"
+    assert messages_service.should_federate(dm) is False
 
 
 async def test_create_channel_refuses_dm(session):
