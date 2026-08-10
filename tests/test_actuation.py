@@ -496,6 +496,14 @@ def test_verify_and_advance_rejects_unlisted_command(tmp_path):
                            now_ms=_NOW, expected_robot_id="arm-1", allowed_commands={"nod"})
 
 
+def test_verify_and_advance_requires_non_empty_allowed_pubkeys(tmp_path):
+    # Symmetry with allowed_commands — an empty allowlist is a misconfiguration, fail fast.
+    hw = SeqHighWater(str(tmp_path / "seq.json"))
+    with pytest.raises(ActuationError, match="allowed_pubkeys"):
+        verify_and_advance(_envelope(), allowed_pubkeys=set(), seq_store=hw,
+                           now_ms=_NOW, expected_robot_id="arm-1", allowed_commands={"wave"})
+
+
 def test_verify_and_advance_wrong_robot_rejected(tmp_path):
     # A signed command for arm-2 must not actuate arm-1's bridge.
     hw = SeqHighWater(str(tmp_path / "seq.json"))
@@ -504,21 +512,37 @@ def test_verify_and_advance_wrong_robot_rejected(tmp_path):
                            seq_store=hw, now_ms=_NOW, expected_robot_id="arm-1", allowed_commands={"wave", "terminate"})
 
 
-def test_persist_failure_surfaces_as_actuation_error(tmp_path):
-    # A store in a read-only directory can't persist — the failure must surface as
-    # ActuationError (not a raw OSError) so the caller's fail-closed handler catches it.
-    import os
-    if hasattr(os, "geteuid") and os.geteuid() == 0:
-        pytest.skip("running as root — directory mode does not block writes")
-    d = tmp_path / "ro"
-    d.mkdir()
-    hw = SeqHighWater(str(d / "seq.json"))
-    os.chmod(d, 0o500)  # read+execute, no write
-    try:
-        with pytest.raises(ActuationError, match="persist failed"):
-            hw._check_and_advance("arm-1", 1)
-    finally:
-        os.chmod(d, 0o700)  # restore so tmp cleanup can remove it
+def test_persist_failure_surfaces_as_actuation_error_and_rolls_back(tmp_path, monkeypatch):
+    # Mock the OSError (not chmod) so this runs EVERYWHERE — CI containers often run as root,
+    # where a dir-mode approach silently skips exactly the env meant to enforce fail-closed.
+    hw = SeqHighWater(str(tmp_path / "seq.json"))
+    hw._check_and_advance("arm-1", 5)  # establishes a durable mark at 5
+
+    def boom(*a, **k):
+        raise OSError("disk full")
+    monkeypatch.setattr(hw, "_persist", boom)
+
+    # A persist failure must surface as ActuationError (not raw OSError) ...
+    with pytest.raises(ActuationError, match="persist failed"):
+        hw._check_and_advance("arm-1", 6)
+    # ... AND roll the in-memory mark back to 5 (memory never leads disk): once the store is
+    # writable again, seq=6 is NOT already-burned and still advances.
+    monkeypatch.undo()
+    assert hw._check_and_advance("arm-1", 6) is True
+
+
+def test_persist_failure_rolls_back_absent_mark(tmp_path, monkeypatch):
+    # Rollback when the robot had NO prior mark: a failed first advance must not leave a
+    # phantom in-memory mark that would reject the legitimate retry.
+    hw = SeqHighWater(str(tmp_path / "seq.json"))
+
+    def boom(*a, **k):
+        raise OSError("disk full")
+    monkeypatch.setattr(hw, "_persist", boom)
+    with pytest.raises(ActuationError, match="persist failed"):
+        hw._check_and_advance("arm-9", 1)
+    monkeypatch.undo()
+    assert hw._check_and_advance("arm-9", 1) is True  # not burned by the failed attempt
 
 
 # ---- sole-exception contract: encode failures normalize to ActuationError ----

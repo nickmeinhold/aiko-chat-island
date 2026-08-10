@@ -64,11 +64,18 @@ commander + the LiveKit transport are out of this repo — tracked as follow-ups
     reaches ``seq=100`` and commander B (also allowlisted) then sends a valid ``seq=50``, B's
     command is dropped. For increment 1 (one commander per robot) this holds; a genuine
     multi-commander deployment must key the store by ``(robot_id, sender_pubkey)`` instead.
-  * A persist failure keeps the in-memory mark advanced (fail-safe) but leaves DISK at the old
-    mark. On a bridge RESTART after such a failure the store reloads the lower mark, so a
-    still-fresh, previously memory-only-burned envelope can actuate ONCE (bounded by
-    ``max_age_ms`` and still requiring a valid signature) — "spent" is process-lifetime, not
-    crash-lifetime. Treat a persist failure as an operator-visible fault, not a soft skip.
+  * A persist failure ROLLS BACK the in-memory mark (memory never leads disk) and raises
+    ``ActuationError`` without actuating — so the seq is not consumed and can be retried once
+    the store is writable. A persist failure is still an operator-visible fault (the store is
+    unwritable), but it no longer burns a seq or opens a restart-replay window.
+  * ``SeqHighWater`` uses ONE lock across all robots (not per-robot) and fsyncs inside it, so a
+    slow disk head-of-line-blocks every robot's admit. Correct for a command-rate wave loop;
+    a high-frequency or many-robot bridge should move to per-robot locks. It is also
+    single-PROCESS: two bridge processes on one store file can each admit the same seq — run
+    exactly one (a follow-up adds an interprocess lock).
+  * ``allowed_pubkeys`` entries MUST be canonical Multikey strings as emitted by
+    ``encode_multikey`` (the incoming key is canonicalized before the membership test); a
+    hand-pasted non-canonical spelling fails closed (the real commander is silently rejected).
 """
 from __future__ import annotations
 
@@ -84,7 +91,6 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from .signing import (
     MAX_PUBKEY_STR,
-    MAX_SIGNED_AT_MS,
     OriginError,
     SIG_RAW_LEN,
     b64url_raw,
@@ -103,6 +109,11 @@ SUPPORTED_V = 1
 _MAX_ROBOT_ID = 128                 # a robot identity string cap (untrusted wire input)
 _MAX_COMMAND = 64                   # a command token cap; the bridge additionally maps it through a CLOSED table
 _MAX_SIG_STR = 128
+# signed_at_ms ceiling pinned LOCALLY (not imported from signing.py): this module's thesis is
+# "never inherit the carriage module's assumptions", and signing.py validates timestamps for a
+# different threat model (carried messages where a minutes-old ts is benign). A far-future ms
+# clock value, comfortably inside u64 so struct.pack(">Q") never raises.
+_MAX_SIGNED_AT_MS = 1 << 62
 # seq ceiling is 2**53-1 (JS Number.MAX_SAFE_INTEGER), NOT full u64: the wire is JSON and a
 # JavaScript/TypeScript commander loses integer precision above 2**53-1, so an independent
 # signer and this verifier could silently diverge on a larger seq. Cap it at the interop floor.
@@ -244,7 +255,7 @@ def verify_actuation(
         raise ActuationError(f"seq must be a non-negative integer <= 2**53-1 ({_MAX_SEQ}) for JSON interop")
 
     ts = raw["signed_at_ms"]
-    if isinstance(ts, bool) or not isinstance(ts, int) or ts < 0 or ts > MAX_SIGNED_AT_MS:
+    if isinstance(ts, bool) or not isinstance(ts, int) or ts < 0 or ts > _MAX_SIGNED_AT_MS:
         raise ActuationError("signed_at_ms must be a sane non-negative integer")
 
     pubkey_str = raw["sender_pubkey"]
@@ -325,8 +336,9 @@ class SeqHighWater:
     concurrent callers (a lock serializes the read-modify-write) — LiveKit data handlers can
     fire concurrently, and an unguarded RMW would let two callers both observe
     ``seq > high_water`` and both actuate (a double wave). On a persist failure the in-memory
-    mark stays advanced (fail-safe: rejects more, never actuates more) and the error surfaces
-    as ``ActuationError``.
+    mark is ROLLED BACK (memory never leads disk: admit ⇔ durable commit) and the error
+    surfaces as ``ActuationError`` — the failing call refuses to actuate, and the rolled-back
+    seq is safe to retry once the store is writable again.
     """
 
     def __init__(self, path: str) -> None:
@@ -374,17 +386,23 @@ class SeqHighWater:
             raise ActuationError(f"seq must be a non-negative integer <= 2**53-1 ({_MAX_SEQ})")
         # Serialize the read-modify-write: concurrent LiveKit handlers must not both pass.
         with self._lock:
-            if seq <= self._marks.get(robot_id, -1):
+            prev = self._marks.get(robot_id)  # None if this robot has no mark yet
+            if seq <= (prev if prev is not None else -1):
                 return False
             self._marks[robot_id] = seq
             try:
                 self._persist()
             except OSError as e:
-                # The mark stays advanced in memory — that is the FAIL-SAFE direction (it only
-                # ever rejects MORE, never actuates more). Surface as ActuationError (not a raw
-                # OSError) so the caller's `except ActuationError` catches it and does NOT
-                # actuate on a mark we could not durably commit.
-                raise ActuationError(f"seq high-water persist failed: {e} — refusing to actuate") from e
+                # ROLL BACK so memory never leads disk: admit ⇔ durable commit. The failing
+                # call already refuses to actuate (it raises), so a rolled-back seq is safe to
+                # retry — no permanent in-process wedge, and no post-restart replay of a
+                # memory-only-burned seq. Surface as ActuationError (not raw OSError) so the
+                # caller's fail-closed handler catches it.
+                if prev is None:
+                    self._marks.pop(robot_id, None)
+                else:
+                    self._marks[robot_id] = prev
+                raise ActuationError(f"seq high-water persist failed: {e} — not advanced, refusing to actuate") from e
             return True
 
     def _persist(self) -> None:
@@ -464,6 +482,10 @@ def verify_and_advance(
         raise ActuationError("expected_robot_id must be a non-empty string on the sealed door")
     if not isinstance(allowed_commands, (set, frozenset)) or not allowed_commands:
         raise ActuationError("allowed_commands must be a non-empty set on the sealed door")
+    # Symmetry with allowed_commands: an empty allowlist rejects every commander (safe but
+    # opaque — indistinguishable from attack traffic). Fail FAST on the misconfiguration.
+    if not isinstance(allowed_pubkeys, (set, frozenset)) or not allowed_pubkeys:
+        raise ActuationError("allowed_pubkeys must be a non-empty set on the sealed door")
     # Caller-surface guard: a wrong seq_store would raise AttributeError below, escaping the
     # sole-exception contract this door also sells.
     if not isinstance(seq_store, SeqHighWater):
