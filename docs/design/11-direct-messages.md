@@ -85,21 +85,21 @@ in the `channel_list` EC share and never subscribed, so the reconcile worker
   quote can render "message removed" rather than "unavailable") is an additive follow-up
   the app tab can request — noted, not built, to avoid inventing wire shape unilaterally.
 
-## Decision 5 — block is a CONTENT filter, not a creation gate (flagged fork)
+## Decision 5 — a DM SEND under a block is REFUSED (Nick's ruling 2026-08-10)
 
-`POST /v1/dm` does **not** refuse a DM between users in a block relationship, and does
-not consult `is_blocked_between`. Rationale: the shared read/fanout path already
-neutralizes a DM under a block — `get_history` and the live-fanout `exclude` both drop
-blocked-pair messages in both directions — so the channel is **inert** (no content flows
-either way) without a creation gate. This matches how @-mentions moved block enforcement
-off carriage and onto the interaction/notification layer (#2632). A creation-time gate
-would also leak the block *direction* (returning "blocked" tells A that B blocked them),
-which existence-hiding forbids.
+`POST /v1/dm` still does **not** block-gate creation (a creation-time refusal would leak
+the block *direction*, and the channel shell is harmless). But the **send** is gated: in
+`_handle_send`, if the channel is a DM (`kind == "dm"`) and the sender is in a block
+relationship with the DM peer, the send is **refused**, collapsed into the SAME
+existence-hiding `no_channel` error as a missing/unreadable channel (so the refusal never
+reveals who blocked whom, and is symmetric in both block directions).
 
-**This is a fork worth a second opinion** (moderation semantics). The alternative —
-fold a blocked target into the same 404 as a missing user at creation time — is a
-one-line addition if the app tab / Nick prefers "you cannot open a DM with someone
-you've blocked". Default shipped: no creation gate, block stays a content filter.
+Why refuse rather than filter (the cage-match fork, PR#124 Tesla): a public channel keeps
+block as a read-only *content filter* (a blocked author's message is still seen by
+everyone else). But a **1:1 room** has no "everyone else" — a blocked sender's message
+reaches nobody, so a persisted-but-filtered row is pure dead storage that an **unblock
+would resurface** ("inbox of ghosts"). Refusing the send means no residue accrues.
+DM-specific (keyed on `kind == "dm"`) — public/community block semantics are unchanged.
 
 ## Exclusion from `GET /v1/channels`
 
@@ -156,14 +156,12 @@ two unenforced assumptions. Both are now enforced, not merely documented:
    queries (`members_of_many` + `last_visible_messages`), not per-channel, so the switcher
    endpoint has no N+1.
 
-### Still open for Nick — Decision 5 (block posture) revisited
+### Decision 5 resolved (Nick, 2026-08-10): refuse the send
 
-Tesla's sharpest non-mechanical point: block-as-content-filter means a DM channel under a
-block is *readable-inert* but not *storage-inert* — the blocked party can still open the
-channel and write rows the other never sees, and an **unblock resurfaces that backlog**.
-That is a real moderation-semantics fork, not a bug: the shipped default (content filter,
-no creation/send gate) matches the mentions precedent and never leaks the block direction,
-but the alternative (refuse the DM *send* under a block, same 404 as a missing target, so
-no residue accrues) is a stronger anti-harassment posture. This is a product call, flagged
-for Nick — not decided unilaterally in the build.
+Tesla's sharpest non-mechanical point — block-as-content-filter leaves a DM
+*readable-inert* but not *storage-inert*, so an unblock resurfaces the backlog — was put
+to Nick as a product fork. Ruling: **refuse the DM send under a block** (see the rewritten
+Decision 5 above). Implemented in `_handle_send`, tested in
+`test_dm_send_under_block_is_refused` (symmetric, existence-hiding). Public-channel block
+semantics are unchanged.
 </content>

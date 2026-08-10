@@ -482,12 +482,11 @@ async def test_dm_send_does_not_publish_to_bus(ws_ctx):
     assert len(persisted) == 1, "the DM message is persisted island-locally"
 
 
-async def test_dm_send_under_block_persists_but_is_filtered(ws_ctx):
-    """Pins the shipped Decision 5 behavior (block = CONTENT filter, not a send gate):
-    a blocked sender's DM message is still PERSISTED (storage is not inert) but is
-    FILTERED from the recipient's history. This is the fork flagged for Nick — the test
-    documents the current posture so a decision to switch to 'refuse the send' shows up
-    as an intentional change here."""
+async def test_dm_send_under_block_is_refused(ws_ctx):
+    """Decision 5 (Nick's ruling 2026-08-10): a DM send under a block is REFUSED, not
+    filtered — so NO dead-storage residue accrues (nothing to resurface on unblock). The
+    refusal collapses into the existence-hiding 'no_channel' error, so it never leaks the
+    block direction."""
     session = ws_ctx
     a = await _user(session, "alice")
     b = await _user(session, "bob")
@@ -496,14 +495,21 @@ async def test_dm_send_under_block_persists_but_is_filtered(ws_ctx):
     conn = _RecordingConn(a.id)
     await _handle_send(SimpleNamespace(bus=_FakeBus(), hub=Hub()), conn, a, {
         "type": "send", "channel_id": channel.id,
-        "client_msg_id": "c1", "body": "still stored"})
-    # The row IS persisted (storage not inert)...
+        "client_msg_id": "c1", "body": "should not persist"})
+    # Refused with the existence-hiding shape — no direction leak.
+    assert any(f.get("type") == "error" and f.get("code") == "no_channel"
+               for f in conn.sent)
+    # Nothing persisted — no residue to resurface on a later unblock.
     persisted = (await session.execute(
         Message.__table__.select().where(Message.channel_id == channel.id))).all()
-    assert len(persisted) == 1
-    # ...but B (the blocker) sees nothing in history — the content filter hides it.
-    hist = await messages_service.get_history(session, channel.id, b.id, limit=50)
-    assert hist == []
+    assert len(persisted) == 0
+    # It refuses in BOTH block directions (blocker A→B and blocked-by B→A): symmetric.
+    conn2 = _RecordingConn(b.id)
+    await _handle_send(SimpleNamespace(bus=_FakeBus(), hub=Hub()), conn2, b, {
+        "type": "send", "channel_id": channel.id,
+        "client_msg_id": "c2", "body": "also refused"})
+    assert any(f.get("type") == "error" and f.get("code") == "no_channel"
+               for f in conn2.sent)
 
 
 async def test_standard_channel_send_still_publishes_to_bus(ws_ctx):

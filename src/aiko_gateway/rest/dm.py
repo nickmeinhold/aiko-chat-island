@@ -41,10 +41,10 @@ async def open_dm(body: OpenDmReq, user: CurrentUser, session: DbSession) -> dic
         channel, member_ids = await dm_service.get_or_create_dm(
             session, me=user, target_user_id=body.target_user_id)
     except dm_service.TargetNotFound:
-        # Same 404 the contract promises for a bad target. (Block is NOT gated here —
-        # design 11 §Decision 5: block is a content filter on the shared read/fanout
-        # path, which makes a DM under a block inert without a creation gate, and a
-        # creation-time refusal would leak the block direction.)
+        # Same 404 the contract promises for a bad target. Block is NOT gated at
+        # CREATION (a creation-time refusal would leak the block direction, and the
+        # channel shell is harmless) — the block gate is on the SEND, in the ws path
+        # (design 11 §Decision 5, Nick 2026-08-10: a DM send under a block is refused).
         raise HTTPException(404, "user not found")
     except dm_service.DmKeyCollision:
         # The deterministic dm:<lo>:<hi> key is held by a non-DM channel — fail closed
