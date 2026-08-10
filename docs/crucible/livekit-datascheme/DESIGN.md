@@ -1,7 +1,91 @@
 # DESIGN — `livekit://` DataScheme (Cast)
 
-Status: **design, pre-Temper.** Target repo: `aiko_services` (Andy Gelme's) via fork PR —
-NOT a unilateral commit. This doc is the mold the cage-match strikes.
+Status: **RE-CAST after Temper round 1 — UN-STRUCK (needs a round-2 strike before build).**
+Target repo: `aiko_services` (Andy Gelme's) via fork PR — NOT a unilateral commit.
+
+## TEMPER ROUND 1 — verdict + re-cast (2026-08-11, PR #125)
+
+**Unanimous REQUEST_CHANGES** from 3 cross-family adversaries (Kelvin/Gemini,
+Carnot/GPT, Tesla/Grok; Wu/Kimi dark on a 402 billing error — 3 seated, gate met).
+The strike CONVERGED, and the candidate's VISION survived ("LiveKit *as* aiko
+transport is the right direction" — all three) but its MECHANISM was overturned.
+Binding re-cast decisions folded in below (the original in-process shape is kept
+further down for provenance, struck-through in intent):
+
+- **[REFRAME — flips the default] The in-process asyncio `Room` is NOT the spine.**
+  The PRIMARY falsifier FIRED: `scheme_zmq` teardown is safe only because
+  `zmq.RCVTIMEO` forces the blocking recv to observe the terminate flag — asyncio +
+  native WebRTC/FFI threads give no such guarantee, so a hung `disconnect()` orphans
+  the thread/loop/peer-connections and restart storms leak (Fold-D makes the leak
+  *observable*, not *prevented*). **New default: `livekit://` is a first-class scheme
+  whose `create_*` owns a SUPERVISED OUT-OF-PROCESS helper/sidecar**, speaking frames
+  over the already-solved `zmq://`/unix path. First-class discoverability +
+  EC-observability live at the **URL + registration** layer; process isolation is an
+  impl choice that lets the OS reap what Python can't. In-process `Room` demoted to an
+  optional fast-path, gated on a written **restart-storm acceptance test** (after N×
+  create→traffic→destroy, thread/fd/native counts flat, OR the next `create_*`
+  fail-closes until the prior bridge is reaped/the process recycled).
+- **[FATAL unstated — Tesla] Write the duplex invariant.** camera→app + app→actuation
+  on one `channel_id` = two `Room.connect` with one island identity = LiveKit
+  last-session-wins (one room dies, mis-read as link death by Fold-A). Invariant:
+  **one Room per (process, channel_id, island identity), shared by source+target** —
+  OR **two distinct island identities** (a dedicated robot principal vs the human).
+  Which → the identity model below.
+- **[Identity — Kelvin+Tesla] A dedicated MACHINE principal, not the operator's
+  session on the host.** Product rule = `DM(robot_user, human)`. A human token on the
+  robot means phone+robot can't co-exist in the room (same LiveKit identity). The
+  refresh-token storage/revocation/recovery lifecycle for that machine principal is a
+  real sub-design, not a "provisioning step."
+- **[Token boundary — Tesla+Carnot] Close the `island_url` hole; capability-scope the
+  token.** `island_url` from pipeline config is the `scheme_http` SSRF hole relocated —
+  a malicious base URL harvests the session bearer. Require: **allowlisted island
+  origin, no free-form base URL from untrusted shares, session token never sent to a
+  non-island host** (pin/validate like `scheme_http`). And the token must be
+  **audience/capability-scoped to video-token minting**, not a full user session that
+  also authorizes other island API actions.
+- **[Decouple — Carnot+Tesla] Transport auth ≠ chat topology.** A reusable
+  `aiko_services` transport must not REQUIRE a DM channel model to exist. Least
+  privilege = an **explicit short-lived room capability (publish/subscribe bits)**, not
+  "whatever DM means this quarter." DM-only/2-party is named a **temporary island
+  policy**, not a DataScheme security theorem; a machine-room mint path must not wait on
+  chat features (#2731).
+- **[Dual-mode — Carnot+Tesla] Direct-mint becomes a SEPARATE scheme `livekit-local://`.**
+  Keeping island-auth + `LIVEKIT_*` direct-mint behind one `livekit://` is
+  config-dependent security operators misread; a flag typo must not silently select the
+  master-secret path. Mutually exclusive by scheme name / package extra.
+- **[Cross-thread media — Tesla] Buffer ownership + call-after-destroy gate.** Deep-COPY
+  frames into the queue before `put` (the SDK recycles native buffers after the async
+  iterator advances → use-after-recycle tearing that a pixel-identity test won't catch);
+  a **generation counter / "closed" gate on the SYNC `capture_frame` path** so publish
+  can't run after `VideoSource` teardown begins (Fold-B closed create-vs-first-frame but
+  not destroy-vs-in-flight). Treat non-contiguous/wrong-dtype publish as ERROR.
+- **[Runtime creds — Tesla] The mint chain is a lifecycle, not a connect-time check.**
+  access-token → video-token → LiveKit JWT is a chain of expiries; the robot loop runs
+  hours. Re-mint on every connect/reconnect; define behavior when mint succeeds but the
+  room JWT expires mid-session — else Fold-A's disconnect path becomes an auth incident
+  mislabeled as network. (Pulls reconnect/creds forward from step 3 into the spine.)
+- **[Also folded, lower severity]** DataSource **track selection** must be explicit
+  (a DM room accrues multiple tracks over time → wrong-video risk); backpressure must
+  reach the **SFU/decoder** (subscription pause / adaptive quality), not only the Python
+  queue.
+
+**Re-cast build order (supersedes the one below):** 1 = the out-of-process helper +
+`zmq://` frame bridge + island-endpoint capability-token fetch (allowlisted origin) +
+the restart-storm acceptance test, publish direction, dedicated robot principal. 2 =
+subscribe + track selection. 3 = in-process fast-path ONLY if step-1's isolation proves
+insufficient AND the restart-storm test passes. Reconnect/creds-lifecycle is folded into
+step 1, not deferred.
+
+**This re-cast is UN-STRUCK** — per the crucible, a substantial post-Temper recast is
+itself un-tempered; the four load-bearing changes (out-of-process default, duplex
+invariant, island_url boundary, machine-principal identity) need a **round-2 strike**
+before this is "battle-tested" enough to hand to Andy as build-ready. The author's 6
+claims + Fold A–F remain the build checklist, not the ceiling.
+
+---
+
+_Original pre-Temper design below (provenance; the Shape/build-order are superseded by
+the re-cast above)._
 
 ## Problem
 
