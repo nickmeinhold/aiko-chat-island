@@ -290,7 +290,7 @@ def test_freshness_one_ms_past_forward_skew_rejected():
 
 def test_expected_robot_id_match_accepted():
     env = _envelope(robot_id="arm-1")
-    parsed = verify_actuation(env, allowed_pubkeys=_ALLOW, now_ms=_NOW, expected_robot_id="arm-1")
+    parsed = verify_actuation(env, allowed_pubkeys=_ALLOW, now_ms=_NOW, expected_robot_id="arm-1", allowed_commands={"wave", "terminate"})
     assert parsed["robot_id"] == "arm-1"
 
 
@@ -298,23 +298,23 @@ def test_expected_robot_id_mismatch_rejected():
     # A validly-signed command for arm-2 must be rejected by a bridge that owns arm-1.
     env = _envelope(robot_id="arm-2")
     with pytest.raises(ActuationError, match="does not match"):
-        verify_actuation(env, allowed_pubkeys=_ALLOW, now_ms=_NOW, expected_robot_id="arm-1")
+        verify_actuation(env, allowed_pubkeys=_ALLOW, now_ms=_NOW, expected_robot_id="arm-1", allowed_commands={"wave", "terminate"})
 
 
 # ---- the sealed door: verify_and_advance ----
 
 def test_verify_and_advance_happy_path(tmp_path):
     hw = SeqHighWater(str(tmp_path / "seq.json"))
-    parsed = verify_and_advance(_envelope(seq=1), allowed_pubkeys=_ALLOW, seq_store=hw, now_ms=_NOW, expected_robot_id="arm-1")
+    parsed = verify_and_advance(_envelope(seq=1), allowed_pubkeys=_ALLOW, seq_store=hw, now_ms=_NOW, expected_robot_id="arm-1", allowed_commands={"wave", "terminate"})
     assert parsed["command"] == "wave"
 
 
 def test_verify_and_advance_replay_raises(tmp_path):
     hw = SeqHighWater(str(tmp_path / "seq.json"))
-    verify_and_advance(_envelope(seq=5), allowed_pubkeys=_ALLOW, seq_store=hw, now_ms=_NOW, expected_robot_id="arm-1")
+    verify_and_advance(_envelope(seq=5), allowed_pubkeys=_ALLOW, seq_store=hw, now_ms=_NOW, expected_robot_id="arm-1", allowed_commands={"wave", "terminate"})
     # a fresh, validly-signed envelope reusing seq=5 is a replay → ActuationError, not False
     with pytest.raises(ActuationError, match="replay or stale"):
-        verify_and_advance(_envelope(seq=5), allowed_pubkeys=_ALLOW, seq_store=hw, now_ms=_NOW, expected_robot_id="arm-1")
+        verify_and_advance(_envelope(seq=5), allowed_pubkeys=_ALLOW, seq_store=hw, now_ms=_NOW, expected_robot_id="arm-1", allowed_commands={"wave", "terminate"})
 
 
 def test_verify_and_advance_does_not_advance_on_bad_signature(tmp_path):
@@ -324,9 +324,9 @@ def test_verify_and_advance_does_not_advance_on_bad_signature(tmp_path):
     forged = _envelope(seq=(1 << 53) - 2)
     forged["command"] = "terminate"  # breaks the signature
     with pytest.raises(ActuationError, match="does not verify"):
-        verify_and_advance(forged, allowed_pubkeys=_ALLOW, seq_store=hw, now_ms=_NOW, expected_robot_id="arm-1")
+        verify_and_advance(forged, allowed_pubkeys=_ALLOW, seq_store=hw, now_ms=_NOW, expected_robot_id="arm-1", allowed_commands={"wave", "terminate"})
     # high-water untouched → a normal seq=1 still actuates
-    assert verify_and_advance(_envelope(seq=1), allowed_pubkeys=_ALLOW, seq_store=hw, now_ms=_NOW, expected_robot_id="arm-1")["seq"] == 1
+    assert verify_and_advance(_envelope(seq=1), allowed_pubkeys=_ALLOW, seq_store=hw, now_ms=_NOW, expected_robot_id="arm-1", allowed_commands={"wave", "terminate"})["seq"] == 1
 
 
 def test_verify_and_advance_unallowlisted_key_does_not_advance(tmp_path):
@@ -343,9 +343,9 @@ def test_verify_and_advance_unallowlisted_key_does_not_advance(tmp_path):
            "signed_at_ms": _NOW, "sender_pubkey": other_pub,
            "sig": base64.urlsafe_b64encode(other.sign(msg)).rstrip(b"=").decode()}
     with pytest.raises(ActuationError, match="allowlisted"):
-        verify_and_advance(env, allowed_pubkeys=_ALLOW, seq_store=hw, now_ms=_NOW, expected_robot_id="arm-1")
+        verify_and_advance(env, allowed_pubkeys=_ALLOW, seq_store=hw, now_ms=_NOW, expected_robot_id="arm-1", allowed_commands={"wave", "terminate"})
     # store never advanced by an unauthorized max-seq envelope
-    assert verify_and_advance(_envelope(seq=1), allowed_pubkeys=_ALLOW, seq_store=hw, now_ms=_NOW, expected_robot_id="arm-1")["seq"] == 1
+    assert verify_and_advance(_envelope(seq=1), allowed_pubkeys=_ALLOW, seq_store=hw, now_ms=_NOW, expected_robot_id="arm-1", allowed_commands={"wave", "terminate"})["seq"] == 1
 
 
 def test_concurrent_check_and_advance_admits_one(tmp_path):
@@ -465,10 +465,35 @@ def test_allowed_commands_accepts_listed_command():
 # ---- the sealed door REQUIRES identity binding (fail-closed, not opt-in) ----
 
 def test_verify_and_advance_requires_expected_robot_id(tmp_path):
-    # Omitting expected_robot_id must be a TypeError at call time — not silently unbound.
+    # Omitting expected_robot_id (and allowed_commands) is a TypeError at call time.
     hw = SeqHighWater(str(tmp_path / "seq.json"))
     with pytest.raises(TypeError):
         verify_and_advance(_envelope(), allowed_pubkeys=_ALLOW, seq_store=hw, now_ms=_NOW)
+
+
+def test_verify_and_advance_none_expected_robot_id_fails_closed(tmp_path):
+    # The BLOCKER: a required param is not a value guard. Passing None must NOT silently
+    # skip identity binding (which would let a signed arm-2 command actuate arm-1).
+    hw = SeqHighWater(str(tmp_path / "seq.json"))
+    with pytest.raises(ActuationError, match="expected_robot_id"):
+        verify_and_advance(_envelope(robot_id="arm-2"), allowed_pubkeys=_ALLOW, seq_store=hw,
+                           now_ms=_NOW, expected_robot_id=None, allowed_commands={"wave"})
+
+
+def test_verify_and_advance_requires_non_empty_allowed_commands(tmp_path):
+    # The blessed door fails closed on WHAT as well as WHO — an empty/None command set is
+    # rejected, so a bridge cannot forget command admission and run any signed string.
+    hw = SeqHighWater(str(tmp_path / "seq.json"))
+    with pytest.raises(ActuationError, match="allowed_commands"):
+        verify_and_advance(_envelope(), allowed_pubkeys=_ALLOW, seq_store=hw,
+                           now_ms=_NOW, expected_robot_id="arm-1", allowed_commands=set())
+
+
+def test_verify_and_advance_rejects_unlisted_command(tmp_path):
+    hw = SeqHighWater(str(tmp_path / "seq.json"))
+    with pytest.raises(ActuationError, match="not in the allowed set"):
+        verify_and_advance(_envelope(command="wave"), allowed_pubkeys=_ALLOW, seq_store=hw,
+                           now_ms=_NOW, expected_robot_id="arm-1", allowed_commands={"nod"})
 
 
 def test_verify_and_advance_wrong_robot_rejected(tmp_path):
@@ -476,7 +501,7 @@ def test_verify_and_advance_wrong_robot_rejected(tmp_path):
     hw = SeqHighWater(str(tmp_path / "seq.json"))
     with pytest.raises(ActuationError, match="does not match"):
         verify_and_advance(_envelope(robot_id="arm-2"), allowed_pubkeys=_ALLOW,
-                           seq_store=hw, now_ms=_NOW, expected_robot_id="arm-1")
+                           seq_store=hw, now_ms=_NOW, expected_robot_id="arm-1", allowed_commands={"wave", "terminate"})
 
 
 def test_persist_failure_surfaces_as_actuation_error(tmp_path):
@@ -526,4 +551,4 @@ def test_allowed_commands_non_set_rejected():
 def test_verify_and_advance_bad_seq_store_rejected():
     with pytest.raises(ActuationError, match="seq_store"):
         verify_and_advance(_envelope(), allowed_pubkeys=_ALLOW, seq_store=object(),
-                           now_ms=_NOW, expected_robot_id="arm-1")
+                           now_ms=_NOW, expected_robot_id="arm-1", allowed_commands={"wave", "terminate"})

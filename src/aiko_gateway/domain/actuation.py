@@ -19,7 +19,7 @@ SHAPE but NEVER checks a signature — the gateway carries those, it doesn't ver
 them. Here verification is the whole point and the signature IS load-bearing, so this
 does real Ed25519 verification (net-new) and fails CLOSED on anything unproven.
 
-Two defenses, both required, because each covers a gap the other can't:
+Three defenses, all required, because each covers a gap the others can't:
   * **Ed25519 sig + commander allowlist** — authenticity + authorization. Only the
     one shipped commander key can command the robot; "anyone in the room" cannot.
   * **Durable monotonic ``seq`` high-water** (``SeqHighWater``) — replay + staleness in
@@ -89,6 +89,7 @@ from .signing import (
     SIG_RAW_LEN,
     b64url_raw,
     decode_multikey,
+    encode_multikey,
 )
 
 # DISTINCT domain tag so an actuation signature can never be lifted from — or
@@ -257,7 +258,11 @@ def verify_actuation(
         raw_pubkey = decode_multikey(pubkey_str)
     except OriginError as e:
         raise ActuationError(f"sender_pubkey malformed: {e}") from e
-    if pubkey_str not in allowed_pubkeys:
+    # Authorize on the CANONICAL encoding of the decoded key, not the raw wire string — so
+    # authorization is key-identity, not string-identity. If two Multikey spellings ever
+    # decode to the same 32 bytes, a canonical allowlist still matches; the security story
+    # rests on the bytes, not on the commander and the config agreeing on spelling.
+    if encode_multikey(raw_pubkey) not in allowed_pubkeys:
         raise ActuationError("sender_pubkey is not an allowlisted commander key")
 
     sig_str = raw["sig"]
@@ -414,16 +419,20 @@ def verify_and_advance(
     seq_store: SeqHighWater,
     now_ms: int,
     expected_robot_id: str,
+    allowed_commands: set[str],
     max_age_ms: int = DEFAULT_MAX_AGE_MS,
-    allowed_commands: set[str] | None = None,
 ) -> dict:
     """The SEALED door a bridge should call: verify the envelope, THEN advance the seq —
     in that order — and return the validated dict, or raise ``ActuationError``.
 
-    ``expected_robot_id`` is REQUIRED here (unlike the pure ``verify_actuation``): on a
-    shared LiveKit room the transport fans bytes to every bridge, so a validly-signed
-    command addressed to ``arm-2`` would otherwise actuate ``arm-1``. Binding identity is
-    not caller-optional on the blessed path — omitting it must be impossible, not silent.
+    ``expected_robot_id`` and ``allowed_commands`` are REQUIRED here (unlike the pure,
+    actuator-agnostic ``verify_actuation``): the blessed physical-safety path fails closed on
+    BOTH admission decisions — WHO may command this robot and WHAT it may be commanded to do.
+    A required PARAMETER is not enough (Python would still accept ``None``), so both are
+    value-guarded below: an omitted, ``None``, empty, or wrong-typed identity/command-set is
+    an ``ActuationError``, never a silent skip. On a shared LiveKit room the transport fans
+    bytes to every bridge, so an unbound ``robot_id`` would actuate the wrong arm and an
+    unbounded command set would run any signed ``"terminate"`` the commander could emit.
 
     Why a single door: advancing the durable high-water is a state mutation, and the advance
     primitive persists whatever seq it is handed — so running it BEFORE verification would let
@@ -447,6 +456,14 @@ def verify_and_advance(
     ``verify_actuation`` remains public for pure, side-effect-free verification (tests,
     dry-runs); but the actuation path should reach for THIS.
     """
+    # Value guards on the blessed door — a REQUIRED parameter is not a value guard (Python
+    # accepts None/empty/wrong-typed), and identity/command binding are exactly what "sealed"
+    # means here. Fail closed rather than forward a None that verify_actuation would treat as
+    # "skip the check".
+    if not isinstance(expected_robot_id, str) or not expected_robot_id:
+        raise ActuationError("expected_robot_id must be a non-empty string on the sealed door")
+    if not isinstance(allowed_commands, (set, frozenset)) or not allowed_commands:
+        raise ActuationError("allowed_commands must be a non-empty set on the sealed door")
     # Caller-surface guard: a wrong seq_store would raise AttributeError below, escaping the
     # sole-exception contract this door also sells.
     if not isinstance(seq_store, SeqHighWater):
