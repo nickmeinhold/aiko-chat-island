@@ -91,6 +91,10 @@ SUPPORTED_V = 1
 _MAX_ROBOT_ID = 128                 # a robot identity string cap (untrusted wire input)
 _MAX_COMMAND = 64                   # a command token cap; the bridge additionally maps it through a CLOSED table
 _MAX_SIG_STR = 128
+# seq ceiling is 2**53-1 (JS Number.MAX_SAFE_INTEGER), NOT full u64: the wire is JSON and a
+# JavaScript/TypeScript commander loses integer precision above 2**53-1, so an independent
+# signer and this verifier could silently diverge on a larger seq. Cap it at the interop floor.
+_MAX_SEQ = (1 << 53) - 1
 # The bridge re-checks the deadline at DEQUEUE (immediately before actuation). Tight by
 # default — a servo command that aged in the mailbox is stale. Explicit, NEVER inherit a
 # minutes-long default (a 5-min window on a physical device is the crucible's rejected footgun).
@@ -144,6 +148,7 @@ def verify_actuation(
     now_ms: int,
     max_age_ms: int = DEFAULT_MAX_AGE_MS,
     expected_robot_id: str | None = None,
+    allowed_commands: set[str] | None = None,
 ) -> dict:
     """Verify an inbound actuation envelope at the robot's trust boundary and return
     the validated dict, or raise ``ActuationError``. Fail-closed at every step, in this
@@ -166,12 +171,24 @@ def verify_actuation(
     If ``expected_robot_id`` is given, the envelope's ``robot_id`` MUST equal it — a signed
     command addressed to another robot is rejected at this boundary rather than relying on
     the call site to compare (identity binding; an actuator-agnostic codec still needs it).
+    ``verify_and_advance`` (the blessed actuation path) makes this REQUIRED; it is optional
+    here only for pure codec use (tests/dry-runs).
+
+    If ``allowed_commands`` is given, ``command`` MUST be in it — command admission at the
+    boundary rather than trusting the bridge's downstream table alone. ``None`` keeps the
+    codec actuator-agnostic (the bridge's closed table governs), by design.
 
     Does NOT check the ``seq`` high-water — that is stateful and belongs to
-    ``SeqHighWater.check_and_advance`` at the call site, so verification stays pure and
+    ``SeqHighWater._check_and_advance`` at the call site, so verification stays pure and
     the durable replay guard is a single explicit gate. The caller MUST run BOTH — or, better,
     call ``verify_and_advance``, the SEALED door that runs them in the only safe order.
     """
+    # Caller-surface guards keep the SOLE-exception contract TOTAL: a bad now_ms /
+    # allowed_pubkeys would otherwise raise TypeError, escaping `except ActuationError`.
+    if isinstance(now_ms, bool) or not isinstance(now_ms, int):
+        raise ActuationError("now_ms must be an int (ms since epoch)")
+    if not isinstance(allowed_pubkeys, (set, frozenset)):
+        raise ActuationError("allowed_pubkeys must be a set of commander Multikey strings")
     # The freshness floor is not caller-optional: reject an out-of-range max_age_ms rather
     # than let a bridge kwarg reopen the crucible-rejected minutes window (or invert it).
     if isinstance(max_age_ms, bool) or not isinstance(max_age_ms, int) \
@@ -203,10 +220,12 @@ def verify_actuation(
     command = raw["command"]
     if not isinstance(command, str) or not command or len(command) > _MAX_COMMAND:
         raise ActuationError("command must be a non-empty string within the size cap")
+    if allowed_commands is not None and command not in allowed_commands:
+        raise ActuationError(f"command {command!r} is not in the allowed set — rejected at the boundary")
 
     seq = raw["seq"]
-    if isinstance(seq, bool) or not isinstance(seq, int) or seq < 0 or seq > (1 << 64) - 1:
-        raise ActuationError("seq must be a u64-range non-negative integer")
+    if isinstance(seq, bool) or not isinstance(seq, int) or seq < 0 or seq > _MAX_SEQ:
+        raise ActuationError(f"seq must be a non-negative integer <= 2**53-1 ({_MAX_SEQ}) for JSON interop")
 
     ts = raw["signed_at_ms"]
     if isinstance(ts, bool) or not isinstance(ts, int) or ts < 0 or ts > MAX_SIGNED_AT_MS:
@@ -303,9 +322,9 @@ class SeqHighWater:
                 if not isinstance(k, str):
                     raise ActuationError(f"seq high-water store at {path} has a non-string robot_id key — refusing to start")
                 # bool is an int subclass — a persisted JSON `true` must NOT decay to 1.
-                if isinstance(v, bool) or not isinstance(v, int) or v < 0 or v > (1 << 64) - 1:
+                if isinstance(v, bool) or not isinstance(v, int) or v < 0 or v > _MAX_SEQ:
                     raise ActuationError(
-                        f"seq high-water store at {path} has a non-u64-int mark for {k!r} ({v!r}) — refusing to start"
+                        f"seq high-water store at {path} has a non-seq-range mark for {k!r} ({v!r}) — refusing to start"
                     )
                 marks[k] = v
             self._marks = marks
@@ -319,8 +338,8 @@ class SeqHighWater:
         """
         if not isinstance(robot_id, str) or not robot_id:
             raise ActuationError("robot_id must be a non-empty string")
-        if isinstance(seq, bool) or not isinstance(seq, int) or seq < 0 or seq > (1 << 64) - 1:
-            raise ActuationError("seq must be a u64-range non-negative integer")
+        if isinstance(seq, bool) or not isinstance(seq, int) or seq < 0 or seq > _MAX_SEQ:
+            raise ActuationError(f"seq must be a non-negative integer <= 2**53-1 ({_MAX_SEQ})")
         # Serialize the read-modify-write: concurrent LiveKit handlers must not both pass.
         with self._lock:
             if seq <= self._marks.get(robot_id, -1):
@@ -367,21 +386,31 @@ def verify_and_advance(
     allowed_pubkeys: set[str],
     seq_store: SeqHighWater,
     now_ms: int,
+    expected_robot_id: str,
     max_age_ms: int = DEFAULT_MAX_AGE_MS,
-    expected_robot_id: str | None = None,
+    allowed_commands: set[str] | None = None,
 ) -> dict:
     """The SEALED door a bridge should call: verify the envelope, THEN advance the seq —
     in that order — and return the validated dict, or raise ``ActuationError``.
 
-    Why a single door: advancing the durable high-water is a state mutation with no proof
-    attached — ``SeqHighWater._check_and_advance`` persists whatever seq it is handed — so
-    running it BEFORE verification would let any room participant (no key needed) submit
-    ``seq = 2**64 - 1`` and permanently wedge the robot. This function makes that order
-    unrepresentable: the advance primitive is PRIVATE, and the seq is advanced ONLY after a
-    valid, allowlisted, fresh signature over that exact ``(robot_id, command, seq,
-    signed_at_ms)`` is proven. A replay/stale seq raises ``ActuationError`` (not a bare
-    ``False``), so the caller's fail-closed ``except ActuationError`` handles replay
-    identically to a bad signature.
+    ``expected_robot_id`` is REQUIRED here (unlike the pure ``verify_actuation``): on a
+    shared LiveKit room the transport fans bytes to every bridge, so a validly-signed
+    command addressed to ``arm-2`` would otherwise actuate ``arm-1``. Binding identity is
+    not caller-optional on the blessed path — omitting it must be impossible, not silent.
+
+    Why a single door: advancing the durable high-water is a state mutation, and the advance
+    primitive persists whatever seq it is handed — so running it BEFORE verification would let
+    any room participant (no key needed) submit a huge seq and wedge the robot. The blessed
+    path advances the seq ONLY after a valid, allowlisted, fresh signature over that exact
+    ``(robot_id, command, seq, signed_at_ms)`` is proven. A replay/stale seq raises
+    ``ActuationError`` (not a bare ``False``), so the caller's fail-closed handler treats
+    replay like a bad signature.
+
+    Honest scope: the advance primitive (``_check_and_advance``) is private *by convention*
+    (Python has no hard privacy), and it only ever ADVANCES the guard — it never actuates, so
+    the worst a stray direct call can do is wedge liveness (reject future seqs), never cause a
+    mis-actuation. This function is the only path that advances *after proof*; a bridge should
+    never call the primitive directly.
 
     Ordering, not atomicity: verify and advance are not one atomic critical section. Under
     concurrent envelopes the advance is serialized (the store's lock), and a reordered lower
@@ -397,6 +426,7 @@ def verify_and_advance(
         now_ms=now_ms,
         max_age_ms=max_age_ms,
         expected_robot_id=expected_robot_id,
+        allowed_commands=allowed_commands,
     )
     # Only a verified envelope can advance the durable replay guard (private primitive).
     if not seq_store._check_and_advance(parsed["robot_id"], parsed["seq"]):

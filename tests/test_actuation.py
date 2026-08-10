@@ -84,6 +84,38 @@ def test_module_bytes_match_independent_construction():
     assert a == b
 
 
+# FROZEN golden vector — the layout pinned to an IMMUTABLE constant, not a same-author mirror.
+# Generated once from (seed=range(32), robot_id="arm-1", command="wave", seq=7, signed_at_ms=_NOW).
+# Any change to field order / tag / endianness in EITHER actuation_signing_bytes or the inline
+# construction now fails against this literal — "two mirrors agree" becomes "pinned to nature".
+# The commander repo (out of this tree) MUST reproduce these exact bytes; this is the vector to
+# exchange in that cross-repo handoff.
+_GOLDEN_BYTES_HEX = (
+    "0000001961696b6f636861743a616374756174653a76313a45644453410000002003a107bff3ce10be1d70"
+    "dd18e74bc09967e4d6309ba50d5f1ddc8664125531b80000000561726d2d31000000047761766500000000"
+    "000000070000018bcfe56800"
+)
+_GOLDEN_SIG_B64URL = "uUKhh2UsEeZAIJiIuAYLv4jUzFsOelIAejRdFnCEJ1s-prXU4GTQpEELhcQPvGz1UHwpONqrZId9MlICxFalCA"
+
+
+def test_signing_bytes_match_frozen_golden_vector():
+    from aiko_gateway.domain.actuation import actuation_signing_bytes
+    got = actuation_signing_bytes(raw_pubkey=_RAW_PUB, robot_id="arm-1", command="wave",
+                                  seq=7, signed_at_ms=_NOW)
+    assert got.hex() == _GOLDEN_BYTES_HEX
+
+
+def test_frozen_golden_signature_verifies_through_the_boundary():
+    # A signature frozen against the golden bytes must verify through verify_actuation —
+    # if the module's layout ever drifts, the frozen sig stops verifying.
+    env = {
+        "v": 1, "alg": "EdDSA", "robot_id": "arm-1", "command": "wave", "seq": 7,
+        "signed_at_ms": _NOW, "sender_pubkey": _PUB_MULTIKEY, "sig": _GOLDEN_SIG_B64URL,
+    }
+    parsed = verify_actuation(env, allowed_pubkeys=_ALLOW, now_ms=_NOW)
+    assert parsed["seq"] == 7
+
+
 # ---- fail-closed rejections -------------------------------------------------------
 
 def test_unallowlisted_key_rejected_even_if_signature_valid():
@@ -200,7 +232,7 @@ def test_store_valid_json_non_object_fails_closed(tmp_path, body):
 def test_store_wrong_typed_value_fails_closed(tmp_path, body):
     p = tmp_path / "seq.json"
     p.write_text(body)
-    with pytest.raises(ActuationError, match="non-u64-int mark"):
+    with pytest.raises(ActuationError, match="non-seq-range mark"):
         SeqHighWater(str(p))
 
 
@@ -273,28 +305,28 @@ def test_expected_robot_id_mismatch_rejected():
 
 def test_verify_and_advance_happy_path(tmp_path):
     hw = SeqHighWater(str(tmp_path / "seq.json"))
-    parsed = verify_and_advance(_envelope(seq=1), allowed_pubkeys=_ALLOW, seq_store=hw, now_ms=_NOW)
+    parsed = verify_and_advance(_envelope(seq=1), allowed_pubkeys=_ALLOW, seq_store=hw, now_ms=_NOW, expected_robot_id="arm-1")
     assert parsed["command"] == "wave"
 
 
 def test_verify_and_advance_replay_raises(tmp_path):
     hw = SeqHighWater(str(tmp_path / "seq.json"))
-    verify_and_advance(_envelope(seq=5), allowed_pubkeys=_ALLOW, seq_store=hw, now_ms=_NOW)
+    verify_and_advance(_envelope(seq=5), allowed_pubkeys=_ALLOW, seq_store=hw, now_ms=_NOW, expected_robot_id="arm-1")
     # a fresh, validly-signed envelope reusing seq=5 is a replay → ActuationError, not False
     with pytest.raises(ActuationError, match="replay or stale"):
-        verify_and_advance(_envelope(seq=5), allowed_pubkeys=_ALLOW, seq_store=hw, now_ms=_NOW)
+        verify_and_advance(_envelope(seq=5), allowed_pubkeys=_ALLOW, seq_store=hw, now_ms=_NOW, expected_robot_id="arm-1")
 
 
 def test_verify_and_advance_does_not_advance_on_bad_signature(tmp_path):
     # The catastrophic order made impossible: an UNVERIFIED envelope must NOT touch the
     # high-water, so a later legitimate low seq still works (the DoS wedge cannot happen).
     hw = SeqHighWater(str(tmp_path / "seq.json"))
-    forged = _envelope(seq=2**64 - 1)
+    forged = _envelope(seq=(1 << 53) - 2)
     forged["command"] = "terminate"  # breaks the signature
     with pytest.raises(ActuationError, match="does not verify"):
-        verify_and_advance(forged, allowed_pubkeys=_ALLOW, seq_store=hw, now_ms=_NOW)
+        verify_and_advance(forged, allowed_pubkeys=_ALLOW, seq_store=hw, now_ms=_NOW, expected_robot_id="arm-1")
     # high-water untouched → a normal seq=1 still actuates
-    assert verify_and_advance(_envelope(seq=1), allowed_pubkeys=_ALLOW, seq_store=hw, now_ms=_NOW)["seq"] == 1
+    assert verify_and_advance(_envelope(seq=1), allowed_pubkeys=_ALLOW, seq_store=hw, now_ms=_NOW, expected_robot_id="arm-1")["seq"] == 1
 
 
 def test_verify_and_advance_unallowlisted_key_does_not_advance(tmp_path):
@@ -306,14 +338,14 @@ def test_verify_and_advance_unallowlisted_key_does_not_advance(tmp_path):
     def lp(b):
         return struct.pack(">I", len(b)) + b
     msg = b"".join((lp(b"aikochat:actuate:v1:EdDSA"), lp(other_pub_raw), lp(b"arm-1"),
-                    lp(b"wave"), struct.pack(">Q", 2**64 - 1), struct.pack(">Q", _NOW)))
-    env = {"v": 1, "alg": "EdDSA", "robot_id": "arm-1", "command": "wave", "seq": 2**64 - 1,
+                    lp(b"wave"), struct.pack(">Q", (1 << 53) - 2), struct.pack(">Q", _NOW)))
+    env = {"v": 1, "alg": "EdDSA", "robot_id": "arm-1", "command": "wave", "seq": (1 << 53) - 2,
            "signed_at_ms": _NOW, "sender_pubkey": other_pub,
            "sig": base64.urlsafe_b64encode(other.sign(msg)).rstrip(b"=").decode()}
     with pytest.raises(ActuationError, match="allowlisted"):
-        verify_and_advance(env, allowed_pubkeys=_ALLOW, seq_store=hw, now_ms=_NOW)
+        verify_and_advance(env, allowed_pubkeys=_ALLOW, seq_store=hw, now_ms=_NOW, expected_robot_id="arm-1")
     # store never advanced by an unauthorized max-seq envelope
-    assert verify_and_advance(_envelope(seq=1), allowed_pubkeys=_ALLOW, seq_store=hw, now_ms=_NOW)["seq"] == 1
+    assert verify_and_advance(_envelope(seq=1), allowed_pubkeys=_ALLOW, seq_store=hw, now_ms=_NOW, expected_robot_id="arm-1")["seq"] == 1
 
 
 def test_concurrent_check_and_advance_admits_one(tmp_path):
@@ -366,13 +398,13 @@ def test_max_age_ms_at_ceiling_accepted():
 def test_private_advance_rejects_bool_seq(tmp_path):
     # bool is an int subclass — a persisted JSON `true` would wedge the next restart.
     hw = SeqHighWater(str(tmp_path / "seq.json"))
-    with pytest.raises(ActuationError, match="u64-range"):
+    with pytest.raises(ActuationError, match="seq must be"):
         hw._check_and_advance("arm-1", True)
 
 
 def test_private_advance_rejects_oversized_seq(tmp_path):
     hw = SeqHighWater(str(tmp_path / "seq.json"))
-    with pytest.raises(ActuationError, match="u64-range"):
+    with pytest.raises(ActuationError, match="seq must be"):
         hw._check_and_advance("arm-1", 1 << 64)
 
 
@@ -380,6 +412,70 @@ def test_private_advance_rejects_empty_robot_id(tmp_path):
     hw = SeqHighWater(str(tmp_path / "seq.json"))
     with pytest.raises(ActuationError, match="robot_id"):
         hw._check_and_advance("", 1)
+
+
+# ---- seq interop ceiling (2**53-1, JS Number.MAX_SAFE_INTEGER) ----
+
+def test_seq_above_js_safe_integer_rejected():
+    env = _envelope(seq=(1 << 53))  # one past MAX_SAFE_INTEGER — JS would lose precision
+    # re-sign at that seq so it's the CAP, not the signature, that rejects
+    with pytest.raises(ActuationError, match="2\\*\\*53"):
+        verify_actuation(env, allowed_pubkeys=_ALLOW, now_ms=_NOW)
+
+
+def test_seq_at_js_safe_integer_accepted():
+    env = _envelope(seq=(1 << 53) - 1)
+    parsed = verify_actuation(env, allowed_pubkeys=_ALLOW, now_ms=_NOW)
+    assert parsed["seq"] == (1 << 53) - 1
+
+
+# ---- caller-surface guards keep the sole-exception contract total ----
+
+def test_non_int_now_ms_raises_actuation_error():
+    with pytest.raises(ActuationError, match="now_ms"):
+        verify_actuation(_envelope(), allowed_pubkeys=_ALLOW, now_ms=float(_NOW))
+
+
+def test_non_set_allowed_pubkeys_raises_actuation_error():
+    with pytest.raises(ActuationError, match="allowed_pubkeys"):
+        verify_actuation(_envelope(), allowed_pubkeys=[_PUB_MULTIKEY], now_ms=_NOW)
+
+
+def test_non_dict_envelope_rejected():
+    with pytest.raises(ActuationError, match="JSON object"):
+        verify_actuation(["not", "a", "dict"], allowed_pubkeys=_ALLOW, now_ms=_NOW)
+
+
+# ---- optional command admission at the boundary ----
+
+def test_allowed_commands_rejects_unknown_command():
+    # A validly-signed but unlisted command is rejected when the caller pins the set.
+    env = _envelope(command="terminate")  # signed over "terminate"
+    with pytest.raises(ActuationError, match="not in the allowed set"):
+        verify_actuation(env, allowed_pubkeys=_ALLOW, now_ms=_NOW, allowed_commands={"wave"})
+
+
+def test_allowed_commands_accepts_listed_command():
+    parsed = verify_actuation(_envelope(command="wave"), allowed_pubkeys=_ALLOW, now_ms=_NOW,
+                              allowed_commands={"wave", "nod"})
+    assert parsed["command"] == "wave"
+
+
+# ---- the sealed door REQUIRES identity binding (fail-closed, not opt-in) ----
+
+def test_verify_and_advance_requires_expected_robot_id(tmp_path):
+    # Omitting expected_robot_id must be a TypeError at call time — not silently unbound.
+    hw = SeqHighWater(str(tmp_path / "seq.json"))
+    with pytest.raises(TypeError):
+        verify_and_advance(_envelope(), allowed_pubkeys=_ALLOW, seq_store=hw, now_ms=_NOW)
+
+
+def test_verify_and_advance_wrong_robot_rejected(tmp_path):
+    # A signed command for arm-2 must not actuate arm-1's bridge.
+    hw = SeqHighWater(str(tmp_path / "seq.json"))
+    with pytest.raises(ActuationError, match="does not match"):
+        verify_and_advance(_envelope(robot_id="arm-2"), allowed_pubkeys=_ALLOW,
+                           seq_store=hw, now_ms=_NOW, expected_robot_id="arm-1")
 
 
 def test_persist_failure_surfaces_as_actuation_error(tmp_path):
