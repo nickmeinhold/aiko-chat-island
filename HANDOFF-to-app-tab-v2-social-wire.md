@@ -265,11 +265,47 @@ the REST send path, add an optional `mentions` array:
 
 ---
 
-## #2633 — direct messages as 1:1 channels **[shape final, one field open]**
+## #2633 — direct messages as 1:1 channels **[✅ SHIPPED — gateway half on `main`, 2026-08-10]**
 
-The big one. DMs reuse the existing channel/message infrastructure — a DM is a channel
-with `kind="dm"`, two members, and no community. The schema already permits this
-(`Channel.kind='dm'` is legal and CHECK-exempt from `community_id`).
+> **SHIPPED in PR#124 (squash `a21bba5`), 13-round cage-matched, 1016 tests + CI green.
+> NOT deployed yet** (inert until a version bump past 0.5.0 — same as reactions/mentions).
+> Design of record: `docs/design/11-direct-messages.md`. This is the FINAL wire + behavior
+> contract; build the client against it. Everything below the "shape as first proposed"
+> line is unchanged in shape; the **behavior deltas the client MUST handle** are listed
+> first because a few evolved during the cage-match.
+
+### What the client MUST handle (behavior, read this before coding the DM UI)
+
+1. **`GET /v1/messages/{id}` lives in the MESSAGES surface, not a DM path** — it's a
+   general fetch-one (reply-parent / deep-link), `MessageView | 404` (existence-hiding).
+2. **members is ALWAYS an array** (`["<keyA>","<keyB>"]`), member-SET shape (groups later
+   are additive). A **self-DM** (`target == me`, allowed) returns `members: ["<me>"]`.
+3. **Block → the SEND is REFUSED** (Nick's ruling). Sending to a DM where you are in a
+   block relationship with the peer returns a WS `error` frame **`{code: "no_channel"}`** —
+   the SAME shape as a missing/unreadable channel (existence-hiding, symmetric in BOTH
+   block directions; applies to plain sends AND replies). So: **a `no_channel` on a DM you
+   currently hold in `GET /v1/dm` means "can't send" (a block), NOT "the channel vanished".**
+   Do not surface it as a hard error; treat it as a soft "message not delivered". Nothing
+   is persisted — no residue.
+4. **Leave = a resumable DISMISS.** `DELETE /v1/channels/{dm_id}/leave` → `204` drops the DM
+   from your `GET /v1/dm`. Re-opening (`POST /v1/dm` with the same peer) resumes it,
+   **including any backlog sent while you were away** (unarchive semantics) — it is NOT a
+   permanent cutoff and the peer is never re-injected into your roster by their activity.
+   **To stop someone contacting you, BLOCK them** (that refuses their sends, even after a
+   leave); leave is just "tidy my switcher". (Known caveat: a *live* WS socket keeps
+   receiving frames for a left DM until it re-subscribes — a pre-existing hub-lifecycle gap,
+   island-tracked; on leave, drop the channel from your local subscription set.)
+5. **DMs are excluded from `GET /v1/channels`** — learn your DM channel_ids from
+   `GET /v1/dm`, then subscribe to them over WS like any channel.
+6. **DMs are island-local** (never federate on the bus) — both members are on the same
+   island. Cross-island DMs are a future sealed-federation track, out of scope.
+7. **`unread` is client-side** (your `ChannelReadStore` watermark) — the island emits no
+   `unread`; `GET /v1/dm` gives `last_message` (a full `MessageView` or `null`) to drive it.
+
+### The big one — shape as first proposed (unchanged, for reference)
+
+DMs reuse the existing channel/message infrastructure — a DM is a channel
+with `kind="dm"`, two members, and no community.
 
 **Endpoints** — authenticated:
 
