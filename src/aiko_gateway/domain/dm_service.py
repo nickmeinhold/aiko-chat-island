@@ -118,7 +118,11 @@ class TargetNotFound(Exception):
 
 class DmKeyCollision(Exception):
     """The deterministic ``dm:<lo>:<hi>`` key is already held by a channel that is NOT
-    a DM (kind != 'dm'). FAIL CLOSED (cage-match PR#124 Carnot+Tesla): ``aiko_channel``
+    a DM (kind != 'dm'). NOW BELT-AND-BRACES: the bidirectional ``ck_channels_dm_prefix``
+    DB CHECK (PR#124 round 7) makes a non-DM channel on a ``dm:`` key UNREPRESENTABLE, so
+    this state can no longer arise while that CHECK holds — the guard is retained as
+    fail-closed defense should the CHECK ever be relaxed. FAIL CLOSED (cage-match PR#124
+    Carnot+Tesla): ``aiko_channel``
     is a namespace shared with bus-reconciled channels, so — however unlikely, since the
     key embeds two unguessable 26-char ULIDs — a non-DM channel squatting the key must
     NOT be adopted as a DM. Adopting it would (a) return a non-DM channel from

@@ -342,15 +342,19 @@ async def self_join(
         # Not found, OR private+invite_only and the actor is not already in it —
         # indistinguishable by design (same single-None as the read path).
         raise ChannelNotFound(channel_id)
-    # Hard-seal DM membership (#2633, cage-match PR#124 Tesla): a DM is never self-joinable,
-    # even if a future path opens its policy. Checked AFTER the visibility resolve above,
-    # so a non-member still gets the existence-hiding 404, not a DM-exists signal.
-    if channel.kind == ChannelKind.DM:
-        raise DmMembershipImmutable(channel_id)
-
+    # IDEMPOTENT no-op FIRST (cage-match PR#124 Tesla P2): acknowledging you are already
+    # in the fixed set is NOT a mutation, so an existing DM member self-joining gets the
+    # historical idempotent success (case (e)) — the seal must refuse CHANGING the set,
+    # not a reconciling retry. Only a NON-member (who could join an open-policy DM) hits
+    # the seal below. A non-member of an invite_only DM never reaches here (the visibility
+    # resolve above returned None → 404), so existence-hiding is preserved either way.
     existing = await _membership(session, channel_id, actor_id)
     if existing is not None:
-        return existing  # already in — idempotent self-join
+        return existing  # already in — idempotent self-join (fixed-set acknowledgment)
+    # Hard-seal DM membership (#2633, Tesla): a NON-member cannot join a DM even if a
+    # future path opens its policy — DM membership is fixed at its two creation members.
+    if channel.kind == ChannelKind.DM:
+        raise DmMembershipImmutable(channel_id)
 
     m = Membership(
         channel_id=channel_id,

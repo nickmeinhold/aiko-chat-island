@@ -262,16 +262,23 @@ class Channel(Base):
         # channels are legitimately is_private=false).
         CheckConstraint("kind != 'dm' OR is_private = 1",
                         name="ck_channels_dm_private"),
-        # A DM's aiko_channel MUST carry the reserved 'dm:' prefix (#2633, cage-match
-        # PR#124 Tesla). Completes the DM DB-invariant trio (null community, private,
-        # dm: prefix). The dual bus-federation gate suppresses a DM on EITHER kind=='dm'
-        # OR the dm: prefix, so pinning the prefix at the DB means a mutator that retints
-        # kind='dm'->'standard' (still leaving the dm: aiko_channel) can never re-federate
-        # the room — the prefix leg of the gate is guaranteed present for a DM. aiko_channel
-        # has no UPDATE path (UNIQUE, set once at creation), so this is write-once by
-        # construction; the CHECK makes it unrepresentable-when-wrong, not merely so.
-        CheckConstraint("kind != 'dm' OR aiko_channel LIKE 'dm:%'",
-                        name="ck_channels_dm_prefix"),
+        # The 'dm:' prefix ⟺ kind='dm', BIDIRECTIONAL and CASE-SENSITIVE (#2633,
+        # cage-match PR#124 Carnot+Tesla). Completes the DM DB-invariant set (null
+        # community, private, dm: prefix). Two legs, both load-bearing:
+        #   * kind='dm' ⇒ dm: prefix — the prefix leg of the dual bus gate is guaranteed
+        #     present, so a mutator retinting 'dm'->'standard' still can't re-federate.
+        #   * a dm: prefix ⇒ kind='dm' — the dm: namespace is TOTALLY reserved at the DB,
+        #     so NO writer (create_channel, a direct INSERT, any future path) can squat a
+        #     non-DM channel on the private keyspace and block a real pair's DM. This is
+        #     the "remove the coupling" version of sealing every aiko_channel writer.
+        # substr(...)='dm:' (NOT LIKE): SQLite LIKE case-folds ASCII, so `LIKE 'dm:%'`
+        # would admit 'DM:a:b' — which the CASE-SENSITIVE Python gate (is_dm_channel_name
+        # / startswith) does NOT recognize, re-opening the exact federation hole the CHECK
+        # exists to close. substr comparison is case-sensitive, matching Python's alphabet.
+        CheckConstraint(
+            "(kind = 'dm' AND substr(aiko_channel, 1, 3) = 'dm:') "
+            "OR (kind != 'dm' AND substr(aiko_channel, 1, 3) <> 'dm:')",
+            name="ck_channels_dm_prefix"),
     )
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=new_ulid)
     name: Mapped[str] = mapped_column(String(128), nullable=False)

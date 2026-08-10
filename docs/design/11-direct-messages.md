@@ -116,8 +116,26 @@ We accept that over adding a directional `blocked` code.
 
 **Write-once invariant (PR#124 Tesla P3):** the bus-federation suppression rests on BOTH
 `kind == "dm"` AND the `dm:` `aiko_channel` prefix (the dual gate). Both are set once at
-DM creation and never mutated — `kind` is closed by `ck_channels_kind`, the prefix is
-reserved from the bus. A future mutator must treat both as immutable for a DM row.
+DM creation and never mutated — `kind` is closed by `ck_channels_kind`, and the `dm:`
+prefix ⟺ `kind='dm'` **bidirectionally and case-sensitively** at the DB
+(`ck_channels_dm_prefix`), so the `dm:` namespace is totally reserved (no writer can squat
+it) and a `kind` retint can't strip the prefix leg. A future mutator must treat both as
+immutable for a DM row.
+
+**Scope of "no residue" (PR#124 Tesla P2 — read precisely):** Decision 5's "no residue"
+means no **message rows** accrue under a block (the send is refused). It does NOT mean the
+DM **channel object** disappears: `GET /v1/dm` lists a DM by membership ∩ `kind='dm'` with
+no block filter, so a DM shell (with a `null` `last_message` under a block) stays in both
+parties' switchers. That is consistent with unread being client-side — **the client hides
+a conversation**; the island keeps the channel. Blocking freezes new content at the
+switcher too (no new `last_message`), but does not tombstone the shell.
+
+**Known gap — DM consent semantics (PR#124 Tesla P3, app-tab-owned):** `POST /v1/dm` is
+consentless find-or-create + immutable membership — anyone who knows your `user_id` mints a
+permanent co-membership edge; block stops speech, not presence; there is no
+accept/request/dismiss state server-side. Island-local privacy is solid; **social**
+consent is a v2 product decision the app tab owns (client-side hide is the current answer).
+Tracked as a follow-up so the group PR doesn't rediscover it — see the tracker.
 
 ## Exclusion from `GET /v1/channels`
 

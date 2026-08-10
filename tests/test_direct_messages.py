@@ -350,32 +350,20 @@ async def test_dm_message_hidden_from_blocked_peer(app_ctx, session):
 
 # ------------- namespace-collision + reconcile reservation ----------------- #
 
-async def test_dm_key_collision_fails_closed(session):
-    """If the deterministic dm:<lo>:<hi> key is squatted by a NON-DM channel,
-    get_or_create_dm FAILS CLOSED (never adopts/federates a foreign channel as a DM)."""
-    a = await _user(session, "alice")
-    b = await _user(session, "bob")
-    lo, hi = sorted([a.id, b.id])
-    squat = Channel(id=_ulid(1), name="squat", kind="standard",
-                    aiko_channel=f"dm:{lo}:{hi}", is_private=False)
-    session.add(squat)
-    await session.commit()
-    with pytest.raises(dm_service.DmKeyCollision):
-        await dm_service.get_or_create_dm(session, me=a, target_user_id=b.id)
-    # The squatting channel was NOT mutated — no DM members grafted onto it.
-    members = await dm_service.members_of(session, squat.id)
-    assert members == []
-
-
-async def test_post_dm_key_collision_returns_409(app_ctx, session):
+async def test_dm_prefix_reservation_is_total(session):
+    """The dm: namespace is TOTALLY reserved at the DB (cage-match PR#124 Tesla P1): a
+    NON-DM channel CANNOT squat a dm: aiko_channel — the bidirectional ck_channels_dm_prefix
+    rejects it. This makes the DmKeyCollision state (a non-DM on the dm: key) unrepresentable
+    by ANY writer (create_channel, direct INSERT, future paths), not just guarded at the
+    reconcile path. So a real pair's POST /v1/dm can never be blocked by a squatter."""
     a = await _user(session, "alice")
     b = await _user(session, "bob")
     lo, hi = sorted([a.id, b.id])
     session.add(Channel(id=_ulid(1), name="squat", kind="standard",
                         aiko_channel=f"dm:{lo}:{hi}", is_private=False))
-    await session.commit()
-    resp = await app_ctx.post("/v1/dm", json={"target_user_id": b.id}, headers=_auth(a))
-    assert resp.status_code == 409
+    with pytest.raises(IntegrityError):
+        await session.commit()
+    await session.rollback()
 
 
 async def test_reconcile_refuses_to_mint_dm_channel(session):
@@ -443,16 +431,19 @@ async def test_create_outbound_refuses_blocked_dm_at_mutator_door(session):
     assert rows == []
 
 
-async def test_self_join_refuses_dm(session):
-    """A DM is never self-joinable — its membership is fixed at creation (hard seal,
-    cage-match PR#124 Tesla P2), independent of the 'DMs are invite_only' convention."""
+async def test_self_join_dm_member_is_idempotent(session):
+    """An existing DM member self-joining is an IDEMPOTENT no-op (returns their existing
+    membership), NOT a false 409 (cage-match PR#124 Tesla P2): the seal refuses CHANGING
+    the fixed set, but acknowledging you're already in it is not a change. A third party
+    can't self-join at all — an invite_only DM is existence-hidden from non-members (404),
+    so the seal itself is belt-and-braces for a hypothetical future open-policy DM."""
     from aiko_gateway.domain import memberships_service
     a = await _user(session, "alice")
     b = await _user(session, "bob")
     channel, _ = await dm_service.get_or_create_dm(session, me=a, target_user_id=b.id)
-    with pytest.raises(memberships_service.DmMembershipImmutable):
-        await memberships_service.self_join(
-            session, channel_id=channel.id, actor_id=a.id)
+    m = await memberships_service.self_join(
+        session, channel_id=channel.id, actor_id=a.id)
+    assert m.user_id == a.id and m.channel_id == channel.id  # idempotent, no 409
 
 
 async def test_dm_retry_after_block_returns_existing_row_over_ws(ws_ctx):

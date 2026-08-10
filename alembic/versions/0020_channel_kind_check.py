@@ -62,10 +62,14 @@ _COMMUNITY_CHECK_NEW = (
 # so a non-private DM would be world-readable. Safe vs live prod: all channels are
 # 'standard' (kind != 'dm' arm passes regardless of is_private).
 _DM_PRIVATE_CHECK = "kind != 'dm' OR is_private = 1"
-# A DM's aiko_channel must carry the reserved 'dm:' prefix — completes the DM invariant
-# trio so a kind-retint can't strip the prefix leg of the dual bus gate. Safe vs prod:
-# all channels are 'standard' (kind != 'dm' arm passes).
-_DM_PREFIX_CHECK = "kind != 'dm' OR aiko_channel LIKE 'dm:%'"
+# 'dm:' prefix ⟺ kind='dm', BIDIRECTIONAL + CASE-SENSITIVE (cage-match PR#124
+# Carnot+Tesla): a DM must be dm:-prefixed AND the dm: namespace is totally reserved (no
+# non-DM may wear it, at any writer). substr(...) not LIKE — SQLite LIKE case-folds ASCII
+# ('DM:a:b' would pass) but the Python gate is case-sensitive, so LIKE would reopen the
+# federation hole. Safe vs prod: all channels are 'standard' with non-dm: names.
+_DM_PREFIX_CHECK = (
+    "(kind = 'dm' AND substr(aiko_channel, 1, 3) = 'dm:') "
+    "OR (kind != 'dm' AND substr(aiko_channel, 1, 3) <> 'dm:')")
 
 
 def upgrade() -> None:
