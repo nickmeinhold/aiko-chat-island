@@ -104,10 +104,18 @@ async def can_post(session: AsyncSession, user_id: str, channel: Channel) -> boo
 
 
 async def visible_channels(session: AsyncSession, user_id: str) -> list[Channel]:
-    """Every public channel + every private channel the user belongs to, id asc."""
+    """Every public channel + every private channel the user belongs to, id asc —
+    EXCLUDING DMs (``kind="dm"``, #2633). A DM is a private channel the user belongs to,
+    so it would otherwise appear in this flat list; the contract keeps DMs out of
+    ``GET /v1/channels`` and surfaces them only through ``GET /v1/dm`` (the client learns
+    its DM ids there). This exclusion is CONFINED to the listing: ``readable_channel`` /
+    ``filter_readable_ids`` are untouched, so a member can still subscribe to and read
+    their DM over WS — the DM is hidden from the roster, not from its own members."""
     rows = (
         await session.execute(
-            select(Channel).where(_readable_predicate(user_id)).order_by(Channel.id)
+            select(Channel)
+            .where(_readable_predicate(user_id), Channel.kind != "dm")
+            .order_by(Channel.id)
         )
     ).scalars()
     return list(rows)

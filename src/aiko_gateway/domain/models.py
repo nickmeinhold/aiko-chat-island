@@ -235,8 +235,13 @@ class Channel(Base):
     # the seeded Aiko community, so every channel born from the bus reconcile
     # (upsert_channel) or constructed directly lands in Aiko with no extra code —
     # this is also why existing channels need no per-row decision in the migration.
-    # FOOTGUN: a future DM-creation path must pass community_id=None EXPLICITLY,
-    # or this default silently places the DM in Aiko (see #35).
+    # FOOTGUN (sharper than first documented, verified #2633): passing
+    # `community_id=None` does NOT bypass this default — SQLAlchemy applies a
+    # Python-side scalar `default=` whenever the bound value is None, so `None`
+    # SILENTLY stores DEFAULT_COMMUNITY_ID and places the DM in Aiko (→ it would leak
+    # into visible_channels_in_community). The DM-creation path (dm_service) uses
+    # `sqlalchemy.null()`, the ONLY value that overrides a column default with a real
+    # SQL NULL. Any future community-less channel creation must do the same.
     community_id: Mapped[str | None] = mapped_column(
         ForeignKey("communities.id"), nullable=True, index=True,
         default=DEFAULT_COMMUNITY_ID)

@@ -13,7 +13,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..aiko.payload import InboundMessage
-from . import channels_service, moderation_service, signing_keys_service
+from . import acl, channels_service, moderation_service, signing_keys_service
 from .ids import new_ulid
 from .models import Channel, Message, Retraction, User
 
@@ -214,6 +214,53 @@ async def get_message(session: AsyncSession, message_id: str) -> Message | None:
     message. Does NOT filter on visibility — the caller decides what to do with
     a soft-deleted or otherwise-hidden target."""
     return await session.get(Message, message_id)
+
+
+async def visible_message(
+    session: AsyncSession, viewer_id: str, message_id: str
+) -> Message | None:
+    """The message IFF ``viewer_id`` may currently SEE it — exists, not soft-deleted
+    (taken-down), its channel is readable by the viewer (ACL), and its author is not in
+    a block relationship with the viewer — else None. This is the SINGLE message-
+    visibility predicate, mirroring ``get_history``'s filters; ``GET /v1/messages/{id}``
+    (reply-parent resolution, #2633) and the reaction routes both delegate here so a
+    "can I see this message?" answer can never drift between call sites. Callers choose
+    whether a None is a 404 (existence-hiding) or a silent suppression.
+
+    Deliberately does NOT resurrect a taken-down parent's body — a soft-deleted message
+    is None (a 404 for the fetch-by-id path), never its content, so a reply preview can
+    never leak retracted text (the retraction-leak the #2633 contract warns about)."""
+    msg = await get_message(session, message_id)
+    if msg is None or msg.deleted_at is not None:
+        return None
+    if await acl.readable_channel(session, viewer_id, msg.channel_id) is None:
+        return None
+    if msg.sender_user_id is not None:
+        blocked = await moderation_service.blocked_pair_user_ids(session, viewer_id)
+        if msg.sender_user_id in blocked:
+            return None
+    return msg
+
+
+async def last_visible_message(
+    session: AsyncSession, channel_id: str, viewer_id: str
+) -> Message | None:
+    """The newest message in ``channel_id`` VISIBLE to ``viewer_id`` (not soft-deleted,
+    author not blocked), or None. Powers ``GET /v1/dm``'s ``last_message`` preview. Uses
+    the SAME message-visibility filters as ``get_history`` / ``latest_ulid`` (block +
+    soft-delete), so the DM switcher preview never shows a line the channel read would
+    hide. Retractions are not messages, so they never surface as a ``last_message`` (a
+    DM whose only newer event is a takedown shows the last still-visible line)."""
+    return (await session.execute(
+        select(Message)
+        .where(
+            Message.channel_id == channel_id,
+            Message.deleted_at.is_(None),
+            moderation_service.not_blocked_predicate(viewer_id),
+        )
+        .order_by(Message.id.desc())
+        .limit(1)
+    )).scalar_one_or_none()
 
 
 async def latest_ulid(session: AsyncSession, channel_id: str, viewer_id: str) -> str:

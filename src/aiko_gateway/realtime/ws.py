@@ -193,9 +193,17 @@ async def _handle_send(gw, conn: Connection, user, frame: dict) -> None:
     await conn.send(envelopes.ack(frame["client_msg_id"], row.id, view["created_at"]))
 
     if created:
-        # Mark our publish so its bus echo is dropped by ingest (Phase 0 payoff).
-        echo.mark_sent(channel.aiko_channel, user.aiko_username, frame["body"])
-        gw.bus.send(user.aiko_username, channel.aiko_channel, frame["body"])
-        # Fan the persisted message out to channel subscribers.
+        # A DM NEVER FEDERATES ON THE BUS (#2633, design 11 §Decision 3). The bus is the
+        # shared ChatServer backbone; publishing a private DM there would broadcast it
+        # off-island — a content leak. So the bus publish + its echo-suppression
+        # bookkeeping are gated on kind: a DM is island-local (both members on one
+        # island), delivered only by the LOCAL fanout below. Every non-DM channel still
+        # federates exactly as before. (The bus-ingest path can never mint a `dm:`
+        # channel either — DM aiko_channels are never in the channel_list share.)
+        if channel.kind != "dm":
+            # Mark our publish so its bus echo is dropped by ingest (Phase 0 payoff).
+            echo.mark_sent(channel.aiko_channel, user.aiko_username, frame["body"])
+            gw.bus.send(user.aiko_username, channel.aiko_channel, frame["body"])
+        # Fan the persisted message out to channel subscribers (local; both DM members).
         await gw.hub.fanout(channel.id, envelopes.message_frame(view),
                             exclude_user_ids=exclude)
