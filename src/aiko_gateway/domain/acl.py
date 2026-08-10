@@ -130,11 +130,18 @@ async def visible_channels_in_community(
     Reuses ``_readable_predicate`` so the community detail / join read path shares
     the SAME channel-visibility rule as ``visible_channels`` and the WS subscribe
     path — the rule can't drift between the flat channel list and the per-community
-    one. Only the ``community_id`` scope is added."""
+    one. Only the ``community_id`` scope is added.
+
+    DMs are excluded (``kind != 'dm'``, #2633) exactly as in ``visible_channels`` — a
+    DM is community-less by the DB CHECK, so it can never match ``community_id == X``
+    anyway, but the explicit carve-out is belt-and-braces against a future writer that
+    smuggles a DM into a community (cage-match PR#124 Carnot: the leak is closed at BOTH
+    the DB CHECK and every community read path)."""
     rows = (
         await session.execute(
             select(Channel)
-            .where(Channel.community_id == community_id, _readable_predicate(user_id))
+            .where(Channel.community_id == community_id, _readable_predicate(user_id),
+                   Channel.kind != "dm")
             .order_by(Channel.id)
         )
     ).scalars()

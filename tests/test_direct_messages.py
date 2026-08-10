@@ -276,6 +276,31 @@ async def test_get_message_missing_is_404(app_ctx, session):
     assert resp.status_code == 404
 
 
+async def test_get_message_404_when_author_blocked(app_ctx, session):
+    """GET /v1/messages/{id} honours the block content-filter: a message whose author is
+    in a block relationship with the viewer collapses to the same 404 (existence-hiding),
+    so the fetch-by-id surface can't be used to read around a block."""
+    a = await _user(session, "alice")
+    b = await _user(session, "bob")
+    channel, _ = await dm_service.get_or_create_dm(session, me=a, target_user_id=b.id)
+    msg = await _post_msg(session, channel_id=channel.id, sender=a, body="hi", mid=7)
+    await moderation_service.block_user(session, blocker_id=b.id, blocked_id=a.id)
+    resp = await app_ctx.get(f"/v1/messages/{msg.id}", headers=_auth(b))
+    assert resp.status_code == 404
+
+
+async def test_dm_with_community_rejected_by_check(session):
+    """ck_channels_community_required is bidirectional (#2633 cage-match): a DM
+    (kind='dm') MUST have a NULL community — storing one WITH a community is rejected at
+    the DB, so a DM can never be smuggled into a community's channel listing."""
+    from aiko_gateway.domain.models import DEFAULT_COMMUNITY_ID
+    session.add(Channel(id=_ulid(3), name="leak", kind="dm", aiko_channel="dm:leak",
+                        is_private=True, community_id=DEFAULT_COMMUNITY_ID))
+    with pytest.raises(IntegrityError):
+        await session.commit()
+    await session.rollback()
+
+
 # ---------------- feature-interaction safety properties -------------------- #
 
 async def test_dm_cannot_be_expanded_via_members_api(app_ctx, session):
@@ -455,6 +480,30 @@ async def test_dm_send_does_not_publish_to_bus(ws_ctx):
     persisted = (await session.execute(
         Message.__table__.select().where(Message.channel_id == channel.id))).all()
     assert len(persisted) == 1, "the DM message is persisted island-locally"
+
+
+async def test_dm_send_under_block_persists_but_is_filtered(ws_ctx):
+    """Pins the shipped Decision 5 behavior (block = CONTENT filter, not a send gate):
+    a blocked sender's DM message is still PERSISTED (storage is not inert) but is
+    FILTERED from the recipient's history. This is the fork flagged for Nick — the test
+    documents the current posture so a decision to switch to 'refuse the send' shows up
+    as an intentional change here."""
+    session = ws_ctx
+    a = await _user(session, "alice")
+    b = await _user(session, "bob")
+    channel, _ = await dm_service.get_or_create_dm(session, me=a, target_user_id=b.id)
+    await moderation_service.block_user(session, blocker_id=b.id, blocked_id=a.id)
+    conn = _RecordingConn(a.id)
+    await _handle_send(SimpleNamespace(bus=_FakeBus(), hub=Hub()), conn, a, {
+        "type": "send", "channel_id": channel.id,
+        "client_msg_id": "c1", "body": "still stored"})
+    # The row IS persisted (storage not inert)...
+    persisted = (await session.execute(
+        Message.__table__.select().where(Message.channel_id == channel.id))).all()
+    assert len(persisted) == 1
+    # ...but B (the blocker) sees nothing in history — the content filter hides it.
+    hist = await messages_service.get_history(session, channel.id, b.id, limit=50)
+    assert hist == []
 
 
 async def test_standard_channel_send_still_publishes_to_bus(ws_ctx):

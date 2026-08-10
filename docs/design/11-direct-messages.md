@@ -8,10 +8,12 @@ decisions that are NOT in the ticket — the ones a reviewer needs the reasoning
 ## What a DM is
 
 A DM is an ordinary `Channel` with `kind="dm"`, `is_private=True`,
-`community_id=NULL`, and a `Membership` row per participant. **No new table, no new
-column, no migration.** The schema already permits this exact shape:
-`ck_channels_community_required` (`kind='dm' OR community_id IS NOT NULL`) exempts a DM
-from the community requirement, and `Membership` is already an N-capable join table.
+`community_id=NULL`, and a `Membership` row per participant. **No new table and no new
+column** — DMs reuse the existing `Channel`/`Membership` shape. One additive migration
+(**0020**, cage-match hardening) tightens two CHECK constraints on `channels`: it adds
+`ck_channels_kind` (the closed `ChannelKind` set) and makes `ck_channels_community_required`
+bidirectional (a DM must have a NULL community, a non-DM must have one). `Membership` is
+already an N-capable join table.
 
 Reusing the channel/message machinery means DMs inherit — for free and through the
 *same* enforcement door — auth (I1), membership visibility (I2, `acl.readable_channel`),

@@ -76,7 +76,9 @@ async def list_dms(user: CurrentUser, session: DbSession) -> dict:
         session, channel_ids, user.id)
     items = []
     for ch in channels:
-        view = dm_service.dm_channel_view(ch, members_by_channel.get(ch.id, []))
+        # members_of_many initializes an entry for every requested id, so [] is a keyed
+        # lookup (a DM always has ≥1 member anyway).
+        view = dm_service.dm_channel_view(ch, members_by_channel[ch.id])
         last = last_by_channel.get(ch.id)
         view["last_message"] = (
             messages_service.message_view(last) if last is not None else None)

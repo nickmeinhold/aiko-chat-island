@@ -204,7 +204,14 @@ async def get_or_create_dm(
         await session.rollback()
         winner = (await session.execute(
             select(Channel).where(Channel.aiko_channel == aiko_channel)
-        )).scalar_one()
+        )).scalar_one_or_none()
+        # NARROW the catch (cage-match PR#124 Tesla): only a UNIQUE(aiko_channel) race
+        # leaves a winner behind. If NO row holds the key, the IntegrityError was some
+        # OTHER integrity failure (an FK to a target deleted mid-flight, a CHECK) — NOT
+        # our race — so re-raise it rather than masking it as a phantom race (which would
+        # surface as an opaque NoResultFound/500 on scalar_one()).
+        if winner is None:
+            raise
         # Same fail-closed guard as the adopt path: the winner of the UNIQUE race must
         # itself be a DM (it is, when the race is two POST /v1/dm) — never adopt a
         # non-DM channel that squats the key.

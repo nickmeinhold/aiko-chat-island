@@ -45,12 +45,30 @@ depends_on: Union[str, Sequence[str], None] = None
 # Must match _in_check("kind", ChannelKind) in domain/models.py exactly (parity gate).
 _KIND_CHECK = "kind IN ('standard', 'llm', 'robot', 'dm', 'group')"
 
+# Bidirectional community-membership CHECK (cage-match PR#124 Carnot): tightens the
+# original 0001 `kind = 'dm' OR community_id IS NOT NULL` so a DM must ALSO have a NULL
+# community — closing the leak where a DM stored WITH a community surfaces in
+# visible_channels_in_community. Safe vs live prod: all channels are 'standard' with a
+# community (non-DM arm); no DM exists yet. Must match the model CheckConstraint exactly.
+_COMMUNITY_CHECK_OLD = "kind = 'dm' OR community_id IS NOT NULL"
+_COMMUNITY_CHECK_NEW = (
+    "(kind = 'dm' AND community_id IS NULL) "
+    "OR (kind != 'dm' AND community_id IS NOT NULL)")
+
 
 def upgrade() -> None:
+    # One batch rebuild of `channels` applies both constraint changes (add the kind
+    # CHECK, tighten the community CHECK) in a single table copy.
     with op.batch_alter_table("channels", schema=None) as batch_op:
         batch_op.create_check_constraint("ck_channels_kind", _KIND_CHECK)
+        batch_op.drop_constraint("ck_channels_community_required", type_="check")
+        batch_op.create_check_constraint(
+            "ck_channels_community_required", _COMMUNITY_CHECK_NEW)
 
 
 def downgrade() -> None:
     with op.batch_alter_table("channels", schema=None) as batch_op:
+        batch_op.drop_constraint("ck_channels_community_required", type_="check")
+        batch_op.create_check_constraint(
+            "ck_channels_community_required", _COMMUNITY_CHECK_OLD)
         batch_op.drop_constraint("ck_channels_kind", type_="check")

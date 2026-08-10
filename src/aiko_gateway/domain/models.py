@@ -233,14 +233,20 @@ class Channel(Base):
         # the WS send path gates bus federation on kind != 'dm', so an out-of-set kind
         # must be unrepresentable at the DB, not merely by convention (migration 0020).
         CheckConstraint(_in_check("kind", ChannelKind), name="ck_channels_kind"),
-        # Every NON-DM channel belongs to a community (#32, Phase B1). A DM is
-        # between two users, not in a server, so it is exempt (community_id NULL).
-        # This is the handoff's invariant ("a non-DM channel with null community_id
-        # is a migration bug") turned from a prose hope into an enforced DB valve.
-        # DMs are near-term planned; their creation path MUST set community_id=None
-        # explicitly (the model default below would otherwise place them in Aiko).
-        CheckConstraint("kind = 'dm' OR community_id IS NOT NULL",
-                        name="ck_channels_community_required"),
+        # Community membership is now BIDIRECTIONAL by kind (#2633, cage-match PR#124
+        # Carnot): a NON-DM channel MUST have a community, AND a DM channel MUST NOT
+        # (community_id IS NULL). The first half is #32's original invariant ("a non-DM
+        # channel with null community_id is a migration bug"); the second half is the
+        # DM-privacy half — without it a buggy/direct writer could store a DM WITH the
+        # default Aiko community, and visible_channels_in_community would then leak that
+        # DM into the community channel listing (the exact footgun the DM-creation path
+        # dodges with null(), now enforced at the DB so no future writer must remember
+        # the compensating change). Verified safe vs live prod: every channel is
+        # 'standard' with a community (satisfies the non-DM arm); no DM exists yet.
+        CheckConstraint(
+            "(kind = 'dm' AND community_id IS NULL) "
+            "OR (kind != 'dm' AND community_id IS NOT NULL)",
+            name="ck_channels_community_required"),
     )
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=new_ulid)
     name: Mapped[str] = mapped_column(String(128), nullable=False)

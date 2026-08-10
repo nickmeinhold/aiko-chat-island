@@ -13,8 +13,8 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
 
 from ..db import SessionLocal
 from ..domain import (
-    acl, auth_session, echo, mentions, messages_service, moderation_service,
-    signing,
+    acl, auth_session, dm_service, echo, mentions, messages_service,
+    moderation_service, signing,
 )
 from . import envelopes
 from .hub import Connection
@@ -196,11 +196,14 @@ async def _handle_send(gw, conn: Connection, user, frame: dict) -> None:
         # A DM NEVER FEDERATES ON THE BUS (#2633, design 11 §Decision 3). The bus is the
         # shared ChatServer backbone; publishing a private DM there would broadcast it
         # off-island — a content leak. So the bus publish + its echo-suppression
-        # bookkeeping are gated on kind: a DM is island-local (both members on one
-        # island), delivered only by the LOCAL fanout below. Every non-DM channel still
-        # federates exactly as before. (The bus-ingest path can never mint a `dm:`
-        # channel either — DM aiko_channels are never in the channel_list share.)
-        if channel.kind != "dm":
+        # bookkeeping are gated: a DM is island-local, delivered only by the LOCAL fanout
+        # below. DUAL PREDICATE (cage-match PR#124 Tesla): federate only if the channel is
+        # neither kind 'dm' NOR carries the reserved dm: aiko_channel prefix. The CHECK
+        # closes the kind SET but not a kind TRANSITION — a direct SQL / future mutator
+        # retinting a DM 'dm'->'standard' would otherwise re-open federation of private
+        # bodies. The dm: prefix is write-once at creation and reserved from the bus, so
+        # requiring BOTH to say "not a DM" means a lone kind mutation can't leak the room.
+        if channel.kind != "dm" and not dm_service.is_dm_channel_name(channel.aiko_channel):
             # Mark our publish so its bus echo is dropped by ingest (Phase 0 payoff).
             echo.mark_sent(channel.aiko_channel, user.aiko_username, frame["body"])
             gw.bus.send(user.aiko_username, channel.aiko_channel, frame["body"])
