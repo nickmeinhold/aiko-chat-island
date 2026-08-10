@@ -8,11 +8,13 @@ decisions that are NOT in the ticket — the ones a reviewer needs the reasoning
 ## What a DM is
 
 A DM is an ordinary `Channel` with `kind="dm"`, `is_private=True`,
-`community_id=NULL`, and a `Membership` row per participant. **No new table and no new
-column** — DMs reuse the existing `Channel`/`Membership` shape. One additive migration
-(**0020**, cage-match hardening) tightens two CHECK constraints on `channels`: it adds
-`ck_channels_kind` (the closed `ChannelKind` set) and makes `ck_channels_community_required`
-bidirectional (a DM must have a NULL community, a non-DM must have one). `Membership` is
+`community_id=NULL`, `join_policy="invite_only"`, and a `Membership` row per participant.
+**No new table and no new column** — DMs reuse the existing `Channel`/`Membership` shape.
+**Two additive migrations** (cage-match hardening): **0020** adds/tightens the DM CHECK
+constraints on `channels` — `ck_channels_kind` (closed `ChannelKind` set), bidirectional
+`ck_channels_community_required` (DM ⟺ NULL community), `ck_channels_dm_private` (DM ⇒
+private), `ck_channels_dm_prefix` (DM ⟺ `dm:` prefix, case-sensitive), and
+`ck_channels_dm_invite_only`; **0021** adds a `memberships.user_id` index. `Membership` is
 already an N-capable join table.
 
 Reusing the channel/message machinery means DMs inherit — for free and through the

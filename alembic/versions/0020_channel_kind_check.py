@@ -70,6 +70,10 @@ _DM_PRIVATE_CHECK = "kind != 'dm' OR is_private = 1"
 _DM_PREFIX_CHECK = (
     "(kind = 'dm' AND substr(aiko_channel, 1, 3) = 'dm:') "
     "OR (kind != 'dm' AND substr(aiko_channel, 1, 3) <> 'dm:')")
+# A DM must be invite_only — an open-policy DM would create a self_join existence oracle
+# (cage-match PR#124 Tesla). Safe vs prod (all channels are standard/invite_only-agnostic
+# under the kind!='dm' arm).
+_DM_INVITE_ONLY_CHECK = "kind != 'dm' OR join_policy = 'invite_only'"
 
 
 def upgrade() -> None:
@@ -83,10 +87,13 @@ def upgrade() -> None:
             "ck_channels_community_required", _COMMUNITY_CHECK_NEW)
         batch_op.create_check_constraint("ck_channels_dm_private", _DM_PRIVATE_CHECK)
         batch_op.create_check_constraint("ck_channels_dm_prefix", _DM_PREFIX_CHECK)
+        batch_op.create_check_constraint(
+            "ck_channels_dm_invite_only", _DM_INVITE_ONLY_CHECK)
 
 
 def downgrade() -> None:
     with op.batch_alter_table("channels", schema=None) as batch_op:
+        batch_op.drop_constraint("ck_channels_dm_invite_only", type_="check")
         batch_op.drop_constraint("ck_channels_dm_prefix", type_="check")
         batch_op.drop_constraint("ck_channels_dm_private", type_="check")
         batch_op.drop_constraint("ck_channels_community_required", type_="check")

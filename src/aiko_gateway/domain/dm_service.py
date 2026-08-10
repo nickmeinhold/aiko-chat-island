@@ -171,7 +171,13 @@ async def get_or_create_dm(
         # and return — never a second channel for the same pair.
         if existing.kind != ChannelKind.DM:
             raise DmKeyCollision(aiko_channel)
-        await _ensure_memberships(session, existing.id, member_ids)
+        # Ensure ONLY the CALLER's membership on re-open — NEVER re-add the peer
+        # (cage-match PR#124 Tesla P1). Both members are added atomically at CREATE, so
+        # this is normally a no-op; it exists only to restore the caller's OWN access if
+        # their membership was removed out-of-band. Re-adding the PEER here would be a
+        # forced re-injection of someone whose membership was removed (the harassment
+        # class immutability is meant to close), so the adopt path touches only `me`.
+        await _ensure_memberships(session, existing.id, [me.id])
         await session.commit()
         return existing, member_ids
 
@@ -221,7 +227,8 @@ async def get_or_create_dm(
         # non-DM channel that squats the key.
         if winner.kind != ChannelKind.DM:
             raise DmKeyCollision(aiko_channel)
-        await _ensure_memberships(session, winner.id, member_ids)
+        # Only the caller's membership (never re-inject the peer) — see the adopt path.
+        await _ensure_memberships(session, winner.id, [me.id])
         await session.commit()
         return winner, member_ids
     return channel, member_ids

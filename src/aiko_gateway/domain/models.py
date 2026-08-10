@@ -279,6 +279,16 @@ class Channel(Base):
             "(kind = 'dm' AND substr(aiko_channel, 1, 3) = 'dm:') "
             "OR (kind != 'dm' AND substr(aiko_channel, 1, 3) <> 'dm:')",
             name="ck_channels_dm_prefix"),
+        # A DM MUST be invite_only (#2633, cage-match PR#124 Tesla). self_join treats a
+        # PRIVATE+OPEN channel as joinable-without-membership; an open-policy DM would let
+        # a stranger's POST /join reach the DmMembershipImmutable seal (409) — an existence
+        # oracle (409 on a real DM vs 404 on a random id) the seal itself would create. A
+        # DM is never join-managed (membership is fixed at creation), so pinning
+        # invite_only makes that oracle unrepresentable. dm_service leaves the model
+        # default ('invite_only'), so this holds today; the CHECK stops a direct/future
+        # write from opening it.
+        CheckConstraint("kind != 'dm' OR join_policy = 'invite_only'",
+                        name="ck_channels_dm_invite_only"),
     )
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=new_ulid)
     name: Mapped[str] = mapped_column(String(128), nullable=False)

@@ -484,6 +484,36 @@ async def test_dm_must_be_private_check(session):
     await session.rollback()
 
 
+async def test_dm_must_be_invite_only_check(session):
+    """ck_channels_dm_invite_only (#2633 cage-match Tesla): a DM must be invite_only — an
+    open-policy DM would create a self_join existence oracle. Storing one is DB-rejected."""
+    from sqlalchemy import null
+    session.add(Channel(id=_ulid(6), name="open-dm", kind="dm", aiko_channel="dm:open",
+                        is_private=True, join_policy="open", community_id=null()))
+    with pytest.raises(IntegrityError):
+        await session.commit()
+    await session.rollback()
+
+
+async def test_reopen_does_not_reinject_removed_peer(session):
+    """Adopt (re-open) ensures ONLY the caller's membership — never re-adds a peer whose
+    membership was removed out-of-band (cage-match PR#124 Tesla P1: immutability must not
+    be undone by find-or-create healing the pair)."""
+    a = await _user(session, "alice")
+    b = await _user(session, "bob")
+    channel, _ = await dm_service.get_or_create_dm(session, me=a, target_user_id=b.id)
+    # Simulate an out-of-band removal of B's membership (ops SQL / cascade edge).
+    await session.execute(
+        Membership.__table__.delete().where(
+            (Membership.channel_id == channel.id) & (Membership.user_id == b.id)))
+    await session.commit()
+    # A re-opens the DM → must NOT re-inject B.
+    await dm_service.get_or_create_dm(session, me=a, target_user_id=b.id)
+    assert b.id not in await dm_service.members_of(session, channel.id), \
+        "re-open must not force-re-add a removed peer"
+    assert a.id in await dm_service.members_of(session, channel.id)
+
+
 async def test_dm_must_carry_dm_prefix_check(session):
     """ck_channels_dm_prefix (#2633 cage-match): a DM's aiko_channel MUST start with
     'dm:' — the prefix leg of the dual bus gate. A DM with a non-dm: name is rejected at
@@ -613,6 +643,34 @@ async def test_dm_reply_under_block_uses_no_channel_not_blocked(ws_ctx):
         "body": "reply under block", "reply_to": m1.id})
     codes = [f.get("code") for f in conn.sent if f.get("type") == "error"]
     assert codes == ["no_channel"], f"reply-under-block must be no_channel, got {codes}"
+
+
+async def test_dm_reply_retry_after_block_reconciles(ws_ctx):
+    """A DM REPLY retry after a block reconciles (ack of the existing row), NOT no_channel
+    (cage-match PR#124 round 7 Carnot/Tesla P0 — the reply arm short-circuited before
+    create_outbound's idempotency check; now the reply block sub-check is DM-skipped so
+    the mutator owns refuse-vs-reconcile for every send shape). This is the case the
+    round-6 fix missed: retry-after-block WITH reply_to set."""
+    session = ws_ctx
+    a = await _user(session, "alice")
+    b = await _user(session, "bob")
+    channel, _ = await dm_service.get_or_create_dm(session, me=a, target_user_id=b.id)
+    m1 = await _post_msg(session, channel_id=channel.id, sender=b, body="hi from bob", mid=5)
+    gw = SimpleNamespace(bus=_FakeBus(), hub=Hub())
+    frame = {"type": "send", "channel_id": channel.id, "client_msg_id": "C1",
+             "body": "a reply", "reply_to": m1.id}
+    # A replies to B's message BEFORE any block — persists + acks.
+    conn1 = _RecordingConn(a.id)
+    await _handle_send(gw, conn1, a, frame)
+    assert any(f.get("type") == "ack" for f in conn1.sent)
+    assert not any(f.get("type") == "error" for f in conn1.sent)
+    # B blocks A; A retries the SAME reply frame → must reconcile (ack), not no_channel.
+    await moderation_service.block_user(session, blocker_id=b.id, blocked_id=a.id)
+    conn2 = _RecordingConn(a.id)
+    await _handle_send(gw, conn2, a, frame)
+    assert not any(f.get("type") == "error" for f in conn2.sent), \
+        "reply retry-after-block must reconcile, not refuse"
+    assert any(f.get("type") == "ack" for f in conn2.sent)
 
 
 async def test_standard_channel_send_still_publishes_to_bus(ws_ctx):

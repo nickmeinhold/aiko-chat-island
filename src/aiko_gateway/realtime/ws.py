@@ -135,23 +135,23 @@ async def _handle_send(gw, conn: Connection, user, frame: dict) -> None:
                     "no_reply_target", "reply target not found in this channel",
                     frame["client_msg_id"]))
                 return
-            if (target.sender_user_id is not None
+            # BLOCK gate on the reply — NON-DM channels ONLY (#2633; cage-match PR#124
+            # round 7 Carnot/Tesla P0). For a DM, the block refusal is owned by the
+            # mutator (create_outbound: idempotency-first, then DM peer-block →
+            # BlockedDmSend → no_channel). Doing it HERE would short-circuit BEFORE that
+            # idempotency check, so a reply RETRY-after-block would get no_channel instead
+            # of reconciling the already-persisted row — the exact idempotency break the
+            # plain-send fix removed, hiding in the reply arm. A DM has only the peer to
+            # reply to, so create_outbound's peer-block gate covers the reply case
+            # uniformly (new → no_channel; retry → ack). The reply-target validation above
+            # (no_reply_target) still runs for DMs — only this block sub-check is deferred.
+            if (channel.kind != "dm"
+                    and target.sender_user_id is not None
                     and await moderation_service.is_blocked_between(
                         session, user.id, target.sender_user_id)):
-                # For a DM, collapse the reply-block into the SAME existence-hiding
-                # no_channel as a plain DM send-under-block (create_outbound →
-                # BlockedDmSend), so reply_to doesn't split the error surface with a
-                # distinct "blocked" code (#2633 §Decision 5; cage-match PR#124
-                # Carnot F1/Tesla P1). Public/community channels keep the honest
-                # "blocked" reply code. Crucially this does NOT short-circuit a
-                # PLAIN DM send before create_outbound's idempotency-first check —
-                # only a reply carrying a blocked target reaches here (Tesla P0: the
-                # early gate that broke retry-after-block idempotency is removed).
-                code = "no_channel" if channel.kind == "dm" else "blocked"
-                detail = ("channel not found" if channel.kind == "dm"
-                          else "cannot reply to a blocked user")
                 await conn.send(envelopes.error(
-                    code, detail, frame["client_msg_id"]))
+                    "blocked", "cannot reply to a blocked user",
+                    frame["client_msg_id"]))
                 return
         # Sovereign-signing carriage (#1816): shape-validate the `origin` envelope
         # at the trust boundary (never trust its claimed alg; its client_msg_id must
