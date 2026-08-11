@@ -18,11 +18,11 @@ PROVEN 2026-08-11 against BOTH live islands on livekit-server v1.13.5:
 RESULT=RELAY_MEDIA_OK, all_relay=true (1/1 local candidates were RELAY), transport
 turn:<box>:3478?transport=udp (TRANSPORT_UDP). Run from an off-box external vantage.
 
-This is the livekit-rtc successor to gate A of e2e_media_relay.py — the turnutils_uclient
-approach there is wrong-premised (LiveKit's TURN is session-bound; there is no standalone
-TURN credential to hand turnutils). Wiring this into standup.sh/update.sh and retiring the
-now-moot gate-B exposure machinery (session-bound TURN is not an open relay by construction)
-is a separate, cage-match-tier change to the shipped BOOTSTRAP gates — tracked, not done here.
+This is the livekit-rtc engine for gate A of e2e_media_relay.py — the turnutils_uclient
+approach there was wrong-premised (LiveKit's TURN is session-bound; there is no standalone
+TURN credential to hand turnutils). e2e_media_relay.py invokes this harness and reads its
+exit code + the structured RELAY_ASSERT line below; the harness OWNS the dual-leg relay-only
+invariant (both pub and sub must gather candidates that are all RELAY, else it exits non-zero).
 
 Env: LK_URL, LK_API_KEY, LK_API_SECRET, LK_ROOM (optional).
 """

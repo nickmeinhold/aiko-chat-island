@@ -103,13 +103,17 @@ def gate_A(host: str) -> None:
     # pub and sub gathered candidates that were ALL relay. We confirm its structured
     # RELAY_ASSERT line agrees — a machine contract, not a stdout grep (cage-match #128:
     # a bare `"all_relay": true in out` was satisfied by one leg while the other leaked).
-    m = re.search(r"RELAY_ASSERT=(\{.*\})", out)
-    if not m:
-        block("A", f"harness emitted no RELAY_ASSERT line — cannot confirm both legs relay-only:\n{out[-500:]}")
+    # Line-anchored + require EXACTLY ONE (cage-match #128: a non-anchored first-match
+    # regex over merged stdout/stderr could be satisfied by a stray/duplicate line
+    # before a later failing assertion).
+    asserts = re.findall(r"(?m)^RELAY_ASSERT=(\{.*\})$", out)
+    if len(asserts) != 1:
+        block("A", f"expected exactly one RELAY_ASSERT line, found {len(asserts)} — cannot confirm both legs "
+                   f"relay-only:\n{out[-500:]}")
     try:
-        a = json.loads(m.group(1))
+        a = json.loads(asserts[0])
     except json.JSONDecodeError:
-        block("A", f"unparseable RELAY_ASSERT: {m.group(1)[:200]}")
+        block("A", f"unparseable RELAY_ASSERT: {asserts[0][:200]}")
     if not (a.get("result") == "OK" and a.get("pub_all_relay") is True and a.get("sub_all_relay") is True):
         block("A", f"relay-only NOT proven on BOTH legs (pub+sub each all-relay): {a}")
     print("  ok A: forced relay-only media round-tripped; every candidate was RELAY (media went through TURN).")
@@ -139,24 +143,29 @@ def _parse_version(ref: str):
     return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
 
 
-def _turn_block_unknown_keys(yaml_path: str) -> set:
-    """Keys under the rendered `turn:` block that are NOT in KNOWN_TURN_KEYS — a
-    lightweight scan (the config is flat). An unknown key could be a relay-permission
-    / CIDR override, so B3 fails closed on any."""
-    keys, in_turn = set(), False
-    with open(yaml_path) as fh:
-        for line in fh:
-            raw = line.rstrip("\n")
-            if re.match(r"^turn:\s*(#.*)?$", raw):
-                in_turn = True
-                continue
-            if in_turn:
-                if re.match(r"^\S", raw):        # dedent to a new top-level block ends turn:
-                    break
-                m = re.match(r"^\s+([A-Za-z_][A-Za-z0-9_]*):", raw)
-                if m:
-                    keys.add(m.group(1))
-    return keys - KNOWN_TURN_KEYS
+def _turn_block_unknown_keys(yaml_path: str):
+    """Keys under the rendered `turn:` block that are NOT in KNOWN_TURN_KEYS. Parsed
+    with a real YAML loader (cage-match #128: a line-regex is blind to inline maps,
+    anchors/merge keys, quoted keys, and nested keys — the closed-set invariant that
+    a trust boundary rests on must be parsed as YAML, not approximated). Returns None
+    if the config can't be safely parsed, so the caller fails closed."""
+    try:
+        import yaml
+    except ImportError:
+        return None  # caller blocks: a trust-boundary invariant must not fall back to a regex
+    # The rendered config carries envsubst output (plain scalars) — safe_load handles it.
+    # The .tmpl (pre-render) has ${...} placeholders that are still valid YAML scalars.
+    try:
+        with open(yaml_path) as fh:
+            doc = yaml.safe_load(fh)
+    except yaml.YAMLError:
+        return None
+    if not isinstance(doc, dict) or "turn" not in doc:
+        return set()  # no turn block → no override keys (turn disabled is not our concern)
+    turn = doc["turn"]
+    if not isinstance(turn, dict):
+        return None   # turn present but not a mapping — unexpected shape, fail closed
+    return set(map(str, turn.keys())) - KNOWN_TURN_KEYS
 
 
 def gate_B3(host: str) -> None:
@@ -170,9 +179,19 @@ def gate_B3(host: str) -> None:
     if not ref:
         block("B3", "cannot determine the running LiveKit image (docker inspect failed AND LIVEKIT_IMAGE unset) "
                     "— refusing to certify RFC1918 relay-deny.")
+    # For a firewall-OPENING gate the version must be RUNTIME-observed, not operator
+    # intent (cage-match #128: env LIVEKIT_IMAGE is compose-pinned intent, and warning
+    # instead of blocking is a soft fail-open). Require docker inspect; the env fallback
+    # is allowed only under an explicit LIVEKIT_B3_ALLOW_ENV=1 opt-out for off-box runs
+    # that do NOT open the range.
     if not src.startswith("docker"):
-        print(f"  WARN B3: version from {src}='{ref}' — operator-asserted, NOT the running container. "
-              f"Prefer running the gate where `docker inspect livekit` resolves.")
+        if os.environ.get("LIVEKIT_B3_ALLOW_ENV") == "1":
+            print(f"  WARN B3: version from {src}='{ref}' via explicit LIVEKIT_B3_ALLOW_ENV=1 — operator-asserted, "
+                  f"NOT runtime-observed. Do NOT open the firewall range on this run.")
+        else:
+            block("B3", f"LiveKit image not runtime-observed (docker inspect failed; falling back to {src}). "
+                        f"A firewall-opening gate requires the RUNNING image. Run where `docker inspect livekit` "
+                        f"resolves, or set LIVEKIT_B3_ALLOW_ENV=1 for an off-box check that does NOT open the range.")
     repo = ref.rsplit(":", 1)[0].split("@")[0]
     if repo != OFFICIAL_LIVEKIT_REPO:
         block("B3", f"image repo '{repo}' is not the official {OFFICIAL_LIVEKIT_REPO} — cannot assume LiveKit's "
@@ -188,15 +207,19 @@ def gate_B3(host: str) -> None:
         block("B3", f"rendered config {yaml_path} not found — cannot assert the turn block carries no "
                     f"relay-permission override. Set LIVEKIT_YAML to the box's rendered livekit.yaml.")
     unknown = _turn_block_unknown_keys(yaml_path)
+    if unknown is None:
+        block("B3", f"could not YAML-parse {yaml_path} (or PyYAML missing) — a trust-boundary config-invariant "
+                    f"must not fall back to a regex. Install pyyaml in the gate's python and ensure the config parses.")
     if unknown:
         block("B3", f"turn block has unrecognized key(s) {sorted(unknown)} in {yaml_path} — a possible "
                     f"relay-permission / peer-CIDR override. Refusing to certify default-deny; review before opening.")
     print(f"  ok B3: {ref} (official {OFFICIAL_LIVEKIT_REPO}, >= v{'.'.join(map(str, MIN_CIDR_DENY_VERSION))}) "
           f"+ turn block within the safe key set — default private-CIDR deny holds.")
-    print("  NOTE B3: a live runtime private-deny probe is unimplementable for session-bound embedded TURN "
-          "(no standalone TURN cred / client permission API); this version+repo+config-invariant is the strongest "
-          "achievable check. A hand-rebuilt image relabeled as the official tag is an accepted out-of-scope "
-          "(root-on-box supply-chain) residual, not certified here.")
+    print("  NOTE B3: this is a POLICY proxy (runtime image + repo + version floor + config key-set), not a "
+          "packet-level RFC1918-deny probe. A behavioral probe is DEFERRED, not impossible: the candidate is to "
+          "extract the session-bound TURN cred the SFU issues to a joined livekit-rtc client (as gate A already "
+          "obtains) and drive a turnutils CreatePermission to a 10.x/169.254.x peer, asserting refusal — tracked. "
+          "Residual until then: a default regression under an accepted tag, or a hand-rebuilt relabeled image.")
 
 
 def gate_B(host: str) -> None:

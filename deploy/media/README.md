@@ -78,4 +78,5 @@ everywhere, not a nick.
 
 `e2e_media_relay.py` **fails CLOSED**: any check that cannot produce positive evidence
 exits non-zero and `standup.sh` will NOT open the firewall. Gate A additionally needs a
-python with `livekit` + `livekit-api` + `numpy` (the box venv) as `python3`.
+python with `livekit` + `livekit-api` + `numpy` + `pyyaml` (the box venv) as `python3`
+(`pyyaml` is used by gate B3's config-invariant; it fails closed if absent).

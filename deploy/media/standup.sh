@@ -44,7 +44,9 @@ echo "== 2. validate range + render config (turn enabled) with restrictive perms
     < livekit.yaml.tmpl > livekit.yaml )
 chmod 600 livekit.yaml   # explicit: umask only guards CREATE; a re-run over an existing 0644 must not leave secrets world-readable
 export LIVEKIT_YAML="$PWD/livekit.yaml"   # gate B3 reads the rendered turn block for its config-invariant
-export LIVEKIT_IMAGE="$IMAGE"             # gate B3 version floor (docker inspect is preferred; this is the fallback)
+# NOTE: do NOT export LIVEKIT_IMAGE here — B3 requires the RUNTIME-observed image
+# (docker inspect livekit, running by step 5). Pre-seeding the env fallback would
+# defeat B3's fail-closed "image not runtime-observed" block (cage-match #128).
 
 echo "== 3. assert ranges: rendered relay == .env, and DISJOINT from SFU ICE =="
 ice_s=$(awk '/port_range_start:/{print $2; exit}' livekit.yaml); ice_e=$(awk '/port_range_end:/{print $2; exit}' livekit.yaml)
@@ -84,7 +86,7 @@ read -r -p "Confirm BOTH firewall layers open for the ranges above, then press e
 
 echo "== 8. connectivity-acceptance (A): forced relay-only media round-trip (livekit-rtc) =="
 echo "   proves the UDP relay path; TLS/5349 relay is a KNOWN GAP (not advertised to clients)."
-echo "   NOTE: needs a python with livekit + livekit-api + numpy (the box venv) on PATH as python3."
+echo "   NOTE: needs a python with livekit + livekit-api + numpy + pyyaml (the box venv) on PATH as python3."
 python3 e2e_media_relay.py --host "$TURN_DOMAIN"
 
 echo "== BOOTSTRAP complete. Enable the renewal timer: =="
