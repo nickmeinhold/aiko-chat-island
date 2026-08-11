@@ -51,5 +51,12 @@ everywhere, not a nick.
   candidate with `type == relay` **AND** `protocol == TCP/TLS`; plus a UDP-relay
   canary. `e2e_media_relay.py`.
 - **B — exposure (before opening the range to real traffic):** unauth `ALLOCATE`
-  fails · short-TTL LiveKit-issued creds · no relay to RFC1918/link-local · ports
-  outside `50000–60000` proven closed · token-issuer allowlist · abuse ceiling.
+  *positively* rejected (auth-reject marker, not just a non-zero exit) · short-TTL
+  LiveKit-issued creds · no relay to RFC1918/link-local · ports outside
+  `50000–60000` sampled (advisory — can fail the gate, cannot certify closure;
+  external multi-port audit still required).
+
+`e2e_media_relay.py` **fails CLOSED**: the cred-mint (`LIVEKIT_TURN_CRED_CMD`) and
+private-IP-denial (`TURN_B3_PRIVATE_DENY_CMD`) checks are DESIGN §7 build-time
+wire-ups — **until they're set, the gate BLOCKS (exit non-zero) and `standup.sh`
+will NOT open the firewall**. A not-yet-wired check never waves through.

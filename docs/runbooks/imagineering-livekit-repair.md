@@ -71,9 +71,11 @@ Separately, **pin the image** off `:latest` → `v1.13.5` as its OWN windowed st
    unacked within the secondary-page interval, page the secondary.
 3. **NOTICE** — post the tenant-notice (dreamfinder/lyra/AITW owners) with the
    window + lead time (worst-case-full-outage severity until §4-step-6 measured).
-4. **ACT** — in the window: `sudo docker restart livekit`. `cert-restart.sh`'s
-   validate-before-restart applies (refuse a half-written/mismatched pair,
-   fail-closed).
+4. **ACT** — in the window, first **validate the on-disk pair without touching the
+   service**: `./cert-restart.sh --validate-only` (parses the leaf pair, EC+RSA
+   agnostic, never restarts/probes — the safe command for shared infra). If VALID:
+   `sudo docker restart livekit`. Do NOT run bare `cert-restart.sh` here — that is
+   BOOTSTRAP automation; on this shared box the restart is yours to fire in-window.
 5. **RE-GATE** — re-run gate A + the non-island canary; confirm the alarm now
    reads a fresh `notAfter`.
 6. **ESCALATE** — if no change-window is taken within **T** of the first page, the

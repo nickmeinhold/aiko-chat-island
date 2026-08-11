@@ -1,43 +1,72 @@
 #!/usr/bin/env bash
-# cert-restart.sh — BOOTSTRAP restart trigger (machine-forced renewal loop).
+# cert-restart.sh — renewal restart decision (BOOTSTRAP machine-forced loop).
 #
-# Runs served-cert-alarm.sh; on exit 10 (STALE served cert) it restarts LiveKit so
-# pion/turn reloads the renewed cert from the RO bind-mount. On exit 20 (endpoint
-# down) it does NOT restart (the service is already dead — restarting won't fix a
-# missing cert and would mask the real fault); the alarm has already paged.
+# Two clocks (round-1 Tesla): "served cert stale" alone is NOT enough — restarting
+# on notAfter<N every day while Caddy has NOT actually renewed = a daily multi-tenant
+# outage LOOP. Restart ONLY when the DISK cert (Caddy's renewal) is strictly NEWER
+# than the SERVED (in-memory) cert AND the pair validates. If disk is also stale
+# (renewal pipeline broken), PAGE only — never thrash.
 #
-# CLIENT+REPAIR (imagineering) does NOT install this — its restart is human-forced
-# via the runbook state machine. This trigger is BOOTSTRAP-only (island-owned box).
+# Modes:
+#   (default)         BOOTSTRAP: decide + restart. Honors ALARM_RESTART=0 (page-only).
+#   --validate-only   parse the on-disk leaf pair, report valid/invalid, NEVER restart
+#                     or probe — the safe command a CLIENT+REPAIR operator runs by hand.
+#
+# CLIENT+REPAIR (imagineering) installs NO timer and runs `--validate-only`; the
+# runbook state machine owns the restart.
 set -euo pipefail
-cd "$(dirname "$0")"
+cd "$(dirname "$0")"; . lib/cert-pair.sh
 [ -f .env ] && set -a && . ./.env && set +a
 : "${TURN_DOMAIN:?set TURN_DOMAIN}"
 CERT_DIR="${CADDY_CERT_LEAF_DIR:?set CADDY_CERT_LEAF_DIR}"
+: "${ALARM_RESTART:=1}"          # 0 => detector-only (page, never restart)
+TURN_TLS_PORT="${TURN_TLS_PORT:-5349}"
+HOST="${TURN_PROBE_HOST:-127.0.0.1}"
+crt="$CERT_DIR/${TURN_DOMAIN}.crt"; key="$CERT_DIR/${TURN_DOMAIN}.key"
+
+if [ "${1:-}" = "--validate-only" ]; then
+  if cert_pair_matches "$crt" "$key"; then echo "on-disk leaf pair VALID (matched, unexpired)."; exit 0
+  else echo "on-disk leaf pair INVALID (missing / mismatched / expired) — do NOT restart onto it." >&2; exit 1; fi
+elif [ -n "${1:-}" ]; then
+  echo "unknown arg '$1' (only --validate-only). Failing closed." >&2; exit 2   # fail-closed on unknown flag
+fi
 
 set +e; ./served-cert-alarm.sh; rc=$?; set -e
 case "$rc" in
   0)  echo "served cert healthy — no restart."; exit 0 ;;
-  10) echo "served cert STALE — validating renewed material before restart…" ;;
-  20) echo "endpoint DOWN — alarm paged; NOT restarting (not a cert-renewal)."; exit 0 ;;
-  *)  echo "alarm returned unexpected rc=$rc — failing closed, no restart." >&2; exit 1 ;;
+  20) echo "endpoint DOWN — alarm paged; NOT restarting (not a renewal)."; exit 0 ;;
+  10) echo "served cert STALE — checking whether disk has a NEWER renewed cert…" ;;
+  *)  echo "alarm rc=$rc unexpected — failing closed, no restart." >&2; exit 1 ;;
 esac
 
-# Validate-before-restart (Tesla r3 residual): refuse to restart onto a half-written
-# or mismatched cert/key pair — restarting into a broken pair would take TURN down
-# harder than a soon-to-expire cert. Fail CLOSED: bad pair => no restart, alarm stays.
-crt="$CERT_DIR/${TURN_DOMAIN}.crt"; key="$CERT_DIR/${TURN_DOMAIN}.key"
-if [ ! -s "$crt" ] || [ ! -s "$key" ]; then
-  echo "renewed cert/key missing or empty at $CERT_DIR — refusing restart (fail-closed)." >&2; exit 1
+# Two-clock guard: only restart if the disk cert is a genuine renewal (strictly
+# newer than what's served) AND the pair validates. Otherwise the renewal pipeline
+# is broken — page (already done by the alarm) and STOP, don't thrash.
+disk_epoch="$(cert_file_not_after_epoch "$crt" || true)"
+served_epoch="$(served_cert_not_after_epoch "$HOST" "$TURN_TLS_PORT" "$TURN_DOMAIN" || true)"
+if [ -z "$disk_epoch" ] || [ -z "$served_epoch" ]; then
+  echo "could not read disk/served notAfter — failing closed, no restart." >&2; exit 1
 fi
-crt_mod="$(openssl x509 -noout -modulus -in "$crt" 2>/dev/null | openssl md5)"
-key_mod="$(openssl rsa  -noout -modulus -in "$key" 2>/dev/null | openssl md5 \
-           || openssl ec -noout -in "$key" 2>/dev/null | openssl md5)"
-if [ -z "$crt_mod" ] || [ "$crt_mod" != "$key_mod" ]; then
-  echo "cert/key modulus mismatch (half-write?) — refusing restart (fail-closed)." >&2; exit 1
+if [ "$disk_epoch" -le "$served_epoch" ]; then
+  echo "disk cert is NOT newer than the served cert (renewal pipeline hasn't produced a fresh cert) — paged, NOT restarting (no thrash)." >&2; exit 0
+fi
+if ! cert_pair_matches "$crt" "$key"; then
+  echo "disk cert/key pair invalid (half-write / mismatch / expired) — refusing restart (fail-closed)." >&2; exit 1
 fi
 
-echo "renewed pair valid — restarting livekit."
+if [ "$ALARM_RESTART" != "1" ]; then
+  echo "ALARM_RESTART=$ALARM_RESTART (detector-only) — a fresh valid cert is on disk but restart is DISABLED; page and stop." >&2; exit 0
+fi
+
+echo "disk has a newer valid renewed pair — restarting livekit."
 docker restart livekit
-# Re-run the alarm to confirm the served endpoint now presents the fresh cert.
-sleep 5
-./served-cert-alarm.sh
+# Poll the endpoint for health instead of a blind sleep (round-1 Kelvin).
+for i in $(seq 1 24); do
+  if served_cert_not_after_epoch "$HOST" "$TURN_TLS_PORT" "$TURN_DOMAIN" >/dev/null 2>&1; then
+    echo "endpoint healthy post-restart."; exec ./served-cert-alarm.sh
+  fi
+  sleep 5
+done
+echo "endpoint did not come healthy within 120s post-restart — PAGE." >&2
+./served-cert-alarm.sh || true
+exit 1

@@ -1,47 +1,36 @@
 #!/usr/bin/env bash
-# cert-tree-contract.sh — the "third box" (DESIGN §4b, Tesla): prove the renewal
-# trigger's validate-before-restart logic behaves the SAME against a cert tree
-# shaped like EITHER box topology, and FAIL-CLOSES on a half-written/mismatched
-# pair. No docker, no live endpoint — pure logic contract for cert-restart.sh.
+# cert-tree-contract.sh — the "third box" (DESIGN §4b). Proves the renewal
+# trigger's validate-before-restart logic behaves the same across BOTH box
+# topologies AND BOTH key families, and fail-closes on a bad pair. No docker, no
+# live endpoint.
 #
-# Topologies exercised:
-#   host-FS leaf dir      (enspyr systemd Caddy):  .../turn.enspyr.co/{crt,key}
-#   docker-volume subpath (imagineering container): <vol>/turn.imagineering.cc/{crt,key}
-# Both reduce to "a leaf dir holding <domain>.crt + <domain>.key"; the contract is
-# that the validation is identical and topology-independent.
+# Sources the SAME cert_pair_matches() the trigger uses (round-1 Carnot+Tesla: a
+# separate RSA-only test was a verifier blind to the ECDSA production path — the
+# check must fail differently from the checked, and it can't if it's a copy).
 set -euo pipefail
+cd "$(dirname "$0")/.."; . lib/cert-pair.sh
 FAILS=0
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 
-# Same check cert-restart.sh performs before restarting.
-valid_pair() {  # $1 crt  $2 key  -> 0 if matched non-empty pair, else 1
-  [ -s "$1" ] && [ -s "$2" ] || return 1
-  local cm km
-  cm="$(openssl x509 -noout -modulus -in "$1" 2>/dev/null | openssl md5)"
-  km="$(openssl rsa -noout -modulus -in "$2" 2>/dev/null | openssl md5)"
-  [ -n "$cm" ] && [ "$cm" = "$km" ]
-}
+mk_rsa() { mkdir -p "$1"; openssl req -x509 -newkey rsa:2048 -nodes -days 30 -subj "/CN=$2" -keyout "$1/$2.key" -out "$1/$2.crt" >/dev/null 2>&1; }
+mk_ec()  { mkdir -p "$1"; openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 30 -subj "/CN=$2" -keyout "$1/$2.key" -out "$1/$2.crt" >/dev/null 2>&1; }
+check()  { if eval "$2"; then echo "  ok: $1"; else echo "  FAIL: $1" >&2; FAILS=$((FAILS+1)); fi; }
 
-mk_pair() {  # $1 dir  $2 domain  -> writes a matched self-signed crt/key
-  mkdir -p "$1"
-  openssl req -x509 -newkey rsa:2048 -nodes -days 30 -subj "/CN=$2" \
-    -keyout "$1/$2.key" -out "$1/$2.crt" >/dev/null 2>&1
-}
-
-check() { if eval "$2"; then echo "  ok: $1"; else echo "  FAIL: $1" >&2; FAILS=$((FAILS+1)); fi; }
-
-for topo in "host:turn.enspyr.co:$TMP/varlib/.../certs" "volume:turn.imagineering.cc:$TMP/caddydata/certs"; do
+# host-FS (enspyr systemd Caddy) and docker-volume (imagineering) topologies ×
+# RSA and EC (Caddy/LE DEFAULT) key families.
+for topo in "host:turn.enspyr.co:$TMP/varlib/certs" "volume:turn.imagineering.cc:$TMP/caddydata/certs"; do
   IFS=: read -r name domain base <<<"$topo"
-  leaf="$base/$domain"; mk_pair "$leaf" "$domain"
-  echo "[$name topology] leaf=$leaf"
-  # 1. valid matched pair -> accepted (would restart)
-  check "valid pair accepted" "valid_pair '$leaf/$domain.crt' '$leaf/$domain.key'"
-  # 2. mismatched key (half-write / wrong renewal) -> rejected (fail-closed, no restart)
-  mk_pair "$TMP/other" "other.example"; cp "$TMP/other/other.example.key" "$leaf/$domain.key"
-  check "mismatched key rejected" "! valid_pair '$leaf/$domain.crt' '$leaf/$domain.key'"
-  # 3. empty cert (mid-write) -> rejected
-  : > "$leaf/$domain.crt"
-  check "empty cert rejected" "! valid_pair '$leaf/$domain.crt' '$leaf/$domain.key'"
+  for fam in rsa ec; do
+    leaf="$base/$fam/$domain"; "mk_$fam" "$leaf" "$domain"
+    echo "[$name topology / $fam] leaf=$leaf"
+    check "$fam valid pair accepted" "cert_pair_matches '$leaf/$domain.crt' '$leaf/$domain.key'"
+    # mismatched key from a different pair -> rejected (fail-closed)
+    mk_ec "$TMP/other/$fam" other.example; cp "$TMP/other/$fam/other.example.key" "$leaf/$domain.key"
+    check "$fam mismatched key rejected" "! cert_pair_matches '$leaf/$domain.crt' '$leaf/$domain.key'"
+    # empty cert (mid-write) -> rejected
+    : > "$leaf/$domain.crt"
+    check "$fam empty cert rejected" "! cert_pair_matches '$leaf/$domain.crt' '$leaf/$domain.key'"
+  done
 done
 
 [ "$FAILS" -eq 0 ] && { echo "cert-tree contract: PASS"; exit 0; } || { echo "cert-tree contract: $FAILS FAILURE(S)" >&2; exit 1; }
