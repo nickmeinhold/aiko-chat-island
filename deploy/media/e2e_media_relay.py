@@ -37,9 +37,11 @@ the public firewall range on a false green.
                       SFU's session-bound TURN cred from the raw signaling JoinResponse
                       (the same session-bound cred gate A relies on, read off the wire —
                       livekit-rtc never surfaces it), allocates a relay, then issues
-                      CreatePermission for a PUBLIC control + the SSRF-critical private
-                      ranges, requiring 200 for the control and 403 for every private
-                      peer. A version proxy was the prior stopgap; the behavioral probe
+                      CreatePermission for a PUBLIC control + a representative SENTINEL
+                      per SSRF-critical private range (the set is MANDATORY/hard-coded,
+                      not env-shrinkable), requiring 200 for the control and 403 for
+                      every sentinel. Sampled, not an exhaustive range proof. A version
+                      proxy was the prior stopgap; the behavioral probe
                       supersedes it AND is more truthful (it found LiveKit's default deny
                       does NOT cover 100.64/10 CGNAT — task #6, excluded from the set).
                       Runs in the exposure phase: needs :443 (join) + :3478 (TURN
@@ -153,8 +155,9 @@ def gate_B3(host: str) -> None:
     # is insufficient (a 0 with a non-OK body, or an OK body on a non-zero exit, is drift).
     if r.returncode != 0 or a.get("result") != "OK":
         block("B3", f"behavioral relay-deny NOT proven (rc={r.returncode}): {a.get('reason', a)}")
-    print("  ok B3: behavioral probe — allocation succeeded, public control allowed, every "
-          "SSRF-critical private range's CreatePermission refused (403).")
+    print("  ok B3: behavioral probe — every advertised turn:udp endpoint: allocation "
+          "succeeded, public control allowed (before+after), every SSRF-critical private "
+          "sentinel's CreatePermission refused (403). Sampled sentinels, not a full-range proof.")
 
 
 def gate_B(host: str) -> None:

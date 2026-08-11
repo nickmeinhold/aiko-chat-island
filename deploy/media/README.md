@@ -70,8 +70,11 @@ everywhere, not a nick.
     session-bound TURN credential from the raw signaling `JoinResponse` (which
     `livekit-rtc` never surfaces — the wire does), allocates a relay, then issues
     `CreatePermission` for a **public control** + the **SSRF-critical private ranges**
-    (`10/8`, `172.16/12`, `192.168/16`, `169.254/16`, `127/8`), requiring the control
-    **allowed (200)** and every private peer **refused (403)**. Fail-closed exit code
+    (`10/8`, `172.16/12`, `192.168/16`, `169.254/16`, `127/8` — one **sentinel** per
+    range, a mandatory hard-coded set that env can only add to, never shrink),
+    requiring the control **allowed (200) before and after** and every sentinel
+    **refused (403)**. Sampled sentinels, not an exhaustive range proof. Every
+    advertised `turn:udp` endpoint must pass. Fail-closed exit code
     (0 OK / 3 FAIL / 2 BLOCK) **and** a single structured `B3_ASSERT` verdict line.
     Supersedes the prior version-proxy — and is more truthful: it found LiveKit's
     default deny does **not** cover `100.64/10` (CGNAT), tracked separately (task #6).
