@@ -1,0 +1,13 @@
+# Daily check for a renewed-but-not-yet-served cert. Cheap: an endpoint TLS probe.
+# A restart fires ONLY when the served cert actually goes stale (~monthly, when
+# Caddy renews), not on every tick. Enable: systemctl enable --now cert-restart.timer
+[Unit]
+Description=Daily LiveKit served-cert staleness check (BOOTSTRAP)
+
+[Timer]
+OnCalendar=*-*-* 04:17:00
+Persistent=true
+RandomizedDelaySec=600
+
+[Install]
+WantedBy=timers.target
