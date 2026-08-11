@@ -97,7 +97,7 @@ def gate_A(host: str) -> None:
     except subprocess.TimeoutExpired:
         block("A", "relay harness timed out (no media round-trip within 180s) — relay path down.")
     out = r.stdout + r.stderr
-    if r.returncode != 0 or "RESULT=RELAY_MEDIA_OK" not in out:
+    if r.returncode != 0 or not re.search(r"(?m)^RESULT=RELAY_MEDIA_OK\b", out):
         block("A", f"forced relay-only media did NOT round-trip (rc={r.returncode}):\n{out[-900:]}")
     # The harness OWNS the dual-leg relay-only invariant and exits non-zero unless BOTH
     # pub and sub gathered candidates that were ALL relay. We confirm its structured
@@ -160,11 +160,14 @@ def _turn_block_unknown_keys(yaml_path: str):
             doc = yaml.safe_load(fh)
     except yaml.YAMLError:
         return None
-    if not isinstance(doc, dict) or "turn" not in doc:
-        return set()  # no turn block → no override keys (turn disabled is not our concern)
-    turn = doc["turn"]
+    if not isinstance(doc, dict):
+        return None
+    turn = doc.get("turn")
     if not isinstance(turn, dict):
-        return None   # turn present but not a mapping — unexpected shape, fail closed
+        # No turn block (or not a mapping) is NO EVIDENCE, not proof of safety — a
+        # firewall-opening gate must not certify deny from an absent config (cage-match
+        # #128 r3, Tesla). Fail closed.
+        return None
     return set(map(str, turn.keys())) - KNOWN_TURN_KEYS
 
 
@@ -208,8 +211,9 @@ def gate_B3(host: str) -> None:
                     f"relay-permission override. Set LIVEKIT_YAML to the box's rendered livekit.yaml.")
     unknown = _turn_block_unknown_keys(yaml_path)
     if unknown is None:
-        block("B3", f"could not YAML-parse {yaml_path} (or PyYAML missing) — a trust-boundary config-invariant "
-                    f"must not fall back to a regex. Install pyyaml in the gate's python and ensure the config parses.")
+        block("B3", f"could not verify the turn block in {yaml_path} (PyYAML missing, config unparseable, or no "
+                    f"turn: block present) — a trust-boundary invariant must not certify deny from absent evidence. "
+                    f"Install pyyaml and point LIVEKIT_YAML at the rendered livekit.yaml (with a turn: mapping).")
     if unknown:
         block("B3", f"turn block has unrecognized key(s) {sorted(unknown)} in {yaml_path} — a possible "
                     f"relay-permission / peer-CIDR override. Refusing to certify default-deny; review before opening.")
