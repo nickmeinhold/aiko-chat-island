@@ -62,8 +62,14 @@ URL     = os.environ["LK_URL"]
 KEY     = os.environ["LK_API_KEY"]
 SECRET  = os.environ["LK_API_SECRET"]
 ROOM    = os.environ.get("LK_ROOM", f"b3-probe-{int(time.time())}")
+# SSRF-critical restricted ranges, one representative IP each — all REFUSED (403)
+# on enspyr v1.13.5: RFC1918 (10/8, 172.16/12, 192.168/16), link-local + cloud
+# metadata (169.254/16), loopback (127/8). NOT included: 100.64/10 (RFC 6598
+# CGNAT) — LiveKit's default deny does NOT cover it (probe found it ALLOWED); that
+# gap is tracked separately (task #6), excluded here so the gate doesn't false-block.
 PEERS   = [p.strip() for p in os.environ.get(
-    "B3_PRIVATE_PEERS", "10.0.0.1,169.254.169.254").split(",") if p.strip()]
+    "B3_PRIVATE_PEERS",
+    "10.0.0.1,172.16.0.1,192.168.0.1,169.254.169.254,127.0.0.1").split(",") if p.strip()]
 # Positive control: a PUBLIC peer whose permission MUST be granted (200). Without
 # it, "403 for a private peer" could be a server that denies EVERY permission —
 # the refusal would be vacuous. The control proves permissions work in general, so
