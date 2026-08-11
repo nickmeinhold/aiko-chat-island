@@ -24,6 +24,10 @@ import argparse, os, shutil, subprocess, sys
 
 TURN_DOMAIN = os.environ.get("TURN_DOMAIN", "")
 UCLIENT = shutil.which("turnutils_uclient")
+# Positive auth-reject evidence for B1. NOTE (DESIGN §7, round-2 Tesla): these are
+# coupled to coturn/pion English; pin them to a GOLDEN stderr captured from the real
+# livekit-server v1.13.5 + turnutils_uclient build during Phase-2 standup. Until
+# then B1 fails CLOSED if none match (safe: never opens on unproven rejection).
 AUTH_REJECT_MARKERS = ("401", "403", "unauthorized", "forbidden", "allocate error", "wrong credentials")
 
 
@@ -79,8 +83,10 @@ def gate_A(host: str) -> None:
 def gate_B(host: str) -> None:
     print(f"== Gate B (exposure) against {host} ==")
     need_uclient("gate B")
-    rng = os.environ.get("TURN_RELAY_RANGE", "50000-60000")
-    lo = int(rng.split("-")[0]); hi = int(rng.split("-")[1])
+    try:
+        lo = int(os.environ["TURN_RELAY_START"]); hi = int(os.environ["TURN_RELAY_END"])
+    except (KeyError, ValueError):
+        block("gate B", "TURN_RELAY_START/END unset or non-numeric — the single-source relay range must be set.")
 
     # B1: unauthenticated ALLOCATE must be POSITIVELY rejected — a non-zero exit
     # alone is not proof (TLS-down / timeout / bad-host also exit non-zero). Require
@@ -98,6 +104,8 @@ def gate_B(host: str) -> None:
     # B2: ports outside the relay range closed. `nc -zu` is a WEAK UDP instrument
     # (implementation-defined), so this probes several ports AND is explicitly
     # advisory — it can only FAIL the gate on an open port, never certify closure.
+    if not shutil.which("nc"):
+        block("B2", "nc not installed — cannot sample outside-range ports. Failing closed.")
     print(f"  B2: sampling ports outside {lo}-{hi} (advisory; can fail, cannot certify) …")
     for p in (lo - 1, hi + 1, 20000):   # neighbours + a mid old-default(1024-30000) sample
         if subprocess.run(["nc", "-z", "-u", "-w", "3", host, str(p)], capture_output=True).returncode == 0:

@@ -25,6 +25,9 @@ notify() {  # $1 severity  $2 message — guaranteed signal (notify OR local fla
   echo "$msg" >&2
   if [ -n "$ALARM_NOTIFY_URL" ] && curl -fsS -m 10 -X POST "$ALARM_NOTIFY_URL" \
        --data-urlencode "text=$msg" >/dev/null 2>&1; then
+    # Notify delivered — clear any prior durable flag for this severity so the
+    # monitor doesn't double-fire a scar after the page already went out (round-2 Tesla).
+    rm -f "$ALARM_FLAG_DIR/${TURN_DOMAIN}.${1}.flag" 2>/dev/null || true
     return 0
   fi
   # Notify failed (or unset) → durable local flag the existing box monitor scrapes.

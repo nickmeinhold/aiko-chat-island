@@ -25,11 +25,12 @@ turn:
   # cert-restart.timer). The alarm probes the :5349 ENDPOINT, not this file.
   cert_file: /certs/${TURN_DOMAIN}.crt
   key_file: /certs/${TURN_DOMAIN}.key
-  # NARROW relay range (default is a huge 1024-30000). Opened on BOTH firewall
-  # layers by standup.sh; ports OUTSIDE this range are proven closed by exposure
-  # test B. Keep disjoint from rtc.port_range_* above.
-  relay_range_start: 50000
-  relay_range_end: 60000
+  # NARROW relay range (default is a huge 1024-30000). SINGLE SOURCE: ${TURN_RELAY_*}
+  # from .env drive the rendered config, the firewall opens, AND the exposure probe
+  # — standup asserts they match so config/firewall/gate can't diverge (round-2
+  # Carnot+Tesla: the range was a third source of truth). Keep disjoint from rtc above.
+  relay_range_start: ${TURN_RELAY_START}
+  relay_range_end: ${TURN_RELAY_END}
 
 # EXPOSURE INVARIANT (DESIGN §3.4): pinned v1.13.5 denies TURN relay to private
 # IPs by DEFAULT (behavior since v1.12.0 — RESEARCH §2). We do not rely on the

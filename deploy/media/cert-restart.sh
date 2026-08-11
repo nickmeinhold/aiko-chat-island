@@ -25,8 +25,8 @@ HOST="${TURN_PROBE_HOST:-127.0.0.1}"
 crt="$CERT_DIR/${TURN_DOMAIN}.crt"; key="$CERT_DIR/${TURN_DOMAIN}.key"
 
 if [ "${1:-}" = "--validate-only" ]; then
-  if cert_pair_matches "$crt" "$key"; then echo "on-disk leaf pair VALID (matched, unexpired)."; exit 0
-  else echo "on-disk leaf pair INVALID (missing / mismatched / expired) — do NOT restart onto it." >&2; exit 1; fi
+  if cert_pair_matches "$crt" "$key" "$TURN_DOMAIN"; then echo "on-disk leaf pair VALID (matched, unexpired, for $TURN_DOMAIN)."; exit 0
+  else echo "on-disk leaf pair INVALID (missing / mismatched / expired / wrong-domain) — do NOT restart onto it." >&2; exit 1; fi
 elif [ -n "${1:-}" ]; then
   echo "unknown arg '$1' (only --validate-only). Failing closed." >&2; exit 2   # fail-closed on unknown flag
 fi
@@ -50,23 +50,27 @@ fi
 if [ "$disk_epoch" -le "$served_epoch" ]; then
   echo "disk cert is NOT newer than the served cert (renewal pipeline hasn't produced a fresh cert) — paged, NOT restarting (no thrash)." >&2; exit 0
 fi
-if ! cert_pair_matches "$crt" "$key"; then
-  echo "disk cert/key pair invalid (half-write / mismatch / expired) — refusing restart (fail-closed)." >&2; exit 1
+if ! cert_pair_matches "$crt" "$key" "$TURN_DOMAIN"; then
+  echo "disk cert/key pair invalid (half-write / mismatch / expired / wrong-domain) — refusing restart (fail-closed)." >&2; exit 1
 fi
 
 if [ "$ALARM_RESTART" != "1" ]; then
   echo "ALARM_RESTART=$ALARM_RESTART (detector-only) — a fresh valid cert is on disk but restart is DISABLED; page and stop." >&2; exit 0
 fi
 
-echo "disk has a newer valid renewed pair — restarting livekit."
+echo "disk has a newer valid renewed pair — restarting livekit (served=$served_epoch disk=$disk_epoch)."
 docker restart livekit
-# Poll the endpoint for health instead of a blind sleep (round-1 Kelvin).
+# Watermark (round-2 Tesla): require the SERVED cert to actually ADVANCE past what
+# it was — a restart that comes back still serving the OLD in-memory cert (bad
+# mount / wrong cert_file / partial config) would otherwise leave disk>served true
+# forever and thrash a restart every tick. Measure the load, not the intent to load.
 for i in $(seq 1 24); do
-  if served_cert_not_after_epoch "$HOST" "$TURN_TLS_PORT" "$TURN_DOMAIN" >/dev/null 2>&1; then
-    echo "endpoint healthy post-restart."; exec ./served-cert-alarm.sh
+  now="$(served_cert_not_after_epoch "$HOST" "$TURN_TLS_PORT" "$TURN_DOMAIN" 2>/dev/null || true)"
+  if [ -n "$now" ] && [ "$now" -gt "$served_epoch" ]; then
+    echo "served cert advanced ($served_epoch -> $now) — renewal picked up."; exec ./served-cert-alarm.sh
   fi
   sleep 5
 done
-echo "endpoint did not come healthy within 120s post-restart — PAGE." >&2
+echo "FATAL: served cert did NOT advance past $served_epoch within 120s of restart — LiveKit is stuck serving the old in-memory cert (bad mount / cert_file / config). PAGE; NOT retrying restart until disk changes." >&2
 ./served-cert-alarm.sh || true
 exit 1

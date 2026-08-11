@@ -20,7 +20,14 @@ docker compose up -d
 
 echo "== verify: served-cert endpoint + relay gate A =="
 sleep 5
-./served-cert-alarm.sh || { echo "served-cert alarm non-zero after update — investigate before trusting." >&2; exit 1; }
+# The alarm's rc=10 means "endpoint UP, cert aging" — that is renewal debt, NOT an
+# update failure (a pin-roll inside the alarm window would else always false-red).
+# Only endpoint-DOWN (20) or an unexpected rc fails the update (round-2 Tesla).
+set +e; ./served-cert-alarm.sh; arc=$?; set -e
+case "$arc" in
+  0|10) echo "endpoint up (alarm rc=$arc$( [ "$arc" = 10 ] && echo ': cert aging, not an update failure' ))." ;;
+  *)    echo "served-cert endpoint DOWN/unexpected after update (rc=$arc) — roll back the tag." >&2; exit 1 ;;
+esac
 python3 e2e_media_relay.py --host "$TURN_DOMAIN" || {
   echo "relay gate A FAILED after pin — a v1.12/v1.13.1 TURN-auth change may have broken relay. Roll back the tag." >&2; exit 1; }
 echo "update verified."
