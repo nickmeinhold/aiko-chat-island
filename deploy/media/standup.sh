@@ -11,7 +11,7 @@ cd "$(dirname "$0")"; . lib/cert-pair.sh
 [ -f .env ] || { echo "no .env — copy .env.example and fill it." >&2; exit 1; }
 set -a && . ./.env && set +a
 : "${TURN_DOMAIN:?}" "${NODE_IP:?}" "${LIVEKIT_API_KEY:?}" "${LIVEKIT_API_SECRET:?}" "${CADDY_CERT_LEAF_DIR:?}"
-: "${TURN_RELAY_START:?}" "${TURN_RELAY_END:?}"
+: "${LIVEKIT_URL:?}" "${TURN_RELAY_START:?}" "${TURN_RELAY_END:?}"
 
 case "$TURN_DOMAIN" in
   turn.imagineering.cc) echo "REFUSING: imagineering is shared infra — use docs/runbooks/imagineering-livekit-repair.md." >&2; exit 1 ;;
@@ -69,7 +69,7 @@ echo "== 6. exposure-acceptance (B) — range still CLOSED to real traffic =="
 # own host-network listener, and INPUT is still shut to the world (round-2 Tesla:
 # a localhost probe risks TLS/name noise that never yields a clean auth-reject).
 python3 e2e_media_relay.py --exposure-only --host "$TURN_DOMAIN" || {
-  echo "exposure gate B FAILED/BLOCKED — NOT opening the firewall (fail-closed). Wire the DESIGN §7 checks (cred mint, B3) first." >&2; exit 1; }
+  echo "exposure gate B FAILED/BLOCKED — NOT opening the firewall (fail-closed). Check B1 (unauth ALLOCATE reject), B2 (out-of-range ports), B3 (LiveKit >= v1.12 for CIDR-deny)." >&2; exit 1; }
 
 echo "== 7. open firewall (double layer): UDP 3478, TCP 5349, UDP ${TURN_RELAY_START}-${TURN_RELAY_END} =="
 echo "   OCI security-list opens need the cloud API/console (operator hands). Host iptables:"
@@ -80,7 +80,9 @@ cat <<FW
 FW
 read -r -p "Confirm BOTH firewall layers open for the ranges above, then press enter for gate A… "
 
-echo "== 8. connectivity-acceptance (A): forced relay over TCP/TLS + UDP canary =="
+echo "== 8. connectivity-acceptance (A): forced relay-only media round-trip (livekit-rtc) =="
+echo "   proves the UDP relay path; TLS/5349 relay is a KNOWN GAP (not advertised to clients)."
+echo "   NOTE: needs a python with livekit + livekit-api + numpy (the box venv) on PATH as python3."
 python3 e2e_media_relay.py --host "$TURN_DOMAIN"
 
 echo "== BOOTSTRAP complete. Enable the renewal timer: =="

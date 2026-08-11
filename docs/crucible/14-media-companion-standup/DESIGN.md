@@ -115,9 +115,13 @@ Set **narrow** `turn.relay_range_start: 50000` / `relay_range_end: 60000` in `li
 
 Green connectivity ≠ safe to expose. **A proves the path exists; B (§3.4) proves it's safe to open.** Both required; A here, B in §3.4.
 
-**A — connectivity acceptance.** `type == relay` alone is insufficient (a relay candidate can be embedded-TURN over UDP). Read the **selected candidate pair** and assert:
-1. **relayed path over TLS/TCP works:** `iceTransportPolicy: 'relay'` forcing a TURNS URL → selected remote candidate `type == relay` **AND** its `protocol`/relay-transport resolves to **TCP/TLS** (exact WebRTC-stats field confirmed against the SDK at build — not assumed).
-2. **UDP-relay canary:** a second run proving 3478 + the relay range relays over UDP (the opened range is provably necessary + reachable).
+**A — connectivity acceptance.** `type == relay` alone is insufficient (a relay candidate can be embedded-TURN over UDP). Read the gathered candidates and assert:
+1. **relay media round-trips (UDP path):** `iceTransportPolicy: 'relay'` (forbids host/srflx) → a real livekit-rtc client's synthetic video is received by a second client, **and every gathered ICE candidate is `candidate_type == relay`** (media had no path but the TURN allocation). Implemented by `deploy/media/e2e_relay_livekit.py`, gated by `e2e_media_relay.py` gate A. Proves the **UDP/3478** relay path.
+
+> **UPDATE 2026-08-11 — the original assertion (1) below is DEFERRED; it does not hold today.** The gate was written to require the relayed path over **TLS/TCP (5349)**. Live testing proved that path **non-functional for clients**: LiveKit advertises only the UDP TURN (`turn.externalTLS:false`); a forced-relay client gathers a single UDP relay candidate, and with UDP blocked the peer connection times out (`wait_pc_connection`). The `:5349` cert is valid — the relay **advertisement** is the gap, an `external_tls` config matter tracked separately. Until that task proves TLS relay, gate A asserts the **UDP** path only (per (1) above), and the memory scope-note ("generic relay fallback for symmetric-NAT / home+mobile firewalls; hostile-443-only-corporate deferred") is the governing scope. The stale original text, kept for provenance:
+>
+> - ~~**relayed path over TLS/TCP works:** `iceTransportPolicy: 'relay'` forcing a TURNS URL → selected remote candidate `type == relay` **AND** its `protocol`/relay-transport resolves to **TCP/TLS**.~~ (deferred — TLS relay not advertised to clients; see UPDATE.)
+> - ~~**UDP-relay canary:** a second run proving 3478 + the relay range relays over UDP.~~ (subsumed into (1) — the forced-relay client IS the UDP proof.)
 
 ## 4b. Degenerate states enumerated (author self-strike + round-1 neighbors)
 
