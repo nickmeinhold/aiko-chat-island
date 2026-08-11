@@ -54,6 +54,17 @@ if ! cert_pair_matches "$crt" "$key" "$TURN_DOMAIN"; then
   echo "disk cert/key pair invalid (half-write / mismatch / expired / wrong-domain) — refusing restart (fail-closed)." >&2; exit 1
 fi
 
+# Durable thrash latch (round-3 Tesla P0): if a prior restart for THIS disk cert
+# already failed to make the served cert advance, do NOT restart again — page and
+# stop until a genuinely new renewal (different disk_epoch) arrives. Enforcement,
+# not a comment: a broken mount / wrong cert_file would else restart every tick.
+: "${ALARM_FLAG_DIR:=/var/local/media-alarm}"; mkdir -p "$ALARM_FLAG_DIR" 2>/dev/null || ALARM_FLAG_DIR="$(dirname "$0")"
+LATCH="$ALARM_FLAG_DIR/${TURN_DOMAIN}.restart-failed.epoch"
+if [ "$(cat "$LATCH" 2>/dev/null)" = "$disk_epoch" ]; then
+  echo "restart already FAILED for disk cert (epoch=$disk_epoch) and served hasn't advanced — NOT restarting again (latched). Fix the mount/cert_file; a new renewal clears the latch." >&2
+  ./served-cert-alarm.sh || true; exit 1
+fi
+
 if [ "$ALARM_RESTART" != "1" ]; then
   echo "ALARM_RESTART=$ALARM_RESTART (detector-only) — a fresh valid cert is on disk but restart is DISABLED; page and stop." >&2; exit 0
 fi
@@ -67,10 +78,14 @@ docker restart livekit
 for i in $(seq 1 24); do
   now="$(served_cert_not_after_epoch "$HOST" "$TURN_TLS_PORT" "$TURN_DOMAIN" 2>/dev/null || true)"
   if [ -n "$now" ] && [ "$now" -gt "$served_epoch" ]; then
-    echo "served cert advanced ($served_epoch -> $now) — renewal picked up."; exec ./served-cert-alarm.sh
+    echo "served cert advanced ($served_epoch -> $now) — renewal picked up."
+    rm -f "$LATCH" 2>/dev/null || true   # success clears the thrash latch
+    exec ./served-cert-alarm.sh
   fi
   sleep 5
 done
-echo "FATAL: served cert did NOT advance past $served_epoch within 120s of restart — LiveKit is stuck serving the old in-memory cert (bad mount / cert_file / config). PAGE; NOT retrying restart until disk changes." >&2
+# Watermark failed: latch THIS disk_epoch so the next tick won't restart again.
+printf '%s\n' "$disk_epoch" > "$LATCH" 2>/dev/null || true
+echo "FATAL: served cert did NOT advance past $served_epoch within 120s of restart — LiveKit is stuck serving the old in-memory cert (bad mount / cert_file / config). PAGE; latched disk_epoch=$disk_epoch so no restart re-fires until a new renewal." >&2
 ./served-cert-alarm.sh || true
 exit 1

@@ -11,14 +11,16 @@ were fail-OPEN on the most critical exposure checks).
   B  exposure       unauth ALLOCATE POSITIVELY rejected · creds short-TTL LiveKit-issued
                     · no relay to RFC1918/link-local · ports outside range closed.
 
-The primitive is the canonical `turnutils_uclient` (coturn tools) — we do NOT
-hand-roll a TURN client. Some sub-checks (real cred mint, B3 private-IP denial) are
-DESIGN §7 build-time wire-ups; until wired they BLOCK (exit non-zero), they do not
-wave through.
+The primitive is the canonical `turnutils_uclient` (coturn tools; server address is
+the trailing POSITIONAL arg) — we do NOT hand-roll a TURN client. Confirm the exact
+turnutils_uclient flags against the installed build at Phase-2 (DESIGN §7); a wrong
+flag fails CLOSED (block), never opens the firewall. Some sub-checks (real cred mint,
+B3 private-IP denial) are §7 wire-ups; until wired they BLOCK, they do not wave through.
 
-Env: TURN_DOMAIN, LIVEKIT_API_KEY/SECRET, TURN_RELAY_RANGE=50000-60000,
+Env: TURN_DOMAIN, LIVEKIT_API_KEY/SECRET, TURN_RELAY_START/END,
      LIVEKIT_TURN_CRED_CMD (a command that prints `user\\tcredential\\tttl_seconds`
-     for a short-TTL LiveKit-issued TURN credential — the real client path).
+     for a short-TTL LiveKit-issued TURN credential — the real client path),
+     TURN_B3_PRIVATE_DENY_CMD (exits 0 iff a private-IP relay permission is refused).
 """
 import argparse, os, shutil, subprocess, sys
 
@@ -64,13 +66,13 @@ def gate_A(host: str) -> None:
     need_uclient("gate A")
     user, cred = mint_turn_cred()
     print("  A1: forced relay over TLS/TCP :5349 …")
-    r = subprocess.run([UCLIENT, "-S", "-p", "5349", "-u", user, "-w", cred, "-y", "-c", host],
+    r = subprocess.run([UCLIENT, "-S", "-p", "5349", "-u", user, "-w", cred, "-y", host],
                        capture_output=True, text=True, timeout=60)
     if r.returncode != 0:
         block("A1", f"TLS relay allocate/permission failed:\n{r.stderr[-600:]}")
     print("  ok A1: TLS relay path established.")
     print("  A2: UDP-relay canary :3478 …")
-    r = subprocess.run([UCLIENT, "-p", "3478", "-u", user, "-w", cred, "-y", "-c", host],
+    r = subprocess.run([UCLIENT, "-p", "3478", "-u", user, "-w", cred, "-y", host],
                        capture_output=True, text=True, timeout=60)
     if r.returncode != 0:
         block("A2", f"UDP relay canary failed:\n{r.stderr[-600:]}")
@@ -92,7 +94,7 @@ def gate_B(host: str) -> None:
     # alone is not proof (TLS-down / timeout / bad-host also exit non-zero). Require
     # an auth-reject marker in the tool output (round-1 Tesla: fail-open detector).
     print("  B1: unauthenticated ALLOCATE must be rejected (positive evidence) …")
-    r = subprocess.run([UCLIENT, "-p", "5349", "-S", "-y", "-c", host], capture_output=True, text=True, timeout=45)
+    r = subprocess.run([UCLIENT, "-p", "5349", "-S", "-y", host], capture_output=True, text=True, timeout=45)
     blob = (r.stdout + r.stderr).lower()
     if r.returncode == 0:
         block("B1", "unauthenticated ALLOCATE SUCCEEDED — this is an open relay.")

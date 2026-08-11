@@ -25,9 +25,14 @@ cert_pair_matches() {  # $1 crt  $2 key  [$3 domain] -> 0 if matched, non-empty,
 }
 
 cert_has_dns_san() {  # $1 crt  $2 domain -> 0 if $2 is an exact DNS SAN of the cert
-  local d
-  for d in $(openssl x509 -in "$1" -noout -text 2>/dev/null \
-             | awk '/Subject Alternative Name/{getline; gsub(/DNS:/,""); gsub(/,/," "); print}'); do
+  local sans d
+  # Prefer the machine-readable extension dump (OpenSSL 3, Kelvin r3); fall back to
+  # the -text parse on LibreSSL, which lacks -ext. Either way, split on DNS: and
+  # exact-compare each entry (no -w prefix footgun, no wildcard handling — Caddy
+  # issues exact-name leaves).
+  sans="$(openssl x509 -in "$1" -noout -ext subjectAltName 2>/dev/null)"
+  [ -n "$sans" ] || sans="$(openssl x509 -in "$1" -noout -text 2>/dev/null | grep -A1 'Subject Alternative Name')"
+  for d in $(printf '%s' "$sans" | tr ',' '\n' | sed -n 's/.*DNS:\([^,[:space:]]*\).*/\1/p'); do
     [ "$d" = "$2" ] && return 0
   done
   return 1

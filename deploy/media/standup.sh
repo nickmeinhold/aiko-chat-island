@@ -35,9 +35,14 @@ cert_pair_matches "$CADDY_CERT_LEAF_DIR/${TURN_DOMAIN}.crt" "$CADDY_CERT_LEAF_DI
   || { echo "leaf pair invalid/mismatched/wrong-domain/expired — refusing to boot onto it (fail-closed)." >&2; exit 1; }
 echo "cert pair valid for $TURN_DOMAIN."
 
-echo "== 2. render config (turn enabled) with restrictive perms =="
+echo "== 2. validate range + render config (turn enabled) with restrictive perms =="
+# start<=end and sane bounds (round-3 Tesla: an inverted range still 'matches' .env
+# but feeds iptables/LiveKit an undefined window).
+[ "$TURN_RELAY_START" -le "$TURN_RELAY_END" ] && [ "$TURN_RELAY_START" -ge 1024 ] && [ "$TURN_RELAY_END" -le 65535 ] \
+  || { echo "FATAL: TURN_RELAY_START/END ($TURN_RELAY_START-$TURN_RELAY_END) not a sane ordered 1024-65535 range." >&2; exit 1; }
 ( umask 077; envsubst '${TURN_DOMAIN} ${NODE_IP} ${LIVEKIT_API_KEY} ${LIVEKIT_API_SECRET} ${TURN_RELAY_START} ${TURN_RELAY_END}' \
-    < livekit.yaml.tmpl > livekit.yaml )   # secrets in livekit.yaml -> 0600
+    < livekit.yaml.tmpl > livekit.yaml )
+chmod 600 livekit.yaml   # explicit: umask only guards CREATE; a re-run over an existing 0644 must not leave secrets world-readable
 
 echo "== 3. assert ranges: rendered relay == .env, and DISJOINT from SFU ICE =="
 ice_s=$(awk '/port_range_start:/{print $2; exit}' livekit.yaml); ice_e=$(awk '/port_range_end:/{print $2; exit}' livekit.yaml)
