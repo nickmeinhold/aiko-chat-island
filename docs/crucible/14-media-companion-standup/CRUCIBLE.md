@@ -11,7 +11,7 @@ Bring the self-hosted **LiveKit SFU** — which carries STUN/TURN *inside it* (p
 ## Why this thrills me AND what it changes
 
 - The drift the island model was *built to kill* is sitting one directory over, un-managed. Both boxes run `livekit/livekit-server:latest` (unpinned). imagineering's TURN cert died **Jul 24** (18 days ago, static Apr-25 cert, no renewal). enspyr has **no `turn:` block at all**. This is not hypothetical rot — it's live breakage.
-- **What it removes:** relay-fallback video is currently broken on imagineering and absent on enspyr. Users behind symmetric NAT / restrictive corporate firewalls **cannot connect** right now. This is a real failure class, not a convenience.
+- **What it removes:** relay-fallback video is currently broken on imagineering and absent on enspyr. Users behind **symmetric NAT and most home/mobile firewalls** **cannot connect** right now. (Scope narrowed after Temper round 1: this is *generic* relay fallback, NOT hostile-443-only corporate networks — see DESIGN §1.) This is a real failure class, not a convenience.
 - **What it unblocks:** "a fresh island can do video out of the box" — media becomes part of the standup story, so federation grows a media plane instead of a hand-built snowflake per box.
 - The *oh, of course*: point the island's own proven discipline (pin → deploy-from-repo → Caddy cert → verify) at the thing next to it. The mechanism already exists; it just isn't aimed here yet.
 

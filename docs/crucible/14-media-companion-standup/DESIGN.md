@@ -1,123 +1,155 @@
 # DESIGN — Media companion standup (LiveKit SFU + managed TURN)
 
-**Task:** #14 · **Crucible:** `docs/crucible/14-media-companion-standup/` · **Status:** Cast (pre-Fold, pre-Temper)
-**Depends on:** `RESEARCH.md` (5 mechanism cells marked `[HEAT-PENDING]` below)
+**Task:** #14 · **Crucible:** `docs/crucible/14-media-companion-standup/` · **Status:** re-Cast after Temper round 1 (unanimous REQUEST_CHANGES), pre-Temper round 2
+**Depends on:** `RESEARCH.md`. **Round-1 temper ledger:** §9.
 
 ---
 
 ## 1. Problem
 
-The self-hosted LiveKit SFU — which carries STUN/TURN inside it (pion/turn), so there is **no separate coturn** — is the one piece of the media path that never came under the island's drift-killing discipline. Live symptoms, verified on the boxes 2026-08-11:
+The self-hosted LiveKit SFU — which carries STUN/TURN inside it (pion/turn), so there is **no separate coturn** — is the one piece of the media path never brought under the island's drift-killing discipline. Verified on the boxes 2026-08-11:
 
 | | imagineering (`chat.imagineering.cc`) | enspyr (`chat.enspyr.co`) |
 |---|---|---|
 | LiveKit image | `livekit/livekit-server:**latest**` | `livekit/livekit-server:**latest**` |
 | TURN | enabled, **cert EXPIRED Jul 24** (static Apr-25, no renewal) | **no `turn:` block — zero relay** |
 | Caddy | **container** (`caddy:2-alpine`), cert store in Docker volume `/data/caddy/…` | **systemd** (`User=caddy`), cert store host FS `/var/lib/caddy/.local/share/caddy/…` |
-| LiveKit tenancy | **shared box infra**: `realm-token` mint, dreamfinder, lyra, tech-world, AITW (Firebase webhook + Redis) | **bare, island-dedicated** (no webhook, no Redis) |
+| LiveKit tenancy | **shared box infra**: `realm-token` mint, dreamfinder, lyra, tech-world, AITW (Firebase webhook + Redis) | **bare, island-dedicated** |
 
-Consequence: relay-fallback video is **broken** on imagineering (dead cert) and **absent** on enspyr (no TURN). Users behind symmetric NAT / restrictive firewalls cannot connect.
+Consequence: relay-fallback video is **broken** on imagineering (dead cert) and **absent** on enspyr (no TURN).
 
-## 2. The frame decision (answers CRUCIBLE claim 1)
+**Scope of the claim (narrowed after temper — decided with Nick 2026-08-11).** This restores **generic relay fallback**: users behind **symmetric NAT and most home/mobile firewalls** who can't hold a P2P path but *can* reach TURN on UDP 3478 / TLS 5349. It does **NOT** claim to serve **hostile locked-down corporate networks** that permit only TCP 443 — that needs TURN-on-443 coexistence with Caddy (port 443 is Caddy's), which is explicitly **out of scope** here and deferred to a follow-up task if a real 443-only user appears. (Round-1 Carnot/Tesla catch: 5349 proves TURN works, not that it works for a 443-only user.)
 
-**The media plane is not one shape across the two boxes, so the design is not one application across them.** One repo artifact — a `deploy/media/` companion standup — applied in **two modes**:
+## 2. The frame (re-anchored after temper): media is always box-plane
 
-- **OWN (enspyr + any future greenfield island):** the island *ships with* the media companion as its sibling. Repo-authoritative `livekit.yaml` + pinned compose + cert hook + standup/update + relay test. This is the literal "companion standup sibling to the island."
-- **CONSUME + minimally repair (imagineering):** LiveKit here is shared box infra the island *consumes*, owned outside the island's lifecycle. The companion is a **documented reference**, NOT auto-applied. We touch only the two things that fix #14 without clobbering other tenants: **(a) pin the image**, **(b) add the `turn.imagineering.cc` Caddy cert block + renewal hook.** We do **not** overwrite imagineering's multi-tenant `livekit.yaml` (its webhook/redis/keys stay verbatim).
+Round 1, all three adversaries: calling both boxes "companion modes" under `deploy/media/` still *island-shapes a box plane*. The truer frame:
 
-This is exactly task #9's hint ("capture the enspyr SFU hand-build as the reference") and #14's open question ("consider whether the SFU should become a documented companion standup"). It rejects both poles the CRUCIBLE named: not folded into the island image (coupling), not pretending both boxes are symmetric (breaks imagineering's tenants).
+> **The media plane (SFU + TURN) is always BOX-plane, never island-plane.** The island is one *consumer* of it.
+
+Two operator postures on that box plane, drawn on the **ownership** line:
+
+- **BOOTSTRAP (enspyr + any future greenfield island):** the box has no media plane yet, so we stand one up *for* the island. Repo-authoritative, island-owned lifecycle. Artifact: `deploy/media/` (pinned compose, `livekit.yaml.tmpl`, restart trigger, relay test). Because the box is island-dedicated, the island legitimately owns this plane's lifecycle — including an **unattended** renewal restart (the blip only hits island users).
+- **CLIENT + REPAIR (imagineering):** a media plane already exists, shared by AITW/dreamfinder/lyra/token-mint, **owned outside the island**. The island is a *client* of it. We do the minimum to fix #14 — **pin the image, deliver the cert, alarm on expiry** — via an **attended runbook** an operator runs in a change window, never an autonomous island timer reaching into someone else's plane. Artifact: `docs/runbooks/imagineering-livekit-repair.md`. **Named shared-SFU owner: Nick (operator); change-control: attended window + tenant notice.**
+
+Physically-split artifacts (not one dual-mode dir) so responsibility can't diffuse — Carnot's catch. `deploy/media/` is island-owned automation; the runbook is a human procedure against a plane the island doesn't own.
 
 ## 3. Shape
 
 ```
 aiko-chat-island/
-  deploy/media/                     # the companion standup (NEW)
-    docker-compose.yml              # pinned livekit image + redis (redis only where OWN mode needs dispatch)
-    livekit.yaml.tmpl               # OWN-mode template; ${DOMAIN} ${NODE_IP} ${API_KEY} ${API_SECRET}
-    standup.sh                      # OWN-mode: render template, open firewall, first cert, up -d, verify
-    update.sh                       # pull pinned image, backup-first, up -d, verify /health + relay
-    cert-renew-hook.sh              # Caddy-triggered: copy renewed turn cert → livekit path → restart
-    e2e_media_relay.py              # forced-relay acceptance test (iceTransportPolicy: relay)
-    README.md                       # OWN vs CONSUME modes; imagineering = CONSUME reference
-    caddy/
-      turn.imagineering.cc.block    # snippet to add to imagineering's container Caddyfile
-      turn.enspyr.co.block          # snippet to add to enspyr's systemd Caddyfile
+  deploy/media/                     # BOOTSTRAP (enspyr + future islands) — island-owned
+    docker-compose.yml              # pinned livekit image; Caddy cert dir bind-mounted RO; redis only if OWN needs dispatch
+    livekit.yaml.tmpl               # ${DOMAIN} ${NODE_IP} ${API_KEY} ${API_SECRET}; turn.cert_file → the RO mount path; narrow relay range
+    standup.sh                      # render template, first-cert-before-turn-enable, open firewall, up -d, relay test
+    update.sh                       # pull pinned image, backup-first, up -d, verify
+    cert-restart.timer + .sh        # BOOTSTRAP ONLY: detect served-cert change → restart livekit; alarm on notAfter
+    e2e_media_relay.py              # forced-relay acceptance test (exact observable — §4a)
+    test/cert-tree-contract.sh      # contract test: fixture cert trees (host-FS vs docker-volume) → trigger fires or fail-closes
+    README.md                       # frame: media is box-plane; BOOTSTRAP here, CLIENT+REPAIR in the runbook
+  docs/runbooks/
+    imagineering-livekit-repair.md  # CLIENT+REPAIR — attended: pin, cert bind-mount, restart-in-window, tenant notice, rollback
 ```
 
-### 3.1 The cert lifecycle (the load-bearing mechanism) — FOLDED to mechanism C
+### 3.1 Cert lifecycle — FOLDED to bind-mount (coupling removed, not guarded)
 
-The trick: **Caddy owns the cert; LiveKit only reads it.** A plain `turn.<domain>` block makes Caddy obtain + auto-renew the LE cert via the **port-80 HTTP-01 challenge** (port 80 is already reachable on both boxes — no DNS-API creds, no custom Caddy build) — completely independent of TURN's UDP-3478 / TLS-5349 media traffic. Then a **standalone renewal watcher** delivers the cert bytes to LiveKit's `turn.cert_file` path and restarts LiveKit (pion/turn loads cert at startup only — **no hot-reload**, livekit#3463, so renewal ⇒ restart; restart drops only in-flight ICE, not established media).
+Round-1 Tesla/Carnot FATAL: the copy-based mechanism C (Caddy holds cert A, LiveKit serves copy B) recreates the Jul-24 class — a silent watcher death or path drift leaves LiveKit serving an aging copy while Caddy's cert is fine. **Remove the coupling:** LiveKit reads Caddy's cert *directly*.
 
-**Why NOT Caddy's own on-renewal hook (the research's default):** that needs a *custom `xcaddy` build* with `caddy-events-exec` (experimental, background-exec, permission-denied under enspyr's unprivileged `User=caddy`) — building a new drift surface (a hand-compiled Caddy to re-version forever) to kill an old one. Remove the coupling, don't guard it. Caddy still *issues + renews* the cert (honors the "Caddy-managed" decision); a tiny external watcher does the delivery.
+- **Caddy still issues + auto-renews** the `turn.<domain>` cert via stock **HTTP-01** (port 80 already reachable on both boxes — no custom build, no DNS creds). Honors Nick's "Caddy-managed" decision.
+- **Bind-mount Caddy's cert dir READ-ONLY into the LiveKit container**, and point `turn.cert_file`/`key_file` straight at the mounted path. The cert bytes are then **always live** — no copy, no second key material, no half-write.
+  - enspyr: mount host `/var/lib/caddy/.local/share/caddy/certificates/acme-v02…/turn.enspyr.co/` RO.
+  - imagineering: share Caddy's Docker cert **volume** (or its host path) RO into the livekit container.
+- **The only reason to touch LiveKit on renewal is pion/turn's lack of hot-reload** (RESEARCH §1) → it must **restart** to pick up the renewed bytes. So the "watcher" collapses to a **restart-on-change trigger**, nothing more:
+  - **BOOTSTRAP (enspyr):** a `systemd` timer diffs the *served* cert's fingerprint (read from the running container's cert path) and, on change, restarts livekit. Unattended — the blip is island-only.
+  - **CLIENT+REPAIR (imagineering):** **no timer.** The runbook has the operator restart livekit in a change window after a renewal, with tenant notice. (Renewals are ~monthly and LE warns ~30 days ahead, so this is a scheduled, not reactive, task.)
+- **Expiry alarm on the SERVED cert (both boxes), not "diff exit 0"** (Tesla): a cron/systemd check reads `notAfter` from the cert LiveKit is *actually serving* and alerts if < N days — so a dead trigger surfaces as an alarm long before it becomes a Jul-24 repeat.
 
-**The watcher (one script, per-box path adapter):** a `systemd` timer (daily) that:
-1. locates Caddy's live `turn.<domain>.{crt,key}` — enspyr host FS `/var/lib/caddy/.local/share/caddy/certificates/acme-v02…/turn.enspyr.co/`; imagineering Docker volume (`docker cp` / mounted volume from `/data/caddy/…`).
-2. compares its SHA-256 to the cert currently deployed at LiveKit's `turn.cert_file`. **No change → exit (no restart).**
-3. on change: **validate the new crt+key pair** (`openssl` modulus match + not-expired) — **fail-closed: if it doesn't validate, do NOT restart** (keep serving the still-valid old cert until next cycle; a soon-to-expire cert beats a broken TURN).
-4. atomic-copy (write-temp + rename) into LiveKit's cert dir → `docker restart livekit`.
+### 3.2 Restart = a real multi-tenant media interruption (blast-radius reclassified)
 
-Change frequency ≈ monthly (LE 90-day certs renew at ~30 days left), so the restart is rare and can be pinned to a low-traffic hour on multi-tenant imagineering.
+Round-1 Carnot/Tesla FATAL: the RESEARCH §1 "restart drops only in-flight ICE, not established media" claim is **almost certainly false** — embedded pion/turn shares the SFU's Go process, so `docker restart livekit` tears down room state + SFU-anchored media for **every tenant**. **This design no longer assumes established media survives.** Instead:
 
-### 3.2 Pin — v1.13.5, and pin is NOT a no-op
+- **Empirical gate:** before trusting *any* survival characterization, run a **live-room restart test** — a call up on imagineering (or a staging room), restart livekit, measure what actually drops and how fast clients reconnect. The result is documented, not asserted.
+- **Treat every renewal restart as scheduled media downtime:** BOOTSTRAP (enspyr) absorbs it unattended because it's island-only; CLIENT+REPAIR (imagineering) makes it an **attended window with tenant notice** (dreamfinder/lyra/AITW owners) + a rollback path. Restart is priced as an outage, not a nick.
 
-Replace `:latest` with **`livekit/livekit-server:v1.13.5`** on both boxes. **Caveat (RESEARCH §2):** v1.12.0 + v1.13.1 changed TURN auth (TTL now required; no relay-to-private-IP by default). If a box's current `:latest` predates v1.12, pinning **can change TURN behavior** — so the build order treats "fix cert" and "pin" as *separate verified steps*, each followed by the relay test. imagineering's pin is applied in place (CONSUME); enspyr's lives in the repo compose (OWN).
+### 3.3 Pin — v1.13.5, and pin is NOT a no-op
 
-### 3.3 Firewall (double-firewall, per `reference_oci_double_firewall_local_iptables`)
+Replace `:latest` with **`livekit/livekit-server:v1.13.5`**. **Caveat (RESEARCH §2):** v1.12.0 + v1.13.1 changed TURN auth (TTL now required; no relay-to-private-IP by default). So "fix cert" and "pin" are **separate relay-tested gates** (§4). **Before pinning imagineering, enumerate the TURN-token issuers** (realm-token mint, clients, agents) — a TTL-required pin can green `e2e_media_relay.py` and still break an older token path not on the list (Tesla).
 
-Set a **narrow** `turn.relay_range_start: 50000` / `relay_range_end: 60000` in `livekit.yaml` (default is a huge `1024–30000` — RESEARCH §5), then per box open **both** OCI security-list AND host iptables for: **UDP 3478** (TURN), **TCP 5349** (TURN/TLS), **and UDP 50000–60000** (relay allocation). Keep this distinct from the SFU's own ICE UDP range (7882–7892). Verify with an *external* UDP reachability probe, not the OCI API's `AVAILABLE` state.
+### 3.4 Credential model — precondition before opening the relay range
+
+Round-1 Tesla/Carnot: opening 3478 + 5349 + a UDP relay range while `[confirm not open relay]` is still a TODO = shipping the hole before the credential model. **Falsify before build:**
+- **Unauthenticated `ALLOCATE` must fail** — an explicit negative test.
+- TURN credentials must be **short-TTL, LiveKit-issued** (the v1.13.1 TTL-required pin enforces this), never long-lived static TURN secrets in yaml.
+
+### 3.5 Firewall (double-firewall, per `reference_oci_double_firewall_local_iptables`)
+
+Set **narrow** `turn.relay_range_start: 50000` / `relay_range_end: 60000` in `livekit.yaml` (default `1024–30000` — RESEARCH §5). Per box open **both** OCI security-list AND host iptables for **UDP 3478**, **TCP 5349**, **UDP 50000–60000**. Keep the SFU's own ICE UDP range (7882–7892) **disjoint** from the relay range — asserted as an invariant in the template. Verify with an *external* UDP probe.
 
 ## 4. Build order (core-first, each step independently useful)
 
-1. **Fix the fire — cert only (imagineering CONSUME):** add `turn.imagineering.cc` Caddy block → Caddy issues a fresh cert → copy to LiveKit certs → restart → **run the relay test on the CURRENT (`:latest`) version.** Independently shippable; stops the 18-day bleed. *No pin yet* — prove relay works before changing the version.
-2. **Pin imagineering (separate verified step):** bump `:latest` → `v1.13.5`, restart, **re-run the relay test** (catches any v1.12/v1.13.1 TURN-auth behavior change). Rollback = re-pin to the prior digest if relay regresses.
-3. **Author the companion (repo):** `deploy/media/` — pinned compose, `livekit.yaml.tmpl` (with narrow relay range), `cert-watch.sh` + `.timer`, `e2e_media_relay.py`, README (OWN vs CONSUME).
-4. **enspyr OWN standup:** create `turn.enspyr.co` A-record (Namecheap API) → box; add `turn.enspyr.co` Caddy block; **obtain the first cert BEFORE enabling TURN** (LiveKit won't boot with `turn.tls_port` + a missing `cert_file`) — start LiveKit turn-disabled, wait for cert, render template with `turn:` enabled, restart; open firewall; **relay test passes on enspyr (parity achieved).**
-5. **Wire the renewal watcher both boxes:** install `cert-watch.timer`. Prove by simulating a cert swap (or forcing renewal) → watcher validates → restarts → relay test still passes.
-6. **Backfill imagineering into the reference:** document its shared-infra config (webhook/redis/keys) as the CONSUME reference in the README; do NOT migrate it to the template.
+1. **Fix the fire — cert only (imagineering CLIENT+REPAIR):** add `turn.imagineering.cc` Caddy block → Caddy issues via HTTP-01 → bind-mount into livekit → **attended restart in a window** → relay test on the CURRENT (`:latest`) version. Stops the 18-day bleed. *No pin yet.*
+2. **Pin imagineering (separate gate):** after enumerating token issuers (§3.3), bump `:latest`→`v1.13.5`, attended restart, **re-run relay test** (catches v1.12/v1.13.1 TURN-auth changes). Rollback = re-pin prior digest.
+3. **Author `deploy/media/` (BOOTSTRAP) + the CONSUME runbook:** pinned compose w/ RO cert mount, template (narrow relay range, disjoint ICE range), `cert-restart` timer, `e2e_media_relay.py`, the cert-tree contract test, README; and `docs/runbooks/imagineering-livekit-repair.md`.
+4. **enspyr BOOTSTRAP standup:** `turn.enspyr.co` A-record (Namecheap API) → box; add `turn.enspyr.co` Caddy block; **obtain first cert BEFORE enabling TURN** (LiveKit won't boot with `turn.tls_port` + missing `cert_file`) — start turn-disabled, wait for cert, enable, restart; open firewall; **credential negative test (§3.4)**; **relay test passes (parity)**.
+5. **Wire the BOOTSTRAP restart trigger + expiry alarm (both boxes):** enspyr timer; both-box served-cert `notAfter` alarm. Prove by forcing a renewal → restart → relay test still passes.
+6. **Live-room restart measurement (§3.2):** document what a restart actually costs on the shared box, feeding the runbook's tenant-notice policy.
 
-## 4a. Acceptance gate (the real one)
+## 4a. Acceptance gate (exact observable — Round-1 Carnot/Tesla)
 
-Forced-relay test (`iceTransportPolicy: 'relay'`) is **not** passed by "video appeared" — a `relay` candidate can be the media node's embedded TURN over **UDP**, leaving the TLS/5349 path unproven. The gate is: selected candidate pair `type == relay` **AND `protocol == TCP/TLS`** (RESEARCH §6, livekit#3971). `e2e_media_relay.py` must assert the protocol field, not just the type.
+`type == relay` alone is not enough (a relay candidate can be embedded-TURN over UDP). The gate reads the **selected candidate pair** and asserts:
+1. **relayed path over TLS/TCP works:** with `iceTransportPolicy: 'relay'` forcing a TURNS URL, the selected pair's remote candidate `type == relay` **AND** its `protocol`/relay-transport resolves to **TCP/TLS** (exact WebRTC-stats field confirmed against the SDK at build time — not assumed).
+2. **UDP-relay canary:** a second run proving 3478 + the relay range relays over UDP (so the opened range is provably necessary + reachable).
+3. **negative test:** unauthenticated `ALLOCATE` fails (§3.4).
 
-## 4b. Fold — degenerate states enumerated (author self-strike)
+## 4b. Degenerate states enumerated (author self-strike + round-1 neighbors)
 
-- **n=0 / first cert (enspyr):** LiveKit fails to boot if `turn.tls_port` is set but `cert_file` is absent → **step 4 sequences cert-before-turn-enable.**
-- **Renewal race:** watcher copies a half-written cert mid-renewal → mitigated by Caddy's atomic write + the watcher's own validate-then-atomic-copy; **fail-closed skips restart on an invalid pair.**
-- **Restart during active calls (imagineering multi-tenant):** only in-flight ICE drops (established media survives); restart fires **only on actual cert change** (~monthly) at a low-traffic hour — not on every timer tick.
-- **Pin is a behavior change, not a no-op:** v1.12/v1.13.1 TURN-auth changes → **steps 1 and 2 are separate relay-tested gates**, never bundled.
-- **relay range hole:** forgetting `relay_range_*` → default `1024–30000` firewall hole; §3.3 narrows + opens explicitly.
+- **First cert (enspyr):** LiveKit won't boot with `turn.tls_port` + missing `cert_file` → step 4 sequences cert-before-turn-enable.
+- **Trigger dies silently:** covered by the served-cert `notAfter` alarm (§3.1) — a dead timer surfaces as an expiry alert, not a Jul-24 repeat.
+- **Restart during active calls:** reclassified as real multi-tenant downtime (§3.2) — attended window on imagineering.
+- **Pin is a behavior change:** steps 1 & 2 are separate relay-tested gates.
+- **Caddy upgrade / volume rename moves the cert path:** the bind-mount path is asserted by the cert-tree **contract test** (§3, `test/`) against fixture trees for both box topologies; a moved path fails the test, not production.
+- **relay range hole:** §3.5 narrows + opens explicitly; ICE range disjoint asserted in template.
 
 ## 5. Blast radius & consent spine
 
-- **imagineering LiveKit restart drops live calls for OTHER tenants** (dreamfinder/lyra/AITW), not just the island. Cert-renewal restarts must be scheduled low-traffic; the fix-the-fire step-1 restart is a one-time, announce-able event. **Owner:** Nick (operator). This is the strongest argument for CONSUME mode — we minimize how often the island's tooling restarts a service other people depend on.
-- **Do not clobber imagineering's `livekit.yaml`** (API keys, webhook, redis are load-bearing for AITW). CONSUME mode touches only the cert + the image pin.
-- **No new public surface** beyond TURN's already-intended UDP 3478 / TCP 5349 + relay range. TURN relays media for *authenticated* LiveKit sessions (it uses LiveKit's API-key credential flow), so it is not an open relay — `[HEAT-PENDING: confirm LiveKit embedded TURN requires the room credential, i.e. not an abusable open TURN]`.
-- **Secrets:** LiveKit API key/secret live on the box (`.env` / rendered yaml), never in the repo template (template carries `${VARS}`).
+- **A LiveKit restart is a real media outage for ALL tenants** (§3.2), not just island users. **BOOTSTRAP (enspyr):** island-owned, unattended, island-only blast. **CLIENT+REPAIR (imagineering):** attended change window + tenant notice (dreamfinder/lyra/AITW) + rollback; the island's automation NEVER autonomously restarts imagineering's shared SFU. **Owner: Nick.**
+- **Do not clobber imagineering's `livekit.yaml`** (API keys, webhook, redis are load-bearing for AITW). CLIENT+REPAIR touches only the cert mount + the image pin.
+- **Public UDP surface gated by the credential model (§3.4)** — unauthenticated ALLOCATE must fail before the range is opened to non-test traffic; creds are short-TTL LiveKit-issued.
+- **Secrets:** LiveKit API key/secret stay on the box (`.env`/rendered yaml), never in the repo template (`${VARS}`).
 
-## 6. Claims to falsify (carried into Fold + Temper)
+## 6. Rejected alternatives
 
-Verbatim from CRUCIBLE + refined:
-1. **FRAME** — is "companion" right, or is imagineering purely box-infra the island consumes? → **Resolved to a two-mode design (OWN/CONSUME); Temper must confirm the split is honest, not a dodge.**
-2. **Asymmetry** — one mechanism must survive both box shapes → the two cert-delivery adapters; Temper: is a single hook script maintainable across container-vs-systemd Caddy, or should they be two scripts?
-3. **Cert delivery across the container boundary** — `[HEAT-PENDING #2]`.
-4. **pion/turn no hot-reload → restart on renewal** — `[HEAT-PENDING #1]`; blast radius §5.
-5. **No coturn** — subtraction; Temper must show a LiveKit-embedded-TURN gap to overturn.
+- **Fold LiveKit into the island's pinned image** — coupling + multi-tenant contradiction.
+- **Standalone coturn** — subtraction; embedded TURN is enough **iff media ≡ LiveKit-only on these boxes forever**. Reopen trigger (documented, not present debt): a non-LiveKit WebRTC consumer, OR a hostile-443 requirement that wants a dedicated 443 TURN endpoint.
+- **Cert mechanism A (custom `xcaddy` + `caddy-events-exec`)** — a hand-compiled Caddy is new forever-drift; module is experimental + permission-gotcha under enspyr's unprivileged Caddy.
+- **Cert mechanism C-copy (fingerprint-diff copy+validate+restart)** — round-1 casualty: guards the coupling instead of removing it; bind-mount (§3.1) dissolves it.
+- **Cert mechanism B (standalone `lego`/`certbot`)** — reverses Nick's "Caddy-managed" decision; bind-mount keeps Caddy as issuer while removing the copy, so B is unneeded. (Fallback only if the decision flexes.)
+- **Hot-reload TLS proxy fronting 5349 (no restart on renewal)** — would zero out imagineering's tenant impact without operator involvement; held in reserve, heavier (more parts), revisit only if the attended-window cost proves unacceptable.
 
-## 7. Rejected alternatives
+## 7. Open variables (build-time)
 
-- **Fold LiveKit into the island's pinned image** — coupling + multi-tenant contradiction (CRUCIBLE §Rejected).
-- **Standalone coturn** — subtraction (claim 5).
-- **Do nothing** — status quo that produced the dead cert.
-- **Cert mechanism A: custom `xcaddy` + `caddy-events-exec` (research default)** — rejected in Fold: a hand-compiled Caddy binary is a *new* drift surface to re-version forever, the exec module is experimental with a permission gotcha under enspyr's unprivileged Caddy, and DNS-01 needs Namecheap creds + IP allowlist we don't need. More coupling to guard, not less.
-- **Cert mechanism B: standalone `lego`/`certbot` (fully decouple from Caddy)** — cleaner in the abstract (TURN cert is a LiveKit concern), but adds a *second* ACME client to the box and **reverses Nick's "Caddy-managed" decision**. Chosen mechanism C keeps Caddy as issuer (honors the decision) while dropping only the custom-build cost. *(If Temper prefers full decoupling, B is the fallback — flag to Nick, since it changes the recorded decision.)*
-- **Front TURN TLS with a hot-reloading proxy to avoid the restart** — more moving parts than a rare scheduled restart; re-examine only if restart blast radius proves unacceptable.
+- **DNS:** confirm `turn.imagineering.cc` resolves + port 80 reachable for HTTP-01; **create `turn.enspyr.co` A-record** (Namecheap API).
+- **imagineering Caddy cert-volume share:** exact RO mount of the Docker cert volume into livekit — pick at build.
+- **Exact WebRTC-stats field** for the relay-over-TLS protocol assertion (§4a) — confirm against the SDK.
+- **imagineering TURN-token issuer list** (§3.3) — enumerate before pin.
+- **OWN-mode Redis?** enspyr single-node likely needs none — confirm before templating.
 
-## 8. Open variables (Heat-resolved / remaining)
+## 8. Claims to falsify (carried into Temper round 2)
 
-Resolved by RESEARCH: no hot-reload → restart (§1); pin `v1.13.5` + behavior-change caveat (§2); mechanism C via HTTP-01 stock Caddy (§3); narrow relay range `50000–60000` (§5); protocol-check acceptance gate (§6).
+1. **Frame:** does "media is box-plane; BOOTSTRAP vs CLIENT+REPAIR" hold, or does splitting the artifacts leave a seam? (round-1 frame finding folded — round 2 confirms.)
+2. **Bind-mount** genuinely removes the dual-SoT class (vs the copy it replaced)?
+3. **Restart reclassified honestly** — is "attended window + tenant notice on imagineering, unattended on enspyr" a real control plane now, or still folklore?
+4. **Credential model + acceptance gate** — is the negative-test/exact-observable spec sufficient to call the public UDP surface safe?
+5. **No coturn** still stands under the narrowed (non-443) scope?
 
-**Remaining (for Blade / build-time):**
-- **DNS:** confirm `turn.imagineering.cc` resolves to the box (yaml references it — likely yes); **create `turn.enspyr.co` A-record** via Namecheap API.
-- **Port 80 reachability** for `turn.<domain>` HTTP-01 — Caddy listens `:80` on both boxes; confirm no upstream block on the `turn.` host specifically.
-- **imagineering cert-store host access:** the watcher needs to read Caddy's cert from the Docker volume (`docker cp` vs host-mounted volume) — pick at build time.
-- **Does the OWN-mode compose need Redis?** enspyr's LiveKit is single-node (no agent dispatch) → likely no Redis; confirm before templating.
+## 9. Temper round-1 ledger (unanimous REQUEST_CHANGES → folded)
+
+| # | Finding | Reviewer(s) | Disposition |
+|---|---|---|---|
+| 1 | "restart drops only in-flight ICE" is false (embedded TURN shares SFU process) | Carnot, Tesla (FATAL) | **Folded** §3.2 — reclassified as real multi-tenant outage; live-room test required |
+| 2 | Copy-based cert = dual-SoT, recreates Jul-24 class | Tesla (FATAL), Carnot (MAJOR) | **Folded** §3.1 — bind-mount RO, watcher→restart-trigger, notAfter alarm |
+| 3 | OWN/CONSUME half-dodge; island-shapes a box plane | all three (FRAME) | **Folded** §2 — media-is-box-plane; BOOTSTRAP vs CLIENT+REPAIR; artifacts split; owner named |
+| 4 | 5349 ≠ 443; "corporate firewall" over-claimed | Carnot (FATAL) | **Folded** §1 — scope narrowed to generic relay (Nick decided); 443 deferred |
+| 5 | Open relay before credential model | Tesla, Carnot | **Folded** §3.4 — negative test + short-TTL LiveKit creds precondition |
+| 6 | Acceptance gate underspecified; needs exact observable + UDP canary + token matrix | Carnot, Tesla | **Folded** §4a, §3.3 |
+| 7 | Two delivery topologies ≠ one script; need contract test | Tesla | **Folded** §3 `test/`, §4b |
+| 8 | CONSUME "reference" goes stale | Kelvin, Tesla | **Folded** §2 — it's a runbook + named owner + change-control, not a passive doc |
