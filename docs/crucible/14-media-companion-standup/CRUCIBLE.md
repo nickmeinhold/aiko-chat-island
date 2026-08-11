@@ -6,7 +6,9 @@
 
 ## The pick
 
-Bring the self-hosted **LiveKit SFU** — which carries STUN/TURN *inside it* (pion/turn), so there is no separate coturn to add — under the island's management discipline: **version-pinned image, repo-authoritative compose, Caddy-managed auto-renewing TURN cert, one-command standup + pull-based update, forced-relay acceptance test.** Land it as a **companion sibling** to the island unit, not folded into the island's single pinned image.
+> **FRAME UPDATE (Temper round 1, kept through round 2).** The original seed below framed this as a "companion sibling to the island." The temper re-anchored it: **the media plane (SFU + embedded STUN/TURN) is always BOX-plane; the island is a *consumer* of it** — never an island appendage. The binding frame is DESIGN §2 (BOOTSTRAP vs CLIENT+REPAIR on the ownership line); the "companion" language below is retained as the historical spark, not the design of record.
+
+Bring the self-hosted **LiveKit SFU** — which carries STUN/TURN *inside it* (pion/turn), so there is no separate coturn to add — under managed discipline: **version-pinned image, repo-authoritative compose (BOOTSTRAP) / attended repair runbook (CLIENT+REPAIR), Caddy-issued TURN cert bind-mounted into LiveKit, endpoint-probed expiry alarm, forced renewal loop, split connectivity/exposure acceptance gates.** Applied per the box's ownership posture (DESIGN §2), never folded into the island's single pinned image.
 
 ## Why this thrills me AND what it changes
 

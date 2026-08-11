@@ -4,7 +4,9 @@ Sourced findings, 2026-08-11. Five mechanism cells for DESIGN.
 
 ## 1. pion/turn cert reload — NO hot-reload (restart required)
 
-LiveKit's embedded TURN (pion/turn) loads `turn.cert_file`/`turn.key_file` **once at process start**; a renewed cert on disk keeps serving the old cert until restart. Confirmed [livekit/livekit#3463](https://github.com/livekit/livekit/issues/3463) — feature requested, **closed as not planned**. So **every renewal ⇒ a livekit restart**. Restart is cheap (~seconds, Go binary) and drops only **in-flight ICE negotiation, not established media** — so the blast radius of a renewal restart on multi-tenant imagineering is bounded to calls mid-connect, not calls in progress.
+LiveKit's embedded TURN (pion/turn) loads `turn.cert_file`/`turn.key_file` **once at process start**; a renewed cert on disk keeps serving the old cert until restart. Confirmed [livekit/livekit#3463](https://github.com/livekit/livekit/issues/3463) — feature requested, **closed as not planned**. So **every renewal ⇒ a livekit restart**.
+
+> **SUPERSEDED (Temper round 2, Carnot + Tesla FATAL).** An earlier version of this section claimed the restart "drops only in-flight ICE negotiation, not established media." **That is false and must not be quoted.** Embedded pion/turn lives in the **same Go process as the SFU**, so `docker restart livekit` tears down **room state + SFU-anchored media for every tenant** (island, dreamfinder, lyra, AITW) — it is a full multi-tenant media outage until clients reconnect, not a mid-connect nick. **No survival claim is permitted without the live-room measurement (DESIGN §3.2).** Two corollaries the design depends on: (a) the cert LiveKit *serves* is the in-memory copy loaded at boot, so a disk-file check cannot detect a stale-serving process — the expiry alarm must probe the TLS endpoint (DESIGN §3.1); (b) the renewal→restart loop must be *forced*, not calendar-hoped (DESIGN §3.2).
 
 ## 2. Pin — `v1.13.5` (and pinning is NOT a no-op)
 
