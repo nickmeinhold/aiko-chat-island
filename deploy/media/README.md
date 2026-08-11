@@ -65,10 +65,16 @@ everywhere, not a nick.
     non-zero exit) — `turnutils_uclient`, no cred needed for the negative test.
   - **B2** ports outside `50000–60000` sampled closed (advisory — can fail the gate,
     cannot certify closure; external multi-port audit still required).
-  - **B3** no relay to RFC1918/link-local — asserted from the **LiveKit version**:
-    v1.12.0+ denies restricted/private peer CIDRs by default (upstream changelog),
-    read from `LIVEKIT_IMAGE` or `docker inspect livekit`. Replaces the old unwired
-    `TURN_B3_PRIVATE_DENY_CMD` runtime probe.
+  - **B3** no relay to RFC1918/link-local. A live runtime private-deny probe is
+    **unimplementable** for session-bound embedded TURN (no standalone TURN cred /
+    client permission API — same root cause as gate A), so B3 asserts the strongest
+    achievable fail-closed proxy: the **runtime-observed image** (`docker inspect
+    livekit` preferred; `LIVEKIT_IMAGE` env only a weaker fallback), the **official
+    livekit repo**, a **version floor** (v1.12.0+ denies restricted CIDRs by default),
+    and a **closed-set config-invariant** (the rendered `turn:` block carries no
+    unknown key that could be a relay-permission override). Replaces the old unwired
+    `TURN_B3_PRIVATE_DENY_CMD`. Accepted residual: a hand-rebuilt image relabeled as
+    the official tag (root-on-box supply chain) is out of scope.
 
 `e2e_media_relay.py` **fails CLOSED**: any check that cannot produce positive evidence
 exits non-zero and `standup.sh` will NOT open the firewall. Gate A additionally needs a

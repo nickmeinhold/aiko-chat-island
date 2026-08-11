@@ -49,10 +49,9 @@ def mint(identity: str, can_pub: bool, can_sub: bool) -> str:
     )
 
 
-def relay_opts(token_side: str):
+def relay_opts():
     # ice_servers empty: the SFU supplies its session-bound embedded-TURN creds.
-    cfg = rtc.RtcConfiguration(ice_transport_type=rtc.IceTransportType.TRANSPORT_RELAY)
-    return cfg
+    return rtc.RtcConfiguration(ice_transport_type=rtc.IceTransportType.TRANSPORT_RELAY)
 
 
 def _walk(stats_list):
@@ -135,11 +134,11 @@ async def main():
         got.set()
 
     await sub_room.connect(URL, mint("relay-sub", False, True),
-                           options=rtc.RoomOptions(auto_subscribe=True, rtc_config=relay_opts("sub")))
+                           options=rtc.RoomOptions(auto_subscribe=True, rtc_config=relay_opts()))
     print(f"[sub] connected id={sub_room.local_participant.identity} room={sub_room.name} (RELAY-only)", flush=True)
 
     await pub_room.connect(URL, mint("relay-pub", True, False),
-                           options=rtc.RoomOptions(auto_subscribe=False, rtc_config=relay_opts("pub")))
+                           options=rtc.RoomOptions(auto_subscribe=False, rtc_config=relay_opts()))
     print(f"[pub] connected id={pub_room.local_participant.identity} room={pub_room.name} (RELAY-only)", flush=True)
 
     source = rtc.VideoSource(W, H)
@@ -161,12 +160,27 @@ async def main():
     rc = 2
     try:
         await asyncio.wait_for(got.wait(), timeout=30)
-        # let media settle so stats have a nominated pair
+        # let media settle so stats have gathered candidates
         await asyncio.sleep(2)
         print("RESULT=RELAY_MEDIA_OK", result.get("track"), flush=True)
-        await dump_stats(pub_room, "pub")
-        await dump_stats(sub_room, "sub")
-        rc = 0
+        # HARNESS OWNS THE RELAY-ONLY INVARIANT (cage-match #128, Carnot/Tesla):
+        # media receipt alone is NOT sufficient — BOTH legs must have gathered
+        # candidates and every one must be RELAY. Stats unavailable on EITHER leg is
+        # FATAL (can't confirm relay-only) → fail closed, never rc=0. The parent gate
+        # reads the structured RELAY_ASSERT line + this exit code, not a stdout grep.
+        pub_info = await dump_stats(pub_room, "pub")
+        sub_info = await dump_stats(sub_room, "sub")
+        def _leg_ok(info):
+            return bool(info) and info.get("local_candidates", 0) > 0 and info.get("all_relay") is True
+        pub_ok, sub_ok = _leg_ok(pub_info), _leg_ok(sub_info)
+        assertion = {"result": "OK" if (pub_ok and sub_ok) else "FAIL",
+                     "pub_all_relay": pub_ok, "sub_all_relay": sub_ok}
+        print("RELAY_ASSERT=" + json.dumps(assertion), flush=True)
+        if pub_ok and sub_ok:
+            rc = 0
+        else:
+            print("RESULT=RELAY_ASSERT_FAILED both legs must be relay-only with gathered candidates", flush=True)
+            rc = 3
     except asyncio.TimeoutError:
         print("RESULT=TIMEOUT_NO_TRACK_UNDER_RELAY_ONLY", flush=True)
         await dump_stats(pub_room, "pub")

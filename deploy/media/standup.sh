@@ -43,6 +43,8 @@ echo "== 2. validate range + render config (turn enabled) with restrictive perms
 ( umask 077; envsubst '${TURN_DOMAIN} ${NODE_IP} ${LIVEKIT_API_KEY} ${LIVEKIT_API_SECRET} ${TURN_RELAY_START} ${TURN_RELAY_END}' \
     < livekit.yaml.tmpl > livekit.yaml )
 chmod 600 livekit.yaml   # explicit: umask only guards CREATE; a re-run over an existing 0644 must not leave secrets world-readable
+export LIVEKIT_YAML="$PWD/livekit.yaml"   # gate B3 reads the rendered turn block for its config-invariant
+export LIVEKIT_IMAGE="$IMAGE"             # gate B3 version floor (docker inspect is preferred; this is the fallback)
 
 echo "== 3. assert ranges: rendered relay == .env, and DISJOINT from SFU ICE =="
 ice_s=$(awk '/port_range_start:/{print $2; exit}' livekit.yaml); ice_e=$(awk '/port_range_end:/{print $2; exit}' livekit.yaml)
