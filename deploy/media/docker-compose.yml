@@ -1,0 +1,25 @@
+# LiveKit media plane — BOOTSTRAP mode (island-owned, greenfield box)
+#
+# Host networking for WebRTC UDP media (SFU ICE range + TURN relay range).
+# Caddy (host or container) terminates TLS for the :7880 signaling endpoint and
+# ISSUES the turn.<domain> cert; here that cert's LEAF dir is bind-mounted
+# read-only so pion/turn reads Caddy's live bytes directly — no copy, no dual SoT.
+#
+# Pinned, NOT :latest (the drift task #14 exists to kill). Bump deliberately:
+# edit the tag, run update.sh, re-run the acceptance gates (a pin is a TURN-auth
+# behavior change — see DESIGN §3.3).
+
+services:
+  livekit:
+    image: livekit/livekit-server:v1.13.5
+    container_name: livekit
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./livekit.yaml:/etc/livekit.yaml:ro
+      # Leaf cert dir ONLY (never the whole Caddy data volume — it holds the
+      # ACME account key adjacent). ${CADDY_CERT_LEAF_DIR} is the single-domain
+      # dir: host FS on systemd-Caddy boxes, or a volume subpath on container-Caddy
+      # boxes. Read-only: LiveKit reads Caddy's live cert, never writes it.
+      - ${CADDY_CERT_LEAF_DIR}:/certs:ro
+    command: --config /etc/livekit.yaml

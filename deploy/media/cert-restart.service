@@ -1,0 +1,14 @@
+# BOOTSTRAP-only: machine-forced renewal restart. Install on island-dedicated
+# boxes (enspyr), NEVER on a shared multi-tenant box (imagineering uses the
+# runbook). Paired with cert-restart.timer. Adjust WorkingDirectory to the box's
+# deploy/media checkout.
+[Unit]
+Description=LiveKit TURN cert-renewal restart trigger (BOOTSTRAP)
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/aiko/deploy/media
+ExecStart=/opt/aiko/deploy/media/cert-restart.sh
+# Needs docker access; run as a user in the docker group (or root).

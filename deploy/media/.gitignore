@@ -1,0 +1,5 @@
+# Credential/secret fence (round-2 Tesla): these carry the LiveKit API secret or
+# are per-box runtime state. Only .env.example and *.tmpl are tracked.
+.env
+livekit.yaml
+*.flag
