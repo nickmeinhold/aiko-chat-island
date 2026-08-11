@@ -52,11 +52,13 @@ operator env value must never shrink a firewall-opening gate's tested set to zer
 
 Env: LK_URL (wss signaling), LK_API_KEY, LK_API_SECRET, LK_ROOM (optional),
      B3_EXTRA_PRIVATE_PEERS (optional, comma list — ADDS sentinels, cannot remove),
-     B3_PUBLIC_CONTROL (optional; default 1.1.1.1),
-     NODE_IP (optional; if set, the advertised TURN host must equal it).
-Deps: websockets, livekit-api (livekit.protocol.rtc), aioice. No turnutils/coturn.
+     B3_PUBLIC_CONTROL (optional; default 1.1.1.1; must be a global IP),
+     NODE_IP + B3_EXPECT_HOST (optional; advertised TURN host must resolve into their
+     IP set — gate_B3 passes B3_EXPECT_HOST=TURN_DOMAIN so the exposure path always pins).
+Deps: websockets, livekit-api (livekit.protocol.rtc), aioice. No turnutils/coturn (the
+      PROBE has no coturn dep; gate B1 in e2e_media_relay.py still uses turnutils_uclient).
 """
-import asyncio, os, sys, json, time, urllib.parse
+import asyncio, os, sys, json, time, ssl, socket, ipaddress, urllib.parse
 import websockets
 from livekit import api
 from livekit.protocol.rtc import SignalResponse
@@ -77,28 +79,59 @@ ROOM    = os.environ.get("LK_ROOM", f"b3-probe-{int(time.time())}")
 #   for those exact destinations, not every address in each block (a regression that
 #   denied 10.0.0.1 but allowed 10.99.99.99 would pass). It is a representative probe,
 #   not an exhaustive range proof — the gate output and docs say "sentinel", not
-#   "every private IP". NOT covered (tracked, task #6): 100.64/10 (RFC 6598 CGNAT,
-#   found ALLOWED) and IPv6 forms (ULA fc00::/7, link-local fe80::/10, ::1, and
-#   IPv4-mapped ::ffff:10.x) — excluded here so the gate doesn't false-block, not
-#   because they're proven safe.
+#   "every private IP".
+#   IPv6 (cage-match #129 r2, empirically resolved on enspyr v1.13.5, NOT a residual):
+#   a native-IPv6 peer on this IPv4 allocation returns 443 Peer-Address-Family-Mismatch
+#   (RFC 6156) — the server cannot relay IPv4-allocation traffic to an IPv6 peer, and the
+#   relay address is IPv4-only, so IPv6 private targets are not a vector here. IPv4-mapped
+#   forms (::ffff:10.0.0.1) are REFUSED 403 — the deny applies, no bypass. So IPv6 forms
+#   are deliberately NOT in the mandatory set: they'd 443 (inconclusive) and false-BLOCK a
+#   server that is not actually reachable over IPv6. task #6 tracks the IPv6-ALLOCATION
+#   question (would the server grant an IPv6 relay if one were requested).
 MANDATORY_PRIVATE_PEERS = [
     "10.0.0.1", "172.16.0.1", "192.168.0.1", "169.254.169.254", "127.0.0.1"]
 EXTRA_PRIVATE_PEERS = [p.strip() for p in
                        os.environ.get("B3_EXTRA_PRIVATE_PEERS", "").split(",") if p.strip()]
 PRIVATE_PEERS = MANDATORY_PRIVATE_PEERS + EXTRA_PRIVATE_PEERS
-# Positive control: a PUBLIC peer whose permission MUST be granted (200). Without
-# it, "403 for a private peer" could be a server that denies EVERY permission —
-# the refusal would be vacuous. The control proves permissions work in general, so
-# the private 403 is specifically the RFC1918/CIDR policy. It is re-checked AFTER
-# the private matrix too (a mid-run global/quota 403 must not read as policy deny).
-# (No packets are sent to it; only a TURN permission is created on a throwaway
-# allocation, then torn down.)
-PUBLIC_CONTROL = os.environ.get("B3_PUBLIC_CONTROL", "1.1.1.1")
-# Optional pin: the TURN host the SFU advertises must equal the box the firewall
-# will open (NODE_IP). Guards "probe the wrong coil, open the right port" (Tesla):
-# a mis-advertised ice host would otherwise certify a DIFFERENT TURN than the one
-# being exposed. Skipped when NODE_IP is unset (can't verify).
+# INFORMATIONAL sentinel — a band LiveKit's default deny does NOT cover: 100.64/10
+# (RFC 6598 CGNAT), found ALLOWED (200). It is NOT mandatory (that would BLOCK every
+# standup until the server denies it, and its real reachability/severity on OCI is
+# still open — task #6). But a firewall-opening gate must not emit a clean OK that
+# HIDES a known-open private-ish band (cage-match #129 r2, Tesla): so we probe it and,
+# if still ALLOWED, NAME it in the OK verdict as a surfaced known-gap.
+CGNAT_INFO_SENTINEL = "100.64.0.1"
+# Positive control: a PUBLIC peer whose permission MUST be granted (200) — otherwise a
+# private 403 is vacuous (a server denying EVERY permission). Re-checked AFTER the
+# private matrix on the SAME allocation too (a mid-run global/quota 403 must not read
+# as policy deny). It must itself be a GLOBAL address (cage-match #129 r2, Tesla: a
+# private/empty B3_PUBLIC_CONTROL would silently degrade the control) — validated below.
+PUBLIC_CONTROL = os.environ.get("B3_PUBLIC_CONTROL", "1.1.1.1").strip()
+# Host pin: the TURN host the SFU advertises must resolve to the SAME box the firewall
+# will open — else the gate certifies one TURN and opens another ("probe the wrong coil,
+# open the right port", Tesla). Compared by RESOLVED IP SET, not raw string, so an FQDN
+# advertisement (turn.<domain>) and a dotted NODE_IP are reconciled (cage-match #129 r2).
+# Expected identity comes from NODE_IP and/or B3_EXPECT_HOST (gate_B3 passes the exposure
+# TURN_DOMAIN). If neither is set (off-box manual run) the pin can't be verified and the
+# probe WARNs; standup always passes B3_EXPECT_HOST, so the exposure path always pins.
 NODE_IP = os.environ.get("NODE_IP", "").strip()
+EXPECT_HOST = os.environ.get("B3_EXPECT_HOST", "").strip()
+
+
+def _resolve_ips(name: str) -> set:
+    """Resolve a host (IP literal or FQDN) to its set of IP strings; empty on failure."""
+    if not name:
+        return set()
+    try:
+        return {ai[4][0] for ai in socket.getaddrinfo(name, None)}
+    except (socket.gaierror, OSError):
+        return set()
+
+
+def _is_global(addr: str) -> bool:
+    try:
+        return ipaddress.ip_address(addr).is_global
+    except ValueError:
+        return False
 
 
 def _block(reason: str) -> "int":
@@ -144,165 +177,230 @@ async def extract_turn_creds(timeout: float = 15.0):
                 return list(sr.join.ice_servers)
 
 
-def pick_udp_turns(ice_servers):
-    """Return EVERY (host, port, username, credential) for the plain UDP TURN URIs the
-    SFU advertised — not just the first (cage-match #129, Tesla: a benign first URI
-    could mask a later open one; the gate must probe them all).
+def pick_turn_endpoints(ice_servers):
+    """Return EVERY advertised RELAY endpoint as a dict {transport, host, port, user, cred,
+    uri} — across ALL transports, not just UDP (cage-match #129 r3: enspyr advertises BOTH
+    a turn:udp AND a turns:tcp relay; probing only UDP left the TLS relay's deny untested).
+    Each is tested on its own transport; probe them all (a benign endpoint can't vouch for
+    another). stun: URIs carry no relay and are skipped.
 
-    We deliberately probe turn:...:3478?transport=udp — NOT turns:/5349. task #4:
-    TLS/5349 relay is a known gap (externalTLS:false), so probing it would fail B3
-    for the wrong reason. A STUN-only URI (stun:) carries no relay and is skipped."""
+    transport ∈ {udp, tcp, tls}: turns:→tls; turn:+transport=tcp→tcp; turn:+transport=udp
+    OR no-transport-on-3478→udp. A no-transport turn:host:<non-3478> is ambiguous → tcp
+    (conservative: it will be allocate-tested, not silently datagram-probed)."""
     out = []
     for s in ice_servers:
         user, cred = s.username, s.credential
         for uri in s.urls:
             low = uri.lower()
-            if not low.startswith("turn:"):        # skip stun: and turns:
+            if low.startswith("stun:"):
                 continue
-            if "transport=udp" not in low and "transport=" in low:
-                continue                            # explicit non-udp transport
-            body = uri.split(":", 1)[1].split("?", 1)[0]   # host[:port]
-            if body.startswith("["):               # bracketed IPv6 literal: [::1]:3478
-                host, _, rest = body[1:].partition("]")
-                port = rest.lstrip(":") or "3478"
+            if low.startswith("turns:"):
+                scheme, rest = "tls", uri[len("turns:"):]
+            elif low.startswith("turn:"):
+                scheme, rest = "turn", uri[len("turn:"):]
+            else:
+                continue
+            body = rest.split("?", 1)[0]                    # host[:port]
+            if body.startswith("["):                        # [IPv6]:port
+                host, _, tail = body[1:].partition("]")
+                port = tail.lstrip(":")
             elif ":" in body:
                 host, port = body.rsplit(":", 1)
             else:
-                host, port = body, "3478"
-            out.append((host, int(port), user, cred))
+                host, port = body, ""
+            if scheme == "tls":
+                transport, port = "tls", int(port or 5349)
+            elif "transport=udp" in low:
+                transport, port = "udp", int(port or 3478)
+            elif "transport=tcp" in low:
+                transport, port = "tcp", int(port or 3478)
+            elif not port or port == "3478":                # no transport, default port → udp
+                transport, port = "udp", 3478
+            else:                                            # no transport, non-default port → treat as tcp
+                transport, port = "tcp", int(port)
+            out.append({"transport": transport, "host": host, "port": port,
+                        "user": user, "cred": cred, "uri": uri})
     return out
 
 
-async def create_permission(host, port, user, cred, peer):
-    """Allocate with the session cred, then issue ONE CreatePermission for `peer`
-    and classify the server's answer. Uses aioice's TURN client (mature, RFC-tested
-    long-term-cred auth + 401/nonce re-challenge — the exact handling turnutils
-    botched). Returns {allocate_ok, verdict, code} where verdict is one of:
-      ALLOWED  (200) — server permitted a relay permission to this peer
-      REFUSED  (403) — server forbade it (the desired policy)
-      ERR<n>         — some other error code
-      NO_ALLOC       — allocation itself failed (bad cred / unreachable)"""
+async def teardown(inner_transport, proto):
+    """Reversible cleanup: cancel the refresh loop aioice starts in connect(), best-effort
+    deallocate (Refresh lifetime=0) so repeated runs don't accrete allocations on a public
+    TURN surface (cage-match #129 r1, Carnot), then drop the socket."""
+    rt = getattr(proto, "refresh_task", None)
+    if rt is not None:
+        rt.cancel()
+    try:
+        await asyncio.wait_for(proto.delete(), timeout=5)
+    except Exception:
+        pass
+    inner_transport.close()
+
+
+async def allocate(transport, host, port, user, cred):
+    """Create ONE TURN allocation with the session cred over the endpoint's transport
+    (udp datagram, or tcp/tls stream). Returns (inner_transport, proto, relay); raises on
+    failure (socket cleaned up). The caller issues MANY CreatePermissions on this single
+    allocation — the attacker's real shape, and the only shape under which the post-matrix
+    control re-check is meaningful (cage-match #129 r2/r3, Tesla)."""
     loop = asyncio.get_event_loop()
     server = (host, port)
-    inner_transport, proto = await loop.create_datagram_endpoint(
-        lambda: turn.TurnClientUdpProtocol(
-            server, username=user, password=cred, lifetime=600, channel_refresh_time=500),
-        remote_addr=server)
+    if transport == "udp":
+        inner_transport, proto = await loop.create_datagram_endpoint(
+            lambda: turn.TurnClientUdpProtocol(
+                server, username=user, password=cred, lifetime=600, channel_refresh_time=500),
+            remote_addr=server)
+    else:  # tcp or tls
+        sslctx = ssl.create_default_context() if transport == "tls" else None
+        inner_transport, proto = await loop.create_connection(
+            lambda: turn.TurnClientTcpProtocol(
+                server, username=user, password=cred, lifetime=600, channel_refresh_time=500),
+            host=host, port=port, ssl=sslctx)
     try:
-        try:
-            relay = await asyncio.wait_for(proto.connect(), timeout=15)   # ALLOCATE = positive control
-        except Exception as e:
-            return {"peer": peer, "allocate_ok": False, "verdict": "NO_ALLOC",
-                    "code": None, "detail": repr(e)}
-        req = stun.Message(message_method=stun.Method.CREATE_PERMISSION,
-                           message_class=stun.Class.REQUEST)
-        req.attributes["XOR-PEER-ADDRESS"] = (peer, 9)   # port is immaterial to a permission
-        try:
-            await asyncio.wait_for(proto.request_with_retry(req), timeout=15)
-            return {"peer": peer, "allocate_ok": True, "verdict": "ALLOWED",
-                    "code": 200, "relay": list(relay)}
-        except stun.TransactionFailed as e:
-            code = e.response.attributes.get("ERROR-CODE", (None, ""))[0]
-            return {"peer": peer, "allocate_ok": True,
-                    "verdict": "REFUSED" if code == 403 else f"ERR{code}",
-                    "code": code, "relay": list(relay)}
-        except (asyncio.TimeoutError, stun.TransactionTimeout) as e:
-            # Allocate succeeded but the permission got no answer — distinct from a
-            # broken cred (NO_ALLOC). Inconclusive, not refused (cage-match #129, Carnot:
-            # don't report "no allocation" when the allocation in fact succeeded).
-            return {"peer": peer, "allocate_ok": True, "verdict": "PERM_TIMEOUT",
-                    "code": None, "relay": list(relay), "detail": repr(e)}
-    finally:
-        # Reversible cleanup: cancel the allocation's refresh loop (aioice starts one
-        # in connect()) and best-effort deallocate (Refresh lifetime=0) so repeated
-        # runs don't accrete allocations on a public TURN surface (cage-match #129,
-        # Carnot); then drop the socket.
-        rt = getattr(proto, "refresh_task", None)
-        if rt is not None:
-            rt.cancel()
-        try:
-            await asyncio.wait_for(proto.delete(), timeout=5)
-        except Exception:
-            pass
-        inner_transport.close()
+        relay = await asyncio.wait_for(proto.connect(), timeout=15)
+    except Exception:
+        await teardown(inner_transport, proto)
+        raise
+    return inner_transport, proto, relay
+
+
+async def check_perm(proto, peer):
+    """Issue ONE CreatePermission for `peer` on an EXISTING allocation; classify the
+    control-plane answer: ALLOWED(200) / REFUSED(403) / ERR<code> / PERM_TIMEOUT."""
+    req = stun.Message(message_method=stun.Method.CREATE_PERMISSION,
+                       message_class=stun.Class.REQUEST)
+    req.attributes["XOR-PEER-ADDRESS"] = (peer, 9)   # port is immaterial to a permission
+    try:
+        await asyncio.wait_for(proto.request_with_retry(req), timeout=15)
+        res = {"peer": peer, "verdict": "ALLOWED", "code": 200}
+    except stun.TransactionFailed as e:
+        code = e.response.attributes.get("ERROR-CODE", (None, ""))[0]
+        res = {"peer": peer, "verdict": "REFUSED" if code == 403 else f"ERR{code}", "code": code}
+    except (asyncio.TimeoutError, stun.TransactionTimeout) as e:
+        res = {"peer": peer, "verdict": "PERM_TIMEOUT", "code": None, "detail": repr(e)}
+    print("  probe " + json.dumps(res), flush=True)
+    return res
 
 
 async def main() -> int:
+    # The positive control must itself be a GLOBAL address — a private/empty
+    # B3_PUBLIC_CONTROL would make the anti-vacuity check meaningless (cage-match #129 r2).
+    if not _is_global(PUBLIC_CONTROL):
+        return _block(f"B3_PUBLIC_CONTROL {PUBLIC_CONTROL!r} is not a global/public IP — the positive "
+                      "control would be meaningless; set a public literal (default 1.1.1.1)")
+
     try:
         ice = await extract_turn_creds()
     except Exception as e:
         return _block(f"signal-join extraction failed: {e!r}")
     if not ice:
-        return _block("no ice_servers in the SFU JoinResponse — cannot extract a TURN cred")
+        return _block("no ice_servers in the SFU JoinResponse (or timed out waiting for a join "
+                      "frame) — cannot extract a TURN cred")
 
-    turns = pick_udp_turns(ice)
-    if not turns:
-        return _block("JoinResponse carried no usable turn:...:udp URI "
+    endpoints = pick_turn_endpoints(ice)
+    if not endpoints:
+        return _block("JoinResponse carried no usable turn:/turns: relay URI "
                       f"(saw {[list(s.urls) for s in ice]})")
     if not PRIVATE_PEERS:            # defensive: the mandatory set is hard-coded non-empty
         return _block("no private peers to test — the mandatory SSRF-critical set is empty (bug)")
 
-    # Host pin: every advertised TURN host must be the box the firewall will open.
-    if NODE_IP:
-        mismatched = sorted({h for (h, _, _, _) in turns if h != NODE_IP})
-        if mismatched:
-            return _block(f"advertised TURN host(s) {mismatched} != NODE_IP {NODE_IP} — the SFU is "
-                          "steering clients to a TURN other than the box being exposed; refusing to certify")
+    # Host pin (resolve-and-compare, not raw string): every advertised TURN host must
+    # resolve into the exposed box's identity (NODE_IP and/or B3_EXPECT_HOST). No pin set
+    # (off-box manual run) → WARN and continue; standup always passes B3_EXPECT_HOST, so
+    # the exposure path always pins (cage-match #129 r2, Carnot+Tesla).
+    expected = _resolve_ips(NODE_IP) | _resolve_ips(EXPECT_HOST)
+    if expected:
+        for e in endpoints:
+            adv = _resolve_ips(e["host"]) or {e["host"]}
+            if not (adv & expected):
+                return _block(f"advertised TURN host {e['host']} (→{sorted(adv)}) does not resolve into "
+                              f"the exposed box {sorted(expected)} (NODE_IP/B3_EXPECT_HOST) — probe-the-"
+                              "wrong-coil-open-the-right-port; refusing to certify")
+    else:
+        print("  WARN B3: no NODE_IP / B3_EXPECT_HOST set — cannot pin the advertised TURN to the box "
+              "being exposed (off-box manual run only; standup passes B3_EXPECT_HOST).", flush=True)
 
-    async def probe(host, port, user, cred, peer):
+    # Test EVERY advertised relay endpoint on its OWN transport, each on a SINGLE allocation
+    # (attacker's real shape; the after-control re-check is only meaningful on the same
+    # allocation). A LIVE endpoint MUST pass control-before + sentinels-refused + control-
+    # after. An UNREACHABLE endpoint (allocate fails/times out — e.g. an advertised-but-dead
+    # turns: relay) is NOT an SSRF vector (you can't relay through a relay you can't allocate
+    # on) → surfaced, non-blocking. At least one endpoint must be LIVE and pass, else there
+    # is no reachable relay to certify → BLOCK (cage-match #129 r3).
+    tested, unreachable = [], []
+    for ep in endpoints:
+        label = f"{ep['transport']}:{ep['host']}:{ep['port']}"
+        print(f"  endpoint {label} user={ep['user'][:8]}… "
+              f"({len(ice)} ice_server(s), {len(endpoints)} relay URI(s))", flush=True)
         try:
-            res = await create_permission(host, port, user, cred, peer)
-        except Exception as e:
-            res = {"peer": peer, "allocate_ok": None, "verdict": "PROBE_ERR", "detail": repr(e)}
-        print("  probe " + json.dumps(res), flush=True)
-        return res
+            inner, proto, relay = await allocate(ep["transport"], ep["host"], ep["port"],
+                                                 ep["user"], ep["cred"])
+        except (asyncio.TimeoutError, OSError, ssl.SSLError, ConnectionError) as e:
+            # A genuine CONNECTIVITY failure (connect timeout / refused / TLS handshake / no
+            # TURN response) — the endpoint can't be allocated on, so it is not a relay vector
+            # (you can't relay through what you can't allocate). Surfaced, non-blocking. NOTE:
+            # only connectivity errors land here — a code bug or unexpected error propagates and
+            # crashes the probe (rc≠0 → gate BLOCKs), so a bug can never masquerade as
+            # "unreachable" and silently pass an untested relay (cage-match #129 r3, caught a
+            # NameError doing exactly that).
+            print(f"  UNREACHABLE {label}: allocate failed ({e!r}) — not a relay vector, surfaced", flush=True)
+            unreachable.append({"endpoint": label, "uri": ep["uri"], "detail": repr(e)})
+            continue
+        try:
+            print(f"  allocated relay {list(relay)}", flush=True)
 
-    # EVERY advertised turn:udp endpoint must pass the full matrix — a single open one
-    # is the SSRF hole regardless of how many others deny (cage-match #129, Tesla).
-    all_results = []
-    for (host, port, user, cred) in turns:
-        print(f"  endpoint turn:{host}:{port} user={user[:8]}… "
-              f"(from SFU JoinResponse, {len(ice)} ice_server(s), {len(turns)} udp URI(s))", flush=True)
+            control = await check_perm(proto, PUBLIC_CONTROL)     # must be GRANTED (200)
+            if control["verdict"] != "ALLOWED":
+                return _block(f"public-peer control {PUBLIC_CONTROL} not permitted on {label} "
+                              f"(got {control['verdict']}/{control.get('code')}) — server denies "
+                              "permissions broadly; cannot isolate an RFC1918-specific deny")
 
-        # Positive control FIRST: a public peer's permission must be GRANTED (200). If
-        # not, the server denies permissions broadly and a private 403 proves nothing
-        # about an RFC1918-specific policy — fail closed.
-        control = await probe(host, port, user, cred, PUBLIC_CONTROL)
-        if not control.get("allocate_ok"):
-            return _block(f"no TURN allocation succeeded on turn:{host}:{port} — credential/"
-                          "reachability problem, cannot certify relay-deny")
-        if control["verdict"] != "ALLOWED":
-            return _block(f"public-peer control {PUBLIC_CONTROL} not permitted on turn:{host}:{port} "
-                          f"(got {control['verdict']}/{control.get('code')}) — server denies "
-                          "permissions broadly; cannot isolate an RFC1918-specific deny")
+            results = [await check_perm(proto, p) for p in PRIVATE_PEERS]
+            allowed = [r["peer"] for r in results if r["verdict"] == "ALLOWED"]
+            inconclusive = [r["peer"] for r in results if r["verdict"] not in ("ALLOWED", "REFUSED")]
+            if allowed:
+                print("B3_ASSERT=" + json.dumps({"result": "FAIL",
+                      "reason": "server ALLOWED a relay permission to a private sentinel",
+                      "endpoint": label, "allowed": allowed, "peers": results}), flush=True)
+                return 3
+            if inconclusive:
+                return _block(f"non-403 result creating permission on {label} for {inconclusive} — "
+                              f"cannot positively confirm refusal (fail-closed): {results}")
 
-        results = [await probe(host, port, user, cred, p) for p in PRIVATE_PEERS]
-        allowed = [r["peer"] for r in results if r["verdict"] == "ALLOWED"]
-        inconclusive = [r["peer"] for r in results if r["verdict"] not in ("ALLOWED", "REFUSED")]
-        if allowed:
-            print("B3_ASSERT=" + json.dumps({"result": "FAIL",
-                  "reason": "server ALLOWED a relay permission to a private sentinel",
-                  "endpoint": f"turn:{host}:{port}", "allowed": allowed, "peers": results}), flush=True)
-            return 3
-        if inconclusive:
-            return _block(f"non-403 result creating permission on turn:{host}:{port} for "
-                          f"{inconclusive} — cannot positively confirm refusal (fail-closed): {results}")
+            # Re-check control on the SAME allocation AFTER the matrix — still ALLOWED, else a
+            # mid-run global/quota 403 was masquerading as policy refusal (cage-match #129 r2).
+            control2 = await check_perm(proto, PUBLIC_CONTROL)
+            if control2["verdict"] != "ALLOWED":
+                return _block(f"public control stopped being permitted after the private matrix on "
+                              f"{label} (got {control2['verdict']}/{control2.get('code')}) — a global/"
+                              "quota 403 may be masquerading as policy refusal; cannot certify")
 
-        # Re-check the control AFTER the private matrix: it must STILL be ALLOWED. If a
-        # mid-run global/quota/rate 403 kicked in, the private "403"s were not policy
-        # refusals — the OK would be false (cage-match #129, Tesla). This proves the
-        # server stayed selectively permissive across the whole matrix.
-        control2 = await probe(host, port, user, cred, PUBLIC_CONTROL)
-        if control2["verdict"] != "ALLOWED":
-            return _block(f"public control stopped being permitted after the private matrix on "
-                          f"turn:{host}:{port} (got {control2['verdict']}/{control2.get('code')}) — a "
-                          "global/quota 403 may be masquerading as policy refusal; cannot certify")
-        all_results.append({"endpoint": f"turn:{host}:{port}", "peers": results})
+            # Informational: probe a KNOWN-open private-ish band (100.64/10 CGNAT) so a clean OK
+            # cannot HIDE it — surfaced in the verdict, not buried in a comment (cage-match #129
+            # r2, Tesla). Non-blocking (task #6 owns the severity call).
+            cgnat = await check_perm(proto, CGNAT_INFO_SENTINEL)
+            tested.append({"endpoint": label, "peers": results, "cgnat_100_64_0_1": cgnat["verdict"]})
+        finally:
+            await teardown(inner, proto)
 
-    print("B3_ASSERT=" + json.dumps({"result": "OK",
-          "reason": f"every advertised turn:udp endpoint ({len(turns)}): allocation succeeded, public "
-                    "control allowed before+after, every SSRF-critical private sentinel refused (403)",
-          "sentinels": PRIVATE_PEERS, "endpoints": all_results}), flush=True)
+    if not tested:
+        return _block(f"no advertised relay endpoint was reachable to certify (all unreachable: "
+                      f"{[u['endpoint'] for u in unreachable]}) — cannot prove a relay-deny on a relay "
+                      "nobody can allocate; refusing to open the range")
+
+    known_open = sorted({t["endpoint"] for t in tested if t["cgnat_100_64_0_1"] == "ALLOWED"})
+    verdict = {"result": "OK",
+               "reason": f"{len(tested)} live relay endpoint(s) tested: allocation succeeded, public "
+                         "control allowed before+after (same allocation), every SSRF-critical private "
+                         "sentinel refused via control-plane CreatePermission (403). Sampled sentinels, "
+                         "not a full-range proof.",
+               "sentinels": PRIVATE_PEERS, "tested": tested}
+    if unreachable:
+        verdict["unreachable"] = unreachable   # advertised but un-allocatable (not a vector), surfaced
+    if known_open:
+        verdict["known_open_band"] = (f"100.64/10 (RFC 6598 CGNAT) still ALLOWED on {known_open} — "
+                                      "SURFACED known gap (task #6), non-blocking by policy")
+    print("B3_ASSERT=" + json.dumps(verdict), flush=True)
     return 0
 
 

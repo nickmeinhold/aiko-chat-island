@@ -73,8 +73,12 @@ everywhere, not a nick.
     (`10/8`, `172.16/12`, `192.168/16`, `169.254/16`, `127/8` — one **sentinel** per
     range, a mandatory hard-coded set that env can only add to, never shrink),
     requiring the control **allowed (200) before and after** and every sentinel
-    **refused (403)**. Sampled sentinels, not an exhaustive range proof. Every
-    advertised `turn:udp` endpoint must pass. Fail-closed exit code
+    **refused (403)**. Sampled sentinels, not an exhaustive range proof. **Every
+    advertised relay endpoint (each transport — udp/tcp/tls) is tested on one
+    allocation**; a live one must pass, an **unreachable** one (can't allocate → not a
+    relay vector) is surfaced non-blocking, and ≥1 live endpoint must pass. Known-open
+    bands (`100.64/10` CGNAT) and unreachable endpoints are named in the `B3_ASSERT`
+    verdict, not hidden. Fail-closed exit code
     (0 OK / 3 FAIL / 2 BLOCK) **and** a single structured `B3_ASSERT` verdict line.
     Supersedes the prior version-proxy — and is more truthful: it found LiveKit's
     default deny does **not** cover `100.64/10` (CGNAT), tracked separately (task #6).

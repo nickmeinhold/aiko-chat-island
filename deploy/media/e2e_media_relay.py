@@ -36,16 +36,18 @@ the public firewall range on a false green.
                       (b3_relay_probe.py), NOT a version/config proxy. It extracts the
                       SFU's session-bound TURN cred from the raw signaling JoinResponse
                       (the same session-bound cred gate A relies on, read off the wire —
-                      livekit-rtc never surfaces it), allocates a relay, then issues
-                      CreatePermission for a PUBLIC control + a representative SENTINEL
-                      per SSRF-critical private range (the set is MANDATORY/hard-coded,
-                      not env-shrinkable), requiring 200 for the control and 403 for
-                      every sentinel. Sampled, not an exhaustive range proof. A version
-                      proxy was the prior stopgap; the behavioral probe
-                      supersedes it AND is more truthful (it found LiveKit's default deny
-                      does NOT cover 100.64/10 CGNAT — task #6, excluded from the set).
-                      Runs in the exposure phase: needs :443 (join) + :3478 (TURN
-                      control), NOT the relay range.
+                      livekit-rtc never surfaces it), then for EVERY advertised relay
+                      endpoint (each transport — udp/tcp/tls) allocates ONCE and issues
+                      CreatePermission for a PUBLIC control + a mandatory hard-coded
+                      SENTINEL per SSRF-critical private range, requiring 200 for the
+                      control (before AND after the matrix) and 403 for every sentinel.
+                      A LIVE endpoint must pass; an UNREACHABLE advertised endpoint (can't
+                      allocate → not a relay vector) is surfaced non-blocking; ≥1 live
+                      endpoint must pass else BLOCK. Sampled sentinels, not an exhaustive
+                      range proof. Supersedes the version proxy AND is more truthful: it
+                      found 100.64/10 CGNAT still ALLOWED (surfaced in the verdict, task #6)
+                      and an advertised-but-dead turns: relay. Exposure phase: needs :443
+                      (join) + :3478 (TURN control), NOT the relay range.
 
 Env: TURN_DOMAIN, LIVEKIT_URL (wss signaling), LIVEKIT_API_KEY/SECRET, TURN_RELAY_START/END.
 Requires: a python with livekit + livekit-api + numpy (gate A) + websockets + aioice
@@ -133,7 +135,12 @@ def gate_B3(host: str) -> None:
         block("B3", "LIVEKIT_URL + LIVEKIT_API_KEY + LIVEKIT_API_SECRET required for the behavioral TURN probe.")
     if not os.path.exists(B3_PROBE):
         block("B3", f"missing {B3_PROBE}")
-    env = {**os.environ, "LK_URL": url, "LK_API_KEY": key, "LK_API_SECRET": secret}
+    # Pass the exposure target as the host-pin identity: the TURN the probe certifies must
+    # resolve to the box whose firewall we're about to open (cage-match #129: "probe the
+    # wrong coil, open the right port"). `host` is TURN_DOMAIN; the probe also folds in
+    # NODE_IP if the box sets it.
+    env = {**os.environ, "LK_URL": url, "LK_API_KEY": key, "LK_API_SECRET": secret,
+           "B3_EXPECT_HOST": host}
     try:
         r = subprocess.run([sys.executable, B3_PROBE], env=env, capture_output=True, text=True, timeout=120)
     except subprocess.TimeoutExpired:
@@ -155,9 +162,10 @@ def gate_B3(host: str) -> None:
     # is insufficient (a 0 with a non-OK body, or an OK body on a non-zero exit, is drift).
     if r.returncode != 0 or a.get("result") != "OK":
         block("B3", f"behavioral relay-deny NOT proven (rc={r.returncode}): {a.get('reason', a)}")
-    print("  ok B3: behavioral probe — every advertised turn:udp endpoint: allocation "
-          "succeeded, public control allowed (before+after), every SSRF-critical private "
-          "sentinel's CreatePermission refused (403). Sampled sentinels, not a full-range proof.")
+    print("  ok B3: behavioral probe — every LIVE advertised relay endpoint (all transports): "
+          "public control allowed (before+after) + every SSRF-critical private sentinel refused "
+          "(403). Unreachable endpoints + any known-open band (100.64/10) are surfaced in "
+          "B3_ASSERT above. Sampled sentinels, not a full-range proof.")
 
 
 def gate_B(host: str) -> None:
