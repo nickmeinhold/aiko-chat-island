@@ -89,7 +89,7 @@ Round-1/2 Tesla/Carnot: authz ≠ abuse-resistance, and "unauth ALLOCATE fails" 
 
 **Exposure-acceptance (B) — all required before opening the range to non-test traffic:**
 - **Unauthenticated `ALLOCATE` fails** (negative test).
-- Credentials **short-TTL, LiveKit-issued** (the v1.13.1 TTL-required pin enforces this), never static TURN secrets in yaml.
+- Credentials **short-TTL, LiveKit-issued** (the v1.13.1 TTL-required pin enforces this), never static TURN secrets in yaml. **UPDATE 2026-08-11 (cage-match #128):** the explicit `LIVEKIT_TURN_CRED_CMD` gate was removed as unwireable — session-bound TURN has no standalone cred to mint or inspect. The property is now **by construction**: the only TURN cred that exists is the short-TTL, LiveKit-issued, session-bound one the SFU hands a joined client, and gate A *exercises exactly that path* (a real livekit-rtc client relays through it). B3's config-invariant asserts the rendered turn block carries no static TURN secret key. Proven, not merely asserted — just not via a separate probe. **Ordering caveat (cage-match #128 r3, Tesla):** gate A runs at standup step 8, *after* the firewall opens at step 7 — so the credential-model safety guaranteeing the range is safe to open at step 7 rests on *construction* (session-bound TURN) + B1 (unauth ALLOCATE fails, pre-open), NOT on a pre-open cred-mint probe. Gate A *demonstrates* the session-cred relay works but does so post-open (it proves external reachability). If a pre-open credential proof is wanted, gate A can run against the box's own-IP hairpin at step 6 (signaling is Caddy:443, always open); deferred with the B3 behavioral-probe work.
 - **No relay to private IPs** — pin `turn`'s RFC1918/link-local deny as a config **invariant on both boxes** (RESEARCH §2: v1.12 defaults to this, but the design pins it explicitly — an open ALLOCATE surface without it is SSRF-shaped blast radius).
 - **Range bounds proven closed:** an external probe confirms ports *outside* 50000–60000 are closed (so a mis-set `relay_range` default can't leave the old 1024–30000 open from a prior snowflake).
 - **Trust boundary on token minting:** the §3.3 issuer inventory (realm-token / clients / agents) is the *allowlist* of who may mint TURN-capable tokens — named + accepted, not just enumerated.
@@ -115,9 +115,13 @@ Set **narrow** `turn.relay_range_start: 50000` / `relay_range_end: 60000` in `li
 
 Green connectivity ≠ safe to expose. **A proves the path exists; B (§3.4) proves it's safe to open.** Both required; A here, B in §3.4.
 
-**A — connectivity acceptance.** `type == relay` alone is insufficient (a relay candidate can be embedded-TURN over UDP). Read the **selected candidate pair** and assert:
-1. **relayed path over TLS/TCP works:** `iceTransportPolicy: 'relay'` forcing a TURNS URL → selected remote candidate `type == relay` **AND** its `protocol`/relay-transport resolves to **TCP/TLS** (exact WebRTC-stats field confirmed against the SDK at build — not assumed).
-2. **UDP-relay canary:** a second run proving 3478 + the relay range relays over UDP (the opened range is provably necessary + reachable).
+**A — connectivity acceptance.** `type == relay` alone is insufficient (a relay candidate can be embedded-TURN over UDP). Read the gathered candidates and assert:
+1. **relay media round-trips (UDP path):** `iceTransportPolicy: 'relay'` (forbids host/srflx) → a real livekit-rtc client's synthetic video is received by a second client, **and every gathered ICE candidate is `candidate_type == relay`** (media had no path but the TURN allocation). Implemented by `deploy/media/e2e_relay_livekit.py`, gated by `e2e_media_relay.py` gate A. Proves the **UDP/3478** relay path.
+
+> **UPDATE 2026-08-11 — the original assertion (1) below is DEFERRED; it does not hold today.** The gate was written to require the relayed path over **TLS/TCP (5349)**. Live testing proved that path **non-functional for clients**: LiveKit advertises only the UDP TURN (`turn.externalTLS:false`); a forced-relay client gathers a single UDP relay candidate, and with UDP blocked the peer connection times out (`wait_pc_connection`). The `:5349` cert is valid — the relay **advertisement** is the gap, an `external_tls` config matter tracked separately. Until that task proves TLS relay, gate A asserts the **UDP** path only (per (1) above), and the memory scope-note ("generic relay fallback for symmetric-NAT / home+mobile firewalls; hostile-443-only-corporate deferred") is the governing scope. The stale original text, kept for provenance:
+>
+> - ~~**relayed path over TLS/TCP works:** `iceTransportPolicy: 'relay'` forcing a TURNS URL → selected remote candidate `type == relay` **AND** its `protocol`/relay-transport resolves to **TCP/TLS**.~~ (deferred — TLS relay not advertised to clients; see UPDATE.)
+> - ~~**UDP-relay canary:** a second run proving 3478 + the relay range relays over UDP.~~ (subsumed into (1) — the forced-relay client IS the UDP proof.)
 
 ## 4b. Degenerate states enumerated (author self-strike + round-1 neighbors)
 
