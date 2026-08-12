@@ -60,6 +60,14 @@ fail silently → cert rots → :443 TURNS dies ~89d out. Closed two ways:
 
 ## Build + PROVE OFF THE LIVE :443 (do ALL of this before running cutover.sh)
 
+**STATUS 2026-08-12: DONE.** A full disposable-VM rehearsal ran the real scripts against real
+systemd/iptables/Caddy/HAProxy/LiveKit + a real ACME server: 4 reboot-at-checkpoint runs, 5
+rollback runs, 3 fault injections, and a genuine TURN-over-TLS allocation through the mux.
+See [`rehearsal/RESULTS.md`](rehearsal/RESULTS.md) for the evidence, the two findings, and the
+honest scope. Harness: [`rehearsal/`](rehearsal/). **F1 (the B3 gate fails open on
+`turns:443` being dead) should be fixed before the live cutover — it is the check that would
+tell you the cutover failed.**
+
 `cutover.sh` refuses to run unless `OFF443_PROVEN=1` — you assert you have:
 
 1. `haproxy -c -f haproxy.cfg` → exit 0 (config check, no bind). ✅ validated off-prod.
@@ -100,6 +108,20 @@ rules are proactive future-proofing (harmless now). The off-box v6 probe is ther
 **conditional but MANDATORY-if-present**: if `ip -6 addr show scope global` on the box is ever
 non-empty, the off-box `openssl -6 -connect [<v6>]:5349` closure proof becomes a **blocking**
 sign-off step — a public v6 plaintext endpoint must never exist unverified.
+
+## If the cutover dies mid-flight (recovery, not theory)
+
+- **`cutover.sh` hard-killed between 2.3 and 2.4** (Caddy has released `:443`, HAProxy hasn't
+  taken it): `:443` is UNBOUND and chat is down, and **nothing will fix it on its own** — the
+  unit is enabled but not started. Recover with `sudo systemctl start haproxy` (or reboot: the
+  persisted state is boot-correct, proven in the rehearsal). This is the one window with no
+  watchdog; it is ~100 ms wide in a normal run.
+- **A clean rollback does NOT mean a healthy system.** `rollback.sh` restores the `.stock`
+  files, i.e. *whatever was there when cutover started* — if that was already broken, you get
+  it back, broken. Rollback's hard-gate protects the security invariant (it refuses to reopen
+  the `:5349` firewall unless TLS is genuinely being presented), not service health. Read its
+  final lines: if it says it refused to reopen the firewall, TURN is down-but-closed and needs
+  a hand.
 
 ## Known windows + limitations (named, not hidden)
 

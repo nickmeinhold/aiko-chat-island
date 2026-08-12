@@ -53,6 +53,18 @@ fw_block_ports() {
   done
 }
 port_listening() { [ -n "$(ss -tlnH "sport = :$1" 2>/dev/null)" ]; }
+# REHEARSAL-ONLY checkpoint stop (task #6). The four machines must be provable at their
+# INTERMEDIATE states — "reboot at CP2" and "rollback from CP3" are the tests that catch the
+# boot-correctness and 4-artifact-restore bugs a diff-read cannot (INV-3 / INV-6). Exiting
+# here leaves the system deliberately mid-cutover, so it is DOUBLE-gated: inert unless BOTH
+# REHEARSAL=1 and CUTOVER_STOP_AFTER name the checkpoint. Exit 99 = "stopped on purpose",
+# distinct from any real failure code.
+ckpt() {
+  [ "${REHEARSAL:-0}" = "1" ] || return 0
+  [ "${CUTOVER_STOP_AFTER:-}" = "$1" ] || return 0
+  log "REHEARSAL: stopping after checkpoint '$1' — state left intentionally mid-cutover."
+  exit 99
+}
 [ "$(id -u)" -eq 0 ] || die "run as root (systemctl / docker / iptables / apt)"
 
 # ============================ PHASE 0 — preconditions (read-only) ============================
@@ -132,6 +144,7 @@ fw_block_ports || roll "could not confirm the loopback DROP on both families —
 # Persist fail-closed: a runtime-only rule is cleared by a reboot (Carnot P0). If save fails,
 # ROLL BACK — do not leave a reboot time-bomb (livekit plaintext + a volatile-only DROP).
 netfilter-persistent save >/dev/null 2>&1 || roll "netfilter-persistent save FAILED — the DROPs would not survive a reboot; unwinding"
+ckpt CP1
 
 # --- 2.2 flip LiveKit to external_tls (plaintext on 5349, now firewalled) --------------------
 # Canonical, turn:-SCOPED YAML edit (Kelvin+Carnot+Tesla — all three flagged the unbounded sed):
@@ -176,6 +189,7 @@ if timeout 6 openssl s_client -connect 127.0.0.1:5349 -servername "$TURN_DOMAIN"
   roll "5349 still presents TLS after external_tls flip — livekit did not apply external_tls"
 fi
 log "2.2 confirmed: livekit-server RUNNING + holds :5349 LISTENING + plaintext (no TLS) + firewalled"
+ckpt CP2
 
 # --- 2.3 move Caddy off public :443 → loopback:8443 -----------------------------------------
 log "2.3 installing Caddyfile.mux, enabling haproxy, reloading caddy (releases public :443)"
@@ -196,6 +210,7 @@ systemctl reload caddy || roll "caddy reload failed"
 # → a spurious rollback. Bounded (5s); this wait is PART OF the measured dark window (honest).
 for _ in $(seq 1 50); do port_listening 443 || break; sleep 0.1; done
 port_listening 443 && roll "Caddy did not release :443 within 5s of reload"
+ckpt CP3
 
 # --- 2.4 start HAProxy on :443 (closes the dark window) — back-to-back with 2.3 -------------
 log "2.4 starting haproxy on :443"
@@ -207,6 +222,7 @@ log "INV-2: :443 dark window was $((DARK_END - DARK_START)) ms"
 # Preflight the internal terminator actually bound (Carnot dead-backend): :8444 must listen.
 port_listening 8444 || roll "fe_turn_terminate did not bind :8444 (cert problem?)"
 port_listening 443  || roll ":443 not bound after haproxy start"
+ckpt CP4
 
 # ============================ PHASE 3 — on-box verify (auto-rollback on any red) ==============
 log "3 verifying (chat / livekit / turn-TLS on :443)"
