@@ -1,36 +1,37 @@
-# Caddyfile for the MUXED state (Shape C) — Caddy moved OFF public :443 to loopback:8443,
-# HAProxy owns public :443 and passes non-turn SNI here as raw TLS. cutover.sh installs this
-# as /etc/caddy/Caddyfile; rollback.sh restores /etc/caddy/Caddyfile.stock (the 3-site public
-# original). :80 is UNTOUCHED — Caddy keeps it for HTTP-01 ACME + redirects.
+# Caddyfile for the MUXED state (Shape C) — Caddy moved OFF public :443 to :8443, HAProxy owns
+# public :443 and passes non-turn SNI here as raw TLS. cutover.sh installs this as
+# /etc/caddy/Caddyfile; rollback.sh restores /etc/caddy/Caddyfile.stock (the 3-site public
+# original). :80 stays PUBLIC — Caddy keeps it for HTTP-01 ACME + redirects.
 #
-# Diff from stock: (1) global https_port 8443, (2) every site `bind 127.0.0.1` (public :443
-# is HAProxy's now; Caddy must never re-grab it), (3) the turn.enspyr.co block is KEPT
-# (loopback-only) PURELY so Caddy keeps ISSUING/RENEWING that cert (Tesla "issuance dies
-# when you unstub") — HAProxy serves it to relayers, but Caddy is still the ACME client.
-# (4) turn's acme issuer forces HTTP-01 via disable_tlsalpn_challenge: after cutover a
-# TLS-ALPN-01 challenge on :443 would hit HAProxy and fail, so make the challenge choice
-# deterministic instead of relying on Caddy's fallback (Tesla/Carnot fail-closed ACME).
+# Diff from stock: (1) global https_port 8443 — Caddy serves HTTPS on 8443 instead of 443.
+# (2) the turn.enspyr.co block is KEPT so Caddy keeps ISSUING/RENEWING that cert (Tesla
+# "issuance dies when you unstub"); HAProxy serves it to relayers but Caddy is the ACME client.
+# (3) turn's acme issuer forces HTTP-01 via disable_tlsalpn_challenge: after cutover a TLS-ALPN-01
+# challenge on :443 would hit HAProxy and fail, so make the challenge deterministic.
+#
+# DELIBERATELY NO per-site `bind 127.0.0.1` (Carnot P0): Caddy's `bind` applies to ALL of a
+# site's listeners including :80, so binding sites to loopback would make the HTTP-01 challenge
+# + redirects loopback-only → public HTTP-01 renewal FAILS → the turn cert rots. Instead we leave
+# :80 wildcard (public, the renewal spine) and move only HTTPS to :8443; cutover.sh firewalls
+# :8443 to loopback (same guard as :5349) so HAProxy is the only external path to Caddy's HTTPS —
+# not relying on the OCI security-list alone (reference_oci_double_firewall).
 
 {
     https_port 8443
 }
 
 chat.enspyr.co {
-    bind 127.0.0.1
     reverse_proxy localhost:8095
 }
 
 livekit.enspyr.co {
-    bind 127.0.0.1
     reverse_proxy 127.0.0.1:7880
 }
 
-# Kept loopback-only so Caddy keeps managing (issuing + renewing) the turn.enspyr.co cert
-# that HAProxy serves. The response body is irrelevant (HAProxy peels this SNI before it
-# ever reaches Caddy on public :443) — what matters is that a managed site exists so the
-# cert stays renewed, and that renewal is forced onto HTTP-01.
+# Kept so Caddy keeps managing (issuing + renewing) the turn.enspyr.co cert that HAProxy serves.
+# The response body is irrelevant (HAProxy peels this SNI before it reaches Caddy on public :443);
+# what matters is that a managed site exists so the cert stays renewed, forced onto HTTP-01.
 turn.enspyr.co {
-    bind 127.0.0.1
     tls {
         issuer acme {
             disable_tlsalpn_challenge

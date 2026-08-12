@@ -37,7 +37,7 @@ never owned by two processes**: stop HAProxy → Caddy back on :443 → LiveKit 
 | Port | Before | After |
 |---|---|---|
 | `:443` (public) | Caddy (all TLS) | **HAProxy** — SNI mux |
-| `127.0.0.1:8443` | — | Caddy (all sites, moved off :443) |
+| `:8443` | — | Caddy HTTPS (moved off :443); **firewalled to loopback** (only HAProxy reaches it) |
 | `127.0.0.1:8444` | — | HAProxy turn-TLS terminator (holds turn cert) |
 | `:5349` | LiveKit TURN/TLS (own cert) | LiveKit TURN **plaintext** (external_tls), **loopback-firewalled** |
 | `:80` | Caddy (HTTP-01) | Caddy (HTTP-01) — **unchanged**, the renewal path |
@@ -93,8 +93,13 @@ signaling green. **If it fails: `sudo bash deploy/media/turn-443/rollback.sh`.**
 Also prove INV-1 from **off-box** (the on-box guard is v4+v6 host-INPUT, valid only because
 LiveKit is host-networked — cutover asserts that): from your laptop,
 `openssl s_client -connect <enspyr-public-ip>:5349` must **fail/refuse** (public plaintext :5349
-is closed). A localhost probe can't prove external closure; this can. Repeat over IPv6 if the box
-ever gains a public v6 address.
+is closed). A localhost probe can't prove external closure; this can.
+
+**IPv6 (pick-a-universe, Kelvin):** the box has NO public IPv6 today, so cutover's `ip6tables`
+rules are proactive future-proofing (harmless now). The off-box v6 probe is therefore
+**conditional but MANDATORY-if-present**: if `ip -6 addr show scope global` on the box is ever
+non-empty, the off-box `openssl -6 -connect [<v6>]:5349` closure proof becomes a **blocking**
+sign-off step — a public v6 plaintext endpoint must never exist unverified.
 
 ## Gate
 

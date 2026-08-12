@@ -21,7 +21,7 @@ CADDY_STOCK="${CADDY_STOCK:-/etc/caddy/Caddyfile.stock}"
 LIVEKIT_DIR="${LIVEKIT_DIR:-/home/ubuntu/apps/livekit}"
 LIVEKIT_YAML="${LIVEKIT_YAML:-${LIVEKIT_DIR}/livekit.yaml}"
 LIVEKIT_STOCK="${LIVEKIT_STOCK:-${LIVEKIT_YAML}.stock}"
-FW_RULE=(! -i lo -p tcp --dport 5349 -j DROP)   # the plaintext-5349 guard rule
+FW_PORTS=(5349 8443)   # the loopback-only guard ports cutover added (v4+v6): plaintext TURN + Caddy HTTPS
 
 log()  { echo "[rollback] $*"; }
 die()  { echo "[rollback] FATAL: $*" >&2; exit 1; }
@@ -44,7 +44,18 @@ fi
 systemctl disable --now haproxy-cert-sync.timer 2>/dev/null || true
 
 # --- 2. Restore Caddy to public :443 --------------------------------------------------------
-[ -s "$CADDY_STOCK" ] || die "no $CADDY_STOCK to restore — cannot put Caddy back on :443 by hand-guessing; ABORT"
+# Idempotency (Tesla P1): a SUCCESSFUL rollback rm's the .stock files, so a 2nd standalone run
+# finds no CADDY_STOCK. That is NOT an error IF the box is already stock — detect it (haproxy
+# gone + Caddy active + something on :443) and no-op success, rather than die. Only die if the
+# stock is missing AND we're in a genuinely-broken half-state.
+if [ ! -s "$CADDY_STOCK" ]; then
+  if ! systemctl is-active --quiet haproxy && ! systemctl is-enabled --quiet haproxy 2>/dev/null \
+     && systemctl is-active --quiet caddy && [ -n "$(ss -tlnH 'sport = :443' 2>/dev/null)" ]; then
+    log "no $CADDY_STOCK and box is already in stock state (haproxy gone, Caddy on :443) — nothing to roll back; exiting clean."
+    exit 0
+  fi
+  die "no $CADDY_STOCK to restore and the box is NOT in a clean stock state — half-muxed without a backup; fix Caddy's :443 config by hand. ABORT."
+fi
 if ! cmp -s "$CADDY_STOCK" "$CADDYFILE"; then
   log "restoring stock Caddyfile"
   cp "$CADDY_STOCK" "$CADDYFILE"
@@ -75,19 +86,28 @@ if ! timeout 8 openssl s_client -connect 127.0.0.1:5349 -servername turn.enspyr.
 fi
 log "confirmed: 5349 presents TLS — safe to reopen firewall"
 
-# --- 4. Reopen public :5349 (LAST — TLS is confirmed back) — BOTH families -------------------
-# cutover added the DROP on iptables AND ip6tables; remove both so rollback is symmetric.
+# --- 4. Reopen public :5349 + :8443 (LAST — TLS is confirmed back) — BOTH families -----------
+# cutover added the DROP on iptables AND ip6tables for every guard port; remove them all so
+# rollback is symmetric. (:5349 reopens now-TLS TURN; :8443 was Caddy's loopback-only HTTPS.)
 removed_any=0
 for fam in iptables ip6tables; do
   command -v "$fam" >/dev/null 2>&1 || continue
-  if "$fam" -C INPUT "${FW_RULE[@]}" 2>/dev/null; then
-    log "removing the plaintext-5349 DROP rule ($fam)"
-    "$fam" -D INPUT "${FW_RULE[@]}" || die "failed to remove $fam DROP — 5349 still localhost-only (SAFE, but not fully rolled back); fix by hand"
-    removed_any=1
-  fi
+  for port in "${FW_PORTS[@]}"; do
+    if "$fam" -C INPUT ! -i lo -p tcp --dport "$port" -j DROP 2>/dev/null; then
+      log "removing the loopback DROP for :$port ($fam)"
+      "$fam" -D INPUT ! -i lo -p tcp --dport "$port" -j DROP || die "failed to remove $fam DROP for :$port — still localhost-only (SAFE, but not fully rolled back); fix by hand"
+      removed_any=1
+    fi
+  done
 done
-[ "$removed_any" = 1 ] && { command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1 || true; }
-[ "$removed_any" = 0 ] && log "no plaintext-5349 DROP rule present on either family (already open or never added)"
+if [ "$removed_any" = 1 ]; then
+  if command -v netfilter-persistent >/dev/null 2>&1; then
+    netfilter-persistent save >/dev/null 2>&1 \
+      || log "WARN: netfilter-persistent save failed — the DROP is removed at runtime but a reboot may RESTORE the persisted DROP (5349 would stay closed; SAFE direction, but rollback is incomplete). Re-run 'netfilter-persistent save' by hand."
+  fi
+else
+  log "no plaintext-5349 DROP rule present on either family (already open or never added)"
+fi
 
 # Consume the .stock backups — they've served their purpose. Leaving them would make the
 # NEXT cutover.sh abort on its "a prior cutover is in progress" guard forever.

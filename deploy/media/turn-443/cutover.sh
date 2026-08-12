@@ -26,24 +26,30 @@ LIVEKIT_STOCK="${LIVEKIT_STOCK:-${LIVEKIT_YAML}.stock}"
 HAPROXY_CFG="${HAPROXY_CFG:-${HERE}/haproxy.cfg}"
 CERT_SYNC="${CERT_SYNC:-${HERE}/haproxy-cert-sync.sh}"
 TURN_DOMAIN="${TURN_DOMAIN:-turn.enspyr.co}"
-# The plaintext-5349 guard, applied to BOTH families (Carnot/Tesla P0: an iptables-only
-# rule does nothing for IPv6). ! -i lo = block every non-loopback ingress to tcp/5349.
-FW_RULE=(! -i lo -p tcp --dport 5349 -j DROP)
+# Loopback-only guard ports, applied to BOTH families (Carnot/Tesla: an iptables-only rule does
+# nothing for IPv6). 5349 = LiveKit plaintext TURN (external_tls); 8443 = Caddy HTTPS after it
+# moves off :443 (only HAProxy on 127.0.0.1 should reach it — Carnot P0, and not relying on the
+# OCI security-list alone). ! -i lo = block every non-loopback ingress to that tcp port.
+FW_PORTS=(5349 8443)
 
 log()  { echo "[cutover] $*"; }
 die()  { echo "[cutover] ABORT (no mutation past this point): $*" >&2; exit 1; }
 roll() { echo "[cutover] !!! VERIFY FAILED: $* — AUTO-ROLLBACK !!!" >&2; bash "${HERE}/rollback.sh"; exit 1; }
 # docker compose v2 (plugin) or v1 (standalone) — don't silently fail on a v1 box.
 dc()   { if docker compose version >/dev/null 2>&1; then docker compose "$@"; else docker-compose "$@"; fi; }
-# Apply the DROP on BOTH iptables (v4) and ip6tables (v6), idempotently, and VERIFY each rule
-# is actually present afterward (fail-closed: a silent add-failure must not let the plaintext
-# flip proceed). Returns non-zero if either family can't be confirmed.
-fw_block_5349() {
-  local fam ipt
+# Apply the DROP for every guard port on BOTH iptables (v4) and ip6tables (v6), idempotently,
+# and VERIFY each rule is present afterward (fail-closed: a silent add-failure must not let the
+# cutover proceed). Returns non-zero if any (family × port) can't be confirmed.
+fw_block_ports() {
+  local fam port
   for fam in iptables ip6tables; do
-    command -v "$fam" >/dev/null 2>&1 || { echo "[cutover] $fam missing — cannot guard 5349 on that family"; return 1; }
-    "$fam" -C INPUT "${FW_RULE[@]}" 2>/dev/null || "$fam" -I INPUT 1 "${FW_RULE[@]}" || return 1
-    "$fam" -C INPUT "${FW_RULE[@]}" 2>/dev/null || { echo "[cutover] $fam DROP rule not present after add"; return 1; }
+    command -v "$fam" >/dev/null 2>&1 || { echo "[cutover] $fam missing — cannot guard the loopback-only ports on that family"; return 1; }
+    for port in "${FW_PORTS[@]}"; do
+      "$fam" -C INPUT ! -i lo -p tcp --dport "$port" -j DROP 2>/dev/null \
+        || "$fam" -I INPUT 1 ! -i lo -p tcp --dport "$port" -j DROP || return 1
+      "$fam" -C INPUT ! -i lo -p tcp --dport "$port" -j DROP 2>/dev/null \
+        || { echo "[cutover] $fam DROP for :$port not present after add"; return 1; }
+    done
   done
 }
 port_listening() { [ -n "$(ss -tlnH "sport = :$1" 2>/dev/null)" ]; }
@@ -75,7 +81,11 @@ command -v netfilter-persistent >/dev/null 2>&1 || die "netfilter-persistent abs
 
 command -v haproxy >/dev/null 2>&1 || { log "installing haproxy"; apt-get install -y haproxy >/dev/null || die "haproxy install failed"; }
 id haproxy >/dev/null 2>&1 || die "haproxy user missing after install"
-systemctl stop haproxy 2>/dev/null || true    # must NOT be bound to :443 yet (Caddy owns it)
+# DISABLE, not just stop (Tesla P0): apt's postinst ENABLES+starts haproxy. With the mux config
+# about to be installed to /etc/haproxy/haproxy.cfg while Caddy still owns public :443, an
+# enabled haproxy would START on any reboot in the Phase-0→2.4 window and double-bind :443. Keep
+# it disabled until 2.4 flips it on intentionally, so no reboot mid-cutover can race the acceptor.
+systemctl disable --now haproxy 2>/dev/null || true
 
 # Build + validate the turn PEM from Caddy's store (cert-sync is the sole writer). haproxy
 # not active yet → it just stages the PEM.
@@ -102,39 +112,57 @@ FW_SNAP="$(mktemp /tmp/cutover-iptables.XXXXXX)"; iptables-save > "$FW_SNAP" 2>/
 log "firewall snapshot at $FW_SNAP"
 
 # ============================ PHASE 2 — the sequenced cutover =================================
-# --- 2.1 INV-1: firewall :5349 (both families, verified) BEFORE any plaintext exists ---------
-log "2.1 firewalling public :5349 (v4+v6, loopback-only) BEFORE the plaintext flip"
-fw_block_5349 || die "could not confirm the :5349 DROP on both families — refusing to flip LiveKit to plaintext with 5349 possibly reachable"
+# --- 2.1 INV-1: firewall :5349 + :8443 (both families, verified) BEFORE any plaintext exists --
+# Once this mutates iptables, a bare `die` would STRAND a partial DROP on production's currently-
+# working public :5349 TLS (Carnot P0). So every failure from here uses roll() — rollback.sh
+# removes the DROPs (both ports, both families) and restores the untouched .stock state.
+log "2.1 firewalling public :5349 + :8443 (v4+v6, loopback-only) BEFORE the plaintext flip"
+fw_block_ports || roll "could not confirm the loopback DROP on both families — unwinding (rollback removes any partial rule)"
 # Persist fail-closed: a runtime-only rule is cleared by a reboot (Carnot P0). If save fails,
 # ROLL BACK — do not leave a reboot time-bomb (livekit plaintext + a volatile-only DROP).
-netfilter-persistent save >/dev/null 2>&1 || die "netfilter-persistent save FAILED — the :5349 DROP would not survive a reboot; refusing to proceed (nothing plaintext yet)"
+netfilter-persistent save >/dev/null 2>&1 || roll "netfilter-persistent save FAILED — the DROPs would not survive a reboot; unwinding"
 
 # --- 2.2 flip LiveKit to external_tls (plaintext on 5349, now firewalled) --------------------
-# Canonical YAML edit (Kelvin+Carnot P1): delete ANY existing external_tls / cert_file / key_file
-# under the 2-space turn block FIRST, then insert one canonical `external_tls: true` — so a
-# pre-existing `external_tls: false` (YAML last-key-wins → would stay false) or a re-run can't
-# leave a conflicting/duplicate key. (yq deliberately NOT used: mikefarah vs python-yq flavors
-# differ and a wrong-flavor call would spuriously roll back.) Robustness does NOT rest on the
-# edit alone — the 3-way liveness+plaintext gate below PROVES the intended state, replacing the
-# old grep-only "confirmation-bias" check (Kelvin).
-log "2.2 flipping livekit.yaml → external_tls:true (drop cert_file/key_file), restart"
-sed -i -e '/^  cert_file:/d' -e '/^  key_file:/d' -e '/^  external_tls:/d' \
-       -e '/^  tls_port:/a\  external_tls: true' "$LIVEKIT_YAML"
+# Canonical, turn:-SCOPED YAML edit (Kelvin+Carnot+Tesla — all three flagged the unbounded sed):
+# an awk pass bounded to the top-level `turn:` mapping deletes any cert_file/key_file/external_tls
+# there and inserts one `external_tls: true` after tls_port — so it cannot collaterally delete a
+# same-named 2-space key in ANOTHER section, and a pre-existing `external_tls: false` (YAML
+# last-key-wins) can't survive. (yq deliberately NOT used: mikefarah vs python-yq flavors differ
+# and a wrong-flavor call would spuriously roll back; pyyaml reorders + strips comments. The file
+# is machine-managed and the liveness gate below is the real backstop.)
+log "2.2 flipping livekit.yaml → external_tls:true (drop cert_file/key_file, turn-scoped), restart"
+awk '
+  /^[^[:space:]]/ { in_turn = ($0 ~ /^turn:/) }
+  in_turn && /^[[:space:]]+(cert_file|key_file|external_tls):/ { next }
+  { print }
+  in_turn && /^[[:space:]]+tls_port:/ { print "  external_tls: true" }
+' "$LIVEKIT_YAML" > "${LIVEKIT_YAML}.new" && mv "${LIVEKIT_YAML}.new" "$LIVEKIT_YAML" \
+  || roll "awk edit of livekit.yaml failed"
 grep -q '^  external_tls: true' "$LIVEKIT_YAML" || roll "livekit.yaml external_tls edit did not take"
 dc -f "${LIVEKIT_DIR}/docker-compose.yml" restart livekit || roll "livekit restart failed"
 # LIVENESS BEFORE PLAINTEXT (Tesla P0 — the false-green fix): a broken config bootloops LiveKit,
 # and a DEAD socket also fails a TLS handshake — so "no cert seen" is NOT proof of plaintext.
-# Require, in order: (a) the container is actually RUNNING, (b) 5349 accepts a plain TCP
-# connect (it's LISTENING), (c) a TLS handshake FAILS (it's plaintext, not TLS). All three.
-sleep 4
+# Require, in order: (a) container RUNNING, (b) 5349 LISTENING, (c) livekit holds it, (d) TLS
+# fails. BOUNDED POLL, not a fixed `sleep 4` (Kelvin): wait up to 30s for (a)+(b) rather than
+# guessing the restart duration; then assert the rest.
+for _ in $(seq 1 30); do
+  [ "$(docker inspect livekit --format '{{.State.Running}}' 2>/dev/null)" = "true" ] \
+    && timeout 2 bash -c "exec 3<>/dev/tcp/127.0.0.1/5349" 2>/dev/null && break
+  sleep 1
+done
 [ "$(docker inspect livekit --format '{{.State.Running}}' 2>/dev/null)" = "true" ] \
-  || roll "livekit container is not Running after the external_tls edit (bootloop? bad config)"
+  || roll "livekit container is not Running 30s after the external_tls edit (bootloop? bad config)"
 timeout 6 bash -c "exec 3<>/dev/tcp/127.0.0.1/5349" 2>/dev/null \
-  || roll "nothing is LISTENING on 127.0.0.1:5349 after restart — livekit did not bind (a TLS-fail here would be a FALSE green)"
+  || roll "nothing is LISTENING on 127.0.0.1:5349 30s after restart — livekit did not bind (a TLS-fail here would be a FALSE green)"
+# Assert LIVEKIT itself holds :5349 — not just "something plaintext" (Tesla P2: a stray listener
+# would also pass Running+LISTENING+TLS-fail). The positive "it's really TURN" proof is the
+# off-box b3 probe (RUNBOOK acceptance); this bounds the on-box residue cheaply.
+ss -tlnpH 'sport = :5349' 2>/dev/null | grep -q 'livekit-server' \
+  || roll "the process listening on :5349 is not livekit-server — refusing (external_tls state unproven)"
 if timeout 6 openssl s_client -connect 127.0.0.1:5349 -servername "$TURN_DOMAIN" </dev/null 2>/dev/null | grep -q "BEGIN CERTIFICATE"; then
   roll "5349 still presents TLS after external_tls flip — livekit did not apply external_tls"
 fi
-log "2.2 confirmed: livekit RUNNING + 5349 LISTENING + plaintext (no TLS) + firewalled"
+log "2.2 confirmed: livekit-server RUNNING + holds :5349 LISTENING + plaintext (no TLS) + firewalled"
 
 # --- 2.3 move Caddy off public :443 → loopback:8443 -----------------------------------------
 log "2.3 installing Caddyfile.mux, reloading caddy (releases public :443)"
@@ -151,9 +179,11 @@ port_listening 443 && roll "Caddy did not release :443 within 5s of reload"
 
 # --- 2.4 start HAProxy on :443 (closes the dark window) — back-to-back with 2.3 -------------
 log "2.4 starting haproxy on :443"
-# Enable so :443 stays HAProxy's across a reboot (intentional — rollback.sh disables it, so the
-# stock state has haproxy masked and Caddy owning :443; Carnot P1 double-bind).
-systemctl enable haproxy >/dev/null 2>&1 || log "WARN: could not enable haproxy unit (will not survive reboot)"
+# Enable so :443 stays HAProxy's across a reboot — HARD-ROLL on failure (Tesla P0), not WARN: a
+# started-but-not-enabled haproxy + the mux Caddyfile means a reboot leaves :443 UNBOUND (chat +
+# signaling + TURNS dark). Same fail-closed class as the cert timer. rollback.sh disables it, so
+# stock state = Caddy owns :443, haproxy disabled.
+systemctl enable haproxy >/dev/null 2>&1 || roll "could not enable haproxy unit — a reboot would leave :443 unbound; refusing to stand up a non-persistent mux"
 systemctl start haproxy || roll "haproxy failed to start"
 DARK_END=$(date +%s%3N)
 log "INV-2: :443 dark window was $((DARK_END - DARK_START)) ms"
