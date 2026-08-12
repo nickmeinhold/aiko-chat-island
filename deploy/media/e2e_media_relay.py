@@ -139,6 +139,10 @@ def gate_B3(host: str) -> None:
     # resolve to the box whose firewall we're about to open (cage-match #129: "probe the
     # wrong coil, open the right port"). `host` is TURN_DOMAIN; the probe also folds in
     # NODE_IP if the box sets it.
+    # Deliberately NOT setting B3_REQUIRE_ENDPOINT here: on both islands turns:443 is dead
+    # until the TURN-on-443 cutover lands (task #4), so pinning it in the standup gate would
+    # block every standup on a known-open gap. It rides through **os.environ, so the cutover's
+    # acceptance step opts in (B3_REQUIRE_ENDPOINT=tls:<domain>:443) without a code change here.
     env = {**os.environ, "LK_URL": url, "LK_API_KEY": key, "LK_API_SECRET": secret,
            "B3_EXPECT_HOST": host}
     try:

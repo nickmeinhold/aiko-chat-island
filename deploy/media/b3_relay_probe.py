@@ -54,7 +54,9 @@ Env: LK_URL (wss signaling), LK_API_KEY, LK_API_SECRET, LK_ROOM (optional),
      B3_EXTRA_PRIVATE_PEERS (optional, comma list — ADDS sentinels, cannot remove),
      B3_PUBLIC_CONTROL (optional; default 1.1.1.1; must be a global IP),
      NODE_IP + B3_EXPECT_HOST (optional; advertised TURN host must resolve into their
-     IP set — gate_B3 passes B3_EXPECT_HOST=TURN_DOMAIN so the exposure path always pins).
+     IP set — gate_B3 passes B3_EXPECT_HOST=TURN_DOMAIN so the exposure path always pins),
+     B3_REQUIRE_ENDPOINT (optional, comma list of '<transport>[:<host>][:<port>]' with '*'
+     wildcards; each MUST be live+passing or the run BLOCKs — the LIVENESS assertion, see below).
 Deps: websockets, livekit-api (livekit.protocol.rtc), aioice. No turnutils/coturn (the
       PROBE has no coturn dep; gate B1 in e2e_media_relay.py still uses turnutils_uclient).
 """
@@ -115,6 +117,37 @@ PUBLIC_CONTROL = os.environ.get("B3_PUBLIC_CONTROL", "1.1.1.1").strip()
 # probe WARNs; standup always passes B3_EXPECT_HOST, so the exposure path always pins.
 NODE_IP = os.environ.get("NODE_IP", "").strip()
 EXPECT_HOST = os.environ.get("B3_EXPECT_HOST", "").strip()
+# LIVENESS assertion (task #6 finding F1). This probe answers a SECURITY question — "does the
+# running relay refuse RFC1918" — and for that, an advertised-but-unallocatable endpoint is
+# correctly non-blocking: you cannot relay through a relay you cannot allocate on. But the
+# turn-443 RUNBOOK also designates this probe as the post-cutover ACCEPTANCE GATE, worded
+# "turns:443 must flip UNREACHABLE -> ALLOCATED" — and nothing here ASSERTED that. The task #6
+# rehearsal caught it empirically: a run with tls:turn.<domain>:443 UNREACHABLE still returned
+# result:OK / exit 0 on the strength of the UDP endpoint alone. So a cutover that left TURN-over-
+# TLS dead — the exact failure the cutover exists to fix — would be green-lit by its own gate.
+# Sound as a security assertion, fail-OPEN as a liveness one; this closes the liveness half
+# WITHOUT touching the security semantics. Opt-in, mirroring the NODE_IP/B3_EXPECT_HOST
+# warn-vs-pin pattern, so an off-box manual run still works unpinned.
+REQUIRE_ENDPOINTS = [s.strip() for s in os.environ.get("B3_REQUIRE_ENDPOINT", "").split(",") if s.strip()]
+
+
+def _spec_matches(spec, ep):
+    """'<transport>[:<host>][:<port>]', '*' wildcards a field. Matched against the endpoint's
+    PARSED fields, not its label string, so an IPv6 host (which contains colons) can't be
+    mis-split. 'tls:443' (no host) is accepted as transport+port."""
+    transport, _, rest = spec.partition(":")
+    if transport not in ("", "*") and transport.lower() != str(ep["transport"]).lower():
+        return False
+    if not rest:
+        return True
+    host, sep, port = rest.rpartition(":")
+    if not sep:                      # no second colon -> the remainder is a bare port
+        host, port = "", rest
+    if host not in ("", "*") and host.lower() != str(ep["host"]).lower():
+        return False
+    if port not in ("", "*") and str(port) != str(ep["port"]):
+        return False
+    return True
 
 
 def _resolve_ips(name: str) -> set:
@@ -327,7 +360,7 @@ async def main() -> int:
     # turns: relay) is NOT an SSRF vector (you can't relay through a relay you can't allocate
     # on) → surfaced, non-blocking. At least one endpoint must be LIVE and pass, else there
     # is no reachable relay to certify → BLOCK (cage-match #129 r3).
-    tested, unreachable = [], []
+    tested, unreachable, tested_eps = [], [], []
     for ep in endpoints:
         label = f"{ep['transport']}:{ep['host']}:{ep['port']}"
         print(f"  endpoint {label} user={ep['user'][:8]}… "
@@ -380,8 +413,24 @@ async def main() -> int:
             # r2, Tesla). Non-blocking (task #6 owns the severity call).
             cgnat = await check_perm(proto, CGNAT_INFO_SENTINEL)
             tested.append({"endpoint": label, "peers": results, "cgnat_100_64_0_1": cgnat["verdict"]})
+            tested_eps.append(ep)
         finally:
             await teardown(inner, proto)
+
+    # The required endpoints must be LIVE AND PASSING — checked against `tested`, so an endpoint
+    # that landed in `unreachable` (or was never advertised at all) fails this. Runs BEFORE the
+    # no-tested BLOCK is irrelevant: both are fail-closed, but this one names WHICH endpoint the
+    # caller was relying on, which is the whole point of a gate.
+    if REQUIRE_ENDPOINTS:
+        missing = [spec for spec in REQUIRE_ENDPOINTS
+                   if not any(_spec_matches(spec, ep) for ep in tested_eps)]
+        if missing:
+            return _block(
+                f"required relay endpoint(s) {missing} were not proven live: they are absent from "
+                f"the tested set {[t['endpoint'] for t in tested]}"
+                + (f" (unreachable: {[u['endpoint'] for u in unreachable]})" if unreachable else "")
+                + " — the caller pinned these as the endpoints that MUST work (B3_REQUIRE_ENDPOINT), "
+                  "so a pass here would certify a relay path that does not exist")
 
     if not tested:
         return _block(f"no advertised relay endpoint was reachable to certify (all unreachable: "
