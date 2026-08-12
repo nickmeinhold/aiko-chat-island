@@ -42,21 +42,50 @@ everywhere, not a nick.
 | `update.sh` | pull the pinned image, backup-first, `up -d`, verify |
 | `served-cert-alarm.sh` | probes the **:5349 TLS endpoint** (not the disk file) for `notAfter < N days` → alert |
 | `cert-restart.sh` + `.service`/`.timer` | BOOTSTRAP restart trigger (alarm-driven) |
-| `e2e_media_relay.py` | acceptance gate A (relay over TCP/TLS + UDP canary) |
+| `e2e_media_relay.py` | acceptance gates A (connectivity) + B (exposure) |
+| `e2e_relay_livekit.py` | gate A's engine: a livekit-rtc forced relay-only media client |
 | `test/cert-tree-contract.sh` | contract test: fixture cert trees (host-FS vs docker-volume) |
 
 ## Acceptance gates (both required — see DESIGN §3.4, §4a)
 
-- **A — connectivity:** forced-relay (`iceTransportPolicy: relay`) selects a
-  candidate with `type == relay` **AND** `protocol == TCP/TLS`; plus a UDP-relay
-  canary. `e2e_media_relay.py`.
-- **B — exposure (before opening the range to real traffic):** unauth `ALLOCATE`
-  *positively* rejected (auth-reject marker, not just a non-zero exit) · short-TTL
-  LiveKit-issued creds · no relay to RFC1918/link-local · ports outside
-  `50000–60000` sampled (advisory — can fail the gate, cannot certify closure;
-  external multi-port audit still required).
+- **A — connectivity:** a real **livekit-rtc** client (`e2e_relay_livekit.py`) forces
+  relay-only ICE and confirms synthetic video round-trips — asserting
+  `RESULT=RELAY_MEDIA_OK` **and** `all_relay=true` (every gathered candidate was a TURN
+  allocation, so media had no path but the relay). This replaces the old
+  `turnutils_uclient` gate: LiveKit's embedded TURN is **session-bound**, so there is no
+  standalone TURN credential to hand turnutils — the client mints its cred by joining a
+  room. Proves the **UDP/3478** relay path.
+  - **KNOWN GAP — TLS/5349 relay is NOT asserted** (proven non-functional 2026-08-11):
+    LiveKit advertises only the UDP TURN to clients (`turn.externalTLS:false`); with UDP
+    blocked, a forced-relay client's peer connection times out. The `:5349` cert is
+    valid — the relay *advertisement* is the gap. Tracked as the `external_tls` task; do
+    not re-add a TLS assertion here until that proves TLS relay works.
+- **B — exposure (before opening the range to real traffic):**
+  - **B1** unauth `ALLOCATE` *positively* rejected (auth-reject marker, not just a
+    non-zero exit) — `turnutils_uclient`, no cred needed for the negative test.
+  - **B2** ports outside `50000–60000` sampled closed (advisory — can fail the gate,
+    cannot certify closure; external multi-port audit still required).
+  - **B3** no relay to RFC1918/link-local — a **behavioral, packet-level probe**
+    (`b3_relay_probe.py`), not a version/config proxy. It extracts the SFU's
+    session-bound TURN credential from the raw signaling `JoinResponse` (which
+    `livekit-rtc` never surfaces — the wire does), allocates a relay, then issues
+    `CreatePermission` for a **public control** + the **SSRF-critical private ranges**
+    (`10/8`, `172.16/12`, `192.168/16`, `169.254/16`, `127/8` — one **sentinel** per
+    range, a mandatory hard-coded set that env can only add to, never shrink),
+    requiring the control **allowed (200) before and after** and every sentinel
+    **refused (403)**. Sampled sentinels, not an exhaustive range proof. **Every
+    advertised relay endpoint (each transport — udp/tcp/tls) is tested on one
+    allocation**; a live one must pass, an **unreachable** one (can't allocate → not a
+    relay vector) is surfaced non-blocking, and ≥1 live endpoint must pass. Known-open
+    bands (`100.64/10` CGNAT) and unreachable endpoints are named in the `B3_ASSERT`
+    verdict, not hidden. Fail-closed exit code
+    (0 OK / 3 FAIL / 2 BLOCK) **and** a single structured `B3_ASSERT` verdict line.
+    Supersedes the prior version-proxy — and is more truthful: it found LiveKit's
+    default deny does **not** cover `100.64/10` (CGNAT), tracked separately (task #6).
+    Runs in the exposure phase: needs `:443` (join) + `:3478` (TURN control), not the
+    relay range.
 
-`e2e_media_relay.py` **fails CLOSED**: the cred-mint (`LIVEKIT_TURN_CRED_CMD`) and
-private-IP-denial (`TURN_B3_PRIVATE_DENY_CMD`) checks are DESIGN §7 build-time
-wire-ups — **until they're set, the gate BLOCKS (exit non-zero) and `standup.sh`
-will NOT open the firewall**. A not-yet-wired check never waves through.
+`e2e_media_relay.py` **fails CLOSED**: any check that cannot produce positive evidence
+exits non-zero and `standup.sh` will NOT open the firewall. Needs the box venv as
+`python3`: `livekit` + `livekit-api` + `numpy` (gate A) + `websockets` + `aioice`
+(gate B3).

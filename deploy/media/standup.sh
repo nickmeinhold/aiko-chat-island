@@ -11,7 +11,7 @@ cd "$(dirname "$0")"; . lib/cert-pair.sh
 [ -f .env ] || { echo "no .env — copy .env.example and fill it." >&2; exit 1; }
 set -a && . ./.env && set +a
 : "${TURN_DOMAIN:?}" "${NODE_IP:?}" "${LIVEKIT_API_KEY:?}" "${LIVEKIT_API_SECRET:?}" "${CADDY_CERT_LEAF_DIR:?}"
-: "${TURN_RELAY_START:?}" "${TURN_RELAY_END:?}"
+: "${LIVEKIT_URL:?}" "${TURN_RELAY_START:?}" "${TURN_RELAY_END:?}"
 
 case "$TURN_DOMAIN" in
   turn.imagineering.cc) echo "REFUSING: imagineering is shared infra — use docs/runbooks/imagineering-livekit-repair.md." >&2; exit 1 ;;
@@ -43,6 +43,8 @@ echo "== 2. validate range + render config (turn enabled) with restrictive perms
 ( umask 077; envsubst '${TURN_DOMAIN} ${NODE_IP} ${LIVEKIT_API_KEY} ${LIVEKIT_API_SECRET} ${TURN_RELAY_START} ${TURN_RELAY_END}' \
     < livekit.yaml.tmpl > livekit.yaml )
 chmod 600 livekit.yaml   # explicit: umask only guards CREATE; a re-run over an existing 0644 must not leave secrets world-readable
+# (B3 is now a behavioral CreatePermission probe against the RUNNING TURN — it needs
+# no rendered-yaml or image env; the old LIVEKIT_YAML/LIVEKIT_IMAGE exports are gone.)
 
 echo "== 3. assert ranges: rendered relay == .env, and DISJOINT from SFU ICE =="
 ice_s=$(awk '/port_range_start:/{print $2; exit}' livekit.yaml); ice_e=$(awk '/port_range_end:/{print $2; exit}' livekit.yaml)
@@ -68,8 +70,10 @@ echo "== 6. exposure-acceptance (B) — range still CLOSED to real traffic =="
 # Probe TURN_DOMAIN (not 127.0.0.1) so SNI matches the leaf; the box reaches its
 # own host-network listener, and INPUT is still shut to the world (round-2 Tesla:
 # a localhost probe risks TLS/name noise that never yields a clean auth-reject).
+# NOTE: gate B3 now runs here too (behavioral probe) — needs the box venv
+# (websockets + aioice + livekit-api) on PATH as python3, plus signaling :443.
 python3 e2e_media_relay.py --exposure-only --host "$TURN_DOMAIN" || {
-  echo "exposure gate B FAILED/BLOCKED — NOT opening the firewall (fail-closed). Wire the DESIGN §7 checks (cred mint, B3) first." >&2; exit 1; }
+  echo "exposure gate B FAILED/BLOCKED — NOT opening the firewall (fail-closed). Check B1 (unauth ALLOCATE reject), B2 (out-of-range ports), B3 (behavioral relay-to-private-IP refusal; needs signaling :443 + TURN :3478 + venv aioice/websockets)." >&2; exit 1; }
 
 echo "== 7. open firewall (double layer): UDP 3478, TCP 5349, UDP ${TURN_RELAY_START}-${TURN_RELAY_END} =="
 echo "   OCI security-list opens need the cloud API/console (operator hands). Host iptables:"
@@ -80,7 +84,9 @@ cat <<FW
 FW
 read -r -p "Confirm BOTH firewall layers open for the ranges above, then press enter for gate A… "
 
-echo "== 8. connectivity-acceptance (A): forced relay over TCP/TLS + UDP canary =="
+echo "== 8. connectivity-acceptance (A): forced relay-only media round-trip (livekit-rtc) =="
+echo "   proves the UDP relay path; TLS/5349 relay is a KNOWN GAP (not advertised to clients)."
+echo "   NOTE: needs the box venv (livekit + livekit-api + numpy + websockets + aioice) on PATH as python3."
 python3 e2e_media_relay.py --host "$TURN_DOMAIN"
 
 echo "== BOOTSTRAP complete. Enable the renewal timer: =="
