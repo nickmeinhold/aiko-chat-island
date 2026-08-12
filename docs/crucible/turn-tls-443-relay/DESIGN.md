@@ -5,6 +5,31 @@ Companion: [`CRUCIBLE.md`](CRUCIBLE.md) (the case + falsifier), [`RESEARCH.md`](
 
 ---
 
+## 🔧 RE-CAST v3 (2026-08-12, post-falsifiers) — LiveKit-blessed `external_tls`
+
+Phase-0 falsifiers resolved: **B1 TRUE** (LiveKit has `turn.bind_addresses`) but Shape B
+(second public IP) was **vetoed on cost** (billable reserved IP). **C2 FALSE** (no cert
+hot-reload). So the shape is **C — a mature L4 SNI proxy on :443** — and reading LiveKit's
+own `config-sample.yaml` gave the key refinement: **`external_tls: true`**. LiveKit's
+documented recommendation for a shared :443 is *"place a L4 load balancer in front ... set
+external_tls to true"* — the proxy terminates TLS, LiveKit takes PLAINTEXT on tls_port.
+
+**This dissolves the temper's worst finding (F3/C2 cert-reload media bounce):** LiveKit no
+longer holds the cert, so there is no stale-cert-after-renewal restart. The terminating
+proxy (HAProxy) owns the cert and hot-reloads it gracefully (no dropped connections).
+
+**Chosen: HAProxy** (mature, temper-aligned over experimental caddy-l4) on :443, SNI-routing:
+`turn.enspyr.co` → terminate TLS → plaintext to LiveKit :5349; else → raw passthrough to
+Caddy (moved to 127.0.0.1:8443). **Built + config-validated (`haproxy -c` exit 0) 2026-08-12,
+off-prod.** Artifacts + full cutover/rollback runbook: **`deploy/media/turn-443/`**
+([`haproxy.cfg`](../../../deploy/media/turn-443/haproxy.cfg),
+[`RUNBOOK.md`](../../../deploy/media/turn-443/RUNBOOK.md)). Still-live temper findings folded
+into the runbook: cert-issuance-survives-unstubbing (Tesla), fail-closed HTTP-01, behavioral
+negative tests, single 3-artifact-rollback cutover script. NEXT: prove the full chain
+off-:443 on enspyr, code-cage-match the config, then the guarded cutover.
+
+---
+
 ## ⚔️ TEMPER VERDICT (PR #130, 2026-08-12) → RE-CAST v2
 
 **4-way design cage-match (Maxwell + Kelvin + Carnot + Tesla; Wu dark on a Kimi 402).
