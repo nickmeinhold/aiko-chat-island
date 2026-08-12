@@ -28,13 +28,20 @@ die()  { echo "[rollback] FATAL: $*" >&2; exit 1; }
 dc()   { if docker compose version >/dev/null 2>&1; then docker compose "$@"; else docker-compose "$@"; fi; }
 [ "$(id -u)" -eq 0 ] || die "run as root (systemctl / docker / iptables)"
 
-# --- 1. Stop HAProxy, free public :443 ------------------------------------------------------
-if systemctl is-active --quiet haproxy; then
-  log "stopping haproxy (frees :443)"
-  systemctl stop haproxy || die "could not stop haproxy — :443 still muxed, ABORT (fix by hand)"
+# --- 1. Stop AND DISABLE HAProxy, free public :443 ------------------------------------------
+# DISABLE (not just stop): an enabled haproxy would restart on the next reboot and reclaim :443
+# while Caddy is also restored to public :443 → double-bind / outage after an "apparently
+# successful" rollback (Carnot P1). Mask-equivalent: disable + stop returns to stock (Caddy owns
+# :443, no haproxy).
+if systemctl is-active --quiet haproxy || systemctl is-enabled --quiet haproxy 2>/dev/null; then
+  log "stopping + disabling haproxy (frees :443, won't reclaim on reboot)"
+  systemctl disable --now haproxy 2>/dev/null || die "could not stop/disable haproxy — :443 still muxed, ABORT (fix by hand)"
 else
-  log "haproxy already stopped"
+  log "haproxy already stopped + disabled"
 fi
+# Disable the cert-sync timer too — it's meaningless once HAProxy is gone, and leaving it enabled
+# would keep poking a nonexistent haproxy on every tick.
+systemctl disable --now haproxy-cert-sync.timer 2>/dev/null || true
 
 # --- 2. Restore Caddy to public :443 --------------------------------------------------------
 [ -s "$CADDY_STOCK" ] || die "no $CADDY_STOCK to restore — cannot put Caddy back on :443 by hand-guessing; ABORT"
@@ -68,14 +75,19 @@ if ! timeout 8 openssl s_client -connect 127.0.0.1:5349 -servername turn.enspyr.
 fi
 log "confirmed: 5349 presents TLS — safe to reopen firewall"
 
-# --- 4. Reopen public :5349 (LAST — TLS is confirmed back) ----------------------------------
-if iptables -C INPUT "${FW_RULE[@]}" 2>/dev/null; then
-  log "removing the plaintext-5349 DROP rule (reopening public 5349, now TLS)"
-  iptables -D INPUT "${FW_RULE[@]}" || die "failed to remove firewall DROP — 5349 still localhost-only (SAFE state, but not fully rolled back); fix by hand"
-  command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1 || true
-else
-  log "no plaintext-5349 DROP rule present (already open or never added)"
-fi
+# --- 4. Reopen public :5349 (LAST — TLS is confirmed back) — BOTH families -------------------
+# cutover added the DROP on iptables AND ip6tables; remove both so rollback is symmetric.
+removed_any=0
+for fam in iptables ip6tables; do
+  command -v "$fam" >/dev/null 2>&1 || continue
+  if "$fam" -C INPUT "${FW_RULE[@]}" 2>/dev/null; then
+    log "removing the plaintext-5349 DROP rule ($fam)"
+    "$fam" -D INPUT "${FW_RULE[@]}" || die "failed to remove $fam DROP — 5349 still localhost-only (SAFE, but not fully rolled back); fix by hand"
+    removed_any=1
+  fi
+done
+[ "$removed_any" = 1 ] && { command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1 || true; }
+[ "$removed_any" = 0 ] && log "no plaintext-5349 DROP rule present on either family (already open or never added)"
 
 # Consume the .stock backups — they've served their purpose. Leaving them would make the
 # NEXT cutover.sh abort on its "a prior cutover is in progress" guard forever.

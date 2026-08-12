@@ -90,6 +90,12 @@ window (Caddy-release → HAProxy-bind).
 UDP relay still allocates, all RFC1918/link-local/loopback/CGNAT sentinels still 403, chat +
 signaling green. **If it fails: `sudo bash deploy/media/turn-443/rollback.sh`.**
 
+Also prove INV-1 from **off-box** (the on-box guard is v4+v6 host-INPUT, valid only because
+LiveKit is host-networked — cutover asserts that): from your laptop,
+`openssl s_client -connect <enspyr-public-ip>:5349` must **fail/refuse** (public plaintext :5349
+is closed). A localhost probe can't prove external closure; this can. Repeat over IPv6 if the box
+ever gains a public v6 address.
+
 ## Gate
 
 **Code cage-match this config + the cutover/rollback scripts before the live cutover** (the
