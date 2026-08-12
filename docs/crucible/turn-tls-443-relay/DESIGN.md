@@ -1,7 +1,79 @@
 # DESIGN — TURN-over-TLS on :443 (enspyr media plane)
 
-Status: **CAST (pre-Fold, pre-Temper)** · Scope: **enspyr only** · Task #4
+Status: **TEMPERED → RE-CAST v2 (UN-RE-TEMPERED)** · Scope: **enspyr only** · Task #4
 Companion: [`CRUCIBLE.md`](CRUCIBLE.md) (the case + falsifier), [`RESEARCH.md`](RESEARCH.md) (Heat findings)
+
+---
+
+## ⚔️ TEMPER VERDICT (PR #130, 2026-08-12) → RE-CAST v2
+
+**4-way design cage-match (Maxwell + Kelvin + Carnot + Tesla; Wu dark on a Kimi 402).
+UNANIMOUS REQUEST_CHANGES.** The ore SURVIVES (TURNS must exist on :443; advertise-5349
+is provably dead) but **Shape A as primary is INVALIDATED.** Every fatal finding rhymes on
+one principle: *never put experimental pre-1.0 code in front of the shared :443 acceptor
+before falsifying the cheaper shapes that don't touch it at all.* The re-cast below flips
+the design accordingly. **This v2 is UN-RE-TEMPERED — it needs a fresh strike once Phase 0
+picks the shape (a substantial recast is itself un-struck).**
+
+**What flipped:**
+1. **Falsify B1 FIRST (was: "don't block A on B1").** B1 (can LiveKit bind TURN/TLS to a
+   specific IP?) is a ~1hr probe that, if true, yields **Shape B** with ZERO :443 blast
+   radius. Building the experimental mux before running it is backwards. → **Phase 0.**
+2. **New Shape C — mature L4-in-front (HAProxy / nginx `stream` / sslh), STOCK Caddy.**
+   SNI peel `turn→127.0.0.1:5349`, else→Caddy:8443. Dissolves experimental
+   caddy-l4-in-the-chat-process without per-IP LiveKit binds. LiveKit's own docs assume an
+   LB on 443. → priced in Phase 0.
+3. **Shape A (caddy-l4 `listener_wrappers`) demoted to LAST RESORT** — only if B1 is dead
+   AND no mature L4-front is viable. "Caddy's :443 untouched" was fiction: the wrapper IS
+   the front door for chat + WSS + video.
+4. **C2 (LiveKit SIGHUP cert-reload?) resolved BEFORE shipping restart-as-default** — a
+   scheduled full-media bounce every 60-90d is a bug, not a tradeoff (F3).
+
+**Fold misses the panel caught (folded into the re-cast, must appear in whichever shape wins):**
+- **Cert issuance dies with the turn stub (Tesla):** deleting `turn.enspyr.co { respond }`
+  may stop Caddy *issuing/renewing* that cert (Caddy issues for configured site names).
+  Need an explicit cert-management identity for `turn` that survives its SNI no longer
+  hitting Caddy's terminator. HTTP-01-on-:80 is necessary, not sufficient.
+- **Cert private-key ownership boundary (Carnot F8):** LiveKit reading Caddy's ACME private
+  key — permissions/group/storage-path/compromise-blast-radius unstated. BOTH shapes.
+- **SNI-only routing ⇒ no HTTP on turn:443 (Carnot F9):** health checks must speak TURNS.
+- **ACME disable must be fail-closed (Tesla+Carnot):** "assert HTTP-01" is soft — Caddy
+  picks challenge randomly, `disable_tlsalpn_challenge` unreliable (#7612). Use deterministic
+  JSON `challenges.tls-alpn.disabled` for the host.
+- **A2 over-claimed:** `caddy validate` ≠ layer4 semantics (route order blackholing ACME,
+  passthrough that works for openssl but not a real TURN client, ClientHello fragmentation).
+  Needs per-traffic-class behavioral tests + staging soak/canary.
+- **Acceptance gate additions:** cert-reload with mux LIVE (not the reused pre-mux proof);
+  served-cert fingerprint == store after rotation on turns:443; negative tests
+  (unknown/chat/livekit SNI, acme-tls/1, malformed/slow ClientHello, concurrent WSS during
+  reload); forced-relay MEDIA through 443 (ALLOCATED ≠ media; relay_range Q5 UNVERIFIED).
+- **Cutover is a cold cut (Carnot F6+Tesla):** single fail-closed cutover *script* (validate
+  both configs → install → restart → probe → else restore ALL THREE artifacts: binary +
+  Caddyfile + 5349 bind/firewall), loopback test on an alt port first, soak before closing
+  public 5349. F1 rollback is THREE artifacts, not two.
+
+## Re-cast build order v2 (core-first, evidence-gated)
+
+- **Phase 0 — FALSIFIERS FIRST (cheap, read-only, pick the shape):**
+  (a) **B1:** grep LiveKit v1.13.5 config/source for a per-IP TURN/TLS bind address; if it
+  exists, prove it binds only a secondary IP on a scratch box. (b) **L4-front viability:**
+  can HAProxy/nginx `stream` SNI-peel `turn.enspyr.co`→5349 with stock Caddy on an internal
+  port, and does it survive WSS + ClientHello edge cases? (c) **C2:** does `livekit-server`
+  reload its TURN cert on SIGHUP (no full restart)? Outcomes select the shape:
+  **B1 true → Shape B** (second IP, zero :443 touch) · **else L4-front viable → Shape C**
+  (stock Caddy, boring proxy) · **else → Shape A** (experimental caddy-l4, last resort).
+- **Phase 1 — cert lifecycle (shape-independent, task #3):** cert-management identity for
+  `turn` that survives (Tesla finding), private-key ownership boundary (F8), fail-closed
+  tls-alpn disable (F2), SIGHUP-or-restart reload proven with the served-cert fingerprint
+  test. Independently valuable; precondition for #4 not silently rotting.
+- **Phase 2 — build the WINNING shape**, with the behavioral acceptance gate + single
+  fail-closed cutover script + soak. Then **cage-match the CODE** (this design temper does
+  not substitute for the implementation strike).
+
+**Everything below is the v1 CAST that the temper struck. Kept for the audit trail; the
+v2 re-cast above supersedes the "Position" and "Build order" sections.**
+
+---
 
 ## Problem
 
