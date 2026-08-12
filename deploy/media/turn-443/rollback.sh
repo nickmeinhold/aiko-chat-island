@@ -49,12 +49,26 @@ systemctl disable --now haproxy-cert-sync.timer 2>/dev/null || true
 # gone + Caddy active + something on :443) and no-op success, rather than die. Only die if the
 # stock is missing AND we're in a genuinely-broken half-state.
 if [ ! -s "$CADDY_STOCK" ]; then
+  # FULL stock invariant (Tesla P1): "already rolled back → exit clean" must prove EVERY artifact,
+  # not just Caddy-on-:443 — else a COSMETICALLY-stock box (Caddy on :443 but livekit STILL
+  # plaintext + the DROP already removed) would report COMPLETE while leaving PUBLIC PLAINTEXT
+  # TURN. Require: haproxy gone, Caddy on :443, LiveKit presents TLS on :5349, and no guard DROP.
+  lk_tls=0
+  timeout 8 openssl s_client -connect 127.0.0.1:5349 -servername turn.enspyr.co </dev/null 2>/dev/null | grep -q "BEGIN CERTIFICATE" && lk_tls=1
+  drop_present=0
+  for fam in iptables ip6tables; do
+    command -v "$fam" >/dev/null 2>&1 || continue
+    for port in "${FW_PORTS[@]}"; do
+      "$fam" -C INPUT ! -i lo -p tcp --dport "$port" -j DROP 2>/dev/null && drop_present=1
+    done
+  done
   if ! systemctl is-active --quiet haproxy && ! systemctl is-enabled --quiet haproxy 2>/dev/null \
-     && systemctl is-active --quiet caddy && [ -n "$(ss -tlnH 'sport = :443' 2>/dev/null)" ]; then
-    log "no $CADDY_STOCK and box is already in stock state (haproxy gone, Caddy on :443) — nothing to roll back; exiting clean."
+     && systemctl is-active --quiet caddy && [ -n "$(ss -tlnH 'sport = :443' 2>/dev/null)" ] \
+     && [ "$lk_tls" = 1 ] && [ "$drop_present" = 0 ]; then
+    log "no $CADDY_STOCK and the FULL stock invariant holds (haproxy gone, Caddy on :443, LiveKit TLS on 5349, no guard DROP) — nothing to roll back; exiting clean."
     exit 0
   fi
-  die "no $CADDY_STOCK to restore and the box is NOT in a clean stock state — half-muxed without a backup; fix Caddy's :443 config by hand. ABORT."
+  die "no $CADDY_STOCK to restore and the box is NOT fully stock (haproxy present? livekit still plaintext? residual DROP?) — cannot finish rollback safely without the backup; fix by hand. ABORT."
 fi
 if ! cmp -s "$CADDY_STOCK" "$CADDYFILE"; then
   log "restoring stock Caddyfile"
@@ -78,6 +92,13 @@ else
 fi
 
 # --- 3b. HARD GATE before reopening the firewall: 5349 must speak TLS, not plaintext --------
+# Bounded readiness poll FIRST (Tesla P1): share cutover's pattern so a slow livekit restart
+# doesn't false-red the gate on the first run. Wait up to 30s for Running + 5349 listening.
+for _ in $(seq 1 30); do
+  [ "$(docker inspect livekit --format '{{.State.Running}}' 2>/dev/null)" = "true" ] \
+    && timeout 2 bash -c "exec 3<>/dev/tcp/127.0.0.1/5349" 2>/dev/null && break
+  sleep 1
+done
 # This is the invariant the whole rollback exists to protect. openssl handshake must SUCCEED
 # on localhost:5349; if it doesn't, LiveKit is still plaintext (or down) and we must NOT
 # reopen the public firewall.
@@ -109,9 +130,20 @@ else
   log "no plaintext-5349 DROP rule present on either family (already open or never added)"
 fi
 
+# Purge the cutover-installed cert-sync artifacts (Kelvin P2: a rollback should restore the
+# filesystem, not just process state). These are purely ours + inert once the timer is disabled;
+# removing them leaves no confusing residue. (We do NOT remove the haproxy PACKAGE or its
+# /etc/haproxy/haproxy.cfg — the package predates nothing here but purging it is out of a
+# rollback's scope; it's disabled + inert, and a re-cutover reuses it.)
+rm -f /usr/local/bin/haproxy-cert-sync.sh \
+      /etc/systemd/system/haproxy-cert-sync.service \
+      /etc/systemd/system/haproxy-cert-sync.timer \
+      "/etc/haproxy/certs/turn.enspyr.co.pem" "/etc/haproxy/certs/turn.enspyr.co.pem.needs-reload"
+systemctl daemon-reload 2>/dev/null || true
+
 # Consume the .stock backups — they've served their purpose. Leaving them would make the
 # NEXT cutover.sh abort on its "a prior cutover is in progress" guard forever.
 rm -f "$CADDY_STOCK" "$LIVEKIT_STOCK"
 
-log "ROLLBACK COMPLETE — Caddy on :443, LiveKit TLS on 5349, HAProxy stopped, firewall open, .stock consumed."
+log "ROLLBACK COMPLETE — Caddy on :443, LiveKit TLS on 5349, HAProxy stopped+disabled, firewall open, cert-sync purged, .stock consumed."
 log "Verify: curl -sI https://chat.enspyr.co | head -1 ; and re-run b3_relay_probe (turns:443 will be UNREACHABLE again — expected pre-mux)."

@@ -78,6 +78,12 @@ LK_NETMODE="$(docker inspect livekit --format '{{.HostConfig.NetworkMode}}' 2>/d
 # reopening public plaintext :5349 while livekit.yaml stays external_tls (Carnot P0). netfilter-
 # persistent must exist so the rule survives; die if absent rather than ship a reboot time-bomb.
 command -v netfilter-persistent >/dev/null 2>&1 || die "netfilter-persistent absent — the :5349 DROP would not survive a reboot (reopening public plaintext TURN). Install iptables-persistent first."
+# openssl is load-bearing for the plaintext-flip verify (Tesla P1): the 2.2 check treats "no TLS
+# cert presented" as proof of plaintext, so a MISSING openssl would make that check pass
+# vacuously (fail-OPEN on the security-critical flip). Require it up front so the only reason for
+# "no cert" is genuine plaintext, not a missing tool.
+command -v openssl >/dev/null 2>&1 || die "openssl absent — the plaintext-flip verify would fail OPEN without it"
+command -v ss >/dev/null 2>&1 || die "ss absent — needed for the listener/owner checks"
 
 command -v haproxy >/dev/null 2>&1 || { log "installing haproxy"; apt-get install -y haproxy >/dev/null || die "haproxy install failed"; }
 id haproxy >/dev/null 2>&1 || die "haproxy user missing after install"
@@ -97,7 +103,12 @@ TURN_DOMAIN="$TURN_DOMAIN" bash "$CERT_SYNC" || die "cert-sync could not build t
 install -D -m 0644 "$HAPROXY_CFG" /etc/haproxy/haproxy.cfg
 haproxy -c -f /etc/haproxy/haproxy.cfg >/dev/null 2>&1 || die "haproxy -c failed on /etc/haproxy/haproxy.cfg"
 caddy validate --config "$CADDY_MUX" --adapter caddyfile >/dev/null 2>&1 || die "Caddyfile.mux fails caddy validate"
-log "PHASE 0 OK — preconditions clear, nothing mutated yet."
+# Honest scope (Tesla P2): Phase 0 HAS mutated some prep state — haproxy installed+disabled, the
+# mux haproxy.cfg + turn PEM staged. None of it is live-serving (haproxy is stopped+disabled,
+# Caddy still owns :443), so an abort here needs no rollback of live traffic — but a manual
+# `systemctl start haproxy` before 2.3 WOULD double-bind :443. The disabled unit prevents that on
+# reboot; don't hand-start it.
+log "PHASE 0 OK — preconditions clear; prep staged (haproxy installed+DISABLED, cfg+PEM staged), no live change yet."
 
 # ============================ PHASE 1 — stage backups (FAIL-CLOSED) ==========================
 # The backups ARE the rollback's trusted source of truth — an unchecked cp that silently fails
@@ -135,7 +146,9 @@ awk '
   /^[^[:space:]]/ { in_turn = ($0 ~ /^turn:/) }
   in_turn && /^[[:space:]]+(cert_file|key_file|external_tls):/ { next }
   { print }
-  in_turn && /^[[:space:]]+tls_port:/ { print "  external_tls: true" }
+  in_turn && /^[[:space:]]+tls_port:/ {
+    match($0, /^[[:space:]]+/); print substr($0, 1, RLENGTH) "external_tls: true"   # copy tls_port indent (Tesla P2)
+  }
 ' "$LIVEKIT_YAML" > "${LIVEKIT_YAML}.new" && mv "${LIVEKIT_YAML}.new" "$LIVEKIT_YAML" \
   || roll "awk edit of livekit.yaml failed"
 grep -q '^  external_tls: true' "$LIVEKIT_YAML" || roll "livekit.yaml external_tls edit did not take"
@@ -165,9 +178,16 @@ fi
 log "2.2 confirmed: livekit-server RUNNING + holds :5349 LISTENING + plaintext (no TLS) + firewalled"
 
 # --- 2.3 move Caddy off public :443 → loopback:8443 -----------------------------------------
-log "2.3 installing Caddyfile.mux, reloading caddy (releases public :443)"
+log "2.3 installing Caddyfile.mux, enabling haproxy, reloading caddy (releases public :443)"
 cp "$CADDY_MUX" "$CADDYFILE"
 caddy validate --config "$CADDYFILE" --adapter caddyfile >/dev/null 2>&1 || roll "installed Caddyfile.mux failed validation"
+# ENABLE haproxy HERE — BEFORE the live Caddy reload (Carnot reboot-window fix). Once the mux
+# Caddyfile is on disk (Caddy→:8443) AND haproxy is enabled, the PERSISTED state is boot-correct:
+# any reboot from this point boots Caddy on :8443 + haproxy on :443, no conflict, no unbound :443.
+# (If it were enabled only at 2.4 as before, a reboot in the 2.3-reload→2.4-start window would boot
+# Caddy-on-8443 + haproxy-disabled → :443 unbound.) Hard-roll on failure (Tesla). The only residual
+# window is the ~100ms cp→enable above, before any LIVE change (Caddy still serving :443 in-memory).
+systemctl enable haproxy >/dev/null 2>&1 || roll "could not enable haproxy unit — a reboot could leave :443 unbound; refusing to stand up a non-persistent mux"
 # ---- INV-2: :443 dark window OPENS here ----
 DARK_START=$(date +%s%3N)
 systemctl reload caddy || roll "caddy reload failed"
@@ -179,11 +199,8 @@ port_listening 443 && roll "Caddy did not release :443 within 5s of reload"
 
 # --- 2.4 start HAProxy on :443 (closes the dark window) — back-to-back with 2.3 -------------
 log "2.4 starting haproxy on :443"
-# Enable so :443 stays HAProxy's across a reboot — HARD-ROLL on failure (Tesla P0), not WARN: a
-# started-but-not-enabled haproxy + the mux Caddyfile means a reboot leaves :443 UNBOUND (chat +
-# signaling + TURNS dark). Same fail-closed class as the cert timer. rollback.sh disables it, so
-# stock state = Caddy owns :443, haproxy disabled.
-systemctl enable haproxy >/dev/null 2>&1 || roll "could not enable haproxy unit — a reboot would leave :443 unbound; refusing to stand up a non-persistent mux"
+# (haproxy was already ENABLED in 2.3 so the persisted state is boot-correct; here we just start
+# the live process to bind :443 now.)
 systemctl start haproxy || roll "haproxy failed to start"
 DARK_END=$(date +%s%3N)
 log "INV-2: :443 dark window was $((DARK_END - DARK_START)) ms"

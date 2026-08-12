@@ -101,6 +101,20 @@ rules are proactive future-proofing (harmless now). The off-box v6 probe is ther
 non-empty, the off-box `openssl -6 -connect [<v6>]:5349` closure proof becomes a **blocking**
 sign-off step — a public v6 plaintext endpoint must never exist unverified.
 
+## Known windows + limitations (named, not hidden)
+
+- **Dual dark window during cutover (2.1→2.4):** once :5349 is firewalled (2.1) and before HAProxy
+  binds :443 (2.4), BOTH TLS-TURN ingresses are down (public :5349 closed, :443 not yet TURNS).
+  This is intentional blast, not a bug — the advertised `turns:443` is already dead pre-cutover, so
+  no working relay is interrupted. The separate :443 *reload→bind* gap (chat/signaling) is the
+  millisecond dark window `cutover.sh` measures and logs.
+- **Client IP on the non-turn path is preserved via PROXY protocol** (HAProxy `send-proxy-v2` →
+  Caddy `:8443` `proxy_protocol`), so the gateway's per-IP auth rate limiter still sees real IPs.
+  **The TURN path (`be_livekit_plain`) does NOT send PROXY protocol** — LiveKit's embedded TURN
+  isn't configured to trust it, so LiveKit sees the relay client as `127.0.0.1`. TURN *allocation*
+  works regardless; any LiveKit-side per-source-IP logic on the relay is the accepted Shape-C tax
+  (add `send-proxy` there only if LiveKit is later configured to expect it).
+
 ## Gate
 
 **Code cage-match this config + the cutover/rollback scripts before the live cutover** (the
