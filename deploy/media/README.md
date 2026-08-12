@@ -65,18 +65,27 @@ everywhere, not a nick.
     non-zero exit) — `turnutils_uclient`, no cred needed for the negative test.
   - **B2** ports outside `50000–60000` sampled closed (advisory — can fail the gate,
     cannot certify closure; external multi-port audit still required).
-  - **B3** no relay to RFC1918/link-local. A live runtime private-deny probe is
-    **unimplementable** for session-bound embedded TURN (no standalone TURN cred /
-    client permission API — same root cause as gate A), so B3 asserts the strongest
-    achievable fail-closed proxy: the **runtime-observed image** (`docker inspect
-    livekit` preferred; `LIVEKIT_IMAGE` env only a weaker fallback), the **official
-    livekit repo**, a **version floor** (v1.12.0+ denies restricted CIDRs by default),
-    and a **closed-set config-invariant** (the rendered `turn:` block carries no
-    unknown key that could be a relay-permission override). Replaces the old unwired
-    `TURN_B3_PRIVATE_DENY_CMD`. Accepted residual: a hand-rebuilt image relabeled as
-    the official tag (root-on-box supply chain) is out of scope.
+  - **B3** no relay to RFC1918/link-local — a **behavioral, packet-level probe**
+    (`b3_relay_probe.py`), not a version/config proxy. It extracts the SFU's
+    session-bound TURN credential from the raw signaling `JoinResponse` (which
+    `livekit-rtc` never surfaces — the wire does), allocates a relay, then issues
+    `CreatePermission` for a **public control** + the **SSRF-critical private ranges**
+    (`10/8`, `172.16/12`, `192.168/16`, `169.254/16`, `127/8` — one **sentinel** per
+    range, a mandatory hard-coded set that env can only add to, never shrink),
+    requiring the control **allowed (200) before and after** and every sentinel
+    **refused (403)**. Sampled sentinels, not an exhaustive range proof. **Every
+    advertised relay endpoint (each transport — udp/tcp/tls) is tested on one
+    allocation**; a live one must pass, an **unreachable** one (can't allocate → not a
+    relay vector) is surfaced non-blocking, and ≥1 live endpoint must pass. Known-open
+    bands (`100.64/10` CGNAT) and unreachable endpoints are named in the `B3_ASSERT`
+    verdict, not hidden. Fail-closed exit code
+    (0 OK / 3 FAIL / 2 BLOCK) **and** a single structured `B3_ASSERT` verdict line.
+    Supersedes the prior version-proxy — and is more truthful: it found LiveKit's
+    default deny does **not** cover `100.64/10` (CGNAT), tracked separately (task #6).
+    Runs in the exposure phase: needs `:443` (join) + `:3478` (TURN control), not the
+    relay range.
 
 `e2e_media_relay.py` **fails CLOSED**: any check that cannot produce positive evidence
-exits non-zero and `standup.sh` will NOT open the firewall. Gate A additionally needs a
-python with `livekit` + `livekit-api` + `numpy` + `pyyaml` (the box venv) as `python3`
-(`pyyaml` is used by gate B3's config-invariant; it fails closed if absent).
+exits non-zero and `standup.sh` will NOT open the firewall. Needs the box venv as
+`python3`: `livekit` + `livekit-api` + `numpy` (gate A) + `websockets` + `aioice`
+(gate B3).

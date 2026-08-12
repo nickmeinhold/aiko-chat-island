@@ -32,43 +32,38 @@ the public firewall range on a false green.
                       for the negative test.
                    B2 ports OUTSIDE the relay range sampled closed (advisory: can fail
                       the gate on an open port, cannot certify closure).
-                      B3 no relay to RFC1918/link-local. A live runtime private-deny
-                      probe is UNIMPLEMENTABLE for session-bound embedded TURN (no
-                      standalone TURN cred / client permission API — same root cause as
-                      gate A). So B3 asserts the strongest achievable fail-closed proxy:
-                      the RUNTIME-observed image (docker inspect preferred; LIVEKIT_IMAGE
-                      env only as a weaker fallback), the OFFICIAL livekit repo, a VERSION
-                      floor (v1.12.0+ denies restricted CIDRs by default), and a closed-set
-                      CONFIG-INVARIANT (the rendered turn block carries no unknown key that
-                      could be a relay-permission override). Replaces the old unwired
-                      TURN_B3_PRIVATE_DENY_CMD that blocked forever. A hand-rebuilt image
-                      relabeled as the official tag is an accepted out-of-scope residual.
+                   B3 no relay to RFC1918/link-local — a BEHAVIORAL, packet-level probe
+                      (b3_relay_probe.py), NOT a version/config proxy. It extracts the
+                      SFU's session-bound TURN cred from the raw signaling JoinResponse
+                      (the same session-bound cred gate A relies on, read off the wire —
+                      livekit-rtc never surfaces it), then for EVERY advertised relay
+                      endpoint (each transport — udp/tcp/tls) allocates ONCE and issues
+                      CreatePermission for a PUBLIC control + a mandatory hard-coded
+                      SENTINEL per SSRF-critical private range, requiring 200 for the
+                      control (before AND after the matrix) and 403 for every sentinel.
+                      A LIVE endpoint must pass; an UNREACHABLE advertised endpoint (can't
+                      allocate → not a relay vector) is surfaced non-blocking; ≥1 live
+                      endpoint must pass else BLOCK. Sampled sentinels, not an exhaustive
+                      range proof. Supersedes the version proxy AND is more truthful: it
+                      found 100.64/10 CGNAT still ALLOWED (surfaced in the verdict, task #6)
+                      and an advertised-but-dead turns: relay. Exposure phase: needs :443
+                      (join) + :3478 (TURN control), NOT the relay range.
 
-Env: TURN_DOMAIN, LIVEKIT_URL (wss signaling), LIVEKIT_API_KEY/SECRET,
-     TURN_RELAY_START/END, LIVEKIT_IMAGE (optional; else `docker inspect livekit`).
-Requires (gate A): a python with livekit + livekit-api + numpy (the box venv).
+Env: TURN_DOMAIN, LIVEKIT_URL (wss signaling), LIVEKIT_API_KEY/SECRET, TURN_RELAY_START/END.
+Requires: a python with livekit + livekit-api + numpy (gate A) + websockets + aioice
+     (gate B3) — the box venv.
 """
 import argparse, json, os, re, shutil, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 HARNESS = os.path.join(HERE, "e2e_relay_livekit.py")
+B3_PROBE = os.path.join(HERE, "b3_relay_probe.py")
 TURN_DOMAIN = os.environ.get("TURN_DOMAIN", "")
 UCLIENT = shutil.which("turnutils_uclient")
 # Positive auth-reject evidence for B1. Coupled to coturn/pion English; pin to a GOLDEN
 # stderr from the real livekit-server + turnutils build at Phase-2 (DESIGN §7). Until
 # then B1 fails CLOSED if none match (safe: never opens on unproven rejection).
 AUTH_REJECT_MARKERS = ("401", "403", "unauthorized", "forbidden", "allocate error", "wrong credentials")
-MIN_CIDR_DENY_VERSION = (1, 12, 0)   # v1.12.0: restricted-CIDR relay denied by default
-OFFICIAL_LIVEKIT_REPO = "livekit/livekit-server"
-# Closed set of keys the rendered turn: block may contain. LiveKit exposes NO
-# peer-CIDR relay allowlist key, so the default private-CIDR deny cannot be
-# config-overridden — B3 asserts the turn block stays within this set, so a
-# future/hand-added override key fails closed. `external_tls` is pre-listed so the
-# task #4 TLS-relay fix won't false-block B3 later.
-KNOWN_TURN_KEYS = frozenset({
-    "enabled", "domain", "udp_port", "tls_port", "cert_file", "key_file",
-    "relay_range_start", "relay_range_end", "external_tls",
-})
 
 
 def block(what: str, why: str) -> "NoReturn":
@@ -124,106 +119,57 @@ def gate_A(host: str) -> None:
               "DESIGN §4a TLS assertion deferred to the external_tls task).")
 
 
-def _running_livekit_ref() -> tuple:
-    """(image_ref, source). Runtime truth FIRST (docker inspect the running
-    container); LIVEKIT_IMAGE env is an explicit WEAKER fallback — operator intent,
-    not the running bytes (cage-match #128: a pinned env var could claim v1.13.5
-    while the container runs something else)."""
-    if shutil.which("docker"):
-        r = subprocess.run(["docker", "inspect", "livekit", "--format", "{{.Config.Image}}"],
-                           capture_output=True, text=True)
-        if r.returncode == 0 and r.stdout.strip():
-            return r.stdout.strip(), "docker inspect livekit"
-    ref = os.environ.get("LIVEKIT_IMAGE", "")
-    return ref, "env LIVEKIT_IMAGE (fallback — not runtime-observed)"
-
-
-def _parse_version(ref: str):
-    m = re.search(r":v?(\d+)\.(\d+)\.(\d+)", ref or "")
-    return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
-
-
-def _turn_block_unknown_keys(yaml_path: str):
-    """Keys under the rendered `turn:` block that are NOT in KNOWN_TURN_KEYS. Parsed
-    with a real YAML loader (cage-match #128: a line-regex is blind to inline maps,
-    anchors/merge keys, quoted keys, and nested keys — the closed-set invariant that
-    a trust boundary rests on must be parsed as YAML, not approximated). Returns None
-    if the config can't be safely parsed, so the caller fails closed."""
-    try:
-        import yaml
-    except ImportError:
-        return None  # caller blocks: a trust-boundary invariant must not fall back to a regex
-    # The rendered config carries envsubst output (plain scalars) — safe_load handles it.
-    # The .tmpl (pre-render) has ${...} placeholders that are still valid YAML scalars.
-    try:
-        with open(yaml_path) as fh:
-            doc = yaml.safe_load(fh)
-    except yaml.YAMLError:
-        return None
-    if not isinstance(doc, dict):
-        return None
-    turn = doc.get("turn")
-    if not isinstance(turn, dict):
-        # No turn block (or not a mapping) is NO EVIDENCE, not proof of safety — a
-        # firewall-opening gate must not certify deny from an absent config (cage-match
-        # #128 r3, Tesla). Fail closed.
-        return None
-    return set(map(str, turn.keys())) - KNOWN_TURN_KEYS
-
-
 def gate_B3(host: str) -> None:
-    """No relay to RFC1918/link-local. A live runtime private-deny probe is
-    UNIMPLEMENTABLE for session-bound embedded TURN (no standalone TURN cred, no
-    client permission API — same root cause that made turnutils gate A wrong-premised),
-    so B3 asserts the strongest achievable proxy, fail-closed: runtime-observed image,
-    official repo, version floor, and a closed-set config-invariant."""
-    print("  B3: relay-to-private-IP denied (runtime image + official repo + version floor + config-invariant) …")
-    ref, src = _running_livekit_ref()
-    if not ref:
-        block("B3", "cannot determine the running LiveKit image (docker inspect failed AND LIVEKIT_IMAGE unset) "
-                    "— refusing to certify RFC1918 relay-deny.")
-    # For a firewall-OPENING gate the version must be RUNTIME-observed, not operator
-    # intent (cage-match #128: env LIVEKIT_IMAGE is compose-pinned intent, and warning
-    # instead of blocking is a soft fail-open). Require docker inspect; the env fallback
-    # is allowed only under an explicit LIVEKIT_B3_ALLOW_ENV=1 opt-out for off-box runs
-    # that do NOT open the range.
-    if not src.startswith("docker"):
-        if os.environ.get("LIVEKIT_B3_ALLOW_ENV") == "1":
-            print(f"  WARN B3: version from {src}='{ref}' via explicit LIVEKIT_B3_ALLOW_ENV=1 — operator-asserted, "
-                  f"NOT runtime-observed. Do NOT open the firewall range on this run.")
-        else:
-            block("B3", f"LiveKit image not runtime-observed (docker inspect failed; falling back to {src}). "
-                        f"A firewall-opening gate requires the RUNNING image. Run where `docker inspect livekit` "
-                        f"resolves, or set LIVEKIT_B3_ALLOW_ENV=1 for an off-box check that does NOT open the range.")
-    repo = ref.rsplit(":", 1)[0].split("@")[0]
-    if repo != OFFICIAL_LIVEKIT_REPO:
-        block("B3", f"image repo '{repo}' is not the official {OFFICIAL_LIVEKIT_REPO} — cannot assume LiveKit's "
-                    f"built-in RFC1918 relay-deny. A relabeled third-party/rebuilt image is not certified here.")
-    ver = _parse_version(ref)
-    if ver is None:
-        block("B3", f"cannot parse a version from '{ref}' (:latest / digest-only?) — fail-closed; pin a vX.Y.Z tag.")
-    if ver < MIN_CIDR_DENY_VERSION:
-        block("B3", f"LiveKit {ref} < v{'.'.join(map(str, MIN_CIDR_DENY_VERSION))} does not deny restricted-CIDR "
-                    f"relay by default — SSRF-shaped open-relay-to-internal risk. Pin a newer image.")
-    yaml_path = os.environ.get("LIVEKIT_YAML", os.path.join(HERE, "livekit.yaml"))
-    if not os.path.exists(yaml_path):
-        block("B3", f"rendered config {yaml_path} not found — cannot assert the turn block carries no "
-                    f"relay-permission override. Set LIVEKIT_YAML to the box's rendered livekit.yaml.")
-    unknown = _turn_block_unknown_keys(yaml_path)
-    if unknown is None:
-        block("B3", f"could not verify the turn block in {yaml_path} (PyYAML missing, config unparseable, or no "
-                    f"turn: block present) — a trust-boundary invariant must not certify deny from absent evidence. "
-                    f"Install pyyaml and point LIVEKIT_YAML at the rendered livekit.yaml (with a turn: mapping).")
-    if unknown:
-        block("B3", f"turn block has unrecognized key(s) {sorted(unknown)} in {yaml_path} — a possible "
-                    f"relay-permission / peer-CIDR override. Refusing to certify default-deny; review before opening.")
-    print(f"  ok B3: {ref} (official {OFFICIAL_LIVEKIT_REPO}, >= v{'.'.join(map(str, MIN_CIDR_DENY_VERSION))}) "
-          f"+ turn block within the safe key set — default private-CIDR deny holds.")
-    print("  NOTE B3: this is a POLICY proxy (runtime image + repo + version floor + config key-set), not a "
-          "packet-level RFC1918-deny probe. A behavioral probe is DEFERRED, not impossible: the candidate is to "
-          "extract the session-bound TURN cred the SFU issues to a joined livekit-rtc client (as gate A already "
-          "obtains) and drive a turnutils CreatePermission to a 10.x/169.254.x peer, asserting refusal — tracked. "
-          "Residual until then: a default regression under an accepted tag, or a hand-rebuilt relabeled image.")
+    """No relay to RFC1918/link-local — a BEHAVIORAL, packet-level assertion of the
+    RUNNING TURN (b3_relay_probe.py), not a version/config proxy. The probe extracts
+    the SFU's session-bound TURN cred from the raw signaling JoinResponse, allocates a
+    relay, and issues CreatePermission to a public control + the SSRF-critical private
+    ranges — requiring the control ALLOWED (200) and every private peer REFUSED (403).
+    Its exit code (0 OK / 3 FAIL / 2 BLOCK) is fail-closed; we ALSO parse the single
+    structured B3_ASSERT line, a machine contract (mirrors gate A's RELAY_ASSERT)."""
+    print("  B3: relay-to-private-IP denied (behavioral CreatePermission probe) …")
+    url = os.environ.get("LIVEKIT_URL", "")
+    key = os.environ.get("LIVEKIT_API_KEY", "")
+    secret = os.environ.get("LIVEKIT_API_SECRET", "")
+    if not (url and key and secret):
+        block("B3", "LIVEKIT_URL + LIVEKIT_API_KEY + LIVEKIT_API_SECRET required for the behavioral TURN probe.")
+    if not os.path.exists(B3_PROBE):
+        block("B3", f"missing {B3_PROBE}")
+    # Pass the exposure target as the host-pin identity: the TURN the probe certifies must
+    # resolve to the box whose firewall we're about to open (cage-match #129: "probe the
+    # wrong coil, open the right port"). `host` is TURN_DOMAIN; the probe also folds in
+    # NODE_IP if the box sets it.
+    # Deliberately NOT setting B3_REQUIRE_ENDPOINT here: on both islands turns:443 is dead
+    # until the TURN-on-443 cutover lands (task #4), so pinning it in the standup gate would
+    # block every standup on a known-open gap. It rides through **os.environ, so the cutover's
+    # acceptance step opts in (B3_REQUIRE_ENDPOINT=tls:<domain>:443) without a code change here.
+    env = {**os.environ, "LK_URL": url, "LK_API_KEY": key, "LK_API_SECRET": secret,
+           "B3_EXPECT_HOST": host}
+    try:
+        r = subprocess.run([sys.executable, B3_PROBE], env=env, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        block("B3", "behavioral TURN probe timed out (signaling :443 or TURN :3478 unreachable?) — fail closed.")
+    out = r.stdout + r.stderr
+    for line in (l for l in out.splitlines() if l.strip()):
+        print("   " + line)
+    # Exactly-one machine contract (cage-match #128 lesson on gate A: a non-anchored or
+    # duplicated assert line can mask a later failure). The probe emits ONE B3_ASSERT.
+    asserts = re.findall(r"(?m)^B3_ASSERT=(\{.*\})$", out)
+    if len(asserts) != 1:
+        block("B3", f"expected exactly one B3_ASSERT line, found {len(asserts)} — cannot certify "
+                    f"relay-deny:\n{out[-500:]}")
+    try:
+        a = json.loads(asserts[0])
+    except json.JSONDecodeError:
+        block("B3", f"unparseable B3_ASSERT: {asserts[0][:200]}")
+    # Require BOTH the fail-closed exit code AND the structured OK verdict — either alone
+    # is insufficient (a 0 with a non-OK body, or an OK body on a non-zero exit, is drift).
+    if r.returncode != 0 or a.get("result") != "OK":
+        block("B3", f"behavioral relay-deny NOT proven (rc={r.returncode}): {a.get('reason', a)}")
+    print("  ok B3: behavioral probe — every LIVE advertised relay endpoint (all transports): "
+          "public control allowed (before+after) + every SSRF-critical private sentinel refused "
+          "(403). Unreachable endpoints + any known-open band (100.64/10) are surfaced in "
+          "B3_ASSERT above. Sampled sentinels, not a full-range proof.")
 
 
 def gate_B(host: str) -> None:
@@ -257,8 +203,7 @@ def gate_B(host: str) -> None:
             block("B2", f"UDP {p} (outside relay range) is OPEN — relay_range mis-set or an old 1024-30000 default left open.")
     print("  ok B2 (advisory): sampled outside ports not observed open — external multi-port audit still required (DESIGN §7).")
 
-    # B3: no relay to RFC1918/link-local (own function — see gate_B3 for why a runtime
-    # probe is unimplementable here and what the fail-closed proxy asserts instead).
+    # B3: no relay to RFC1918/link-local — behavioral CreatePermission probe (see gate_B3).
     gate_B3(host)
 
 
