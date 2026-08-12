@@ -1,7 +1,16 @@
 # DESIGN — TURN-over-TLS on :443 (enspyr media plane)
 
-Status: **TEMPERED → RE-CAST v2 (UN-RE-TEMPERED)** · Scope: **enspyr only** · Task #4
+Status: **RE-CAST v3 (Shape C / `external_tls`) — implementation shipped, CODE cage-match round 1 = REQUEST_CHANGES, reworked, pending re-strike** · Scope: **enspyr only** · Task #4
 Companion: [`CRUCIBLE.md`](CRUCIBLE.md) (the case + falsifier), [`RESEARCH.md`](RESEARCH.md) (Heat findings)
+
+> **Ceremony note (2026-08-12):** the v1 CAST and v2 re-cast sections below are the design
+> AUDIT TRAIL, superseded by RE-CAST v3. The shipped artifact is Shape C (`external_tls`), not
+> Shape A (caddy-l4). Implementation lives in `deploy/media/turn-443/` (haproxy.cfg + Caddyfile.mux
+> + cutover.sh + rollback.sh + haproxy-cert-sync.{sh,service,timer}). A code cage-match on the
+> prose-only first draft returned unanimous REQUEST_CHANGES (missing scripts, 3-vs-4-artifact
+> rollback leaving plaintext TURN on public :5349, cert-renewal time bomb, key-perm boundary);
+> those are addressed in the shipped scripts. **Still UNPROVEN in production — needs the code
+> re-strike + the off-:443 proof + the guarded cutover.**
 
 ---
 
