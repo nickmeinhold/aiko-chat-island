@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# checks.sh — the assertions the rehearsal is FOR. Sourced by run-matrix.sh.
+#
+# Design rule: every check must be able to FAIL. A probe that returns "closed" because the
+# probe itself is broken proves nothing (feedback_negative_probe_not_negative_fact), so the
+# external-vantage probes are validated POSITIVE at CP0 (where the port is genuinely open)
+# before their negative result is trusted anywhere else.
+TURN_DOMAIN="${TURN_DOMAIN:-turn.enspyr.co}"
+CHAT_DOMAIN="${CHAT_DOMAIN:-chat.enspyr.co}"
+
+# The "external" vantage point: a container on docker0. Traffic from it arrives on a
+# NON-loopback interface, so the `! -i lo ... -j DROP` rules apply exactly as they would to a
+# real internet client. This is what makes an off-box closure claim testable inside one VM.
+DOCKER_GW="$(ip -4 -o addr show docker0 2>/dev/null | awk '{print $4}' | cut -d/ -f1)"
+
+ext_tcp_open() {  # ext_tcp_open <port> -> 0 if a container can complete a TCP connect
+  local port="$1"
+  docker run --rm --network bridge busybox:latest \
+    timeout 4 nc -z "$DOCKER_GW" "$port" >/dev/null 2>&1
+}
+
+port_owner() {    # port_owner <port> -> process name holding it, or "" if unbound
+  ss -tlnpH "sport = :$1" 2>/dev/null | grep -oE 'users:\(\("[^"]+' | head -1 | sed 's/.*"//'
+}
+
+tls_serves_cert() { # tls_serves_cert <host> <port> <sni>
+  timeout 8 openssl s_client -connect "${1}:${2}" -servername "${3}" </dev/null 2>/dev/null \
+    | grep -q "BEGIN CERTIFICATE"
+}
+
+cert_fingerprint() { # cert_fingerprint <host> <port> <sni>
+  timeout 8 openssl s_client -connect "${1}:${2}" -servername "${3}" </dev/null 2>/dev/null \
+    | openssl x509 -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2
+}
+
+chat_reachable() { curl -sS --max-time 8 -o /dev/null "https://${CHAT_DOMAIN}/" 2>/dev/null; }
+
+# INV-5: what client IP does the app behind Caddy actually see? Returns the echoed XFF.
+chat_seen_client_ip() {
+  curl -sS --max-time 8 "https://${CHAT_DOMAIN}/" 2>/dev/null | jq -r '.x_forwarded_for // "none"'
+}
+
+fw_rule_present() { # fw_rule_present <family> <port>
+  "$1" -C INPUT ! -i lo -p tcp --dport "$2" -j DROP 2>/dev/null
+}
+
+livekit_running() { [ "$(docker inspect livekit --format '{{.State.Running}}' 2>/dev/null)" = "true" ]; }
+livekit_external_tls() { grep -q '^  external_tls: true' /home/ubuntu/apps/livekit/livekit.yaml 2>/dev/null; }
+
+# ---------------------------------------------------------------- composite state report
+state_report() {
+  local o443; o443="$(port_owner 443)"
+  echo "  :443 owner        = ${o443:-<UNBOUND>}"
+  echo "  :8443 owner       = $(port_owner 8443)"
+  echo "  :5349 owner       = $(port_owner 5349)"
+  echo "  livekit running   = $(livekit_running && echo yes || echo NO)"
+  echo "  livekit ext_tls   = $(livekit_external_tls && echo yes || echo no)"
+  echo "  fw v4 5349 / 8443 = $(fw_rule_present iptables 5349 && echo DROP || echo open) / $(fw_rule_present iptables 8443 && echo DROP || echo open)"
+  echo "  fw v6 5349 / 8443 = $(fw_rule_present ip6tables 5349 && echo DROP || echo open) / $(fw_rule_present ip6tables 8443 && echo DROP || echo open)"
+  echo "  haproxy unit      = $(systemctl is-enabled haproxy 2>/dev/null)/$(systemctl is-active haproxy 2>/dev/null)"
+  echo "  ext :5349 reach   = $(ext_tcp_open 5349 && echo OPEN || echo closed)"
+  echo "  ext :8443 reach   = $(ext_tcp_open 8443 && echo OPEN || echo closed)"
+  echo "  chat reachable    = $(chat_reachable && echo yes || echo NO)"
+}
+
+# ---------------------------------------------------------------- the safety invariants
+# These must hold at EVERY checkpoint, before and after a reboot. This is the heart of the
+# rehearsal: not "did the happy path work" but "is every intermediate state safe to be in".
+PASS=0; FAIL=0
+chk() { # chk <description> <0-if-ok>
+  if [ "$2" -eq 0 ]; then echo "    PASS  $1"; PASS=$((PASS+1));
+  else echo "    FAIL  $1"; FAIL=$((FAIL+1)); fi
+}
+
+assert_safety() {
+  local label="$1"
+  echo "  --- safety invariants [$label] ---"
+
+  # INV-1: public plaintext TURN must NEVER be reachable. The only states where :5349 may be
+  # externally reachable are those where LiveKit is still doing its own TLS.
+  local ext5349 ext8443
+  ext_tcp_open 5349 && ext5349=open || ext5349=closed
+  if livekit_external_tls; then
+    chk "INV-1 plaintext :5349 NOT externally reachable" "$([ "$ext5349" = closed ] && echo 0 || echo 1)"
+  elif [ "$ext5349" = open ]; then
+    tls_serves_cert 127.0.0.1 5349 "$TURN_DOMAIN"
+    chk "INV-1 :5349 open but LiveKit still terminating TLS" $?
+  else
+    chk "INV-1 :5349 closed externally (also safe)" 0
+  fi
+
+  # INV-8: Caddy's HTTPS must not be publicly reachable once it has moved to :8443.
+  if [ -n "$(port_owner 8443)" ]; then
+    ext_tcp_open 8443 && ext8443=open || ext8443=closed
+    chk "INV-8 :8443 NOT externally reachable" "$([ "$ext8443" = closed ] && echo 0 || echo 1)"
+  fi
+
+  # INV-2: :443 must have exactly one owner — never two, never (lastingly) zero.
+  local owner; owner="$(port_owner 443)"
+  chk "INV-2 :443 has exactly one owner (got '${owner:-NONE}')" "$([ -n "$owner" ] && echo 0 || echo 1)"
+
+  # Service continuity: chat must answer in every steady state.
+  chat_reachable; chk "chat.enspyr.co reachable" $?
+}

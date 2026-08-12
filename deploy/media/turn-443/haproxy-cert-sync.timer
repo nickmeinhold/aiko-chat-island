@@ -1,0 +1,15 @@
+# Fire haproxy-cert-sync hourly (+ shortly after boot). Caddy renews ~30d before expiry, so
+# hourly polling closes the HAProxy-serves-stale-cert gap to <1h — far inside any renewal
+# margin. Cheap: a no-change run is one fingerprint compare. This is the Shape-C form of the
+# task #3 cert-restart timer (sync caddy->haproxy, not restart livekit — external_tls means
+# LiveKit no longer holds the cert).
+[Unit]
+Description=Hourly sync of Caddy turn cert into HAProxy PEM
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

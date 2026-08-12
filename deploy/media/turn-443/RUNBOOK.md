@@ -1,0 +1,164 @@
+# TURN-over-TLS on :443 — build + cutover runbook (enspyr, task #4)
+
+Architecture: [`haproxy.cfg`](haproxy.cfg). Shape C / `external_tls`. See
+`docs/crucible/turn-tls-443-relay/DESIGN.md` for the tempered design + why this beats the
+caddy-l4 mux. **The cutover + rollback are SCRIPTS, not prose** — this runbook orchestrates
+them; it is not the thing you hand-execute on the live front door.
+
+Artifacts in this dir:
+
+| File | Role |
+|---|---|
+| `haproxy.cfg` | the :443 SNI mux (installed to `/etc/haproxy/haproxy.cfg`) |
+| `Caddyfile.mux` | Caddy moved to loopback:8443 + turn cert-issuance block (HTTP-01 forced) |
+| `cutover.sh` | fail-closed, 4-artifact, auto-rollback-on-red live cutover |
+| `rollback.sh` | restores all 4 artifacts; safe to run standalone anytime |
+| `haproxy-cert-sync.sh` + `.service` + `.timer` | the cert-renewal fix (see below) |
+
+## The 4 coupled artifacts (the cage-match P0)
+
+A Shape-C cutover changes **four** pieces of state, and rollback must restore **all four** —
+the earlier "3-artifact rollback" left LiveKit on `external_tls` (**plaintext TURN on public
+:5349**) after a "successful" rollback. The four:
+
+| # | Artifact | Cutover | Rollback |
+|---|---|---|---|
+| 1 | `iptables` :5349 | DROP non-loopback (**first**, before plaintext) | remove DROP (**last**, after TLS restored) |
+| 2 | `livekit.yaml` | `external_tls: true`, drop cert/key, restart | restore `.stock` (TLS on 5349), restart |
+| 3 | `/etc/caddy/Caddyfile` | → `Caddyfile.mux` (loopback:8443) | restore `.stock` (public :443) |
+| 4 | HAProxy | install + start on :443 | stop (frees :443) |
+
+`rollback.sh` orders these so **plaintext TURN is never publicly reachable** and **:443 is
+never owned by two processes**: stop HAProxy → Caddy back on :443 → LiveKit back to TLS →
+**hard-gate (openssl handshake on 5349 must present a cert)** → only then reopen the firewall.
+
+## Ports after cutover
+
+| Port | Before | After |
+|---|---|---|
+| `:443` (public) | Caddy (all TLS) | **HAProxy** — SNI mux |
+| `:8443` | — | Caddy HTTPS (moved off :443); **firewalled to loopback** (only HAProxy reaches it) |
+| `127.0.0.1:8444` | — | HAProxy turn-TLS terminator (holds turn cert) |
+| `:5349` | LiveKit TURN/TLS (own cert) | LiveKit TURN **plaintext** (external_tls), **loopback-firewalled** |
+| `:80` | Caddy (HTTP-01) | Caddy (HTTP-01) — **unchanged**, the renewal path |
+| `:3478/udp`, relay 50000-60000 | LiveKit | unchanged |
+
+## Cert renewal (the P1 time-bomb fix)
+
+Once HAProxy owns :443, a TLS-ALPN-01 renewal for `turn.enspyr.co` would hit HAProxy and
+fail silently → cert rots → :443 TURNS dies ~89d out. Closed two ways:
+
+1. **Deterministic HTTP-01.** `Caddyfile.mux` keeps a loopback-only `turn.enspyr.co` block
+   with `tls { issuer acme { disable_tlsalpn_challenge } }` — Caddy stays the ACME client and
+   renews via HTTP-01 on :80 (untouched). Keeping the block also prevents "issuance dies when
+   you unstub" (Tesla).
+2. **`haproxy-cert-sync.timer`** (hourly, fingerprint-gated) rebuilds HAProxy's PEM from
+   Caddy's renewed cert + `systemctl reload haproxy` (graceful). This is the Shape-C form of
+   task #3's cert timer: sync caddy→haproxy, **not** restart LiveKit (external_tls means
+   LiveKit no longer holds the cert). The PEM is written `0640 root:haproxy` via atomic
+   rename — the turn key crosses into haproxy's uid space locked, never world-readable (Tesla F8).
+
+## Build + PROVE OFF THE LIVE :443 (do ALL of this before running cutover.sh)
+
+**STATUS 2026-08-12: DONE.** A full disposable-VM rehearsal ran the real scripts against real
+systemd/iptables/Caddy/HAProxy/LiveKit + a real ACME server: 4 reboot-at-checkpoint runs, 5
+rollback runs, 3 fault injections, and a genuine TURN-over-TLS allocation through the mux.
+See [`rehearsal/RESULTS.md`](rehearsal/RESULTS.md) for the evidence, the two findings, and the
+honest scope. Harness: [`rehearsal/`](rehearsal/). **F1 (the B3 gate fails open on
+`turns:443` being dead) should be fixed before the live cutover — it is the check that would
+tell you the cutover failed.**
+
+`cutover.sh` refuses to run unless `OFF443_PROVEN=1` — you assert you have:
+
+1. `haproxy -c -f haproxy.cfg` → exit 0 (config check, no bind). ✅ validated off-prod.
+2. Staged a full parallel chain on ALT ports (HAProxy fe443→`:9443`, terminator `:8444`, a
+   **scratch** LiveKit / scratch config — NEVER flip the live process as a rehearsal oscillator,
+   Tesla) and proven a real TURNS allocation THROUGH `:9443` with `b3_relay_probe` pointed at
+   the alt port.
+3. Negative tests on the alt chain: chat + livekit SNI passthrough still 200/WSS; unknown SNI;
+   `acme-tls/1` ALPN; malformed/slow ClientHello; non-TLS junk (rejected); concurrent WSS during
+   a HAProxy reload.
+4. Cert-sync rehearsal: force a `turn.enspyr.co` renew, run `haproxy-cert-sync.sh`, confirm the
+   served-cert fingerprint on the alt chain == Caddy's store.
+
+## Cutover (the ONE irreversible step)
+
+```bash
+sudo OFF443_PROVEN=1 bash deploy/media/turn-443/cutover.sh
+```
+
+It runs the sequenced state machine (Phase 0 preconditions → stage backups → 2.1 firewall
+5349 → 2.2 flip LiveKit → 2.3 move Caddy → 2.4 start HAProxy → Phase 3 on-box verify → Phase 4
+enable cert-sync), auto-rolling-back on any verify failure. It measures + logs the :443 dark
+window (Caddy-release → HAProxy-bind).
+
+## Acceptance gate (run from OFF-BOX after cutover.sh reports green)
+
+Run the probe with the `turns:443` endpoint **pinned**, so "UNREACHABLE → ALLOCATED" is
+enforced by the tool rather than promised by the operator:
+
+```bash
+B3_REQUIRE_ENDPOINT="tls:${TURN_DOMAIN}:443" B3_EXPECT_HOST="$TURN_DOMAIN" \
+  python3 deploy/media/b3_relay_probe.py     # exit 0 = ALLOCATED; exit 2 = BLOCK
+```
+
+Without that pin the probe returns **OK/exit 0 even when `turns:443` is dead** — it treats an
+un-allocatable endpoint as "not a relay vector, surfaced" and certifies on the UDP endpoint
+alone. That is correct for its security question and fail-open for this one; the task #6
+rehearsal caught it empirically (`rehearsal/RESULTS.md` F1). **Pin it, or the acceptance gate
+will green-light exactly the failure this cutover exists to fix.**
+
+Expect: `turns:443` ALLOCATED, UDP relay still allocates, all RFC1918/link-local/loopback/CGNAT
+sentinels still 403, chat + signaling green.
+**If it fails: `sudo bash deploy/media/turn-443/rollback.sh`.**
+
+> **Dependency:** `b3_relay_probe.py` lives on PR#129 (`feat/b3-behavioral-probe`), which is
+> stacked on PR#128. Until both merge, `main` still carries the older `TURN_B3_PRIVATE_DENY_CMD`
+> gate — so merge #128 → #129 before the cutover, or you are certifying production with tooling
+> that only exists in a PR.
+
+Also prove INV-1 from **off-box** (the on-box guard is v4+v6 host-INPUT, valid only because
+LiveKit is host-networked — cutover asserts that): from your laptop,
+`openssl s_client -connect <enspyr-public-ip>:5349` must **fail/refuse** (public plaintext :5349
+is closed). A localhost probe can't prove external closure; this can.
+
+**IPv6 (pick-a-universe, Kelvin):** the box has NO public IPv6 today, so cutover's `ip6tables`
+rules are proactive future-proofing (harmless now). The off-box v6 probe is therefore
+**conditional but MANDATORY-if-present**: if `ip -6 addr show scope global` on the box is ever
+non-empty, the off-box `openssl -6 -connect [<v6>]:5349` closure proof becomes a **blocking**
+sign-off step — a public v6 plaintext endpoint must never exist unverified.
+
+## If the cutover dies mid-flight (recovery, not theory)
+
+- **`cutover.sh` hard-killed between 2.3 and 2.4** (Caddy has released `:443`, HAProxy hasn't
+  taken it): `:443` is UNBOUND and chat is down, and **nothing will fix it on its own** — the
+  unit is enabled but not started. Recover with `sudo systemctl start haproxy` (or reboot: the
+  persisted state is boot-correct, proven in the rehearsal). This is the one window with no
+  watchdog; it is ~100 ms wide in a normal run.
+- **A clean rollback does NOT mean a healthy system.** `rollback.sh` restores the `.stock`
+  files, i.e. *whatever was there when cutover started* — if that was already broken, you get
+  it back, broken. Rollback's hard-gate protects the security invariant (it refuses to reopen
+  the `:5349` firewall unless TLS is genuinely being presented), not service health. Read its
+  final lines: if it says it refused to reopen the firewall, TURN is down-but-closed and needs
+  a hand.
+
+## Known windows + limitations (named, not hidden)
+
+- **Dual dark window during cutover (2.1→2.4):** once :5349 is firewalled (2.1) and before HAProxy
+  binds :443 (2.4), BOTH TLS-TURN ingresses are down (public :5349 closed, :443 not yet TURNS).
+  This is intentional blast, not a bug — the advertised `turns:443` is already dead pre-cutover, so
+  no working relay is interrupted. The separate :443 *reload→bind* gap (chat/signaling) is the
+  millisecond dark window `cutover.sh` measures and logs.
+- **Client IP on the non-turn path is preserved via PROXY protocol** (HAProxy `send-proxy-v2` →
+  Caddy `:8443` `proxy_protocol`), so the gateway's per-IP auth rate limiter still sees real IPs.
+  **The TURN path (`be_livekit_plain`) does NOT send PROXY protocol** — LiveKit's embedded TURN
+  isn't configured to trust it, so LiveKit sees the relay client as `127.0.0.1`. TURN *allocation*
+  works regardless; any LiveKit-side per-source-IP logic on the relay is the accepted Shape-C tax
+  (add `send-proxy` there only if LiveKit is later configured to expect it).
+
+## Gate
+
+**Code cage-match this config + the cutover/rollback scripts before the live cutover** (the
+design temper does not cover the implementation). Round 1 (2026-08-12) returned unanimous
+REQUEST_CHANGES on the prose-only version; this revision ships the scripts + fixes — re-run
+the cage-match on it before deploying.
