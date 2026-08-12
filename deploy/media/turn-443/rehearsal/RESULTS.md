@@ -59,10 +59,20 @@ This is the same fail-open class rounds 1–2 of the #129 cage-match caught, one
 probe is sound as a *security* assertion (does the relay deny RFC1918) and fails open as a
 *liveness* assertion (does the relay exist).
 
-**Fix:** an opt-in required-endpoint assertion — e.g. `B3_REQUIRE_ENDPOINT=tls:<domain>:443`
-which BLOCKs when that endpoint is not in `tested`. The cutover gate then passes it, and
-"UNREACHABLE → ALLOCATED" becomes something the tool enforces instead of something the
-operator promises. Filed as a task against PR#129's branch.
+**FIXED** 2026-08-12 on `feat/b3-behavioral-probe` (`1cdf35a`): opt-in `B3_REQUIRE_ENDPOINT`
+(`<transport>[:<host>][:<port>]`, `*` wildcards, matched on parsed fields so an IPv6 host can't
+be mis-split) BLOCKs when a pinned endpoint is absent from `tested`. Security semantics
+untouched. RED/GREEN proven in this rig with the guard as the only variable, against a
+`turns:443` that fails exactly as the live islands do today (`TimeoutError`):
+
+| rig state | guard | verdict |
+|---|---|---|
+| `turns:443` dead | off | `OK` / exit 0 — **the bug, reproduced** |
+| `turns:443` dead | on | `BLOCK` / exit 2 |
+| `turns:443` live | on | `OK` / exit 0 — no false-blocking |
+
+Plus 10 unit cases on the matcher. Standup deliberately does **not** pin it (turns:443 is dead
+on both islands until task #4 lands; pinning there would block every standup on a known gap).
 
 ### F2 — a SIGKILL between 2.3 and 2.4 leaves `:443` unbound with no watchdog (MEDIUM)
 

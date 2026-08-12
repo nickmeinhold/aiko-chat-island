@@ -94,9 +94,28 @@ window (Caddy-release → HAProxy-bind).
 
 ## Acceptance gate (run from OFF-BOX after cutover.sh reports green)
 
-`deploy/media/b3_relay_probe.py` against enspyr must flip `turns:443` `UNREACHABLE → ALLOCATED`,
-UDP relay still allocates, all RFC1918/link-local/loopback/CGNAT sentinels still 403, chat +
-signaling green. **If it fails: `sudo bash deploy/media/turn-443/rollback.sh`.**
+Run the probe with the `turns:443` endpoint **pinned**, so "UNREACHABLE → ALLOCATED" is
+enforced by the tool rather than promised by the operator:
+
+```bash
+B3_REQUIRE_ENDPOINT="tls:${TURN_DOMAIN}:443" B3_EXPECT_HOST="$TURN_DOMAIN" \
+  python3 deploy/media/b3_relay_probe.py     # exit 0 = ALLOCATED; exit 2 = BLOCK
+```
+
+Without that pin the probe returns **OK/exit 0 even when `turns:443` is dead** — it treats an
+un-allocatable endpoint as "not a relay vector, surfaced" and certifies on the UDP endpoint
+alone. That is correct for its security question and fail-open for this one; the task #6
+rehearsal caught it empirically (`rehearsal/RESULTS.md` F1). **Pin it, or the acceptance gate
+will green-light exactly the failure this cutover exists to fix.**
+
+Expect: `turns:443` ALLOCATED, UDP relay still allocates, all RFC1918/link-local/loopback/CGNAT
+sentinels still 403, chat + signaling green.
+**If it fails: `sudo bash deploy/media/turn-443/rollback.sh`.**
+
+> **Dependency:** `b3_relay_probe.py` lives on PR#129 (`feat/b3-behavioral-probe`), which is
+> stacked on PR#128. Until both merge, `main` still carries the older `TURN_B3_PRIVATE_DENY_CMD`
+> gate — so merge #128 → #129 before the cutover, or you are certifying production with tooling
+> that only exists in a PR.
 
 Also prove INV-1 from **off-box** (the on-box guard is v4+v6 host-INPUT, valid only because
 LiveKit is host-networked — cutover asserts that): from your laptop,
