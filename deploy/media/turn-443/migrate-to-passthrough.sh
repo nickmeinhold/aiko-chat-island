@@ -22,7 +22,10 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 TURN_DOMAIN="${TURN_DOMAIN:?set TURN_DOMAIN (e.g. turn.enspyr.co)}"
-LIVEKIT_DIR="${LIVEKIT_DIR:-$HOME/apps/livekit}"
+# No $HOME default: this runs under sudo, where $HOME is /root, and "~/apps/livekit" would
+# silently resolve to a path that does not exist — or worse, on a box where it does. Both this
+# and TURN_DOMAIN are required and unguessable on purpose.
+LIVEKIT_DIR="${LIVEKIT_DIR:?set LIVEKIT_DIR (the dir holding livekit.yaml + docker-compose.yml)}"
 TURN_TLS_PORT="${TURN_TLS_PORT:-5349}"
 LK_YAML="$LIVEKIT_DIR/livekit.yaml"
 HA_CFG=/etc/haproxy/haproxy.cfg
@@ -130,20 +133,47 @@ log "PHASE 2 — render + install the passthrough haproxy.cfg (graceful reload, 
 cp -a "$HA_CFG" "$HA_CFG$STOCK_SUFFIX"
 
 sed "s/@@TURN_DOMAIN@@/${TURN_DOMAIN}/g" "$HERE/haproxy.cfg.tmpl" > "$HA_CFG.new"
-grep -q '@@' "$HA_CFG.new" && { rm -f "$HA_CFG.new"; die "unrendered placeholder left in haproxy.cfg"; }
-grep -qi 'ssl crt' "$HA_CFG.new" && { rm -f "$HA_CFG.new"; die "rendered config still terminates TLS — wrong template"; }
+# These two guards fire BEFORE haproxy.cfg is replaced, but NOT before Phase 1 mutated LiveKit —
+# so they must unwind LiveKit, and must not use die()'s "nothing mutated" wording. (The stock
+# haproxy.cfg is still in place here, which is why this is restore_livekit and not restore_both.)
+if grep -q '@@' "$HA_CFG.new"; then
+  rm -f "$HA_CFG.new"; rm -f "$HA_CFG$STOCK_SUFFIX"; restore_livekit
+  die "unrendered placeholder left in the rendered haproxy.cfg (LiveKit restored)"
+fi
+if grep -qi 'ssl crt' "$HA_CFG.new"; then
+  rm -f "$HA_CFG.new"; rm -f "$HA_CFG$STOCK_SUFFIX"; restore_livekit
+  die "rendered config still terminates TLS — wrong template (LiveKit restored)"
+fi
 mv -f "$HA_CFG.new" "$HA_CFG"
 
-restore_haproxy() {
+# Restoring HAProxy ALONE would be worse than doing nothing. By this point LiveKit has already
+# been switched to terminate its own TLS, so putting back the external_tls haproxy.cfg — which
+# forwards PLAINTEXT to :5349 — pairs a plaintext-speaking proxy with a TLS-expecting backend
+# and TURN is dead, with both halves individually looking "restored". The two are one coupled
+# artifact for rollback purposes even though they are two files.
+restore_both() {
   log "  restoring the previous haproxy.cfg and reloading"
   mv -f "$HA_CFG$STOCK_SUFFIX" "$HA_CFG"
   systemctl reload haproxy || systemctl restart haproxy || true
+  restore_livekit
+  # Verify the pair is actually back in agreement rather than assuming it: a failed restore that
+  # reports success is how you find out at 3am.
+  for _ in $(seq 1 30); do
+    if echo | timeout 6 openssl s_client -connect "127.0.0.1:443" -servername "$TURN_DOMAIN" 2>/dev/null \
+         | openssl x509 -noout -checkhost "$TURN_DOMAIN" >/dev/null 2>&1; then
+      log "  restore verified: turn TLS answers through :443 again"; return 0
+    fi
+    sleep 1
+  done
+  echo "[passthrough] WARNING: restored both artifacts but turn TLS does NOT answer through :443." >&2
+  echo "  The box is in the PRE-migration shape on disk but unverified in behaviour. Check" >&2
+  echo "  'systemctl status haproxy', the livekit container, and $HA_CFG before walking away." >&2
 }
 
-haproxy -c -f "$HA_CFG" >/dev/null 2>&1 || { restore_haproxy; die "haproxy -c rejected the rendered config"; }
-systemctl reload haproxy || { restore_haproxy; die "haproxy reload failed"; }
+haproxy -c -f "$HA_CFG" >/dev/null 2>&1 || { restore_both; die "haproxy -c rejected the rendered config"; }
+systemctl reload haproxy || { restore_both; die "haproxy reload failed"; }
 
-listening 443 || { restore_haproxy; die ":443 is not bound after the reload"; }
+listening 443 || { restore_both; die ":443 is not bound after the reload"; }
 
 log "  verifying a real TLS handshake for $TURN_DOMAIN THROUGH :443"
 ok=0
@@ -152,7 +182,7 @@ for _ in $(seq 1 15); do
        | openssl x509 -noout -checkhost "$TURN_DOMAIN" >/dev/null 2>&1; then ok=1; break; fi
   sleep 1
 done
-[ "$ok" = 1 ] || { restore_haproxy; die "no valid $TURN_DOMAIN handshake through :443 after the swap"; }
+[ "$ok" = 1 ] || { restore_both; die "no valid $TURN_DOMAIN handshake through :443 after the swap"; }
 log "PHASE 2 OK — :443 passes turn SNI straight to LiveKit"
 
 # ============================ PHASE 3 — decommission cert-sync ==============================
