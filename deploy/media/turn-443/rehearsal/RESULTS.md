@@ -283,3 +283,46 @@ The rig previously **could not** complete a relay-only WebRTC call at all: its S
 RFC1918 address, which the TURN relay correctly refuses as a peer. `provision.sh` now aliases a
 non-private address (`203.0.113.5`, TEST-NET-3) and points `node_ip` at it, persisted through
 reboot. The rig can now run the real-client relay proof end to end.
+
+## migrate-to-passthrough.sh — rehearsed against enspyr's ACTUAL current state
+
+The cutover path is the easy one to rehearse; the risky artifact is the one that runs on the
+**live, working** island. So the rig was driven backwards into enspyr's exact present shape —
+the pre-task-#8 `cutover.sh` and `haproxy-cert-sync.*` restored from git at `92d2036` and run
+for real, producing `external_tls: true`, HAProxy terminating on `:443`, plaintext `:5349`
+firewalled, cert-sync timer active — and then migrated forward.
+
+| claim | result |
+|---|---|
+| Phase 0 reads the cert **from inside the container** | ✅ passed on a correct mount |
+| Phase 1 `livekit.yaml` edit is minimal + scoped | ✅ **3-line** diff (`external_tls` out, `cert_file`/`key_file` in); nothing else touched |
+| Phase 1 verifies by cert **subject**, not "a handshake happened" | ✅ |
+| **no dark window on `:443`** | ✅ `haproxy` `NRestarts: 0`, `:443` bound continuously — a graceful reload, not a restart |
+| Phase 3 removes cert-sync entirely | ✅ 0 unit files, 0 files left in `/etc/haproxy/certs`, PEM **shredded** |
+| Phase 4 renewal-ownership gate | ✅ |
+| no residue | ✅ both `.pre-passthrough` staging files consumed |
+| B3 pinned `tls:*:443` | ✅ OK / exit 0 |
+| real Chromium client, UDP blocked | ✅ `relay/tls`, exit 0 |
+
+### The B3 gate BLOCKed first, and it was right to
+
+The first post-migration gate run returned **`BLOCK` / exit 2**, not OK. Cause:
+`SSLCertVerificationError` — Pebble mints a new issuance root on every container start, the
+guest had rebooted during the INV-3 test, and the system trust store held a root that no longer
+signed anything. A rig artifact, not a migration fault.
+
+What matters is the behaviour: the probe **refused to certify** on the strength of the working
+`udp:3478` endpoint alone. That is exactly finding F1's fix (`B3_REQUIRE_ENDPOINT`) doing its
+job on a live run, unprompted — the same run under the pre-F1 probe would have returned OK.
+
+### And one more instrument fail-open, in my own hands
+
+An earlier attempt at this verification reported `B3_EXIT=0` while the probe had not run at all:
+`/tmp` was wiped by the reboot, taking the venv with it, and `$?` after a pipeline reports the
+status of `cut`, not of the python process. A dead instrument reporting success through a
+pipeline that could only ever print zero.
+
+Fixed twice over: the probe venv now lives in `/opt/probeenv` (survives a reboot), and exit
+status is captured directly rather than through a pipe. **Four fail-opens in one session, every
+one in a measuring device rather than in the thing being measured** — that ratio is a property
+of this verification layer, not a run of bad luck.
