@@ -136,6 +136,36 @@ WantedBy=multi-user.target
 EOF
 systemctl daemon-reload && systemctl enable --now echo-gateway >/dev/null 2>&1
 
+# ------------------------------------------------------------------ SFU address (relay parity)
+# The rig's own address is RFC1918, and LiveKit's TURN relay correctly REFUSES to deliver to an
+# RFC1918 peer (deny_peer_cidrs / the SSRF guard). Since the SFU is itself the relay's peer, a
+# relay-only WebRTC client can NEVER complete a call on a rig addressed this way — the guard
+# fires at the SFU. Production doesn't hit this because the islands have public IPs.
+#
+# Found the hard way (2026-08-14): it presents as "the TURN relay is broken", identical to a
+# real server fault, and is only distinguishable in LiveKit's own log (requestsSent:8 /
+# responsesReceived:0). Alias a non-private address so the SFU looks like a public host to its
+# own relay, and the rig can run the real-client relay proof end to end.
+SFU_IP="${SFU_IP:-203.0.113.5}"     # TEST-NET-3: not private, so not denied; not routable, so inert
+ip addr show dev eth0 | grep -q "$SFU_IP" || ip addr add "${SFU_IP}/32" dev eth0
+# PERSIST it. A bare `ip addr add` is gone after a reboot, and LiveKit keeps advertising the
+# address regardless — so the box serves a node_ip it does not hold, every relay call fails, and
+# every port/cert check stays green. Observed on this rig, exactly once, during a reboot test.
+cat > /etc/systemd/system/sfu-alias.service <<EOF
+[Unit]
+Description=Alias the rehearsal SFU address on eth0 (relay-deny parity)
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'ip addr show dev eth0 | grep -q ${SFU_IP} || ip addr add ${SFU_IP}/32 dev eth0'
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload && systemctl enable --now sfu-alias.service >/dev/null 2>&1
+log "aliased ${SFU_IP} on eth0 as the SFU address (persisted; relay-deny parity with a public island)"
+
 # ------------------------------------------------------------------ LiveKit (mirrors enspyr)
 log "installing LiveKit (host-networked, mirrors enspyr's config)"
 mkdir -p "$LIVEKIT_DIR"
@@ -146,7 +176,7 @@ rtc:
   port_range_start: 7882
   port_range_end: 7892
   use_external_ip: false
-  node_ip: ${VM_IP}
+  node_ip: ${SFU_IP}
   tcp_port: 7881
 turn:
   enabled: true
