@@ -26,8 +26,7 @@ vm()  { limactl shell "$VM" -- sudo bash -c "$1"; }
 sync_artifacts() {
   say "syncing artifacts into $VM:$REMOTE"
   vm "mkdir -p $REMOTE $REMOTE/rehearsal"
-  for f in haproxy.cfg Caddyfile.mux cutover.sh rollback.sh haproxy-cert-sync.sh \
-           haproxy-cert-sync.service haproxy-cert-sync.timer; do
+  for f in haproxy.cfg.tmpl Caddyfile.mux cutover.sh rollback.sh migrate-to-passthrough.sh; do
     limactl copy "$REPO_DIR/$f" "$VM:/tmp/$f" >/dev/null 2>&1 || { echo "copy failed: $f"; exit 1; }
     vm "install -m 0755 /tmp/$f $REMOTE/$f"
   done
@@ -35,6 +34,15 @@ sync_artifacts() {
     limactl copy "$REPO_DIR/rehearsal/$f" "$VM:/tmp/$f" >/dev/null 2>&1
     vm "install -m 0755 /tmp/$f $REMOTE/rehearsal/$f"
   done
+  # cert-restart is now LOAD-BEARING (LiveKit holds the cert and cannot hot-reload it), so the
+  # rig must exercise the real script, not a stand-in. FAULT 1 runs it end to end.
+  vm "mkdir -p /opt/media/lib"
+  for f in cert-restart.sh served-cert-alarm.sh; do
+    limactl copy "$REPO_DIR/../$f" "$VM:/tmp/$f" >/dev/null 2>&1 || { echo "copy failed: $f"; exit 1; }
+    vm "install -m 0755 /tmp/$f /opt/media/$f"
+  done
+  limactl copy "$REPO_DIR/../lib/cert-pair.sh" "$VM:/tmp/cert-pair.sh" >/dev/null 2>&1
+  vm "install -m 0644 /tmp/cert-pair.sh /opt/media/lib/cert-pair.sh"
   vm "python3 - <<'PY'
 p='$REMOTE/Caddyfile.mux'; s=open(p).read()
 subs=[('{\n    https_port 8443',
@@ -48,19 +56,34 @@ open(p,'w').write(s)
 print('  Caddyfile.mux patched for Pebble (2/2 substitutions asserted)')
 PY"
   vm "caddy validate --config $REMOTE/Caddyfile.mux --adapter caddyfile >/dev/null 2>&1 && echo '  Caddyfile.mux validates' || echo '  WARN Caddyfile.mux failed validate'"
-  # NOTE: `haproxy -c` stats the turn PEM, so it legitimately FAILS before cutover has built it.
-  # (That dependency is itself INV-4's teeth: no PEM => haproxy cannot even start.) Report which
-  # of the two situations we are in rather than printing a scary-but-expected warning.
-  vm "if haproxy -c -f $REMOTE/haproxy.cfg >/dev/null 2>&1; then echo '  haproxy.cfg config-check OK'; \
-      elif [ ! -s /etc/haproxy/certs/${TURN_DOMAIN:-turn.enspyr.co}.pem ]; then echo '  haproxy.cfg config-check deferred (turn PEM not built yet — expected pre-cutover)'; \
-      else echo '  WARN haproxy.cfg config-check FAILED with a PEM present'; fi"
+  # Under passthrough the config references NO cert, so `haproxy -c` is unconditionally
+  # checkable — no more "deferred until the PEM exists" branch, which was itself a symptom:
+  # a config you cannot validate until a side-effect has run is a config with a hidden
+  # dependency. Render the template first, exactly as cutover.sh will.
+  vm "sed 's/@@TURN_DOMAIN@@/${TURN_DOMAIN:-turn.enspyr.co}/g' $REMOTE/haproxy.cfg.tmpl > $REMOTE/haproxy.cfg.rendered
+      if grep -q '@@' $REMOTE/haproxy.cfg.rendered; then echo '  WARN unrendered placeholder in haproxy.cfg'; fi
+      if haproxy -c -f $REMOTE/haproxy.cfg.rendered >/dev/null 2>&1; then echo '  haproxy.cfg (rendered) config-check OK'; \
+      else echo '  WARN haproxy.cfg config-check FAILED'; haproxy -c -f $REMOTE/haproxy.cfg.rendered 2>&1 | tail -3; fi"
 }
 
 report() { vm "cd $REMOTE/rehearsal && source ./checks.sh && state_report && assert_safety '$1' && echo \"  RESULT pass=\$PASS fail=\$FAIL\" && [ \$FAIL -eq 0 ]"; }
 
+# assert_safety answers "is this state SAFE to be in", which is deliberately independent of
+# "did the thing we ran WORK". Those are different questions and conflating them is a fail-open:
+# a cutover that aborted at line 1 leaves a perfectly safe CP0 box, and reporting that as
+# `post-cutover pass=4 fail=0` is the F1 class of bug one layer up — the gate certifying the
+# very outcome it exists to detect. Caught on this rig 2026-08-14, by exactly that output.
+# So SUCCESS is asserted separately, by who owns :443.
+assert_muxed()   { vm "[ -n \"\$(ss -tlnpH 'sport = :443' | grep haproxy)\" ]" \
+                     && echo "  SUCCESS haproxy owns :443 (the cutover actually happened)" \
+                     || { echo "  FAIL :443 is not owned by haproxy — the cutover did NOT take effect"; return 1; }; }
+assert_unmuxed() { vm "[ -n \"\$(ss -tlnpH 'sport = :443' | grep caddy)\" ]" \
+                     && echo "  SUCCESS caddy owns :443 (the rollback actually happened)" \
+                     || { echo "  FAIL :443 is not owned by caddy — the rollback did NOT take effect"; return 1; }; }
+
 run_cutover() { # run_cutover [checkpoint]
   local stop="${1:-}"
-  vm "cd $REMOTE && OFF443_PROVEN=1 REHEARSAL=1 CUTOVER_STOP_AFTER='$stop' CADDY_CERT_DIR=/opt/turncerts bash cutover.sh 2>&1 | tail -25; exit \${PIPESTATUS[0]}"
+  vm "cd $REMOTE && OFF443_PROVEN=1 REHEARSAL=1 CUTOVER_STOP_AFTER='$stop' TURN_DOMAIN='${TURN_DOMAIN:-turn.enspyr.co}' CADDY_CERT_DIR=/opt/turncerts bash cutover.sh 2>&1 | tail -25; exit \${PIPESTATUS[0]}"
 }
 
 wait_for_vm() {
@@ -122,12 +145,15 @@ case "${1:-}" in
     fi
     say "running rollback.sh"
     vm "cd $REMOTE && CADDY_CERT_DIR=/opt/turncerts bash rollback.sh 2>&1 | tail -20"
-    say "did all four artifacts come back?"
+    # livekit.yaml stays in this snapshot on purpose even though the cutover never touches it:
+    # "the file we promise not to modify is byte-identical afterwards" is a claim worth checking,
+    # not assuming. It is the cheapest possible regression test for the whole shape.
+    say "did both artifacts come back byte-identical (and livekit.yaml stay untouched)?"
     vm "sha256sum -c /tmp/pre-cutover.sha 2>&1 | sed 's/^/  /'"
-    report "$CP post-rollback"
+    report "$CP post-rollback" && assert_unmuxed
     say "IDEMPOTENCY — running rollback.sh a second time"
     vm "cd $REMOTE && CADDY_CERT_DIR=/opt/turncerts bash rollback.sh >/dev/null 2>&1; echo \"  second run exit=\$?\""
-    report "$CP post-rollback-x2"
+    report "$CP post-rollback-x2" && assert_unmuxed
     ;;
 
   fault-livekit)
@@ -150,7 +176,8 @@ case "${1:-}" in
     vm "cd $REMOTE/rehearsal && bash reset.sh" >/dev/null || { echo "RESET FAILED — aborting test"; exit 1; }
     run_cutover ""; rc=$?
     echo "cutover exit=$rc"
-    report "post-cutover"
+    [ $rc -eq 0 ] || { echo "FULL CUTOVER FAILED (exit $rc) — not reporting a state as if it succeeded"; exit 1; }
+    report "post-cutover" && assert_muxed
     ;;
 
   *) grep '^#   \./drive.sh' "$0" | sed 's/^# //' ;;

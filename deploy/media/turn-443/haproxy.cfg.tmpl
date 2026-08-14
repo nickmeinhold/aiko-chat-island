@@ -1,0 +1,105 @@
+# HAProxy :443 SNI mux for TURN-over-TLS (task #4; PASSTHROUGH shape since task #8).
+#
+# WHY: LiveKit advertises turns:<turn-domain>:443 (hardcoded, roommanager.go), but Caddy owns
+# :443 for chat + LiveKit-WSS. This mux peeks the ClientHello, peels ONLY the turn SNI off :443
+# and forwards that stream RAW to LiveKit's own TLS TURN listener; every other SNI is
+# raw-passthrough to stock Caddy (moved to :8443, firewalled to loopback — NOT via a Caddy
+# `bind 127.0.0.1`, which would also make :80 loopback and break HTTP-01), untouched.
+#
+# HAProxy HOLDS NO CERTIFICATE AND SEES NO PLAINTEXT. The client's TLS session is end-to-end
+# with LiveKit. That is the whole point of the shape: every security-critical invariant the
+# earlier external_tls shape carried existed to manage a plaintext window that this shape
+# never opens. See the be_turn comment below for the full list of what it deleted.
+#
+# CERT: LiveKit reads Caddy's live cert store directly (compose mounts caddy's
+# certificates/.../<turn-domain> at /certs:ro; livekit.yaml cert_file/key_file). Caddy remains
+# the sole ACME client, from a site block with `disable_tlsalpn_challenge` so renewal is
+# deterministically HTTP-01 on :80 (TLS-ALPN on :443 would hit HAProxy — Tesla/Carnot
+# fail-closed-ACME finding). LiveKit has no cert hot-reload, so a renewal needs a LiveKit
+# restart: that is cert-restart.{sh,service,timer}, two-clock guarded so it can't thrash.
+#
+# DEPLOY:
+#   - a box where HAProxy ALREADY owns :443 (enspyr) → migrate-to-passthrough.sh. Backend swap
+#     only, graceful reload, NO dark window on :443.
+#   - a box where Caddy still owns :443 (imagineering) → cutover.sh / rollback.sh.
+# Never bind :443 here by hand while Caddy still owns it (port clash).
+
+global
+    maxconn 8192
+    log /dev/log local0
+    ssl-default-bind-options ssl-min-ver TLSv1.2
+
+defaults
+    mode tcp
+    log global
+    option tcplog
+    timeout connect 5s
+    # 30m inactivity (Kelvin/Tesla, now DATA-backed): the earlier 1h was a guess; the real live
+    # traffic keeps connections active far more often than that — WebRTC STUN consent runs ~every
+    # 5s on an active relay, TURN allocations refresh well inside RFC5766's 10-minute lifetime, and
+    # LiveKit WSS pings are on the order of seconds. So 30m is ~3x the longest legit idle (the 10m
+    # TURN refresh) — comfortably above any live-but-quiet session, while halving the window a
+    # dead-idle connection can hold a slot toward maxconn (8192). The fe443 non-hello reject already
+    # bounds UN-established slowloris; this bounds the established-then-idle case.
+    timeout client  30m
+    timeout server  30m
+
+# ---- public :443 front door — peek ClientHello SNI, route by it (no termination here) ----
+# NO per-IP conn-rate stick-table here (deliberately): this is a SHARED acceptor fronting chat +
+# LiveKit-WSS + TURN, and a per-source connection cap would reject legit users behind a corporate
+# NAT / campus / CGNAT egress across ALL of those services at once (Carnot P2). The slowloris
+# surface the 1h timeouts open is instead bounded by the `tcp-request content reject` below —
+# a client that never completes a ClientHello within inspect-delay is dropped, so it can't hold a
+# slot for an hour. maxconn (global) caps total. If prod telemetry later shows real abuse, add a
+# targeted stick-table with a production-derived threshold — not a blind one on the shared door.
+frontend fe443
+    bind :443
+    tcp-request inspect-delay 5s
+    # Accept only once a real TLS ClientHello has arrived; REJECT anything else after the
+    # delay (non-TLS junk, a slow/dribbled hello, a scanner) instead of letting it fall
+    # through into Caddy and sit on a slot (Tesla/Carnot no-SNI/non-hello harmonic).
+    tcp-request content accept if { req_ssl_hello_type 1 }
+    tcp-request content reject
+
+    # @@TURN_DOMAIN@@ → raw passthrough to LiveKit. Everything else (incl. a valid no-SNI hello)
+    # → raw passthrough to Caddy. no-SNI-to-Caddy is the DOCUMENTED default policy, not an
+    # accident: Caddy answers/refuses on its own terms; no unmatched-SNI blackhole.
+    use_backend be_turn if { req_ssl_sni -i @@TURN_DOMAIN@@ }
+    default_backend be_caddy
+
+# everything else (chat.enspyr.co, livekit.enspyr.co) → RAW TLS passthrough to Caddy, which
+# terminates + manages those certs. Caddy is moved to :8443 (global `https_port 8443`, :8443
+# firewalled to loopback) by cutover.sh.
+#
+# send-proxy-v2 (Carnot P1): without it Caddy — and the gateway app behind it — would see every
+# client as 127.0.0.1 (HAProxy), silently defeating the gateway's per-IP auth rate limiter, X-
+# Forwarded-For, and any IP-based control. The PROXY v2 header carries the real client address;
+# Caddy's :8443 listener is configured (Caddyfile.mux) to read it. check-send-proxy makes the
+# HEALTH CHECK send the header too — Caddy expects it on every :8443 connection, so a plain
+# (headerless) check would be rejected and mark the backend down.
+backend be_caddy
+    server caddy 127.0.0.1:8443 check check-send-proxy send-proxy-v2
+
+# ---- @@TURN_DOMAIN@@ → RAW PASSTHROUGH to LiveKit's own TLS listener ----
+# HAProxy terminates NOTHING here: it forwards the byte stream it already peeked, and LiveKit
+# (pion/turn, cert_file/key_file) completes the handshake with the client end-to-end.
+#
+# This replaced a terminating frontend + a plaintext backend on 2026-08-14, after the task #8
+# falsifier proved a real Chromium client relays through passthrough (selected pair relay/tls,
+# 11429 B, with the UDP-unblocked control correctly failing). What that deleted, in full:
+#   - haproxy-cert-sync.{sh,service,timer} and the PEM it maintained
+#   - the cert/key crossing caddy's uid into haproxy's (0640 root:haproxy)
+#   - the .needs-reload sentinel and its two-planes logic — the ROUND-4 P0
+#   - plaintext TURN on :5349, therefore INV-1, therefore the v4+v6 DROPs, therefore the
+#     hard netfilter-persistent dependency and the host-networking assertion
+#   - the ordering constraint (firewall BEFORE flip) that shaped the whole cutover
+#   - mutating livekit.yaml at all: the awk edit, the 4th backup artifact, the liveness poll,
+#     the ss-owner check and the false-green TLS test
+# The cost it buys back is a LiveKit restart on cert renewal (~4x/year) — cert-restart.sh,
+# which already existed for exactly this and is already cage-matched.
+#
+# `check` is a bare TCP connect: it confirms LiveKit holds :5349, so a turn connection is
+# refused fast rather than forwarded into a dead socket. It deliberately does NOT prove TLS
+# liveness — that is the b3 probe's job with B3_REQUIRE_ENDPOINT pinned (finding F1).
+backend be_turn
+    server livekit 127.0.0.1:5349 check

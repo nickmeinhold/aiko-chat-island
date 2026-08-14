@@ -196,3 +196,90 @@ deletes `haproxy-cert-sync.{sh,service,timer}`, the PEM uid boundary, the `.need
 sentinel, INV-1 and its v4+v6 DROPs, the `netfilter-persistent` dependency, the `livekit.yaml`
 mutation, and the ordering constraint that shapes the entire state machine. What replaces it is
 `cert-restart.sh`, which already exists and is already cage-matched.
+
+---
+
+# Passthrough shape — full rig rehearsal (2026-08-14, task #8 build)
+
+The falsifier above proved passthrough *can* carry a call. This is the shipped artifact running
+the whole state machine on the rig.
+
+## Verdict
+
+| test | result | evidence |
+|---|---|---|
+| full cutover | ✅ | `:443` dark window **90 / 91 / 94 / 95 ms** across four runs; `pass=5 fail=0`; success asserted separately (haproxy owns `:443`) |
+| B3 acceptance gate, `tls:*:443` pinned | ✅ | ALLOCATED through the mux; 5 SSRF sentinels + CGNAT 403; public control 200 before *and* after |
+| real Chromium relay proof through the mux | ✅ | selected pair `relay/tls`, **11425 B ↑ / 1860 B ↓**, UDP blocked so `:443` was the only path |
+| rollback from `done` and `CP4` | ✅ | Caddyfile **byte-identical** to pre-cutover; **`livekit.yaml` byte-identical too** (it is never touched); second run exits 0 and changes nothing |
+| reboot at `done` | ✅ | boots to exactly one `:443` owner (haproxy), Caddy on `:8443`, chat served |
+| fault injections | ✅ | **17/17** — see below |
+
+## Three fail-opens found, all in instruments rather than in the shape
+
+The shape itself behaved. Everything that went wrong today was a *measuring* device, which is
+the third session running where that has been the dominant failure mode.
+
+### 1. The harness certified a cutover that never happened
+
+`cutover.sh` correctly refused to run (no `TURN_DOMAIN`), and `drive.sh` reported
+**`post-cutover ... RESULT pass=5 fail=0`** — over a box still at CP0.
+
+`assert_safety` answers *"is this state safe"*, which is deliberately independent of *"did the
+thing we ran work"*. Conflating them is exactly the F1 class from the last session, one layer
+up: the gate certifying the outcome it exists to detect. Fixed by asserting **success**
+separately (`assert_muxed` / `assert_unmuxed`, by `:443` ownership) and by refusing to report a
+state at all when the cutover exited non-zero.
+
+### 2. A green board over a media plane that could not work
+
+After the reboot test the safety matrix reported `pass=5 fail=0` — while LiveKit was advertising
+`203.0.113.5`, an address the box **no longer held** (the `ip addr add` alias did not survive
+the reboot). Every listener, cert and route check was green; every relay call would have failed.
+
+Ports and certs are not the media path. Added an **ADVERTISED-IDENTITY-IS-HELD** check — the
+SFU's `node_ip` must be an address the box actually has — and RED/GREEN-proved it with the alias
+as the only variable (`fail=1` without, `pass=6` with). The alias is now a persisted unit.
+
+This is task #11's thesis demonstrating itself, unprompted, on the rig.
+
+### 3. My own assertion encoded an assumption the mechanism does not make
+
+FAULT 1 initially failed on *"after cert-restart, :443 serves the NEW cert"*. `cert-restart.sh`
+is a **staleness** guard, not a renewal detector: it fires only once the *served* cert falls
+inside `ALARM_NOTAFTER_DAYS` (14). Caddy renews at ~30 days remaining, so a renewed cert can sit
+on disk unserved for **~16 days**.
+
+Not a bug — that is the anti-thrash design, and the served cert stays valid throughout. But the
+INV-4′ wording ("a renewal reaches what clients see") implied *promptly*, and `haproxy-cert-sync`
+genuinely was prompt. The claim is now stated at its true scope, and the fault drives **both**
+branches: no restart while fresh, propagation once stale (`served cert advanced
+1794476582 → 1794476660`, watermark confirmed).
+
+## Fault injections — 17/17
+
+- **FAULT 1** cert renewal: no-thrash while fresh · re-issue produces a different cert · clients
+  still see the old one (the hazard is real, not theoretical) · propagation once stale.
+- **FAULT 2** cutover refuses a dead passthrough backend: aborts non-zero · says *why* · mutates
+  **nothing** (Caddy still owns `:443`, no `.stock` staged) · re-cutover succeeds once healthy.
+- **FAULT 3** SNI matrix: turn SNI → a cert that is **byte-identical to LiveKit's own on :5349**
+  (the positive proof that this is true passthrough, not something HAProxy synthesised) · chat
+  SNI → Caddy · unknown SNI → byte-identical to Caddy's own answer · a rejected handshake does
+  not poison the acceptor · non-TLS junk dropped.
+
+## A contract I nearly broke
+
+The Phase-4 gate was first written as "`cert-restart.timer` must be active". `cert-restart.service`
+carries an explicit constraint: *BOOTSTRAP-only — island-dedicated boxes, **NEVER** a shared
+multi-tenant box*. That gate would have permanently blocked imagineering, the one box
+`cutover.sh` exists for, and a machine-forced `docker restart livekit` there would bounce matrix,
+outline and a dozen bots. The gate now requires renewal to have a **named owner**
+(`CERT_RENEWAL_OWNER=timer|runbook`) — fail-closed with a declared opt-out, because fail-closed
+with no way through just gets commented out by the first operator who hits it.
+
+## Rig capability added
+
+The rig previously **could not** complete a relay-only WebRTC call at all: its SFU advertised an
+RFC1918 address, which the TURN relay correctly refuses as a peer. `provision.sh` now aliases a
+non-private address (`203.0.113.5`, TEST-NET-3) and points `node_ip` at it, persisted through
+reboot. The rig can now run the real-client relay proof end to end.
