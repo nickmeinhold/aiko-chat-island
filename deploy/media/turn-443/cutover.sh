@@ -98,19 +98,30 @@ command -v netfilter-persistent >/dev/null 2>&1 || die "netfilter-persistent abs
 command -v openssl >/dev/null 2>&1 || die "openssl absent — the turn-TLS verifies would fail OPEN without it"
 command -v ss >/dev/null 2>&1 || die "ss absent — needed for the listener/owner checks"
 
-command -v haproxy >/dev/null 2>&1 || { log "installing haproxy"; apt-get install -y haproxy >/dev/null || die "haproxy install failed"; }
-id haproxy >/dev/null 2>&1 || die "haproxy user missing after install"
-# DISABLE, not just stop (Tesla P0): apt's postinst ENABLES+starts haproxy. With the mux config
-# about to be installed to /etc/haproxy/haproxy.cfg while Caddy still owns public :443, an
-# enabled haproxy would START on any reboot in the Phase-0→2.4 window and double-bind :443. Keep
-# it disabled until 2.4 flips it on intentionally, so no reboot mid-cutover can race the acceptor.
-systemctl disable --now haproxy 2>/dev/null || true
+# ---- WRONG-ENTRYPOINT GUARD — must precede EVERY mutation below (Carnot, HIGH) ----
+# This script is for a box where CADDY owns :443. Run it on an already-muxed box (enspyr) and
+# the old ordering was catastrophic: `systemctl disable --now haproxy` ran FIRST, taking the
+# LIVE :443 mux down, and only THEN did the backend assertion fail — with `die`, not roll(),
+# because Phase 0 is "before any mutation". Except it wasn't: the mutation was the first thing
+# that happened. The script detected the wrong universe only after damaging it.
+#
+# So the entrypoint is asserted from the OUTSIDE, by who owns :443, before anything is touched.
+_p443_owner() { ss -tlnpH 'sport = :443' 2>/dev/null | grep -oE '"[^"]+"' | head -1 | tr -d '"'; }
+P443_OWNER="$(_p443_owner)"
+case "$P443_OWNER" in
+  haproxy)
+    die "HAProxy already owns :443 — this box is already muxed. cutover.sh would take the LIVE front door down before it could tell. Use migrate-to-passthrough.sh instead." ;;
+  caddy|"")
+    log "  :443 owner is '${P443_OWNER:-<unbound>}' — correct entrypoint for cutover.sh" ;;
+  *)
+    die "an unexpected process ('$P443_OWNER') owns :443 — refusing to cut over a topology this script does not model." ;;
+esac
 
-# THE BACKEND MUST BE ALIVE BEFORE WE MOVE THE FRONT DOOR. Under passthrough, HAProxy holds no
-# cert and cannot answer a turn handshake itself — LiveKit must already be serving TLS for
-# TURN_DOMAIN on :5349. Assert it here, in Phase 0, while Caddy still owns :443 and aborting
-# costs nothing. Checking the SUBJECT (not merely "a handshake happened") is what makes this a
-# real check: a dead socket and a wrong-cert socket fail differently, and both must fail here.
+# THE BACKEND MUST BE ALIVE BEFORE WE MOVE THE FRONT DOOR — and, per the above, before we touch
+# ANYTHING. Under passthrough HAProxy holds no cert and cannot answer a turn handshake itself,
+# so LiveKit must already be serving TLS for TURN_DOMAIN on :5349. Checking the SUBJECT (not
+# merely "a handshake happened") is what makes this a real check: a dead socket and a wrong-cert
+# socket fail differently, and both must fail here.
 log "asserting LiveKit already terminates TLS for $TURN_DOMAIN on :5349 (the passthrough backend)"
 _turn_backend_ok() {
   local out
@@ -119,15 +130,28 @@ _turn_backend_ok() {
 }
 _turn_backend_ok || die "LiveKit is not serving a valid $TURN_DOMAIN cert on :5349. Fix livekit.yaml (cert_file/key_file + the /certs mount) BEFORE cutting :443 over — a mux in front of a dead backend is worse than no mux."
 
+# ---- only now may we mutate ----
+command -v haproxy >/dev/null 2>&1 || { log "installing haproxy"; apt-get install -y haproxy >/dev/null || die "haproxy install failed"; }
+id haproxy >/dev/null 2>&1 || die "haproxy user missing after install"
+# DISABLE, not just stop (Tesla P0): apt's postinst ENABLES+starts haproxy. With the mux config
+# about to be installed to /etc/haproxy/haproxy.cfg while Caddy still owns public :443, an
+# enabled haproxy would START on any reboot in the Phase-0→2.4 window and double-bind :443. Keep
+# it disabled until 2.4 flips it on intentionally, so no reboot mid-cutover can race the acceptor.
+# Safe here ONLY because the entrypoint guard above proved HAProxy does not own :443.
+systemctl disable --now haproxy 2>/dev/null || true
+
 # Render the mux config for this box's turn domain and config-check it. Rendering from a single
 # template is deliberate: two hand-maintained per-box configs is exactly the repo↔runtime drift
 # that task #10 was filed for.
+# mktemp, not a predictable /tmp name: this runs as root, and `sed > /tmp/<fixed-name>` in a
+# world-writable dir follows a pre-planted symlink with root privileges.
 log "rendering haproxy.cfg for $TURN_DOMAIN"
-sed "s/@@TURN_DOMAIN@@/${TURN_DOMAIN}/g" "$HAPROXY_TMPL" > /tmp/haproxy.cfg.rendered
-grep -q '@@' /tmp/haproxy.cfg.rendered && die "unrendered placeholder left in the rendered haproxy.cfg"
-grep -qi 'ssl crt' /tmp/haproxy.cfg.rendered && die "rendered config terminates TLS — that is the OLD external_tls template, not passthrough"
-install -D -m 0644 /tmp/haproxy.cfg.rendered /etc/haproxy/haproxy.cfg
-rm -f /tmp/haproxy.cfg.rendered
+RENDERED="$(mktemp /tmp/haproxy.cfg.rendered.XXXXXX)"
+sed "s/@@TURN_DOMAIN@@/${TURN_DOMAIN}/g" "$HAPROXY_TMPL" > "$RENDERED"
+grep -q '@@' "$RENDERED" && { rm -f "$RENDERED"; die "unrendered placeholder left in the rendered haproxy.cfg"; }
+grep -qi 'ssl crt' "$RENDERED" && { rm -f "$RENDERED"; die "rendered config terminates TLS — that is the OLD external_tls template, not passthrough"; }
+install -D -m 0644 "$RENDERED" /etc/haproxy/haproxy.cfg
+rm -f "$RENDERED"
 haproxy -c -f /etc/haproxy/haproxy.cfg >/dev/null 2>&1 || die "haproxy -c failed on /etc/haproxy/haproxy.cfg"
 caddy validate --config "$CADDY_MUX" --adapter caddyfile >/dev/null 2>&1 || die "Caddyfile.mux fails caddy validate"
 # Honest scope (Tesla P2): Phase 0 HAS mutated some prep state — haproxy installed+disabled, the
@@ -210,12 +234,39 @@ sleep 2
 # No -f: we verify the MUX ROUTES the SNI to Caddy and gets a response, not the HTTP status
 # (chat's app / livekit's root may legitimately be non-2xx). A routing/passthrough failure is
 # a curl transport error (exit != 0); an HTTP 404/401 is a successful route.
-curl -sS -o /dev/null --max-time 10 https://chat.enspyr.co/ 2>/dev/null || roll "chat.enspyr.co not routing through the mux"
-curl -sS -o /dev/null --max-time 10 https://livekit.enspyr.co/ 2>/dev/null || roll "livekit.enspyr.co not routing through the mux"
+# --resolve pins the request to THIS box's loopback (Carnot). Previously these were bare
+# `curl https://chat.enspyr.co/` with the domains HARDCODED while only TURN_DOMAIN was
+# templated — so running the cutover on imagineering would have verified the mux by fetching
+# ENSPYR, over the internet, and very likely PASSED. Not a check that fails on the wrong box:
+# a check that succeeds by measuring a different machine. The domains are now derived from
+# TURN_DOMAIN and the request is forced onto the local :443 the cutover just bound.
+CHAT_DOMAIN="${CHAT_DOMAIN:-chat.${TURN_DOMAIN#turn.}}"
+LK_DOMAIN="${LK_DOMAIN:-livekit.${TURN_DOMAIN#turn.}}"
+curl -sS -o /dev/null --max-time 10 --resolve "${CHAT_DOMAIN}:443:127.0.0.1" "https://${CHAT_DOMAIN}/" 2>/dev/null \
+  || roll "${CHAT_DOMAIN} not routing through the mux on THIS box"
+curl -sS -o /dev/null --max-time 10 --resolve "${LK_DOMAIN}:443:127.0.0.1" "https://${LK_DOMAIN}/" 2>/dev/null \
+  || roll "${LK_DOMAIN} not routing through the mux on THIS box"
 # turn:443 must now complete TLS end-to-end with LiveKit through the passthrough. Full TURN
 # allocation is the OFF-BOX b3 probe (acceptance gate below) — on-box we prove TLS terminates.
-timeout 8 openssl s_client -connect "${TURN_DOMAIN}:443" -servername "$TURN_DOMAIN" </dev/null 2>/dev/null \
-  | grep -q "BEGIN CERTIFICATE" || roll "turns:443 did not present a cert through HAProxy"
+#
+# Two corrections here, both Tesla, both the same class as the curl fix above:
+#   1. 127.0.0.1, not "${TURN_DOMAIN}:443". Connecting by NAME leaves the box via DNS and can
+#      certify a DIFFERENT machine's :443 while this acceptor is unbound or misrouted.
+#   2. -checkhost, not `grep BEGIN CERTIFICATE`. "A cert appeared" is satisfied by ANY cert —
+#      including Caddy's, which is exactly what a mis-rendered SNI rule would produce, since
+#      Caddyfile.mux deliberately keeps a turn. site block. Phase 0 of this same script already
+#      argued that the subject is what separates a wrong-cert socket from a right one; Phase 3
+#      was still grepping for a header.
+# The cert must ALSO be byte-identical to what LiveKit serves directly — the positive proof
+# that this is passthrough and not something HAProxy answered on its own.
+_served443_fp() { echo | timeout 8 openssl s_client -connect 127.0.0.1:443 -servername "$TURN_DOMAIN" 2>/dev/null | openssl x509 -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2; }
+_lk5349_fp()    { echo | timeout 8 openssl s_client -connect 127.0.0.1:5349 -servername "$TURN_DOMAIN" 2>/dev/null | openssl x509 -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2; }
+echo | timeout 8 openssl s_client -connect 127.0.0.1:443 -servername "$TURN_DOMAIN" 2>/dev/null \
+  | openssl x509 -noout -checkhost "$TURN_DOMAIN" >/dev/null 2>&1 \
+  || roll "turns:443 on THIS box did not present a cert valid for $TURN_DOMAIN through the mux"
+_fp443="$(_served443_fp)"; _fp5349="$(_lk5349_fp)"
+[ -n "$_fp443" ] && [ "$_fp443" = "$_fp5349" ] \
+  || roll "the cert served on :443 for $TURN_DOMAIN is NOT LiveKit's own cert from :5349 (got '${_fp443:-none}' vs '${_fp5349:-none}') — the turn SNI is being answered by something other than the passthrough backend"
 
 # ============================ PHASE 4 — renewal must be guarded ==============================
 # The cert time-bomb did not disappear with cert-sync, it MOVED. LiveKit holds the cert and has

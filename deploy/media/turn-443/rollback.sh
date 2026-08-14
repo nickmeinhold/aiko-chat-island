@@ -36,6 +36,31 @@ drop_present() {
   return 1
 }
 
+# --- 0. IS THERE ANYTHING TO ROLL BACK TO? (Tesla, HIGH) -------------------------------------
+# This must precede step 1, because step 1 frees :443. The old order was: disable HAProxy
+# FIRST, then discover there is no Caddyfile.stock and die — which on a migrated box (where
+# migrate-to-passthrough.sh consumed the stock file, and Caddy is on :8443 with no config to
+# put it back on :443) means the RUNBOOK's own "rollback anytime" instruction takes the LIVE
+# front door down and leaves it down. Same wrong-entrypoint class Carnot found in cutover.sh,
+# at the other end of the pair: mutate first, discover the wrong universe second.
+#
+# So: if HAProxy currently owns :443 and there is no stock Caddyfile to restore, REFUSE —
+# before touching anything. Taking :443 down with nothing to hand it to is strictly worse
+# than the muxed state we were asked to leave.
+if systemctl is-active --quiet haproxy && [ ! -s "$CADDY_STOCK" ]; then
+  if [ -n "$(ss -tlnpH 'sport = :443' 2>/dev/null | grep haproxy)" ]; then
+    die "HAProxy owns :443 but there is no $CADDY_STOCK to restore Caddy from.
+
+This is the post-migrate-to-passthrough shape: the stock Caddyfile was consumed on a
+successful migration, so there is nothing to roll :443 back TO. Stopping HAProxy here would
+free :443 with no owner and leave chat, signaling and TURN dark.
+
+REFUSING. If you genuinely want to leave the mux, restore a public-:443 Caddyfile by hand
+(drop the global 'https_port 8443' + the :8443 proxy_protocol listener from
+/etc/caddy/Caddyfile), verify 'caddy validate', THEN re-run this script."
+  fi
+fi
+
 # --- 1. Stop AND DISABLE HAProxy, free public :443 ------------------------------------------
 # DISABLE (not just stop): an enabled haproxy would restart on the next reboot and reclaim :443
 # while Caddy is also restored to public :443 → double-bind / outage after an "apparently
