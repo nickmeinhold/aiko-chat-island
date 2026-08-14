@@ -1,7 +1,61 @@
 # DESIGN — TURN-over-TLS on :443 (enspyr media plane)
 
-Status: **RE-CAST v3 (Shape C / `external_tls`) — implementation shipped, CODE cage-match round 1 = REQUEST_CHANGES, reworked, pending re-strike** · Scope: **enspyr only** · Task #4
+Status: **Shape C (`external_tls`) LIVE + media-proven on enspyr (2026-08-13, PR#131)** ·
+imagineering NOT cut over · Scope: **enspyr only** · Task #4
 Companion: [`CRUCIBLE.md`](CRUCIBLE.md) (the case + falsifier), [`RESEARCH.md`](RESEARCH.md) (Heat findings)
+
+---
+
+## ⚠️ PREMISE CORRECTIONS — read before reasoning from anything below
+
+Three claims in this document are **false**, and two of them *selected the architecture*.
+They are corrected here rather than edited away, because the pattern matters more than the
+individual errors.
+
+**1. "caddy-l4 is experimental / last resort" — FALSE.**
+`caddy-l4` is what LiveKit's **own** `livekit/generate` image emits by default: a `caddy.yaml`
+that muxes `:443` by TLS SNI and routes the turn hostname to TURN/5349. Their VM deployment doc
+lists port *"443 — primary HTTPS and TURN/TLS"*. We rejected the vendor's default path as exotic
+while simultaneously adopting a different vendor path (`external_tls` + LB) as blessed.
+The **conclusion** (HAProxy) still stands, but for a reason never written down: caddy-l4 needs an
+`xcaddy` custom build, and on these boxes the distro Caddy package is the ACME authority for
+three live domains — swapping it for a self-built binary puts cert renewal for `chat`,
+`livekit` and `turn` behind our own build pipeline. That is the real rationale; "experimental"
+was not.
+
+**2. "Shape B (second public IP) vetoed on cost — billable reserved IP" — FALSE.**
+Verified 2026-08-14 against the tenancy itself: `reserved-public-ip-count` limit **50**, 1 in
+use; **no public-IP SKU anywhere in 30 days of billing** (12 line items, $0.00); Oracle's VCN
+pricing page carries 13 dollar amounts and zero IPv4 entries. A second reserved public IP is
+**free** and attaches to a secondary private IP on the existing VNIC. The cost veto was
+invented, never checked, and it eliminated the lowest-blast-radius shape from consideration.
+
+**3. "`external_tls: true` is required for a shared `:443`" — FALSE (falsified 2026-08-14).**
+Plain **SNI passthrough** — HAProxy peeking the ClientHello and forwarding the raw stream to
+LiveKit's own TLS TURN listener, holding no certificate at all — carries a real call. Proven on
+the rehearsal rig with a real Chromium WebRTC client, relay-only, UDP to the box blocked:
+selected pair `relay/tls` via `turns:turn.enspyr.co:443?transport=tcp`, **11429 B sent /
+1925 B received**, with the UDP-unblocked control correctly failing the same assertion
+(`relayProtocol=udp`, exit 3). HAProxy's own log shows Chromium's ClientHello routed
+`fe443 → be_turn/lk`, so the long-flagged *"passthrough works for openssl but not a real TURN
+client / ClientHello fragmentation"* risk is **closed by measurement, not argument**.
+Scope limit: the rig uses a private Pebble CA, so that run proves **transport**, not chain
+validation — chain validation is proven separately in production (PR#131, real Let's Encrypt
+cert). Consequence: `external_tls` is a **choice**, not a requirement, and it is the choice
+that creates every plaintext-window invariant in the cutover. See task #8.
+
+**The pattern (this is the finding).** All three are the same failure: a premise held
+confidently, load-bearing on the whole design, and never falsified — while a Phase-0 falsifier
+discipline *existed in this very document* and these slipped past it. Four rounds of adversarial
+review then hardened what the premises had already chosen. Adversarial review is structurally
+**additive**: it asks "what is missing / what breaks / what is unguarded", and can never return
+"this component should not exist." Only a subtractive pass, or a question from outside the
+frame, catches this class.
+
+**What LiveKit's own docs do NOT cover** (so this is not re-litigated as "the vendor solved it"):
+coexistence with the aiko gateway on a shared `:443`, the live multi-artifact cutover and its
+rollback, cert-sync into a separate terminator, and the relay-deny (SSRF) behavioural proof.
+Those four are genuinely ours.
 
 > **Ceremony note (2026-08-12):** the v1 CAST and v2 re-cast sections below are the design
 > AUDIT TRAIL, superseded by RE-CAST v3. The shipped artifact is Shape C (`external_tls`), not
@@ -17,7 +71,8 @@ Companion: [`CRUCIBLE.md`](CRUCIBLE.md) (the case + falsifier), [`RESEARCH.md`](
 ## 🔧 RE-CAST v3 (2026-08-12, post-falsifiers) — LiveKit-blessed `external_tls`
 
 Phase-0 falsifiers resolved: **B1 TRUE** (LiveKit has `turn.bind_addresses`) but Shape B
-(second public IP) was **vetoed on cost** (billable reserved IP). **C2 FALSE** (no cert
+(second public IP) was **vetoed on cost** (billable reserved IP — ⚠️ **FALSE, see correction 2
+above; the IP is free**). **C2 FALSE** (no cert
 hot-reload). So the shape is **C — a mature L4 SNI proxy on :443** — and reading LiveKit's
 own `config-sample.yaml` gave the key refinement: **`external_tls: true`**. LiveKit's
 documented recommendation for a shared :443 is *"place a L4 load balancer in front ... set
@@ -27,7 +82,9 @@ external_tls to true"* — the proxy terminates TLS, LiveKit takes PLAINTEXT on 
 longer holds the cert, so there is no stale-cert-after-renewal restart. The terminating
 proxy (HAProxy) owns the cert and hot-reloads it gracefully (no dropped connections).
 
-**Chosen: HAProxy** (mature, temper-aligned over experimental caddy-l4) on :443, SNI-routing:
+**Chosen: HAProxy** (mature, temper-aligned over "experimental" caddy-l4 — ⚠️ **that
+characterisation is FALSE, see correction 1; the real reason is the xcaddy build vs. the distro
+Caddy that holds ACME for three live domains**) on :443, SNI-routing:
 `turn.enspyr.co` → terminate TLS → plaintext to LiveKit :5349; else → raw passthrough to
 Caddy (moved to 127.0.0.1:8443). **Built + config-validated (`haproxy -c` exit 0) 2026-08-12,
 off-prod.** Artifacts + full cutover/rollback runbook: **`deploy/media/turn-443/`**

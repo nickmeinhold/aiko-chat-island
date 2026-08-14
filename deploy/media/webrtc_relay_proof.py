@@ -83,8 +83,14 @@ async def main() -> int:
     from playwright.async_api import async_playwright
     page_html = PAGE.replace("URL_", json.dumps(LK_URL)).replace("TOKEN_", json.dumps(TOKEN))
     serve(page_html.encode())
+    # CHROMIUM_EXTRA_ARGS exists so this same artifact — not a forked copy of it — can run
+    # against the rehearsal rig, whose certs come from a local Pebble CA that no browser
+    # trusts. Pin that CA by SPKI (--ignore-certificate-errors-spki-list=<b64 sha256>), never
+    # by blanket --ignore-certificate-errors: the cert chain is part of what a TURNS client
+    # must do, so disabling verification wholesale would make the proof unable to fail.
+    extra = [a for a in os.environ.get("CHROMIUM_EXTRA_ARGS", "").split() if a]
     async with async_playwright() as p:
-        browser = await p.chromium.launch(args=["--no-sandbox", "--disable-dev-shm-usage"])
+        browser = await p.chromium.launch(args=["--no-sandbox", "--disable-dev-shm-usage"] + extra)
         page = await browser.new_page()
         errs = []
         page.on("console", lambda m: errs.append(m.text) if m.type == "error" else None)
