@@ -11,6 +11,7 @@
 #   ./drive.sh rollback CP1|..|CP4  # cutover→checkpoint, rollback.sh, assert all 4 restored
 #   ./drive.sh full                 # complete cutover, assert, then B3/cert tests
 #   ./drive.sh reset                # back to CP0 (independent of rollback.sh)
+#   ./drive.sh refresh-ca           # re-fetch Pebble's root + re-issue certs (after any reboot)
 set -uo pipefail
 VM="${VM:-turnrig}"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"   # deploy/media/turn-443
@@ -106,6 +107,34 @@ case "${1:-}" in
     ;;
 
   reset) vm "cd $REMOTE/rehearsal && bash reset.sh" ;;
+
+  # Pebble mints a NEW issuance root every time its container starts, so any guest reboot (or
+  # a docker restart) silently invalidates every cert Caddy issued under the previous root AND
+  # the copy in the system trust store. Everything then fails with "unable to get local issuer
+  # certificate" — which looks exactly like a server fault and is not one. This bit twice in one
+  # session; the second time cost a diagnosis detour mid-rehearsal. It is a rig-maintenance
+  # command, not a test, so it lives here rather than in reset.sh (which must stay independent
+  # of the artifact under test AND cheap enough to run between every case).
+  refresh-ca)
+    TD="${TURN_DOMAIN:-turn.enspyr.co}"
+    say "refreshing the Pebble issuance root + re-issuing all certs ($TD)"
+    vm "curl -sk --max-time 5 https://127.0.0.1:15000/roots/0 -o /opt/pebble/issuance-root.pem
+        grep -q 'BEGIN CERTIFICATE' /opt/pebble/issuance-root.pem || { echo '  FATAL: could not fetch Pebble root (is the container up?)'; exit 1; }
+        cp /opt/pebble/issuance-root.pem /usr/local/share/ca-certificates/pebble-issuance-root.crt
+        update-ca-certificates >/dev/null 2>&1
+        # /opt/turncerts points at the PER-DOMAIN dir for turn.<domain>, so wiping only that
+        # re-issues turn and leaves chat/livekit still signed by the SUPERSEDED root — which is
+        # how the first attempt reported 'turn ok, chat still failing'. Clear the whole ACME
+        # issuer tree so EVERY name is re-issued under the current root.
+        STORE=\$(readlink -f /opt/turncerts); ACME_DIR=\$(dirname \$STORE)
+        rm -rf \$ACME_DIR/*
+        systemctl restart caddy
+        for i in \$(seq 1 60); do [ -s \"\$STORE/${TD}.crt\" ] && break; sleep 2; done
+        docker restart livekit >/dev/null; sleep 8
+        echo '  re-issued; verifying chain end-to-end:'
+        curl -sS -o /dev/null -w '    chat  -> %{http_code}\n' --max-time 8 https://chat.${TD#turn.} 2>&1 || echo '    chat  -> STILL FAILING'
+        echo | openssl s_client -connect 127.0.0.1:5349 -servername ${TD} 2>&1 | grep -m1 'Verify return code' | sed 's/^/    turn  -> /'"
+    ;;
 
   reboot)
     CP="${2:?checkpoint required}"
