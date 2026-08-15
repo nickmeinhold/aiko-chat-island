@@ -31,6 +31,12 @@ sync_artifacts() {
     limactl copy "$REPO_DIR/$f" "$VM:/tmp/$f" >/dev/null 2>&1 || { echo "copy failed: $f"; exit 1; }
     vm "install -m 0755 /tmp/$f $REMOTE/$f"
   done
+  # lib/turn-assert.sh is the single door for the shared assertions — the scripts source it at
+  # runtime, so a sync that forgets it produces a "command not found" at deploy time, not a
+  # silently weaker check. Ship it first.
+  vm "mkdir -p $REMOTE/lib"
+  limactl copy "$REPO_DIR/lib/turn-assert.sh" "$VM:/tmp/turn-assert.sh" >/dev/null 2>&1 || { echo "copy failed: lib/turn-assert.sh"; exit 1; }
+  vm "install -m 0644 /tmp/turn-assert.sh $REMOTE/lib/turn-assert.sh"
   for f in checks.sh reset.sh; do
     limactl copy "$REPO_DIR/rehearsal/$f" "$VM:/tmp/$f" >/dev/null 2>&1
     vm "install -m 0755 /tmp/$f $REMOTE/rehearsal/$f"

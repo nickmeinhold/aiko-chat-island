@@ -28,6 +28,11 @@ LIVEKIT_DIR="${LIVEKIT_DIR:-/home/ubuntu/apps/livekit}"
 LIVEKIT_YAML="${LIVEKIT_YAML:-${LIVEKIT_DIR}/livekit.yaml}"
 HAPROXY_TMPL="${HAPROXY_TMPL:-${HERE}/haproxy.cfg.tmpl}"
 TURN_DOMAIN="${TURN_DOMAIN:?set TURN_DOMAIN (e.g. turn.enspyr.co)}"
+# Shared assertions — ONE door (see lib/turn-assert.sh). migrate-to-passthrough.sh sources the
+# same file, so a correction to any of these lands in both paths or in neither.
+# shellcheck source=lib/turn-assert.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib/turn-assert.sh"
+turn_domain_valid "$TURN_DOMAIN" || { echo "[cutover] ABORT: TURN_DOMAIN '$TURN_DOMAIN' is not a plain DNS name — refusing to render root-owned config from it." >&2; exit 1; }
 # Loopback-only guard port, applied to BOTH families (Carnot/Tesla: an iptables-only rule does
 # nothing for IPv6). 8443 = Caddy HTTPS after it moves off :443 (only HAProxy on 127.0.0.1
 # should reach it — Carnot P0, and not relying on the OCI security-list alone).
@@ -127,12 +132,9 @@ esac
 # the right cert and a broken TURN implementation passes this. That is B3's job, off-box, as the
 # acceptance gate. Naming the boundary here so the phase is not read as more than it measures.
 log "asserting LiveKit already serves a valid $TURN_DOMAIN cert on :5349 (TLS identity; TURN protocol viability is B3's gate)"
-_turn_backend_ok() {
-  local out
-  out="$(echo | timeout 10 openssl s_client -connect "127.0.0.1:5349" -servername "$TURN_DOMAIN" 2>/dev/null)" || return 1
-  echo "$out" | openssl x509 -noout -checkhost "$TURN_DOMAIN" >/dev/null 2>&1
-}
-_turn_backend_ok || die "LiveKit is not serving a valid $TURN_DOMAIN cert on :5349. Fix livekit.yaml (cert_file/key_file + the /certs mount) BEFORE cutting :443 over — a mux in front of a dead backend is worse than no mux."
+_rc=0; turn_tls_ok 127.0.0.1 5349 "$TURN_DOMAIN" || _rc=$?
+[ "$_rc" -eq 0 ] || die "passthrough backend check FAILED: $(turn_tls_reason "$_rc" 127.0.0.1 5349 "$TURN_DOMAIN"). Fix livekit.yaml (cert_file/key_file + the /certs mount) BEFORE cutting :443 over — a mux in front of a dead or expiring backend is worse than no mux."
+log "  backend OK (cert valid for $TURN_DOMAIN, not expiring inside the margin)"
 
 # ---- only now may we mutate ----
 command -v haproxy >/dev/null 2>&1 || { log "installing haproxy"; apt-get install -y haproxy >/dev/null || die "haproxy install failed"; }
@@ -268,12 +270,10 @@ curl -sS -o /dev/null --max-time 10 --resolve "${LK_DOMAIN}:443:127.0.0.1" "http
 # to an HTTPS GET; LiveKit's TURN socket cannot speak HTTP at all. A successful GET through :443
 # for the turn name therefore PROVES the SNI landed on Caddy — the exact misroute — and a failed
 # one is what correct passthrough looks like.
-echo | timeout 8 openssl s_client -connect 127.0.0.1:443 -servername "$TURN_DOMAIN" 2>/dev/null \
-  | openssl x509 -noout -checkhost "$TURN_DOMAIN" >/dev/null 2>&1 \
-  || roll "turns:443 on THIS box did not present a cert valid for $TURN_DOMAIN through the mux"
-if curl -sS -o /dev/null --max-time 8 --resolve "${TURN_DOMAIN}:443:127.0.0.1" "https://${TURN_DOMAIN}/" 2>/dev/null; then
-  roll "an HTTPS GET for $TURN_DOMAIN through :443 SUCCEEDED — the turn SNI is being answered by CADDY (default_backend), not passed through to LiveKit. Cert and fingerprint checks CANNOT see this: Caddy serves the same store LiveKit mounts."
-fi
+_rc=0; turn_tls_ok 127.0.0.1 443 "$TURN_DOMAIN" || _rc=$?
+[ "$_rc" -eq 0 ] || roll "through the mux: $(turn_tls_reason "$_rc" 127.0.0.1 443 "$TURN_DOMAIN")"
+turn_path_is_passthrough "$TURN_DOMAIN" \
+  || roll "an HTTPS GET for $TURN_DOMAIN through :443 SUCCEEDED — the turn SNI is being answered by CADDY (default_backend), not passed through to LiveKit. Cert and fingerprint checks CANNOT see this: Caddy serves the same store LiveKit mounts."
 log "  turn SNI is NOT answered by Caddy (HTTP GET refused) — the passthrough path is real"
 
 # ============================ PHASE 4 — renewal must be guarded ==============================
