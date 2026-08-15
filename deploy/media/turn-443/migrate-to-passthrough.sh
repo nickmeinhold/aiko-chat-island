@@ -49,7 +49,11 @@ listening() { [ -n "$(ss -tlnH "sport = :$1" 2>/dev/null)" ]; }
 # Local wrapper over the shared assertion, so the many call sites below stay readable.
 serves_tls_for_domain() { turn_tls_ok 127.0.0.1 "$TURN_TLS_PORT" "$TURN_DOMAIN"; }
 
-# ============================ PHASE 0 — preconditions (read-only) ============================
+# ==================== PHASE 0 — preconditions (read-only, ONE exception) =====================
+# The exception is named rather than hidden (Carnot round 4): on the resume path this phase
+# DELETES stale .pre-passthrough files. They are not rollback evidence at that point — the box is
+# already passthrough, so restoring them would recreate the out-of-phase pair Tesla found in
+# round 3. Leaving them would preserve a trap, not an option. Every other line here is read-only.
 log "PHASE 0 — preconditions"
 
 [ "$(id -u)" -eq 0 ] || die "must run as root"
@@ -136,18 +140,20 @@ docker exec livekit test -r "$KEY_IN_CTR" 2>/dev/null \
 log "  cert + key readable inside the container"
 
 # Same subject check as above, but against the file, before we commit to serving it.
-docker exec livekit sh -c "cat $CERT_IN_CTR" 2>/dev/null \
+docker exec livekit cat "$CERT_IN_CTR" 2>/dev/null \
   | openssl x509 -noout -checkhost "$TURN_DOMAIN" >/dev/null 2>&1 \
   || die "the mounted cert is not valid for $TURN_DOMAIN"
-docker exec livekit sh -c "cat $CERT_IN_CTR" 2>/dev/null \
+docker exec livekit cat "$CERT_IN_CTR" 2>/dev/null \
   | openssl x509 -noout -checkend 86400 >/dev/null 2>&1 \
   || die "the mounted cert expires within 24h — renew before migrating, not during"
 log "  cert is valid for $TURN_DOMAIN and not expiring imminently"
 
 log "PHASE 0 OK"
 
-# Phases 1-3 are skipped entirely on the resume path (already-migrated box re-running to clear
-# the Phase 4 gate). Phase 4 is NOT skipped — it is the whole reason a resume exists.
+# Phases 1-2 (the MUTATING ones) are skipped on the resume path. Phase 3 (decommission) and
+# Phase 4 (the renewal gate) always run: Phase 3 is idempotent and a crash after Phase 2 would
+# otherwise leave cert-sync and the PEM in place forever, and Phase 4 is the whole reason a
+# resume exists.
 if [ "$ALREADY_PASSTHROUGH" -eq 0 ]; then
 
 # ============================ PHASE 1 — LiveKit takes back its TLS ==========================
@@ -273,11 +279,24 @@ done
 # that is Caddy wearing LiveKit's face. cutover.sh, checks.sh and faults.sh all grew this
 # discriminator in round 2; THIS script — the one that runs on the live, already-muxed box with
 # no dark window and no second chance — did not. Same door now.
-turn_path_is_passthrough "$TURN_DOMAIN" \
-  || { restore_both; die_restored "after the swap, an HTTPS GET for $TURN_DOMAIN through :443 SUCCEEDED — the turn SNI is being answered by CADDY, not passed through to LiveKit. The cert cannot show you this (same store)."; }
+CHAT_DOMAIN="${CHAT_DOMAIN:-chat.${TURN_DOMAIN#turn.}}"   # known-positive control for the probe
+_prc=0; turn_path_is_passthrough "$TURN_DOMAIN" "$CHAT_DOMAIN" || _prc=$?
+case "$_prc" in
+  0) : ;;
+  1) restore_both; die_restored "after the swap, an HTTPS GET for $TURN_DOMAIN through :443 SUCCEEDED — the turn SNI is being answered by CADDY, not passed through to LiveKit. The cert cannot show you this (same store)." ;;
+  *) restore_both; die_restored "after the swap, the turn-path probe could not discriminate (see the [turn-assert] line above). An unproven path is not a passing one — unwinding rather than declaring a mux we cannot verify." ;;
+esac
 log "PHASE 2 OK — :443 passes turn SNI straight to LiveKit (path discriminated, not inferred from the cert)"
 
+fi  # end: if ALREADY_PASSTHROUGH == 0 — Phases 1-2 are the mutation; Phase 3 below is NOT.
+
 # ============================ PHASE 3 — decommission cert-sync ==============================
+# RUNS ON BOTH PATHS, including resume (Tesla, round 4). A crash after Phase 2 succeeded leaves a
+# box that is fully passthrough but still carries cert-sync units and an unshredded PEM — the
+# private key of a terminator that no longer terminates. The resume path used to skip straight to
+# Phase 4, so that residue would have survived forever, silently. Every operation here is
+# idempotent (disable/rm/shred of things that may already be gone), which is what makes running
+# it unconditionally safe.
 log "PHASE 3 — removing haproxy-cert-sync (it has nothing left to sync)"
 # CONSUME THE STAGING FILES FIRST, before anything in this phase is destroyed (Tesla P1).
 # Phase 3 shreds the PEM — the old terminator's private key. Once that is carbon, the stock
@@ -304,7 +323,6 @@ rmdir /etc/haproxy/certs 2>/dev/null || true
 systemctl daemon-reload
 log "PHASE 3 OK"
 
-fi  # end: if ALREADY_PASSTHROUGH == 0
 
 # ============================ PHASE 4 — cert-restart must be live ===========================
 # Passthrough makes LiveKit the cert holder, and LiveKit cannot hot-reload one. Without this
