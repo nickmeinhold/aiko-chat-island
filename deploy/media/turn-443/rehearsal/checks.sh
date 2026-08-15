@@ -142,9 +142,17 @@ assert_safety() {
     chk "INV-8 :8443 NOT externally reachable" "$([ "$ext8443" = closed ] && echo 0 || echo 1)"
   fi
 
-  # INV-2: :443 must have exactly one owner — never two, never (lastingly) zero.
-  local owner; owner="$(port_owner 443)"
-  chk "INV-2 :443 has exactly one owner (got '${owner:-NONE}')" "$([ -n "$owner" ] && echo 0 || echo 1)"
+  # INV-2: :443 must have EXACTLY ONE owner — never two, never (lastingly) zero. `port_owner`
+  # takes head -1, so the old check only ever proved "non-empty" (Tesla round 7): two processes
+  # sharing :443 via SO_REUSEPORT would have passed an invariant whose whole name is "exactly
+  # one". Count the distinct holders.
+  local owner nowners
+  owner="$(port_owner 443)"
+  # -p is REQUIRED for the users: field to exist at all — without it this counted 0 on a
+  # perfectly healthy box and failed the invariant it was written to check. Caught on the rig
+  # immediately, which is the only reason it is not in this PR.
+  nowners="$(ss -tlnpH 'sport = :443' 2>/dev/null | grep -c 'users:')"
+  chk "INV-2 :443 has exactly one owner (got ${nowners:-0}: '${owner:-NONE}')" "$([ "${nowners:-0}" -eq 1 ] && echo 0 || echo 1)"
 
   # Service continuity: chat must answer in every steady state.
   chat_reachable; chk "chat.enspyr.co reachable" $?

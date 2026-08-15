@@ -609,3 +609,67 @@ option. I am siding with the proved finding over the reasoned one.
 
 **Rig after round 6:** cutover green (90 ms), 7/7 invariants, 18/18 faults, migration end-to-end
 green, DNS validator RED/GREEN.
+
+## Round 7 — the previous generation's key, still in the lock
+
+Kelvin APPROVE. Carnot + Tesla `REQUEST_CHANGES`. Seven real, one rejected, and one regression
+**I introduced during the round and the fault suite caught**.
+
+### Tesla's P0, verified against live enspyr
+
+Round 4 sealed rollback against a **missing** `Caddyfile.stock`. It never considered the previous
+generation's key still being in the lock: the *original* cutover leaves `/etc/caddy/Caddyfile.stock`
+on disk and never removes it, and `migrate-to-passthrough.sh` consumes `.pre-passthrough` — a
+different object. **enspyr has that stock file right now** (checked, not assumed).
+
+So a migrated box is observationally identical to a freshly cut-over one. `rollback.sh` would
+proceed, hand `:443` back to Caddy, print `COMPLETE` — with LiveKit still on passthrough TLS and
+`turns:443` **dead**. Chat keeps working, so nothing looks broken. The RUNBOOK offered
+`rollback.sh` as the recovery for *both* deploy paths.
+
+### The regression the rig caught mid-round
+
+My first fix inferred "was this migrated?" from the box's shape. It cannot be inferred: a box
+**cut over** to passthrough and one **migrated** to it both have `cert_file` and a certless
+`haproxy.cfg`. The guard misfired on a cutover box and blocked its legitimate rollback — three
+fault assertions went red immediately.
+
+The honest fix is a **marker**: `migrate-to-passthrough.sh` writes
+`/etc/haproxy/.migrated-to-passthrough`, the one fact only it knows. RED/GREEN:
+
+```
+pre-migrate: :443=haproxy   stock=PRESENT      <- the old guard would NOT have caught this
+after migrate: marker WRITTEN, stock still PRESENT
+rollback            -> FATAL, refuses, :443 still haproxy
+ROLLBACK_ACCEPT_TURN_LOSS=1 rollback -> WARNING, proceeds, :443 now caddy
+```
+
+### Also fixed
+
+- The EXIT trap restored HAProxy and LiveKit on **two independent muted chains** — a successful
+  `mv` with a failed `reload` left memory on passthrough and disk on terminate-and-forward, then
+  slammed LiveKit back to plaintext (Tesla). It calls `restore_both` now, which treats them as
+  the one artifact they are and verifies the pair.
+- The EXIT trap also fired on Phase 4's **intentional** `exit 3`, printing "UNEXPECTED EXIT …
+  unwinding" over a documented re-runnable exit whose data plane is complete and correct
+  (Carnot). Contradictory instructions on an operator path are their own failure.
+- `drive.sh`'s **reboot** path reported safety without asserting the mux survived — the same
+  conflation fixed for `full` and `rollback`, left in the third caller (Tesla). *Third* time this
+  PR that a fix landed in some-but-not-all sites.
+- `INV-2` claimed "exactly one owner" while `port_owner` takes `head -1`, so it only ever proved
+  *non-empty* (Tesla). It counts holders now — and the first version of that count omitted
+  `ss -p`, so it returned 0 on a healthy box and failed its own invariant. Caught on the rig
+  within one run, which is the only reason it is not in this PR.
+- `server livekit 127.0.0.1:5349 check` was a **TCP-connect** health check on a TLS backend, so a
+  LiveKit that accepts the socket and then fails the handshake is marked UP and clients are routed
+  into it (Carnot). Now `check-ssl verify none sni str(<domain>)` — the *check* completes a real
+  handshake; the data path still forwards raw bytes and terminates nothing.
+
+**Rejected (second time):** Carnot's "CHAT_DOMAIN/LK_DOMAIN defaults can verify the wrong names".
+They are `${VAR:-default}` overridable, and a wrong value fails **closed**: the control GET fails
+→ the path probe returns INDETERMINATE → the cutover rolls back. The default cannot silently
+verify the wrong thing.
+
+**Rig after round 7:** cutover green (102 ms), 7/7 invariants, 18/18 faults, migration end-to-end
+green, marker guard RED/GREEN, **B3 `OK`** and the **real Chromium relay proof `OK` (11427 B over
+`relay/tls`)**.

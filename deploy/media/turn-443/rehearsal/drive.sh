@@ -165,7 +165,15 @@ case "${1:-}" in
     limactl shell "$VM" -- sudo systemctl reboot >/dev/null 2>&1 || true
     sleep 10; wait_for_vm || exit 1
     say "state AFTER reboot — this is INV-3"
-    report "$CP post-reboot"
+    # assert_muxed too (Tesla round 7): INV-3 is the claim that the CUT-OVER state is
+    # boot-correct, and `report` only answers "is this state safe". A box that came back with
+    # Caddy on :443 is perfectly safe and has un-run the cutover — which is the exact
+    # conflation named in RESULTS.md, found for `full`, and left here in the reboot path.
+    if [ "$CP" = "done" ] || [ "$CP" = "CP4" ]; then
+      report "$CP post-reboot" && assert_muxed
+    else
+      report "$CP post-reboot"
+    fi
     ;;
 
   rollback)
