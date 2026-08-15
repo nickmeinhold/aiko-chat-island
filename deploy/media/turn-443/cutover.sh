@@ -209,8 +209,15 @@ ckpt CP1
 #
 # Deliberately left as a comment rather than deleted silently: three cage-match rounds argued
 # about the code that was here, and someone reading the rehearsal RESULTS will look for it.
-ss -tlnpH 'sport = :5349' 2>/dev/null | grep -q 'livekit-server' \
-  || roll "the process listening on :5349 is not livekit-server — refusing to point the mux at it"
+# Bounded readiness poll, not a single shot (Carnot round 10): a transient — a container
+# restarting for unrelated reasons — would otherwise roll back a perfectly good cutover.
+_lk_owner_ok=0
+for _ in $(seq 1 15); do
+  ss -tlnpH 'sport = :5349' 2>/dev/null | grep -q 'livekit-server' && { _lk_owner_ok=1; break; }
+  sleep 1
+done
+[ "$_lk_owner_ok" = 1 ] \
+  || roll "the process listening on :5349 is not livekit-server after 15s — refusing to point the mux at it"
 ckpt CP2
 
 # --- 2.3 move Caddy off public :443 → loopback:8443 -----------------------------------------
@@ -313,7 +320,12 @@ log "  turn SNI is NOT answered by Caddy (HTTP GET refused) — the passthrough 
 # renewal". Fail-closed with a declared opt-out beats fail-closed with no way through — the
 # latter just gets commented out by the first operator who hits it.
 log "4 renewal ownership (LiveKit owns the cert now; it cannot hot-reload one)"
-case "${CERT_RENEWAL_OWNER:-timer}" in
+# NO DEFAULT (Tesla round 10). This defaulted to `timer` — and cutover.sh's only customer is
+# imagineering, the SHARED multi-tenant box where cert-restart.service is forbidden by contract
+# ("NEVER on a shared box"). So the default was the FORBIDDEN owner for this script's only user:
+# an operator who just runs it gets refused by a gate demanding the one thing they must not
+# install. Renewal ownership is a per-box decision; make it stated, not inherited.
+case "${CERT_RENEWAL_OWNER:?set CERT_RENEWAL_OWNER=timer (island-dedicated box: requires an enabled+active cert-restart.timer) or CERT_RENEWAL_OWNER=runbook (SHARED multi-tenant box, e.g. imagineering, where cert-restart.service must NOT be installed and a human owns the restart)}" in
   timer)
     # is-ENABLED as well as is-active (Tesla): `systemctl start` without `enable` greens an
     # is-active check and then evaporates on the next reboot, taking the sole owner of INV-4'

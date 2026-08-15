@@ -106,9 +106,12 @@ on the strength of the UDP endpoint alone. It did exactly that during the passth
 ## Cutover (the ONE irreversible step)
 
 ```bash
-sudo OFF443_PROVEN=1 TURN_DOMAIN=turn.<domain> bash deploy/media/turn-443/cutover.sh
-# on a SHARED box where cert-restart.timer must not be installed:
-sudo OFF443_PROVEN=1 TURN_DOMAIN=turn.<domain> CERT_RENEWAL_OWNER=runbook bash .../cutover.sh
+# CERT_RENEWAL_OWNER is REQUIRED — there is no default, because the only sensible default for
+# this script's actual customer (imagineering, shared) is the one the contract forbids.
+sudo OFF443_PROVEN=1 TURN_DOMAIN=turn.<domain> CERT_RENEWAL_OWNER=runbook \
+  bash deploy/media/turn-443/cutover.sh          # SHARED box: a human owns the restart
+sudo OFF443_PROVEN=1 TURN_DOMAIN=turn.<domain> CERT_RENEWAL_OWNER=timer \
+  bash deploy/media/turn-443/cutover.sh          # island-dedicated box: timer must be enabled+active
 ```
 
 It runs the sequenced state machine (Phase 0 preconditions incl. **asserting the passthrough

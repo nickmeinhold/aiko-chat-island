@@ -752,3 +752,32 @@ this whole PR has been arguing against.
 
 **Rig after round 9:** cutover green (99 ms), 7/7 invariants, 18/18 faults, all three migrate
 states proved.
+
+## Round 10 — four real, one stale-line false positive
+
+Kelvin APPROVE. Carnot + Tesla `REQUEST_CHANGES`.
+
+- **`CERT_RENEWAL_OWNER` defaulted to the forbidden owner** (Tesla). It defaulted to `timer` —
+  and `cutover.sh`'s only customer is **imagineering**, the shared multi-tenant box where
+  `cert-restart.service` is forbidden by contract. So an operator who just ran the script got
+  refused by a gate demanding the one thing they must not install. There is no default now:
+  renewal ownership is a per-box decision and must be stated.
+- **The marker was read after the staging-file guards** (Tesla). A box that crashed between the
+  marker write and the stock consumption hit the "restore BOTH" recipe — which on an
+  already-migrated box recreates exactly the out-of-phase pair round 3 RED-proved. The marker is
+  the strongest statement about the box's shape, so it is consulted first, and stale stocks
+  alongside it now mean *finish the idempotent decommission*, not *refuse with a broken recipe*.
+- **The EXIT trap was armed after the first staging write** (Carnot) — a window where a stock
+  existed with no net under it. Armed before Phase 1 now.
+- **The socket-owner check was a single shot, not a readiness loop** (Carnot) — a container
+  restarting for unrelated reasons would have rolled back a good cutover. Bounded 15s poll.
+
+**Rejected:** Carnot's "the Phase-1 wait uses bare `-checkhost` while `turn_tls_ok` checks expiry
+and chain" — it calls `serves_tls_for_domain`, which *is* `turn_tls_ok`. The cited lines are the
+awk edit, not a checkhost call.
+
+Proved on the rig: marker + stale stocks → *"already migrated, but the Phase-3 coda did not
+finish — discarding stale stocks and completing the decommission"*, `:443` still `haproxy`, zero
+stocks left; a clean re-run says *"ALREADY migrated. Nothing to do."*
+
+**Rig after round 10:** cutover green (93 ms), 7/7 invariants, 18/18 faults.

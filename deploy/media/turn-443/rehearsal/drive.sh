@@ -94,7 +94,7 @@ assert_unmuxed() { vm "[ -n \"\$(ss -tlnpH 'sport = :443' | grep caddy)\" ]" \
 
 run_cutover() { # run_cutover [checkpoint]
   local stop="${1:-}"
-  vm "cd $REMOTE && OFF443_PROVEN=1 REHEARSAL=1 CUTOVER_STOP_AFTER='$stop' TURN_DOMAIN='${TURN_DOMAIN:-turn.enspyr.co}' CADDY_CERT_DIR=/opt/turncerts bash cutover.sh 2>&1 | tail -25; exit \${PIPESTATUS[0]}"
+  vm "cd $REMOTE && OFF443_PROVEN=1 CERT_RENEWAL_OWNER=timer REHEARSAL=1 CUTOVER_STOP_AFTER='$stop' TURN_DOMAIN='${TURN_DOMAIN:-turn.enspyr.co}' CADDY_CERT_DIR=/opt/turncerts bash cutover.sh 2>&1 | tail -25; exit \${PIPESTATUS[0]}"
 }
 
 wait_for_vm() {
