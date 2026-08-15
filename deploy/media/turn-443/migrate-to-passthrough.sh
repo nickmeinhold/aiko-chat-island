@@ -89,6 +89,24 @@ turn_key() {  # turn_key <key-regex> — true if the key exists inside the top-l
 # ALREADY_PASSTHROUGH branch, the stale-stock discard, _DATA_PLANE_DONE, and the reconcile-reload.
 # Fail before mutating instead of unwinding afterwards — which is the better behaviour anyway.
 
+# THE MARKER IS READ FIRST (Tesla round 10). It used to be interrogated AFTER the staging-file
+# guards — so a box that crashed between the marker write and the stock consumption (both in the
+# Phase 2/3 coda) hit the "restore BOTH" recipe, which on an already-migrated box recreates
+# exactly the out-of-phase pair round 3 RED-proved. The marker is the strongest statement about
+# this box's shape, so it is the first thing consulted.
+if [ -f /etc/haproxy/.migrated-to-passthrough ]; then
+  # Stale stocks alongside the marker mean the Phase-3 coda did not finish. They are INVALID
+  # (their haproxy.cfg cannot pair with a TLS-speaking LiveKit), and the decommission is
+  # idempotent — so finish the job rather than refusing with a recipe that would break the box.
+  if [ -e "$LK_YAML$STOCK_SUFFIX" ] || [ -e "$HA_CFG$STOCK_SUFFIX" ]; then
+    log "  already migrated, but the Phase-3 coda did not finish — discarding stale stocks and completing the decommission"
+    rm -f "$LK_YAML$STOCK_SUFFIX" "$HA_CFG$STOCK_SUFFIX"
+    _FINISH_DECOMMISSION_ONLY=1
+  else
+    die "this box is ALREADY migrated (marker: /etc/haproxy/.migrated-to-passthrough). Nothing to do."
+  fi
+fi
+
 # A previous aborted run leaves .pre-passthrough files. WHICH ones tells you exactly where it
 # died and what "restore by hand" means, so say it rather than making the operator infer it.
 if [ -e "$LK_YAML$STOCK_SUFFIX" ] && [ ! -e "$HA_CFG$STOCK_SUFFIX" ]; then
@@ -110,11 +128,6 @@ TLS-expecting backend is dead TURN with both halves looking restored):
 then verify turns:443 answers and re-run this script."
 done
 
-# This script migrates a box that is in the external_tls shape. If it is not, say which shape it
-# IS rather than guessing — an already-migrated box needs nothing done to it.
-if [ -f /etc/haproxy/.migrated-to-passthrough ]; then
-  die "this box is ALREADY migrated (marker: /etc/haproxy/.migrated-to-passthrough). Nothing to do."
-fi
 turn_key '^[[:space:]]+external_tls:[[:space:]]*true' \
   || die "livekit.yaml has no external_tls:true — this box is not in the shape this migrates FROM. If it is already passthrough, there is nothing to do; if it is something else, inspect $LK_YAML and $HA_CFG by hand."
 
@@ -149,7 +162,15 @@ log "  cert is valid for $TURN_DOMAIN and not expiring imminently"
 
 log "PHASE 0 OK"
 
+# The trap is armed BEFORE the first staging write (Carnot round 10). It used to be installed
+# after Phase 1 had already copied livekit.yaml to .pre-passthrough, leaving a window where a
+# stock existed with no net under it.
+trap _on_unexpected_exit EXIT
+
 # ============================ PHASE 1 — LiveKit takes back its TLS ==========================
+if [ "${_FINISH_DECOMMISSION_ONLY:-0}" -eq 1 ]; then
+  log "skipping Phases 1-2 (data plane already migrated); completing Phase 3 only"
+else
 log "PHASE 1 — livekit.yaml: external_tls:true -> cert_file/key_file"
 cp -a "$LK_YAML" "$LK_YAML$STOCK_SUFFIX"
 
@@ -252,7 +273,6 @@ _on_unexpected_exit() {
     echo "[passthrough] nothing was staged yet — no unwind needed." >&2
   fi
 }
-trap _on_unexpected_exit EXIT
 
 
 # Scoped to the top-level turn: mapping (same discipline as the cutover's awk edit): replace the
@@ -347,6 +367,8 @@ log "PHASE 2 OK — :443 passes turn SNI straight to LiveKit (path discriminated
 printf 'migrated-to-passthrough %s\n' "$TURN_DOMAIN" > /etc/haproxy/.migrated-to-passthrough \
   || { restore_both; die_restored "could not write /etc/haproxy/.migrated-to-passthrough — without it rollback.sh cannot tell this box was migrated and would silently kill turns:443. Unwound rather than proceed."; }
 
+
+fi  # end: skip the mutating phases when only the decommission is outstanding
 
 # ============================ PHASE 3 — decommission cert-sync ==============================
 # RUNS ON BOTH PATHS, including resume (Tesla, round 4). A crash after Phase 2 succeeded leaves a
