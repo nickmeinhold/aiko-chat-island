@@ -128,12 +128,19 @@ sudo TURN_DOMAIN=turn.<domain> LIVEKIT_DIR=/home/<user>/apps/livekit \
   bash deploy/media/turn-443/migrate-to-passthrough.sh
 ```
 
-Phase 0 preconditions (incl. reading the cert **from inside the container**, so a mount that
-looks right on the host but is wrong in the container fails here rather than at handshake time)
-→ Phase 1 `livekit.yaml` back to its own TLS + restart, verified by cert **subject** →
-Phase 2 render + install the passthrough config, `haproxy -c`, graceful reload, verify a real
-handshake through :443 → Phase 3 shred the PEM and remove cert-sync → Phase 4 renewal ownership.
-Each phase restores what it touched on failure. **No dark window on :443.**
+Phase 0 preconditions — including reading the cert **from inside the container** (a mount that
+looks right on the host but is wrong in the container fails here, not at handshake time) and
+**asserting `cert-restart.timer` is enabled+active BEFORE anything is touched**. Then Phase 1
+returns `livekit.yaml` to its own TLS and restarts, verified by cert **subject**; Phase 2 renders
+and installs the passthrough config, `haproxy -c`, graceful reload, and verifies both the cert
+**and the path** through `:443` (an HTTPS GET for the turn name must FAIL — Caddy would answer it,
+LiveKit cannot); Phase 3 shreds the PEM and removes cert-sync. Each phase restores what it
+touched, and an EXIT trap unwinds anything staged if the script dies somewhere unhandled.
+**No dark window on :443.**
+
+There is no resume path and no post-mutation gate: the renewal check that used to sit at the end
+is a precondition, so a failure there costs nothing and leaves nothing half-done. Re-running on an
+already-migrated box says "nothing to do" (it leaves `/etc/haproxy/.migrated-to-passthrough`).
 
 ## Acceptance gate (run from OFF-BOX after cutover.sh reports green)
 
