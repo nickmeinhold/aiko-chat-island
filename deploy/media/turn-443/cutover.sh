@@ -116,8 +116,15 @@ P443_OWNER="$(_p443_owner)"
 case "$P443_OWNER" in
   haproxy)
     die "HAProxy already owns :443 — this box is already muxed. cutover.sh would take the LIVE front door down before it could tell. Use migrate-to-passthrough.sh instead." ;;
-  caddy|"")
-    log "  :443 owner is '${P443_OWNER:-<unbound>}' — correct entrypoint for cutover.sh" ;;
+  caddy)
+    log "  :443 owner is 'caddy' — correct entrypoint for cutover.sh" ;;
+  "")
+    # An unbound :443 is a legitimate pre-cutover state (Caddy stopped, fresh box) but it is NOT
+    # the universe this script models, and rollback's whole job is handing :443 BACK to Caddy
+    # (Carnot round 6). Require that there is something to hand it back to.
+    systemctl list-unit-files caddy.service >/dev/null 2>&1 && systemctl cat caddy >/dev/null 2>&1 \
+      || die ":443 is unbound AND there is no caddy unit on this box — a cutover here would have no rollback target. Refusing."
+    log "  :443 is UNBOUND (unusual but allowed: a caddy unit exists, so rollback has a target)" ;;
   *)
     die "an unexpected process ('$P443_OWNER') owns :443 — refusing to cut over a topology this script does not model." ;;
 esac
@@ -168,7 +175,7 @@ caddy validate --config "$CADDY_MUX" --adapter caddyfile >/dev/null 2>&1 || die 
 # Caddy still owns :443), so an abort here needs no rollback of live traffic — but a manual
 # `systemctl start haproxy` before 2.3 WOULD double-bind :443. The disabled unit prevents that on
 # reboot; don't hand-start it.
-log "PHASE 0 OK — preconditions clear; prep staged (haproxy installed+DISABLED, cfg+PEM staged), no live change yet."
+log "PHASE 0 OK — preconditions clear; prep staged (haproxy installed+DISABLED, rendered cfg installed). No PEM: this shape holds no cert."
 
 # ============================ PHASE 1 — stage backups (FAIL-CLOSED) ==========================
 # The backups ARE the rollback's trusted source of truth — an unchecked cp that silently fails

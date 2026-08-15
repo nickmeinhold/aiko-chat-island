@@ -42,7 +42,7 @@ die()  { echo "[passthrough] ABORT (nothing mutated past this point): $*" >&2; e
 # For aborts AFTER a phase has mutated and unwound: "nothing mutated" is false there and reads as
 # a stronger safety claim than the run actually earned. Caught by the round-3 RED proof, where a
 # correct restore printed the wrong reassurance.
-die_restored() { echo "[passthrough] ABORT (changes were made and have been RESTORED — see the restore lines above): $*" >&2; exit 1; }
+die_restored() { _RESTORE_IN_PROGRESS=1; echo "[passthrough] ABORT (changes were made and have been RESTORED — see the restore lines above): $*" >&2; exit 1; }
 dc()   { if docker compose version >/dev/null 2>&1; then docker compose "$@"; else docker-compose "$@"; fi; }
 listening() { [ -n "$(ss -tlnH "sport = :$1" 2>/dev/null)" ]; }
 
@@ -82,12 +82,18 @@ turn_key() {  # turn_key <key-regex> — true if the key exists inside the top-l
     in_turn && $0 ~ pat { found=1 }
     END { exit(found ? 0 : 1) }' "$LK_YAML"
 }
+# Four of these five beats read DISK, and disk is not the running process (Tesla round 6): an
+# edited-but-unreloaded haproxy.cfg would classify the box as passthrough while :443 still serves
+# the old shape. So the classification ends with a RUNTIME check — the same path discriminator the
+# deploy phases use. Disk says what it should be; the probe says what it is.
 is_passthrough_shape() {
-  ! turn_key '^[[:space:]]+external_tls:[[:space:]]*true' \
-    && turn_key '^[[:space:]]+cert_file:' \
-    && ! grep -qi 'ssl crt' "$HA_CFG" \
-    && grep -qF "req_ssl_sni -i ${TURN_DOMAIN}" "$HA_CFG" \
-    && serves_tls_for_domain
+  ! turn_key '^[[:space:]]+external_tls:[[:space:]]*true' || return 1
+  turn_key '^[[:space:]]+cert_file:'                      || return 1
+  ! grep -qi 'ssl crt' "$HA_CFG"                          || return 1
+  grep -qF "req_ssl_sni -i ${TURN_DOMAIN}" "$HA_CFG"      || return 1
+  serves_tls_for_domain                                   || return 1
+  # RUNTIME: is :443 actually passing the turn SNI through right now?
+  turn_path_is_passthrough "$TURN_DOMAIN" "chat.${TURN_DOMAIN#turn.}"
 }
 
 ALREADY_PASSTHROUGH=0
@@ -159,6 +165,25 @@ if [ "$ALREADY_PASSTHROUGH" -eq 0 ]; then
 # ============================ PHASE 1 — LiveKit takes back its TLS ==========================
 log "PHASE 1 — livekit.yaml: external_tls:true -> cert_file/key_file"
 cp -a "$LK_YAML" "$LK_YAML$STOCK_SUFFIX"
+
+# SAFETY NET for the failures that do NOT land on a `|| { restore_*; }` line (Tesla round 6).
+# `set -e` means a bare failure — the `cp -a` that stages a stock, the `sed` that renders, a
+# transient docker hiccup — exits immediately, skipping every restore and leaving LiveKit
+# already flipped with HAProxy still on the old config: the out-of-phase pair, with no message.
+# "Each phase restores what it touched" was true only for the failures I had enumerated.
+MIGRATION_COMPLETE=0
+_on_unexpected_exit() {
+  local rc=$?
+  [ "$rc" -eq 0 ] && return 0
+  [ "$MIGRATION_COMPLETE" -eq 1 ] && return 0
+  [ "${_RESTORE_IN_PROGRESS:-0}" -eq 1 ] && return 0
+  echo "[passthrough] UNEXPECTED EXIT (rc=$rc) outside a handled failure path — attempting to unwind." >&2
+  _RESTORE_IN_PROGRESS=1
+  [ -e "$HA_CFG$STOCK_SUFFIX" ] && { mv -f "$HA_CFG$STOCK_SUFFIX" "$HA_CFG" && systemctl reload haproxy; } 2>/dev/null
+  [ -e "$LK_YAML$STOCK_SUFFIX" ] && { mv -f "$LK_YAML$STOCK_SUFFIX" "$LK_YAML"; (cd "$LIVEKIT_DIR" && dc restart livekit >/dev/null 2>&1); } 2>/dev/null
+  echo "[passthrough] unwind attempted. VERIFY BY HAND: turns:443 must answer, and :$TURN_TLS_PORT must be back to plaintext." >&2
+}
+trap _on_unexpected_exit EXIT
 
 restore_livekit() {
   log "  restoring livekit.yaml and restarting"
@@ -365,6 +390,7 @@ if ! systemctl is-enabled --quiet cert-restart.timer 2>/dev/null || ! systemctl 
 fi
 log "PHASE 4 OK — renewal restarts are guarded"
 
+MIGRATION_COMPLETE=1
 log "MIGRATION COMPLETE. Now run the acceptance gates:"
 log "  b3_relay_probe.py with B3_REQUIRE_ENDPOINT=tls:*:443   (relay-deny + liveness)"
 log "  webrtc_relay_proof.py from a UDP-blocked vantage        (a real call actually flows)"

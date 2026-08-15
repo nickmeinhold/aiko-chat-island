@@ -554,3 +554,58 @@ assertion falsifiable. A guard that has never failed has not been tested.
   wrong thing. It now names the actual owner, or `<nothing>`.
 
 **Rig after round 5:** cutover green (96 ms), 7/7 invariants, 18/18 faults, chain gate RED/GREEN.
+
+## Round 6 — I padded a measured value with guesses, in the commit that said not to
+
+Kelvin errored out (empty response — a **dark seat**, not an approval). Carnot and Tesla both
+`REQUEST_CHANGES`. Seven real, one rejected, three accepted as documented limits.
+
+**Tesla's sharpest:** the curl exit-code list read `28|52|56|35|18|55|97`. I measured **28** on
+the rig and then OR'd the rest *by reasoning* — in the same commit whose comment says these codes
+are measured rather than reasoned. **35 is `SSL connect error`: the handshake never completed**,
+which is the exact opposite of "accepts TLS and stays silent". One measured value, padded with
+guesses that only ever widen the green. Narrowed to `28|52|56`.
+
+**Third instance of mutate-before-verify** (Carnot): `rollback.sh` stopped and disabled HAProxy
+before proving the stock Caddyfile could actually take `:443` — `caddy validate` ran *after* the
+port was freed. A corrupt or still-muxed stock file meant front door freed, Caddy refuses to
+start, `:443` down with nothing to put on it. It now validates (and rejects a stock file that
+still contains `https_port 8443`) while HAProxy is still serving.
+
+**The `set -e` hole** (Tesla): "each phase restores what it touched" was true only for failures
+landing on a `|| { restore_*; }` line. A bare failure — the `cp -a` staging a stock, the `sed`
+rendering, a docker hiccup — exits immediately, skipping every restore and leaving the
+out-of-phase pair with no message. Added an EXIT trap that unwinds anything staged, guarded
+against double-unwinding the handled paths.
+
+**Also:** `is_passthrough_shape` classified from four disk reads, so an edited-but-unreloaded
+`haproxy.cfg` would read as passthrough while `:443` still served the old shape — it now ends on
+the runtime path probe (disk says what it should be; the probe says what it is). `turn_domain_valid`
+was a character allowlist that accepted `turn-.example.com`, `a..b` and 64-octet labels — now
+validates real DNS label structure (tested: those three reject, real domains accept). An unbound
+`:443` was accepted as a cutover entrypoint with no check that a rollback target exists. And a
+Phase 0 log line still said "cfg+PEM staged" — a phantom from the previous shape.
+
+### Rejected, with the conflict named
+
+Carnot: *"migrate consumes both `.pre-passthrough` files before proving Phase 3 can complete."*
+Rejected — and worth recording **why**, because two adversaries disagree here. Tesla's round-3
+finding (RED-proved) is that once Phase 2 succeeds, those stocks are **invalid**: restoring them
+pairs a plaintext-forwarding proxy with a TLS-speaking LiveKit. Phase 3 then shreds the PEM, which
+makes the stock `haproxy.cfg` unbootable. Keeping them past Phase 2 preserves a trap, not an
+option. I am siding with the proved finding over the reasoned one.
+
+### Three limits accepted as limits, written into INVARIANTS.md
+
+1. The path probe discriminates **Caddy-vs-not**, not terminator-vs-passthrough (both complete
+   TLS then refuse HTTP). The terminator case is caught one layer up by the `ssl crt` config
+   assertion — two checks, one gap each, overlapping.
+2. `migrate-to-passthrough.sh` has a window between Phase 1 and Phase 2 that is **not
+   boot-correct** and survives a reboot. Inherent — two coupled processes cannot flip in the same
+   instant. Mitigated by the EXIT trap and Phase 0's recovery detection; named, not claimed away.
+3. `:5349` public is **not the same surface** as `:443`: `fe443` bounces a non-ClientHello in 5s,
+   LiveKit's raw socket does not. "No plaintext exposed" is true; "no additional exposure" is not
+   the same claim.
+
+**Rig after round 6:** cutover green (90 ms), 7/7 invariants, 18/18 faults, migration end-to-end
+green, DNS validator RED/GREEN.

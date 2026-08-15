@@ -69,6 +69,19 @@ REFUSING. If you genuinely want to leave the mux, restore a public-:443 Caddyfil
   fi
 fi
 
+# --- 0b. CAN the stock Caddyfile actually take :443? Prove it BEFORE freeing the port ---------
+# Third instance of the same class this PR keeps finding (Carnot round 6): the no-stock guard
+# above proves a stock file EXISTS, and `caddy validate` ran only after HAProxy had already been
+# stopped. A corrupt or non-:443 stock file therefore meant: front door freed, Caddy refuses to
+# start, :443 down with nothing to put on it. Validate while HAProxy is still serving.
+if [ -s "$CADDY_STOCK" ]; then
+  caddy validate --config "$CADDY_STOCK" --adapter caddyfile >/dev/null 2>&1 \
+    || die "$CADDY_STOCK does not pass 'caddy validate' — stopping HAProxy now would free :443 with nothing able to take it. Fix the stock Caddyfile first; the mux is still serving in the meantime."
+  grep -qE '^[[:space:]]*https_port[[:space:]]+8443' "$CADDY_STOCK" \
+    && die "$CADDY_STOCK still contains 'https_port 8443' — that is the MUXED Caddyfile, not the stock one. Restoring it would leave :443 unowned. Refusing."
+  log "stock Caddyfile validates and is not the muxed config — safe to hand :443 back"
+fi
+
 # --- 1. Stop AND DISABLE HAProxy, free public :443 ------------------------------------------
 # DISABLE (not just stop): an enabled haproxy would restart on the next reboot and reclaim :443
 # while Caddy is also restored to public :443 → double-bind / outage after an "apparently
