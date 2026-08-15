@@ -52,11 +52,15 @@ drop_present() {
 # unit reads inactive — supervised outside systemd, mid-restart, or a lagging unit state. Gating
 # the guard on is-active would let exactly those cases fall through into the stop/disable.
 if [ ! -s "$CADDY_STOCK" ]; then
-  if [ -n "$(ss -tlnpH 'sport = :443' 2>/dev/null | grep haproxy)" ]; then
+  # Any owner that is not Caddy — or no owner at all — means stopping HAProxy cannot improve
+  # things and may make them worse, and there is nothing to restore either way (Carnot round 4:
+  # the guard named port ownership but protected only one owner).
+  _own="$(ss -tlnpH 'sport = :443' 2>/dev/null | grep -oE '"[^"]+"' | head -1 | tr -d '"')"
+  if [ "$_own" != "caddy" ]; then
     die "HAProxy owns :443 but there is no $CADDY_STOCK to restore Caddy from.
 
-This is the post-migrate-to-passthrough shape: the stock Caddyfile was consumed on a
-successful migration, so there is nothing to roll :443 back TO. Stopping HAProxy here would
+(:443 owner is '"'"'${_own:-<unbound>}'"'"'.) This is the post-migrate-to-passthrough shape: the stock
+Caddyfile was consumed on a successful migration, so there is nothing to roll :443 back TO. Stopping HAProxy here would
 free :443 with no owner and leave chat, signaling and TURN dark.
 
 REFUSING. If you genuinely want to leave the mux, restore a public-:443 Caddyfile by hand
@@ -97,12 +101,23 @@ if [ ! -s "$CADDY_STOCK" ]; then
 fi
 if ! cmp -s "$CADDY_STOCK" "$CADDYFILE"; then
   log "restoring stock Caddyfile"
-  cp "$CADDY_STOCK" "$CADDYFILE"
+  # CHECK THE cp (Tesla): there is no `set -e` here, and a failed copy leaves Caddyfile.mux in
+  # place — which `caddy validate` then PASSES, and `systemctl restart caddy` then serves happily
+  # on :8443, with HAProxy already stopped. The script would log ROLLBACK COMPLETE over an
+  # unbound front door. Verify the copy landed, byte for byte, before trusting anything after it.
+  cp "$CADDY_STOCK" "$CADDYFILE" || die "failed to copy $CADDY_STOCK over $CADDYFILE — :443 is currently UNBOUND (haproxy is stopped). Restore it by hand NOW."
+  cmp -s "$CADDY_STOCK" "$CADDYFILE" || die "the restored $CADDYFILE does not match $CADDY_STOCK — refusing to restart Caddy onto an unverified config while :443 is unbound."
 fi
 caddy validate --config "$CADDYFILE" --adapter caddyfile >/dev/null 2>&1 \
   || die "stock Caddyfile fails validation — NOT restarting Caddy; fix it by hand (:443 is currently unbound)"
 log "restarting caddy (back on public :443)"
 systemctl restart caddy || die "caddy restart failed — :443 may be down; investigate NOW"
+# And VERIFY it actually took :443 (Tesla): "restart succeeded" only says the unit started. If
+# the restored config still puts Caddy on :8443, the unit is happily green and the front door is
+# unbound — the exact "verifies the parchment, not the door" failure. Bounded poll, then assert.
+for _ in $(seq 1 30); do [ -n "$(ss -tlnpH 'sport = :443' 2>/dev/null | grep caddy)" ] && break; sleep 1; done
+[ -n "$(ss -tlnpH 'sport = :443' 2>/dev/null | grep caddy)" ] \
+  || die "caddy restarted but does NOT own :443 (owner: '$(ss -tlnpH 'sport = :443' 2>/dev/null | grep -oE '\"[^\"]+\"' | head -1 | tr -d '\"')'). The front door is not restored — do NOT walk away."
 
 # --- 3. Reopen :8443 — BOTH families ---------------------------------------------------------
 # cutover added the DROP on iptables AND ip6tables; remove both so rollback is symmetric.

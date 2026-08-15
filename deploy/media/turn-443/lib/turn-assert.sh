@@ -65,11 +65,51 @@ turn_tls_reason() {  # turn_tls_reason <rc> <host> <port> <domain>
 #   GET succeeds  -> Caddy has the turn SNI  -> MISROUTED
 #   GET fails     -> LiveKit has it          -> real passthrough
 # Pinned to 127.0.0.1 so it measures THIS box, never whatever DNS resolves to.
-turn_path_is_passthrough() {  # turn_path_is_passthrough <domain> [port]
-  local domain="$1" port="${2:-443}"
-  if curl -sS -o /dev/null --max-time 8 --resolve "${domain}:${port}:127.0.0.1" \
-       "https://${domain}/" 2>/dev/null; then
-    return 1   # an HTTP response came back => Caddy answered => misrouted
+# CURL EXIT CODES, not "did it fail" (Carnot + Tesla, independently — which is what makes it
+# high-confidence). The first version returned "passthrough" on ANY non-success: curl absent
+# (127), connection refused (7), timeout (28), TLS verify failed (60). So the instrument built to
+# fix a fail-open was itself fail-open. Worse, it interacted with a deliberate choice above:
+# turn_tls_ok treats an unverifiable chain as advisory so a private-CA box can deploy, while curl
+# verifies HARD — on such a box the GET dies with 60 and reads as green, forever.
+#
+# So: interpret ONLY the outcomes that actually discriminate, and demand a known-positive control
+# first. If curl cannot reach :443 for a name that MUST work, then a failure on the turn name
+# says nothing about routing — it says the instrument is blind, and blind must not read as green.
+#
+# The exit codes below are MEASURED, not reasoned. The first version guessed 52/56 ("empty
+# reply"/"reset") for the LiveKit case; the rig returned **28 (timeout)** — pion/turn completes
+# the TLS handshake and then simply never speaks HTTP, so curl waits out the clock. That guess
+# would have auto-rolled-back every correct cutover. It did, once, on the rig.
+#
+#   exit 0                  -> an HTTP response came back -> Caddy answered -> MISROUTED
+#   exit 28/52/56/35/18/55  -> a peer that accepts TLS and does not speak HTTP -> passthrough,
+#                              but ONLY meaningful once the control has proved the box is
+#                              reachable at all: a black hole times out identically.
+#   exit 7 (refused) / 60 (TLS verify) / 127 (no curl) -> INDETERMINATE, never green.
+#
+# THE CONTROL IS WHAT MAKES 28 READABLE. Without it, "timed out" is equally "LiveKit is behind
+# the mux, correctly silent" and "nothing is there". With a control that succeeded through the
+# same :443, only the first reading survives. A caller that passes no control gets a hard
+# INDETERMINATE rather than a courtesy pass.
+turn_path_is_passthrough() {  # <domain> [control-domain] [port]
+  local domain="$1" control="${2:-}" port="${3:-443}" rc
+  command -v curl >/dev/null 2>&1 || { echo "[turn-assert] curl absent — cannot discriminate the turn path" >&2; return 2; }
+
+  if [ -z "$control" ]; then
+    echo "[turn-assert] no control domain given — a timeout cannot be told from a black hole. Refusing to report passthrough." >&2
+    return 2
   fi
-  return 0
+  curl -sS -o /dev/null --max-time 8 --resolve "${control}:${port}:127.0.0.1" "https://${control}/" 2>/dev/null || {
+    echo "[turn-assert] CONTROL FAILED: an HTTPS GET for ${control} through :${port} did not succeed, so this probe cannot tell a misroute from a broken instrument. Refusing to report passthrough." >&2
+    return 2
+  }
+
+  curl -sS -o /dev/null --max-time 8 --resolve "${domain}:${port}:127.0.0.1" "https://${domain}/" 2>/dev/null
+  rc=$?
+  case "$rc" in
+    0)                       return 1 ;;   # Caddy answered — misrouted
+    28|52|56|35|18|55|97)    return 0 ;;   # accepts TLS, never speaks HTTP — LiveKit's TURN socket
+    *) echo "[turn-assert] turn-path probe INDETERMINATE (curl exit $rc for ${domain}): neither a misroute proof nor a passthrough proof." >&2
+       return 2 ;;
+  esac
 }

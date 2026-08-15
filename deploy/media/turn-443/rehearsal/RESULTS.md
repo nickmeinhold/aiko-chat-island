@@ -440,3 +440,64 @@ grepped for a sentence I had reworded — a test asserting prose rather than a f
 
 **Rig after round 3:** full cutover green (96 ms), 7/7 invariants, **18/18** faults, migration
 RED/GREEN proved, resume-with-stale-stocks proved.
+
+## Round 4 — the instrument built to fix a fail-open was itself fail-open
+
+Kelvin APPROVE (fourth time). Carnot and Tesla `REQUEST_CHANGES`, and they **independently
+converged** on the same finding, which is what makes it high-confidence rather than one model's
+hunch.
+
+`turn_path_is_passthrough` returned "passthrough" on **any** non-success from curl: absent (127),
+refused (7), timeout (28), TLS-verify-failed (60). Tesla found the sharpest corollary: I had
+deliberately made chain verification *advisory* in `turn_tls_ok` so a private-CA box could still
+deploy — while curl verifies **hard**. On such a box the GET dies with 60 and reads green
+forever. The rig only escaped because its Pebble root is in the system trust store.
+
+Two fixes, and the second one is the point:
+
+1. **Discriminate by exit code**, not by "did it fail".
+2. **Require a known-positive control.** A GET for the chat domain must succeed through the same
+   `:443` before a failure on the turn name means anything. Without it, "timed out" reads
+   identically as *"LiveKit is behind the mux, correctly silent"* and *"nothing is there"*.
+
+### And the rig corrected my exit codes
+
+I classified the LiveKit case as curl 52/56 (empty reply / reset) by reasoning. **The rig
+returned 28 (timeout)** — pion/turn completes the TLS handshake and then never speaks HTTP, so
+curl waits out the clock. That guess would have auto-rolled-back every *correct* cutover, and it
+did exactly that once, on the rig, before the value was measured.
+
+Which also produced an unplanned proof: a genuine verify failure drove the **auto-rollback path
+end to end**, cleanly, on a live mux.
+
+RED/GREEN, all three states:
+
+| state | verdict |
+|---|---|
+| SNI rule misrouted | **FAIL** — caught |
+| control domain broken | **FAIL** — `INDETERMINATE`, explicitly not a pass |
+| correct | **PASS** |
+
+### Also fixed
+
+- The resume path skipped Phase 3 entirely, so a crash after a successful Phase 2 left cert-sync
+  units installed and the PEM unshredded **forever** — the private key of a terminator that no
+  longer terminates (Tesla). Phase 3 is idempotent and now runs on both paths.
+- `rollback.sh` did an **unchecked `cp`** with no `set -e`, then `caddy validate` on whatever was
+  on disk. A failed copy leaves `Caddyfile.mux` in place, validate passes, Caddy restarts happily
+  on `:8443`, HAProxy is already stopped — and it logs `ROLLBACK COMPLETE` over an unbound front
+  door (Tesla: *"verifies the parchment, not the door"*). Copy is now verified byte-for-byte, and
+  the script asserts Caddy actually **took** `:443` before claiming success.
+- The no-stock rollback guard protected against one owner (`haproxy`) though its comment named
+  port ownership generally (Carnot). Any non-Caddy owner now refuses.
+- `docker exec livekit sh -c "cat ..."` → argv form, no shell in the feed (Carnot).
+- Phase 0 is labelled *"read-only, ONE exception"* and the exception — deleting stale staging
+  files on the resume path — is named, because it is a mutation inside a phase that claimed not
+  to have any (Carnot).
+
+**Rejected with proof:** Carnot's "CHAT_DOMAIN/LK_DOMAIN silently bake a naming convention" —
+both are `${CHAT_DOMAIN:-...}` overridable (`cutover.sh:249-250`); the convention is the default,
+not the only option.
+
+**Rig after round 4:** cutover green (84 ms), 7/7 invariants, 18/18 faults, path probe RED/GREEN
+across all three outcomes.

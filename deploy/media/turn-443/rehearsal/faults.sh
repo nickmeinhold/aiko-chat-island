@@ -99,7 +99,7 @@ chk "  ...and it is byte-identical to LiveKit's own cert on :5349" "$([ -n "$lk_
 # IDENTICAL cert. The claim "true passthrough" was unearned. Discriminate the PATH instead —
 # Caddy answers an HTTPS GET, LiveKit's TURN socket cannot.
 . /opt/turn-443/lib/turn-assert.sh
-turn_path_is_passthrough "$TURN_DOMAIN"
+turn_path_is_passthrough "$TURN_DOMAIN" "chat.${TURN_DOMAIN#turn.}"
 chk "  ...and the turn SNI is NOT answered by Caddy (TRUE passthrough)" $?
 timeout 8 openssl s_client -connect 127.0.0.1:443 -servername "chat.enspyr.co" </dev/null 2>/dev/null | grep -q "BEGIN CERT"
 chk "chat SNI  -> passthrough to Caddy presents a cert" $?

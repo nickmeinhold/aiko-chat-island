@@ -272,8 +272,14 @@ curl -sS -o /dev/null --max-time 10 --resolve "${LK_DOMAIN}:443:127.0.0.1" "http
 # one is what correct passthrough looks like.
 _rc=0; turn_tls_ok 127.0.0.1 443 "$TURN_DOMAIN" || _rc=$?
 [ "$_rc" -eq 0 ] || roll "through the mux: $(turn_tls_reason "$_rc" 127.0.0.1 443 "$TURN_DOMAIN")"
-turn_path_is_passthrough "$TURN_DOMAIN" \
-  || roll "an HTTPS GET for $TURN_DOMAIN through :443 SUCCEEDED — the turn SNI is being answered by CADDY (default_backend), not passed through to LiveKit. Cert and fingerprint checks CANNOT see this: Caddy serves the same store LiveKit mounts."
+# CHAT_DOMAIN is the known-positive control: it MUST answer through this same :443, so if it
+# does not, the probe is blind and must not report either way (Carnot + Tesla).
+_prc=0; turn_path_is_passthrough "$TURN_DOMAIN" "$CHAT_DOMAIN" || _prc=$?
+case "$_prc" in
+  0) : ;;
+  1) roll "an HTTPS GET for $TURN_DOMAIN through :443 SUCCEEDED — the turn SNI is being answered by CADDY (default_backend), not passed through to LiveKit. Cert and fingerprint checks CANNOT see this: Caddy serves the same store LiveKit mounts." ;;
+  *) roll "the turn-path probe could not discriminate (see the [turn-assert] line above). An unproven path is not a passing one — refusing to complete the cutover on an unverifiable mux." ;;
+esac
 log "  turn SNI is NOT answered by Caddy (HTTP GET refused) — the passthrough path is real"
 
 # ============================ PHASE 4 — renewal must be guarded ==============================

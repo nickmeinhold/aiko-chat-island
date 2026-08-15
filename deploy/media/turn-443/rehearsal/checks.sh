@@ -126,11 +126,12 @@ assert_safety() {
   # (Tesla). Discriminate the PATH: Caddy answers `respond "turn" 200` to an HTTPS GET; LiveKit's
   # TURN socket cannot speak HTTP. A successful GET means Caddy has the turn SNI — the misroute.
   if [ "$(port_owner 443)" = "haproxy" ]; then
-    if turn_path_is_passthrough "$TURN_DOMAIN"; then
-      chk "PASSTHROUGH-PATH turn SNI is NOT answered by Caddy (real passthrough)" 0
-    else
-      chk "PASSTHROUGH-PATH turn SNI is answered by CADDY, not LiveKit (misrouted)" 1
-    fi
+    _prc=0; turn_path_is_passthrough "$TURN_DOMAIN" "$CHAT_DOMAIN" || _prc=$?
+    case "$_prc" in
+      0) chk "PASSTHROUGH-PATH turn SNI is NOT answered by Caddy (real passthrough)" 0 ;;
+      1) chk "PASSTHROUGH-PATH turn SNI is answered by CADDY, not LiveKit (misrouted)" 1 ;;
+      *) chk "PASSTHROUGH-PATH probe INDETERMINATE — cannot confirm the path (not a pass)" 1 ;;
+    esac
   fi
 
   # INV-8: Caddy's HTTPS must not be publicly reachable once it has moved to :8443.
