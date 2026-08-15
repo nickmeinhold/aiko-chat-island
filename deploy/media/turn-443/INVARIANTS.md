@@ -49,6 +49,30 @@ off-box B3 probe's job, with `B3_REQUIRE_ENDPOINT` pinned, and the real-client r
 it. Written down because a phase that is read as proving more than it measures is how a green
 board ends up over a dead media plane.
 
+**Three limits the cage-match named, kept as limits rather than papered over.**
+
+1. **The path probe discriminates Caddy-vs-not, not terminator-vs-passthrough** (Tesla). Both an
+   HAProxy TLS terminator and LiveKit complete a handshake and then refuse HTTP, so the probe
+   cannot tell them apart. It catches the misroute that actually exists in this shape (turn SNI
+   falling into `be_caddy`); a reintroduced terminator is caught one layer up, by the config
+   assertion that `ssl crt` appears nowhere in the rendered file. Two checks, one gap each,
+   overlapping — worth stating so nobody reads the probe as proving more than it does.
+
+2. **`migrate-to-passthrough.sh` has a window that is NOT boot-correct** (Tesla). Between Phase 1
+   (LiveKit takes back its TLS) and Phase 2 (HAProxy stops forwarding plaintext), the pair is out
+   of phase — and because LiveKit is `restart: unless-stopped` and HAProxy is unit-enabled, that
+   state **survives a reboot**. INV-3 was only ever scoped to `cutover.sh`. This is inherent:
+   two coupled processes cannot flip in the same instant. It is mitigated, not eliminated — the
+   window is a container restart wide, an EXIT trap unwinds unhandled failures inside it, and
+   Phase 0 detects and prints the exact recovery if a run died there. Named as a gap because it
+   is one.
+
+3. **`:5349` public is not the same surface as `:443`** (Tesla). "Same service" is true of the
+   protocol and false of the door: `fe443` rejects a non-ClientHello within 5s and counts against
+   `maxconn`, while LiveKit's raw TURNS socket has neither bouncer. Leaving `:5349` open is
+   harmless as *"no plaintext is exposed"* and is not the same claim as *"no additional exposure"*.
+   Operators who want the smaller surface should firewall it; nothing here depends on either choice.
+
 **Honest accounting of what this cost.** One invariant got *harder*: INV-4′. Under
 `external_tls` the terminating proxy could hot-reload a renewed cert with no media bounce; now
 LiveKit must restart. That is the trade the whole shape turns on, and it is a good one — a

@@ -15,11 +15,21 @@
 # ---------------------------------------------------------------- input validation
 # TURN_DOMAIN reaches `sed s///` (where / and & are syntax) and grep patterns, as root, writing
 # the front door's config. An allowlist is the whole fix — anything outside it is not a hostname.
+# Character allowlist ALONE accepted `turn-.example.com`, `turn.-example.com`, `a..b`, and labels
+# over 63 octets (Carnot). Since this renders root-owned config, validate the STRUCTURE: every
+# label 1-63 chars, alphanumeric at both ends, hyphens only inside, and the whole name <= 253.
 turn_domain_valid() {  # turn_domain_valid <domain>
-  case "$1" in
-    ""|*[!a-zA-Z0-9.-]*|.*|-*|*.|*-) return 1 ;;
-    *) return 0 ;;
-  esac
+  local d="$1" label
+  [ -n "$d" ] || return 1
+  [ "${#d}" -le 253 ] || return 1
+  case "$d" in *[!a-zA-Z0-9.-]*|.*|*.|*..*) return 1 ;; esac
+  local IFS=.
+  for label in $d; do
+    [ -n "$label" ] || return 1
+    [ "${#label}" -le 63 ] || return 1
+    case "$label" in -*|*-) return 1 ;; esac
+  done
+  return 0
 }
 
 # ---------------------------------------------------------------- TLS identity
@@ -93,10 +103,15 @@ turn_tls_reason() {  # turn_tls_reason <rc> <host> <port> <domain>
 # would have auto-rolled-back every correct cutover. It did, once, on the rig.
 #
 #   exit 0                  -> an HTTP response came back -> Caddy answered -> MISROUTED
-#   exit 28/52/56/35/18/55  -> a peer that accepts TLS and does not speak HTTP -> passthrough,
+#   exit 28/52/56           -> a peer that COMPLETED TLS and produced no HTTP -> passthrough,
 #                              but ONLY meaningful once the control has proved the box is
 #                              reachable at all: a black hole times out identically.
-#   exit 7 (refused) / 60 (TLS verify) / 127 (no curl) -> INDETERMINATE, never green.
+#   everything else (7 refused, 35 SSL-connect-error, 60 verify, 127 no curl) -> INDETERMINATE.
+#
+# 35 WAS IN THE GREEN LIST AND SHOULD NOT HAVE BEEN (Tesla). It is "SSL connect error" — the
+# handshake never completed — which is the opposite of "accepts TLS and stays silent". I measured
+# 28 and then OR'd 35/18/55/97 alongside it BY REASONING, in the same commit that says these codes
+# are measured rather than reasoned. One measured value, padded with guesses that widen the green.
 #
 # THE CONTROL IS WHAT MAKES 28 READABLE. Without it, "timed out" is equally "LiveKit is behind
 # the mux, correctly silent" and "nothing is there". With a control that succeeded through the
@@ -119,7 +134,8 @@ turn_path_is_passthrough() {  # <domain> [control-domain] [port]
   rc=$?
   case "$rc" in
     0)                       return 1 ;;   # Caddy answered — misrouted
-    28|52|56|35|18|55|97)    return 0 ;;   # accepts TLS, never speaks HTTP — LiveKit's TURN socket
+    28|52|56)                return 0 ;;   # peer completed TLS and produced no HTTP: 28 timeout
+                                           # (MEASURED against pion), 52 empty reply, 56 reset.
     *) echo "[turn-assert] turn-path probe INDETERMINATE (curl exit $rc for ${domain}): neither a misroute proof nor a passthrough proof." >&2
        return 2 ;;
   esac
