@@ -122,7 +122,11 @@ esac
 # so LiveKit must already be serving TLS for TURN_DOMAIN on :5349. Checking the SUBJECT (not
 # merely "a handshake happened") is what makes this a real check: a dead socket and a wrong-cert
 # socket fail differently, and both must fail here.
-log "asserting LiveKit already terminates TLS for $TURN_DOMAIN on :5349 (the passthrough backend)"
+# SCOPE, stated precisely (Carnot): this proves a TLS handshake completes and the cert is valid
+# for TURN_DOMAIN. It does NOT prove the TURN protocol stack behind it works — a listener with
+# the right cert and a broken TURN implementation passes this. That is B3's job, off-box, as the
+# acceptance gate. Naming the boundary here so the phase is not read as more than it measures.
+log "asserting LiveKit already serves a valid $TURN_DOMAIN cert on :5349 (TLS identity; TURN protocol viability is B3's gate)"
 _turn_backend_ok() {
   local out
   out="$(echo | timeout 10 openssl s_client -connect "127.0.0.1:5349" -servername "$TURN_DOMAIN" 2>/dev/null)" || return 1
@@ -229,7 +233,7 @@ port_listening 443  || roll ":443 not bound after haproxy start"
 ckpt CP4
 
 # ============================ PHASE 3 — on-box verify (auto-rollback on any red) ==============
-log "3 verifying (chat / livekit / turn-TLS on :443)"
+log "3 verifying (chat / livekit route + turn TLS identity and PATH on :443; TURN protocol = B3)"
 sleep 2
 # No -f: we verify the MUX ROUTES the SNI to Caddy and gets a response, not the HTTP status
 # (chat's app / livekit's root may legitimately be non-2xx). A routing/passthrough failure is

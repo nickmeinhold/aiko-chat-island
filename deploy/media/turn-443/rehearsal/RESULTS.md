@@ -326,3 +326,72 @@ Fixed twice over: the probe venv now lives in `/opt/probeenv` (survives a reboot
 status is captured directly rather than through a pipe. **Four fail-opens in one session, every
 one in a measuring device rather than in the thing being measured** — that ratio is a property
 of this verification layer, not a run of bad luck.
+
+---
+
+# Cage-match rounds 1-2 (2026-08-14/15) — what the adversaries found in the passthrough build
+
+Two rounds, four families. **Kelvin APPROVED both times.** Carnot and Tesla each returned
+`REQUEST_CHANGES` twice, and between them found four defects that would have taken a live island
+down or certified a broken one. A single adversary would have shipped this.
+
+## Round 1 — 8 real findings
+
+The two worst were the **same defect at opposite ends of the pair**, found by two different
+families: *mutate first, discover the wrong universe second*.
+
+| finding | who | proof |
+|---|---|---|
+| `cutover.sh` disabled HAProxy before asserting anything about the box | Carnot | **RED-proved on the rig** with the pre-fix script: `haproxy active→inactive`, `:443` **UNBOUND**, chat `curl 000` |
+| `rollback.sh` freed `:443` before checking a stock Caddyfile existed to hand it back to | Tesla | the RUNBOOK's own "rollback anytime" line was an outage generator on a migrated box |
+| Phase 3 verified with a **hardcoded** `curl https://chat.enspyr.co/` | Carnot + Tesla | on imagineering that leaves the box, hits enspyr, and **passes** — a check that succeeds by measuring a different machine |
+| Phase 4's "idempotent from here" was false — staging files left, Phase 0 refuses | Carnot + Maxwell | the one failure path designed to be re-runnable was the only one that bricked the re-run |
+| `restore_both` warned and returned on an unverified rollback | Kelvin | fail-apathetic: the caller's `die` buried the five-alarm |
+| unescaped `TURN_DOMAIN` in a grep regex, ORed in front of `-checkhost` | Carnot | a weaker check before a stronger one can only weaken it |
+| cert-sync removed from `/usr/local/sbin`; the old cutover installed to `/usr/local/bin` | Maxwell | **verified on live enspyr** — the script is still on disk there |
+| root rendering to a predictable `/tmp` path | Maxwell | symlink clobber |
+
+## Round 2 — 9 real findings, 1 rejected
+
+**The headline: a check I added in round 1 was blind to the failure it was written for.**
+
+Comparing the cert fingerprint on `:443` against LiveKit's on `:5349` was introduced as "the
+positive proof that this is passthrough". It is not. `Caddyfile.mux` deliberately keeps a
+`turn.` site block, and Caddy serves it **from the same cert store LiveKit mounts** — so a
+mis-rendered SNI rule that dumps turn into `default_backend be_caddy` produces a byte-identical
+cert. RED-proved by breaking the SNI rule for real:
+
+```
+cert valid for turn.enspyr.co through :443?   YES
+fingerprints match?                           YES   <- the round-1 check PASSES on a broken mux
+PASSTHROUGH-PATH check                        FAIL  <- the round-2 check catches it
+after restore                                 PASS
+```
+
+The fix discriminates the **path**, not the certificate: Caddy answers `respond "turn" 200` to
+an HTTPS GET; LiveKit's TURN socket cannot speak HTTP at all. A successful GET for the turn name
+through `:443` therefore *proves* the misroute.
+
+This is the verifier-shares-a-representation-with-the-verified class, and it is the fourth
+distinct instrument failure in this workstream. The pattern is now unambiguous: **in this
+subsystem, the measuring devices fail more often than the thing being measured.**
+
+Other round-2 finds: `restore_both` verified recovery by an `:443` handshake that completes even
+with LiveKit dead (HAProxy terminates `:443` under the old shape — measuring the front
+oscillator says nothing about the pair); Phase 3 shredded the PEM *before* consuming the staging
+files, so a kill in between left Phase 0 printing a "restore BOTH" recipe that reassembles an
+unbootable config; Phase 4 checked `is-active` without `is-enabled`, so a `start`-without-`enable`
+greened the gate and evaporated on reboot; `checks.sh` skipped its backend assertion entirely
+when `:5349` had no owner (fail-open by omission); the resume detector used whole-file greps
+while the mutation it guards is `turn:`-scoped; `TURN_DOMAIN` reached `sed s///` unvalidated as
+root; and the rollback guard was keyed on unit-active state rather than port ownership.
+
+**Rejected with proof:** Carnot's `$HA_CFG.new survives abort paths` — it is `rm`'d on both
+(`migrate-to-passthrough.sh:186,190`). Carnot cited round-1 line numbers.
+
+## Where this leaves the rig
+
+Full cutover green, 7/7 invariants (including the new `PASSTHROUGH-PATH`), 18/18 fault
+assertions, migration rehearsed against enspyr's real pre-migration shape, resume path proven
+both directions. `refresh-ca` was added to `drive.sh` because Pebble's per-restart root rotation
+cost two diagnosis detours in one session.
