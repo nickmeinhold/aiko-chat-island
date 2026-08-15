@@ -176,12 +176,25 @@ _on_unexpected_exit() {
   local rc=$?
   [ "$rc" -eq 0 ] && return 0
   [ "$MIGRATION_COMPLETE" -eq 1 ] && return 0
+  [ "${_DATA_PLANE_DONE:-0}" -eq 1 ] && return 0
   [ "${_RESTORE_IN_PROGRESS:-0}" -eq 1 ] && return 0
-  echo "[passthrough] UNEXPECTED EXIT (rc=$rc) outside a handled failure path — attempting to unwind." >&2
+  echo "[passthrough] UNEXPECTED EXIT (rc=$rc) outside a handled failure path — unwinding." >&2
   _RESTORE_IN_PROGRESS=1
-  [ -e "$HA_CFG$STOCK_SUFFIX" ] && { mv -f "$HA_CFG$STOCK_SUFFIX" "$HA_CFG" && systemctl reload haproxy; } 2>/dev/null
-  [ -e "$LK_YAML$STOCK_SUFFIX" ] && { mv -f "$LK_YAML$STOCK_SUFFIX" "$LK_YAML"; (cd "$LIVEKIT_DIR" && dc restart livekit >/dev/null 2>&1); } 2>/dev/null
-  echo "[passthrough] unwind attempted. VERIFY BY HAND: turns:443 must answer, and :$TURN_TLS_PORT must be back to plaintext." >&2
+  # Use the COUPLED restore, not two independent muted chains (Tesla round 7). The earlier
+  # version did `mv haproxy.cfg && reload` and `mv livekit.yaml && restart` separately, both
+  # 2>/dev/null — so a successful mv with a failed reload left memory on passthrough and disk on
+  # terminate-and-forward, then slammed LiveKit back to plaintext: the out-of-phase pair, with
+  # the trap's own voice muted. restore_both exists precisely because these are one artifact,
+  # and it VERIFIES the pair afterwards.
+  if [ -e "$HA_CFG$STOCK_SUFFIX" ]; then
+    restore_both          # restores haproxy AND livekit, then asserts both ends agree
+  elif [ -e "$LK_YAML$STOCK_SUFFIX" ]; then
+    # Only LiveKit was staged (died inside Phase 1) — HAProxy was never touched.
+    restore_livekit
+    echo "[passthrough] unwound LiveKit only (HAProxy was never modified). VERIFY: turns:443 must answer." >&2
+  else
+    echo "[passthrough] nothing was staged yet — no unwind needed." >&2
+  fi
 }
 trap _on_unexpected_exit EXIT
 
@@ -386,11 +399,22 @@ if ! systemctl is-enabled --quiet cert-restart.timer 2>/dev/null || ! systemctl 
   echo "  a stale cert and TURN-over-TLS will fail silently. Wire it (task #3) and re-run." >&2
   echo "  Re-running is SAFE: Phase 0 detects the already-migrated shape, verifies it, and" >&2
   echo "  resumes at this gate without touching the live data plane." >&2
+  # The data plane is COMPLETE and CORRECT here; only the renewal gate is unmet. Tell the EXIT
+  # trap so it does not print "UNEXPECTED EXIT … unwinding" over an intentional, documented
+  # re-runnable exit (Carnot round 7) — contradictory instructions on an operator path are their
+  # own kind of failure.
+  _DATA_PLANE_DONE=1
   exit 3
 fi
 log "PHASE 4 OK — renewal restarts are guarded"
 
 MIGRATION_COMPLETE=1
+# Leave a MARKER. rollback.sh must be able to tell a box that was CUT OVER to passthrough from
+# one that was MIGRATED to it — and no observable state distinguishes them (both have
+# cert_file + a certless haproxy.cfg), which is precisely why Tesla's round-7 finding was subtle
+# and why inferring it from shape misfired on a cutover box. This is the one fact only this
+# script knows, so it is the one that gets written down.
+printf 'migrated-to-passthrough %s\n' "$TURN_DOMAIN" > /etc/haproxy/.migrated-to-passthrough 2>/dev/null || true
 log "MIGRATION COMPLETE. Now run the acceptance gates:"
 log "  b3_relay_probe.py with B3_REQUIRE_ENDPOINT=tls:*:443   (relay-deny + liveness)"
 log "  webrtc_relay_proof.py from a UDP-blocked vantage        (a real call actually flows)"

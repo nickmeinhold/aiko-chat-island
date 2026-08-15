@@ -57,16 +57,53 @@ if [ ! -s "$CADDY_STOCK" ]; then
   # the guard named port ownership but protected only one owner).
   _own="$(ss -tlnpH 'sport = :443' 2>/dev/null | grep -oE '"[^"]+"' | head -1 | tr -d '"')"
   if [ "$_own" != "caddy" ]; then
-    die "':443' is held by '${_own:-<nothing>}' (not Caddy) and there is no $CADDY_STOCK to restore Caddy from.
+    die ":443 is held by ${_own:-<nothing>} (not Caddy) and there is no $CADDY_STOCK to restore Caddy from.
 
-(:443 owner is '"'"'${_own:-<unbound>}'"'"'.) This is the post-migrate-to-passthrough shape: the stock
-Caddyfile was consumed on a successful migration, so there is nothing to roll :443 back TO. Stopping HAProxy here would
+This is the post-migrate-to-passthrough shape: the stock Caddyfile was consumed, so there is
+nothing to roll :443 back TO. Stopping HAProxy here would
 free :443 with no owner and leave chat, signaling and TURN dark.
 
 REFUSING. If you genuinely want to leave the mux, restore a public-:443 Caddyfile by hand
 (drop the global 'https_port 8443' + the :8443 proxy_protocol listener from
 /etc/caddy/Caddyfile), verify 'caddy validate', THEN re-run this script."
   fi
+fi
+
+# --- 0a. IS THIS A MIGRATED BOX? (Tesla round 7 — VERIFIED against live enspyr) --------------
+# The round-4 guard sealed the door against a MISSING stock Caddyfile. It did not consider the
+# previous generation's key still being in the lock: the original cutover leaves
+# /etc/caddy/Caddyfile.stock on disk and never removes it, and migrate-to-passthrough.sh only
+# consumes .pre-passthrough — a different object. enspyr has that stock file RIGHT NOW.
+#
+# So a migrated box is observationally identical to a freshly cut-over one: HAProxy owns :443,
+# a valid pre-mux stock exists, the live Caddyfile has https_port 8443. Rollback would proceed,
+# hand :443 back to Caddy, and print COMPLETE — with LiveKit still on passthrough TLS and
+# turns:443 DEAD. Chat lives, TURN goes dark, both halves look restored.
+#
+# That is not "restoring what was there": before the MIGRATION there was a working turns:443.
+# Rolling a migrated box back is a deliberate downgrade to the pre-mux state, so it must be
+# declared, not stumbled into.
+# The discriminator is a MARKER migrate-to-passthrough.sh writes, not the box's shape. Shape
+# cannot tell these apart: a box CUT OVER to passthrough and a box MIGRATED to it both have
+# livekit cert_file and a certless haproxy.cfg. An earlier attempt at this guard inferred from
+# shape and blocked the legitimate rollback of a cut-over box — caught by the rig's fault suite,
+# which is what it is for.
+if [ -f /etc/haproxy/.migrated-to-passthrough ]; then
+  if [ "${ROLLBACK_ACCEPT_TURN_LOSS:-0}" != "1" ]; then
+    die "this box was MIGRATED to passthrough (marker: /etc/haproxy/.migrated-to-passthrough).
+
+rollback.sh unwinds a CUTOVER, not a MIGRATION. Running it here would hand :443 back to Caddy
+and leave turns:443 DEAD — LiveKit stays on its own TLS behind a mux that no longer exists.
+Chat would keep working, so nothing would look broken.
+
+A stale Caddyfile.stock from the ORIGINAL cutover is still on disk (verified present on enspyr),
+which is why the missing-stock guard below does not catch this.
+
+If you genuinely want the pre-mux state and accept losing turns:443, declare it:
+    ROLLBACK_ACCEPT_TURN_LOSS=1 sudo bash $0"
+  fi
+  log "WARNING: rolling back a MIGRATED box — turns:443 will be DEAD after this (declared)."
+  rm -f /etc/haproxy/.migrated-to-passthrough
 fi
 
 # --- 0b. CAN the stock Caddyfile actually take :443? Prove it BEFORE freeing the port ---------

@@ -102,4 +102,10 @@ backend be_caddy
 # refused fast rather than forwarded into a dead socket. It deliberately does NOT prove TLS
 # liveness — that is the b3 probe's job with B3_REQUIRE_ENDPOINT pinned (finding F1).
 backend be_turn
-    server livekit 127.0.0.1:5349 check
+    # check-ssl (Carnot): a bare `check` is a TCP connect, so a LiveKit that accepts the socket
+    # and then fails the TLS handshake — a bad/missing cert, a half-loaded config — is marked UP
+    # and clients are routed into it. `check-ssl verify none` makes the HEALTH CHECK complete a
+    # real handshake; `verify none` because this proxy deliberately holds no trust material and
+    # the cert's validity is asserted by the deploy scripts and the B3 gate, not here. The DATA
+    # path is untouched: HAProxy still forwards raw bytes and terminates nothing.
+    server livekit 127.0.0.1:5349 check check-ssl verify none sni str(@@TURN_DOMAIN@@)
