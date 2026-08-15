@@ -6,6 +6,8 @@
 # external-vantage probes are validated POSITIVE at CP0 (where the port is genuinely open)
 # before their negative result is trusted anywhere else.
 TURN_DOMAIN="${TURN_DOMAIN:-turn.enspyr.co}"
+# Rig runs a private Pebble CA — see drive.sh. Declared, not defaulted.
+export TURN_ALLOW_UNVERIFIED_CHAIN="${TURN_ALLOW_UNVERIFIED_CHAIN:-1}"
 CHAT_DOMAIN="${CHAT_DOMAIN:-chat.enspyr.co}"
 
 # The "external" vantage point: a container on docker0. Traffic from it arrives on a

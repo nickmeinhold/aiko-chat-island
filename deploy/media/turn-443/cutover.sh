@@ -156,7 +156,10 @@ RENDERED="$(mktemp /tmp/haproxy.cfg.rendered.XXXXXX)"
 sed "s/@@TURN_DOMAIN@@/${TURN_DOMAIN}/g" "$HAPROXY_TMPL" > "$RENDERED"
 grep -q '@@' "$RENDERED" && { rm -f "$RENDERED"; die "unrendered placeholder left in the rendered haproxy.cfg"; }
 grep -qi 'ssl crt' "$RENDERED" && { rm -f "$RENDERED"; die "rendered config terminates TLS — that is the OLD external_tls template, not passthrough"; }
-install -D -m 0644 "$RENDERED" /etc/haproxy/haproxy.cfg
+install -D -m 0644 "$RENDERED" /etc/haproxy/haproxy.cfg \
+  || { rm -f "$RENDERED"; die "could not install the rendered config to /etc/haproxy/haproxy.cfg"; }
+cmp -s "$RENDERED" /etc/haproxy/haproxy.cfg \
+  || { rm -f "$RENDERED"; die "the installed /etc/haproxy/haproxy.cfg does not match what was rendered"; }
 rm -f "$RENDERED"
 haproxy -c -f /etc/haproxy/haproxy.cfg >/dev/null 2>&1 || die "haproxy -c failed on /etc/haproxy/haproxy.cfg"
 caddy validate --config "$CADDY_MUX" --adapter caddyfile >/dev/null 2>&1 || die "Caddyfile.mux fails caddy validate"
@@ -205,7 +208,13 @@ ckpt CP2
 
 # --- 2.3 move Caddy off public :443 → loopback:8443 -----------------------------------------
 log "2.3 installing Caddyfile.mux, enabling haproxy, reloading caddy (releases public :443)"
-cp "$CADDY_MUX" "$CADDYFILE"
+# CHECKED (Carnot round 5 — the same unchecked-copy class found in rollback.sh in round 4, which
+# I fixed there and did not sweep for here). This script runs `set -uo pipefail`, NOT `set -e`, so
+# a failed cp continues silently into `caddy validate`, which then validates the file that was
+# ALREADY on disk — the pre-cutover Caddyfile — passes, and the cutover proceeds to hand :443 to
+# HAProxy while Caddy is still configured for :443 too. Verify the copy landed before trusting it.
+cp "$CADDY_MUX" "$CADDYFILE" || roll "could not install Caddyfile.mux over $CADDYFILE"
+cmp -s "$CADDY_MUX" "$CADDYFILE" || roll "$CADDYFILE does not match Caddyfile.mux after the copy"
 caddy validate --config "$CADDYFILE" --adapter caddyfile >/dev/null 2>&1 || roll "installed Caddyfile.mux failed validation"
 # ENABLE haproxy HERE — BEFORE the live Caddy reload (Carnot reboot-window fix). Once the mux
 # Caddyfile is on disk (Caddy→:8443) AND haproxy is enabled, the PERSISTED state is boot-correct:

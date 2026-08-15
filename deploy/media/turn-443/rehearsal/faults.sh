@@ -7,6 +7,8 @@
 set -uo pipefail
 R=/opt/turn-443
 TURN_DOMAIN="${TURN_DOMAIN:-turn.enspyr.co}"
+# Rig runs a private Pebble CA — see drive.sh. Declared, not defaulted.
+export TURN_ALLOW_UNVERIFIED_CHAIN="${TURN_ALLOW_UNVERIFIED_CHAIN:-1}"
 STORE="$(readlink -f /opt/turncerts)"
 P=0; F=0
 chk() { if [ "$2" -eq 0 ]; then echo "  PASS  $1"; P=$((P+1)); else echo "  FAIL  $1"; F=$((F+1)); fi; }

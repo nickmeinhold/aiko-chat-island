@@ -162,8 +162,14 @@ cp -a "$LK_YAML" "$LK_YAML$STOCK_SUFFIX"
 
 restore_livekit() {
   log "  restoring livekit.yaml and restarting"
-  mv -f "$LK_YAML$STOCK_SUFFIX" "$LK_YAML"
-  (cd "$LIVEKIT_DIR" && dc restart livekit >/dev/null 2>&1) || true
+  # CHECKED explicitly: these functions are invoked as `{ restore_livekit; die_restored ...; }`
+  # on the right-hand side of `||`, where bash SUSPENDS set -e — so the script's `set -euo
+  # pipefail` does NOT cover them. A silently-failed restore here is the worst outcome the file
+  # has, because the caller then reports a clean unwind.
+  mv -f "$LK_YAML$STOCK_SUFFIX" "$LK_YAML" \
+    || echo "[passthrough] CRITICAL: could not restore $LK_YAML from $LK_YAML$STOCK_SUFFIX — livekit.yaml is NOT restored. Fix by hand before anything else." >&2
+  (cd "$LIVEKIT_DIR" && dc restart livekit >/dev/null 2>&1) \
+    || echo "[passthrough] CRITICAL: livekit restart failed during restore — the container may be down." >&2
 }
 
 # Scoped to the top-level turn: mapping (same discipline as the cutover's awk edit): replace the
@@ -221,8 +227,10 @@ mv -f "$HA_CFG.new" "$HA_CFG"
 # artifact for rollback purposes even though they are two files.
 restore_both() {
   log "  restoring the previous haproxy.cfg and reloading"
-  mv -f "$HA_CFG$STOCK_SUFFIX" "$HA_CFG"
-  systemctl reload haproxy || systemctl restart haproxy || true
+  mv -f "$HA_CFG$STOCK_SUFFIX" "$HA_CFG" \
+    || echo "[passthrough] CRITICAL: could not restore $HA_CFG — the passthrough config is still installed. Fix by hand." >&2
+  systemctl reload haproxy || systemctl restart haproxy \
+    || echo "[passthrough] CRITICAL: haproxy would neither reload nor restart during restore — :443 may be serving the wrong config or nothing." >&2
   restore_livekit
   # Verify the pair is actually back in AGREEMENT — and note what "agreement" means here.
   # An earlier version verified with `openssl s_client :443 -checkhost`, which is blind by
@@ -240,7 +248,18 @@ restore_both() {
          | openssl x509 -noout -checkhost "$TURN_DOMAIN" >/dev/null 2>&1; then ok_front=1; break; fi
     sleep 1
   done
-  if listening "$TURN_TLS_PORT" && ! serves_tls_for_domain; then ok_back=1; fi
+  # POSITIVE assertion, not the absence of TLS (Carnot round 5). `! serves_tls_for_domain` is
+  # satisfied by genuine plaintext AND by a wrong cert, an expired cert, or a handshake that dies
+  # after the TCP accept — so a restore that left LiveKit broken-but-listening read as "back to
+  # plaintext, all good". Require the things that are actually true of the restored external_tls
+  # pair: the container is RUNNING, livekit.yaml is back on external_tls, livekit-server itself
+  # holds the socket, and only then that it is not speaking TLS.
+  if [ "$(docker inspect livekit --format '{{.State.Running}}' 2>/dev/null)" = "true" ] \
+     && turn_key '^[[:space:]]+external_tls:[[:space:]]*true' \
+     && ss -tlnpH "sport = :$TURN_TLS_PORT" 2>/dev/null | grep -q 'livekit-server' \
+     && ! serves_tls_for_domain; then
+    ok_back=1
+  fi
   if [ "$ok_front" = 1 ] && [ "$ok_back" = 1 ]; then
     log "  restore verified: :443 answers AND :$TURN_TLS_PORT is back to plaintext (the external_tls pair)"
     return 0

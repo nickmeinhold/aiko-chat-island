@@ -501,3 +501,56 @@ not the only option.
 
 **Rig after round 4:** cutover green (84 ms), 7/7 invariants, 18/18 faults, path probe RED/GREEN
 across all three outcomes.
+
+## Round 5 — the same unchecked-copy class, in the file I did not sweep
+
+Kelvin APPROVE (fifth time). Carnot `REQUEST_CHANGES` with four; Tesla timed out and was re-run.
+
+**Carnot's first finding is my own repeated mistake.** Round 4 fixed an unchecked `cp` in
+`rollback.sh`. I did not grep for siblings. `cutover.sh` — which runs `set -uo pipefail`, *not*
+`set -e` — had two: the rendered-config `install` and `cp "$CADDY_MUX" "$CADDYFILE"`. A failed
+copy there continues silently into `caddy validate`, which then validates **the file already on
+disk** (the pre-cutover Caddyfile), passes, and the cutover hands `:443` to HAProxy while Caddy
+is still configured to want it.
+
+That is twice in one PR that I fixed instances instead of sweeping the class. The sweep
+(`grep -n '^\s*\(cp\|mv\|install\) ' ... | grep -v '||'`) took one command and found both.
+
+It also surfaced a subtlety `set -e` does not cover: `restore_livekit` and `restore_both` are
+invoked as `{ restore_X; die_restored ...; }` on the right-hand side of `||`, where bash
+**suspends** `set -e`. Their `mv`s were unchecked despite the shebang. A silently-failed restore
+is the worst outcome in the file, because the caller then reports a clean unwind.
+
+### Chain verification is now hard by default
+
+I had made it advisory so a private-CA box could still deploy. Carnot's objection outranks that
+reasoning: **a chain real WebRTC clients cannot verify is a chain that does not work**, and this
+gates a production deploy — so the one environment where it matters most was getting the weakest
+check. It is fail-closed now, with a named opt-out (`TURN_ALLOW_UNVERIFIED_CHAIN=1`) that the rig
+declares explicitly. An operator on a genuinely private-CA box has to make the same declaration
+by hand, which is the point: a decision someone made, not a default someone inherited.
+
+RED-proved by removing Pebble's root from the trust store:
+
+```
+root removed, no opt-out   -> rc=3  "its CHAIN does not verify … real WebRTC clients would reject it too"
+root removed, opt-out      -> rc=0
+root restored              -> rc=0
+```
+
+Worth recording: the *first* attempt at that proof came back `rc=0` — the rig's chain verifies
+fine, so the opt-out was inert and the check untested. Removing the root was what made the
+assertion falsifiable. A guard that has never failed has not been tested.
+
+### Also fixed
+
+- `restore_both` verified the restored backend as `listening && ! serves_tls_for_domain`.
+  "Not serving TLS" is equally satisfied by genuine plaintext, a wrong cert, an expired cert, or
+  a handshake that dies after the accept — so a restore that left LiveKit broken-but-listening
+  read as success. Now a **positive** assertion: container Running, `livekit.yaml` back on
+  `external_tls`, `livekit-server` holding the socket, *and* not speaking TLS.
+- The no-stock rollback guard's fatal message still said "HAProxy owns :443" after the condition
+  was broadened to any non-Caddy owner — during an outage it would point the operator at the
+  wrong thing. It now names the actual owner, or `<nothing>`.
+
+**Rig after round 5:** cutover green (96 ms), 7/7 invariants, 18/18 faults, chain gate RED/GREEN.

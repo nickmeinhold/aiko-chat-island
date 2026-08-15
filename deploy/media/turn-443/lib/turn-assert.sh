@@ -28,10 +28,16 @@ turn_domain_valid() {  # turn_domain_valid <domain>
 # through Phase 0 and let a live :443 move. So: name AND not-expired AND (where a trust store can
 # see it) a verifying chain.
 #
-# CHAIN VERIFICATION IS ADVISORY, DELIBERATELY. On a box whose turn cert comes from a private CA
-# the operator has not installed system-wide, a hard chain requirement would fail-CLOSED on a
-# perfectly good cert — and this assertion gates a deploy. Name + expiry are hard; chain failure
-# warns. Stated so the asymmetry reads as a decision, not an oversight.
+# CHAIN VERIFICATION IS HARD BY DEFAULT, with a NAMED opt-out. It was advisory, on the reasoning
+# that a private-CA box would otherwise fail-closed on a perfectly good cert. Carnot's round-5
+# objection is correct and outranks that: a chain real WebRTC clients cannot verify is a chain
+# that does not work, and this function gates a PRODUCTION deploy. Defaulting to "warn" meant the
+# one environment where it matters most got the weakest check.
+#
+# So the default is fail-closed, and the rehearsal rig — whose Pebble CA is genuinely private —
+# opts out explicitly with TURN_ALLOW_UNVERIFIED_CHAIN=1. An operator on a private-CA production
+# box must make the same declaration by hand, which is the point: it becomes a decision someone
+# made, not a default someone inherited.
 turn_tls_ok() {  # turn_tls_ok <host> <port> <domain> [expiry-margin-seconds]
   local host="$1" port="$2" domain="$3" margin="${4:-86400}" pem
   pem="$(echo | timeout 10 openssl s_client -connect "${host}:${port}" -servername "$domain" 2>/dev/null)" || return 1
@@ -39,7 +45,11 @@ turn_tls_ok() {  # turn_tls_ok <host> <port> <domain> [expiry-margin-seconds]
   printf '%s' "$pem" | openssl x509 -noout -checkend "$margin" >/dev/null 2>&1 || return 2
   if ! echo | timeout 10 openssl s_client -connect "${host}:${port}" -servername "$domain" \
         -verify_return_error -verify_hostname "$domain" >/dev/null 2>&1; then
-    echo "[turn-assert] NOTE: ${host}:${port} presents a valid, unexpired cert for ${domain}, but its chain does not verify against this box's trust store (private CA, or a missing intermediate). Not treated as fatal — see turn-assert.sh." >&2
+    if [ "${TURN_ALLOW_UNVERIFIED_CHAIN:-0}" = "1" ]; then
+      echo "[turn-assert] NOTE: ${host}:${port} serves a valid, unexpired cert for ${domain} whose chain does not verify here — accepted because TURN_ALLOW_UNVERIFIED_CHAIN=1 was declared." >&2
+      return 0
+    fi
+    return 3
   fi
   return 0
 }
@@ -50,6 +60,7 @@ turn_tls_reason() {  # turn_tls_reason <rc> <host> <port> <domain>
   case "$1" in
     1) echo "no TLS handshake, or the cert is not valid for $4, on $2:$3" ;;
     2) echo "the cert on $2:$3 is valid for $4 but EXPIRES within the margin — renew before deploying, not during" ;;
+    3) echo "the cert on $2:$3 is valid for $4 and unexpired, but its CHAIN does not verify against this box's trust store — real WebRTC clients would reject it too. Fix the chain, or declare TURN_ALLOW_UNVERIFIED_CHAIN=1 if this box genuinely uses a private CA" ;;
     *) echo "ok" ;;
   esac
 }
