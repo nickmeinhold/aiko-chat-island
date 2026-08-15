@@ -98,6 +98,20 @@ is_passthrough_shape() {
 
 ALREADY_PASSTHROUGH=0
 if is_passthrough_shape; then
+  # RECONCILE MEMORY WITH DISK BEFORE TRUSTING THIS (Tesla round 8). Four of the five beats in
+  # is_passthrough_shape read DISK, and the fifth — the path probe — cannot tell a still-
+  # TERMINATING HAProxy from a passthrough one (documented limit, INVARIANTS.md): a terminator
+  # forwards the GET to LiveKit as plaintext, LiveKit does not answer HTTP, and it times out
+  # exactly like passthrough. So a box whose haproxy.cfg was updated but never reloaded would
+  # classify as already-migrated, skip to Phase 3, shred the PEM the RUNNING process is still
+  # serving, and print COMPLETE over a dead media plane. A reload is idempotent; do it, then
+  # re-verify against the process that is actually running.
+  log "  disk reads as passthrough — reloading haproxy so the RUNNING config matches, then re-verifying"
+  systemctl reload haproxy || systemctl restart haproxy \
+    || die "disk is in the passthrough shape but haproxy would neither reload nor restart — refusing to classify this box from disk alone."
+  sleep 1
+  turn_path_is_passthrough "$TURN_DOMAIN" "chat.${TURN_DOMAIN#turn.}" \
+    || die "after reloading haproxy to match disk, the turn path still does not verify as passthrough — refusing to resume. Inspect $HA_CFG and the running process by hand."
   ALREADY_PASSTHROUGH=1
   # Stale staging files from a run that got as far as a successful Phase 2 are now INVALID —
   # the old haproxy.cfg they hold cannot be paired with a TLS-speaking LiveKit. Discard them
@@ -166,6 +180,76 @@ if [ "$ALREADY_PASSTHROUGH" -eq 0 ]; then
 log "PHASE 1 — livekit.yaml: external_tls:true -> cert_file/key_file"
 cp -a "$LK_YAML" "$LK_YAML$STOCK_SUFFIX"
 
+# The two restore functions are defined HERE, ABOVE the EXIT trap that calls them (Carnot
+# round 8). They used to sit further down, next to the phases that use them — which meant the
+# trap was installed referring to functions that did not exist yet, and any failure in the
+# window before their definitions ran would have fired the trap into "command not found". A
+# safety net whose own cord is not tied on yet.
+restore_livekit() {
+  log "  restoring livekit.yaml and restarting"
+  # CHECKED explicitly: these functions are invoked as `{ restore_livekit; die_restored ...; }`
+  # on the right-hand side of `||`, where bash SUSPENDS set -e — so the script's `set -euo
+  # pipefail` does NOT cover them. A silently-failed restore here is the worst outcome the file
+  # has, because the caller then reports a clean unwind.
+  mv -f "$LK_YAML$STOCK_SUFFIX" "$LK_YAML" \
+    || echo "[passthrough] CRITICAL: could not restore $LK_YAML from $LK_YAML$STOCK_SUFFIX — livekit.yaml is NOT restored. Fix by hand before anything else." >&2
+  (cd "$LIVEKIT_DIR" && dc restart livekit >/dev/null 2>&1) \
+    || echo "[passthrough] CRITICAL: livekit restart failed during restore — the container may be down." >&2
+}
+
+restore_both() {
+  log "  restoring the previous haproxy.cfg and reloading"
+  mv -f "$HA_CFG$STOCK_SUFFIX" "$HA_CFG" \
+    || echo "[passthrough] CRITICAL: could not restore $HA_CFG — the passthrough config is still installed. Fix by hand." >&2
+  systemctl reload haproxy || systemctl restart haproxy \
+    || echo "[passthrough] CRITICAL: haproxy would neither reload nor restart during restore — :443 may be serving the wrong config or nothing." >&2
+  restore_livekit
+  # Verify the pair is actually back in AGREEMENT — and note what "agreement" means here.
+  # An earlier version verified with `openssl s_client :443 -checkhost`, which is blind by
+  # construction (Tesla): under the OLD shape HAProxy TERMINATES :443, so that handshake
+  # completes against HAProxy's own cert whether LiveKit came back, stayed on TLS, or died —
+  # and restore_livekit ends in `|| true`. Measuring the front oscillator says nothing about
+  # whether the pair is in phase.
+  #
+  # The restored shape is: HAProxy terminates :443 AND forwards PLAINTEXT to :5349. So the
+  # backend-side assertion is the inverse of the passthrough one — :5349 must be alive and must
+  # NOT present TLS — and the front must answer. Both, or this is not a verified restore.
+  local ok_front=0 ok_back=0
+  for _ in $(seq 1 30); do
+    if echo | timeout 6 openssl s_client -connect "127.0.0.1:443" -servername "$TURN_DOMAIN" 2>/dev/null \
+         | openssl x509 -noout -checkhost "$TURN_DOMAIN" >/dev/null 2>&1; then ok_front=1; break; fi
+    sleep 1
+  done
+  # POSITIVE assertion, not the absence of TLS (Carnot round 5). `! serves_tls_for_domain` is
+  # satisfied by genuine plaintext AND by a wrong cert, an expired cert, or a handshake that dies
+  # after the TCP accept — so a restore that left LiveKit broken-but-listening read as "back to
+  # plaintext, all good". Require the things that are actually true of the restored external_tls
+  # pair: the container is RUNNING, livekit.yaml is back on external_tls, livekit-server itself
+  # holds the socket, and only then that it is not speaking TLS.
+  if [ "$(docker inspect livekit --format '{{.State.Running}}' 2>/dev/null)" = "true" ] \
+     && turn_key '^[[:space:]]+external_tls:[[:space:]]*true' \
+     && ss -tlnpH "sport = :$TURN_TLS_PORT" 2>/dev/null | grep -q 'livekit-server' \
+     && ! serves_tls_for_domain; then
+    ok_back=1
+  fi
+  if [ "$ok_front" = 1 ] && [ "$ok_back" = 1 ]; then
+    log "  restore verified: :443 answers AND :$TURN_TLS_PORT is back to plaintext (the external_tls pair)"
+    return 0
+  fi
+
+  echo "" >&2
+  echo "[passthrough] ############## ROLLBACK UNVERIFIED — TURN IS DOWN ##############" >&2
+  echo "  Both artifacts were restored to the PRE-migration shape ON DISK, but the running pair" >&2
+  echo "  does not agree:  :443 answers=$ok_front   :$TURN_TLS_PORT back-to-plaintext=$ok_back" >&2
+  echo "  (:443 answering ALONE proves nothing — HAProxy terminates it under the old shape.)" >&2
+  echo "  Do NOT walk away. Check, in this order:" >&2
+  echo "    docker logs livekit --tail 50  (did it come back on external_tls?)" >&2
+  echo "    systemctl status haproxy       (is it running with the restored config?)" >&2
+  echo "    diff $HA_CFG $HA_CFG$STOCK_SUFFIX" >&2
+  echo "  Exiting 4 = 'migration failed AND recovery unproven'." >&2
+  exit 4
+}
+
 # SAFETY NET for the failures that do NOT land on a `|| { restore_*; }` line (Tesla round 6).
 # `set -e` means a bare failure — the `cp -a` that stages a stock, the `sed` that renders, a
 # transient docker hiccup — exits immediately, skipping every restore and leaving LiveKit
@@ -198,17 +282,6 @@ _on_unexpected_exit() {
 }
 trap _on_unexpected_exit EXIT
 
-restore_livekit() {
-  log "  restoring livekit.yaml and restarting"
-  # CHECKED explicitly: these functions are invoked as `{ restore_livekit; die_restored ...; }`
-  # on the right-hand side of `||`, where bash SUSPENDS set -e — so the script's `set -euo
-  # pipefail` does NOT cover them. A silently-failed restore here is the worst outcome the file
-  # has, because the caller then reports a clean unwind.
-  mv -f "$LK_YAML$STOCK_SUFFIX" "$LK_YAML" \
-    || echo "[passthrough] CRITICAL: could not restore $LK_YAML from $LK_YAML$STOCK_SUFFIX — livekit.yaml is NOT restored. Fix by hand before anything else." >&2
-  (cd "$LIVEKIT_DIR" && dc restart livekit >/dev/null 2>&1) \
-    || echo "[passthrough] CRITICAL: livekit restart failed during restore — the container may be down." >&2
-}
 
 # Scoped to the top-level turn: mapping (same discipline as the cutover's awk edit): replace the
 # external_tls line in place with the two cert lines, touching nothing else.
@@ -263,58 +336,6 @@ mv -f "$HA_CFG.new" "$HA_CFG"
 # forwards PLAINTEXT to :5349 — pairs a plaintext-speaking proxy with a TLS-expecting backend
 # and TURN is dead, with both halves individually looking "restored". The two are one coupled
 # artifact for rollback purposes even though they are two files.
-restore_both() {
-  log "  restoring the previous haproxy.cfg and reloading"
-  mv -f "$HA_CFG$STOCK_SUFFIX" "$HA_CFG" \
-    || echo "[passthrough] CRITICAL: could not restore $HA_CFG — the passthrough config is still installed. Fix by hand." >&2
-  systemctl reload haproxy || systemctl restart haproxy \
-    || echo "[passthrough] CRITICAL: haproxy would neither reload nor restart during restore — :443 may be serving the wrong config or nothing." >&2
-  restore_livekit
-  # Verify the pair is actually back in AGREEMENT — and note what "agreement" means here.
-  # An earlier version verified with `openssl s_client :443 -checkhost`, which is blind by
-  # construction (Tesla): under the OLD shape HAProxy TERMINATES :443, so that handshake
-  # completes against HAProxy's own cert whether LiveKit came back, stayed on TLS, or died —
-  # and restore_livekit ends in `|| true`. Measuring the front oscillator says nothing about
-  # whether the pair is in phase.
-  #
-  # The restored shape is: HAProxy terminates :443 AND forwards PLAINTEXT to :5349. So the
-  # backend-side assertion is the inverse of the passthrough one — :5349 must be alive and must
-  # NOT present TLS — and the front must answer. Both, or this is not a verified restore.
-  local ok_front=0 ok_back=0
-  for _ in $(seq 1 30); do
-    if echo | timeout 6 openssl s_client -connect "127.0.0.1:443" -servername "$TURN_DOMAIN" 2>/dev/null \
-         | openssl x509 -noout -checkhost "$TURN_DOMAIN" >/dev/null 2>&1; then ok_front=1; break; fi
-    sleep 1
-  done
-  # POSITIVE assertion, not the absence of TLS (Carnot round 5). `! serves_tls_for_domain` is
-  # satisfied by genuine plaintext AND by a wrong cert, an expired cert, or a handshake that dies
-  # after the TCP accept — so a restore that left LiveKit broken-but-listening read as "back to
-  # plaintext, all good". Require the things that are actually true of the restored external_tls
-  # pair: the container is RUNNING, livekit.yaml is back on external_tls, livekit-server itself
-  # holds the socket, and only then that it is not speaking TLS.
-  if [ "$(docker inspect livekit --format '{{.State.Running}}' 2>/dev/null)" = "true" ] \
-     && turn_key '^[[:space:]]+external_tls:[[:space:]]*true' \
-     && ss -tlnpH "sport = :$TURN_TLS_PORT" 2>/dev/null | grep -q 'livekit-server' \
-     && ! serves_tls_for_domain; then
-    ok_back=1
-  fi
-  if [ "$ok_front" = 1 ] && [ "$ok_back" = 1 ]; then
-    log "  restore verified: :443 answers AND :$TURN_TLS_PORT is back to plaintext (the external_tls pair)"
-    return 0
-  fi
-
-  echo "" >&2
-  echo "[passthrough] ############## ROLLBACK UNVERIFIED — TURN IS DOWN ##############" >&2
-  echo "  Both artifacts were restored to the PRE-migration shape ON DISK, but the running pair" >&2
-  echo "  does not agree:  :443 answers=$ok_front   :$TURN_TLS_PORT back-to-plaintext=$ok_back" >&2
-  echo "  (:443 answering ALONE proves nothing — HAProxy terminates it under the old shape.)" >&2
-  echo "  Do NOT walk away. Check, in this order:" >&2
-  echo "    docker logs livekit --tail 50  (did it come back on external_tls?)" >&2
-  echo "    systemctl status haproxy       (is it running with the restored config?)" >&2
-  echo "    diff $HA_CFG $HA_CFG$STOCK_SUFFIX" >&2
-  echo "  Exiting 4 = 'migration failed AND recovery unproven'." >&2
-  exit 4
-}
 
 haproxy -c -f "$HA_CFG" >/dev/null 2>&1 || { restore_both; die_restored "haproxy -c rejected the rendered config"; }
 systemctl reload haproxy || { restore_both; die_restored "haproxy reload failed"; }
@@ -344,6 +365,15 @@ case "$_prc" in
   *) restore_both; die_restored "after the swap, the turn-path probe could not discriminate (see the [turn-assert] line above). An unproven path is not a passing one — unwinding rather than declaring a mux we cannot verify." ;;
 esac
 log "PHASE 2 OK — :443 passes turn SNI straight to LiveKit (path discriminated, not inferred from the cert)"
+
+# MARKER, written HERE — the instant the data plane becomes passthrough (Tesla round 8). It used
+# to be written at the very end, so Phase 4's `exit 3` (renewal gate unmet, data plane complete
+# and correct) left a fully-migrated box with NO marker — and rollback.sh would then silently
+# downgrade it, which is the exact hole the marker exists to close. The marker records a fact
+# about the DATA PLANE, so it belongs where that fact becomes true.
+# The write is CHECKED: a marker that silently failed to land is the same as no marker at all.
+printf 'migrated-to-passthrough %s\n' "$TURN_DOMAIN" > /etc/haproxy/.migrated-to-passthrough \
+  || { restore_both; die_restored "could not write /etc/haproxy/.migrated-to-passthrough — without it rollback.sh cannot tell this box was migrated and would silently kill turns:443. Unwound rather than proceed."; }
 
 fi  # end: if ALREADY_PASSTHROUGH == 0 — Phases 1-2 are the mutation; Phase 3 below is NOT.
 
@@ -409,12 +439,6 @@ fi
 log "PHASE 4 OK — renewal restarts are guarded"
 
 MIGRATION_COMPLETE=1
-# Leave a MARKER. rollback.sh must be able to tell a box that was CUT OVER to passthrough from
-# one that was MIGRATED to it — and no observable state distinguishes them (both have
-# cert_file + a certless haproxy.cfg), which is precisely why Tesla's round-7 finding was subtle
-# and why inferring it from shape misfired on a cutover box. This is the one fact only this
-# script knows, so it is the one that gets written down.
-printf 'migrated-to-passthrough %s\n' "$TURN_DOMAIN" > /etc/haproxy/.migrated-to-passthrough 2>/dev/null || true
 log "MIGRATION COMPLETE. Now run the acceptance gates:"
 log "  b3_relay_probe.py with B3_REQUIRE_ENDPOINT=tls:*:443   (relay-deny + liveness)"
 log "  webrtc_relay_proof.py from a UDP-blocked vantage        (a real call actually flows)"

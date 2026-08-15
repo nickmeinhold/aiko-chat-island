@@ -126,7 +126,7 @@ turn_path_is_passthrough() {  # <domain> [control-domain] [port]
     return 2
   fi
   curl -sS -o /dev/null --max-time 8 --resolve "${control}:${port}:127.0.0.1" "https://${control}/" 2>/dev/null || {
-    echo "[turn-assert] CONTROL FAILED: an HTTPS GET for ${control} through :${port} did not succeed, so this probe cannot tell a misroute from a broken instrument. Refusing to report passthrough." >&2
+    echo "[turn-assert] CONTROL FAILED: an HTTPS GET for ${control} through :${port} did not succeed, so this probe cannot tell a misroute from a broken instrument. Refusing to report passthrough. If this box serves chat under a different name, set CHAT_DOMAIN to it." >&2
     return 2
   }
 

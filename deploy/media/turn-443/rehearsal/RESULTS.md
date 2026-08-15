@@ -673,3 +673,43 @@ verify the wrong thing.
 **Rig after round 7:** cutover green (102 ms), 7/7 invariants, 18/18 faults, migration end-to-end
 green, marker guard RED/GREEN, **B3 `OK`** and the **real Chromium relay proof `OK` (11427 B over
 `relay/tls`)**.
+
+## Round 8 — the round-7 fixes had holes, and both adversaries found them
+
+Kelvin APPROVE. Carnot + Tesla `REQUEST_CHANGES`. Five real. Every one of them is a hole in
+something I added in **round 7**, which is the clearest statement yet of the pattern this match
+has been exhibiting: a fix aimed at a finding creates the next finding.
+
+- **The EXIT trap called `restore_both` before `restore_both` existed** (Carnot). The trap was
+  installed in Phase 1; the function was defined after Phase 2 had started. Any failure in that
+  window would have fired the safety net into `command not found` — a net whose own cord is not
+  tied on yet. Both restore functions are now defined above the trap that calls them.
+- **The marker was written at the very end** (Tesla), so Phase 4's `exit 3` — renewal gate unmet,
+  data plane complete and correct — left a fully-migrated box with **no marker**, and `rollback.sh`
+  would then silently downgrade it. That is precisely the hole the marker exists to close. It is
+  now written the instant Phase 2 succeeds (the moment the fact becomes true), and the write is
+  checked, because a marker that silently failed to land is the same as no marker.
+- **The resume path trusted a disk classification** (Tesla). Four of `is_passthrough_shape`'s five
+  beats read disk, and the fifth — the path probe — cannot tell a still-**terminating** HAProxy
+  from a passthrough one (the limit documented in round 6: a terminator forwards the GET to
+  LiveKit as plaintext, LiveKit does not answer HTTP, and it times out identically). A box whose
+  `haproxy.cfg` was edited but never reloaded would classify as already-migrated, skip to Phase 3,
+  **shred the PEM the running process is still serving**, and print `COMPLETE` over a dead media
+  plane. The resume path now reloads HAProxy so memory matches disk, then re-verifies.
+- **The marker was removed before the rollback succeeded** (Carnot) — an abort halfway through
+  would leave a migrated box unmarked, so the *next* attempt sails past the guard. Retired at the
+  end now, after the rollback actually completes.
+- The control-failure message now names the fix (`set CHAT_DOMAIN`) instead of leaving the
+  operator to infer it.
+
+Proved on the rig, with `cert-restart.timer` stopped to force the exit-3 path:
+
+```
+exit=3, MIGRATION IS INCOMPLETE
+marker after exit 3: PRESENT          <- round 7 would have left this MISSING
+rollback on that box: FATAL, refuses  <- and would have sailed through before
+resume: "reloading haproxy so the RUNNING config matches, then re-verifying" -> COMPLETE
+```
+
+**Rig after round 8:** cutover green (98 ms), 7/7 invariants, 18/18 faults, exit-3 marker proved,
+resume reconciliation proved, rollback guard proved.

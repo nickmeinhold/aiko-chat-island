@@ -103,7 +103,10 @@ If you genuinely want the pre-mux state and accept losing turns:443, declare it:
     ROLLBACK_ACCEPT_TURN_LOSS=1 sudo bash $0"
   fi
   log "WARNING: rolling back a MIGRATED box — turns:443 will be DEAD after this (declared)."
-  rm -f /etc/haproxy/.migrated-to-passthrough
+  # The marker is removed at the END, after the rollback actually succeeds (Carnot round 8).
+  # Removing it here would mean an abort halfway through leaves a migrated box with no marker —
+  # so the NEXT rollback attempt would sail past this guard, which is the state it exists to stop.
+  _WAS_MIGRATED=1
 fi
 
 # --- 0b. CAN the stock Caddyfile actually take :443? Prove it BEFORE freeing the port ---------
@@ -205,6 +208,8 @@ systemctl daemon-reload 2>/dev/null || true
 # Consume the .stock backup — leaving it would make the NEXT cutover.sh abort on its
 # "a prior cutover is in progress" guard forever.
 rm -f "$CADDY_STOCK"
+# And only NOW retire the migrated-box marker: the rollback has actually completed.
+[ "${_WAS_MIGRATED:-0}" = "1" ] && rm -f /etc/haproxy/.migrated-to-passthrough
 
 log "ROLLBACK COMPLETE — Caddy on :443, HAProxy stopped+disabled, :8443 reopened, .stock consumed."
 log "LiveKit was never touched: it is still serving its own TLS on :5349, exactly as before."
