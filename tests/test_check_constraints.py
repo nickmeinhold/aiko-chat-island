@@ -249,3 +249,51 @@ def test_upgrade_0001_to_0002_preserves_data_structure_and_applies_check(
                                .replace("'aiko/c'", "'aiko/c3'")), {"jp": "bogus"})
     finally:
         engine.dispose()
+
+
+def test_users_kind_check_rejects_out_of_set(tmp_path, monkeypatch):
+    """users.kind is a closed set at the DB (#3096, migration 0022).
+
+    The kind decides how a sender is RENDERED (human vs agent), so leaving it an
+    unenforced open string is the same posture the #2633 cage-match rejected for
+    channels.kind. A direct SQL writer must not be able to invent a third kind —
+    a client that switch-dispatches on it would fall through to whatever its
+    default branch is, which for a badge means guessing.
+    """
+    engine = _fresh_at_head(tmp_path, monkeypatch)
+    try:
+        with engine.begin() as c:
+            c.execute(text(_insert_user("u1")))  # default 'human' -> ok
+            c.execute(text(_insert_user("u2").replace(
+                "(id, username, display_name, aiko_username, created_at)",
+                "(id, username, display_name, aiko_username, created_at, kind)"
+            ).replace(f"'{_TS}')", f"'{_TS}', 'agent')")))  # explicit agent -> ok
+        # DISTINCT user id so a failure can only be the kind CHECK, never a PK
+        # collision masking it (the same trap Carnot found in PR#24).
+        with pytest.raises(IntegrityError) as exc:
+            with engine.begin() as c:
+                c.execute(text(_insert_user("u3").replace(
+                    "(id, username, display_name, aiko_username, created_at)",
+                    "(id, username, display_name, aiko_username, created_at, kind)"
+                ).replace(f"'{_TS}')", f"'{_TS}', 'daemon')")))
+        assert "ck_users_kind" in str(exc.value) or "CHECK" in str(exc.value)
+    finally:
+        engine.dispose()
+
+
+def test_users_kind_backfills_human(tmp_path, monkeypatch):
+    """A row inserted WITHOUT kind gets 'human' from the server_default (#3096).
+
+    Two things at once: the migration's backfill direction is the honest one (no
+    agent account can predate 0022), and the default is retained after backfill so
+    a writer that omits the column gets 'human' rather than an error — the safe
+    direction for a column that gates rendering.
+    """
+    engine = _fresh_at_head(tmp_path, monkeypatch)
+    try:
+        with engine.begin() as c:
+            c.execute(text(_insert_user("u1")))
+            got = c.execute(text("SELECT kind FROM users WHERE id='u1'")).scalar_one()
+        assert got == "human"
+    finally:
+        engine.dispose()
