@@ -181,7 +181,9 @@ log "  edited (diff vs original: $(diff <(cat "$LK_YAML$STOCK_SUFFIX") "$LK_YAML
 
 (cd "$LIVEKIT_DIR" && dc restart livekit >/dev/null) || { restore_livekit; die "livekit restart failed"; }
 
-log "  waiting for LiveKit to serve TLS for $TURN_DOMAIN on :$TURN_TLS_PORT"
+# Same scope note as cutover.sh: TLS identity, not TURN protocol viability. The acceptance
+# gates named at the end (B3 + the real-client relay proof) are what prove the protocol.
+log "  waiting for LiveKit to serve a valid $TURN_DOMAIN cert on :$TURN_TLS_PORT (TLS identity)"
 ok=0
 for _ in $(seq 1 60); do
   if listening "$TURN_TLS_PORT" && serves_tls_for_domain; then ok=1; break; fi

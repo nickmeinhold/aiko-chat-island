@@ -6,8 +6,12 @@
 > complex, not that the review was thorough. Nick's question — "can this be drastically
 > simplified?" — was answered by this file the whole time, and I read it as a scoreboard.
 >
-> Under the passthrough shape (task #8) the count is **six**, and four of the deletions are not
-> simplifications of an invariant but removals of the thing that made it necessary.
+> Under the passthrough shape (task #8) the count is **seven** (I wrote "six" first and the
+> table said otherwise — in a file about honest measurement, count the rows). Three invariants
+> are deleted outright, and the deletions are not
+> simplifications but removals of the thing that made each one necessary. (INV-7 grew a
+> second clause in the 2026-08-15 cage-match — a routing invariant whose only test was a cert
+> check was not actually being tested.)
 
 The surface used to be four coupled state machines transitioning together on a live shared
 `:443`. It is now **two** — `Caddyfile` (C) and `HAProxy` (H) — plus one firewall rule.
@@ -23,7 +27,7 @@ security-ordered participant to a single tidy DROP.
 | **INV-4′** | The turn cert stays renewable, and a renewal reaches what clients see **before the served cert expires** | C: `turn.` site block with `disable_tlsalpn_challenge` (HTTP-01 on `:80`); L: reads Caddy's store directly via the `/certs` mount | Caddy (sole ACME client) + `cert-restart.sh` | Force a renewal → assert (a) no restart while the served cert is still fresh, (b) once it reads stale, the served cert advances. **This is the invariant that got harder**, not easier — see the propagation-lag note below. `cutover.sh` Phase 4 and `migrate-to-passthrough.sh` Phase 4 both **refuse to finish** unless renewal has a named owner. |
 | **INV-5** | Real client IP is preserved on the non-TURN path (the gateway's per-IP rate limiter) | H: `send-proxy-v2` + `check-send-proxy`; C: `:8443` listener reads PROXY from 127.0.0.1 | `haproxy.cfg.tmpl` `be_caddy` + `Caddyfile.mux` | Hit chat through the mux from a distinct source IP; assert the gateway sees **that** IP, not 127.0.0.1. |
 | **INV-6′** | Rollback restores both artifacts, idempotently | ordering in `rollback.sh` (HAProxy off → Caddy back on `:443` → reopen `:8443`) | `rollback.sh`; `.stock` staged + `cmp`-verified by `cutover.sh` Phase 1 | Roll back from each checkpoint; `cmp` the Caddyfile against a pre-cutover snapshot. Run it **twice** (idempotency). Run it with the `.stock` missing. |
-| **INV-7** | SNI routing is correct and exposes nothing extra | H: `fe443` accepts only a real ClientHello, rejects the rest; `turn.` SNI → raw passthrough; everything else → raw passthrough to Caddy | `haproxy.cfg.tmpl` `fe443` | Matrix: turn SNI → LiveKit's cert; chat SNI → chat cert + response; unknown SNI; **no** SNI; `acme-tls/1` ALPN; non-TLS junk (rejected); dribbled/slow hello (dropped at 5s). |
+| **INV-7** | SNI routing is correct, exposes nothing extra, **and the turn path really is passthrough** | H: `fe443` accepts only a real ClientHello, rejects the rest; `turn.` SNI → `be_turn` (raw); everything else → raw passthrough to Caddy | `haproxy.cfg.tmpl` `fe443` | Matrix: chat SNI → chat cert + response; unknown SNI → byte-identical to Caddy's own answer; **no** SNI; `acme-tls/1` ALPN; non-TLS junk (rejected); dribbled/slow hello (dropped at 5s). **Plus the path test, which the cert cannot give you**: `Caddyfile.mux` keeps a `turn.` block served from the same store LiveKit mounts, so a misroute into `be_caddy` yields a **byte-identical** cert — checkhost passes and fingerprints match on a broken mux (RED-proved 2026-08-15). So assert an HTTPS GET for the turn name through `:443` **fails**: Caddy would answer it, LiveKit's TURN socket cannot. |
 | **INV-8** | Caddy's `:8443` is not publicly reachable (it is bound on all interfaces **on purpose**, so `:80` HTTP-01 keeps working — the r3 P0) | F: v4+v6 DROP on 8443 | `cutover.sh` 2.1 | Off-box connect to `:8443` refused; loopback connect succeeds. |
 
 ## What was DELETED, and why it is a deletion rather than a simplification
@@ -35,6 +39,15 @@ security-ordered participant to a single tidy DROP.
 | **INV-10** — relay-deny survives the flip | the `awk` edit to `livekit.yaml` could have clobbered `deny_peer_cidrs` | `livekit.yaml` is never edited. The relay-deny property is still **verified** (b3 probe through the mux) but it is no longer an invariant this cutover can violate. |
 | the ordering constraint | firewall **before** the flip; rollback reopens only **after** TLS is restored, behind a hard gate | Both ends of that constraint were the plaintext window. Steps are now ordered for tidiness, not safety. |
 | `haproxy-cert-sync.{sh,service,timer}` + the PEM | HAProxy served a *copy* of Caddy's cert and needed it kept fresh | HAProxy holds no cert. The private key no longer crosses a uid boundary, and the `.needs-reload` sentinel — **the round-4 P0** — has nothing to sequence. |
+
+**What the phase assertions do and do not prove.** `cutover.sh` Phase 0/3 and
+`migrate-to-passthrough.sh` Phase 1/2 assert **TLS identity** (a handshake completes; the cert
+verifies for the turn domain) and, since 2026-08-15, the **path** (the turn SNI is not being
+answered by Caddy). They do **not** prove the TURN protocol stack behind the socket works — a
+listener with a valid cert and a broken TURN implementation passes all of them. That is the
+off-box B3 probe's job, with `B3_REQUIRE_ENDPOINT` pinned, and the real-client relay proof after
+it. Written down because a phase that is read as proving more than it measures is how a green
+board ends up over a dead media plane.
 
 **Honest accounting of what this cost.** One invariant got *harder*: INV-4′. Under
 `external_tls` the terminating proxy could hot-reload a renewed cert with no media bounce; now
