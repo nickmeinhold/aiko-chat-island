@@ -249,24 +249,28 @@ curl -sS -o /dev/null --max-time 10 --resolve "${LK_DOMAIN}:443:127.0.0.1" "http
 # turn:443 must now complete TLS end-to-end with LiveKit through the passthrough. Full TURN
 # allocation is the OFF-BOX b3 probe (acceptance gate below) — on-box we prove TLS terminates.
 #
-# Two corrections here, both Tesla, both the same class as the curl fix above:
+# Three corrections here, all Tesla, all the same class as the curl fix above:
 #   1. 127.0.0.1, not "${TURN_DOMAIN}:443". Connecting by NAME leaves the box via DNS and can
 #      certify a DIFFERENT machine's :443 while this acceptor is unbound or misrouted.
-#   2. -checkhost, not `grep BEGIN CERTIFICATE`. "A cert appeared" is satisfied by ANY cert —
-#      including Caddy's, which is exactly what a mis-rendered SNI rule would produce, since
-#      Caddyfile.mux deliberately keeps a turn. site block. Phase 0 of this same script already
-#      argued that the subject is what separates a wrong-cert socket from a right one; Phase 3
-#      was still grepping for a header.
-# The cert must ALSO be byte-identical to what LiveKit serves directly — the positive proof
-# that this is passthrough and not something HAProxy answered on its own.
-_served443_fp() { echo | timeout 8 openssl s_client -connect 127.0.0.1:443 -servername "$TURN_DOMAIN" 2>/dev/null | openssl x509 -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2; }
-_lk5349_fp()    { echo | timeout 8 openssl s_client -connect 127.0.0.1:5349 -servername "$TURN_DOMAIN" 2>/dev/null | openssl x509 -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2; }
+#   2. -checkhost, not `grep BEGIN CERTIFICATE`. "A cert appeared" is satisfied by ANY cert.
+#   3. And the one that matters most: NEITHER of those, NOR a fingerprint comparison, can see
+#      the failure this check exists for. `Caddyfile.mux` deliberately keeps a turn. site block,
+#      and Caddy serves it from THE SAME cert store LiveKit mounts. So if a mis-rendered SNI
+#      rule dumps turn traffic into default_backend be_caddy, Caddy answers with a byte-
+#      IDENTICAL cert: checkhost passes, fingerprints match, roll() never fires. A verifier that
+#      shares a representation with the thing it verifies is blind to bugs in that shared layer.
+#
+# So discriminate the PATH, not the certificate. Caddy's turn block answers `respond "turn" 200`
+# to an HTTPS GET; LiveKit's TURN socket cannot speak HTTP at all. A successful GET through :443
+# for the turn name therefore PROVES the SNI landed on Caddy — the exact misroute — and a failed
+# one is what correct passthrough looks like.
 echo | timeout 8 openssl s_client -connect 127.0.0.1:443 -servername "$TURN_DOMAIN" 2>/dev/null \
   | openssl x509 -noout -checkhost "$TURN_DOMAIN" >/dev/null 2>&1 \
   || roll "turns:443 on THIS box did not present a cert valid for $TURN_DOMAIN through the mux"
-_fp443="$(_served443_fp)"; _fp5349="$(_lk5349_fp)"
-[ -n "$_fp443" ] && [ "$_fp443" = "$_fp5349" ] \
-  || roll "the cert served on :443 for $TURN_DOMAIN is NOT LiveKit's own cert from :5349 (got '${_fp443:-none}' vs '${_fp5349:-none}') — the turn SNI is being answered by something other than the passthrough backend"
+if curl -sS -o /dev/null --max-time 8 --resolve "${TURN_DOMAIN}:443:127.0.0.1" "https://${TURN_DOMAIN}/" 2>/dev/null; then
+  roll "an HTTPS GET for $TURN_DOMAIN through :443 SUCCEEDED — the turn SNI is being answered by CADDY (default_backend), not passed through to LiveKit. Cert and fingerprint checks CANNOT see this: Caddy serves the same store LiveKit mounts."
+fi
+log "  turn SNI is NOT answered by Caddy (HTTP GET refused) — the passthrough path is real"
 
 # ============================ PHASE 4 — renewal must be guarded ==============================
 # The cert time-bomb did not disappear with cert-sync, it MOVED. LiveKit holds the cert and has
@@ -285,6 +289,11 @@ _fp443="$(_served443_fp)"; _fp5349="$(_lk5349_fp)"
 log "4 renewal ownership (LiveKit owns the cert now; it cannot hot-reload one)"
 case "${CERT_RENEWAL_OWNER:-timer}" in
   timer)
+    # is-ENABLED as well as is-active (Tesla): `systemctl start` without `enable` greens an
+    # is-active check and then evaporates on the next reboot, taking the sole owner of INV-4'
+    # with it. Measure the persistence, not the transient.
+    systemctl is-enabled --quiet cert-restart.timer 2>/dev/null \
+      || roll "cert-restart.timer is not ENABLED — it would not survive a reboot, and it is the only thing standing between a renewal and a dead turns:443 ~89d out. \`systemctl enable --now cert-restart.timer\`, then re-run."
     systemctl is-active --quiet cert-restart.timer \
       || roll "cert-restart.timer is not active — LiveKit would serve a stale cert at the next renewal and TURN-over-TLS would fail silently. Wire it (deploy/media/cert-restart.*, task #3), or declare CERT_RENEWAL_OWNER=runbook if this is a shared box where the timer must not be installed."
     log "  cert-restart.timer is active — renewal restarts are automatic" ;;

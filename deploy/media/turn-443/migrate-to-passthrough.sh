@@ -22,6 +22,12 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 TURN_DOMAIN="${TURN_DOMAIN:?set TURN_DOMAIN (e.g. turn.enspyr.co)}"
+# Validate before this value reaches `sed s///` (where / and & are syntax) or a grep pattern
+# (where . and friends are syntax), as root, writing the front door's config (Carnot). A
+# DNS-label allowlist is the whole fix — anything outside it is not a hostname anyway.
+case "$TURN_DOMAIN" in
+  *[!a-zA-Z0-9.-]*|.*|-*|*.|*-) echo "[passthrough] ABORT: TURN_DOMAIN '$TURN_DOMAIN' is not a plain DNS name (letters, digits, dot, hyphen; no leading/trailing dot or hyphen). Refusing to render root-owned config from it." >&2; exit 1 ;;
+esac
 # No $HOME default: this runs under sudo, where $HOME is /root, and "~/apps/livekit" would
 # silently resolve to a path that does not exist — or worse, on a box where it does. Both this
 # and TURN_DOMAIN are required and unguessable on purpose.
@@ -99,10 +105,20 @@ done
 #
 # So: recognise the already-migrated shape, VERIFY it rather than assume it, and jump to the
 # gate — the mutating phases below are simply skipped by the guard.
+# Shape predicates are scoped to the top-level `turn:` mapping, exactly like Phase 1's mutation
+# (Carnot): a bare `grep '^\s*cert_file:'` over the whole YAML can certify the wrong shape from
+# an unrelated section, and a stray `external_tls` anywhere could block a valid resume. The
+# check must read the same region the edit writes.
+turn_key() {  # turn_key <key-regex> — true if the key exists inside the top-level turn: mapping
+  awk -v pat="$1" '
+    /^[^[:space:]]/ { in_turn = ($0 ~ /^turn:/) }
+    in_turn && $0 ~ pat { found=1 }
+    END { exit(found ? 0 : 1) }' "$LK_YAML"
+}
 ALREADY_PASSTHROUGH=0
-if ! grep -qE '^\s*external_tls:\s*true' "$LK_YAML"; then
-  if grep -qE '^\s*cert_file:' "$LK_YAML" && serves_tls_for_domain \
-     && ! grep -qi 'ssl crt' "$HA_CFG" && grep -qE "req_ssl_sni -i ${TURN_DOMAIN//./\\.}" "$HA_CFG"; then
+if ! turn_key '^[[:space:]]+external_tls:[[:space:]]*true'; then
+  if turn_key '^[[:space:]]+cert_file:' && serves_tls_for_domain \
+     && ! grep -qi 'ssl crt' "$HA_CFG" && grep -qF "req_ssl_sni -i ${TURN_DOMAIN}" "$HA_CFG"; then
     ALREADY_PASSTHROUGH=1
     log "  box is ALREADY in the passthrough shape and serving TLS — resuming at the Phase 4 gate"
   else
@@ -202,26 +218,36 @@ restore_both() {
   mv -f "$HA_CFG$STOCK_SUFFIX" "$HA_CFG"
   systemctl reload haproxy || systemctl restart haproxy || true
   restore_livekit
-  # Verify the pair is actually back in agreement rather than assuming it: a failed restore that
-  # reports success is how you find out at 3am.
+  # Verify the pair is actually back in AGREEMENT — and note what "agreement" means here.
+  # An earlier version verified with `openssl s_client :443 -checkhost`, which is blind by
+  # construction (Tesla): under the OLD shape HAProxy TERMINATES :443, so that handshake
+  # completes against HAProxy's own cert whether LiveKit came back, stayed on TLS, or died —
+  # and restore_livekit ends in `|| true`. Measuring the front oscillator says nothing about
+  # whether the pair is in phase.
+  #
+  # The restored shape is: HAProxy terminates :443 AND forwards PLAINTEXT to :5349. So the
+  # backend-side assertion is the inverse of the passthrough one — :5349 must be alive and must
+  # NOT present TLS — and the front must answer. Both, or this is not a verified restore.
+  local ok_front=0 ok_back=0
   for _ in $(seq 1 30); do
     if echo | timeout 6 openssl s_client -connect "127.0.0.1:443" -servername "$TURN_DOMAIN" 2>/dev/null \
-         | openssl x509 -noout -checkhost "$TURN_DOMAIN" >/dev/null 2>&1; then
-      log "  restore verified: turn TLS answers through :443 again"; return 0
-    fi
+         | openssl x509 -noout -checkhost "$TURN_DOMAIN" >/dev/null 2>&1; then ok_front=1; break; fi
     sleep 1
   done
-  # NOT a warning. A migration that failed AND whose rollback cannot be verified is a
-  # five-alarm state, and printing a polite note before returning 0 is fail-apathetic
-  # (Kelvin): the caller's `die` would then report only the ORIGINAL failure, and the far
-  # more serious "recovery is unproven" gets buried under it. Exit LOUD, with a distinct
-  # code, so no caller can mistake this for a clean unwind.
+  if listening "$TURN_TLS_PORT" && ! serves_tls_for_domain; then ok_back=1; fi
+  if [ "$ok_front" = 1 ] && [ "$ok_back" = 1 ]; then
+    log "  restore verified: :443 answers AND :$TURN_TLS_PORT is back to plaintext (the external_tls pair)"
+    return 0
+  fi
+
   echo "" >&2
   echo "[passthrough] ############## ROLLBACK UNVERIFIED — TURN IS DOWN ##############" >&2
-  echo "  Both artifacts were restored to the PRE-migration shape ON DISK, but turn TLS does" >&2
-  echo "  NOT answer through :443. Do NOT walk away. Check, in this order:" >&2
-  echo "    systemctl status haproxy       (is it running with the restored config?)" >&2
+  echo "  Both artifacts were restored to the PRE-migration shape ON DISK, but the running pair" >&2
+  echo "  does not agree:  :443 answers=$ok_front   :$TURN_TLS_PORT back-to-plaintext=$ok_back" >&2
+  echo "  (:443 answering ALONE proves nothing — HAProxy terminates it under the old shape.)" >&2
+  echo "  Do NOT walk away. Check, in this order:" >&2
   echo "    docker logs livekit --tail 50  (did it come back on external_tls?)" >&2
+  echo "    systemctl status haproxy       (is it running with the restored config?)" >&2
   echo "    diff $HA_CFG $HA_CFG$STOCK_SUFFIX" >&2
   echo "  Exiting 4 = 'migration failed AND recovery unproven'." >&2
   exit 4
@@ -244,6 +270,13 @@ log "PHASE 2 OK — :443 passes turn SNI straight to LiveKit"
 
 # ============================ PHASE 3 — decommission cert-sync ==============================
 log "PHASE 3 — removing haproxy-cert-sync (it has nothing left to sync)"
+# CONSUME THE STAGING FILES FIRST, before anything in this phase is destroyed (Tesla P1).
+# Phase 3 shreds the PEM — the old terminator's private key. Once that is carbon, the stock
+# haproxy.cfg is UNBOOTABLE (`bind ... ssl crt /etc/haproxy/certs/....pem` cannot be satisfied),
+# so the "restore BOTH" recipe Phase 0 prints would reassemble a corpse: neither old nor new, a
+# third state with unbootable turn and both files looking restored. Ordering the consumption
+# before the shred means the moment the stocks stop being valid is the moment they stop existing.
+rm -f "$LK_YAML$STOCK_SUFFIX" "$HA_CFG$STOCK_SUFFIX"
 systemctl disable --now haproxy-cert-sync.timer >/dev/null 2>&1 || true
 systemctl disable --now haproxy-cert-sync.service >/dev/null 2>&1 || true
 rm -f /etc/systemd/system/haproxy-cert-sync.timer /etc/systemd/system/haproxy-cert-sync.service
@@ -262,13 +295,6 @@ rmdir /etc/haproxy/certs 2>/dev/null || true
 systemctl daemon-reload
 log "PHASE 3 OK"
 
-# Consume the staging files HERE, before the Phase 4 gate — not after it (Carnot HIGH,
-# Maxwell M1). By this point the data plane is live and correct AND cert-sync has been
-# shredded and removed, so there is nothing left to roll back TO: keeping the .pre-passthrough
-# files past this line buys no recovery, and costs the re-run that Phase 4's own failure
-# message promises. Fail-closed still holds — every phase that could need them ran already.
-rm -f "$LK_YAML$STOCK_SUFFIX" "$HA_CFG$STOCK_SUFFIX"
-
 fi  # end: if ALREADY_PASSTHROUGH == 0
 
 # ============================ PHASE 4 — cert-restart must be live ===========================
@@ -280,9 +306,11 @@ fi  # end: if ALREADY_PASSTHROUGH == 0
 # box where the timer is exactly what the contract prescribes. If that ever stops being true,
 # add the fork here too rather than weakening the gate.
 log "PHASE 4 — asserting cert-restart.timer is active"
-if ! systemctl is-active --quiet cert-restart.timer; then
+# is-ENABLED as well as is-active (Tesla): `systemctl start` without `enable` greens an
+# is-active check and evaporates on the next reboot, taking the sole owner of INV-4' with it.
+if ! systemctl is-enabled --quiet cert-restart.timer 2>/dev/null || ! systemctl is-active --quiet cert-restart.timer; then
   echo "[passthrough] MIGRATION IS INCOMPLETE." >&2
-  echo "  The data plane is live and correct, but cert-restart.timer is NOT active." >&2
+  echo "  The data plane is live and correct, but cert-restart.timer is not BOTH enabled and active." >&2
   echo "  LiveKit now owns the cert and cannot hot-reload it, so the next renewal will serve" >&2
   echo "  a stale cert and TURN-over-TLS will fail silently. Wire it (task #3) and re-run." >&2
   echo "  Re-running is SAFE: Phase 0 detects the already-migrated shape, verifies it, and" >&2

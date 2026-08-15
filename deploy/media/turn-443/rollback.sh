@@ -47,7 +47,11 @@ drop_present() {
 # So: if HAProxy currently owns :443 and there is no stock Caddyfile to restore, REFUSE —
 # before touching anything. Taking :443 down with nothing to hand it to is strictly worse
 # than the muxed state we were asked to leave.
-if systemctl is-active --quiet haproxy && [ ! -s "$CADDY_STOCK" ]; then
+# Keyed off PORT OWNERSHIP, not `systemctl is-active` (Carnot): the invariant is "something is
+# serving :443 and there is nothing to hand it to", and a process can own the socket while the
+# unit reads inactive — supervised outside systemd, mid-restart, or a lagging unit state. Gating
+# the guard on is-active would let exactly those cases fall through into the stop/disable.
+if [ ! -s "$CADDY_STOCK" ]; then
   if [ -n "$(ss -tlnpH 'sport = :443' 2>/dev/null | grep haproxy)" ]; then
     die "HAProxy owns :443 but there is no $CADDY_STOCK to restore Caddy from.
 

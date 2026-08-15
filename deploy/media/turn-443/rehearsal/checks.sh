@@ -23,9 +23,11 @@ port_owner() {    # port_owner <port> -> process name holding it, or "" if unbou
   ss -tlnpH "sport = :$1" 2>/dev/null | grep -oE 'users:\(\("[^"]+' | head -1 | sed 's/.*"//'
 }
 
-tls_serves_cert() { # tls_serves_cert <host> <port> <sni>
-  timeout 8 openssl s_client -connect "${1}:${2}" -servername "${3}" </dev/null 2>/dev/null \
-    | grep -q "BEGIN CERTIFICATE"
+tls_serves_cert() { # tls_serves_cert <host> <port> <domain>
+  # -checkhost, not `grep BEGIN CERTIFICATE` (Tesla): the banner claims "a valid $TURN_DOMAIN
+  # cert" while the test only proved SOME cert appeared. Verify the name the caller asked about.
+  echo | timeout 8 openssl s_client -connect "$1:$2" -servername "$3" 2>/dev/null \
+    | openssl x509 -noout -checkhost "$3" >/dev/null 2>&1
 }
 
 cert_fingerprint() { # cert_fingerprint <host> <port> <sni>
@@ -96,9 +98,16 @@ assert_safety() {
 
   # The backend the mux depends on. A passthrough mux in front of a LiveKit that is not serving
   # a valid cert for TURN_DOMAIN is a turn endpoint that accepts and then dies mid-handshake.
+  # FAIL-OPEN BY OMISSION (Tesla): this used to be skipped entirely when :5349 had no owner, so
+  # a muxed box with a DEAD turn backend printed pass=N fail=0. If HAProxy owns :443, the whole
+  # point of the mux is that :5349 is behind it — an unbound backend is a red, not a silence.
   if [ -n "$(port_owner 5349)" ]; then
     tls_serves_cert 127.0.0.1 5349 "$TURN_DOMAIN"
     chk "BACKEND LiveKit serves a valid $TURN_DOMAIN cert on :5349" $?
+  elif [ "$(port_owner 443)" = "haproxy" ]; then
+    chk "BACKEND :5349 has NO owner while haproxy fronts :443 — the turn backend is DEAD" 1
+  else
+    chk "BACKEND :5349 unbound (and :443 is not muxed) — not yet a fault" 0
   fi
 
   # ADVERTISED-IDENTITY-IS-HELD. The SFU hands clients its node_ip as the address to send media
@@ -111,6 +120,19 @@ assert_safety() {
   if [ -n "$advertised" ]; then
     ip -4 -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | grep -qx "$advertised"
     chk "ADVERTISED node_ip ($advertised) is an address this box actually HOLDS" $?
+  fi
+
+  # PASSTHROUGH-PATH. A cert check cannot tell passthrough from a misroute, because
+  # Caddyfile.mux keeps a turn. site block served from THE SAME store LiveKit mounts — so if the
+  # SNI rule dumps turn into default_backend be_caddy, the cert and even its fingerprint match
+  # (Tesla). Discriminate the PATH: Caddy answers `respond "turn" 200` to an HTTPS GET; LiveKit's
+  # TURN socket cannot speak HTTP. A successful GET means Caddy has the turn SNI — the misroute.
+  if [ "$(port_owner 443)" = "haproxy" ]; then
+    if curl -sS -o /dev/null --max-time 8 --resolve "${TURN_DOMAIN}:443:127.0.0.1" "https://${TURN_DOMAIN}/" 2>/dev/null; then
+      chk "PASSTHROUGH-PATH turn SNI is answered by CADDY, not LiveKit (misrouted)" 1
+    else
+      chk "PASSTHROUGH-PATH turn SNI is NOT answered by Caddy (real passthrough)" 0
+    fi
   fi
 
   # INV-8: Caddy's HTTPS must not be publicly reachable once it has moved to :8443.

@@ -91,7 +91,16 @@ chk "turn SNI  -> LiveKit (through passthrough) presents a cert" $?
 # And it must be LIVEKIT's cert, end-to-end — not something HAProxy synthesised. Compare the
 # fingerprint through :443 against the one LiveKit serves directly on :5349.
 lk_direct="$(timeout 8 openssl s_client -connect 127.0.0.1:5349 -servername "$TURN_DOMAIN" </dev/null 2>/dev/null | openssl x509 -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)"
-chk "  ...and it is byte-identical to LiveKit's own cert on :5349 (true passthrough)" "$([ -n "$lk_direct" ] && [ "$(served_fp)" = "$lk_direct" ] && echo 0 || echo 1)"
+chk "  ...and it is byte-identical to LiveKit's own cert on :5349" "$([ -n "$lk_direct" ] && [ "$(served_fp)" = "$lk_direct" ] && echo 0 || echo 1)"
+# That fingerprint match does NOT prove passthrough (Tesla): Caddyfile.mux keeps a turn. site
+# block served from THE SAME store LiveKit mounts, so a misroute into be_caddy produces an
+# IDENTICAL cert. The claim "true passthrough" was unearned. Discriminate the PATH instead —
+# Caddy answers an HTTPS GET, LiveKit's TURN socket cannot.
+if curl -sS -o /dev/null --max-time 8 --resolve "${TURN_DOMAIN}:443:127.0.0.1" "https://${TURN_DOMAIN}/" 2>/dev/null; then
+  chk "  ...and the turn SNI is NOT answered by Caddy (TRUE passthrough)" 1
+else
+  chk "  ...and the turn SNI is NOT answered by Caddy (TRUE passthrough)" 0
+fi
 timeout 8 openssl s_client -connect 127.0.0.1:443 -servername "chat.enspyr.co" </dev/null 2>/dev/null | grep -q "BEGIN CERT"
 chk "chat SNI  -> passthrough to Caddy presents a cert" $?
 # DIFFERENTIAL, not pattern-matching: the correct claim is "the mux is transparent", so compare
