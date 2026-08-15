@@ -65,67 +65,34 @@ command -v openssl >/dev/null || die "openssl missing — it is load-bearing for
 systemctl is-active --quiet haproxy || die "haproxy is not active — this script migrates a box that ALREADY runs the mux; use cutover.sh instead"
 listening 443 || die ":443 is not bound — refusing to migrate a half-configured box"
 
-# ---- WHAT SHAPE IS THIS BOX IN? Ask before judging the staging files (Tesla, round 3) ----
-# Ordering matters and got it wrong once. The stock-file guards used to run FIRST, so the window
-# between "Phase 2's reload succeeded" and "Phase 3 consumed the stocks" — a fully working
-# passthrough box that still has both .pre-passthrough files — hit the both-stocks `die` and got
-# told to restore BOTH. That recipe reloads the OLD terminating haproxy.cfg against a LiveKit
-# that now speaks TLS: precisely the out-of-phase pair restore_both exists to prevent. The
-# staging files are evidence, not a verdict; read the RUNNING shape first and let it arbitrate.
-#
-# Shape predicates are scoped to the top-level `turn:` mapping, exactly like Phase 1's mutation
-# (Carnot): a bare whole-file grep can certify the wrong shape from an unrelated section, and a
-# stray external_tls anywhere could block a valid resume. The check reads the region the edit writes.
 turn_key() {  # turn_key <key-regex> — true if the key exists inside the top-level turn: mapping
   awk -v pat="$1" '
     /^[^[:space:]]/ { in_turn = ($0 ~ /^turn:/) }
     in_turn && $0 ~ pat { found=1 }
     END { exit(found ? 0 : 1) }' "$LK_YAML"
 }
-# Four of these five beats read DISK, and disk is not the running process (Tesla round 6): an
-# edited-but-unreloaded haproxy.cfg would classify the box as passthrough while :443 still serves
-# the old shape. So the classification ends with a RUNTIME check — the same path discriminator the
-# deploy phases use. Disk says what it should be; the probe says what it is.
-is_passthrough_shape() {
-  ! turn_key '^[[:space:]]+external_tls:[[:space:]]*true' || return 1
-  turn_key '^[[:space:]]+cert_file:'                      || return 1
-  ! grep -qi 'ssl crt' "$HA_CFG"                          || return 1
-  grep -qF "req_ssl_sni -i ${TURN_DOMAIN}" "$HA_CFG"      || return 1
-  serves_tls_for_domain                                   || return 1
-  # RUNTIME: is :443 actually passing the turn SNI through right now?
-  turn_path_is_passthrough "$TURN_DOMAIN" "chat.${TURN_DOMAIN#turn.}"
-}
 
-ALREADY_PASSTHROUGH=0
-if is_passthrough_shape; then
-  # RECONCILE MEMORY WITH DISK BEFORE TRUSTING THIS (Tesla round 8). Four of the five beats in
-  # is_passthrough_shape read DISK, and the fifth — the path probe — cannot tell a still-
-  # TERMINATING HAProxy from a passthrough one (documented limit, INVARIANTS.md): a terminator
-  # forwards the GET to LiveKit as plaintext, LiveKit does not answer HTTP, and it times out
-  # exactly like passthrough. So a box whose haproxy.cfg was updated but never reloaded would
-  # classify as already-migrated, skip to Phase 3, shred the PEM the RUNNING process is still
-  # serving, and print COMPLETE over a dead media plane. A reload is idempotent; do it, then
-  # re-verify against the process that is actually running.
-  log "  disk reads as passthrough — reloading haproxy so the RUNNING config matches, then re-verifying"
-  systemctl reload haproxy || systemctl restart haproxy \
-    || die "disk is in the passthrough shape but haproxy would neither reload nor restart — refusing to classify this box from disk alone."
-  sleep 1
-  turn_path_is_passthrough "$TURN_DOMAIN" "chat.${TURN_DOMAIN#turn.}" \
-    || die "after reloading haproxy to match disk, the turn path still does not verify as passthrough — refusing to resume. Inspect $HA_CFG and the running process by hand."
-  ALREADY_PASSTHROUGH=1
-  # Stale staging files from a run that got as far as a successful Phase 2 are now INVALID —
-  # the old haproxy.cfg they hold cannot be paired with a TLS-speaking LiveKit. Discard them
-  # rather than leaving a trap that tells the next operator to reassemble a broken pair.
-  if [ -e "$LK_YAML$STOCK_SUFFIX" ] || [ -e "$HA_CFG$STOCK_SUFFIX" ]; then
-    log "  discarding stale .pre-passthrough files: the box is already passthrough, so restoring them would recreate the out-of-phase pair"
-    rm -f "$LK_YAML$STOCK_SUFFIX" "$HA_CFG$STOCK_SUFFIX"
-  fi
-  log "  box is ALREADY in the passthrough shape and serving TLS — resuming at the Phase 4 gate"
-else
-  # Not passthrough. NOW the staging files tell you where a previous run died, and WHICH ones
-  # exist determines what "restore by hand" actually means.
-  if [ -e "$LK_YAML$STOCK_SUFFIX" ] && [ ! -e "$HA_CFG$STOCK_SUFFIX" ]; then
-    die "$LK_YAML$STOCK_SUFFIX exists but $HA_CFG$STOCK_SUFFIX does not — a previous run died
+# ---- SUBTRACTION (cage-match round 9): the resume path is GONE, and so is what it cost ----
+# Rounds 7, 8 and 9 all produced findings in one small interaction — resume classifier × marker
+# timing × EXIT trap — and each patch spawned the next finding. Nine rounds against a 2-4 norm is
+# not a stubborn bug, it is a signal that the shape is wrong.
+#
+# The resume path existed for exactly ONE reason: Phase 4 (renewal ownership) was a gate that
+# could fail AFTER the data plane had already migrated, so the script had to be re-runnable from
+# a completed state. That required classifying "is this box already passthrough?", which required
+# reading disk, which could not distinguish a still-terminating HAProxy, which required a
+# reconcile-reload, which needed the marker written earlier, which needed the trap to know the
+# difference between an intentional exit and a crash…
+#
+# Move the renewal check to PHASE 0 and the whole tower disappears. A precondition cannot fail
+# after a mutation, because it runs before one. Deleted with it: is_passthrough_shape(), the
+# ALREADY_PASSTHROUGH branch, the stale-stock discard, _DATA_PLANE_DONE, and the reconcile-reload.
+# Fail before mutating instead of unwinding afterwards — which is the better behaviour anyway.
+
+# A previous aborted run leaves .pre-passthrough files. WHICH ones tells you exactly where it
+# died and what "restore by hand" means, so say it rather than making the operator infer it.
+if [ -e "$LK_YAML$STOCK_SUFFIX" ] && [ ! -e "$HA_CFG$STOCK_SUFFIX" ]; then
+  die "$LK_YAML$STOCK_SUFFIX exists but $HA_CFG$STOCK_SUFFIX does not — a previous run died
 between Phase 1 and Phase 2. LiveKit is terminating its own TLS; HAProxy is still on the old
 external_tls config forwarding PLAINTEXT to :$TURN_TLS_PORT. turns:443 is DOWN right now.
 
@@ -133,20 +100,32 @@ To unwind (HAProxy was never modified, so only LiveKit must move):
     mv -f '$LK_YAML$STOCK_SUFFIX' '$LK_YAML'
     (cd '$LIVEKIT_DIR' && docker compose restart livekit)
 then verify turns:443 answers and re-run this script."
-  fi
-  for f in "$LK_YAML$STOCK_SUFFIX" "$HA_CFG$STOCK_SUFFIX"; do
-    [ -e "$f" ] && die "$f exists — a previous run aborted mid-Phase-2, and this box is NOT in the
-passthrough shape. Both artifacts were staged, so restore BOTH together (they are one coupled
-artifact — a plaintext-forwarding proxy against a TLS-expecting backend is dead TURN with both
-halves looking restored):
+fi
+for f in "$LK_YAML$STOCK_SUFFIX" "$HA_CFG$STOCK_SUFFIX"; do
+  [ -e "$f" ] && die "$f exists — a previous run aborted mid-Phase-2. Both artifacts were staged,
+so restore BOTH together (they are one coupled artifact — a plaintext-forwarding proxy against a
+TLS-expecting backend is dead TURN with both halves looking restored):
     mv -f '$HA_CFG$STOCK_SUFFIX' '$HA_CFG' && systemctl reload haproxy
     mv -f '$LK_YAML$STOCK_SUFFIX' '$LK_YAML' && (cd '$LIVEKIT_DIR' && docker compose restart livekit)
 then verify turns:443 answers and re-run this script."
-  done
-  # Neither shape, no staging files: refuse to guess.
-  turn_key '^[[:space:]]+external_tls:[[:space:]]*true' \
-    || die "livekit.yaml has no external_tls:true, but the box is not in a verified passthrough shape either — refusing to guess. Inspect $LK_YAML and $HA_CFG by hand."
+done
+
+# This script migrates a box that is in the external_tls shape. If it is not, say which shape it
+# IS rather than guessing — an already-migrated box needs nothing done to it.
+if [ -f /etc/haproxy/.migrated-to-passthrough ]; then
+  die "this box is ALREADY migrated (marker: /etc/haproxy/.migrated-to-passthrough). Nothing to do."
 fi
+turn_key '^[[:space:]]+external_tls:[[:space:]]*true' \
+  || die "livekit.yaml has no external_tls:true — this box is not in the shape this migrates FROM. If it is already passthrough, there is nothing to do; if it is something else, inspect $LK_YAML and $HA_CFG by hand."
+
+# RENEWAL OWNERSHIP — checked HERE, as a precondition, not as a post-mutation gate (round 9).
+# LiveKit will hold the cert and cannot hot-reload it, so an unguarded renewal serves a stale cert
+# and TURN-over-TLS dies silently ~89d out. is-ENABLED as well as is-active: `systemctl start`
+# without `enable` greens an is-active check and evaporates on the next reboot.
+systemctl is-enabled --quiet cert-restart.timer 2>/dev/null && systemctl is-active --quiet cert-restart.timer \
+  || die "cert-restart.timer is not both ENABLED and ACTIVE. LiveKit is about to become the cert holder and cannot hot-reload one, so without this timer the next renewal serves a stale cert and turns:443 dies silently ~89d from now.
+Wire it first (deploy/media/cert-restart.*, task #3), then re-run. Nothing has been changed."
+log "  cert-restart.timer is enabled+active — renewal has an owner"
 
 # The cert LiveKit is about to serve must already be present, valid, and for the right name.
 # Read it from the container's own view: a host-side path that looks fine but is mounted
@@ -169,12 +148,6 @@ docker exec livekit cat "$CERT_IN_CTR" 2>/dev/null \
 log "  cert is valid for $TURN_DOMAIN and not expiring imminently"
 
 log "PHASE 0 OK"
-
-# Phases 1-2 (the MUTATING ones) are skipped on the resume path. Phase 3 (decommission) and
-# Phase 4 (the renewal gate) always run: Phase 3 is idempotent and a crash after Phase 2 would
-# otherwise leave cert-sync and the PEM in place forever, and Phase 4 is the whole reason a
-# resume exists.
-if [ "$ALREADY_PASSTHROUGH" -eq 0 ]; then
 
 # ============================ PHASE 1 — LiveKit takes back its TLS ==========================
 log "PHASE 1 — livekit.yaml: external_tls:true -> cert_file/key_file"
@@ -260,7 +233,6 @@ _on_unexpected_exit() {
   local rc=$?
   [ "$rc" -eq 0 ] && return 0
   [ "$MIGRATION_COMPLETE" -eq 1 ] && return 0
-  [ "${_DATA_PLANE_DONE:-0}" -eq 1 ] && return 0
   [ "${_RESTORE_IN_PROGRESS:-0}" -eq 1 ] && return 0
   echo "[passthrough] UNEXPECTED EXIT (rc=$rc) outside a handled failure path — unwinding." >&2
   _RESTORE_IN_PROGRESS=1
@@ -375,7 +347,6 @@ log "PHASE 2 OK — :443 passes turn SNI straight to LiveKit (path discriminated
 printf 'migrated-to-passthrough %s\n' "$TURN_DOMAIN" > /etc/haproxy/.migrated-to-passthrough \
   || { restore_both; die_restored "could not write /etc/haproxy/.migrated-to-passthrough — without it rollback.sh cannot tell this box was migrated and would silently kill turns:443. Unwound rather than proceed."; }
 
-fi  # end: if ALREADY_PASSTHROUGH == 0 — Phases 1-2 are the mutation; Phase 3 below is NOT.
 
 # ============================ PHASE 3 — decommission cert-sync ==============================
 # RUNS ON BOTH PATHS, including resume (Tesla, round 4). A crash after Phase 2 succeeded leaves a
@@ -411,32 +382,15 @@ systemctl daemon-reload
 log "PHASE 3 OK"
 
 
-# ============================ PHASE 4 — cert-restart must be live ===========================
-# Passthrough makes LiveKit the cert holder, and LiveKit cannot hot-reload one. Without this
-# timer the next renewal serves a stale cert and TURN-over-TLS dies silently, months from now.
+# ============================ PHASE 4 — GONE (moved to Phase 0, round 9) ====================
+# This used to be a hard gate here, AFTER the data plane had migrated — which is what forced the
+# whole resume/marker/trap tower that rounds 7-9 kept finding holes in. The check itself was
+# right; its POSITION was wrong. It now runs as a Phase 0 precondition, where failing costs
+# nothing and cannot leave a half-finished box.
 #
-# Unlike cutover.sh this has no CERT_RENEWAL_OWNER=runbook escape, deliberately: this script
-# only runs on a box that ALREADY runs the mux, which today means an island-dedicated BOOTSTRAP
-# box where the timer is exactly what the contract prescribes. If that ever stops being true,
-# add the fork here too rather than weakening the gate.
-log "PHASE 4 — asserting cert-restart.timer is active"
-# is-ENABLED as well as is-active (Tesla): `systemctl start` without `enable` greens an
-# is-active check and evaporates on the next reboot, taking the sole owner of INV-4' with it.
-if ! systemctl is-enabled --quiet cert-restart.timer 2>/dev/null || ! systemctl is-active --quiet cert-restart.timer; then
-  echo "[passthrough] MIGRATION IS INCOMPLETE." >&2
-  echo "  The data plane is live and correct, but cert-restart.timer is not BOTH enabled and active." >&2
-  echo "  LiveKit now owns the cert and cannot hot-reload it, so the next renewal will serve" >&2
-  echo "  a stale cert and TURN-over-TLS will fail silently. Wire it (task #3) and re-run." >&2
-  echo "  Re-running is SAFE: Phase 0 detects the already-migrated shape, verifies it, and" >&2
-  echo "  resumes at this gate without touching the live data plane." >&2
-  # The data plane is COMPLETE and CORRECT here; only the renewal gate is unmet. Tell the EXIT
-  # trap so it does not print "UNEXPECTED EXIT … unwinding" over an intentional, documented
-  # re-runnable exit (Carnot round 7) — contradictory instructions on an operator path are their
-  # own kind of failure.
-  _DATA_PLANE_DONE=1
-  exit 3
-fi
-log "PHASE 4 OK — renewal restarts are guarded"
+# What that deleted, in this file alone: is_passthrough_shape(), the ALREADY_PASSTHROUGH branch,
+# the stale-stock discard, the reconcile-reload, _DATA_PLANE_DONE, and the "re-running is SAFE"
+# paragraph that was false for two rounds before it was true.
 
 MIGRATION_COMPLETE=1
 log "MIGRATION COMPLETE. Now run the acceptance gates:"

@@ -713,3 +713,42 @@ resume: "reloading haproxy so the RUNNING config matches, then re-verifying" -> 
 
 **Rig after round 8:** cutover green (98 ms), 7/7 invariants, 18/18 faults, exit-3 marker proved,
 resume reconciliation proved, rollback guard proved.
+
+## Round 9 — stopped patching and deleted the thing generating the findings
+
+Kelvin APPROVE. Carnot + Tesla `REQUEST_CHANGES` — and every finding was, again, in the same
+small interaction: **resume classifier × marker timing × EXIT trap**. Tesla's headline was that
+the marker is written only inside the Phase-2 block, so a box completing via the *resume* path
+finishes unmarked and `rollback.sh` would silently downgrade it. Carnot's was that the resume
+classifier could still certify a running terminator as passthrough.
+
+Rounds 7, 8 and 9 all landed in that one interaction, each patch spawning the next finding. Nine
+rounds against a 2-4 norm is not a stubborn bug; it is a reading that the shape is wrong.
+
+**So the fix is a deletion.** That entire tower existed for one reason: Phase 4 (renewal
+ownership) was a gate that could fail **after** the data plane had migrated, so the script had to
+be re-runnable from a completed state. That required classifying "is this already passthrough?",
+which required reading disk, which could not distinguish a still-terminating HAProxy, which
+required a reconcile-reload, which required the marker earlier, which required the trap to tell
+an intentional exit from a crash.
+
+The check was right; its **position** was wrong. Moved to Phase 0 it cannot fail after a mutation,
+because it runs before one. Deleted with it: `is_passthrough_shape()`, the `ALREADY_PASSTHROUGH`
+branch, the stale-stock discard, the reconcile-reload, `_DATA_PLANE_DONE`, and a "re-running is
+SAFE" paragraph that was false for two rounds before it became true. 444 → 398 lines, and the
+removed lines are the intricate ones.
+
+Proved on the rig:
+
+```
+timer NOT wired  -> ABORT in Phase 0; livekit external_tls unchanged; no marker; no stocks staged
+timer wired      -> renewal has an owner -> PHASE 2 OK -> MIGRATION COMPLETE, marker PRESENT
+re-run           -> "this box is ALREADY migrated. Nothing to do."
+```
+
+Failing *before* mutating is also just better behaviour than unwinding afterwards — the old
+version's best case was a live data plane plus a nag, which is exactly the "acceptable for now"
+this whole PR has been arguing against.
+
+**Rig after round 9:** cutover green (99 ms), 7/7 invariants, 18/18 faults, all three migrate
+states proved.
