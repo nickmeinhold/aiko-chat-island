@@ -124,3 +124,75 @@ Note: Pebble mints a **new issuance root on every container start**, so after an
 refresh `/usr/local/share/ca-certificates/pebble-issuance-root.crt` from
 `https://127.0.0.1:15000/roots/0` and re-issue the site certs, or TLS verification will fail for
 reasons that have nothing to do with the artifact under test.
+
+---
+
+# Task #8 Phase-0 falsifier — plain SNI passthrough (2026-08-14)
+
+**Question.** `external_tls: true` is the choice that creates every plaintext-window invariant
+in the cutover (INV-1 and the firewall DROPs, the ordering constraint, the `livekit.yaml`
+mutation, `haproxy-cert-sync` and its PEM uid boundary — the round-4 P0). It buys exactly one
+thing: avoiding a LiveKit restart on cert renewal, ~4x/year. The alternative is **plain SNI
+passthrough** — HAProxy peeks the ClientHello and forwards the raw stream to LiveKit's own TLS
+TURN listener, holding **no certificate at all**. The design flagged one risk against it and
+never tested it: *"passthrough that works for `openssl s_client` but not for a real TURN client;
+ClientHello fragmentation."*
+
+**Verdict: GREEN.** Passthrough carries a real call.
+
+| run | UDP TURN | selected pair | bytes | exit |
+|---|---|---|---|---|
+| **verdict** | blocked | `relay/tls` — `turns:turn.enspyr.co:443?transport=tcp` | 11429 ↑ / 1925 ↓ | **0** |
+| **control** | allowed | `relay/udp` — `turn:203.0.113.5:3478` | 11428 ↑ / 1862 ↓ | **3** (correctly FAILS) |
+
+The control is what makes the green mean anything: the same harness, same box, one variable
+flipped, and it refuses to certify the UDP path. A green with no discriminating control is a
+rubber stamp.
+
+Corroborating server-side evidence, which is stronger than the client's own report:
+
+- **HAProxy log**: `fe443 be_turn/lk` for Chromium's connections — the ClientHello was
+  SNI-peeked and routed to the passthrough backend. The fragmentation risk is closed by
+  observation, not inference.
+- **B3 relay-deny through the passthrough**: `tls:turn.enspyr.co:443` ALLOCATED, all five
+  SSRF sentinels 403, CGNAT 403, public control 200 before *and* after, on the same allocation.
+  The security property survives the shape change.
+
+**Scope limit (stated, not buried).** The rig's certs come from a local Pebble CA, so the
+Chromium run used `--ignore-certificate-errors`. It therefore proves **transport**, not chain
+validation. Chain validation is proven separately in production (PR#131, real Let's Encrypt
+cert), and LiveKit reads that same Caddy-issued cert through the `/opt/turncerts` symlink — so
+no *new* cert-plumbing is introduced by passthrough.
+
+## Two instrument findings — both would have been reported as server bugs
+
+1. **`--ignore-certificate-errors-spki-list` does NOT reach Chromium's TURNS socket.** With the
+   Pebble root pinned by SPKI, `pion.turn` logged `TLS handshake failed: remote error: tls:
+   unknown certificate` — Chromium rejecting the cert. Adding the root to the NSS user db
+   (`~/.pki/nssdb`) did not help either; only the blanket flag did. Pin-by-SPKI silently does
+   not apply here, and the failure is indistinguishable from a broken server unless you read
+   the server log.
+
+2. **The rig structurally cannot complete relay-only WebRTC as originally built.** Its SFU
+   advertises `192.168.5.15` — RFC1918 — which the TURN relay correctly **refuses** as a peer
+   (`deny_peer_cidrs`, `requestsSent: 8 / responsesReceived: 0`). That is the SSRF guard working
+   against the SFU itself, and it fails identically under Shape C. Read without the server log
+   it looks exactly like "passthrough is broken".
+
+   **Fix, and it makes the rig permanently more capable:** alias a non-private address on `eth0`
+   and point `rtc.node_ip` at it, so the relay is permitted to deliver to the SFU:
+
+   ```bash
+   ip addr add 203.0.113.5/32 dev eth0        # TEST-NET-3, allowed by the deny list
+   sed -i 's/^  node_ip: .*/  node_ip: 203.0.113.5/' ~/apps/livekit/livekit.yaml
+   docker restart livekit
+   ```
+
+   With that, the rig can run the real-client relay proof end to end — which is what task #11
+   (wire the relay proof into a routine gate) needs a home for.
+
+**Consequence for the design.** `external_tls` is a choice, not a requirement. Dropping it
+deletes `haproxy-cert-sync.{sh,service,timer}`, the PEM uid boundary, the `.needs-reload`
+sentinel, INV-1 and its v4+v6 DROPs, the `netfilter-persistent` dependency, the `livekit.yaml`
+mutation, and the ordering constraint that shapes the entire state machine. What replaces it is
+`cert-restart.sh`, which already exists and is already cage-matched.
