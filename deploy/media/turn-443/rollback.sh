@@ -57,7 +57,7 @@ if [ ! -s "$CADDY_STOCK" ]; then
   # the guard named port ownership but protected only one owner).
   _own="$(ss -tlnpH 'sport = :443' 2>/dev/null | grep -oE '"[^"]+"' | head -1 | tr -d '"')"
   if [ "$_own" != "caddy" ]; then
-    die "HAProxy owns :443 but there is no $CADDY_STOCK to restore Caddy from.
+    die "':443' is held by '${_own:-<nothing>}' (not Caddy) and there is no $CADDY_STOCK to restore Caddy from.
 
 (:443 owner is '"'"'${_own:-<unbound>}'"'"'.) This is the post-migrate-to-passthrough shape: the stock
 Caddyfile was consumed on a successful migration, so there is nothing to roll :443 back TO. Stopping HAProxy here would

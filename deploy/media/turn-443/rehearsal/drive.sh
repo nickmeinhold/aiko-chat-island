@@ -17,7 +17,11 @@ VM="${VM:-turnrig}"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"   # deploy/media/turn-443
 REMOTE=/opt/turn-443
 say() { echo; echo "=== $* ==="; }
-vm()  { limactl shell "$VM" -- sudo bash -c "$1"; }
+# The rig's certs come from a local Pebble CA, so chain verification against a REAL trust store
+# is meaningless here. turn_tls_ok is fail-closed on that by default (a chain production clients
+# cannot verify is a chain that does not work), so the rig declares the opt-out explicitly —
+# once, visibly, rather than by weakening the shared assertion for everyone.
+vm()  { limactl shell "$VM" -- sudo bash -c "export TURN_ALLOW_UNVERIFIED_CHAIN=1; $1"; }
 
 # The ONE documented delta between the shipped artifact and what the rig runs: both Caddyfiles
 # are pointed at the local Pebble CA. Everything structural under test (https_port 8443, the
