@@ -1,9 +1,19 @@
 # Shape B — TURN-over-TLS on :443 via a second IP (imagineering)
 
-**Status: designed + rig-proven, NOT yet applied to a live box.**
-Proven end-to-end on the `turnrig` Lima rig 2026-08-15 (claude-tasks#3051): Caddy on IP1:443 and
-LiveKit on IP2:443 coexisting, ACME renewal intact, and a real Chromium relay-only call selecting
-`turns:<domain>:443` with the client's UDP blocked.
+**Status: APPLIED AND VERIFIED LIVE on imagineering 2026-08-15.**
+
+```
+selected: turns:turn.imagineering.cc:443?transport=tcp @137.23.18.134
+relayProtocol tls · all_relay true · 11427 B sent / 1927 B received
+```
+
+Real Chromium client, `iceTransportPolicy:relay`, browser UDP dropped. The UDP-open control
+correctly selected `udp`. All 31 Caddy tenant sites verified serving afterwards, and all six SFU
+consumers healthy with zero LiveKit errors. Previously rig-proven on `turnrig`
+(claude-tasks#3051).
+
+Live values: **IP1** `10.0.0.21` (Caddy) · **IP2** `10.0.0.22` · **PUB2** `137.23.18.134`
+(reserved, `turn-imagineering-shapeb`).
 
 This is the **alternative to `../turn-443/`** (the HAProxy SNI mux, live on enspyr). Read
 [Which shape for which box](#which-shape-for-which-box) before picking. Shape B is *not* a
@@ -118,10 +128,22 @@ sudo ip addr add 10.0.0.22/24 dev enp0s3        # confirm the real iface name fi
 ip -4 addr show | grep inet                     # expect BOTH 10.0.0.21 and 10.0.0.22
 ```
 
-**Make it survive reboot** (netplan drop-in or `oci-network-config`), and confirm with a reboot
-before you rely on it — an address that vanishes on reboot takes TURN with it. The local
-firewall already ACCEPTs `tcp dpt:443` and `dpt:80` without a source/destination restriction, so
-no new rule is needed; confirm with `sudo iptables -L INPUT -n | grep -E 'dpt:(80|443)'`.
+**Make it survive reboot.** On imagineering this is `/etc/netplan/60-shapeb-secondary-ip.yaml`
+(mode 600), validated with `netplan generate` and **deliberately not `netplan apply`** — apply can
+bounce a live interface, and `ip addr add` already did the work for this boot.
+
+> **OUTSTANDING on imagineering:** the reboot has not been done, so persistence is *validated but
+> not proven*. Until a reboot confirms it, treat `10.0.0.22` as this-boot-only — if the box
+> restarts and the address does not come back, TURN dies with it. Verify at the next planned
+> reboot.
+
+The local firewall needs no new rule — every INPUT rule is destination-agnostic, so the new
+address inherits them. Confirm with `sudo iptables -S INPUT`.
+
+> **Instrument warning:** `iptables -L | grep udp` does **not** show `multiport` rules — they
+> render as protocol `17` with no literal "udp". Grepping that way made the RTC range
+> (`7882:7892`) and the TURN relay range (`30000:40000`) look closed on imagineering when both
+> are open. Read `iptables -S`, not a grep of `-L`.
 
 ### 3. Pin Caddy to IP1 and give ACME a `:80` on IP2
 
@@ -207,7 +229,23 @@ with globally-routable IPs it is unnecessary, and it would weaken the SSRF guard
 `turn.imagineering.cc` A record → **PUB2** (Namecheap, API-drivable). Lower the TTL first if it
 is long. Everything else (`livekit.`, `chat.`, the other 30 sites) stays on the primary.
 
-Verify from **off the box**: `dig +short turn.imagineering.cc` returns PUB2.
+Verify **against the authoritative server**, not your resolver:
+`dig +short turn.imagineering.cc @1.1.1.1` returns PUB2.
+
+> **imagineering specifics.** There was no A record for `turn` — it resolved via a
+> `*.imagineering.cc` wildcard. A *specific* record beats the wildcard, so adding
+> `turn A <PUB2>` (DNS-only, **never** proxied — Cloudflare proxying would break TURN outright)
+> moves only that name and leaves the other 30 subdomains on the primary.
+
+> **The propagation hazard — and why `openssl` will lie to you here.** Caddy on IP1 keeps a
+> `turn.<domain>` block (it must: Caddy is the ACME client). So during propagation, a client
+> holding a stale answer connects to **Caddy** on the primary IP and gets a **valid certificate
+> for the turn domain** — `Verify return code: 0 (ok)` — with no TURN behind it. That is a green
+> TLS handshake onto a dead path, and it cost a false "Shape B is broken" reading during this
+> very cutover: the test vantage had a stale resolver entry. **Always confirm which IP you
+> actually reached** (`--resolve`, `getent hosts`, or `openssl -connect <PUB2>:443`) before
+> concluding anything about the server. The mux shape's gate checks the mirror image of this
+> (`cutover.sh:303`).
 
 ### 6. Apply
 
