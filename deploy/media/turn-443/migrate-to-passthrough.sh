@@ -22,12 +22,12 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 TURN_DOMAIN="${TURN_DOMAIN:?set TURN_DOMAIN (e.g. turn.enspyr.co)}"
-# Validate before this value reaches `sed s///` (where / and & are syntax) or a grep pattern
-# (where . and friends are syntax), as root, writing the front door's config (Carnot). A
-# DNS-label allowlist is the whole fix — anything outside it is not a hostname anyway.
-case "$TURN_DOMAIN" in
-  *[!a-zA-Z0-9.-]*|.*|-*|*.|*-) echo "[passthrough] ABORT: TURN_DOMAIN '$TURN_DOMAIN' is not a plain DNS name (letters, digits, dot, hyphen; no leading/trailing dot or hyphen). Refusing to render root-owned config from it." >&2; exit 1 ;;
-esac
+# Shared assertions — ONE door (see lib/turn-assert.sh). cutover.sh sources the same file, so a
+# correction lands in both paths or in neither. Round 3 caught the fix landing in 3 of 4 sites
+# and missing THIS script — the one that runs on the live already-muxed box.
+# shellcheck source=lib/turn-assert.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib/turn-assert.sh"
+turn_domain_valid "$TURN_DOMAIN" || { echo "[passthrough] ABORT: TURN_DOMAIN '$TURN_DOMAIN' is not a plain DNS name — refusing to render root-owned config from it." >&2; exit 1; }
 # No $HOME default: this runs under sudo, where $HOME is /root, and "~/apps/livekit" would
 # silently resolve to a path that does not exist — or worse, on a box where it does. Both this
 # and TURN_DOMAIN are required and unguessable on purpose.
@@ -39,25 +39,15 @@ STOCK_SUFFIX=".pre-passthrough"
 
 log()  { echo "[passthrough] $*"; }
 die()  { echo "[passthrough] ABORT (nothing mutated past this point): $*" >&2; exit 1; }
+# For aborts AFTER a phase has mutated and unwound: "nothing mutated" is false there and reads as
+# a stronger safety claim than the run actually earned. Caught by the round-3 RED proof, where a
+# correct restore printed the wrong reassurance.
+die_restored() { echo "[passthrough] ABORT (changes were made and have been RESTORED — see the restore lines above): $*" >&2; exit 1; }
 dc()   { if docker compose version >/dev/null 2>&1; then docker compose "$@"; else docker-compose "$@"; fi; }
 listening() { [ -n "$(ss -tlnH "sport = :$1" 2>/dev/null)" ]; }
 
-# Does the socket present a VALID cert for TURN_DOMAIN? This is the anti-false-green check: a
-# dead socket and a plaintext socket both fail a TLS handshake, so "a cert that verifies for
-# this exact name" is the only statement that distinguishes "LiveKit is terminating TLS for the
-# right name" from "something answered".
-#
-# openssl does the hostname verification, EXCLUSIVELY. An earlier version tried a
-# `grep "^subject=.*CN *= *${TURN_DOMAIN}$"` first and fell back to -checkhost. Two problems
-# (Carnot): TURN_DOMAIN is interpolated UNESCAPED into a regex, where `.` matches any
-# character — so `turn.enspyr.co` also matches `turnXenspyr!co` — and the grep arm ignores
-# SAN and expiry entirely, so it could pass a cert -checkhost would reject. A weaker check
-# ORed in front of a stronger one can only ever weaken the result.
-serves_tls_for_domain() {
-  echo | timeout 10 openssl s_client -connect "127.0.0.1:${TURN_TLS_PORT}" \
-        -servername "$TURN_DOMAIN" 2>/dev/null \
-    | openssl x509 -noout -checkhost "$TURN_DOMAIN" >/dev/null 2>&1
-}
+# Local wrapper over the shared assertion, so the many call sites below stay readable.
+serves_tls_for_domain() { turn_tls_ok 127.0.0.1 "$TURN_TLS_PORT" "$TURN_DOMAIN"; }
 
 # ============================ PHASE 0 — preconditions (read-only) ============================
 log "PHASE 0 — preconditions"
@@ -71,14 +61,47 @@ command -v openssl >/dev/null || die "openssl missing — it is load-bearing for
 systemctl is-active --quiet haproxy || die "haproxy is not active — this script migrates a box that ALREADY runs the mux; use cutover.sh instead"
 listening 443 || die ":443 is not bound — refusing to migrate a half-configured box"
 
-# A previous aborted run leaves .pre-passthrough files. WHICH ones tells you exactly where it
-# died and what "restore by hand" means, so say it rather than making the operator infer it
-# (Tesla: the stock files are simultaneously the lock and the only key, and a terse message
-# turns the key the wrong way). The crash-between-Phase-1-and-Phase-2 case is the dangerous
-# one: LiveKit is on its own TLS while HAProxy still forwards plaintext, so turns:443 is dead
-# and neither half looks wrong on its own.
-if [ -e "$LK_YAML$STOCK_SUFFIX" ] && [ ! -e "$HA_CFG$STOCK_SUFFIX" ]; then
-  die "$LK_YAML$STOCK_SUFFIX exists but $HA_CFG$STOCK_SUFFIX does not — a previous run died
+# ---- WHAT SHAPE IS THIS BOX IN? Ask before judging the staging files (Tesla, round 3) ----
+# Ordering matters and got it wrong once. The stock-file guards used to run FIRST, so the window
+# between "Phase 2's reload succeeded" and "Phase 3 consumed the stocks" — a fully working
+# passthrough box that still has both .pre-passthrough files — hit the both-stocks `die` and got
+# told to restore BOTH. That recipe reloads the OLD terminating haproxy.cfg against a LiveKit
+# that now speaks TLS: precisely the out-of-phase pair restore_both exists to prevent. The
+# staging files are evidence, not a verdict; read the RUNNING shape first and let it arbitrate.
+#
+# Shape predicates are scoped to the top-level `turn:` mapping, exactly like Phase 1's mutation
+# (Carnot): a bare whole-file grep can certify the wrong shape from an unrelated section, and a
+# stray external_tls anywhere could block a valid resume. The check reads the region the edit writes.
+turn_key() {  # turn_key <key-regex> — true if the key exists inside the top-level turn: mapping
+  awk -v pat="$1" '
+    /^[^[:space:]]/ { in_turn = ($0 ~ /^turn:/) }
+    in_turn && $0 ~ pat { found=1 }
+    END { exit(found ? 0 : 1) }' "$LK_YAML"
+}
+is_passthrough_shape() {
+  ! turn_key '^[[:space:]]+external_tls:[[:space:]]*true' \
+    && turn_key '^[[:space:]]+cert_file:' \
+    && ! grep -qi 'ssl crt' "$HA_CFG" \
+    && grep -qF "req_ssl_sni -i ${TURN_DOMAIN}" "$HA_CFG" \
+    && serves_tls_for_domain
+}
+
+ALREADY_PASSTHROUGH=0
+if is_passthrough_shape; then
+  ALREADY_PASSTHROUGH=1
+  # Stale staging files from a run that got as far as a successful Phase 2 are now INVALID —
+  # the old haproxy.cfg they hold cannot be paired with a TLS-speaking LiveKit. Discard them
+  # rather than leaving a trap that tells the next operator to reassemble a broken pair.
+  if [ -e "$LK_YAML$STOCK_SUFFIX" ] || [ -e "$HA_CFG$STOCK_SUFFIX" ]; then
+    log "  discarding stale .pre-passthrough files: the box is already passthrough, so restoring them would recreate the out-of-phase pair"
+    rm -f "$LK_YAML$STOCK_SUFFIX" "$HA_CFG$STOCK_SUFFIX"
+  fi
+  log "  box is ALREADY in the passthrough shape and serving TLS — resuming at the Phase 4 gate"
+else
+  # Not passthrough. NOW the staging files tell you where a previous run died, and WHICH ones
+  # exist determines what "restore by hand" actually means.
+  if [ -e "$LK_YAML$STOCK_SUFFIX" ] && [ ! -e "$HA_CFG$STOCK_SUFFIX" ]; then
+    die "$LK_YAML$STOCK_SUFFIX exists but $HA_CFG$STOCK_SUFFIX does not — a previous run died
 between Phase 1 and Phase 2. LiveKit is terminating its own TLS; HAProxy is still on the old
 external_tls config forwarding PLAINTEXT to :$TURN_TLS_PORT. turns:443 is DOWN right now.
 
@@ -86,44 +109,19 @@ To unwind (HAProxy was never modified, so only LiveKit must move):
     mv -f '$LK_YAML$STOCK_SUFFIX' '$LK_YAML'
     (cd '$LIVEKIT_DIR' && docker compose restart livekit)
 then verify turns:443 answers and re-run this script."
-fi
-for f in "$LK_YAML$STOCK_SUFFIX" "$HA_CFG$STOCK_SUFFIX"; do
-  [ -e "$f" ] && die "$f exists — a previous run aborted mid-Phase-2. Both artifacts were
-staged, so restore BOTH together (they are one coupled artifact — a plaintext-forwarding proxy
-against a TLS-expecting backend is dead TURN with both halves looking restored):
+  fi
+  for f in "$LK_YAML$STOCK_SUFFIX" "$HA_CFG$STOCK_SUFFIX"; do
+    [ -e "$f" ] && die "$f exists — a previous run aborted mid-Phase-2, and this box is NOT in the
+passthrough shape. Both artifacts were staged, so restore BOTH together (they are one coupled
+artifact — a plaintext-forwarding proxy against a TLS-expecting backend is dead TURN with both
+halves looking restored):
     mv -f '$HA_CFG$STOCK_SUFFIX' '$HA_CFG' && systemctl reload haproxy
     mv -f '$LK_YAML$STOCK_SUFFIX' '$LK_YAML' && (cd '$LIVEKIT_DIR' && docker compose restart livekit)
 then verify turns:443 answers and re-run this script."
-done
-
-# RESUME PATH (Carnot HIGH + Maxwell M1). Phase 4 can legitimately fail on a box whose data
-# plane is already fully migrated and correct — it only asserts that renewal has an owner. Its
-# message told the operator to wire the timer and re-run, calling the script "idempotent from
-# here", and that was simply false: the staging files were still on disk (Phase 0 refuses while
-# they exist) and external_tls was already gone (this check refuses too). The one failure path
-# designed to be re-runnable was the only one that bricked the re-run.
-#
-# So: recognise the already-migrated shape, VERIFY it rather than assume it, and jump to the
-# gate — the mutating phases below are simply skipped by the guard.
-# Shape predicates are scoped to the top-level `turn:` mapping, exactly like Phase 1's mutation
-# (Carnot): a bare `grep '^\s*cert_file:'` over the whole YAML can certify the wrong shape from
-# an unrelated section, and a stray `external_tls` anywhere could block a valid resume. The
-# check must read the same region the edit writes.
-turn_key() {  # turn_key <key-regex> — true if the key exists inside the top-level turn: mapping
-  awk -v pat="$1" '
-    /^[^[:space:]]/ { in_turn = ($0 ~ /^turn:/) }
-    in_turn && $0 ~ pat { found=1 }
-    END { exit(found ? 0 : 1) }' "$LK_YAML"
-}
-ALREADY_PASSTHROUGH=0
-if ! turn_key '^[[:space:]]+external_tls:[[:space:]]*true'; then
-  if turn_key '^[[:space:]]+cert_file:' && serves_tls_for_domain \
-     && ! grep -qi 'ssl crt' "$HA_CFG" && grep -qF "req_ssl_sni -i ${TURN_DOMAIN}" "$HA_CFG"; then
-    ALREADY_PASSTHROUGH=1
-    log "  box is ALREADY in the passthrough shape and serving TLS — resuming at the Phase 4 gate"
-  else
-    die "livekit.yaml has no external_tls:true, but the box is not in a verified passthrough shape either — refusing to guess. Inspect $LK_YAML and $HA_CFG by hand."
-  fi
+  done
+  # Neither shape, no staging files: refuse to guess.
+  turn_key '^[[:space:]]+external_tls:[[:space:]]*true' \
+    || die "livekit.yaml has no external_tls:true, but the box is not in a verified passthrough shape either — refusing to guess. Inspect $LK_YAML and $HA_CFG by hand."
 fi
 
 # The cert LiveKit is about to serve must already be present, valid, and for the right name.
@@ -179,7 +177,7 @@ grep -qE '^\s*external_tls:' "$LK_YAML.new" \
 mv -f "$LK_YAML.new" "$LK_YAML"
 log "  edited (diff vs original: $(diff <(cat "$LK_YAML$STOCK_SUFFIX") "$LK_YAML" | grep -c '^[<>]') lines)"
 
-(cd "$LIVEKIT_DIR" && dc restart livekit >/dev/null) || { restore_livekit; die "livekit restart failed"; }
+(cd "$LIVEKIT_DIR" && dc restart livekit >/dev/null) || { restore_livekit; die_restored "livekit restart failed"; }
 
 # Same scope note as cutover.sh: TLS identity, not TURN protocol viability. The acceptance
 # gates named at the end (B3 + the real-client relay proof) are what prove the protocol.
@@ -189,7 +187,7 @@ for _ in $(seq 1 60); do
   if listening "$TURN_TLS_PORT" && serves_tls_for_domain; then ok=1; break; fi
   sleep 1
 done
-[ "$ok" = 1 ] || { restore_livekit; die "LiveKit did not present a valid $TURN_DOMAIN cert on :$TURN_TLS_PORT"; }
+[ "$ok" = 1 ] || { restore_livekit; die_restored "LiveKit did not present a valid $TURN_DOMAIN cert on :$TURN_TLS_PORT"; }
 log "PHASE 1 OK — LiveKit is terminating its own TLS"
 
 # ============================ PHASE 2 — HAProxy backend swap ================================
@@ -202,11 +200,11 @@ sed "s/@@TURN_DOMAIN@@/${TURN_DOMAIN}/g" "$HERE/haproxy.cfg.tmpl" > "$HA_CFG.new
 # haproxy.cfg is still in place here, which is why this is restore_livekit and not restore_both.)
 if grep -q '@@' "$HA_CFG.new"; then
   rm -f "$HA_CFG.new"; rm -f "$HA_CFG$STOCK_SUFFIX"; restore_livekit
-  die "unrendered placeholder left in the rendered haproxy.cfg (LiveKit restored)"
+  die_restored "unrendered placeholder left in the rendered haproxy.cfg (LiveKit restored)"
 fi
 if grep -qi 'ssl crt' "$HA_CFG.new"; then
   rm -f "$HA_CFG.new"; rm -f "$HA_CFG$STOCK_SUFFIX"; restore_livekit
-  die "rendered config still terminates TLS — wrong template (LiveKit restored)"
+  die_restored "rendered config still terminates TLS — wrong template (LiveKit restored)"
 fi
 mv -f "$HA_CFG.new" "$HA_CFG"
 
@@ -255,10 +253,10 @@ restore_both() {
   exit 4
 }
 
-haproxy -c -f "$HA_CFG" >/dev/null 2>&1 || { restore_both; die "haproxy -c rejected the rendered config"; }
-systemctl reload haproxy || { restore_both; die "haproxy reload failed"; }
+haproxy -c -f "$HA_CFG" >/dev/null 2>&1 || { restore_both; die_restored "haproxy -c rejected the rendered config"; }
+systemctl reload haproxy || { restore_both; die_restored "haproxy reload failed"; }
 
-listening 443 || { restore_both; die ":443 is not bound after the reload"; }
+listening 443 || { restore_both; die_restored ":443 is not bound after the reload"; }
 
 log "  verifying a real TLS handshake for $TURN_DOMAIN THROUGH :443"
 ok=0
@@ -267,8 +265,17 @@ for _ in $(seq 1 15); do
        | openssl x509 -noout -checkhost "$TURN_DOMAIN" >/dev/null 2>&1; then ok=1; break; fi
   sleep 1
 done
-[ "$ok" = 1 ] || { restore_both; die "no valid $TURN_DOMAIN handshake through :443 after the swap"; }
-log "PHASE 2 OK — :443 passes turn SNI straight to LiveKit"
+[ "$ok" = 1 ] || { restore_both; die_restored "no valid $TURN_DOMAIN handshake through :443 after the swap"; }
+# THE CHECK THIS SCRIPT WAS MISSING (Tesla, round 3). A handshake whose leaf -checkhosts for
+# TURN_DOMAIN does NOT prove the stream reached LiveKit: Caddyfile.mux keeps a turn. block served
+# from the same store LiveKit mounts, so a dropped/mis-rendered `use_backend be_turn` yields a
+# byte-identical cert and this phase would log "passes turn SNI straight to LiveKit" over a mux
+# that is Caddy wearing LiveKit's face. cutover.sh, checks.sh and faults.sh all grew this
+# discriminator in round 2; THIS script — the one that runs on the live, already-muxed box with
+# no dark window and no second chance — did not. Same door now.
+turn_path_is_passthrough "$TURN_DOMAIN" \
+  || { restore_both; die_restored "after the swap, an HTTPS GET for $TURN_DOMAIN through :443 SUCCEEDED — the turn SNI is being answered by CADDY, not passed through to LiveKit. The cert cannot show you this (same store)."; }
+log "PHASE 2 OK — :443 passes turn SNI straight to LiveKit (path discriminated, not inferred from the cert)"
 
 # ============================ PHASE 3 — decommission cert-sync ==============================
 log "PHASE 3 — removing haproxy-cert-sync (it has nothing left to sync)"

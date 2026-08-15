@@ -23,12 +23,10 @@ port_owner() {    # port_owner <port> -> process name holding it, or "" if unbou
   ss -tlnpH "sport = :$1" 2>/dev/null | grep -oE 'users:\(\("[^"]+' | head -1 | sed 's/.*"//'
 }
 
-tls_serves_cert() { # tls_serves_cert <host> <port> <domain>
-  # -checkhost, not `grep BEGIN CERTIFICATE` (Tesla): the banner claims "a valid $TURN_DOMAIN
-  # cert" while the test only proved SOME cert appeared. Verify the name the caller asked about.
-  echo | timeout 8 openssl s_client -connect "$1:$2" -servername "$3" 2>/dev/null \
-    | openssl x509 -noout -checkhost "$3" >/dev/null 2>&1
-}
+# Same door as the deploy scripts (lib/turn-assert.sh), so a correction to what "valid" or
+# "passthrough" means cannot land in the scripts and miss the harness that checks them.
+. /opt/turn-443/lib/turn-assert.sh 2>/dev/null || . "$(dirname "${BASH_SOURCE[0]}")/../lib/turn-assert.sh"
+tls_serves_cert() { turn_tls_ok "$1" "$2" "$3"; }
 
 cert_fingerprint() { # cert_fingerprint <host> <port> <sni>
   timeout 8 openssl s_client -connect "${1}:${2}" -servername "${3}" </dev/null 2>/dev/null \
@@ -128,10 +126,10 @@ assert_safety() {
   # (Tesla). Discriminate the PATH: Caddy answers `respond "turn" 200` to an HTTPS GET; LiveKit's
   # TURN socket cannot speak HTTP. A successful GET means Caddy has the turn SNI — the misroute.
   if [ "$(port_owner 443)" = "haproxy" ]; then
-    if curl -sS -o /dev/null --max-time 8 --resolve "${TURN_DOMAIN}:443:127.0.0.1" "https://${TURN_DOMAIN}/" 2>/dev/null; then
-      chk "PASSTHROUGH-PATH turn SNI is answered by CADDY, not LiveKit (misrouted)" 1
-    else
+    if turn_path_is_passthrough "$TURN_DOMAIN"; then
       chk "PASSTHROUGH-PATH turn SNI is NOT answered by Caddy (real passthrough)" 0
+    else
+      chk "PASSTHROUGH-PATH turn SNI is answered by CADDY, not LiveKit (misrouted)" 1
     fi
   fi
 

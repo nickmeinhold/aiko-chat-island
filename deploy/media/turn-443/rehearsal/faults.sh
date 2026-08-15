@@ -73,7 +73,9 @@ caddy_owns_443_before="$(ss -tlnpH 'sport = :443' 2>/dev/null | grep -c caddy)"
 OFF443_PROVEN=1 TURN_DOMAIN="$TURN_DOMAIN" bash "$R/cutover.sh" >/tmp/fault2.log 2>&1
 rc=$?
 chk "cutover ABORTED (non-zero) with a dead turn backend" "$([ $rc -ne 0 ] && echo 0 || echo 1)"
-grep -q "not serving a valid" /tmp/fault2.log
+# Match on the STABLE part of the message. The previous assertion grepped "not serving a valid",
+# which the round-3 rewording broke — a test asserting a sentence rather than a fact.
+grep -qi "backend check FAILED\|not serving a valid" /tmp/fault2.log
 chk "  ...and said WHY (backend cert assertion), not a generic failure" $?
 caddy_owns_443_after="$(ss -tlnpH 'sport = :443' 2>/dev/null | grep -c caddy)"
 chk "NOTHING was mutated — Caddy still owns :443" "$([ "$caddy_owns_443_before" = "$caddy_owns_443_after" ] && [ "$caddy_owns_443_after" != "0" ] && echo 0 || echo 1)"
@@ -96,11 +98,9 @@ chk "  ...and it is byte-identical to LiveKit's own cert on :5349" "$([ -n "$lk_
 # block served from THE SAME store LiveKit mounts, so a misroute into be_caddy produces an
 # IDENTICAL cert. The claim "true passthrough" was unearned. Discriminate the PATH instead —
 # Caddy answers an HTTPS GET, LiveKit's TURN socket cannot.
-if curl -sS -o /dev/null --max-time 8 --resolve "${TURN_DOMAIN}:443:127.0.0.1" "https://${TURN_DOMAIN}/" 2>/dev/null; then
-  chk "  ...and the turn SNI is NOT answered by Caddy (TRUE passthrough)" 1
-else
-  chk "  ...and the turn SNI is NOT answered by Caddy (TRUE passthrough)" 0
-fi
+. /opt/turn-443/lib/turn-assert.sh
+turn_path_is_passthrough "$TURN_DOMAIN"
+chk "  ...and the turn SNI is NOT answered by Caddy (TRUE passthrough)" $?
 timeout 8 openssl s_client -connect 127.0.0.1:443 -servername "chat.enspyr.co" </dev/null 2>/dev/null | grep -q "BEGIN CERT"
 chk "chat SNI  -> passthrough to Caddy presents a cert" $?
 # DIFFERENTIAL, not pattern-matching: the correct claim is "the mux is transparent", so compare

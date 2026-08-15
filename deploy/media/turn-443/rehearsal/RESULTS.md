@@ -395,3 +395,48 @@ Full cutover green, 7/7 invariants (including the new `PASSTHROUGH-PATH`), 18/18
 assertions, migration rehearsed against enspyr's real pre-migration shape, resume path proven
 both directions. `refresh-ca` was added to `drive.sh` because Pebble's per-restart root rotation
 cost two diagnosis detours in one session.
+
+## Round 3 — the fix landed in 3 of 4 places
+
+Kelvin APPROVE (third time), Carnot and Tesla `REQUEST_CHANGES` again. Four real findings, and
+the sharpest was about round 2's own fix.
+
+**Tesla:** the path discriminator went into `cutover.sh`, `checks.sh` and `faults.sh` — and NOT
+into `migrate-to-passthrough.sh`, which is the script that runs on **enspyr**: the already-muxed
+live box, no dark window, no second chance. It was still printing `MIGRATION COMPLETE` on the
+strength of a cert check that round 2 had just proved cannot see a misroute. I fixed *instances*
+rather than the *class*.
+
+So the assertions now live in **one file** (`lib/turn-assert.sh`) sourced by both deploy scripts
+and the rig harness: `turn_domain_valid`, `turn_tls_ok`, `turn_path_is_passthrough`. "We fixed 3
+of 4" stops being a reachable state.
+
+**RED-proved on the rig** by removing `use_backend be_turn` from the template and running the
+real migration against the real old shape:
+
+```
+verifying a real TLS handshake for turn.enspyr.co THROUGH :443   <- SUCCEEDS (the cert lies)
+restoring the previous haproxy.cfg and reloading
+restoring livekit.yaml and restarting
+restore verified: :443 answers AND :5349 is back to plaintext
+ABORT: an HTTPS GET for turn.enspyr.co through :443 SUCCEEDED — answered by CADDY
+```
+
+One fault injection exercised three round-2/3 fixes at once: the Phase 2 path check caught it,
+`restore_both` unwound **both** coupled artifacts, and the new dual restore verification
+confirmed the pair back in phase rather than measuring only the front oscillator.
+
+Also fixed: `-checkhost` verified the name but not expiry or chain while the messages said
+"valid cert" (Carnot) — `turn_tls_ok` now checks name AND expiry, and warns on an unverifiable
+chain rather than fail-closing on a private CA; `cutover.sh` lacked the DNS-label validation
+`migrate` had (Carnot); and the staging-file guards ran *before* the shape detection, so the
+window between a successful Phase 2 and Phase 3's cleanup made a re-run print a recipe that
+reassembles the out-of-phase pair (Tesla) — the running shape now arbitrates, and stale stocks
+on an already-passthrough box are discarded rather than offered as a trap.
+
+Two more of my own, found by running rather than reading: `die()` printed *"nothing mutated past
+this point"* on paths that had mutated and restored (now `die_restored`), and a fault assertion
+grepped for a sentence I had reworded — a test asserting prose rather than a fact.
+
+**Rig after round 3:** full cutover green (96 ms), 7/7 invariants, **18/18** faults, migration
+RED/GREEN proved, resume-with-stale-stocks proved.
