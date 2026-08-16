@@ -98,6 +98,8 @@ def test_fresh_db_upgrades_to_head(tmp_path, monkeypatch) -> None:
             ).scalar()
             report_sql = conn.exec_driver_sql(
                 "SELECT sql FROM sqlite_master WHERE name='message_reports'").scalar()
+            users_sql = conn.exec_driver_sql(
+                "SELECT sql FROM sqlite_master WHERE name='users'").scalar()
     finally:
         engine.dispose()
     assert _MODEL_TABLES <= tables
@@ -124,6 +126,13 @@ def test_fresh_db_upgrades_to_head(tmp_path, monkeypatch) -> None:
     # resolution write succeed — assert it structurally in the migrated DDL.
     assert "ck_message_reports_resolution" in report_sql
     assert "'taken_down'" in report_sql and "'dismissed'" in report_sql
+    # users.kind closed set (#3096, migration 0022). compare_metadata is CHECK-blind
+    # on SQLite, so assert it structurally in the migrated DDL — this is what proves
+    # the MIGRATION enforces the set, not merely the ORM. Both members asserted so a
+    # migration that shipped only 'human' (rejecting every agent insert at write
+    # time) fails here rather than at the first enrollment.
+    assert "ck_users_kind" in users_sql
+    assert "'human'" in users_sql and "'agent'" in users_sql
 
 
 def test_adopt_pre_alembic_db_stamps_baseline(tmp_path, monkeypatch) -> None:
