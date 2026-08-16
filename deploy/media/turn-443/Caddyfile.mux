@@ -18,6 +18,13 @@
 
 {
     https_port 8443
+    # RSA for the TURNS endpoint: a TURN relay is reached by whatever WebRTC stack the client
+    # ships, some of which carry stale compiled-in root bundles, and the RSA hierarchy is the
+    # more broadly embedded one. NOT a fix for any observed failure -- the 2026-08-13 probe
+    # failure was the PROBE (the python livekit SDK bundles a root store containing NO ISRG
+    # root, so it cannot validate any Let's Encrypt cert). Kept because it costs nothing and a
+    # TURNS endpoint wants maximum client compatibility. LE no longer offers an X1 alt chain.
+    key_type rsa2048
     # HAProxy passes non-turn TLS to :8443 with a PROXY v2 header carrying the REAL client IP
     # (Carnot P1) — read it here so Caddy + the gateway see the true source, not 127.0.0.1
     # (otherwise the gateway's per-IP auth rate limiter collapses to a single bucket). Scoped to
