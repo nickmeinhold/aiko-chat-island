@@ -23,6 +23,13 @@
 # Resolved 2026-06-29 (manifest-list digest, multi-arch).
 FROM python:3.12-slim@sha256:423ed6ab25b1921a477529254bfeeabf5855151dc2c3141699a1bfc852199fbf
 
+# Both aiko packages take a REPO arg so either can be built from the nickmeinhold
+# fork without editing this file. aiko_chat already needed it (the wire-contract
+# fork below); aiko_services defaults to geekscape upstream and stays there until
+# there is a reason — the arg exists so that reason doesn't require a Dockerfile
+# change on a live image. Overriding a REPO also means the matching REF must be a
+# commit that EXISTS in that repo; the build fails loudly at checkout if not.
+ARG AIKO_SERVICES_REPO=https://github.com/geekscape/aiko_services.git
 ARG AIKO_SERVICES_REF=a66424db76c5bf8f11adfed456cf3a135baf7494
 ARG AIKO_CHAT_REPO=https://github.com/nickmeinhold/aiko_chat.git
 ARG AIKO_CHAT_REF=3e4e822b65b7e222920642c420661fb0c1e93bb6
@@ -33,7 +40,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt
-RUN git clone https://github.com/geekscape/aiko_services.git \
+RUN git clone "$AIKO_SERVICES_REPO" aiko_services \
     && cd aiko_services && git checkout "$AIKO_SERVICES_REF" && pip install --no-cache-dir -e . \
     && cd /opt \
     && git clone "$AIKO_CHAT_REPO" aiko_chat \
