@@ -274,16 +274,28 @@ async def _recipients(session: AsyncSession, *, channel_id: str, sender_id: str,
     # the invariant you INTENDED and nothing checks it against the code beside it.
     #
     # The invariant is MEMBERSHIP cardinality, not sendable-recipient cardinality.
-    peer_ids = (await session.execute(
-        select(Membership.user_id).where(
-            Membership.channel_id == channel_id,
-            Membership.user_id != sender_id,
-        )
-    )).scalars().all()
-    if len(peer_ids) != 1:
-        log.warning("wake refused channel=%s reason=not_two_party peers=%d",
-                    channel_id, len(peer_ids))
+    member_ids = set((await session.execute(
+        select(Membership.user_id).where(Membership.channel_id == channel_id)
+    )).scalars().all())
+    if sender_id not in member_ids or len(member_ids) != 2:
+        # The invariant STATED ONCE, instead of approximated (cage-match #139
+        # round 8, Carnot). The previous revision counted non-sender members and
+        # accepted exactly one — which never proved the SENDER was a member at
+        # all. A malformed one-member private DM containing only Bob, plus a
+        # caller-supplied sender_id of someone outside the channel, yielded
+        # exactly one "peer" and woke Bob for a stranger.
+        #
+        # The real invariant is that the membership set IS {sender, peer} — and
+        # writing it that way makes both halves fall out of one comparison rather
+        # than requiring two checks that have to agree. Note this is the SAME
+        # invariant the last three rounds kept circling: round 6 added a
+        # cardinality check, round 7 fixed WHAT it counted, round 8 fixed WHOM it
+        # counted. Three rounds to say one sentence correctly.
+        log.warning("wake refused channel=%s reason=not_two_party members=%d "
+                    "sender_is_member=%s",
+                    channel_id, len(member_ids), sender_id in member_ids)
         return []
+    peer_ids = list(member_ids - {sender_id})
 
     # ONLY NOW filter for who may actually be woken. Order matters and is the
     # whole finding: structure first, eligibility second.

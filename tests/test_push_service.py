@@ -488,6 +488,34 @@ async def test_a_three_member_dm_with_a_banned_peer_still_fails_closed(
 
 
 @pytest.mark.asyncio
+async def test_a_non_member_sender_cannot_wake_the_channel(
+    session, dm, configured, fake_apns
+):
+    """THE INVARIANT IS {sender, peer}, NOT "one peer" (cage-match #139 round 8).
+
+    Counting non-sender members and accepting exactly one never proved the SENDER
+    was a member. A malformed one-member private DM containing only Bob, plus a
+    caller-supplied sender_id from outside the channel, yielded exactly one
+    "peer" and woke Bob for a stranger.
+
+    Mallory is a real account with no membership row here.
+    """
+    alice, bob = dm
+    mallory = await users_service.create_user(
+        session, username="mallory", display_name="Mallory", password="pw")
+    # Leave only Bob in the channel, so a non-sender count would read exactly 1.
+    await session.execute(
+        Membership.__table__.delete().where(Membership.c.user_id == alice.id)
+        if hasattr(Membership, "c") else
+        sa.delete(Membership).where(Membership.user_id == alice.id)
+    )
+    await session.commit()
+
+    await _wake(sender_id=mallory.id)
+    assert fake_apns.sent == [], "a non-member sender woke the channel"
+
+
+@pytest.mark.asyncio
 async def test_one_exploding_device_does_not_abandon_the_others(
     session, dm, configured, monkeypatch
 ):
