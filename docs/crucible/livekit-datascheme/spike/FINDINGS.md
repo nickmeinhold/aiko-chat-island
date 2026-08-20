@@ -36,9 +36,15 @@ vanish; deliberately not `docker stop`, whose TCP RST completes the close prompt
 the easy case) and `await room.disconnect()` **never returns: 8/8 cycles at a 10s timeout,
 and still hung at 90s.** No internal timeout rescues it. The Temper was right about this.
 
-**The leak is NOT real.** Under those same hung teardowns, thread and fd growth is
-**exactly zero per cycle** in both arms. The "restart storms leak" half — the half that
-justified overturning the mechanism — is unsupported by measurement.
+**The leak is NOT real *for this teardown shape*.** Under those same hung teardowns, thread
+and fd growth is **exactly zero per cycle** in both arms.
+
+> **SCOPE CORRECTION (F10, later the same day).** That zero is real but narrower than it
+> reads. `run_teardown.py` black-holes the SFU and then HEALS it, which flushes the buffered
+> leave — so the server sees a clean departure and the client's session is genuinely torn
+> down. Under a *true* orphan (drop the reference, never disconnect, process stays alive)
+> the same process leaks **43 fds per cycle**. The original "0.00 fds" was measured in a
+> condition that does not produce the leak. See F10.
 
 So the in-process shape's actual defect is a **liveness** defect, not a resource one. That
 matters because the two have different fixes: a leak needs process isolation, a hang needs
@@ -264,6 +270,51 @@ under D3) rather than every pipeline host holding them.
 Integrated into `scheme_webrtc.create_sources` and re-verified end to end: `PIPELINE_PIXEL_OK`,
 5/5 frames, 0 orphaned sidecars, and the negative control still fails closed.
 
+## F10 — G1: the reaper closes a 43-fd/cycle leak and 70% of the RSS drift, but G1 stays OPEN
+
+F8 gave G1 its first hypothesis: *the ~0.4 MB/cycle RSS drift is the immortal Rooms, and the
+reaper closes it.* Tested with two arms, 20 cycles each, true orphan abandonment (drop the
+reference, no disconnect, process alive — the only shape F8 proves strands the seat), **each
+arm in its own process** and run in both orders, because a shared process lets the second arm
+inherit whatever the first leaked.
+
+| | NO_REAP | REAP |
+|---|---|---|
+| ghost seats after 20 cycles | **20** — one per cycle | **0** |
+| file descriptors per cycle | **+43.1** | **0.0** |
+| RSS per cycle | **1.428 MB** | **0.428 MB** |
+
+**Three results, and only one of them is the one I went looking for.**
+
+**1. Epoch alone converts a collision into a leak — confirmed, and it is the strongest argument
+for the reaper.** Epoch identities were introduced so a new bridge cannot collide with the
+corpse under last-session-wins. But that means the corpse is no longer *overwritten*: without a
+reaper the ghosts **accumulate exactly one per restart**, 20 after 20 cycles, each holding a
+seat forever. The failure mode is not "memory grows" — it is **the room fills up with dead
+robots**, and a room at max-participants is a room nobody living can join. The reaper takes
+that to zero.
+
+**2. A 43-fd-per-cycle leak nobody had seen, and it is an operational wall, not a drift.** At
+43 fds/cycle a default 1024 limit is exhausted in ~24 stream restarts and macOS's 256 in ~6.
+The reaper closes it **completely** (0.0/cycle). This one is a correction to my own earlier
+claim: F1 reported "0.00 fds/cycle" and that number was measured under the *weak* abandonment
+where the leave flushes on heal, so the condition that produces the leak never existed in that
+test. A green from a test that cannot create the failure is not evidence of its absence.
+
+**3. G1 is NOT closed — and the hypothesis is only 70% right.** The reaper removes exactly
+1.0 MB/cycle of the 1.428, so most of the drift in the orphan condition really was the immortal
+Rooms. But a **residual 0.428 MB/cycle survives the reaper** — and that is, to three decimal
+places, the *original* G1 number (0.389 / 0.400 / 0.422 / 0.428 across four independent runs).
+So the drift G1 was opened for is a **separate, still-unexplained leak** that has nothing to do
+with the ghosts. It is remarkably stable across conditions, which is itself a clue: something
+retains ~0.4 MB per connect/abandon cycle regardless of whether the session was cleanly closed,
+stranded, or reaped.
+
+**Disposition:** the reaper is now load-bearing for two independent reasons (seat exhaustion,
+fd exhaustion) rather than one. G1 remains an open merge blocker on the in-process default,
+with its scope narrowed from "an unexplained 0.4 MB/cycle" to "an unexplained 0.4 MB/cycle
+that is NOT the SFU session, because it survives eviction."
+
 ## Instrument failures caught (recorded because they were nearly reported as results)
 
 1. **`encode_ms` = 64 ms/frame** in the first JPEG run — a 50× overstatement. PIL encodes
@@ -288,8 +339,16 @@ Integrated into `scheme_webrtc.create_sources` and re-verified end to end: `PIPE
    producing one plausible answer. Fixed by reading `ps -o state=` and inheriting the env,
    which reversed the conclusion.
 
-All four shared a shape: the instrument's own defect was indistinguishable from the result
-it was built to find. Three of them produced a CONFIDENT, PLAUSIBLE, WRONG answer rather
+5. **A G1 soak whose arms never built the thing under test.** The first run used the
+   pause/abandon/unpause teardown and reported `seats=0` on every cycle in BOTH arms — the
+   leave flushes when the network heals, so there were no ghosts to reap and the reaper
+   "made no difference". The arms were not what they claimed to be. Re-run with true orphan
+   abandonment, the same comparison shows 20 ghosts vs 0 and a 43-fd/cycle leak vs none.
+
+All five shared a shape: the instrument's own defect was indistinguishable from the result
+it was built to find. And three of them were *the same defect twice removed* — a teardown
+that heals the network is not a teardown that strands a session, and I built that mistake
+into three separate harnesses before naming it. Three of them produced a CONFIDENT, PLAUSIBLE, WRONG answer rather
 than an obvious failure — which is why each needed a control rather than a re-read.
 
 ## What is NOT proven
