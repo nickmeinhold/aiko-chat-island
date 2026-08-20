@@ -25,6 +25,79 @@ preserved below as provenance and is **superseded**.
 the spike measured that leak at **0.00 threads and 0.00 fds per cycle** and found the real
 defect to be an unbounded *hang* — so the fix is a **clock, not a process**.
 
+**Read D0 first.** It answers the question this design never asked — *why WebRTC at all* — and
+everything below is conditional on its scoping. Added 2026-08-20 at Nick's direction.
+
+## D0 — WHY WebRTC AT ALL: it buys reach, not media. Scope it accordingly.
+
+*Added 2026-08-20 at Nick's direction, after he asked the question this design had never
+answered: "why do we even need LiveKit then?" It is D0 because everything below is
+conditional on it, and because until now the justification existed nowhere.*
+
+**WebRTC buys exactly two things, and both are about REACH:**
+
+1. **NAT traversal.** A robot behind a home router and a phone on a mobile network cannot
+   address each other. ICE/STUN/TURN is the machinery that gets a packet between them — and
+   this project has already spent weeks buying precisely that (the TURN-over-TLS-on-:443
+   work, tasks #4/#6/#8).
+2. **Browser and phone reach.** `aiko_chat_app` is Flutter. WebRTC is how media reaches it
+   without writing a bespoke client per platform.
+
+Everything else LiveKit provides — codec negotiation, simulcast, adaptive bitrate, loss
+recovery — is in service of those two. **That is the entire list.**
+
+### Where it is a detour, and this is the important half
+
+aiko already carries bulk media over `zmq://` and `rtsp://`, and between hosts that can
+address each other those are **strictly better**: no session, no seat, no participant
+lifecycle, no negotiation.
+
+The spike makes the detour visible. LiveKit delivers VP8 → we decode to numpy → **we push it
+over `zmq://` to the pipeline.** An entire SFU sits in the middle of a path that terminates on
+zmq anyway. Where both ends are ours and routable, that is pure ceremony.
+
+**And the ceremony is not free — it is most of this design.** Every hard problem in D1–D7 and
+in `spike/FINDINGS.md` is LiveKit *session-lifecycle* complexity: immortal participants (F8),
+the seat reaper (F9), epoch identities, last-session-wins collisions, kill escalation (F2),
+the connect/disconnect leak (F11). **None of it exists over zmq, because zmq has no session to
+strand.** A transport with sessions imports session problems; that cost belongs on the ledger
+next to the reach it buys.
+
+### The decision rule
+
+> **`webrtc://` is for reaching something aiko cannot address.** A human on a phone or in a
+> browser, or a device behind a NAT we cannot traverse. Where both ends are aiko-side and
+> mutually routable — pipeline to pipeline, robot to island, island to island — **use
+> `zmq://` or `rtsp://`. `webrtc://` is the wrong tool there.**
+
+So this scheme's honest one-line justification is **not** "this is how aiko does video". It is
+**"this is how aiko media reaches something it cannot address"** — a narrower claim, and the
+one that is actually true.
+
+### Provenance of the assumption, stated plainly
+
+LiveKit entered through the **app**, where browser reach is non-negotiable, and was then
+carried into the mesh design because it was already there. That is inheritance, not a decision.
+The mesh case has different requirements and mostly does not need it. Recording this so the
+next design does not re-inherit it unexamined.
+
+**Consistent with Andy's own framing**, which is the reason to believe it rather than a
+coincidence: he lists the DataScheme transports as `https://, mqtt://, zmq://, webrtc://` —
+**one option among several, chosen when it fits**, not the default road for all aiko media. He
+does want the WebRTC path to exist (*"hook up audio-video-images-text and CODE over WebRTC
+through Chat"*); he has never suggested it should be the only one.
+
+### Consequences for the rest of this design
+
+- **D5's host choice gets easier.** If `webrtc://` exists for unroutable peers, the
+  pipeline/robot host is obviously right and island-local media is obviously out.
+- **#3196 (cross-island calling is broken by per-island SFUs) is partly self-inflicted.**
+  Island-to-island is routable and does not need an SFU between the islands at all; a
+  federation path over aiko's own transports sidesteps the per-island-SFU problem instead of
+  solving it. That deserves its own investigation before anyone builds a media relay.
+- **The build order should not treat `webrtc://` as urgent for machine-to-machine work.**
+  Anything robot-to-pipeline that can route today should just use `zmq://`.
+
 ## D1 — In-process Room is the SPINE. Bounded teardown is the liveness invariant.
 
 `webrtc://` create_sources owns a **daemon thread running a dedicated asyncio loop + the
