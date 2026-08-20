@@ -269,6 +269,49 @@ async def test_rejected_does_not_reap_the_row(session, dm, configured, fake_apns
     assert len(remaining) == 1
 
 
+@pytest.mark.asyncio
+async def test_a_row_re_registered_during_the_send_is_not_reaped(
+    session, dm, configured, monkeypatch
+):
+    """THE RACE, ACTUALLY CREATED — a reaper test that cannot produce the failure
+    cannot clear it (cage-match #139 round 3, Carnot).
+
+    `apns.send` is an awaited network call. Between issuing it and acting on the
+    410, the device can re-register: `register_device` upserts keyed on the
+    globally-unique token, so the same row can be refreshed or reassigned when a
+    handset changes hands. Deleting by id alone would act on a verdict about the
+    row as it WAS and destroy a registration made while we were waiting.
+
+    The fake mutates the row MID-SEND, which is the window itself — not a
+    simulation of it.
+    """
+    alice, bob = dm
+    row = (await session.execute(
+        DeviceToken.__table__.select().where(DeviceToken.user_id == bob.id)
+    )).first()
+    assert row is not None, "fixture precondition: bob has a registered device"
+
+    async def _send_then_reregister(device_token, payload, *, collapse_id=None):
+        # The device comes back to life while APNs is still answering.
+        await session.execute(
+            DeviceToken.__table__.update()
+            .where(DeviceToken.token == device_token)
+            .values(updated_at=dt.datetime.now(dt.UTC))
+        )
+        await session.commit()
+        return apns.Verdict.DEAD_TOKEN
+
+    monkeypatch.setattr(apns, "send", _send_then_reregister)
+    await _wake(sender_id=alice.id)
+
+    survivors = (await session.execute(
+        DeviceToken.__table__.select().where(DeviceToken.user_id == bob.id)
+    )).all()
+    assert len(survivors) == 1, (
+        "a device that re-registered during the send was reaped on a stale verdict"
+    )
+
+
 def test_verdict_mapping_is_narrow():
     """The mapping itself, at the unit level — the reaping rule stated once."""
     assert apns._verdict(200, "") is apns.Verdict.DELIVERED

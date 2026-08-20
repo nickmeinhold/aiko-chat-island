@@ -266,18 +266,56 @@ async def _wake_user(session: AsyncSession, user_id: str, payload: dict,
         log.warning("wake throttled user=%s", user_id)
         return
 
-    dead: list[str] = []
+    # (row_id, token, updated_at) AS OBSERVED AT SEND TIME — not just the id.
+    # See the conditional DELETE below for why all three are carried.
+    dead: list[tuple[str, str, object]] = []
     for row in tokens:
+        observed = (row.id, row.token, row.updated_at)
         verdict = await apns.send(row.token, payload, collapse_id=collapse_id)
         if verdict is apns.Verdict.DEAD_TOKEN:
-            dead.append(row.id)
+            dead.append(observed)
 
+    for row_id, token, updated_at in dead:
+        # COMPARE-AND-DELETE, because there is a real TOCTOU window here and this
+        # is the only irreversible operation in the module (cage-match #139 round
+        # 3, Carnot).
+        #
+        # `apns.send` is an AWAITED network call. Between issuing it and acting on
+        # its verdict, the device can re-register: `register_device` upserts keyed
+        # on the globally-unique token, so the SAME row id can be refreshed, or
+        # reassigned to a different account when a handset changes hands
+        # (logout A → login B). Deleting by id alone acts on a verdict about the
+        # row as it WAS, destroying a registration made while we were waiting —
+        # and a destroyed device row cannot be re-derived from anything the island
+        # holds. The user must reopen the app to be reachable again, which is
+        # exactly what push exists to avoid needing.
+        #
+        # So the delete is CONDITIONAL on the row still being the one we sent to:
+        # same token, and untouched since (`updated_at` is refreshed by
+        # register_device's upsert via `onupdate`). If anything re-registered in
+        # the window, the WHERE matches nothing and the row survives — a stale
+        # token lingering costs one wasted request per send, which is the correct
+        # side to err on for a reaper.
+        #
+        # This is the codebase's established SQLite-safe pattern: an atomic
+        # conditional DELETE rather than a read-then-write (`FOR UPDATE` is inert
+        # on SQLite — see the concurrency notes in memberships_service).
+        result = await session.execute(
+            delete(DeviceToken).where(
+                DeviceToken.id == row_id,
+                DeviceToken.token == token,
+                DeviceToken.updated_at == updated_at,
+            )
+        )
+        if result.rowcount:
+            log.info("reaped dead device row user=%s", user_id)
+        else:
+            # Not an error — the row changed under us, which is precisely the
+            # case this guard exists to protect. Logged so a reaper that never
+            # reaps is diagnosable rather than mysterious.
+            log.info("reap skipped user=%s reason=row_changed_since_send", user_id)
     if dead:
-        # Reap only what Apple positively declared dead — see `apns._verdict` for
-        # why this set is narrower than it first appears.
-        await session.execute(delete(DeviceToken).where(DeviceToken.id.in_(dead)))
         await session.commit()
-        log.info("reaped dead device rows user=%s count=%d", user_id, len(dead))
 
 
 async def wake_for_message(*, channel_id: str, channel_kind: ChannelKindStr, sender_id: str,
