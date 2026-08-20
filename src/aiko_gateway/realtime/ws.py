@@ -208,6 +208,18 @@ async def _handle_send(gw, conn: Connection, user, frame: dict) -> None:
         # filter). Computed inside the session; applied in-memory by the hub so
         # fanout stays one query, not one-per-connection.
         exclude = await moderation_service.blocked_pair_user_ids(session, user.id)
+        # SNAPSHOT the values the wake needs, INSIDE the session (cage-match #139
+        # round 5, Carnot). The scheduling call below happens after this block
+        # exits, and reading `channel.id` / `channel.kind` there is an attribute
+        # access on a DETACHED instance — it works today only because the
+        # sessionmaker sets expire_on_commit=False. That is a property of a
+        # config line in db.py, not of this code, and the failure it would cause
+        # is a lazy load with no session: either a swallowed background error or
+        # an exception on the send path, depending where it trips. Free to fix,
+        # so fix it rather than depend on a setting three files away. (The
+        # comment below already claimed plain values crossed the boundary; now
+        # they actually do.)
+        wake_channel_id, wake_channel_kind = channel.id, channel.kind
 
     # Ack the sender (optimistic-send reconciliation: client_msg_id -> server id).
     await conn.send(envelopes.ack(frame["client_msg_id"], row.id, view["created_at"]))
@@ -239,6 +251,6 @@ async def _handle_send(gw, conn: Connection, user, frame: dict) -> None:
         # Plain values, not `channel`/`row`: this outlives the `async with` session
         # above, and a detached ORM instance raises on attribute access.
         push_service.schedule_wake(
-            channel_id=channel.id, channel_kind=channel.kind,
+            channel_id=wake_channel_id, channel_kind=wake_channel_kind,
             sender_id=user.id, body=frame["body"], exclude_user_ids=exclude,
         )
