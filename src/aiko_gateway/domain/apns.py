@@ -28,6 +28,7 @@ explicitly and raises a message that names the cause.
 """
 from __future__ import annotations
 
+import dataclasses
 import enum
 import logging
 import time
@@ -67,6 +68,27 @@ class ApnsNotConfigured(RuntimeError):
     """This island has no APNs credentials — push is not enabled on this
     deployment. An expected operator state, never a bug: like LiveKit, an
     unconfigured optional capability is simply off."""
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class SendResult:
+    """What Apple said, plus the ONE piece of metadata the caller cannot re-derive.
+
+    `verdict` alone was the original return type. Carnot killed that in cage-match
+    #139 round 4: a 410 body carries a `timestamp` — the moment APNs confirmed the
+    token was no longer valid — and Apple's documented rule is to resume pushing
+    if the app has registered that token AGAIN since. Reducing the response to an
+    enum threw that away, leaving the reaper unable to distinguish "this token is
+    dead" from "this token WAS dead before the user reinstalled".
+
+    For the one irreversible operation in the module, lost metadata is lost
+    reversibility. `invalid_since_ms` is None for every verdict but DEAD_TOKEN,
+    and may be None even then if Apple omits it — the caller must treat None as
+    "no timestamp evidence", never as "invalid since the epoch".
+    """
+
+    verdict: "Verdict"
+    invalid_since_ms: int | None = None
 
 
 class Verdict(enum.Enum):
@@ -236,12 +258,12 @@ def _verdict(status: int, reason: str) -> Verdict:
     return Verdict.REJECTED
 
 
-async def send(device_token: str, payload: dict, *, collapse_id: str | None = None) -> Verdict:
-    """Push one payload to one device. Returns a [Verdict]; never raises for a
+async def send(device_token: str, payload: dict, *, collapse_id: str | None = None) -> SendResult:
+    """Push one payload to one device. Returns a [SendResult]; never raises for a
     protocol-level refusal — a failed push must not be able to fail the message
     send that triggered it (see `push_service.wake`).
 
-    Raises [ApnsNotConfigured] only if called on an island with no credentials,
+    Returns a [SendResult]. Raises [ApnsNotConfigured] only if called on an island with no credentials,
     which is a caller bug: `push_service` gates on `is_configured()` first.
     """
     if not is_configured():
@@ -275,13 +297,22 @@ async def send(device_token: str, payload: dict, *, collapse_id: str | None = No
     except httpx.HTTPError as ex:
         # The device is not implicated by OUR network failing.
         log.warning("apns send failed transport=%s", type(ex).__name__)
-        return Verdict.TRANSIENT
+        return SendResult(Verdict.TRANSIENT)
 
     if response.status_code == 200:
-        return Verdict.DELIVERED
+        return SendResult(Verdict.DELIVERED)
 
+    invalid_since_ms: int | None = None
     try:
-        reason = response.json().get("reason", "")
+        body = response.json()
+        reason = body.get("reason", "")
+        # Apple sends `timestamp` in MILLISECONDS since the epoch on a 410.
+        # Accepted only when it is genuinely an int: a malformed value must read
+        # as "no evidence" (None) rather than coercing to a number that would
+        # then authorise a delete. Fail toward keeping the row.
+        ts = body.get("timestamp")
+        if isinstance(ts, int) and not isinstance(ts, bool):
+            invalid_since_ms = ts
     except ValueError:
         reason = ""
     verdict = _verdict(response.status_code, reason)
@@ -290,4 +321,4 @@ async def send(device_token: str, payload: dict, *, collapse_id: str | None = No
     # model note) and never the provider key.
     log.warning("apns refused status=%s reason=%s verdict=%s",
                 response.status_code, reason, verdict.value)
-    return verdict
+    return SendResult(verdict, invalid_since_ms)

@@ -45,11 +45,18 @@ class FakeApns:
 
     def __init__(self, verdict: apns.Verdict = apns.Verdict.DELIVERED):
         self.verdict = verdict
+        # Apple's 410 timestamp, in ms. None = "Apple sent no timestamp", which
+        # the reaper must treat as NO EVIDENCE rather than as the epoch.
+        self.invalid_since_ms: int | None = None
         self.sent: list[tuple[str, dict, str | None]] = []
 
     async def __call__(self, device_token, payload, *, collapse_id=None):
         self.sent.append((device_token, payload, collapse_id))
-        return self.verdict
+        # Returns the SAME shape the real transport returns. A fake whose
+        # contract has drifted from the real API tests a system that does not
+        # exist — this one drifted once already, when send() grew SendResult, and
+        # the suite caught it immediately because every test goes through here.
+        return apns.SendResult(self.verdict, self.invalid_since_ms)
 
 
 @pytest.fixture
@@ -299,7 +306,7 @@ async def test_a_row_re_registered_during_the_send_is_not_reaped(
             .values(updated_at=dt.datetime.now(dt.UTC))
         )
         await session.commit()
-        return apns.Verdict.DEAD_TOKEN
+        return apns.SendResult(apns.Verdict.DEAD_TOKEN)
 
     monkeypatch.setattr(apns, "send", _send_then_reregister)
     await _wake(sender_id=alice.id)
@@ -310,6 +317,84 @@ async def test_a_row_re_registered_during_the_send_is_not_reaped(
     assert len(survivors) == 1, (
         "a device that re-registered during the send was reaped on a stale verdict"
     )
+
+
+@pytest.mark.asyncio
+async def test_a_stale_410_does_not_reap_a_newer_registration(
+    session, dm, configured, fake_apns
+):
+    """APPLE'S OWN RULE (cage-match #139 round 4, Carnot). A 410 body carries the
+    moment APNs confirmed the token invalid, and Apple says to resume pushing if
+    the app has registered that token AGAIN since.
+
+    Distinct from the mid-send race: here the row was ALREADY refreshed BEFORE we
+    sent, and the 410 we get back is simply stale — a user who deleted the app and
+    reinstalled it. The equality guards cannot see this; only the timestamp can.
+    """
+    alice, bob = dm
+    # The device re-registered one hour AFTER Apple says the token died.
+    await session.execute(
+        DeviceToken.__table__.update()
+        .where(DeviceToken.user_id == bob.id)
+        .values(updated_at=dt.datetime(2026, 8, 21, 12, 0, tzinfo=dt.UTC))
+    )
+    await session.commit()
+    fake_apns.verdict = apns.Verdict.DEAD_TOKEN
+    fake_apns.invalid_since_ms = int(
+        dt.datetime(2026, 8, 21, 11, 0, tzinfo=dt.UTC).timestamp() * 1000)
+
+    await _wake(sender_id=alice.id)
+
+    survivors = (await session.execute(
+        DeviceToken.__table__.select().where(DeviceToken.user_id == bob.id)
+    )).all()
+    assert len(survivors) == 1, "a re-registered device was reaped on a stale 410"
+
+
+@pytest.mark.asyncio
+async def test_a_current_410_still_reaps(session, dm, configured, fake_apns):
+    """THE CONTROL FOR THE TEST ABOVE. A guard that never reaps would satisfy the
+    stale-timestamp test perfectly — so prove a 410 NEWER than the registration
+    still deletes. Withholding must be conditional, not total."""
+    alice, bob = dm
+    await session.execute(
+        DeviceToken.__table__.update()
+        .where(DeviceToken.user_id == bob.id)
+        .values(updated_at=dt.datetime(2026, 8, 21, 11, 0, tzinfo=dt.UTC))
+    )
+    await session.commit()
+    fake_apns.verdict = apns.Verdict.DEAD_TOKEN
+    fake_apns.invalid_since_ms = int(
+        dt.datetime(2026, 8, 21, 12, 0, tzinfo=dt.UTC).timestamp() * 1000)
+
+    await _wake(sender_id=alice.id)
+
+    survivors = (await session.execute(
+        DeviceToken.__table__.select().where(DeviceToken.user_id == bob.id)
+    )).all()
+    assert survivors == [], "a genuinely dead token was not reaped"
+
+
+@pytest.mark.asyncio
+async def test_the_service_reads_blocks_itself_not_only_from_the_caller(
+    session, dm, configured, fake_apns
+):
+    """A door whose lock is supplied by whoever knocks is not a door (cage-match
+    #139 round 4, Carnot). The block set used to arrive only as the caller's
+    `exclude_user_ids`, so a second caller that forgot the argument would silently
+    lose the block gate on a capability louder than a message.
+
+    Here the caller passes NOTHING and a real block exists — the service must
+    still refuse.
+    """
+    from aiko_gateway.domain.models import UserBlock
+
+    alice, bob = dm
+    session.add(UserBlock(blocker_user_id=bob.id, blocked_user_id=alice.id))
+    await session.commit()
+
+    await _wake(sender_id=alice.id, exclude=set())   # caller supplies no exclusion
+    assert fake_apns.sent == [], "the service trusted the caller's empty block set"
 
 
 def test_verdict_mapping_is_narrow():

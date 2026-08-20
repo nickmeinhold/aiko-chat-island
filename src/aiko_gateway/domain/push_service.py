@@ -67,6 +67,7 @@ duplicate notification is a blemish; a missed call is the bug.
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import logging
 from typing import Literal
 
@@ -75,7 +76,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import settings
 from ..db import SessionLocal
-from . import apns
+from . import apns, moderation_service
 from .models import ChannelKind, DeviceToken, Membership, Platform, User
 from .rate_limit import limiter
 
@@ -188,6 +189,18 @@ async def _recipients(session: AsyncSession, *, channel_id: str, sender_id: str,
     the projection starts hiding people (the same reasoning that put raw rows in
     the video-token path, cage-match #122 rd8).
 
+    THE BLOCK SET IS READ HERE, NOT TRUSTED FROM THE CALLER (cage-match #139
+    round 4, Carnot). It used to arrive as `exclude_user_ids` — the same set the
+    WS route computes for fanout — which made the "single door" claim weaker than
+    it read: a second caller that forgot the argument, or passed a stale one,
+    would silently lose the block gate on a capability strictly louder than a
+    message. A door whose lock is supplied by whoever knocks is not a door.
+
+    So the service computes its own, and the caller's set is UNIONED in rather
+    than replaced: the route's set is still authoritative for fanout consistency,
+    and the service's own read is the floor no caller can drop below. Removing
+    the coupling beats remembering to honour it.
+
     BANNED ACCOUNTS ARE EXCLUDED (cage-match #139, Maxwell). A suspended user
     keeps their membership row — ban is an auth-ingress gate, not a membership
     teardown — so a raw-rows read would happily wake the handset of an account
@@ -206,7 +219,10 @@ async def _recipients(session: AsyncSession, *, channel_id: str, sender_id: str,
             User.banned_at.is_(None),
         )
     )).scalars().all()
-    return [uid for uid in rows if uid not in exclude_user_ids]
+    # Union: the caller's fanout set PLUS our own read. Neither is trusted alone.
+    blocked = await moderation_service.blocked_pair_user_ids(session, sender_id)
+    excluded = set(exclude_user_ids) | blocked
+    return [uid for uid in rows if uid not in excluded]
 
 
 async def _wake_user(session: AsyncSession, user_id: str, payload: dict,
@@ -268,14 +284,14 @@ async def _wake_user(session: AsyncSession, user_id: str, payload: dict,
 
     # (row_id, token, updated_at) AS OBSERVED AT SEND TIME — not just the id.
     # See the conditional DELETE below for why all three are carried.
-    dead: list[tuple[str, str, object]] = []
+    dead: list[tuple[str, str, object, int | None]] = []
     for row in tokens:
         observed = (row.id, row.token, row.updated_at)
-        verdict = await apns.send(row.token, payload, collapse_id=collapse_id)
-        if verdict is apns.Verdict.DEAD_TOKEN:
-            dead.append(observed)
+        result = await apns.send(row.token, payload, collapse_id=collapse_id)
+        if result.verdict is apns.Verdict.DEAD_TOKEN:
+            dead.append((*observed, result.invalid_since_ms))
 
-    for row_id, token, updated_at in dead:
+    for row_id, token, updated_at, invalid_since_ms in dead:
         # COMPARE-AND-DELETE, because there is a real TOCTOU window here and this
         # is the only irreversible operation in the module (cage-match #139 round
         # 3, Carnot).
@@ -300,14 +316,27 @@ async def _wake_user(session: AsyncSession, user_id: str, payload: dict,
         # This is the codebase's established SQLite-safe pattern: an atomic
         # conditional DELETE rather than a read-then-write (`FOR UPDATE` is inert
         # on SQLite — see the concurrency notes in memberships_service).
-        result = await session.execute(
-            delete(DeviceToken).where(
-                DeviceToken.id == row_id,
-                DeviceToken.token == token,
-                DeviceToken.updated_at == updated_at,
-            )
-        )
-        if result.rowcount:
+        conditions = [
+            DeviceToken.id == row_id,
+            DeviceToken.token == token,
+            DeviceToken.updated_at == updated_at,
+        ]
+        if invalid_since_ms is not None:
+            # APPLE'S OWN RULE, not just our race guard (cage-match #139 round 4,
+            # Carnot). A 410 body carries the moment APNs confirmed the token
+            # invalid, and Apple says to resume pushing if the app registered that
+            # token AGAIN since. The equality checks above only cover the network
+            # await; this covers a row that was ALREADY refreshed before the send,
+            # whose 410 is simply stale. Keep the row when our registration is
+            # newer than Apple's invalidation.
+            invalid_since = dt.datetime.fromtimestamp(
+                invalid_since_ms / 1000, tz=dt.UTC)
+            conditions.append(DeviceToken.updated_at <= invalid_since)
+        # No timestamp (Apple omitted it, or a malformed body) means NO EVIDENCE —
+        # the equality guards alone decide. Absence of a timestamp must never read
+        # as "invalid since the epoch", which would authorise every delete.
+        outcome = await session.execute(delete(DeviceToken).where(*conditions))
+        if outcome.rowcount:
             log.info("reaped dead device row user=%s", user_id)
         else:
             # Not an error — the row changed under us, which is precisely the
