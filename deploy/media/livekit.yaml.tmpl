@@ -1,0 +1,45 @@
+# LiveKit config TEMPLATE (BOOTSTRAP). Rendered to livekit.yaml by standup.sh
+# (envsubst). Real API keys live in the box .env, never in this template.
+#
+# Placeholders: ${TURN_DOMAIN} ${NODE_IP} ${LIVEKIT_API_KEY} ${LIVEKIT_API_SECRET}
+
+port: 7880
+
+rtc:
+  # SFU's own ICE UDP range — MUST stay DISJOINT from the TURN relay range below
+  # (7882-7892 vs 50000-60000). Asserted by standup.sh before it opens the firewall.
+  port_range_start: 7882
+  port_range_end: 7892
+  tcp_port: 7881
+  use_external_ip: true
+  node_ip: ${NODE_IP}
+
+# Embedded STUN/TURN (pion/turn). No separate coturn.
+turn:
+  enabled: true
+  domain: ${TURN_DOMAIN}
+  udp_port: 3478
+  tls_port: 5349
+  # Bind-mounted RO from Caddy's leaf cert dir (see docker-compose.yml). pion/turn
+  # loads these ONCE at boot — a renewal needs a restart (served-cert-alarm.sh +
+  # cert-restart.timer). The alarm probes the :5349 ENDPOINT, not this file.
+  cert_file: /certs/${TURN_DOMAIN}.crt
+  key_file: /certs/${TURN_DOMAIN}.key
+  # NARROW relay range (default is a huge 1024-30000). SINGLE SOURCE: ${TURN_RELAY_*}
+  # from .env drive the rendered config, the firewall opens, AND the exposure probe
+  # — standup asserts they match so config/firewall/gate can't diverge (round-2
+  # Carnot+Tesla: the range was a third source of truth). Keep disjoint from rtc above.
+  relay_range_start: ${TURN_RELAY_START}
+  relay_range_end: ${TURN_RELAY_END}
+
+# EXPOSURE INVARIANT (DESIGN §3.4): pinned v1.13.5 denies TURN relay to private
+# IPs by DEFAULT (behavior since v1.12.0 — RESEARCH §2). We do not rely on the
+# default silently: exposure test B asserts an ALLOCATE cannot relay to
+# RFC1918/link-local, and that unauthenticated ALLOCATE fails outright. TURN creds
+# are short-TTL, LiveKit-issued from the api key below — never static TURN secrets.
+keys:
+  ${LIVEKIT_API_KEY}: ${LIVEKIT_API_SECRET}
+
+logging:
+  level: info
+  json: true
