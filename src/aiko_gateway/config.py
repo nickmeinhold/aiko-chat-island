@@ -102,6 +102,46 @@ class Settings(BaseSettings):
     # by exactly the leeway; naming it keeps that from drifting).
     livekit_token_ttl_seconds: int = Field(default=600, ge=60, le=3600)
 
+    # --- APNs (push wake — #3267 increment 2) ---
+    # The island wakes a CLOSED handset. Apple is the only party that can reach a
+    # suspended iOS app, so APNs is a mandatory intermediary here in exactly the way
+    # an SFU is mandatory for a browser behind a NAT — it buys REACH, nothing else.
+    #
+    # We talk to APNs DIRECTLY rather than through Firebase's bridge. That is the app
+    # tab's recorded decision (`device_platform.dart`: "Google is not in the RUNTIME
+    # PATH on Apple platforms") and this half must not silently contradict it — the
+    # `Platform` enum's two values only mean something if each talks to its own
+    # service. Android/FCM is a separate transport behind the same door, NOT built yet.
+    #
+    # OPTIONAL, exactly like LiveKit above: absent credentials mean the island runs
+    # normally and simply never pushes. An operator standing up an island gets a
+    # working island without an Apple developer account; notifications are opt-in.
+    # This is why per-island credentials do not fight the one-script standup goal.
+    apns_key_id: str = ""        # the 10-char Key ID of the .p8 (the JWT `kid`)
+    apns_team_id: str = ""       # Apple Developer Team ID (the JWT `iss`)
+    # The app's bundle id — APNs `apns-topic`. NOT derived from any other setting:
+    # a device token is only valid for the topic it was issued under, so a wrong
+    # topic is a silent 400 for every send, and it must be stated, not inferred.
+    apns_topic: str = ""
+    # SECRET — the .p8 signing key, PEM contents (host .env / SOPS), not a path.
+    # Contents rather than a path deliberately: the container would otherwise need a
+    # bind-mount whose absence fails at first-send (a runtime surprise) instead of at
+    # boot, and the existing secret-delivery channel for this deployment is the .env.
+    apns_private_key: str = ""
+    # Sandbox vs production APNs host. A device token from a DEVELOPMENT build is
+    # ONLY valid against api.sandbox.push.apple.com, and a TestFlight/App Store build's
+    # token is ONLY valid against api.push.apple.com — the same token string against
+    # the wrong host is a 400 BadDeviceToken with no other clue. There is no way to
+    # tell the two apart by inspecting the token, so this is an explicit operator
+    # switch and not something the code may guess.
+    apns_use_sandbox: bool = False
+    # Per-RECIPIENT wake budget. Waking a handset is a strictly louder capability than
+    # delivering a message — a message you read when you choose, a push interrupts you
+    # wherever you are — so it gets its own cap, keyed on the person being woken rather
+    # than the sender's IP like the auth buckets. A DM peer who can legitimately send
+    # can still only ring you N times a minute. Not an authn control; a blast-radius cap.
+    apns_wake_per_recipient_per_minute: int = Field(default=6, ge=1, le=60)
+
     # Self-service registration. None → resolved by environment in the validator
     # (open in dev, closed in prod); set OPEN_REGISTRATION to override either way.
     open_registration: bool | None = None
@@ -424,6 +464,34 @@ class Settings(BaseSettings):
                         "gateway_id or they collide across islands (the empty default is the "
                         "fail-open case). Refusing to boot — set GATEWAY_ID."
                     )
+        # APNs, like LiveKit, is OPTIONAL — but HALF-configured is the dangerous
+        # state, not the absent one. Absent credentials are honest: is_configured()
+        # is False, nothing is sent, and the operator knows push is off. A partial
+        # set reads as "push is on" at every call site while every send fails at
+        # Apple's door, and the failure is INVISIBLE because a push has no user-
+        # visible success either — a missed call and a disabled feature look
+        # identical on the handset. So require all four together or none, at boot,
+        # where an operator is watching, rather than at first ring.
+        _apns = {
+            "apns_key_id": self.apns_key_id.strip(),
+            "apns_team_id": self.apns_team_id.strip(),
+            "apns_topic": self.apns_topic.strip(),
+            # NOT stripped: a PEM's trailing newline is part of the file and
+            # cryptography accepts either, but leading whitespace breaks the
+            # "-----BEGIN" header match. lstrip only.
+            "apns_private_key": self.apns_private_key.lstrip(),
+        }
+        for name, value in _apns.items():
+            setattr(self, name, value)
+        if any(_apns.values()) and not all(_apns.values()):
+            missing = sorted(k for k, v in _apns.items() if not v)
+            raise ValueError(
+                f"APNs is half-configured — missing {missing}. Set ALL of "
+                f"{sorted(_apns)} or NONE. A partial set silently fails every "
+                "push at Apple's door, which is indistinguishable on the handset "
+                "from push being switched off. Refusing to boot."
+            )
+
         # A2 (crucible-09 Phase A): `e2ee` is schema-reserved for Phase B and
         # HARD-REJECTED in EVERY environment until MLS lands. Advertising an
         # unimplemented E2EE mode would be the exact mislabel this feature prevents

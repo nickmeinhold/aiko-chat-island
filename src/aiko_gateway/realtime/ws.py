@@ -14,7 +14,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
 from ..db import SessionLocal
 from ..domain import (
     acl, auth_session, echo, mentions, messages_service,
-    moderation_service, signing,
+    moderation_service, push_service, signing,
 )
 from . import envelopes
 from .hub import Connection
@@ -226,3 +226,19 @@ async def _handle_send(gw, conn: Connection, user, frame: dict) -> None:
         # Fan the persisted message out to channel subscribers (local; both DM members).
         await gw.hub.fanout(channel.id, envelopes.message_frame(view),
                             exclude_user_ids=exclude)
+        # Wake a CLOSED handset the fanout above could not reach (#3267/#3253). The
+        # fanout only reaches a live socket; an app that is not running has none, so
+        # without this a call to a closed phone is missed silently and permanently.
+        #
+        # Placed AFTER the write and the fanout, and deliberately not awaited: the
+        # decision of WHETHER to wake is the domain's (push_service.should_wake), and
+        # the push itself is a round trip to Apple that the sender's ack must never
+        # wait on. Guarded by `created` like federation is, so a resend of the same
+        # client_msg_id cannot ring the same phone twice.
+        #
+        # Plain values, not `channel`/`row`: this outlives the `async with` session
+        # above, and a detached ORM instance raises on attribute access.
+        push_service.schedule_wake(
+            channel_id=channel.id, channel_kind=channel.kind,
+            sender_id=user.id, body=frame["body"], exclude_user_ids=exclude,
+        )
