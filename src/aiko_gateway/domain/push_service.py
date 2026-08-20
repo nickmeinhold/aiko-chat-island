@@ -44,11 +44,31 @@ already arrived — and you cannot un-ring a phone. So a muted DM will still wak
 the device today. This is a real defect in the "waking is louder than sending"
 argument, not a cosmetic one, and closing it needs mute to become island-side
 state that this gate can read. Filed rather than silently accepted.
+
+A CONNECTED SOCKET DOES NOT SUPPRESS THE PUSH — a decision, not an oversight
+(cage-match #139 round 2, Carnot). A recipient who is live on the WebSocket gets
+BOTH the in-app ring and a push banner, and the obvious optimisation is to skip
+the wake for anyone the hub currently holds a connection for. We deliberately do
+not, because the two failure directions are not symmetric:
+
+  * Suppressing on a STALE socket means a genuinely unreachable person is never
+    rung — the exact failure this module exists to remove, reintroduced by an
+    optimisation, and invisible because a missed call looks like no call.
+  * Not suppressing on a LIVE socket means a duplicate banner.
+
+Socket presence is also not the question being asked. It answers "is a connection
+open", while the thing that matters is "is this person looking at their phone" —
+and the server cannot observe that. The layer that CAN is the handset: iOS hands
+a foregrounded app `userNotificationCenter(_:willPresent:)` and lets it decline to
+display a banner it is already showing as a live ring. So the duplicate is
+suppressible exactly where the truth lives, and is app-repo work (#3297). A
+duplicate notification is a blemish; a missed call is the bug.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Literal
 
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -84,6 +104,25 @@ CALL_INVITE_BODY = "aiko:call/1 · 📞 started a call"
 _in_flight: set[asyncio.Task] = set()
 
 
+# The channel-kind vocabulary as it crosses THIS module's boundary. `Channel.kind`
+# is a `String` column (the DB CHECK is the enforcement, driven by ChannelKind), so
+# callers hand us a str — but the policy gate should not advertise that it accepts
+# any string at all (cage-match #139 round 2, Carnot: the interface still admitted
+# invalid states even after the magic literal became `ChannelKind.DM.value`). The
+# alias narrows the SIGNATURE to the closed set without pretending the column is an
+# enum it is not, so a type-checker rejects a bare "dm" typo at the call site while
+# the runtime comparison stays the same one the DB constrains.
+#
+# DUPLICATED, AND HELD IN SYNC BY A TEST — `Literal` needs literal values, so it
+# cannot be derived from the enum at type-check time. That makes this the second
+# hand-copied closed set in this module (the first being the invite sentinel), and
+# the first draft of this line got it WRONG: it carried a fifth member,
+# "authenticated", which belongs to a different `kind` field elsewhere in the
+# codebase and is not a ChannelKind at all. Nothing at runtime would have
+# complained. `test_channel_kind_literal_matches_the_enum` is what catches it.
+ChannelKindStr = Literal["standard", "llm", "robot", "dm"]
+
+
 def is_call_invite(body: str) -> bool:
     """Exact match, never `startswith`/`in`. A prefix test would let any message
     beginning with the sentinel wake a device, which hands an attacker a wake
@@ -92,7 +131,7 @@ def is_call_invite(body: str) -> bool:
     return body == CALL_INVITE_BODY
 
 
-def should_wake(channel_kind: str, body: str) -> bool:
+def should_wake(channel_kind: ChannelKindStr, body: str) -> bool:
     """The shared domain predicate for "does this message wake a handset?".
 
     Lives here, next to the sender, rather than being re-derived at each call
@@ -173,14 +212,35 @@ async def _recipients(session: AsyncSession, *, channel_id: str, sender_id: str,
 async def _wake_user(session: AsyncSession, user_id: str, payload: dict,
                      collapse_id: str) -> None:
     """Push to every device this user has registered, reaping the dead ones."""
-    tokens = (await session.execute(
+    # A ROW IS NOT A SENDABLE ROW (cage-match #139 round 2, Carnot). Round 1 moved
+    # the budget charge below a fetch of ALL this user's device rows and claimed
+    # the budget was then only spent when there was "something to spend it on" —
+    # but a recipient holding only an Android/FCM token would still burn wake
+    # slots on every call, so an iPhone registered later in the same minute could
+    # find its first real wake already throttled. Prose and behaviour had drifted
+    # apart inside one function, the same defect class as the reaper's extra arm.
+    #
+    # Partitioned in PYTHON rather than filtered in the query, deliberately.
+    # Filtering in SQL fixes the budget but silently discards the reason the
+    # unsupported rows were ever visited: an Android device that registered
+    # successfully and is never woken would become indistinguishable from a
+    # delivery bug. Both properties are wanted, so keep both — one query, an
+    # early return that the budget never sees, and the skip still says why.
+    rows = (await session.execute(
         select(DeviceToken).where(DeviceToken.user_id == user_id)
     )).scalars().all()
+    tokens = [r for r in rows if r.platform == Platform.APNS.value]
+    for r in rows:
+        if r.platform != Platform.APNS.value:
+            # FCM (Android) is a separate transport behind this same door and is
+            # NOT built. Loud, not silent.
+            log.info("wake skipped user=%s platform=%s reason=transport_not_built",
+                     user_id, r.platform)
     if not tokens:
-        # Not an error: a user with no registered device simply cannot be woken.
-        # Logged at debug because it is the normal state for every account that
-        # has not yet run a build with push wired in.
-        log.debug("wake skipped user=%s reason=no_devices", user_id)
+        # Not an error: a user with no APNs-sendable device cannot be woken by
+        # this island today. Debug because it is the normal state for every
+        # account that has not yet run a build with push wired in.
+        log.debug("wake skipped user=%s reason=no_apns_devices", user_id)
         return
 
     # BUDGET IS SPENT HERE, after we know there is something to spend it on
@@ -208,14 +268,6 @@ async def _wake_user(session: AsyncSession, user_id: str, payload: dict,
 
     dead: list[str] = []
     for row in tokens:
-        if row.platform != Platform.APNS.value:
-            # FCM (Android) is a separate transport behind this same door and is
-            # NOT built. Skipping loudly rather than silently: an Android device
-            # that registered successfully and is never woken would otherwise be
-            # indistinguishable from a delivery bug.
-            log.info("wake skipped user=%s platform=%s reason=transport_not_built",
-                     user_id, row.platform)
-            continue
         verdict = await apns.send(row.token, payload, collapse_id=collapse_id)
         if verdict is apns.Verdict.DEAD_TOKEN:
             dead.append(row.id)
@@ -228,7 +280,7 @@ async def _wake_user(session: AsyncSession, user_id: str, payload: dict,
         log.info("reaped dead device rows user=%s count=%d", user_id, len(dead))
 
 
-async def wake_for_message(*, channel_id: str, channel_kind: str, sender_id: str,
+async def wake_for_message(*, channel_id: str, channel_kind: ChannelKindStr, sender_id: str,
                            body: str, exclude_user_ids: set[str]) -> None:
     """Wake the other DM member's devices for an accepted call invitation.
 
@@ -263,7 +315,7 @@ async def wake_for_message(*, channel_id: str, channel_kind: str, sender_id: str
         log.exception("wake failed channel=%s", channel_id)
 
 
-def schedule_wake(*, channel_id: str, channel_kind: str, sender_id: str,
+def schedule_wake(*, channel_id: str, channel_kind: ChannelKindStr, sender_id: str,
                   body: str, exclude_user_ids: set[str]) -> None:
     """Fire-and-forget the wake. THE SEND PATH MUST NOT WAIT ON APPLE.
 

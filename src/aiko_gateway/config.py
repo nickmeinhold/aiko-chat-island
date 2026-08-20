@@ -529,6 +529,20 @@ class Settings(BaseSettings):
                     "likely the wrong .p8 (an App Store Connect API key looks "
                     "identical on disk). Refusing to boot."
                 )
+            if not isinstance(_key.curve, ec.SECP256R1):
+                # PARSEABLE IS NOT USABLE (cage-match #139 round 2, Carnot) — the
+                # same ladder as presence-is-not-parseability one rung further
+                # down. ES256 is not "EC"; it is P-256 SPECIFICALLY. A P-384 or
+                # P-521 key is a real EC key, satisfies the isinstance check
+                # above, and still cannot sign a provider token — pushing the
+                # failure right back into the swallowed background send path this
+                # whole validator exists to keep it out of.
+                raise ValueError(
+                    "apns_private_key is an EC key on the wrong curve "
+                    f"({_key.curve.name}). ES256 requires P-256 (secp256r1) "
+                    "specifically, so this key parses but can never sign an APNs "
+                    "provider token. Refusing to boot."
+                )
 
         # A2 (crucible-09 Phase A): `e2ee` is schema-reserved for Phase B and
         # HARD-REJECTED in EVERY environment until MLS lands. Advertising an

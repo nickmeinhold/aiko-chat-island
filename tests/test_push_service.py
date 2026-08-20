@@ -29,7 +29,7 @@ import pytest_asyncio
 
 from aiko_gateway.config import settings
 from aiko_gateway.domain import apns, push_service, users_service
-from aiko_gateway.domain.models import DeviceToken, Membership
+from aiko_gateway.domain.models import ChannelKind, DeviceToken, Membership
 
 CHANNEL = "01JDMCHANNELDM000000000000"
 
@@ -130,6 +130,24 @@ def test_sentinel_is_pinned_byte_for_byte():
         ord("l"), ord("l"), ord("/"), ord("1"), ord(" "), 0x00B7, ord(" "),
     ]
     assert push_service.CALL_INVITE_BODY[14] == "\U0001F4DE"
+
+
+def test_channel_kind_literal_matches_the_enum():
+    """`ChannelKindStr` is a hand-copied duplicate of `ChannelKind` — `Literal`
+    cannot be derived from an enum at type-check time — so it is exactly the kind
+    of closed set that drifts silently.
+
+    It already did: the first draft carried a fifth member, "authenticated",
+    lifted from an unrelated `kind ==` comparison elsewhere in the codebase.
+    Nothing at runtime would ever have complained, because the alias is erased at
+    execution and only a type-checker reads it. This assertion is the only thing
+    standing between that alias and quiet nonsense.
+    """
+    import typing
+
+    assert sorted(typing.get_args(push_service.ChannelKindStr)) == sorted(
+        m.value for m in ChannelKind
+    )
 
 
 @pytest.mark.parametrize(
@@ -326,6 +344,38 @@ async def test_wake_budget_is_per_recipient(session, dm, configured, fake_apns,
     for _ in range(5):
         await _wake(sender_id=alice.id)
     assert len(fake_apns.sent) == 3
+
+
+@pytest.mark.asyncio
+async def test_an_fcm_only_recipient_does_not_burn_the_apns_budget(
+    session, dm, configured, fake_apns, monkeypatch
+):
+    """A ROW IS NOT A SENDABLE ROW (cage-match #139 round 2, Carnot).
+
+    Round 1 charged the budget once the recipient was known to have *a device*.
+    A recipient holding only an Android/FCM token therefore burned an APNs wake
+    slot on every call — so an iPhone registered later in the same minute could
+    find its first real wake already throttled. Budget is now charged only when
+    there is an APNs-sendable row.
+
+    The arm that makes this meaningful: after N+1 FCM-only calls, a freshly
+    registered iPhone must STILL be wakeable. A naive implementation throttles it.
+    """
+    alice, bob = dm
+    monkeypatch.setattr(settings, "apns_wake_per_recipient_per_minute", 2,
+                        raising=False)
+    await session.execute(DeviceToken.__table__.delete())
+    session.add(DeviceToken(user_id=bob.id, platform="fcm", token="f" * 100))
+    await session.commit()
+
+    for _ in range(5):            # would exhaust a 2/min budget if charged
+        await _wake(sender_id=alice.id)
+    assert fake_apns.sent == []   # nothing sendable, nothing sent
+
+    session.add(DeviceToken(user_id=bob.id, platform="apns", token="b" * 64))
+    await session.commit()
+    await _wake(sender_id=alice.id)
+    assert len(fake_apns.sent) == 1, "the new iPhone was throttled by FCM-only calls"
 
 
 @pytest.mark.asyncio
