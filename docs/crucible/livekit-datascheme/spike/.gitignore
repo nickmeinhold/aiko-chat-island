@@ -1,0 +1,4 @@
+# Materialised pipeline definitions: run_pipeline.py regenerates these from
+# pipeline_webrtc.json with the room of the moment. Regenerable => not tracked;
+# the committed template keeps its SPIKE_ROOM placeholder.
+.pipeline_*.run.json

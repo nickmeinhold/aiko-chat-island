@@ -133,6 +133,75 @@ architectural consequence the design never priced, and it forces a fork:
 This fork is a genuinely good thing to put to Andy, and unlike F4's question it rests on a
 measurement rather than an estimate.
 
+## F6 — `webrtc://` works as a real DataScheme, and aiko's OWN element consumes it
+
+`scheme_webrtc.py` registers `webrtc` in `aiko.DataScheme.LOOKUP`. `pipeline_webrtc.json`
+then runs under a real broker and a real `aiko_pipeline create -s 1`, and its source
+element is **aiko's own unmodified `image_io.ImageReadZMQ`** — re-exported, not subclassed,
+not wrapped. The only change from the stock zmq pipeline is one string:
+
+```
+"data_sources": "(zmq://localhost:6502)"   ->   "(webrtc://<room>)"
+```
+
+Result: `PIPELINE_VERDICT=PIPELINE_PIXEL_OK`, 5/5 frames delivered by the pipeline,
+max quadrant error 1.3–5.1, `orphaned_sidecars_after_run: 0`. The design's central claim —
+*first-class-ness lives at the URL + registration layer* — **holds**: an element that has
+never heard of WebRTC read video out of a LiveKit room.
+
+Controls, because a green from an instrument I wrote is not evidence:
+
+- **Negative control** (`--no-publisher`): fails closed with
+  `ERROR ... webrtc:// sidecar not ready within 30.0s`. Never reaches PIXEL_OK.
+- **Orphan check** runs only after the pipeline is reaped (checking earlier would report a
+  false positive every run, since a live sidecar under a live pipeline is correct).
+
+**Worth putting to Andy:** the element that works here is called `ImageReadZMQ`. It is
+already transport-agnostic — `process_frame` only calls `bytes_to_image(record)` and never
+touches zmq, exactly matching his "the DataScheme references the transport" model. But the
+NAME still leaks a transport it does not depend on, so reading from `webrtc://` currently
+requires an element called `...ZMQ`. The generic element wants a transport-neutral name.
+
+**Also found:** aiko's `get_network_port_free` calls `psutil.net_connections`, which
+raises `AccessDenied` for an unprivileged process on macOS — so any scheme using it cannot
+start a stream on a dev box. Binding `tcp://127.0.0.1:*` and reading `LAST_ENDPOINT` back
+from zmq avoids the privileged call and removes the helper's check-then-bind race.
+
+## F7 — the out-of-process shape LEAKS on the hard-kill path (the inverse of F1)
+
+This is the sharpest finding of the spike and it cuts against the re-cast.
+
+`destroy_sources` → the supervisor → the SIGKILL escalation all run on aiko's graceful
+path: a stream `STOP` schedules `destroy_stream` with `delay=3.0`, which calls
+`stop_stream` → `destroy_sources`. Verified — it is called, and it reaps the child.
+
+But **aiko's Pipeline installs no SIGINT/SIGTERM handler** (none in `pipeline.py` or
+`process.py`). So on any hard kill of the pipeline process, `destroy_sources` never runs.
+Measured: SIGKILL the pipeline and **the sidecar survives, indefinitely** — still joined to
+the room, still decoding, still holding a live SFU participant seat.
+
+That is an inversion of the whole re-cast argument:
+
+| | in-process Room | out-of-process sidecar |
+|---|---|---|
+| hung `disconnect()` | unbounded hang, no leak | **better** — SIGKILL always wins |
+| pipeline hard-killed | Room dies with the process | **worse** — live SFU seat orphaned |
+
+The out-of-process shape did not remove the leak the Temper feared; it **moved** it to a
+different trigger, and put it somewhere the pipeline can no longer clean up. In-process, a
+killed pipeline takes its Room with it for free.
+
+**Fixed, with a red-then-green proof.** The sidecar now runs a parent-death watchdog
+(`getppid()` change ⇒ reparented ⇒ stop) and bounds its own `disconnect()` at 5s.
+Before: `ORPHANED_BY_SIGKILL=True`, still orphaned at 15s. After: `False`, reaped in
+**1.1s**. The guard was proven to matter by observing it genuinely fail first.
+
+Note the first version of that watchdog **did not work**, for an instructive reason: it
+`print()`ed before setting the stop flag, and stdout is a pipe held by the parent that just
+died — so `BrokenPipeError` killed the watchdog task before it could stop anything, leaving
+exactly the orphan it existed to prevent. State first, then log, and logging must never be
+able to prevent exiting.
+
 ## Instrument failures caught (recorded because they were nearly reported as results)
 
 1. **`encode_ms` = 64 ms/frame** in the first JPEG run — a 50× overstatement. PIL encodes
@@ -145,8 +214,21 @@ measurement rather than an estimate.
    accumulating as parent RSS). The harness was leaking what it was measuring. Fixed, and
    both arms then read FLAT.
 
-Both failures shared a shape: the instrument's own defect was indistinguishable from the
-result it was built to find.
+3. **"`destroy_sources` is never called"** — asserted from a grep that returned 0, twice.
+   Both were capture artifacts: first the harness terminated the pipeline before aiko's
+   `delay=3.0` `destroy_stream` could fire, then it stopped reading the pipeline's stdout
+   after the verdict, so a later print was simply never recorded. The real answer is that
+   it IS called on the graceful path and is NOT called on hard kill (F7) — a distinction
+   both bad greps flattened into a single wrong "never".
+4. **An orphan probe that measured ZOMBIES as alive** — it used `kill -0`, which succeeds
+   for an unreaped dead child, and did not pass `LK_*` through, so the sidecar died at
+   startup and was scored "alive, then killed by parent death". Two independent defects
+   producing one plausible answer. Fixed by reading `ps -o state=` and inheriting the env,
+   which reversed the conclusion.
+
+All four shared a shape: the instrument's own defect was indistinguishable from the result
+it was built to find. Three of them produced a CONFIDENT, PLAUSIBLE, WRONG answer rather
+than an obvious failure — which is why each needed a control rather than a re-read.
 
 ## What is NOT proven
 
@@ -158,9 +240,11 @@ result it was built to find.
   the easy half but it is unmeasured here.
 - **The duplex collision.** Untested. Two `Room.connect()` on one identity is still an
   open Tesla finding.
-- **Anything about a real pipeline.** No `aiko.DataScheme` was registered; the pipeline
-  side is a bare PULL socket standing in for `scheme_zmq`. The claim is about the frame
-  path and teardown behaviour, not about aiko integration.
+- **Publish direction as a DataTarget.** `webrtc://` is a DataSource only here; the
+  aiko -> LiveKit direction is unimplemented.
+- **Any island integration.** Tokens are minted directly from the SFU's dev key. The
+  island-endpoint capability-token model, the allowlisted origin, and the dedicated
+  machine principal are all untouched — this spike deliberately isolates the transport.
 - **Scale.** 640×480, one track, one subscriber, local SFU, macOS. No claim about 1080p,
   multi-track, or a real network.
 
@@ -175,6 +259,13 @@ export LK_URL=ws://127.0.0.1:7880 LK_API_KEY=devkey LK_API_SECRET=secret
 venv/bin/python run_pixel.py --wire jpeg      # F3, F4, F5
 venv/bin/python run_teardown.py --cycles 16   # F1 clean path
 venv/bin/python run_hostile.py --cycles 8     # F1, F2 — the claim that mattered
+
+# F6/F7 — the real aiko Pipeline. Needs a broker too:
+/opt/homebrew/sbin/mosquitto -c ../../../../spike/mosquitto.conf -d   # :1884
+export AIKO_MQTT_HOST=localhost AIKO_MQTT_PORT=1884
+venv/bin/pip install -e /path/to/aiko_services opencv-python-headless
+venv/bin/python run_pipeline.py --frames 5                 # must be PIPELINE_PIXEL_OK
+venv/bin/python run_pipeline.py --frames 5 --no-publisher  # must FAIL CLOSED
 ```
 
 `--dev` uses the published placeholder keys `devkey`/`secret`. That is correct for a

@@ -50,6 +50,19 @@ from livekit import api, rtc
 WIRE_HEADER = struct.Struct("!HHI")  # width, height, payload length
 
 
+def _safe_print(message: str) -> None:
+    """Print that survives a dead parent.
+
+    Once the parent pipeline is gone our stdout pipe has no reader, so any write raises
+    BrokenPipeError. On the teardown path that exception would propagate and abort the
+    very shutdown it was logging — so logging must never be able to prevent exiting.
+    """
+    try:
+        print(message, flush=True)
+    except Exception:
+        pass
+
+
 def mint(key: str, secret: str, room: str, identity: str) -> str:
     grants = api.VideoGrants(room_join=True, room=room, can_publish=False, can_subscribe=True)
     return (
@@ -150,6 +163,37 @@ async def run(args) -> int:
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop.set)
 
+    # PARENT-DEATH WATCHDOG. Measured: SIGKILL an aiko pipeline and this process is
+    # orphaned but keeps running -- still joined to the room, still decoding, holding a
+    # live SFU seat. aiko's Pipeline installs no SIGINT/SIGTERM handler, so
+    # destroy_sources runs ONLY on the graceful destroy_stream path; any hard kill skips
+    # the supervisor entirely. That is a leak the out-of-process shape INTRODUCES (an
+    # in-process Room dies with its pipeline), so the child has to be able to notice on
+    # its own that nobody owns it any more.
+    #
+    # getppid() == 1 is the portable signal for "reparented to init". Linux has
+    # PR_SET_PDEATHSIG and macOS has kqueue NOTE_EXIT, but both are platform-specific and
+    # this poll is accurate within its interval on either.
+    original_ppid = os.getppid()
+
+    async def watch_parent():
+        while not stop.is_set():
+            await asyncio.sleep(1.0)
+            if os.getppid() != original_ppid:
+                # STATE FIRST, THEN LOG. Our stdout is a pipe held by the parent that just
+                # died, so a print here raises BrokenPipeError — which would kill this
+                # watchdog task before it could stop anything, leaving exactly the orphan
+                # it exists to prevent. (Measured: it did, until this order was fixed.)
+                stop.set()
+                try:
+                    print(f"SIDECAR_PARENT_DIED ppid {original_ppid} -> {os.getppid()}",
+                          flush=True)
+                except Exception:
+                    pass
+                return
+
+    parent_watch = asyncio.create_task(watch_parent())
+
     # WHOLE-PROCESS CPU, not just the Python-visible steps. `frame.convert()` measures
     # the I420->RGB24 conversion ONLY — the VP8 decode itself already happened on a
     # native SDK thread before the frame reached this async iterator, so no in-loop timer
@@ -165,10 +209,17 @@ async def run(args) -> int:
 
     cpu_used, wall_used = sum(proc.cpu_times()[:2]) - cpu_t0, time.perf_counter() - wall_t0
 
+    parent_watch.cancel()
     for task in pumps:
         task.cancel()
-    await asyncio.gather(*pumps, return_exceptions=True)
-    await room.disconnect()
+    await asyncio.gather(*pumps, parent_watch, return_exceptions=True)
+    # BOUNDED, always. disconnect() is measured to hang indefinitely against a
+    # black-holed SFU (8/8 cycles, still hung at 90s), so an unbounded await here would
+    # make this process unkillable-by-SIGTERM in exactly the case the watchdog exists for.
+    try:
+        await asyncio.wait_for(room.disconnect(), timeout=5.0)
+    except Exception:
+        _safe_print("SIDECAR_DISCONNECT_TIMEOUT exiting anyway")
     sock.close()
     ctx.term()
 
@@ -179,7 +230,7 @@ async def run(args) -> int:
         return {"n": int(arr.size), "mean": round(float(arr.mean()), 3),
                 "p95": round(float(np.percentile(arr, 95)), 3)}
 
-    print("SIDECAR_STATS=" + json.dumps({
+    _safe_print("SIDECAR_STATS=" + json.dumps({
         "wire": args.wire,
         "frames_in": stats["frames_in"],
         "frames_sent": stats["frames_sent"],
@@ -192,7 +243,7 @@ async def run(args) -> int:
         "wall_seconds": round(wall_used, 3),
         "cores_used": round(cpu_used / wall_used, 3) if wall_used > 0 else None,
         "fps_observed": round(stats["frames_in"] / wall_used, 2) if wall_used > 0 else None,
-    }), flush=True)
+    }))
     return 0
 
 
