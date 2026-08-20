@@ -186,7 +186,16 @@ does `aiko_services` want an opaque/raw media type so a bridged stream stays sin
 The spike proved transport facts. It proved **nothing** about auth or identity: it mints from
 the SFU `--dev` key.
 
-- **G1 — Long soak before the in-process default is called sound.** Thousands of
+- **G1 — RESOLVED (F11), and it is NOT ours.** Bisected with a null control: the residual
+  ~0.4 MB/cycle is entirely in `livekit-rtc`'s `connect()`→`disconnect()`, present under a
+  clean disconnect, unaffected by media or hold, and **linear over 100 cycles** (no plateau).
+  An upstream leak of ~0.4 MB per **stream restart**. Two consequences: **D1 owes an explicit
+  process-recycle policy** (N restarts, N derived from this rate and the memory budget), and
+  **D6 gains its first honest justification** — a fresh process per stream means the OS
+  reclaims this leak, so the sidecar is immune to it by construction where the in-process
+  spine accumulates it forever. Round 1 was right that a sidecar prevents *a* leak; it was
+  wrong about which one, and only measurement could tell them apart.
+- **G1-b — Long soak still owed before the in-process default is called sound.** Thousands of
   create/traffic/destroy cycles with hostile SFU pauses, tracking RSS *and* native threads/fds,
   plus proof that a successor stream can be created after a timed-out teardown. The
   unexplained **~0.4 MB/cycle RSS drift** is the one live reason to doubt D1 and 16 cycles do

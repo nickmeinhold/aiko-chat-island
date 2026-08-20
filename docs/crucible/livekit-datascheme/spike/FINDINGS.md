@@ -315,6 +315,61 @@ fd exhaustion) rather than one. G1 remains an open merge blocker on the in-proce
 with its scope narrowed from "an unexplained 0.4 MB/cycle" to "an unexplained 0.4 MB/cycle
 that is NOT the SFU session, because it survives eviction."
 
+## F11 — G1 RESOLVED: the residual is an upstream `livekit-rtc` leak, and it hands D6 its real justification
+
+The clue was the stability: 0.389 / 0.400 / 0.422 / 0.428 MB per cycle across four runs whose
+teardowns had nothing in common. A leak indifferent to *how a session ends* is probably not in
+the session. So: bisect the cycle instead of soaking it, each arm doing strictly less than the
+one above, each in its own process.
+
+| arm | RSS/cycle |
+|---|---|
+| `NOTHING` — empty loop, **the null control** | **0.0** |
+| `MINT_ONLY` — build a token, no Room | 0.0 |
+| `ROOM_ONLY` — `rtc.Room()` constructed, never connected | 0.0 |
+| **`CONNECT_ONLY` — connect + immediate clean disconnect** | **0.400** |
+| `FULL` — connect + hold + media + disconnect | 0.402 |
+
+**The whole leak is `connect()`→`disconnect()`. Media and hold contribute nothing (0.402 vs
+0.400), and it is present under a perfectly CLEAN disconnect** — which is exactly why it was
+identical under stranding and eviction. It was never about abandonment.
+
+**And it is linear, not a warm-up.** 100 cycles: 91.45 → 130.19 MB, with per-10-cycle growth of
+4.66 / 3.28 / 3.81 / 3.96 / 3.62 / 3.91 / 4.06 / 3.81 / **4.13** MB. The last decade grows as
+fast as the first. No plateau, no asymptote — a genuine leak.
+
+**The null control is what makes this trustworthy.** `NOTHING` reads exactly 0.0, so RSS *is* a
+usable instrument at this resolution here. Every previous G1 measurement lacked that control
+and therefore could not distinguish "a real leak" from "RSS goes up when a process does work".
+
+**Scope:** `livekit-rtc` 1.1.14, CPython 3.13, macOS, against `livekit-server` v1.13.5. Not
+verified on Linux, not bisected below the Python binding into the native SDK, and not checked
+against upstream's issue tracker.
+
+### What it means for the design
+
+**G1 closes as "not ours".** The drift is an upstream defect, ~0.4 MB per **stream restart**
+(not per second, not per frame). A pipeline that restarts a stream 10,000 times accumulates
+~4 GB. That is a **process-recycle policy**, not something the DataScheme can fix.
+
+**And here is the twist: this is the first measured argument FOR the sidecar.** The out-of-
+process shape spawns a fresh process per stream, so the leak is reclaimed by the OS at every
+teardown — **D6 is immune to it by construction**, while the in-process spine accumulates it
+forever.
+
+Round 1 chose the sidecar because "in-process leaks". That was *false as argued* (threads and
+fds are flat) and the claim was correctly reversed in round 2. But there **is** a leak, in a
+place nobody looked, and process recycling **does** fix it. Round 1 was right for the wrong
+reason, and it took three temper rounds plus a day of measurement to find the right one.
+
+This does **not** flip the default back — the in-process spine can adopt an explicit recycle
+policy, and 0.4 MB per restart is affordable for most deployments. But it means:
+
+- **D1 owes a stated recycle policy** ("after N stream restarts, recycle the process"), with N
+  derived from this rate and the deployment's memory budget.
+- **D6 gains a legitimate, measured justification** to replace the false one it was born with:
+  *process recycling reclaims an upstream leak the in-process shape cannot*.
+
 ## Instrument failures caught (recorded because they were nearly reported as results)
 
 1. **`encode_ms` = 64 ms/frame** in the first JPEG run — a 50× overstatement. PIL encodes
