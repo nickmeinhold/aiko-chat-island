@@ -1,7 +1,204 @@
-# DESIGN — `livekit://` DataScheme (Cast)
+# DESIGN — `webrtc://` DataScheme (Cast)
 
-Status: **RE-CAST after Temper round 1 — UN-STRUCK (needs a round-2 strike before build).**
+Status: **RE-CAST round 2 after Temper round 2 — UN-STRUCK (needs a round-3 strike before build).**
 Target repo: `aiko_services` (Andy Gelme's) via fork PR — NOT a unilateral commit.
+
+**Renamed `livekit://` → `webrtc://`.** Andy, 2026-08-12: *"The DataScheme references the
+transport, e.g https://, mqtt://, zmq://, webrtc://"*. LiveKit is our **implementation**, not
+the transport. A scheme named after one vendor forecloses a second SFU and misdescribes the
+layer. `livekit-local://` (direct master-key mint, dev/island-local only) keeps its name
+because it genuinely IS LiveKit-specific.
+
+---
+
+# ROUND 2 RE-CAST — the authoritative design
+
+Folds all eight flaws from [`TEMPER.md`](TEMPER.md) (round 2: Maxwell + Kelvin + Carnot +
+Tesla, full 4-way, **unanimous that the round-1 default must invert**). Round 1's re-cast is
+preserved below as provenance and is **superseded**.
+
+**What changed, in one sentence:** round 1 chose a process boundary to contain a resource leak;
+the spike measured that leak at **0.00 threads and 0.00 fds per cycle** and found the real
+defect to be an unbounded *hang* — so the fix is a **clock, not a process**.
+
+## D1 — In-process Room is the SPINE. Bounded teardown is the liveness invariant.
+
+`webrtc://` create_sources owns a **daemon thread running a dedicated asyncio loop + the
+`Room`**, in the pipeline process — the `scheme_zmq` shape, which is what the original Cast
+proposed and round 1 overturned on a premise that has since been falsified.
+
+**The liveness invariant, which replaces the process boundary as the mechanism:**
+
+> No pipeline-lifecycle operation may ever wait on SFU liveness. Every await that can touch
+> the network is raced against a deadline; on expiry the transport is **abandoned, not
+> awaited**, and the Room is declared dead.
+
+Concretely, `destroy_sources`:
+1. sets the stop flag and **immediately stops accepting publish frames** (a generation gate —
+   a capture after teardown begins is an ERROR, not a late frame);
+2. issues `disconnect()` raced against deadline `T_disconnect` (default 5s);
+3. on expiry **abandons the await**, logs a loud ERROR, and returns — never blocks;
+4. joins the bridge thread against `T_join`; on expiry, logs loudly and marks the scheme
+   **degraded**.
+
+**Why abandoning is safe, and why this is now an evidenced claim rather than a hope:** the
+spike's hostile arm A *is* exactly this operation — `wait_for(disconnect(), T)`, timeout fires,
+Room abandoned, reference dropped — repeated 8× against a black-holed SFU, with **0.00 thread
+and 0.00 fd growth per cycle**. Python cannot kill the stuck coroutine and this design stops
+pretending it can; it makes the stuck coroutine *irrelevant to the pipeline's lifecycle*.
+
+**Restart-storm policy (the degenerate state that must not silently pile up).** After a
+timed-out teardown the abandoned Room may still hold an SFU seat until the server's own
+participant timeout. So a subsequent `create_sources` for the same `(room, identity)` **fails
+closed** while a prior bridge is unreaped, rather than stacking a second live Room behind a
+stuck one — see D2, which this is the same invariant as.
+
+## D2 — Duplex invariant, restated at the right granularity and given an owner
+
+Round 1 wrote: *one Room per `(process, channel_id, island identity)`*. **`process` is deleted
+from the key.** Maxwell and Tesla independently found that keying on `process` makes the
+invariant trivially satisfiable while the harm it exists to prevent goes unmitigated: two
+pipelines, or a restarted pipeline racing an unreaped predecessor, each hold one Room in one
+process and still collide, and LiveKit's last-session-wins silently kills one.
+
+> **INVARIANT: at most one live `Room.connect` per `(room, identity)`, HOST-WIDE.**
+
+**Enforcement point (an invariant without one is a sentence, not a design):** a process-local
+registry keyed by `(room, identity)` inside the scheme module, which D1's in-process spine
+makes possible again — out-of-process there was no shared place to hold it. Source and target
+for the same pair **share one Room object**, they do not open two.
+
+Cross-process collision on one host is prevented by **identity allocation**, not by a lock:
+one machine principal per bridge instance (D4). Two bridges ⇒ two identities ⇒ no collision by
+construction. This is the coupling *removed* rather than guarded.
+
+**Still untested.** LiveKit's last-session-wins behaviour is asserted, not measured. **Merge
+blocker G3.**
+
+## D3 — The island is the token authority; the token is capability-scoped
+
+Unchanged in substance from round 1 and **unchallenged by any family** — but discharged by
+nothing, so it is restated as a gate rather than a decision.
+
+- The scheme **never** accepts an SFU URL or raw token in pipeline config. It calls the island
+  for `{token, url}` and uses them verbatim.
+- The island origin is **allowlisted operator/host config**, never a free-form base URL from a
+  pipeline share — this is `scheme_http`'s SSRF hole relocated, and it closes the same way.
+- The token is **audience/capability-scoped to room-token minting**, not a full user session
+  that also authorizes other island API calls.
+- The mint chain (access → video-token → LiveKit JWT) is a **lifecycle, not a connect-time
+  check**: re-mint on every connect/reconnect, and define behaviour when the room JWT expires
+  mid-session so Fold-A does not label an auth failure as network death.
+- Direct master-key mint stays a **separate scheme** (`livekit-local://`), never a flag — a
+  config typo must not silently select the master-secret path.
+
+## D4 — A dedicated MACHINE principal, and its lifecycle is a sub-design, not a footnote
+
+Round 1 downgraded this from blocker to "a provisioning step" on the strength of a
+register-passkey-once-then-refresh flow. **That downgrade is withdrawn.** The path has never
+been exercised headlessly, the island is passkey-primary with `/register` force-closed in prod,
+and agent identity (#3096) is PR#136 — **open, not merged**.
+
+Reinstated as an open dependency with a named surface: provision, store, rotate, revoke,
+recover, and operator-transfer. A robot that cannot have its credential revoked is a robot you
+cannot take off the network.
+
+## D5 — Choose the host. Do not OR it. (NEW — round 2)
+
+Round 1 said the bridge runs on "a robot host, **or** island-local". Those have **opposite
+blast-radius polarity**, so one default cannot serve both:
+
+| | pipeline/robot host | island gateway container |
+|---|---|---|
+| process death | **is the janitor** — Room dies with the pipeline | long-lived; nothing reaps |
+| a hung await | affects that pipeline | can **mute chat**, which shares the box |
+| an orphan | dies at next reboot | holds an SFU seat until someone notices |
+
+**The call: the pipeline/robot host is the target for the DEFAULT in-process spine.** That is
+where aiko pipelines actually run, it is the deployment whose fate-sharing makes D1 safe, and
+it keeps a media transport out of the gateway that serves chat.
+
+**Island-local is OUT OF SCOPE for v1.** If it is ever adopted it requires the D6 sidecar mode
+plus an island-side participant janitor, because in a container the two failure modes above
+stop being hypothetical. *(This is a design call, not a product ruling — flagged for Nick, who
+owns whether media ever runs inside the gateway.)*
+
+## D6 — The sidecar survives as an OPT-IN isolation mode, with a written contract
+
+Not deleted — it has real uses (fault-isolating native crashes; keeping `livekit` out of a
+host that must not import it). But it is **opt-in**, and it is **illegal without all four** of:
+
+1. **Supervisor escalation:** SIGTERM → `T_term` grace → **SIGKILL** → loud on survival. Not a
+   hardening detail: the spike measured the sidecar ignoring SIGTERM 8/8 with every child
+   reaped by SIGKILL, so escalation is the entire mechanism by which the mode works.
+2. **Lifetime bound to the parent:** a parent-death reaper (`getppid` watchdog, or
+   `PR_SET_PDEATHSIG` / kqueue / cgroup). aiko's Pipeline installs **no SIGINT/SIGTERM
+   handler**, so `destroy_sources` never runs on a hard kill and the child must be able to
+   notice on its own that nobody owns it. **State change must precede any logging** — the
+   spike's first watchdog failed because it printed to a pipe whose reader had just died, and
+   `BrokenPipeError` killed the watchdog before it could stop anything.
+3. **The child bounds its own `disconnect()`** — D1's invariant applies in whatever process
+   awaits the SFU. A process boundary does not exempt anyone from the clock.
+4. **No reconnect once the parent is gone.** A zombie that reconnects is a zombie that kicks
+   the living, via D2's last-session-wins.
+
+## D7 — Fidelity is a term of the URL contract, not an inherited property
+
+The in-process spine yields **numpy frames natively**: no second codec, no transcode, and the
+whole JPEG question disappears. That is now a reason for D1, not just a consequence of it.
+
+Under the D6 sidecar, frames cross a process boundary and must be serialized. aiko's existing
+convention (`image_io.ImageWriteZMQ` → `image_to_bytes` → `PIL.save(format="JPEG")`) puts a
+**second lossy codec in series with VP8**. Measured tolerable (1.2ms/frame, ~6 KiB/frame,
+pixel test still passes at 1.0 MAE) — but tolerable is a consumer-class judgement, and this
+design must not make it silently on the consumer's behalf.
+
+> **A `webrtc://` consumer chooses its fidelity; it never inherits it.** An explicit
+> `fidelity` parameter (`lossless-frames` | `jpeg`) with `lossless-frames` as the default.
+
+Inference tolerates a second codec. Measurement, archival, and anything a control loop acts on
+do not. **Open question for Andy** (and the one that rests on a measurement rather than an
+estimate): should `webrtc://` under zmq carry JPEG for compatibility with today's elements, or
+does `aiko_services` want an opaque/raw media type so a bridged stream stays single-codec?
+
+## Merge blockers — what is NOT discharged
+
+The spike proved transport facts. It proved **nothing** about auth or identity: it mints from
+the SFU `--dev` key.
+
+- **G1 — Long soak before the in-process default is called sound.** Thousands of
+  create/traffic/destroy cycles with hostile SFU pauses, tracking RSS *and* native threads/fds,
+  plus proof that a successor stream can be created after a timed-out teardown. The
+  unexplained **~0.4 MB/cycle RSS drift** is the one live reason to doubt D1 and 16 cycles do
+  not settle it either way.
+- **G2 — Publish direction** is unimplemented and unmeasured. `webrtc://` is DataSource-only.
+- **G3 — The duplex collision (D2) is untested.** Measure LiveKit's same-identity
+  double-connect behaviour before it drives identity architecture.
+- **G4 — D3 and D4 exercised for real**: allowlisted origin validation, audience-scoped mint,
+  refresh, mid-session expiry, machine-principal provisioning end to end on an island.
+- **G5 — No production `webrtc://` may mint from an SFU master key.** `livekit-local://` only.
+
+## Build order (supersedes both earlier orders)
+
+1. **In-process subscribe + the D1 bounded-teardown/restart-storm contract**, with the hostile
+   teardown and successor-creation tests as its acceptance gate. Useful alone: a room's video
+   into an aiko pipeline.
+2. **Publish direction** with the call-after-destroy generation gate (G2).
+3. **Island capability auth + machine principal** (D3, D4 — G4/G5).
+4. **The D6 sidecar mode, only if G1's soak or a real deployment constraint justifies it.**
+
+## Status
+
+**UN-STRUCK.** This round-2 re-cast has not itself faced a strike; per the crucible's own rule,
+a substantial post-Temper recast is un-tempered until struck. Round 3 of a ≤3-round budget.
+
+---
+
+# ROUND 1 RE-CAST — SUPERSEDED (provenance)
+
+_Kept for the record. Its D1 (out-of-process default) was **reversed** by round 2, and its
+duplex invariant was **restated** with `process` removed from the key. Everything below is
+historical._
 
 ## TEMPER ROUND 1 — verdict + re-cast (2026-08-11, PR #125)
 
