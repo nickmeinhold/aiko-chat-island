@@ -77,7 +77,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..config import settings
 from ..db import SessionLocal
 from . import apns, moderation_service
-from .models import ChannelKind, DeviceToken, Membership, Platform, User
+from .models import Channel, ChannelKind, DeviceToken, Membership, Platform, User
 from .rate_limit import limiter
 
 log = logging.getLogger("aiko_gateway.push")
@@ -210,6 +210,41 @@ async def _recipients(session: AsyncSession, *, channel_id: str, sender_id: str,
     same condition `users_service.is_banned` tests, applied in the join rather
     than after it so a banned peer is never even a candidate.
     """
+    # THE DM GATE, READ FROM THE CHANNEL ROW — not from the caller's word for it
+    # (cage-match #139 round 6, Carnot). `channel_kind` arrives as an argument, so
+    # a future caller could pass "dm" alongside a NON-DM channel_id and the
+    # sentinel, and wake every member of a public room. The single-door claim was
+    # stronger than the code: the lock was being carried in by whoever knocked.
+    #
+    # This is the THIRD instance of one pattern in this review — caller-supplied
+    # facts standing in for gates the service claims to own (round 4: the block
+    # set; round 5: detached ORM attributes; here: the channel kind). Swept as a
+    # class rather than patched again, and aligned with the ESTABLISHED pattern
+    # from the video-token path (rest/livekit.py), which is the other capability
+    # gated on "this is really a DM". That path checks three things, and so does
+    # this one now — including the cardinality assertion nobody flagged:
+    #
+    #   1. kind == 'dm'
+    #   2. AND is_private — DEFENCE IN DEPTH, and stated honestly: the schema
+    #      ALREADY guarantees this (`ck_channels_dm_private`: kind != 'dm' OR
+    #      is_private, migration 0020), so the state is unrepresentable and this
+    #      branch is unreachable through the DB. It is kept because it costs one
+    #      comparison and a future writer path or a relaxed constraint would make
+    #      it reachable — but it gets NO test, because a test that cannot create
+    #      the failure cannot clear it. (Note: rest/livekit.py's equivalent check
+    #      carries a now-stale comment claiming kind is NOT DB-constrained to
+    #      is_private; it was true when written and the constraint landed later.)
+    #   3. AND exactly one peer — DM safety rests on the room being {sender, one
+    #      peer}. A malformed 3-member kind='dm' channel would otherwise wake
+    #      everyone in it, which is precisely the unbounded-fanout case DM-only
+    #      exists to prevent.
+    channel = (await session.execute(
+        select(Channel).where(Channel.id == channel_id)
+    )).scalar_one_or_none()
+    if channel is None or channel.kind != ChannelKind.DM.value or not channel.is_private:
+        log.warning("wake refused channel=%s reason=not_a_private_dm", channel_id)
+        return []
+
     rows = (await session.execute(
         select(Membership.user_id)
         .join(User, User.id == Membership.user_id)
@@ -219,6 +254,15 @@ async def _recipients(session: AsyncSession, *, channel_id: str, sender_id: str,
             User.banned_at.is_(None),
         )
     )).scalars().all()
+
+    # Cardinality from GROUND TRUTH, asserted before any exclusion is applied —
+    # a 3-member "DM" must fail closed, not be silently narrowed to whoever
+    # survives the block filter.
+    if len(rows) != 1:
+        log.warning("wake refused channel=%s reason=not_two_party peers=%d",
+                    channel_id, len(rows))
+        return []
+
     # Union: the caller's fanout set PLUS our own read. Neither is trusted alone.
     blocked = await moderation_service.blocked_pair_user_ids(session, sender_id)
     excluded = set(exclude_user_ids) | blocked
@@ -287,7 +331,18 @@ async def _wake_user(session: AsyncSession, user_id: str, payload: dict,
     dead: list[tuple[str, str, object, int | None]] = []
     for row in tokens:
         observed = (row.id, row.token, row.updated_at)
-        result = await apns.send(row.token, payload, collapse_id=collapse_id)
+        try:
+            result = await apns.send(row.token, payload, collapse_id=collapse_id)
+        except Exception:
+            # PER-DEVICE BOUNDARY (cage-match #139 round 6, Carnot). `apns.send`
+            # swallows httpx errors itself, but it can still raise from provider-
+            # token signing, client construction, or any future transport defect —
+            # and the only other catch is OUTSIDE this whole loop, so one bad row
+            # or environment edge would abandon every remaining device AND every
+            # remaining recipient. Entropy localizes only where you build the
+            # boundary. Treated as transient: log, skip, keep going, never reap.
+            log.exception("wake failed for one device user=%s", user_id)
+            continue
         if result.verdict is apns.Verdict.DEAD_TOKEN:
             dead.append((*observed, result.invalid_since_ms))
 
@@ -321,7 +376,24 @@ async def _wake_user(session: AsyncSession, user_id: str, payload: dict,
             DeviceToken.token == token,
             DeviceToken.updated_at == updated_at,
         ]
-        if invalid_since_ms is not None:
+        if invalid_since_ms is None:
+            # NO TIMESTAMP, NO REAP (cage-match #139 round 6, Carnot). Apple
+            # documents `timestamp` on a 410, and it is the ONLY evidence that
+            # distinguishes "this token is dead" from "this token WAS dead before
+            # the user reinstalled and got the same token back". Without it the
+            # equality guards cover only the network-await window, which leaves
+            # real ambiguity on the one irreversible operation in the module.
+            #
+            # This module's stated posture is that failing safe for a reaper means
+            # NOT deleting, and the cost of honouring it here is one wasted request
+            # per send against a stale row — the same trade already accepted for
+            # BadDeviceToken. Applying the doctrine consistently rather than only
+            # where it was convenient. Logged at warning because a 410 without a
+            # timestamp is unexpected: if it ever becomes common the reaper is
+            # effectively off, and that should be visible rather than inferred.
+            log.warning("reap skipped user=%s reason=410_without_timestamp", user_id)
+            continue
+        else:
             # APPLE'S OWN RULE, not just our race guard (cage-match #139 round 4,
             # Carnot). A 410 body carries the moment APNs confirmed the token
             # invalid, and Apple says to resume pushing if the app registered that
@@ -332,9 +404,12 @@ async def _wake_user(session: AsyncSession, user_id: str, payload: dict,
             invalid_since = dt.datetime.fromtimestamp(
                 invalid_since_ms / 1000, tz=dt.UTC)
             conditions.append(DeviceToken.updated_at <= invalid_since)
-        # No timestamp (Apple omitted it, or a malformed body) means NO EVIDENCE —
-        # the equality guards alone decide. Absence of a timestamp must never read
-        # as "invalid since the epoch", which would authorise every delete.
+        # Reached ONLY with a timestamp in hand: the None arm above `continue`s.
+        # (This comment previously said the equality guards decided on their own
+        # when no timestamp arrived — true before round 6, stale the moment the
+        # fail-safe arm landed. Left corrected rather than deleted because the
+        # drift is the point: it is the third time in this review that prose and
+        # behaviour separated inside one function.)
         outcome = await session.execute(delete(DeviceToken).where(*conditions))
         if outcome.rowcount:
             log.info("reaped dead device row user=%s", user_id)

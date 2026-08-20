@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import datetime as dt
 
 import pytest
@@ -29,7 +30,11 @@ import pytest_asyncio
 
 from aiko_gateway.config import settings
 from aiko_gateway.domain import apns, push_service, users_service
-from aiko_gateway.domain.models import ChannelKind, DeviceToken, Membership
+import sqlalchemy as sa
+
+from aiko_gateway.domain.models import (
+    Channel, ChannelKind, DeviceToken, Membership,
+)
 
 CHANNEL = "01JDMCHANNELDM000000000000"
 
@@ -93,7 +98,13 @@ async def dm(session, monkeypatch):
         session, username="alice", display_name="Alice", password="pw")
     bob = await users_service.create_user(
         session, username="bob", display_name="Bob", password="pw")
+    # A REAL private DM channel row. The service reads the channel itself rather
+    # than trusting the caller's `channel_kind` (cage-match #139 round 6), so a
+    # fixture of bare Membership rows no longer wakes anything — correctly.
     session.add_all([
+        Channel(id=CHANNEL, name="alice-bob", kind=ChannelKind.DM.value,
+                aiko_channel="dm:alice-bob", is_private=True,
+                community_id=sa.null()),
         Membership(channel_id=CHANNEL, user_id=alice.id),
         Membership(channel_id=CHANNEL, user_id=bob.id),
         DeviceToken(user_id=bob.id, platform="apns", token="b" * 64),
@@ -236,6 +247,7 @@ async def test_410_unregistered_reaps_the_row(session, dm, configured, fake_apns
     """Apple making a POSITIVE claim about the device: the app is gone. Reap."""
     alice, bob = dm
     fake_apns.verdict = apns.Verdict.DEAD_TOKEN
+    fake_apns.invalid_since_ms = int(dt.datetime.now(dt.UTC).timestamp() * 1000)
     await _wake(sender_id=alice.id)
     remaining = (await session.execute(
         DeviceToken.__table__.select().where(DeviceToken.user_id == bob.id)
@@ -395,6 +407,107 @@ async def test_the_service_reads_blocks_itself_not_only_from_the_caller(
 
     await _wake(sender_id=alice.id, exclude=set())   # caller supplies no exclusion
     assert fake_apns.sent == [], "the service trusted the caller's empty block set"
+
+
+@pytest.mark.asyncio
+async def test_a_lying_caller_cannot_wake_a_public_room(
+    session, dm, configured, fake_apns
+):
+    """THE DM GATE IS READ, NOT TRUSTED (cage-match #139 round 6, Carnot).
+
+    `channel_kind` arrives as an argument. A future caller could pass "dm" beside
+    a NON-DM channel_id and the sentinel, and wake every member of a public room.
+    Here the caller lies exactly that way — the channel row says 'standard' — and
+    the service must refuse on ground truth.
+    """
+    alice, bob = dm
+    from aiko_gateway.domain.models import DEFAULT_COMMUNITY_ID
+    await session.execute(
+        Channel.__table__.update().where(Channel.id == CHANNEL)
+        .values(kind=ChannelKind.STANDARD.value, aiko_channel="general",
+                community_id=DEFAULT_COMMUNITY_ID)
+    )
+    await session.commit()
+    await _wake(sender_id=alice.id, kind="dm")   # the caller insists it is a DM
+    assert fake_apns.sent == [], "the service took the caller's word for the DM gate"
+
+
+@pytest.mark.asyncio
+async def test_a_three_member_dm_fails_closed(session, dm, configured, fake_apns):
+    """DM safety rests on the room being {sender, one peer}. A malformed
+    3-member kind='dm' channel would otherwise wake everyone in it — the
+    unbounded-fanout case DM-only exists to prevent. Nobody flagged this; it came
+    out of aligning with the video-token path's cardinality assertion."""
+    alice, bob = dm
+    carol = await users_service.create_user(
+        session, username="carol", display_name="Carol", password="pw")
+    session.add_all([
+        Membership(channel_id=CHANNEL, user_id=carol.id),
+        DeviceToken(user_id=carol.id, platform="apns", token="c" * 64),
+    ])
+    await session.commit()
+    await _wake(sender_id=alice.id)
+    assert fake_apns.sent == [], "a 3-member 'DM' woke its members"
+
+
+@pytest.mark.asyncio
+async def test_one_exploding_device_does_not_abandon_the_others(
+    session, dm, configured, monkeypatch
+):
+    """PER-DEVICE BOUNDARY (cage-match #139 round 6, Carnot). `apns.send` can
+    still raise from provider-token signing or client construction, and the only
+    other catch is outside the whole loop — so one bad row would abandon every
+    remaining device. Entropy localizes only where you build the boundary."""
+    alice, bob = dm
+    session.add(DeviceToken(user_id=bob.id, platform="apns", token="z" * 64))
+    await session.commit()
+
+    reached = []
+
+    async def _explode_on_first(device_token, payload, *, collapse_id=None):
+        if device_token.startswith("b"):
+            raise RuntimeError("provider token signing blew up")
+        reached.append(device_token)
+        return apns.SendResult(apns.Verdict.DELIVERED)
+
+    monkeypatch.setattr(apns, "send", _explode_on_first)
+    await _wake(sender_id=alice.id)
+    assert reached == ["z" * 64], "a raising device aborted the rest of the batch"
+
+
+@pytest.mark.asyncio
+async def test_a_410_without_a_timestamp_does_not_reap(
+    session, dm, configured, fake_apns, caplog
+):
+    """NO TIMESTAMP, NO REAP (cage-match #139 round 6, Carnot). The timestamp is
+    the only evidence distinguishing "dead" from "was dead before the reinstall".
+    This module's posture is that failing safe for a reaper means NOT deleting —
+    applied consistently, not only where it was convenient.
+
+    Its control is `test_a_current_410_still_reaps`, which DOES supply one.
+    """
+    alice, bob = dm
+    fake_apns.verdict = apns.Verdict.DEAD_TOKEN
+    fake_apns.invalid_since_ms = None
+    with caplog.at_level(logging.WARNING, logger="aiko_gateway.push"):
+        await _wake(sender_id=alice.id)
+    survivors = (await session.execute(
+        DeviceToken.__table__.select().where(DeviceToken.user_id == bob.id)
+    )).all()
+    assert len(survivors) == 1
+
+    # THE ROW MUST SURVIVE BY DECISION, NOT BY ACCIDENT. Mutation-testing caught
+    # this test passing for the wrong reason: with the guard removed, the code
+    # reached `fromtimestamp(None)`, threw, and the broad outer `except` swallowed
+    # it — the row survived because the delete never ran, which is
+    # indistinguishable from the guard working if you only count survivors. So
+    # assert the REASON, and assert nothing exploded.
+    assert any("410_without_timestamp" in r.message for r in caplog.records), (
+        "the row survived, but not via the no-timestamp guard"
+    )
+    assert not any(r.exc_info for r in caplog.records), (
+        "the row survived because something threw, not because the guard fired"
+    )
 
 
 def test_verdict_mapping_is_narrow():
