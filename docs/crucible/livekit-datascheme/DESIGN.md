@@ -1,6 +1,10 @@
 # DESIGN — `webrtc://` DataScheme (Cast)
 
-Status: **RE-CAST round 2 after Temper round 2 — UN-STRUCK (needs a round-3 strike before build).**
+Status: **STRUCK in round 3 — RECAST, and the ≤3-round budget is EXHAUSTED. NOT build-ready.**
+See [`TEMPER-round3.md`](TEMPER-round3.md). All four families RECAST; none moved the spine.
+The candidate **SPLITS**: the transport half (D1/D6/D7 + a new seat-reaper and epoch fold) is
+close and instrumented; the identity half (D2/D3/D4) is still at Cast stage and must be forged
+separately. Do NOT build from the sections below until the round-3 folds land.
 Target repo: `aiko_services` (Andy Gelme's) via fork PR — NOT a unilateral commit.
 
 **Renamed `livekit://` → `webrtc://`.** Andy, 2026-08-12: *"The DataScheme references the
@@ -189,8 +193,17 @@ the SFU `--dev` key.
 
 ## Status
 
-**UN-STRUCK.** This round-2 re-cast has not itself faced a strike; per the crucible's own rule,
-a substantial post-Temper recast is un-tempered until struck. Round 3 of a ≤3-round budget.
+**STRUCK, round 3 — RECAST, budget exhausted, NOT build-ready.** Full 4-way panel; all four
+RECAST, none moved the spine (the in-process default is now settled across two rounds). The
+round-3 folds are in [`TEMPER-round3.md`](TEMPER-round3.md) and are NOT yet applied below.
+
+The headline correction to D1, reached independently by all four families: **an abandoned Room
+is not a dead Room.** It still holds an SFU participant seat, ICE/TURN allocations and decoder
+state — none of which a thread/fd count can see — and D1's fail-closed restart policy then
+blocks on that ghost, converting a hostile teardown into an *unmeasured outage of the
+capability*. The design owes a **seat reaper** (LiveKit RoomService `RemoveParticipant`, new
+surface the island has never touched) and **generational identity** so epoch N+1 is never
+blocked by epoch N's corpse.
 
 ---
 
