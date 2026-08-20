@@ -228,12 +228,18 @@ async def lifespan(app: FastAPI):
                 gossip_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await gossip_task
-            # Close the pooled APNs HTTP/2 connection (#3267). Lazily created on
-            # the first wake, so on an island with push unconfigured — every
-            # island today — this is a no-op. Imported here rather than at module
-            # scope to keep the import graph of `main` unchanged for the
+            # Push shutdown, IN THIS ORDER (#3267; cage-match #139 Maxwell+Carnot).
+            # DRAIN the in-flight wake tasks FIRST, THEN close the pooled APNs
+            # HTTP/2 connection — closing the shared client while a wake is
+            # mid-send tears the connection out from under it, and the resulting
+            # error is swallowed by wake_for_message's broad except as a
+            # misleading "wake failed". The ordering IS the fix; do not swap
+            # these two lines. Both are no-ops on an island with push
+            # unconfigured (every island today). Imported here rather than at
+            # module scope to keep the import graph of `main` unchanged for the
             # clean-checkout route-table tests.
-            from .domain import apns
+            from .domain import apns, push_service
+            await push_service.aclose()
             await apns.aclose()
     finally:
         # Outermost: runs whether startup raised before yield or cleanup raised.

@@ -491,6 +491,44 @@ class Settings(BaseSettings):
                 "push at Apple's door, which is indistinguishable on the handset "
                 "from push being switched off. Refusing to boot."
             )
+        if all(_apns.values()):
+            # PRESENCE IS NOT PARSEABILITY (cage-match #139, Maxwell). The guard
+            # above earns its keep by failing "where an operator is watching,
+            # rather than at first ring" — but truthiness alone lets the single
+            # most common dotenv mistake straight through: a PEM pasted with
+            # literal backslash-n instead of real newlines. That boots clean,
+            # then `jwt.encode` raises on the first ring, gets swallowed by
+            # push_service's broad except, and logs "wake failed" forever. The
+            # invisible failure the guard exists to prevent, one layer deeper.
+            #
+            # So actually LOAD the key, and require it to be EC: ES256 is an
+            # elliptic-curve algorithm, and an RSA .p8 (or an App Store Connect
+            # key pasted by mistake — they look identical on disk) satisfies
+            # every presence check and cannot sign a single push.
+            from cryptography.hazmat.primitives.asymmetric import ec
+            from cryptography.hazmat.primitives.serialization import (
+                load_pem_private_key,
+            )
+            try:
+                _key = load_pem_private_key(
+                    self.apns_private_key.encode(), password=None)
+            except Exception as ex:
+                raise ValueError(
+                    "apns_private_key is not a readable PEM private key "
+                    f"({type(ex).__name__}). The usual cause is a .env that "
+                    r"contains the literal two characters \n instead of real "
+                    "newlines — check the key survived transport intact. "
+                    "Refusing to boot rather than failing invisibly at the "
+                    "first ring."
+                ) from ex
+            if not isinstance(_key, ec.EllipticCurvePrivateKey):
+                raise ValueError(
+                    "apns_private_key parses but is not an elliptic-curve key "
+                    f"(got {type(_key).__name__}). APNs provider tokens are "
+                    "ES256, so only an EC key can sign them — this is most "
+                    "likely the wrong .p8 (an App Store Connect API key looks "
+                    "identical on disk). Refusing to boot."
+                )
 
         # A2 (crucible-09 Phase A): `e2ee` is schema-reserved for Phase B and
         # HARD-REJECTED in EVERY environment until MLS lands. Advertising an

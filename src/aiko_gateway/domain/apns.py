@@ -85,6 +85,17 @@ class Verdict(enum.Enum):
     # provider key, wrong environment). NEVER reap on this — see `_verdict`.
     REJECTED = "rejected"
     # Network error, 429, or a 5xx. The device may be perfectly fine.
+    #
+    # DROPPED, DELIBERATELY — there is no retry, and that is a decision rather
+    # than an omission (cage-match #139: the member read as though it fed a retry
+    # loop that does not exist, sending the next reader looking for one). A wake
+    # carries `apns-expiration` of 60s because a ring that surfaces late is worse
+    # than no ring; a retry that outlives that window delivers nothing, and one
+    # inside it would have to fire within seconds of a failure Apple is already
+    # rate-limiting. So a transient failure means this particular call does not
+    # ring — the message itself is durable and the recipient still sees it on
+    # next open. If retry is ever added it belongs here with a deadline derived
+    # from the same expiration constant, not a generic backoff.
     TRANSIENT = "transient"
 
 
@@ -204,9 +215,21 @@ def _verdict(status: int, reason: str) -> Verdict:
     """
     if status == 200:
         return Verdict.DELIVERED
-    if status == 410 or (status == 400 and reason == "Unregistered"):
-        # 410 is the documented code; the 400 arm is belt-and-braces for the same
-        # positive claim arriving with a different status.
+    if status == 410:
+        # 410 Unregistered — the ONLY reaping condition, and the reason string is
+        # deliberately not consulted: the status alone is Apple's positive claim.
+        #
+        # An earlier revision also reaped `400` carrying reason "Unregistered", as
+        # "belt-and-braces for the same claim arriving with a different status".
+        # Carnot killed it (cage-match #139) and was right on two counts. First it
+        # CONTRADICTED THE DOCSTRING DIRECTLY ABOVE IT, which says 410 only — the
+        # code and its own stated rule had drifted inside one function, which is
+        # the worst place for a reader to have to adjudicate. Second, the
+        # combination is undocumented by Apple and was untested, so it was an
+        # UNVERIFIED WIDENING of the single operation in this module that destroys
+        # state irrecoverably. Belt-and-braces is a fine instinct for a guard and a
+        # bad one for a reaper: extra arms on a guard cost a false refusal, extra
+        # arms on a reaper cost a deleted row that nothing can rebuild.
         return Verdict.DEAD_TOKEN
     if status == 429 or status >= 500:
         return Verdict.TRANSIENT

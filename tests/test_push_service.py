@@ -20,7 +20,9 @@ Built from the domain services only (never `main`), keeping the suite's
 """
 from __future__ import annotations
 
+import asyncio
 import contextlib
+import datetime as dt
 
 import pytest
 import pytest_asyncio
@@ -253,6 +255,15 @@ def test_verdict_mapping_is_narrow():
     """The mapping itself, at the unit level — the reaping rule stated once."""
     assert apns._verdict(200, "") is apns.Verdict.DELIVERED
     assert apns._verdict(410, "Unregistered") is apns.Verdict.DEAD_TOKEN
+    # 410 reaps on STATUS alone; the reason string is not consulted.
+    assert apns._verdict(410, "") is apns.Verdict.DEAD_TOKEN
+    # A 400 carrying reason "Unregistered" must NOT reap (cage-match #139,
+    # Carnot). An earlier revision accepted this as belt-and-braces, which
+    # contradicted the docstring one line above it and widened the only
+    # state-destroying operation in the module on an undocumented, untested
+    # combination. Extra arms on a guard cost a false refusal; extra arms on a
+    # reaper cost a row nothing can rebuild.
+    assert apns._verdict(400, "Unregistered") is apns.Verdict.REJECTED
     # Config-shaped refusals: OURS to fix, never the device's fault.
     assert apns._verdict(400, "BadDeviceToken") is apns.Verdict.REJECTED
     assert apns._verdict(400, "DeviceTokenNotForTopic") is apns.Verdict.REJECTED
@@ -327,6 +338,73 @@ async def test_a_user_with_no_device_is_a_silent_no_op(session, dm, configured,
     await session.commit()
     await _wake(sender_id=alice.id)
     assert fake_apns.sent == []
+
+
+@pytest.mark.asyncio
+async def test_a_banned_peer_is_not_woken(session, dm, configured, fake_apns):
+    """Ban is an auth-INGRESS gate, so a suspended account keeps its membership
+    row and would otherwise still get its handset rung. The block layer traverses
+    the push path structurally (nothing can be written); the ban layer does not,
+    because nothing between `create_outbound` and the wake consults it."""
+    alice, bob = dm
+    bob.banned_at = dt.datetime.now(dt.UTC)
+    await session.commit()
+    await _wake(sender_id=alice.id)
+    assert fake_apns.sent == []
+
+
+# --------------------------------------------------------------------------
+# Lifecycle: scheduling and shutdown.
+# --------------------------------------------------------------------------
+
+def test_schedule_wake_never_raises_without_a_loop(configured):
+    """`asyncio.create_task` raises RuntimeError with no running loop or a
+    closing one. This is called synchronously from the WS send path, OUTSIDE any
+    try/except — unguarded it could take down the message path the whole module
+    swears it cannot touch (cage-match #139). Called here from a plain sync
+    context, which is exactly the no-running-loop case."""
+    push_service.schedule_wake(
+        channel_id=CHANNEL, channel_kind="dm",
+        body=push_service.CALL_INVITE_BODY,
+        sender_id="someone", exclude_user_ids=set(),
+    )  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_aclose_drains_in_flight_wakes_before_the_client_closes():
+    """`_in_flight` (stop the GC eating a wake) and `apns.aclose()` (stop leaking
+    the connection) are each correct alone and collided: closing the shared
+    client mid-send tore the connection out from under a live task, surfacing as
+    a misleading "wake failed". Draining is the fix, and the ordering is the
+    contract — so prove the drain actually waits."""
+    finished = []
+
+    async def _slow_wake():
+        await asyncio.sleep(0.05)
+        finished.append(True)
+
+    task = asyncio.create_task(_slow_wake())
+    push_service._in_flight.add(task)
+    task.add_done_callback(push_service._in_flight.discard)
+
+    await push_service.aclose(timeout=5.0)
+    assert finished == [True], "aclose returned before the in-flight wake finished"
+    assert not push_service._in_flight
+
+
+@pytest.mark.asyncio
+async def test_aclose_is_bounded_and_cancels_a_hung_wake():
+    """Bounded, not unbounded: shutdown must not hang on an unreachable Apple.
+    A lost wake at shutdown beats a gateway that will not stop."""
+    async def _hangs_forever():
+        await asyncio.sleep(3600)
+
+    task = asyncio.create_task(_hangs_forever())
+    push_service._in_flight.add(task)
+    task.add_done_callback(push_service._in_flight.discard)
+
+    await push_service.aclose(timeout=0.05)
+    assert task.cancelled() or task.done()
 
 
 @pytest.mark.asyncio

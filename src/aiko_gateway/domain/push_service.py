@@ -56,7 +56,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..config import settings
 from ..db import SessionLocal
 from . import apns
-from .models import DeviceToken, Membership, Platform
+from .models import ChannelKind, DeviceToken, Membership, Platform, User
 from .rate_limit import limiter
 
 log = logging.getLogger("aiko_gateway.push")
@@ -98,8 +98,14 @@ def should_wake(channel_kind: str, body: str) -> bool:
     Lives here, next to the sender, rather than being re-derived at each call
     site — the same discipline as `messages_service.should_federate`, and for the
     same reason: a second send path must not be able to forget the gate.
+
+    Compares against `ChannelKind.DM`, never a bare "dm" literal (cage-match
+    #139, Carnot): the closed set already exists and drives the DB CHECK on
+    `channels.kind`, so a magic string here would be entropy injected at exactly
+    the policy gate — and a rename of the enum member would leave this predicate
+    silently matching nothing, i.e. push quietly switching itself off.
     """
-    return channel_kind == "dm" and is_call_invite(body)
+    return channel_kind == ChannelKind.DM.value and is_call_invite(body)
 
 
 def _payload(channel_id: str) -> dict:
@@ -142,11 +148,23 @@ async def _recipients(session: AsyncSession, *, channel_id: str, sender_id: str,
     roster, and a safety gate reading a social projection fails OPEN the moment
     the projection starts hiding people (the same reasoning that put raw rows in
     the video-token path, cage-match #122 rd8).
+
+    BANNED ACCOUNTS ARE EXCLUDED (cage-match #139, Maxwell). A suspended user
+    keeps their membership row — ban is an auth-ingress gate, not a membership
+    teardown — so a raw-rows read would happily wake the handset of an account
+    that is not permitted to act on this island. The block layer traverses the
+    push path structurally; the BAN layer had no such luck, because nothing
+    between `create_outbound` and here consults it. `banned_at IS NULL` is the
+    same condition `users_service.is_banned` tests, applied in the join rather
+    than after it so a banned peer is never even a candidate.
     """
     rows = (await session.execute(
-        select(Membership.user_id).where(
+        select(Membership.user_id)
+        .join(User, User.id == Membership.user_id)
+        .where(
             Membership.channel_id == channel_id,
             Membership.user_id != sender_id,
+            User.banned_at.is_(None),
         )
     )).scalars().all()
     return [uid for uid in rows if uid not in exclude_user_ids]
@@ -163,6 +181,29 @@ async def _wake_user(session: AsyncSession, user_id: str, payload: dict,
         # Logged at debug because it is the normal state for every account that
         # has not yet run a build with push wired in.
         log.debug("wake skipped user=%s reason=no_devices", user_id)
+        return
+
+    # BUDGET IS SPENT HERE, after we know there is something to spend it on
+    # (cage-match #139, Maxwell). Charging it in the caller metered *attempts to
+    # wake an unwakeable user* — every call invitation to a peer with no
+    # registered device burned a slot — which is not what the setting says it
+    # meters, and would have throttled the first real wake of a user who had
+    # been called a few times before installing a push-capable build.
+    #
+    # Keyed on the RECIPIENT: waking interrupts a person wherever they are, so
+    # the budget protects the person being interrupted rather than throttling per
+    # sender, which a second sender would simply route around.
+    #
+    # SCOPE (Carnot): this counter is PER-PROCESS. The gateway is single-worker
+    # by construction (worker_guard), so per-process is the whole population
+    # today — but `GATEWAY_ALLOW_MULTIWORKER=true` or any horizontal scaling
+    # multiplies this budget by the worker count. Waking a handset is louder than
+    # delivering a message, so that limitation is worth stating rather than
+    # inheriting silently: a shared-storage counter is the fix if this ever scales.
+    allowed, _ = limiter.hit("apns_wake", user_id,
+                             settings.apns_wake_per_recipient_per_minute, 60.0)
+    if not allowed:
+        log.warning("wake throttled user=%s", user_id)
         return
 
     dead: list[str] = []
@@ -212,15 +253,8 @@ async def wake_for_message(*, channel_id: str, channel_kind: str, sender_id: str
                 exclude_user_ids=exclude_user_ids)
             payload = _payload(channel_id)
             for user_id in recipients:
-                allowed, _ = limiter.hit(
-                    "apns_wake", user_id,
-                    settings.apns_wake_per_recipient_per_minute, 60.0)
-                if not allowed:
-                    # Keyed on the RECIPIENT, so the budget protects the person
-                    # being interrupted rather than throttling per sender — which
-                    # a second sender would simply route around.
-                    log.warning("wake throttled user=%s channel=%s", user_id, channel_id)
-                    continue
+                # The per-recipient budget is charged inside _wake_user, once the
+                # recipient is known to have a device worth waking.
                 await _wake_user(session, user_id, payload, collapse_id=channel_id)
     except Exception:
         # Deliberately broad. This runs detached in a background task, where an
@@ -241,11 +275,71 @@ def schedule_wake(*, channel_id: str, channel_kind: str, sender_id: str,
 
     Cheap short-circuit before scheduling anything: on an island with no APNs
     credentials (every island today) this is a predicate call and no task at all.
+
+    NEVER RAISES — and the guard is the point (cage-match #139, Maxwell+Carnot).
+    `wake_for_message` protects the send path from a push that FAILS, but this
+    function is where the push is *scheduled*, and scheduling has its own failure
+    mode: `asyncio.create_task` raises `RuntimeError` when there is no running
+    loop or the loop is closing. Unguarded, that propagates out of `_handle_send`
+    — so a client disconnecting during shutdown could take down the very message
+    path this module swears it cannot touch. The doctrine has to cover the
+    scheduling, not only the sending.
+
+    (Carnot's related note: this needs a running event loop, so a future
+    synchronous or off-loop caller gets the same RuntimeError. The guard turns
+    that from a crash into a logged no-op, which is the right failure for an
+    optional capability, but such a caller should pass a loop rather than rely
+    on it.)
     """
     if not apns.is_configured() or not should_wake(channel_kind, body):
         return
-    task = asyncio.create_task(wake_for_message(
+    coro = wake_for_message(
         channel_id=channel_id, channel_kind=channel_kind, sender_id=sender_id,
-        body=body, exclude_user_ids=exclude_user_ids))
+        body=body, exclude_user_ids=exclude_user_ids)
+    try:
+        task = asyncio.create_task(coro)
+    except RuntimeError:
+        # No running loop / loop closing. The message is already durable and
+        # already fanned out; only the wake is lost.
+        #
+        # close() the orphan explicitly: a coroutine created but never awaited
+        # emits `RuntimeWarning: coroutine was never awaited` at GC time. That
+        # warning would surface on exactly the shutdown path this guard exists to
+        # make quiet, turning a handled condition back into log noise that reads
+        # like a bug.
+        coro.close()
+        log.warning("wake not scheduled channel=%s reason=no_running_loop", channel_id)
+        return
     _in_flight.add(task)
     task.add_done_callback(_in_flight.discard)
+
+
+async def aclose(timeout: float = 5.0) -> None:
+    """Drain in-flight wakes, then let the transport close. Call BEFORE
+    ``apns.aclose()``.
+
+    A FIX-INTERACTION DEFECT, found by two reviewers independently (cage-match
+    #139, Maxwell + Carnot). `_in_flight` and `apns.aclose()` are each correct in
+    isolation and collided: `_in_flight` exists so the GC cannot eat a live wake,
+    and `apns.aclose()` exists so the pooled HTTP/2 connection is not leaked — but
+    closing the shared client while a task is mid-`send()` tears the connection out
+    from under it. The task then dies inside `wake_for_message`'s broad `except`
+    and logs "wake failed", which is a misleading epitaph for an orderly-shutdown
+    bug: it reads as Apple's fault forever.
+
+    Holding a strong reference is not ownership (Carnot). Ownership is draining.
+
+    BOUNDED, not unbounded: shutdown must not hang on an unreachable Apple. Wakes
+    still running after `timeout` are cancelled — a lost wake during shutdown is
+    the correct trade against a gateway that will not stop.
+    """
+    if not _in_flight:
+        return
+    pending = set(_in_flight)
+    done, still_running = await asyncio.wait(pending, timeout=timeout)
+    for task in still_running:
+        task.cancel()
+    if still_running:
+        # Let the cancellations actually land before the caller closes the client.
+        await asyncio.gather(*still_running, return_exceptions=True)
+        log.warning("cancelled %d in-flight wake(s) at shutdown", len(still_running))
