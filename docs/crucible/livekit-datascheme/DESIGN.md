@@ -45,7 +45,23 @@ Concretely, `destroy_sources`:
 4. joins the bridge thread against `T_join`; on expiry, logs loudly and marks the scheme
    **degraded**.
 
-**Why abandoning is safe, and why this is now an evidenced claim rather than a hope:** the
+**MEASURED, round 3 follow-up (F8) — abandoning is safe for the PROCESS and catastrophic for
+the SEAT.** The server's roster says: clean disconnect frees the seat in 0.0s; a SIGKILLed
+client in 20.1s; a SIGSTOPped client in 22.1s; **an abandoned Room in a still-living process is
+still seated at 240s.** Its native threads keep answering keepalives, so the SFU never notices.
+So D1 must NOT say "the Room is declared dead" — it is **LOCALLY ABANDONED, REMOTELY LIVE**, and
+the seat is reclaimed only by the reaper below. Without the reaper the fail-closed policy denies
+the capability indefinitely.
+
+**The seat reaper + generational identity (mandatory, not optional).** The scheme mints
+`<base>#<epoch>` so a new bridge is a DIFFERENT identity from the corpse and last-session-wins
+cannot fire between them; it then calls LiveKit `RemoveParticipant` to reclaim the stale seat.
+Epoch first, reap second: correctness never depends on the reap succeeding (measured: eviction
+in 0.01s, with bystander and keep-identity controls proving it cannot overreach). **Open trust
+question:** `RemoveParticipant` authenticates with API master credentials, so the island — which
+already holds them under D3 — is the better owner than every pipeline host.
+
+**Why abandoning is safe for the process, and why this is now an evidenced claim rather than a hope:** the
 spike's hostile arm A *is* exactly this operation — `wait_for(disconnect(), T)`, timeout fires,
 Room abandoned, reference dropped — repeated 8× against a black-holed SFU, with **0.00 thread
 and 0.00 fd growth per cycle**. Python cannot kill the stuck coroutine and this design stops

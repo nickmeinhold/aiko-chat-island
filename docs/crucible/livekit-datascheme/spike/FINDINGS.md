@@ -202,6 +202,68 @@ died — so `BrokenPipeError` killed the watchdog task before it could stop anyt
 exactly the orphan it existed to prevent. State first, then log, and logging must never be
 able to prevent exiting.
 
+## F8 — the abandoned Room's seat is IMMORTAL, and that makes the reaper mandatory
+
+Round 3 struck D1 4/4 on the claim that "declared dead" is a local statement the SFU never
+hears. Measured (`measure_seat.py`), against the server's own roster via `ListParticipants`:
+
+| what happened to the client | seat freed after |
+|---|---|
+| clean `disconnect()` — **positive control** | **0.0 s** |
+| process SIGKILLed (OS closes the socket) | **20.1 s** |
+| process SIGSTOPped (socket open, no answers) | **22.1 s** |
+| **Room abandoned, process still alive — D1's case** | **no departure observed in 240 s** |
+
+The control matters: it proves the poller can *see* a departure, so "still seated" is a
+finding rather than a blind instrument.
+
+**LiveKit reaps a silent peer in ~20 s. But an abandoned Room in a living process is not
+silent** — its native WebRTC threads keep answering keepalives, so the SFU sees a perfectly
+healthy participant and never reaps it. D1's ghost is therefore **not a bounded 20-second
+nuisance; it is unbounded**, and it is *worse* than the sidecar orphan the design rejected:
+a sidecar orphan dies when something kills it, while this one is actively kept alive by a
+process that is working correctly.
+
+Claim scope: "no departure observed in 240 s" — more than 10× the silent-peer reap, with the
+mechanism (answered keepalives) understood. That is enough to establish a different regime; it
+is not a proof of "forever", and it is not claimed as one.
+
+**Consequence for the design:** the seat reaper stops being a good idea the panel suggested and
+becomes the only thing that makes D1 viable. Without it, D1's fail-closed restart policy denies
+the capability indefinitely — the self-DoS all four families predicted.
+
+## F9 — the reaper works, and cannot overreach
+
+`reaper.py` + `test_reaper.py`. Built a real immortal ghost, then reclaimed it. Red-then-green
+with the over-reach controls, because the reaper authenticates with **API master credentials**
+and an over-broad one would be a room-wide kick primitive on every host running a pipeline:
+
+| check | result |
+|---|---|
+| ghost genuinely seated before the reap (RED control) | `robot-7#1` present |
+| ghost evicted | yes, in **0.01 s** |
+| bystander `someone-else` untouched | survived |
+| `keep` identity `robot-7#2` untouched | survived |
+| reap against a nonexistent room | success, not error |
+
+**Two design properties, deliberately:**
+
+- **Epoch before reap.** The scheme mints `<base>#<epoch>` and connects as a NEW generation, so
+  epoch N+1 can never collide with epoch N's corpse under last-session-wins. The reap is then
+  *cleanup*, not a precondition — correctness never depends on it succeeding, so a failed reap
+  costs a lingering ghost rather than a broken stream.
+- **The reaper can only reclaim its own base identity.** Not a moderation tool. Anything
+  broader puts room-wide eviction on a robot host.
+
+**Named, not assumed:** the island has never called the LiveKit server API, and
+`mint_room_token` deliberately withholds `roomAdmin`/`roomList`. `RemoveParticipant` needs the
+API key/secret — master credentials for every room on that SFU — which is a real argument that
+the **island** should own the reaper (it already holds those creds and is the token authority
+under D3) rather than every pipeline host holding them.
+
+Integrated into `scheme_webrtc.create_sources` and re-verified end to end: `PIPELINE_PIXEL_OK`,
+5/5 frames, 0 orphaned sidecars, and the negative control still fails closed.
+
 ## Instrument failures caught (recorded because they were nearly reported as results)
 
 1. **`encode_ms` = 64 ms/frame** in the first JPEG run — a 50× overstatement. PIL encodes

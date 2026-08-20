@@ -38,6 +38,7 @@ extras:
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import queue
 import signal
@@ -48,6 +49,7 @@ import threading
 
 import aiko_services as aiko
 import zmq
+from reaper import ReapResult, SeatReaper, epoch_identity
 
 
 __all__ = ["DataSchemeWebRTC"]
@@ -60,6 +62,27 @@ SIDECAR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sidecar.py")
 READY_TIMEOUT_S = 30.0      # bounded wait for the child to report subscribed
 TERM_GRACE_S = 5.0          # how long SIGTERM gets before SIGKILL (F2)
 KILL_GRACE_S = 5.0          # how long SIGKILL gets before we admit defeat loudly
+REAP_TIMEOUT_S = 10.0       # the reap is CLEANUP, not a precondition — never block a stream on it
+
+
+def _run_async(coro):
+    """Run a coroutine to completion from a thread that may or may not have a loop."""
+    result = {}
+
+    def runner():
+        try:
+            result["value"] = asyncio.run(coro)
+        except Exception as exc:                      # noqa: BLE001 — reported, never raised
+            result["error"] = exc
+
+    thread = threading.Thread(target=runner, daemon=True)
+    thread.start()
+    thread.join(timeout=REAP_TIMEOUT_S)
+    if "error" in result:
+        raise result["error"]
+    if "value" not in result:
+        raise TimeoutError(f"seat reap did not finish within {REAP_TIMEOUT_S}s")
+    return result["value"]
 
 
 class DataSchemeWebRTC(aiko.DataScheme):
@@ -97,9 +120,40 @@ class DataSchemeWebRTC(aiko.DataScheme):
         self.terminate = False
         self.child_died = False
 
+        # GENERATIONAL IDENTITY + SEAT REAP, in that order. Measured (`measure_seat.py`):
+        # an abandoned Room in a still-living process holds its SFU seat with no departure
+        # observed in 240s, against ~22s for a merely silent peer — its native threads keep
+        # answering keepalives, so the server sees a healthy participant. A new stream that
+        # reused the same identity would collide with that ghost under LiveKit's
+        # last-session-wins.
+        #
+        # The epoch makes collision impossible by construction (N+1 is a different identity
+        # from N, so there is nothing to fail closed against), and the reap then reclaims the
+        # corpse's seat. Order matters: epoch FIRST so correctness never depends on the reap
+        # succeeding; the reap is cleanup, not a precondition.
+        base = f"webrtc-scheme-{os.getpid()}"
+        identity = epoch_identity(base)
+        # Run the async reap in its OWN thread rather than `asyncio.run` on this one:
+        # create_sources is documented as running on the pipeline thread, but a caller that
+        # already has a running loop would make a bare asyncio.run raise, and a seat reaper
+        # that explodes on an implementation detail of its caller is worse than no reaper.
+        try:
+            reap = _run_async(SeatReaper().reap(room, base, keep=identity))
+        except Exception as exc:                      # noqa: BLE001
+            reap = ReapResult(room=room, base=base, evicted=[], skipped=[], error=repr(exc))
+        if reap.evicted:
+            _LOGGER.info(f"create_sources(): reclaimed {len(reap.evicted)} stale seat(s) "
+                         f"for {base} in {room}: {reap.evicted}")
+        elif not reap.ok:
+            # Non-fatal BY DESIGN: the epoch already guarantees we will not collide. A failed
+            # reap costs a lingering ghost, not a broken stream, so it is logged and stepped
+            # over rather than failing the whole source closed.
+            _LOGGER.warning(f"create_sources(): seat reap failed ({reap.error}) — continuing "
+                            f"on a fresh epoch; a stale seat may linger")
+
         self.child = subprocess.Popen(
             [sys.executable, SIDECAR, "--wire", str(wire), "--zmq", self.zmq_url,
-             "--identity", f"webrtc-scheme-{os.getpid()}"],
+             "--identity", identity],
             env=dict(os.environ, LK_ROOM=room),
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         _LOGGER.debug(f"create_sources(): sidecar pid={self.child.pid} room={room} "
