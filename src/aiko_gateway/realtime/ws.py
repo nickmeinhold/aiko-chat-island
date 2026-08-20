@@ -14,7 +14,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
 from ..db import SessionLocal
 from ..domain import (
     acl, auth_session, echo, mentions, messages_service,
-    moderation_service, signing,
+    moderation_service, push_service, signing,
 )
 from . import envelopes
 from .hub import Connection
@@ -208,6 +208,18 @@ async def _handle_send(gw, conn: Connection, user, frame: dict) -> None:
         # filter). Computed inside the session; applied in-memory by the hub so
         # fanout stays one query, not one-per-connection.
         exclude = await moderation_service.blocked_pair_user_ids(session, user.id)
+        # SNAPSHOT the values the wake needs, INSIDE the session (cage-match #139
+        # round 5, Carnot). The scheduling call below happens after this block
+        # exits, and reading `channel.id` / `channel.kind` there is an attribute
+        # access on a DETACHED instance — it works today only because the
+        # sessionmaker sets expire_on_commit=False. That is a property of a
+        # config line in db.py, not of this code, and the failure it would cause
+        # is a lazy load with no session: either a swallowed background error or
+        # an exception on the send path, depending where it trips. Free to fix,
+        # so fix it rather than depend on a setting three files away. (The
+        # comment below already claimed plain values crossed the boundary; now
+        # they actually do.)
+        wake_channel_id, wake_channel_kind = channel.id, channel.kind
 
     # Ack the sender (optimistic-send reconciliation: client_msg_id -> server id).
     await conn.send(envelopes.ack(frame["client_msg_id"], row.id, view["created_at"]))
@@ -226,3 +238,19 @@ async def _handle_send(gw, conn: Connection, user, frame: dict) -> None:
         # Fan the persisted message out to channel subscribers (local; both DM members).
         await gw.hub.fanout(channel.id, envelopes.message_frame(view),
                             exclude_user_ids=exclude)
+        # Wake a CLOSED handset the fanout above could not reach (#3267/#3253). The
+        # fanout only reaches a live socket; an app that is not running has none, so
+        # without this a call to a closed phone is missed silently and permanently.
+        #
+        # Placed AFTER the write and the fanout, and deliberately not awaited: the
+        # decision of WHETHER to wake is the domain's (push_service.should_wake), and
+        # the push itself is a round trip to Apple that the sender's ack must never
+        # wait on. Guarded by `created` like federation is, so a resend of the same
+        # client_msg_id cannot ring the same phone twice.
+        #
+        # Plain values, not `channel`/`row`: this outlives the `async with` session
+        # above, and a detached ORM instance raises on attribute access.
+        push_service.schedule_wake(
+            channel_id=wake_channel_id, channel_kind=wake_channel_kind,
+            sender_id=user.id, body=frame["body"], exclude_user_ids=exclude,
+        )
