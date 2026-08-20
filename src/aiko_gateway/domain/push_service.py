@@ -12,17 +12,30 @@ send path can skip them. So the route, any in-process caller and the tests all
 enter through `schedule_wake`; `apns.py` underneath is pure transport and holds
 no policy at all.
 
-THE GATES, and the order they run in:
+THE GATES, IN THE ORDER THEY ACTUALLY RUN. This list is kept exhaustive on
+purpose: it listed FIVE while the code ran EIGHT, which is the same
+prose-states-an-invariant-the-code-does-not defect that this review found four
+separate times inside individual functions (see the notes at each site). A gate
+list is the most tempting place for it, because nothing reads a list.
 
+  0. **Downstream of an accepted message.** Structural, not a check written here
+     — it is why the block and idempotency rules traverse for free. See below.
   1. **Configured.** No credentials → this island never pushes. Silent and total.
-  2. **A call invitation in a DM.** Not every message wakes a phone. Today the
-     ONLY trigger is the pinned call-invite sentinel in a `kind='dm'` channel.
-  3. **Downstream of an accepted message.** This is the load-bearing one and it
-     is structural rather than a check written here — see below.
-  4. **Not a blocked pair.** Belt-and-braces over gate 3.
-  5. **A per-recipient wake budget.** Waking is louder than sending.
+  2. **The pinned sentinel, in a channel the CALLER calls a DM** (`should_wake`).
+     Cheap, and deliberately not trusted on its own — gate 3 re-reads it.
+  3. **The channel row really is a private DM**, read from the DB, because a
+     caller could otherwise name a public room and wake all of it.
+  4. **Exactly one peer**, counted on the RAW membership graph before any
+     eligibility filter — structure first, so a 3-member "DM" cannot slip through
+     by having its extra member filtered out.
+  5. **The peer is not banned.** Ban is an auth-INGRESS gate; nothing between
+     `create_outbound` and here consults it.
+  6. **Not a blocked pair** — the caller's fanout set UNIONED with this service's
+     own read, so neither is trusted alone.
+  7. **The peer has an APNs-sendable device.** No device, no budget spent.
+  8. **Within the per-recipient wake budget.** Waking is louder than sending.
 
-GATE 3, STATED PROPERLY, BECAUSE IT IS WHY THE BLOCK RULES TRAVERSE FOR FREE.
+GATE 0, STATED PROPERLY, BECAUSE IT IS WHY THE BLOCK RULES TRAVERSE FOR FREE.
 A wake can only ever be scheduled AFTER `messages_service.create_outbound`
 returned `created=True` for the triggering message. That mutator already refuses
 a DM send between blocked parties (`BlockedDmSend`) and is idempotent on
