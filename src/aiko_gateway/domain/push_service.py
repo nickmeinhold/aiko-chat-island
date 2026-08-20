@@ -245,28 +245,45 @@ async def _recipients(session: AsyncSession, *, channel_id: str, sender_id: str,
         log.warning("wake refused channel=%s reason=not_a_private_dm", channel_id)
         return []
 
-    rows = (await session.execute(
-        select(Membership.user_id)
-        .join(User, User.id == Membership.user_id)
-        .where(
+    # CARDINALITY ON THE RAW MEMBERSHIP GRAPH — no join, no filters (cage-match
+    # #139 round 7, Carnot). The previous revision counted rows that had ALREADY
+    # been ban-filtered, so a malformed THREE-member DM with one banned peer
+    # counted as two members, passed the two-party assertion, and woke the
+    # remaining peer. The channel was still structurally not a DM; only the
+    # sendable-recipient set happened to look like one.
+    #
+    # And the comment sitting right here CLAIMED the count was "from GROUND TRUTH,
+    # asserted before any exclusion is applied" while the query above it applied
+    # one. That is the FOURTH time in this review that prose and behaviour
+    # separated inside a single function — and this instance was written LAST
+    # ROUND, in the fix that swept this very class. Worth leaving on the record:
+    # the drift is not carelessness about comments, it is that a comment states
+    # the invariant you INTENDED and nothing checks it against the code beside it.
+    #
+    # The invariant is MEMBERSHIP cardinality, not sendable-recipient cardinality.
+    peer_ids = (await session.execute(
+        select(Membership.user_id).where(
             Membership.channel_id == channel_id,
             Membership.user_id != sender_id,
-            User.banned_at.is_(None),
         )
     )).scalars().all()
-
-    # Cardinality from GROUND TRUTH, asserted before any exclusion is applied —
-    # a 3-member "DM" must fail closed, not be silently narrowed to whoever
-    # survives the block filter.
-    if len(rows) != 1:
+    if len(peer_ids) != 1:
         log.warning("wake refused channel=%s reason=not_two_party peers=%d",
-                    channel_id, len(rows))
+                    channel_id, len(peer_ids))
         return []
 
-    # Union: the caller's fanout set PLUS our own read. Neither is trusted alone.
+    # ONLY NOW filter for who may actually be woken. Order matters and is the
+    # whole finding: structure first, eligibility second.
+    #   * banned — a suspended account keeps its membership row, and ban is an
+    #     auth-INGRESS gate that nothing between create_outbound and here consults.
+    #   * blocked — the caller's fanout set UNIONED with the service's own read,
+    #     so neither is trusted alone.
+    live = (await session.execute(
+        select(User.id).where(User.id.in_(peer_ids), User.banned_at.is_(None))
+    )).scalars().all()
     blocked = await moderation_service.blocked_pair_user_ids(session, sender_id)
     excluded = set(exclude_user_ids) | blocked
-    return [uid for uid in rows if uid not in excluded]
+    return [uid for uid in live if uid not in excluded]
 
 
 async def _wake_user(session: AsyncSession, user_id: str, payload: dict,

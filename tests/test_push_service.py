@@ -451,6 +451,43 @@ async def test_a_three_member_dm_fails_closed(session, dm, configured, fake_apns
 
 
 @pytest.mark.asyncio
+async def test_a_three_member_dm_with_a_banned_peer_still_fails_closed(
+    session, dm, configured, fake_apns
+):
+    """CARDINALITY IS A STRUCTURAL PROPERTY, NOT A HEADCOUNT OF WHO IS SENDABLE
+    (cage-match #139 round 7, Carnot).
+
+    The previous revision counted rows that had already been ban-filtered, so a
+    malformed THREE-member DM containing one banned peer counted as two, passed
+    the two-party assertion, and woke the remaining peer. The channel was still
+    structurally not a DM — only the sendable set happened to look like one.
+
+    Note what this test needed that the plain 3-member test did not: a BANNED
+    third member. The existing suite had both a 3-member test and a banned-peer
+    test and neither could produce this state, because the bug lives in their
+    INTERACTION. Feature-interaction, not a missing case.
+    """
+    alice, bob = dm
+    carol = await users_service.create_user(
+        session, username="carol", display_name="Carol", password="pw")
+    session.add(Membership(channel_id=CHANNEL, user_id=carol.id))
+    await session.commit()
+    # Carol is banned, so the eligibility filter would remove her — leaving bob
+    # alone and the channel looking two-party.
+    await session.execute(
+        sa.update(sa.table("users", sa.column("id"), sa.column("banned_at")))
+        .where(sa.column("id") == carol.id)
+        .values(banned_at=dt.datetime.now(dt.UTC))
+    )
+    await session.commit()
+
+    await _wake(sender_id=alice.id)
+    assert fake_apns.sent == [], (
+        "a 3-member channel passed the two-party gate because one member was banned"
+    )
+
+
+@pytest.mark.asyncio
 async def test_one_exploding_device_does_not_abandon_the_others(
     session, dm, configured, monkeypatch
 ):
