@@ -44,6 +44,7 @@ everywhere, not a nick.
 | `cert-restart.sh` + `.service`/`.timer` | BOOTSTRAP restart trigger (alarm-driven) |
 | `e2e_media_relay.py` | acceptance gates A (connectivity) + B (exposure) |
 | `e2e_relay_livekit.py` | gate A's engine: a livekit-rtc forced relay-only media client |
+| `webrtc_relay_proof.py` | a real **Chromium** client proving the **TURNS :443** relay carries a call |
 | `test/cert-tree-contract.sh` | contract test: fixture cert trees (host-FS vs docker-volume) |
 
 ## Acceptance gates (both required — see DESIGN §3.4, §4a)
@@ -55,11 +56,33 @@ everywhere, not a nick.
   `turnutils_uclient` gate: LiveKit's embedded TURN is **session-bound**, so there is no
   standalone TURN credential to hand turnutils — the client mints its cred by joining a
   room. Proves the **UDP/3478** relay path.
-  - **KNOWN GAP — TLS/5349 relay is NOT asserted** (proven non-functional 2026-08-11):
-    LiveKit advertises only the UDP TURN to clients (`turn.externalTLS:false`); with UDP
-    blocked, a forced-relay client's peer connection times out. The `:5349` cert is
-    valid — the relay *advertisement* is the gap. Tracked as the `external_tls` task; do
-    not re-add a TLS assertion here until that proves TLS relay works.
+  - **The old TLS/5349 KNOWN-GAP note is SUPERSEDED** (was: "proven non-functional
+    2026-08-11, do not re-add a TLS assertion"). Both boxes advertise
+    `turns:<domain>:443?transport=tcp` alongside the UDP TURN, and a real Chromium client
+    completes a relay-only call over it — measured 2026-08-22 on **both** islands. The
+    port in the gap note was also wrong for the client-facing path: LiveKit advertises
+    `:443` regardless of the configured `tls_port` (enspyr's is still `5349`).
+    `webrtc_relay_proof.py` is the assertion; see below.
+
+- **A2 — TLS relay (`webrtc_relay_proof.py`):** Chromium, relay-only, with the session's
+  ICE servers filtered to `turns:` at the `RTCPeerConnection` boundary so the TLS arm is
+  forced without needing a UDP-blocked vantage. Mint a join token from the box's
+  `LIVEKIT_API_KEY`/`SECRET`, then:
+
+  ```sh
+  LK_URL=wss://livekit.<domain> LK_TOKEN=<minted> TURN_DOMAIN=turn.<domain> \
+    RELAY_ARM=turns ./webrtc_relay_proof.py          # expect exit 0
+  RELAY_NULL_PORT=4443 ... ./webrtc_relay_proof.py   # NULL CONTROL: expect exit 3
+  ```
+
+  **Always run the null arm.** A green from an instrument whose failure mode has never
+  been observed is not evidence. Exit codes: `0` proven, `3` failed, `4` INCONCLUSIVE
+  (the CDN-hosted SDK never loaded — an instrument failure, not a server verdict).
+
+  **Known flake:** 6 of 7 relay-only connects succeeded against imagineering on
+  2026-08-22; one failed at `connect` and did not reproduce over 4 immediate retries. Any
+  gate built on this probe (#3055) must retry with attempt accounting rather than treat a
+  single red as a verdict.
 - **B — exposure (before opening the range to real traffic):**
   - **B1** unauth `ALLOCATE` *positively* rejected (auth-reject marker, not just a
     non-zero exit) — `turnutils_uclient`, no cred needed for the negative test.
