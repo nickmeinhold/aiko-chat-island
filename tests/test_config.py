@@ -674,6 +674,16 @@ _MUST_FORWARD_ENV = {
     "APNS_TOPIC",
     "APNS_PRIVATE_KEY",
     "APNS_USE_SANDBOX",
+    # The fields the totality sweep actually FOUND inert (cage-match PR#141 round 3,
+    # Carnot + Tesla). The inner list said "these may never be excluded" while
+    # omitting the very corpses the outer claim was written for — so any of them could
+    # be walked back into _NOT_FORWARDED behind twenty characters of plausible prose.
+    "OPEN_REGISTRATION",
+    "RATE_LIMIT_ENABLED",
+    "AUTH_RATE_LIMIT",
+    "MAX_REQUEST_BYTES",
+    "PASSKEY_REQUIRE_USER_VERIFICATION",
+    "ISLAND_MODE",
 }
 
 
@@ -839,6 +849,24 @@ def _render_default(default) -> str:
     return str(default)
 
 
+def _render_field_default(field) -> str:
+    """Render a FIELD's effective default, honouring default_factory.
+
+    cage-match PR#141 round 3 (Tesla): `Field(default_factory=list)` also reports
+    `default is PydanticUndefined`, so treating that sentinel as "required" would tell
+    the author of the next modern-style list setting to convert it to `${VAR:?}` — a
+    compose-time hard failure for a field that has a perfectly good default. Consult
+    the factory before concluding a field is required.
+    """
+    from pydantic_core import PydanticUndefined
+
+    if getattr(field, "default_factory", None) is not None:
+        return _render_default(field.default_factory())
+    if field.default is PydanticUndefined:
+        raise _RequiredField
+    return _render_default(field.default)
+
+
 def _settings_field_names() -> set[str]:
     from aiko_gateway.config import Settings
 
@@ -891,7 +919,7 @@ def test_compose_defaults_match_config_defaults():
         if match is None:
             continue  # a non-defaulted form (e.g. `${VAR}`); nothing to compare
         try:
-            expected = _render_default(field.default)
+            expected = _render_field_default(field)
         except _RequiredField:
             # A required field forwarded WITH a default is its own bug: the compose
             # default satisfies the field on every box that does not set it, so the
@@ -967,7 +995,7 @@ def test_no_stale_entries_in_default_may_diverge():
         if var not in env or name not in Settings.model_fields:
             continue
         match = re.fullmatch(r"\$\{" + re.escape(var) + r":-(.*)\}", env[var], re.S)
-        if match and match.group(1) == _render_default(Settings.model_fields[name].default):
+        if match and match.group(1) == _render_field_default(Settings.model_fields[name]):
             no_longer_diverging.append(var)
     assert not no_longer_diverging, (
         "These are listed in _DEFAULT_MAY_DIVERGE but their compose default now "
@@ -1289,3 +1317,61 @@ def test_string_fields_keep_their_whitespace():
         assert Settings().gateway_display_name == "  Padded  ", (
             "a string field must not be silently stripped"
         )
+
+
+def test_must_forward_is_disjoint_from_every_exemption_list():
+    """The never-exclude list must actually be un-excludable.
+
+    cage-match PR#141 round 3 (Carnot MEDIUM, Tesla): _MUST_FORWARD_ENV declares "these
+    may never be excluded", but nothing stopped a name appearing in BOTH it and an
+    exemption list — and `test_exemption_reasons_are_substantive` counts characters,
+    not truth, so a plausible paragraph was enough to reopen the class. Make the two
+    claims contradict each other loudly instead of silently.
+    """
+    # Only _NOT_FORWARDED is an exemption from FORWARDING, which is what
+    # _MUST_FORWARD_ENV asserts. _DEFAULT_MAY_DIVERGE is orthogonal — it says the
+    # forwarded DEFAULT differs from config's, which is perfectly compatible with
+    # "must be forwarded" (APPLE_CLIENT_IDS is both, correctly). An earlier revision
+    # of this test checked both tables and failed on that legitimate pairing.
+    overlap = sorted(set(_MUST_FORWARD_ENV) & set(_NOT_FORWARDED))
+    assert not overlap, (
+        f"{overlap} appear in BOTH _MUST_FORWARD_ENV (may never be excluded) and "
+        "_NOT_FORWARDED (excluded from forwarding). One of the two claims is wrong — "
+        "resolve it in review rather than letting the exemption quietly win."
+    )
+
+
+def test_config_module_has_no_unreachable_code():
+    """No statement may follow a `return` in the same block.
+
+    cage-match PR#141 round 3 (Tesla) — the finding this test exists for. A surgical
+    edit to _normalise_env_strings left the ENTIRE previous implementation sitting
+    after `return data`: dead, unreachable, and invisible to all 1066 passing tests,
+    because a test suite cannot execute code that never runs. It is a booby trap
+    rather than a bug — the next edit that "tidies up the double return" re-arms the
+    crash-loop the function exists to prevent.
+
+    Structural checks are the only instrument that can see this: it fails differently
+    from the tests around it, which is exactly why it catches what they cannot.
+    """
+    import ast
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parent.parent / "src" / "aiko_gateway" / "config.py"
+    tree = ast.parse(src.read_text())
+    unreachable = []
+    for node in ast.walk(tree):
+        body = getattr(node, "body", None)
+        if not isinstance(body, list):
+            continue
+        for i, stmt in enumerate(body[:-1]):
+            if isinstance(stmt, (ast.Return, ast.Raise, ast.Continue, ast.Break)):
+                nxt = body[i + 1]
+                unreachable.append(
+                    f"{type(nxt).__name__} at line {nxt.lineno} follows a "
+                    f"{type(stmt).__name__} at line {stmt.lineno}"
+                )
+    assert not unreachable, (
+        f"config.py contains unreachable statements: {unreachable}. Dead code in a "
+        "boot-time validator is a trap for the next reader, not a harmless leftover."
+    )

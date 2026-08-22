@@ -18,6 +18,41 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # config field and the manifest verifier can never drift.
 from .domain.island_mode import IslandMode
 
+
+def _whitespace_is_never_meaningful(annotation) -> bool:
+    """True when leading/trailing whitespace cannot carry meaning for this type.
+
+    Decided by INSPECTING the type, not by looking for the letters "str" inside
+    `str(annotation)` (cage-match PR#141 round 3, Tesla). That substring test was a
+    curated allowlist wearing a lab coat, and it was wrong in both directions:
+    `"str" in "SecretStr"` is False by case, so a PEM wrapped as SecretStr would have
+    been stripped of the trailing newline its own grammar requires; and any
+    NewType/alias without the letters s-t-r in its name would be treated as a scalar.
+
+    The rule: strip bool / int / float / Enum. Never strip anything that is, or
+    contains, a string type — a credential's edge bytes are the caller's business.
+    """
+    import enum
+    import typing
+
+    args = typing.get_args(annotation)
+    if args:  # Optional[...], unions, list[...] etc — safe only if EVERY arm is
+        return all(
+            a is type(None) or _whitespace_is_never_meaningful(a) for a in args
+        )
+    if isinstance(annotation, type):
+        # Enum FIRST: a str-Enum (class IslandMode(str, Enum)) is a str subclass, so
+        # testing str first would classify it as "do not touch" and `ISLAND_MODE=
+        # "moderator "` would fail its member lookup. No enum member carries
+        # whitespace, so stripping is always safe there.
+        if issubclass(annotation, enum.Enum):
+            return True
+        if issubclass(annotation, str):  # str, SecretStr — a credential's own bytes
+            return False
+        if issubclass(annotation, (bool, int, float)):
+            return True
+    return False  # unknown type — do not touch it (fail safe)
+
 # The dev-only JWT secret. Single source so the default and the fail-closed
 # guard below can never disagree (a prod boot with THIS value is rejected).
 _DEV_JWT_SECRET = "dev-insecure-change-me"
@@ -179,6 +214,17 @@ class Settings(BaseSettings):
         whitespace-only JWT_SECRET) lets it fall to its dev default, which
         _harden_for_production then refuses to boot on — the loud failure, not the
         silent one.
+
+        ON ERASING AN OPERATOR'S BYTES (cage-match PR#141 round 3, Carnot HIGH —
+        considered and deliberately kept): this does make a whitespace-only STRING
+        secret indistinguishable from unset. That is the intended reading. No field on
+        this model has a whitespace-only value that means anything — not a key id, not
+        a topic, not a PEM, not a client secret — so the choice is between "treat it
+        as absent" (feature cleanly off, or a loud fail-closed boot guard) and "keep
+        it" (a value that passes presence checks and then fails at the far end, at
+        Apple's door or an OAuth callback, where there is no user-visible surface to
+        explain it). Absence is the more honest of the two. Values with real content
+        are never erased, and never rewritten except for the non-string strip above.
         """
         if not isinstance(data, dict):
             return data
@@ -191,21 +237,8 @@ class Settings(BaseSettings):
             if value.strip() == "":
                 del data[name]          # the environment said nothing; make it so
                 continue
-            if "str" not in str(field.annotation):
+            if _whitespace_is_never_meaningful(field.annotation):
                 data[name] = value.strip()
-        return data
-        for name, field in cls.model_fields.items():
-            if name not in data:
-                continue
-            value = data[name]
-            if not isinstance(value, str):
-                continue
-            annotation = str(field.annotation)
-            if "bool" in annotation:
-                value = value.strip()
-            if value.strip() == "" and field.default is None:
-                value = None
-            data[name] = value
         return data
 
     # --- social sign-in (#13: Apple + Google native ID-token flow) ---
