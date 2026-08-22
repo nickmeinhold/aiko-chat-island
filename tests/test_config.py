@@ -684,6 +684,12 @@ _MUST_FORWARD_ENV = {
     "MAX_REQUEST_BYTES",
     "PASSKEY_REQUIRE_USER_VERIFICATION",
     "ISLAND_MODE",
+    # ...and their SIBLINGS (cage-match PR#141 round 4, Tesla): promoting
+    # AUTH_RATE_LIMIT while leaving its window excludable, or five APNs keys while
+    # leaving the per-recipient wake budget off, makes "never excludable" a bouquet
+    # again — the cap could go inert in the container behind twenty characters of prose.
+    "AUTH_RATE_LIMIT_WINDOW_SECONDS",
+    "APNS_WAKE_PER_RECIPIENT_PER_MINUTE",
 }
 
 
@@ -847,6 +853,34 @@ def _render_default(default) -> str:
     if isinstance(default, (list, dict)):
         return json.dumps(default)
     return str(default)
+
+
+def _is_complex_field(annotation) -> bool:
+    """True for a field pydantic-settings JSON-decodes in the ENV SOURCE.
+
+    Decided by type introspection, not by looking for the letters "list"/"dict" in
+    `str(annotation)` (cage-match PR#141 round 4, Tesla). Production stopped
+    classifying by substring in round 3; the TEST kept doing it, which is the same lab
+    coat on the instrument rather than the subject — and the instrument is the half
+    that can bless a crash. A `Sequence[str]` would not have matched "list" and would
+    have been reported as a coercion failure no validator could ever fix.
+    """
+    import collections.abc as _abc
+    import typing
+
+    origin = typing.get_origin(annotation)
+    if origin is None:
+        return isinstance(annotation, type) and issubclass(
+            annotation, (list, dict, set, tuple)
+        ) and not issubclass(annotation, str)
+    if origin in (list, dict, set, tuple, frozenset):
+        return True
+    if isinstance(origin, type) and issubclass(
+        origin, (_abc.Sequence, _abc.Mapping, _abc.Set)
+    ) and not issubclass(origin, str):
+        return True
+    # Unions: complex if ANY arm is complex (the env source decodes on the arm).
+    return any(_is_complex_field(a) for a in typing.get_args(annotation))
 
 
 def _render_field_default(field) -> str:
@@ -1035,13 +1069,24 @@ def test_every_forward_states_a_default_or_is_explicitly_required():
         value = env[var]
         if not re.search(r"\$\{" + re.escape(var) + r"[-:}]", value):
             continue  # static literal — a different check's business
-        if re.fullmatch(r"\$\{" + re.escape(var) + r"\}", value):
-            bare.append(var)
+        # ALLOWLIST the two lawful forms rather than denylisting the one bad spelling
+        # (cage-match PR#141 round 4, Tesla). compose has a third expansion,
+        # `${VAR-default}` — hyphen, no colon — which substitutes only when the var is
+        # UNSET, not when it is empty. So a `.env` line reading `FOO=` lands in the
+        # container as "" and dies on the next int/bool, while every check in this
+        # file stays green: 7b's passthrough class invites `-`, and both the parity and
+        # constructibility tests `fullmatch` on `:-` and skip it. Round 2 closed one
+        # spelling of absence; this closes the family.
+        if not re.fullmatch(
+            r"\$\{" + re.escape(var) + r"(:-.*|:\?.*)\}", value, re.S
+        ):
+            bare.append(f"{var} = {value!r}")
     assert not bare, (
-        f"These forwards use the bare `${{VAR}}` form: {bare}. compose does not omit "
-        "an unset variable — it sets it to the empty string, which overrides the "
-        "pydantic default while skipping both the default-parity and constructibility "
-        "checks. Use `${VAR:-<config default>}`, or `${VAR:?why}` if it is required."
+        f"These forwards do not use one of the two lawful forms: {bare}. Exactly "
+        "`${VAR:-<config default>}` (has a default) or `${VAR:?why}` (required) are "
+        "allowed. In particular the bare `${VAR}` and the colonless `${VAR-default}` "
+        "both let an unset-or-empty host value reach pydantic as the empty string "
+        "while skipping the default-parity and constructibility checks."
     )
 
 
@@ -1267,7 +1312,7 @@ def test_whitespace_only_restores_absence_for_every_scalar_field():
         # protects the common case (`:-` substitutes on empty as well as unset, so a
         # blank .env line never reaches the container), leaving only a literally
         # whitespace-only entry — narrow, and tracked rather than silently skipped.
-        if any(t in str(field.annotation) for t in ("list", "dict")):
+        if _is_complex_field(field.annotation):
             continue
         # The reference is the variable genuinely ABSENT from the environment — NOT
         # a plain Settings(), which in this harness already carries JWT_SECRET and
@@ -1374,4 +1419,74 @@ def test_config_module_has_no_unreachable_code():
     assert not unreachable, (
         f"config.py contains unreachable statements: {unreachable}. Dead code in a "
         "boot-time validator is a trap for the next reader, not a harmless leftover."
+    )
+
+
+def test_the_whole_rendered_compose_environment_boots():
+    """Construct Settings from ALL compose defaults at once, not one at a time.
+
+    cage-match PR#141 round 4 (Carnot MEDIUM). `test_every_compose_default_is_constructible`
+    patches a single variable per iteration against the ambient environment, so it
+    proves each default is individually parseable — not that the environment compose
+    actually produces boots. Cross-field guards (the APNs half-set check, the
+    production hardening chain) only fire on combinations, and the full-map render was
+    verified by hand against both boxes rather than by anything that runs again.
+
+    This applies every default simultaneously, in a CLEARED environment so an
+    ambient test-harness value cannot mask a missing one, and asserts the model
+    constructs. `clear=True` also means this exercises the stock-island case: an
+    operator who sets nothing at all.
+    """
+    import os
+    import re
+    from unittest import mock
+
+    from aiko_gateway.config import Settings
+
+    env = _chat_island_environment()
+    rendered = {}
+    for var, value in env.items():
+        match = re.fullmatch(r"\$\{" + re.escape(var) + r":-(.*)\}", str(value), re.S)
+        if match:
+            rendered[var] = match.group(1)
+        elif not str(value).startswith("${"):
+            rendered[var] = str(value)  # static literal
+    # The two operator-supplied secrets get stand-ins. Both MUST be set on a real
+    # island and the stock defaults are deliberately unusable in production:
+    # JWT_SECRET uses the required `${VAR:?}` form so compose refuses to render at all
+    # without it, and ISLAND_SIGNING_SEED's compose default is config._DEV_ISLAND_SEED,
+    # which _harden_for_production rejects by design. This test asserts the rendered
+    # environment boots for an operator who supplied their secrets and NOTHING else —
+    # not that a secretless island boots, which must fail and does.
+    #
+    # Worth noting the seed guard only fired once every default was applied TOGETHER;
+    # the per-variable test cannot reach a cross-field check like it.
+    import base64 as _b64
+
+    # Assigned, NOT setdefault: ISLAND_SIGNING_SEED IS in the rendered map, carrying
+    # the dev seed as its compose default, so setdefault silently left the rejected
+    # value in place. JWT_SECRET is absent from the map (its `${VAR:?}` form is not a
+    # default), but assign both the same way so the two secrets cannot drift apart.
+    rendered["JWT_SECRET"] = "x" * 40
+    rendered["ISLAND_SIGNING_SEED"] = (
+        _b64.urlsafe_b64encode(bytes(range(32))).rstrip(b"=").decode()
+    )
+    # ...and one real operator CHOICE. A stock island with no sign-in ingress is
+    # deliberately un-bootable in production (it could authenticate existing accounts
+    # but never onboard anyone), so the minimum viable contract is "secrets + an
+    # ingress" — which is exactly what both live boxes set. Asserting a
+    # choice-free island boots would be asserting the opposite of the design.
+    #
+    # Adding these one at a time as production guards fired is itself the finding:
+    # each is a REQUIREMENT of a production island that no per-variable test can see,
+    # because every one of them is a cross-FIELD check. This dict is therefore the
+    # minimum operator contract, written down — the same set both live boxes supply.
+    rendered["PASSKEY_ENABLED"] = "true"          # a sign-in ingress must exist
+    rendered["MODERATOR_USER_IDS"] = '["operator-1"]'  # moderator mode needs a moderator
+    rendered["CSAM_RUNBOOK_ACKNOWLEDGED"] = "true"     # A5 operator acknowledgement
+    rendered["GATEWAY_ID"] = "probe.example.org"       # per-island identity
+    with mock.patch.dict(os.environ, rendered, clear=True):
+        settings = Settings()
+    assert settings.environment == "production", (
+        "the rendered compose environment should describe a production island"
     )
