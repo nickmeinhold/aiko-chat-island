@@ -2,7 +2,7 @@
 
 Invariants (all prod-only unless noted):
   1. A production-like deployment MUST NOT boot with the dev-default/weak
-     jwt_secret — `Settings()` raises rather than serving forgeable tokens.
+     jwt_secret — `Settings(_env_file=None)` raises rather than serving forgeable tokens.
   2. Open self-registration defaults OFF in production and ON in dev, with an
      explicit override either way (and no prod break-glass until I2 lands).
   3. Social sign-in enabled in prod requires a usable provider (native client
@@ -608,7 +608,7 @@ def test_island_key_version_out_of_u32_range_rejected_at_boot():
 def test_dev_accepts_the_dev_island_seed():
     # Local dev must stay frictionless: the dev-default seed boots in dev (only prod
     # rejects it). Passed explicitly because conftest seeds a real ISLAND_SIGNING_SEED
-    # into the env, so a bare Settings() would read that, not the dev default.
+    # into the env, so a bare Settings(_env_file=None) would read that, not the dev default.
     s = Settings(_env_file=None, environment="dev", island_signing_seed=_DEV_ISLAND_SEED)
     assert s.island_mode == "moderator"
     assert s.island_signing_seed == _DEV_ISLAND_SEED
@@ -772,9 +772,9 @@ _DEFAULT_MAY_DIVERGE: dict[str, tuple[str, str]] = {
     ),
     "GOOGLE_CLIENT_IDS": (
         '["588100172166-a0r6ipvpju5rd6fh8lv85qqohpdosp33.apps.googleusercontent.com","588100172166-23ppgk6jdb3et2ehc1qj584c6rgs0c9j.apps.googleusercontent.com","588100172166-bagrmvftp3fcer2j2lvnh33j65g58elk.apps.googleusercontent.com"]',
-        "compose ships the real OAuth client IDs; config default is []. Not pinned "
-        "here because the list is long and rotates with the Google project; the "
-        "forward itself is asserted by the totality check.",
+        "compose ships the real OAuth client IDs; config default is []. Pinned "
+        "despite the length: an unpinned exemption means nothing checks the baked "
+        "value at all, and a transposed character in an audience is invisible.",
     ),
     "PASSKEY_EXTRA_ORIGINS": (
         '["android:apk-key-hash:4X-Pyy5caiOFWCJxYkU2YhIdsfnYZqG57ETE7JFgi6A","android:apk-key-hash:jDaX5vI4HYYMxrQkOUtGeSK9hcTgeuP52fGEQaptSOc","android:apk-key-hash:r_tsz5JUp0Rq8qioELOr73CZt0IegpLHz3sw6aI_p3A"]',
@@ -814,6 +814,34 @@ def _render_default(default) -> str:
     if isinstance(default, (list, dict)):
         return json.dumps(default)
     return str(default)
+
+
+def _accepts_empty_string_without_coercion(annotation) -> bool:
+    """True only for types that parse "" on an image WITHOUT config's blank coercion.
+
+    A SAFE-list on purpose (cage-match PR#141 round 7, Tesla): anything unrecognised
+    returns False and is therefore reported as unsafe. The failure direction matters —
+    a false positive here costs one explicit compose default; a false negative is a
+    boot-time crash-loop on a pinned island, which is the outage this PR started from.
+    """
+    import typing
+
+    args = typing.get_args(annotation)
+    if args:
+        # A union is safe only if EVERY non-None arm can take "".
+        return all(
+            a is type(None) or _accepts_empty_string_without_coercion(a) for a in args
+        )
+    # Plain `str` (and str subclasses that are not enums) accept "" verbatim. Nothing
+    # else is assumed to: an enum rejects it, and so do int/float/bool/UUID/Path/
+    # HttpUrl/datetime and every Literal.
+    import enum
+
+    return (
+        isinstance(annotation, type)
+        and issubclass(annotation, str)
+        and not issubclass(annotation, enum.Enum)
+    )
 
 
 def _is_complex_field(annotation) -> bool:
@@ -975,12 +1003,12 @@ def test_open_registration_blank_behaves_as_unset():
     # though they would break the real thing. Test the channel the value arrives on.
     def via_env(value):
         with mock.patch.dict(os.environ, {"OPEN_REGISTRATION": value}, clear=False):
-            return Settings().open_registration
+            return Settings(_env_file=None).open_registration
 
     def unset():
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("OPEN_REGISTRATION", None)
-            return Settings().open_registration
+            return Settings(_env_file=None).open_registration
 
     assert via_env("") == unset(), (
         "blank OPEN_REGISTRATION must behave exactly as if it were unset"
@@ -1145,7 +1173,7 @@ def test_every_compose_default_is_constructible():
         # perfectly in production. Test the channel the value actually arrives on.
         with mock.patch.dict(os.environ, {var: match.group(1)}, clear=False):
             try:
-                Settings()
+                Settings(_env_file=None)
             except Exception as exc:  # noqa: BLE001 — any parse failure is the finding
                 unconstructible.append(
                     f"{var}={match.group(1)!r} -> {type(exc).__name__}"
@@ -1190,7 +1218,7 @@ def test_open_registration_coercion_edges():
     """
     from aiko_gateway.config import Settings
 
-    unset = Settings().open_registration
+    unset = Settings(_env_file=None).open_registration
     for blank in ("", " ", "   ", "\t", "\n"):
         assert Settings(open_registration=blank).open_registration == unset, (
             f"{blank!r} must behave as unset"
@@ -1277,7 +1305,7 @@ def test_whitespace_only_restores_absence_for_every_scalar_field():
         if _is_complex_field(field.annotation):
             continue
         # The reference is the variable genuinely ABSENT from the environment — NOT
-        # a plain Settings(), which in this harness already carries JWT_SECRET and
+        # a plain Settings(_env_file=None), which in this harness already carries JWT_SECRET and
         # ISLAND_SIGNING_SEED. Comparing against harness-set values reported a
         # failure for exactly the behaviour we want: blanking a secret falls back to
         # the dev default, which _harden_for_production then refuses to boot on. The
@@ -1286,13 +1314,13 @@ def test_whitespace_only_restores_absence_for_every_scalar_field():
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop(name.upper(), None)
             try:
-                absent = getattr(Settings(), name)
+                absent = getattr(Settings(_env_file=None), name)
             except Exception:  # noqa: BLE001 — absent is itself invalid; skip
                 continue
         for blank in ("", " ", "   ", "\t"):
             with mock.patch.dict(os.environ, {name.upper(): blank}, clear=False):
                 try:
-                    got = getattr(Settings(), name)
+                    got = getattr(Settings(_env_file=None), name)
                 except Exception as exc:  # noqa: BLE001
                     crashed.append(f"{name.upper()}={blank!r} -> {type(exc).__name__}")
                     continue
@@ -1321,7 +1349,7 @@ def test_string_fields_keep_their_whitespace():
     from aiko_gateway.config import Settings
 
     with mock.patch.dict(os.environ, {"GATEWAY_DISPLAY_NAME": "  Padded  "}, clear=False):
-        assert Settings().gateway_display_name == "  Padded  ", (
+        assert Settings(_env_file=None).gateway_display_name == "  Padded  ", (
             "a string field must not be silently stripped"
         )
 
@@ -1425,11 +1453,23 @@ def test_the_whole_rendered_compose_environment_boots():
     rendered["MODERATOR_USER_IDS"] = '["operator-1"]'  # moderator mode needs a moderator
     rendered["CSAM_RUNBOOK_ACKNOWLEDGED"] = "true"     # A5 operator acknowledgement
     rendered["GATEWAY_ID"] = "probe.example.org"       # per-island identity
+    # `_env_file=None` is load-bearing, not tidiness (cage-match PR#141 round 7,
+    # Tesla). Settings is configured `env_file=".env"` and this repo HAS a root .env,
+    # so `clear=True` on os.environ does NOT isolate the test — pydantic-settings reads
+    # the file regardless, and a developer's laptop config silently becomes part of
+    # the "proof". That is a FOURTH state beyond repo / runtime / built-image, and it
+    # was not in the census until Tesla put it there. Every Settings() in this file is
+    # constructed the same way for the same reason.
     with mock.patch.dict(os.environ, rendered, clear=True):
-        settings = Settings()
-    assert settings.environment == "production", (
-        "the rendered compose environment should describe a production island"
-    )
+        settings = Settings(_env_file=None)
+    # Assert the VALUES the PR claims are behaviour-neutral, not merely that the model
+    # constructed (Tesla: "behaviour-neutrality is prophesied, not measured"). These
+    # four were previously read by hand off a box; now they are pinned in CI.
+    assert settings.environment == "production"
+    assert settings.open_registration is False, "prod must not self-serve register"
+    assert settings.rate_limit_enabled is True, "the abuse cap must be on"
+    assert settings.island_mode.value == "moderator"
+    assert settings.max_request_bytes == 65536
 
 
 def test_no_empty_compose_default_on_a_type_an_older_image_cannot_parse():
@@ -1450,7 +1490,7 @@ def test_no_empty_compose_default_on_a_type_an_older_image_cannot_parse():
     """
     import re
 
-    from aiko_gateway.config import Settings, _whitespace_is_never_meaningful
+    from aiko_gateway.config import Settings
 
     env = _chat_island_environment()
     unsafe = []
@@ -1461,12 +1501,17 @@ def test_no_empty_compose_default_on_a_type_an_older_image_cannot_parse():
         match = re.fullmatch(r"\$\{" + re.escape(var) + r":-(.*)\}", env[var], re.S)
         if match is None or match.group(1) != "":
             continue
-        # An empty default reaches pydantic as "" on any image lacking the coercion.
-        # Only a string-like field survives that. (_whitespace_is_never_meaningful is
-        # True exactly for the non-string scalars, so it doubles as the danger test.)
-        if _whitespace_is_never_meaningful(field.annotation) or _is_complex_field(
-            field.annotation
-        ):
+        # SAFE-LIST, not a danger-list (cage-match PR#141 round 7, Tesla). An earlier
+        # revision reused production's _whitespace_is_never_meaningful, where False
+        # means "unknown type, do not touch the bytes" — fail CLOSED on mutation. The
+        # test read the same False as "this type can eat an empty string on 0.6.0" —
+        # fail OPEN on a crash-loop. One helper, inverted safety: a shared blind spot
+        # rather than shared code. Its complement walked straight through:
+        # HttpUrl | None, UUID | None, datetime | None, Literal[...], Path.
+        #
+        # So enumerate what is SAFE and flag everything else. An unrecognised type is
+        # treated as dangerous, which is the direction that cannot cause an outage.
+        if not _accepts_empty_string_without_coercion(field.annotation):
             unsafe.append(f"{var} ({field.annotation})")
     assert not unsafe, (
         "These forwards use an EMPTY compose default on a field whose type cannot "
