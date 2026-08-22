@@ -666,6 +666,14 @@ _MUST_FORWARD_ENV = {
     "LIVEKIT_API_SECRET",            # secret — token forgery root for the SFU (#122)
     "LIVEKIT_URL",                   # per-island video — the SFU clients connect to
     "LIVEKIT_TOKEN_TTL_SECONDS",     # operator policy — join-token window
+    # Push wake (#3267). APNS_PRIVATE_KEY is a signing secret and the whole point of
+    # the sweep that added these — being forgotten is exactly how they got here, so
+    # they may never be silenced by moving them into _NOT_FORWARDED.
+    "APNS_KEY_ID",
+    "APNS_TEAM_ID",
+    "APNS_TOPIC",
+    "APNS_PRIVATE_KEY",
+    "APNS_USE_SANDBOX",
 }
 
 
@@ -789,12 +797,46 @@ _NOT_FORWARDED: dict[str, str] = {
 # `${VAR:-}` does not "fall back" to the config default, it SETS the container var to
 # the empty string and overrides it — usually into a boot-time pydantic error.
 _DEFAULT_MAY_DIVERGE: dict[str, str] = {
+    "OPEN_REGISTRATION": (
+        "compose sends the RESOLVED prod value (false), not the tri-state None. A "
+        "blank default crash-loops any older pinned image lacking the coercion — "
+        "verified against 0.6.0. See the comment in docker-compose.yml."
+    ),
     "JWT_SECRET": "uses the REQUIRED `${VAR:?...}` form — no default by design",
     "APPLE_CLIENT_IDS": "compose ships the real app identifiers; config default is []",
     "GOOGLE_CLIENT_IDS": "compose ships the real app identifiers; config default is []",
     "PASSKEY_EXTRA_ORIGINS": "compose ships the Android apk-key-hash origin",
     "PASSKEY_ANDROID_CERT_SHA256": "compose ships the Play signing cert fingerprint",
 }
+
+
+class _RequiredField(Exception):
+    """Raised by _render_default for a field with no default at all."""
+
+
+def _render_default(default) -> str:
+    """Render a pydantic default as the string a compose default must equal.
+
+    Raises _RequiredField for a REQUIRED field. Without that, `str(PydanticUndefined)`
+    renders the literal "PydanticUndefined" and the parity test below demands compose
+    read `${VAR:-PydanticUndefined}` — instructing the author to write nonsense instead
+    of telling them the truth, which is that a required field takes the `${VAR:?...}`
+    form and carries no default. JWT_SECRET is the only one today and is exempted, so
+    this is latent until the next required setting is added.
+    """
+    import json
+
+    from pydantic_core import PydanticUndefined
+
+    if default is PydanticUndefined:
+        raise _RequiredField
+    if default is None:
+        return ""
+    if isinstance(default, bool):
+        return str(default).lower()
+    if isinstance(default, (list, dict)):
+        return json.dumps(default)
+    return str(default)
 
 
 def _settings_field_names() -> set[str]:
@@ -835,19 +877,9 @@ def test_no_stale_entries_in_not_forwarded():
 
 def test_compose_defaults_match_config_defaults():
     """A compose default overrides the config default — so it must equal it."""
-    import json
     import re
 
     from aiko_gateway.config import Settings
-
-    def render(default) -> str:
-        if default is None:
-            return ""
-        if isinstance(default, bool):
-            return str(default).lower()
-        if isinstance(default, (list, dict)):
-            return json.dumps(default)
-        return str(default)
 
     env = _chat_island_environment()
     drifted = []
@@ -858,9 +890,23 @@ def test_compose_defaults_match_config_defaults():
         match = re.fullmatch(r"\$\{" + re.escape(var) + r":-(.*)\}", env[var], re.S)
         if match is None:
             continue  # a non-defaulted form (e.g. `${VAR}`); nothing to compare
-        if match.group(1) != render(field.default):
+        try:
+            expected = _render_default(field.default)
+        except _RequiredField:
+            # A required field forwarded WITH a default is its own bug: the compose
+            # default satisfies the field on every box that does not set it, so the
+            # "required" is silently discharged by the template and the operator is
+            # never told. Say that, rather than demanding a rendered default.
             drifted.append(
-                f"{var}: compose={match.group(1)!r} config={render(field.default)!r}"
+                f"{var}: config has NO default (required), but compose supplies "
+                f"{match.group(1)!r} — a required setting must use the "
+                f"`${{{var}:?why it is required}}` form so a missing value FAILS "
+                "loudly, not silently defaults"
+            )
+            continue
+        if match.group(1) != expected:
+            drifted.append(
+                f"{var}: compose={match.group(1)!r} config={expected!r}"
             )
     assert not drifted, (
         "compose defaults have drifted from config.py defaults: "
@@ -914,15 +960,6 @@ def test_no_stale_entries_in_default_may_diverge():
         f"_DEFAULT_MAY_DIVERGE names non-existent Settings field(s): {stale}."
     )
 
-    def render(default) -> str:
-        if default is None:
-            return ""
-        if isinstance(default, bool):
-            return str(default).lower()
-        if isinstance(default, (list, dict)):
-            return json.dumps(default)
-        return str(default)
-
     env = _chat_island_environment()
     no_longer_diverging = []
     for var in sorted(_DEFAULT_MAY_DIVERGE):
@@ -930,7 +967,7 @@ def test_no_stale_entries_in_default_may_diverge():
         if var not in env or name not in Settings.model_fields:
             continue
         match = re.fullmatch(r"\$\{" + re.escape(var) + r":-(.*)\}", env[var], re.S)
-        if match and match.group(1) == render(Settings.model_fields[name].default):
+        if match and match.group(1) == _render_default(Settings.model_fields[name].default):
             no_longer_diverging.append(var)
     assert not no_longer_diverging, (
         "These are listed in _DEFAULT_MAY_DIVERGE but their compose default now "
@@ -955,4 +992,173 @@ def test_no_forwarded_var_without_a_settings_field():
         f"docker-compose.yml forwards var(s) with no matching Settings field: "
         f"{orphans}. Either config.py lost the field (delete the forward) or the "
         "name is misspelt (the operator's value reaches the container unread)."
+    )
+
+
+def test_every_compose_default_is_constructible():
+    """Whatever compose sends when the operator sets NOTHING must parse.
+
+    The general form of the bug cage-match PR#141 (Carnot P1) found in a single
+    field. compose's `environment:` mapping cannot express absence — an unset host
+    var interpolates to the default and the container var is SET — so every default
+    written here is a value pydantic will really receive on a box that configures
+    nothing. Invariant 7b *forces* each field to be forwarded; nothing forced the
+    forwarded value to be constructible, and the two together can manufacture a
+    boot-time crash-loop out of an otherwise correct pair of changes.
+
+    Today all eleven empty-defaulted forwards are `str` / `str | None` / the coerced
+    tri-state, so the suite would pass without this. The hazard is the NEXT field: an
+    `int` or plain `bool` added with an empty default dies at pydantic on every island
+    that has not set it. Quantify the property over the field set rather than pinning
+    the one instance we happen to know about.
+    """
+    import os
+    import re
+    from unittest import mock
+
+    from aiko_gateway.config import Settings
+
+    env = _chat_island_environment()
+    unconstructible = []
+    for name in Settings.model_fields:
+        var = name.upper()
+        if var not in env:
+            continue
+        match = re.fullmatch(r"\$\{" + re.escape(var) + r":-(.*)\}", env[var], re.S)
+        if match is None:
+            continue  # `${VAR}` / `${VAR:?}` — no default to send
+        # Deliver the value the way a CONTAINER delivers it: as an environment
+        # variable, not a constructor kwarg. The two paths are NOT equivalent —
+        # pydantic-settings JSON-decodes complex fields (list[str]) only on the env
+        # path, so `Settings(aiko_channels='["general"]')` raises while the identical
+        # value in the environment parses fine. An earlier revision of this test used
+        # kwargs and reported seven false crash-loops for list fields that work
+        # perfectly in production. Test the channel the value actually arrives on.
+        with mock.patch.dict(os.environ, {var: match.group(1)}, clear=False):
+            try:
+                Settings()
+            except Exception as exc:  # noqa: BLE001 — any parse failure is the finding
+                unconstructible.append(
+                    f"{var}={match.group(1)!r} -> {type(exc).__name__}"
+                )
+    assert not unconstructible, (
+        "These compose defaults cannot be parsed by their own Settings field, so an "
+        "island that does not set them CRASH-LOOPS at boot: "
+        f"{unconstructible}. Either give the forward a default the field accepts, or "
+        "coerce the value at the field boundary (see _blank_is_unspecified)."
+    )
+
+
+def test_exemption_reasons_are_substantive():
+    """An exemption is only as good as the reason written beside it.
+
+    Carnot's P2: both exemption dicts are powerful enough to reopen the whole class —
+    a future author can silence a totality failure by naming the field with a
+    hand-wave. The type system cannot tell a real justification from "", and no test
+    can judge prose. What a test CAN do is refuse the degenerate cases, so that
+    silencing an invariant costs a sentence someone has to stand behind in review.
+    """
+    thin = []
+    for label, table in (("_NOT_FORWARDED", _NOT_FORWARDED),
+                         ("_DEFAULT_MAY_DIVERGE", _DEFAULT_MAY_DIVERGE)):
+        for var, reason in table.items():
+            if len(" ".join(str(reason).split())) < 20:
+                thin.append(f"{label}[{var}] = {reason!r}")
+    assert not thin, (
+        "These exemptions carry no usable justification: "
+        f"{thin}. Excluding a setting from the forwarding invariant is how the "
+        "inert-config class reopens — write why it is safe, in a sentence."
+    )
+
+
+def test_open_registration_coercion_edges():
+    """Pin what the blank coercion does and does NOT swallow.
+
+    It strips whitespace to None deliberately (a .env line of spaces is the same
+    operator intent as a blank one). Everything else must still reach pydantic's
+    own bool parsing, so a real value can never be silently discarded as "unset".
+    """
+    from aiko_gateway.config import Settings
+
+    unset = Settings().open_registration
+    for blank in ("", " ", "   ", "\t", "\n"):
+        assert Settings(open_registration=blank).open_registration == unset, (
+            f"{blank!r} must behave as unset"
+        )
+    # Real values still win — the coercion must not eat them.
+    for falsey in ("false", "False", "0", "no", "off"):
+        assert Settings(open_registration=falsey).open_registration is False, falsey
+    for truthy in ("true", "True", "1", "yes", "on"):
+        assert Settings(open_registration=truthy).open_registration is True, truthy
+    # PADDED real values must parse too (cage-match PR#141, Tesla — verified: before
+    # the fix, a .env line reading `OPEN_REGISTRATION=false ` raised ValidationError
+    # and crash-looped the island on the very field the coercion was added to save).
+    for padded, expected in ((" false", False), ("false ", False), ("  false  ", False),
+                             (" true", True), ("true ", True), ("\ttrue\n", True)):
+        assert Settings(open_registration=padded).open_registration is expected, padded
+
+
+def test_blank_is_unspecified_for_every_none_default_field():
+    """The absence coercion is a CLASS law, not a charm on one field.
+
+    cage-match PR#141 (Tesla): the first version welded blank->None to
+    `open_registration` alone — which is precisely the curated-allowlist mistake the
+    rest of this PR exists to kill, committed one layer down. A coercion that handles
+    only the field that already broke cannot fail for the SHAPE nobody thought of, and
+    the drift test actively blesses the trap: `_render_default(None)` is `""`, so
+    `${VAR:-}` on a future `bool | None` matches config, goes green, and then dies at
+    pydantic on both islands at boot.
+
+    So assert the property over every None-defaulted field, delivered the way a
+    container delivers it (environment variable, not kwarg).
+    """
+    import os
+    from unittest import mock
+
+    from aiko_gateway.config import Settings
+
+    broken = []
+    for name, field in Settings.model_fields.items():
+        if field.default is not None:
+            continue
+        for blank in ("", "   "):
+            with mock.patch.dict(os.environ, {name.upper(): blank}, clear=False):
+                try:
+                    if getattr(Settings(), name) is not None:
+                        # A tri-state field must land on None ("unspecified") or on
+                        # whatever the after-validator resolves it to — never keep the
+                        # blank string itself.
+                        pass
+                except Exception as exc:  # noqa: BLE001
+                    broken.append(f"{name.upper()}={blank!r} -> {type(exc).__name__}")
+    assert not broken, (
+        "These None-default (tri-state) fields reject the blank string that "
+        f"docker-compose inevitably sends when the operator sets nothing: {broken}. "
+        "compose cannot express absence; the coercion in config.py must absorb it."
+    )
+
+
+def test_not_forwarded_vars_are_not_interpolated():
+    """An exclusion must be an INVERSE, not merely a skip.
+
+    cage-match PR#141 (Tesla): `_NOT_FORWARDED` only exempts a var from the
+    interpolation REQUIREMENT — it never asserts the var is actually static or
+    absent. So `HOST: ${HOST:-0.0.0.0}` while `HOST` sits in `_NOT_FORWARDED` under
+    the reason "container-internal bind, compose owns the port mapping" would pass
+    invariant 7b AND the staleness check, while making the bind operator-tunable —
+    the exact silent override the exclusion claims to forbid. The lattice was
+    skip-not-inverse on this coil.
+    """
+    import re
+
+    env = _chat_island_environment()
+    contradictions = []
+    for var in sorted(_NOT_FORWARDED):
+        if var in env and re.search(r"\$\{" + re.escape(var) + r"[-:}]", env[var]):
+            contradictions.append(f"{var} = {env[var]!r}")
+    assert not contradictions, (
+        "These vars are listed in _NOT_FORWARDED (i.e. deliberately NOT "
+        f"operator-settable) yet compose interpolates the host value anyway: "
+        f"{contradictions}. The exclusion is claiming one thing while the template "
+        "does the opposite — either drop the exclusion or make the value static."
     )

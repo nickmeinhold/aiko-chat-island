@@ -249,10 +249,26 @@ services:
       AUTH_RATE_LIMIT: ${AUTH_RATE_LIMIT:-20}
       AUTH_RATE_LIMIT_WINDOW_SECONDS: ${AUTH_RATE_LIMIT_WINDOW_SECONDS:-60}
       MAX_REQUEST_BYTES: ${MAX_REQUEST_BYTES:-65536}
-      # Registration posture. TRI-STATE: blank = "unspecified" = resolve from
-      # ENVIRONMENT (open in dev, closed in prod). compose cannot express absence, so
-      # config.py coerces "" back to None — see _blank_is_unspecified there.
-      OPEN_REGISTRATION: ${OPEN_REGISTRATION:-}
+      # Registration posture. The field is TRI-STATE in config.py (None = "resolve
+      # from ENVIRONMENT": open in dev, closed in prod) but the compose default here
+      # is the RESOLVED prod value, deliberately, and NOT blank.
+      #
+      # WHY NOT BLANK (cage-match PR#141, Carnot P1 — verified against the real
+      # artifact, not reasoned about): a blank default is only safe if the RUNNING
+      # IMAGE contains this branch's _blank_is_unspecified coercion. The islands run
+      # pinned images, and the box's compose is not version-locked to them, so the new
+      # compose can land on an older image. Running the actually-deployed
+      # ghcr.io/nickmeinhold/aiko-chat-island:0.6.0 with OPEN_REGISTRATION="" returns
+      # `bool_parsing` ValidationError — i.e. the island CRASH-LOOPS. The neutrality
+      # proof that missed this constructed Settings from BRANCH source; the pinned
+      # image is a third state distinct from both repo and runtime.
+      #
+      # `false` is safe on BOTH images and changes nothing: ENVIRONMENT is statically
+      # production in this file, and prod resolves the tri-state to closed anyway. So
+      # this states the value prod already had, and removes the version coupling
+      # entirely rather than guarding it. `:-` (not `-`) so an operator's EMPTY .env
+      # entry also lands here instead of reaching pydantic as "".
+      OPEN_REGISTRATION: ${OPEN_REGISTRATION:-false}
       # Island posture (crucible-09) — moderator vs the other modes.
       ISLAND_MODE: ${ISLAND_MODE:-moderator}
       # Passkey per-island binding (Design 06) — the RP-side identity the handset

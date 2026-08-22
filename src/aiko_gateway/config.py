@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Literal
 from urllib.parse import urlparse
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Leaf import (stdlib-only enum) — safe at module top, no config<->domain cycle. The
@@ -146,25 +146,47 @@ class Settings(BaseSettings):
     # (open in dev, closed in prod); set OPEN_REGISTRATION to override either way.
     open_registration: bool | None = None
 
-    @field_validator("open_registration", mode="before")
+    @model_validator(mode="before")
     @classmethod
-    def _blank_is_unspecified(cls, v):
-        """Treat an empty string as "not specified", i.e. None.
+    def _normalise_env_strings(cls, data):
+        """Absorb the two things an environment variable cannot say cleanly.
 
-        This field is TRI-STATE — None means "resolve from environment" (open in
-        dev, closed in prod), which is a different thing from False. docker-compose's
-        `environment:` mapping cannot express ABSENCE: an unset host var interpolates
-        to the empty string, and the variable is still SET in the container. So
-        without this, forwarding `OPEN_REGISTRATION: ${OPEN_REGISTRATION:-}` (which
-        invariant 7 requires, or the operator's host .env value is inert) hands
-        pydantic "" for a `bool | None` and the island CRASH-LOOPS at boot on every
-        deploy where the operator did not set it — i.e. all of them.
+        Both are consequences of the SAME channel limitation, so they are fixed at
+        the same boundary rather than one field at a time (cage-match PR#141: the
+        first version of this handled `open_registration` alone, which is the exact
+        curated-allowlist mistake the rest of this PR exists to stop — Tesla).
 
-        The forwarding requirement and the tri-state default are both correct; it is
-        the CHANNEL between them that cannot carry "absent". Coerce at the boundary
-        rather than dropping either.
+        1. ABSENCE. docker-compose's `environment:` mapping has no "omit if unset":
+           an unset host var interpolates to the empty string and the container var
+           is still SET. So a TRI-STATE field (default None, meaning "resolve from
+           environment") receives "" instead of nothing, and pydantic rejects "" for
+           a `bool | None`. Any field whose default is None gets blank -> None, so
+           the next tri-state field added does not repeat the crash.
+
+        2. STRAY WHITESPACE ON A BOOLEAN. A .env line reading `OPEN_REGISTRATION=false `
+           delivers "false " — which pydantic will NOT parse, so a single trailing
+           space crash-loops the island (Tesla, verified). Whitespace cannot be
+           meaningful in a boolean, so bool-typed fields are stripped.
+
+        Deliberately NOT a blanket strip of every string: APNS_PRIVATE_KEY is a PEM
+        and GITHUB_CLIENT_SECRET is a credential — leading/trailing bytes there are
+        the caller's business, not ours to silently rewrite.
         """
-        return None if isinstance(v, str) and v.strip() == "" else v
+        if not isinstance(data, dict):
+            return data
+        for name, field in cls.model_fields.items():
+            if name not in data:
+                continue
+            value = data[name]
+            if not isinstance(value, str):
+                continue
+            annotation = str(field.annotation)
+            if "bool" in annotation:
+                value = value.strip()
+            if value.strip() == "" and field.default is None:
+                value = None
+            data[name] = value
+        return data
 
     # --- social sign-in (#13: Apple + Google native ID-token flow) ---
     # Explicit on/off, default False, LOUD in prod (mirror open_registration's
