@@ -740,3 +740,152 @@ def test_compose_island_signing_seed_default_matches_config_dev_seed():
         "dev-seed guard (or, worse, run on published key material no longer "
         "denylisted). Update the compose default to match config._DEV_ISLAND_SEED."
     )
+
+
+# --- invariant 7b: the forwarding check is TOTAL, not curated ------------------
+#
+# _MUST_FORWARD_ENV above is a hand-maintained allowlist, and its own scope note
+# admitted the gap: "a CURATED operator-config surface, NOT a proof that config.py
+# has no un-forwarded operator field." On 2026-08-22 that gap was measured — 30 of
+# 62 Settings fields were not forwarded at all, including OPEN_REGISTRATION,
+# RATE_LIMIT_ENABLED, AUTH_RATE_LIMIT, MAX_REQUEST_BYTES and
+# PASSKEY_REQUIRE_USER_VERIFICATION. An allowlist can only ever assert the vars
+# somebody remembered to add, so it cannot fail for the vars nobody thought of —
+# which is precisely the failure mode (four incidents and counting).
+#
+# So invert the burden of proof: EVERY Settings field must be forwarded, and any
+# exception has to be written down here with a reason. Adding a new setting now
+# fails CI until its author makes that choice explicitly.
+#
+# _MUST_FORWARD_ENV is deliberately KEPT rather than subsumed: this test would be
+# satisfied by moving a var into _NOT_FORWARDED, and for those vars that must never
+# be an acceptable answer. Total check = "nothing is forgotten"; curated list =
+# "these specific ones may never be excluded". Different claims.
+
+_NOT_FORWARDED: dict[str, str] = {
+    # Container-internal bind address/port. The image listens inside the container
+    # and compose owns the published mapping; an operator overriding these from the
+    # host .env would move the listener out from under the port mapping and the
+    # healthcheck, breaking the box in a way no error message explains.
+    "HOST": "container-internal bind — compose owns the port mapping",
+    "PORT": "container-internal bind — compose owns the port mapping",
+    # Deliberately NOT operator-tunable. Making the JWT algorithm settable from the
+    # environment is the classic algorithm-confusion footgun; there is no legitimate
+    # per-island reason to change it, and every illegitimate one is an attack.
+    "JWT_ALGORITHM": "security-critical constant — alg-confusion footgun if tunable",
+    # Static-by-design: these describe the compose project's OWN topology, not
+    # operator policy. The mosquitto hostname is the service name on this network;
+    # DB_URL points at the mounted volume; ENVIRONMENT is what makes the image a
+    # production image. A host .env must not be able to repoint them.
+    "AIKO_MQTT_HOST": "compose-topology-owned — the service name on this network",
+    "AIKO_MQTT_PORT": "compose-topology-owned",
+    "AIKO_NAMESPACE": "compose-topology-owned",
+    "DB_URL": "compose-topology-owned — the mounted aiko_data volume",
+    "ENVIRONMENT": "static-by-design — this is what makes the image a prod image",
+}
+
+# Fields where the compose default INTENTIONALLY differs from config.py's default.
+# Everywhere else they must agree, because a compose default is not documentation:
+# `${VAR:-}` does not "fall back" to the config default, it SETS the container var to
+# the empty string and overrides it — usually into a boot-time pydantic error.
+_DEFAULT_MAY_DIVERGE: dict[str, str] = {
+    "JWT_SECRET": "uses the REQUIRED `${VAR:?...}` form — no default by design",
+    "APPLE_CLIENT_IDS": "compose ships the real app identifiers; config default is []",
+    "GOOGLE_CLIENT_IDS": "compose ships the real app identifiers; config default is []",
+    "PASSKEY_EXTRA_ORIGINS": "compose ships the Android apk-key-hash origin",
+    "PASSKEY_ANDROID_CERT_SHA256": "compose ships the Play signing cert fingerprint",
+    "ISLAND_SIGNING_SEED": "dev-seed default asserted by its own drift test above",
+}
+
+
+def _settings_field_names() -> set[str]:
+    from aiko_gateway.config import Settings
+
+    return {name.upper() for name in Settings.model_fields}
+
+
+def test_every_settings_field_is_forwarded_or_explicitly_excluded():
+    """No Settings field may be silently absent from the compose environment."""
+    import re
+
+    env = _chat_island_environment()
+    unaccounted = []
+    for var in sorted(_settings_field_names()):
+        if var in _NOT_FORWARDED:
+            continue
+        if var not in env:
+            unaccounted.append(f"{var} (absent from compose)")
+        elif not re.search(r"\$\{" + re.escape(var) + r"[-:}]", env[var]):
+            unaccounted.append(f"{var} (present but static — host value inert)")
+    assert not unaccounted, (
+        "These Settings fields are not forwarded into the chat-island container, so "
+        "an operator setting them in the host .env would have NO EFFECT and no error "
+        f"to explain why: {unaccounted}. Either add a `VAR: ${{VAR:-<config default>}}` "
+        "forward, or add the name to _NOT_FORWARDED with a reason. See invariant 7b."
+    )
+
+
+def test_no_stale_entries_in_not_forwarded():
+    """_NOT_FORWARDED must not name fields that no longer exist."""
+    stale = sorted(set(_NOT_FORWARDED) - _settings_field_names())
+    assert not stale, (
+        f"_NOT_FORWARDED names non-existent Settings field(s): {stale}. A stale "
+        "exclusion silently widens the exemption if the name is ever reused."
+    )
+
+
+def test_compose_defaults_match_config_defaults():
+    """A compose default overrides the config default — so it must equal it."""
+    import json
+    import re
+
+    from aiko_gateway.config import Settings
+
+    def render(default) -> str:
+        if default is None:
+            return ""
+        if isinstance(default, bool):
+            return str(default).lower()
+        if isinstance(default, (list, dict)):
+            return json.dumps(default)
+        return str(default)
+
+    env = _chat_island_environment()
+    drifted = []
+    for name, field in Settings.model_fields.items():
+        var = name.upper()
+        if var in _NOT_FORWARDED or var in _DEFAULT_MAY_DIVERGE or var not in env:
+            continue
+        match = re.fullmatch(r"\$\{" + re.escape(var) + r":-(.*)\}", env[var], re.S)
+        if match is None:
+            continue  # a non-defaulted form (e.g. `${VAR}`); nothing to compare
+        if match.group(1) != render(field.default):
+            drifted.append(
+                f"{var}: compose={match.group(1)!r} config={render(field.default)!r}"
+            )
+    assert not drifted, (
+        "compose defaults have drifted from config.py defaults: "
+        f"{drifted}. The compose default is the value the container actually gets "
+        "when the operator sets nothing — it does not defer to config.py. Fix the "
+        "compose default, or record the divergence in _DEFAULT_MAY_DIVERGE with a "
+        "reason. See invariant 7b."
+    )
+
+
+def test_open_registration_blank_behaves_as_unset():
+    """The tri-state field must survive compose's inability to express absence.
+
+    docker-compose's `environment:` mapping has no "omit if unset": an unset host var
+    interpolates to the empty string and the container var is still SET. Since
+    invariant 7b requires OPEN_REGISTRATION to be forwarded, "" reaches pydantic on
+    every deploy where the operator did not set it. Before config.py coerced it, that
+    was a ValidationError — i.e. a crash-loop on both live islands.
+    """
+    from aiko_gateway.config import Settings
+
+    assert Settings(open_registration="").open_registration == (
+        Settings().open_registration
+    ), "blank OPEN_REGISTRATION must behave exactly as if it were unset"
+    # and an explicit value must still win in both directions
+    assert Settings(open_registration="false").open_registration is False
+    assert Settings(open_registration="true").open_registration is True

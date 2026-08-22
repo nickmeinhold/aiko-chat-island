@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Literal
 from urllib.parse import urlparse
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Leaf import (stdlib-only enum) — safe at module top, no config<->domain cycle. The
@@ -145,6 +145,26 @@ class Settings(BaseSettings):
     # Self-service registration. None → resolved by environment in the validator
     # (open in dev, closed in prod); set OPEN_REGISTRATION to override either way.
     open_registration: bool | None = None
+
+    @field_validator("open_registration", mode="before")
+    @classmethod
+    def _blank_is_unspecified(cls, v):
+        """Treat an empty string as "not specified", i.e. None.
+
+        This field is TRI-STATE — None means "resolve from environment" (open in
+        dev, closed in prod), which is a different thing from False. docker-compose's
+        `environment:` mapping cannot express ABSENCE: an unset host var interpolates
+        to the empty string, and the variable is still SET in the container. So
+        without this, forwarding `OPEN_REGISTRATION: ${OPEN_REGISTRATION:-}` (which
+        invariant 7 requires, or the operator's host .env value is inert) hands
+        pydantic "" for a `bool | None` and the island CRASH-LOOPS at boot on every
+        deploy where the operator did not set it — i.e. all of them.
+
+        The forwarding requirement and the tri-state default are both correct; it is
+        the CHANNEL between them that cannot carry "absent". Coerce at the boundary
+        rather than dropping either.
+        """
+        return None if isinstance(v, str) and v.strip() == "" else v
 
     # --- social sign-in (#13: Apple + Google native ID-token flow) ---
     # Explicit on/off, default False, LOUD in prod (mirror open_registration's
