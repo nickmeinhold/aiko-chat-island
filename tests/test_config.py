@@ -977,6 +977,46 @@ def test_no_stale_entries_in_default_may_diverge():
     )
 
 
+def test_every_forward_states_a_default_or_is_explicitly_required():
+    """A bare `${VAR}` forward is a hole in the induction step.
+
+    cage-match PR#141 round 2 (Carnot, HIGH). Invariant 7b accepts `${VAR}` as a
+    valid forward — the boundary character class allows the closing brace — but
+    compose does NOT omit the variable when the host has not set it: it resolves to
+    the empty string and STILL overrides the pydantic default. Meanwhile both
+    downstream checks (`..._defaults_match_config_defaults` and
+    `..._every_compose_default_is_constructible`) `continue` past any value that is
+    not `${VAR:-...}`, because there is no default to compare. So a future
+    `RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED}` would pass every assertion in this
+    file and reopen the exact class under a different interpolation form.
+
+    No such forward exists today — this closes it while it is still latent. Two forms
+    are legitimate and must be stated explicitly: `${VAR:-<config default>}` (has a
+    default) or `${VAR:?reason}` (required, fails loudly when missing).
+    """
+    import re
+
+    from aiko_gateway.config import Settings
+
+    env = _chat_island_environment()
+    bare = []
+    for name in Settings.model_fields:
+        var = name.upper()
+        if var not in env or var in _NOT_FORWARDED:
+            continue
+        value = env[var]
+        if not re.search(r"\$\{" + re.escape(var) + r"[-:}]", value):
+            continue  # static literal — a different check's business
+        if re.fullmatch(r"\$\{" + re.escape(var) + r"\}", value):
+            bare.append(var)
+    assert not bare, (
+        f"These forwards use the bare `${{VAR}}` form: {bare}. compose does not omit "
+        "an unset variable — it sets it to the empty string, which overrides the "
+        "pydantic default while skipping both the default-parity and constructibility "
+        "checks. Use `${VAR:-<config default>}`, or `${VAR:?why}` if it is required."
+    )
+
+
 def test_no_forwarded_var_without_a_settings_field():
     """The mirror direction: a forward for a name config.py does not read.
 
@@ -1124,13 +1164,17 @@ def test_blank_is_unspecified_for_every_none_default_field():
         for blank in ("", "   "):
             with mock.patch.dict(os.environ, {name.upper(): blank}, clear=False):
                 try:
-                    if getattr(Settings(), name) is not None:
-                        # A tri-state field must land on None ("unspecified") or on
-                        # whatever the after-validator resolves it to — never keep the
-                        # blank string itself.
-                        pass
+                    got = getattr(Settings(), name)
                 except Exception as exc:  # noqa: BLE001
                     broken.append(f"{name.upper()}={blank!r} -> {type(exc).__name__}")
+                    continue
+                # ASSERT, don't pass (cage-match PR#141 round 2, Tesla): the earlier
+                # revision only recorded exceptions, so a field that silently KEPT the
+                # blank string greened CI while `_render_default(None) == ""` blessed
+                # a `${VAR:-}` forward for it — the same verifier-blindness this file
+                # exists to escape, reincarnated as a prayer.
+                if isinstance(got, str) and got.strip() == "" and got != "":
+                    broken.append(f"{name.upper()}={blank!r} kept whitespace {got!r}")
     assert not broken, (
         "These None-default (tri-state) fields reject the blank string that "
         f"docker-compose inevitably sends when the operator sets nothing: {broken}. "
@@ -1162,3 +1206,86 @@ def test_not_forwarded_vars_are_not_interpolated():
         f"{contradictions}. The exclusion is claiming one thing while the template "
         "does the opposite — either drop the exclusion or make the value static."
     )
+
+
+def test_whitespace_only_restores_absence_for_every_scalar_field():
+    """A whitespace-only value must never crash a box, whatever the field's type.
+
+    cage-match PR#141 round 2 (Tesla), verified before fixing: `RATE_LIMIT_ENABLED="   "`
+    raised ValidationError. Round 1's coercion only handled None-defaults; round 2's
+    only added bools. Both were per-case allowlists inside a PR about killing
+    allowlists, and the second was falsified within one round — so the rule is now
+    "whitespace-only means the operator said nothing", applied to every field.
+
+    These bytes were INERT before this PR. Forwarding them is what connects a stray
+    space in a host .env to the container for the first time, so the property has to
+    hold across the whole field set, not the three fields someone thought to name.
+    """
+    import os
+    from unittest import mock
+
+    from aiko_gateway.config import Settings
+
+    crashed = []
+    for name, field in Settings.model_fields.items():
+        # Only fields this compose actually forwards: a _NOT_FORWARDED var is static
+        # in the template, so the container never receives a host value for it at all.
+        if name.upper() in _NOT_FORWARDED:
+            continue
+        # COMPLEX fields (list/dict) are outside this rule's reach, honestly scoped:
+        # pydantic-settings JSON-decodes them inside the ENV SOURCE, which runs BEFORE
+        # any model validator, so a whitespace-only value raises SettingsError upstream
+        # of the coercion below and no amount of validator work can catch it. compose
+        # protects the common case (`:-` substitutes on empty as well as unset, so a
+        # blank .env line never reaches the container), leaving only a literally
+        # whitespace-only entry — narrow, and tracked rather than silently skipped.
+        if any(t in str(field.annotation) for t in ("list", "dict")):
+            continue
+        # The reference is the variable genuinely ABSENT from the environment — NOT
+        # a plain Settings(), which in this harness already carries JWT_SECRET and
+        # ISLAND_SIGNING_SEED. Comparing against harness-set values reported a
+        # failure for exactly the behaviour we want: blanking a secret falls back to
+        # the dev default, which _harden_for_production then refuses to boot on. The
+        # claim is "blank behaves as unset", so unset is what it must be measured
+        # against.
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(name.upper(), None)
+            try:
+                absent = getattr(Settings(), name)
+            except Exception:  # noqa: BLE001 — absent is itself invalid; skip
+                continue
+        for blank in ("", " ", "   ", "\t"):
+            with mock.patch.dict(os.environ, {name.upper(): blank}, clear=False):
+                try:
+                    got = getattr(Settings(), name)
+                except Exception as exc:  # noqa: BLE001
+                    crashed.append(f"{name.upper()}={blank!r} -> {type(exc).__name__}")
+                    continue
+                if got != absent:
+                    crashed.append(
+                        f"{name.upper()}={blank!r} gave {got!r}, but the same field "
+                        f"genuinely UNSET gives {absent!r}"
+                    )
+    assert not crashed, (
+        "A whitespace-only environment value must behave exactly as if the operator "
+        f"had set nothing, and these do not: {crashed}."
+    )
+
+
+def test_string_fields_keep_their_whitespace():
+    """The absence rule must not become a blanket strip.
+
+    APNS_PRIVATE_KEY is a PEM and GITHUB_CLIENT_SECRET is a credential — silently
+    rewriting their leading/trailing bytes would be a config layer editing secrets.
+    Only NON-string scalars (bool/int/enum), where whitespace cannot carry meaning,
+    are stripped.
+    """
+    import os
+    from unittest import mock
+
+    from aiko_gateway.config import Settings
+
+    with mock.patch.dict(os.environ, {"GATEWAY_DISPLAY_NAME": "  Padded  "}, clear=False):
+        assert Settings().gateway_display_name == "  Padded  ", (
+            "a string field must not be silently stripped"
+        )

@@ -149,31 +149,51 @@ class Settings(BaseSettings):
     @model_validator(mode="before")
     @classmethod
     def _normalise_env_strings(cls, data):
-        """Absorb the two things an environment variable cannot say cleanly.
+        """Restore the one thing an environment variable cannot say: nothing.
 
-        Both are consequences of the SAME channel limitation, so they are fixed at
-        the same boundary rather than one field at a time (cage-match PR#141: the
-        first version of this handled `open_registration` alone, which is the exact
-        curated-allowlist mistake the rest of this PR exists to stop — Tesla).
+        docker-compose's `environment:` mapping has no "omit if unset" — an unset
+        host var interpolates to the empty string and the container var is still
+        SET. So "the operator configured nothing" arrives as `""` (or, if their
+        .env line has a stray space, as `"   "`), and pydantic is handed a value
+        where it should have been handed absence.
 
-        1. ABSENCE. docker-compose's `environment:` mapping has no "omit if unset":
-           an unset host var interpolates to the empty string and the container var
-           is still SET. So a TRI-STATE field (default None, meaning "resolve from
-           environment") receives "" instead of nothing, and pydantic rejects "" for
-           a `bool | None`. Any field whose default is None gets blank -> None, so
-           the next tri-state field added does not repeat the crash.
+        ONE RULE: a whitespace-only string means the operator said nothing, so the
+        key is DELETED and pydantic's own default applies — whatever the field's
+        type is. Earlier revisions of this validator asked "is the default None?"
+        (cage-match PR#141 round 1) and then "is it a bool?" (round 2), and both are
+        per-case allowlists inside a PR whose entire point is that allowlists cannot
+        fail for the case nobody thought of. Tesla found the second one within a
+        round: `RATE_LIMIT_ENABLED="   "` stripped to `""`, missed the None-default
+        branch, and crash-looped — verified. Deleting the key covers bool, int, enum,
+        tri-state and str in a single move, and needs no list to be kept current.
 
-        2. STRAY WHITESPACE ON A BOOLEAN. A .env line reading `OPEN_REGISTRATION=false `
-           delivers "false " — which pydantic will NOT parse, so a single trailing
-           space crash-loops the island (Tesla, verified). Whitespace cannot be
-           meaningful in a boolean, so bool-typed fields are stripped.
+        Separately, a NON-STRING scalar is stripped, because whitespace can never be
+        meaningful in a bool or an enum and `OPEN_REGISTRATION=false ` (one trailing
+        space in a .env) otherwise raises ValidationError — verified, Tesla round 1.
+        pydantic already tolerates padding on ints, but stripping is harmless there
+        and keeps the rule uniform. String-typed fields are deliberately NOT
+        stripped: APNS_PRIVATE_KEY is a PEM and GITHUB_CLIENT_SECRET is a
+        credential, and their leading/trailing bytes are the caller's business.
 
-        Deliberately NOT a blanket strip of every string: APNS_PRIVATE_KEY is a PEM
-        and GITHUB_CLIENT_SECRET is a credential — leading/trailing bytes there are
-        the caller's business, not ours to silently rewrite.
+        Fail-closed by construction: restoring absence for a REQUIRED field (say a
+        whitespace-only JWT_SECRET) lets it fall to its dev default, which
+        _harden_for_production then refuses to boot on — the loud failure, not the
+        silent one.
         """
         if not isinstance(data, dict):
             return data
+        for name, field in list(cls.model_fields.items()):
+            if name not in data:
+                continue
+            value = data[name]
+            if not isinstance(value, str):
+                continue
+            if value.strip() == "":
+                del data[name]          # the environment said nothing; make it so
+                continue
+            if "str" not in str(field.annotation):
+                data[name] = value.strip()
+        return data
         for name, field in cls.model_fields.items():
             if name not in data:
                 continue
