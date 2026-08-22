@@ -298,3 +298,88 @@ push stops being special and dissolves into an already-solved shape (§4.3). If 
 — one app, and it is yours — then the tower is simply a component you run, and
 the honest move is to document it as a platform-forced centre and stop trying to
 design it away.
+
+---
+
+## 9. ADDENDUM 2026-08-23 09:30 — the prior art we should have opened first
+
+Nick, on being told a worldwide federation cannot hold an Apple developer
+agreement: **"Oooh but a world-wide federation *should* hold a developer acc!
+*that's* the answer!"** He is right, the constraint as I stated it was wrong, and
+searching for prior art immediately turned up a production implementation of
+nearly this entire document.
+
+### 9.1 Mastodon already runs this, and the relay is an official repo
+
+- **`mastodon/webpush-apn-relay`** — a relay that forwards Web Push to APNs.
+  https://github.com/mastodon/webpush-apn-relay
+- **`toot-relay`** (DagAgren) — a THIRD-PARTY relay, "built for Toot!.app but
+  usable for anyone". https://github.com/DagAgren/toot-relay
+- Mastodon's own push API docs: https://docs.joinmastodon.org/methods/push/
+
+So both §4.2 (one tower) and §4.3 (many towers, one per app publisher) are not
+proposals — they are **deployed, at fediverse scale, simultaneously.**
+
+### 9.2 The architecture is better than §5, and it retires most of §5
+
+**The relay speaks Web Push on ingress and APNs on egress. Instances never learn
+APNs exists.** They issue standard RFC 8030 POSTs to a per-device endpoint URL;
+the relay translates TTL / Urgency / Topic into expiration, priority, collapse-id.
+
+Three things this replaces:
+
+1. **The "ring-ticket" invented in §5 is just the Web Push endpoint URL** — a
+   per-device, opaque, bearer capability the device hands to its island.
+   Standardised, not invented. Delete the bespoke design.
+2. **Relay content-blindness becomes CRYPTOGRAPHIC, not policy.** Web Push
+   payloads are encrypted island→device (`aesgcm`, RFC 8291); the relay CANNOT
+   read them. §5's `event_id_only` is blindness by good behaviour; this is
+   blindness by construction. Strictly stronger.
+3. **The island needs NO APNs code in that future** — one egress protocol for
+   every platform, because Android/UnifiedPush and browsers ARE Web Push. The
+   unification §4.5 gropes toward already exists and is called Web Push.
+
+### 9.3 The foundation answers §7's "irreducible" residual
+
+§7 and the conversation before it asserted a legal singleton that no distribution
+removes: Apple issues to a legal entity, Team `SPL85G447K` is Nick's account.
+**Too strong.** Apple's organisation enrollment requires a legal entity with a
+D-U-N-S number, which non-profits have — Mozilla, Signal Technology Foundation,
+Wikimedia, Blender, The Document Foundation and **Mastodon gGmbH** all hold
+developer accounts. Mastodon gGmbH holds the account AND runs the official relay
+for a federated network. That is precisely this problem, already solved.
+
+The singleton does not vanish; it becomes **a governed commons rather than a
+person.** Buys: continuity beyond any individual's Apple ID; governance that can
+be WRITTEN DOWN (who may run a relay becomes a process, not goodwill);
+structural honesty about what the thing is.
+
+Costs, stated plainly: a real organisation (incorporation, board, bylaws,
+filings, a deliberately-chosen jurisdiction), months of admin, and **a foundation
+with one member is just Nick with more paperwork.** A badly-governed foundation
+is WORSE than a trusted individual. And Apple retains its veto regardless — the
+foundation changes who holds the relationship, not that Apple can end it.
+
+**Timing is unchanged** (§7's trigger still stands: the first non-Nick operator).
+But name it as the TARGET now, because it changes what can honestly be said to a
+prospective operator.
+
+### 9.4 Premises retired
+
+- §6.3 (UnifiedPush/Flutter) is **reframed, not just answered**: the question is
+  no longer "can we do UnifiedPush" but "can the island speak Web Push", which is
+  one protocol serving Android, browsers AND (via a relay) Apple.
+- §6.4 (enclaves) drops in priority hard. Mastodon does not need attested
+  enclaves because the relay is content-blind by encryption and partitioned by
+  app publisher. Solve it with a standard before reaching for a TEE.
+
+### 9.5 The process failure that produced §§4-5
+
+Four architectures were designed before anyone searched for prior art. The
+standard (RFC 8030/8291) and a reference implementation in Mastodon's own GitHub
+org would have short-circuited most of it. This is the standing "read the
+vendor's / ecosystem's blessed path BEFORE building machinery around it" rule,
+missed — and missed inside a document whose §6 is entirely about the danger of
+unverified premises. The lesson generalises past push: **§6-style premise
+checking must include "has someone already shipped this?", not only "is my
+factual claim true?"**
