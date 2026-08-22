@@ -714,10 +714,11 @@ def test_compose_island_signing_seed_default_matches_config_dev_seed():
 # exception has to be written down here with a reason. Adding a new setting now
 # fails CI until its author makes that choice explicitly.
 #
-# _MUST_FORWARD_ENV is deliberately KEPT rather than subsumed: this test would be
-# satisfied by moving a var into _NOT_FORWARDED, and for those vars that must never
-# be an acceptable answer. Total check = "nothing is forgotten"; curated list =
-# "these specific ones may never be excluded". Different claims.
+# The concern that motivated a curated "never exclude these" list is real — this test
+# IS satisfiable by widening _NOT_FORWARDED — but the answer is not a second
+# hand-maintained list (see the _MUST_FORWARD_ENV deletion note below). It is
+# test_the_exclusion_set_is_closed: the exclusions are FROZEN, so widening them takes
+# two deliberate edits and shows up twice in a diff.
 
 _NOT_FORWARDED: dict[str, str] = {
     # Container-internal bind address/port. The image listens inside the container
@@ -770,17 +771,17 @@ _DEFAULT_MAY_DIVERGE: dict[str, tuple[str, str]] = {
         "compose ships the real app identifiers; config default is []",
     ),
     "GOOGLE_CLIENT_IDS": (
-        None,
+        '["588100172166-a0r6ipvpju5rd6fh8lv85qqohpdosp33.apps.googleusercontent.com","588100172166-23ppgk6jdb3et2ehc1qj584c6rgs0c9j.apps.googleusercontent.com","588100172166-bagrmvftp3fcer2j2lvnh33j65g58elk.apps.googleusercontent.com"]',
         "compose ships the real OAuth client IDs; config default is []. Not pinned "
         "here because the list is long and rotates with the Google project; the "
         "forward itself is asserted by the totality check.",
     ),
     "PASSKEY_EXTRA_ORIGINS": (
-        None,
+        '["android:apk-key-hash:4X-Pyy5caiOFWCJxYkU2YhIdsfnYZqG57ETE7JFgi6A","android:apk-key-hash:jDaX5vI4HYYMxrQkOUtGeSK9hcTgeuP52fGEQaptSOc","android:apk-key-hash:r_tsz5JUp0Rq8qioELOr73CZt0IegpLHz3sw6aI_p3A"]',
         "compose ships the Android apk-key-hash origins; config default is []",
     ),
     "PASSKEY_ANDROID_CERT_SHA256": (
-        None,
+        '["E1:7F:8F:CB:2E:5C:6A:23:85:58:22:71:62:45:36:62:12:1D:B1:F9:D8:66:A1:B9:EC:44:C4:EC:91:60:8B:A0","8C:36:97:E6:F2:38:1D:86:0C:C6:B4:24:39:4B:46:79:22:BD:85:C4:E0:7A:E3:F9:D9:F1:84:41:AA:6D:48:E7","AF:FB:6C:CF:92:54:A7:44:6A:F2:A8:A8:10:B3:AB:EF:70:99:B7:42:1E:82:92:C7:CF:7B:30:E9:A2:3F:A7:70"]',
         "compose ships the Play signing cert fingerprints; config default is []",
     ),
 }
@@ -963,14 +964,30 @@ def test_open_registration_blank_behaves_as_unset():
     every deploy where the operator did not set it. Before config.py coerced it, that
     was a ValidationError — i.e. a crash-loop on both live islands.
     """
+    import os
+    from unittest import mock
+
     from aiko_gateway.config import Settings
 
-    assert Settings(open_registration="").open_registration == (
-        Settings().open_registration
-    ), "blank OPEN_REGISTRATION must behave exactly as if it were unset"
+    # Through the ENVIRONMENT, not constructor kwargs (Carnot round 6). The kwarg path
+    # skips the env source entirely, so source/validator ORDERING changes — the exact
+    # mechanism that puts complex fields beyond reach — would not fail this test even
+    # though they would break the real thing. Test the channel the value arrives on.
+    def via_env(value):
+        with mock.patch.dict(os.environ, {"OPEN_REGISTRATION": value}, clear=False):
+            return Settings().open_registration
+
+    def unset():
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("OPEN_REGISTRATION", None)
+            return Settings().open_registration
+
+    assert via_env("") == unset(), (
+        "blank OPEN_REGISTRATION must behave exactly as if it were unset"
+    )
     # and an explicit value must still win in both directions
-    assert Settings(open_registration="false").open_registration is False
-    assert Settings(open_registration="true").open_registration is True
+    assert via_env("false") is False
+    assert via_env("true") is True
 
 
 def test_no_stale_entries_in_default_may_diverge():
@@ -1458,4 +1475,51 @@ def test_no_empty_compose_default_on_a_type_an_older_image_cannot_parse():
         "that is a boot-time crash-loop, verified against 0.6.0. State the real "
         "default in compose instead (see OPEN_REGISTRATION, which carries `false` "
         "for exactly this reason)."
+    )
+
+
+# The exclusion set is FROZEN. Growing it is a security decision, so it takes two
+# edits in two places and shows up twice in a diff.
+_EXPECTED_EXCLUSIONS = frozenset({
+    "HOST", "PORT", "JWT_ALGORITHM",
+    "AIKO_MQTT_HOST", "AIKO_MQTT_PORT", "AIKO_NAMESPACE", "DB_URL", "ENVIRONMENT",
+})
+
+
+def test_the_exclusion_set_is_closed():
+    """Resolves a real disagreement between two reviewers, rather than picking a side.
+
+    Tesla (round 5) argued _MUST_FORWARD_ENV had to GO: a hand-maintained list of
+    "vars that may never be excluded" is exactly the class this file kills, and this
+    PR's own history proved it — round 3 added AUTH_RATE_LIMIT but not its window,
+    round 4 patched that and still left the passkey and JWT TTLs ordinary. A partial
+    list gives false assurance about the fields it forgot.
+
+    Carnot (round 6) argued it had to STAY: without it, JWT_SECRET, ISLAND_SIGNING_SEED
+    or PASSKEY_REQUIRE_USER_VERIFICATION can be moved into _NOT_FORWARDED behind any
+    twenty characters of prose, since test_exemption_reasons_are_substantive measures
+    length and not legitimacy. That reopens the class for the most sensitive settings.
+
+    Both are right about different risks, so neither fix is correct. The asymmetry
+    they missed: an "important vars" list is OPEN — unbounded, and you must remember
+    to extend it. The EXCLUSION list is small and complete by construction, because it
+    is precisely the complement of the totality check. So freeze the exclusions
+    instead. Nothing can be quietly excluded (Carnot's risk), and there is no
+    open-ended list of important names to forget (Tesla's risk). The duplication
+    between this frozen set and _NOT_FORWARDED is deliberate: it is what makes
+    widening the exemption impossible in one quiet edit.
+    """
+    actual = set(_NOT_FORWARDED)
+    added = sorted(actual - _EXPECTED_EXCLUSIONS)
+    removed = sorted(_EXPECTED_EXCLUSIONS - actual)
+    assert not added, (
+        f"New exclusion(s) from the forwarding invariant: {added}. Excluding a "
+        "setting means an operator's host .env value silently does nothing — the "
+        "class this whole file exists to prevent. If it is genuinely correct, add it "
+        "to _EXPECTED_EXCLUSIONS too and say why in review; the second edit is the "
+        "point, not an inconvenience."
+    )
+    assert not removed, (
+        f"{removed} left _NOT_FORWARDED but is still in _EXPECTED_EXCLUSIONS. Drop it "
+        "from the frozen set so the two agree."
     )
