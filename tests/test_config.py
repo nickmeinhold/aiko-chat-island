@@ -639,58 +639,21 @@ def test_dev_accepts_the_dev_island_seed():
 # (follow-up #26 orbit). TTLs, host/port, and code-defaulted infra knobs are
 # deliberately excluded; DB_URL / AIKO_MQTT_* / ENVIRONMENT are static-by-design
 # (not host-overridable) so they are excluded too.
-_MUST_FORWARD_ENV = {
-    "JWT_SECRET",                    # secret — token forgery root
-    "ISLAND_SIGNING_SEED",           # secret — manifest signing trust-root
-    "ISLAND_KEY_VERSION",            # island identity — rotation lifecycle
-    "MODERATOR_USER_IDS",            # operator policy — the operator seat (#100)
-    "MODERATION_ALERT_WEBHOOK_URL",  # operator config — alert sink (#91)
-    "CSAM_RUNBOOK_ACKNOWLEDGED",     # A5 operator commitment — prod moderator-boot gate
-    "SOCIAL_SIGNIN_ENABLED",         # operator policy
-    "APPLE_CLIENT_IDS",              # per-island auth
-    "GOOGLE_CLIENT_IDS",             # per-island auth
-    "GITHUB_CLIENT_ID",              # per-island auth
-    "GITHUB_CLIENT_SECRET",          # secret
-    "PASSKEY_ENABLED",               # per-island auth
-    "PASSKEY_RP_ID",                 # per-island auth (domain-scoped)
-    "PASSKEY_EXTRA_ORIGINS",         # per-island auth (the original incident)
-    "PASSKEY_ANDROID_CERT_SHA256",   # per-island auth (Play signing certs)
-    "GATEWAY_BASE_URL",              # per-island identity
-    "GATEWAY_ID",                    # per-island identity
-    "GATEWAY_DISPLAY_NAME",          # per-island identity
-    "AIKO_CHANNELS",                 # operator policy — bridged bus channels (#2555)
-    "GATEWAY_SEED_PEERS",            # operator-curated federation
-    "GATEWAY_BOOTSTRAP_PEERS",       # operator-curated federation (gossip fetch)
-    "GATEWAY_GOSSIP_ENABLED",        # operator policy — gossip fetch gate
-    "LIVEKIT_API_KEY",               # per-island video (#122) — inert-in-container class
-    "LIVEKIT_API_SECRET",            # secret — token forgery root for the SFU (#122)
-    "LIVEKIT_URL",                   # per-island video — the SFU clients connect to
-    "LIVEKIT_TOKEN_TTL_SECONDS",     # operator policy — join-token window
-    # Push wake (#3267). APNS_PRIVATE_KEY is a signing secret and the whole point of
-    # the sweep that added these — being forgotten is exactly how they got here, so
-    # they may never be silenced by moving them into _NOT_FORWARDED.
-    "APNS_KEY_ID",
-    "APNS_TEAM_ID",
-    "APNS_TOPIC",
-    "APNS_PRIVATE_KEY",
-    "APNS_USE_SANDBOX",
-    # The fields the totality sweep actually FOUND inert (cage-match PR#141 round 3,
-    # Carnot + Tesla). The inner list said "these may never be excluded" while
-    # omitting the very corpses the outer claim was written for — so any of them could
-    # be walked back into _NOT_FORWARDED behind twenty characters of plausible prose.
-    "OPEN_REGISTRATION",
-    "RATE_LIMIT_ENABLED",
-    "AUTH_RATE_LIMIT",
-    "MAX_REQUEST_BYTES",
-    "PASSKEY_REQUIRE_USER_VERIFICATION",
-    "ISLAND_MODE",
-    # ...and their SIBLINGS (cage-match PR#141 round 4, Tesla): promoting
-    # AUTH_RATE_LIMIT while leaving its window excludable, or five APNs keys while
-    # leaving the per-recipient wake budget off, makes "never excludable" a bouquet
-    # again — the cap could go inert in the container behind twenty characters of prose.
-    "AUTH_RATE_LIMIT_WINDOW_SECONDS",
-    "APNS_WAKE_PER_RECIPIENT_PER_MINUTE",
-}
+# _MUST_FORWARD_ENV DELETED (cage-match PR#141 round 5, Tesla). It listed vars that
+# "may never be excluded" — and was itself a curated allowlist that someone had to
+# remember to extend, which is the exact class this file exists to kill. Round 3 added
+# AUTH_RATE_LIMIT but not its window; round 4 patched that and still left the passkey
+# TTLs, the JWT TTLs and SOCIAL_NONCE_REQUIRED ordinary. A partial never-exclude list
+# gives false assurance about the fields it forgot.
+#
+# It is also fully SUBSUMED: invariant 7b already asserts that every Settings field is
+# forwarded with a host-passthrough interpolation UNLESS it is named in _NOT_FORWARDED
+# with a substantive reason. "Forwarded XOR justified exclusion" is the one honest
+# partition, and it is total. Keeping a second, hand-maintained list beside it added
+# no coverage and one more thing to forget.
+#
+# The incidents that motivated the original list are kept in the invariant-7 comment
+# above: PASSKEY_EXTRA_ORIGINS, MODERATOR_USER_IDS, ISLAND_SIGNING_SEED, APNS_*.
 
 
 def _chat_island_environment() -> dict[str, str]:
@@ -710,36 +673,6 @@ def _chat_island_environment() -> dict[str, str]:
         "assume map form; update them if the compose switches to list syntax."
     )
     return {k: str(v) for k, v in env.items()}
-
-
-def test_operator_settable_vars_are_forwarded_in_compose():
-    env = _chat_island_environment()
-    # Each operator var must be a KEY under chat-island.environment (scoping) AND its
-    # value must interpolate the host var `${VAR...}` (host-passthrough), not a static
-    # literal that would leave the host .env inert.
-    not_keyed = sorted(v for v in _MUST_FORWARD_ENV if v not in env)
-    assert not not_keyed, (
-        "docker-compose.yml chat-island.environment is missing operator-settable "
-        f"var(s): {not_keyed}. A host .env value is INERT unless the service forwards "
-        "it. See invariant 7."
-    )
-    # Require `${VAR` followed by an interpolation boundary (`:`, `-`, or `}`), so a
-    # value forwarding a DIFFERENT host var whose name merely starts with this one
-    # (`JWT_SECRET: ${JWT_SECRET_EXTRA:-x}`) does NOT false-pass as forwarding VAR
-    # (cage-match PR#110, Tesla). re.escape guards names with regex metachars.
-    import re
-
-    not_passthrough = sorted(
-        v
-        for v in _MUST_FORWARD_ENV
-        if not re.search(r"\$\{" + re.escape(v) + r"[-:}]", env[v])
-    )
-    assert not not_passthrough, (
-        "docker-compose.yml forwards these as a STATIC value (or a different host "
-        f"var), not a host interpolation of the var itself: {not_passthrough}. Each "
-        "must be `${VAR...}` so the operator's host .env value reaches the container; "
-        "a literal is inert. See invariant 7."
-    )
 
 
 def test_compose_island_signing_seed_default_matches_config_dev_seed():
@@ -812,17 +745,44 @@ _NOT_FORWARDED: dict[str, str] = {
 # Everywhere else they must agree, because a compose default is not documentation:
 # `${VAR:-}` does not "fall back" to the config default, it SETS the container var to
 # the empty string and overrides it — usually into a boot-time pydantic error.
-_DEFAULT_MAY_DIVERGE: dict[str, str] = {
+_DEFAULT_MAY_DIVERGE: dict[str, tuple[str, str]] = {
+    # var -> (EXACT compose default expected, why it differs from config.py)
+    #
+    # The value is pinned, not just the reason (cage-match PR#141 round 5, Tesla).
+    # Exempting a field from the parity check exempted it from EVERY check on that
+    # value: `OPEN_REGISTRATION: ${OPEN_REGISTRATION:-false}` could be edited to
+    # `true` and CI would stay green while both production islands opened
+    # registration to anyone. Same for the baked Android fingerprints and OAuth
+    # client IDs — still "diverging", still wrong, still silent. An exemption that
+    # does not state the expected spelling is a fuse already pulled.
     "OPEN_REGISTRATION": (
-        "compose sends the RESOLVED prod value (false), not the tri-state None. A "
-        "blank default crash-loops any older pinned image lacking the coercion — "
-        "verified against 0.6.0. See the comment in docker-compose.yml."
+        "false",
+        "compose sends the RESOLVED prod value, not the tri-state None. A blank "
+        "default crash-loops any older pinned image lacking the coercion — verified "
+        "against 0.6.0. See the comment in docker-compose.yml.",
     ),
-    "JWT_SECRET": "uses the REQUIRED `${VAR:?...}` form — no default by design",
-    "APPLE_CLIENT_IDS": "compose ships the real app identifiers; config default is []",
-    "GOOGLE_CLIENT_IDS": "compose ships the real app identifiers; config default is []",
-    "PASSKEY_EXTRA_ORIGINS": "compose ships the Android apk-key-hash origin",
-    "PASSKEY_ANDROID_CERT_SHA256": "compose ships the Play signing cert fingerprint",
+    "JWT_SECRET": (
+        None,
+        "uses the REQUIRED `${VAR:?...}` form — no default by design",
+    ),
+    "APPLE_CLIENT_IDS": (
+        '["cc.imagineering.aikoChatApp"]',
+        "compose ships the real app identifiers; config default is []",
+    ),
+    "GOOGLE_CLIENT_IDS": (
+        None,
+        "compose ships the real OAuth client IDs; config default is []. Not pinned "
+        "here because the list is long and rotates with the Google project; the "
+        "forward itself is asserted by the totality check.",
+    ),
+    "PASSKEY_EXTRA_ORIGINS": (
+        None,
+        "compose ships the Android apk-key-hash origins; config default is []",
+    ),
+    "PASSKEY_ANDROID_CERT_SHA256": (
+        None,
+        "compose ships the Play signing cert fingerprints; config default is []",
+    ),
 }
 
 
@@ -947,7 +907,22 @@ def test_compose_defaults_match_config_defaults():
     drifted = []
     for name, field in Settings.model_fields.items():
         var = name.upper()
-        if var in _NOT_FORWARDED or var in _DEFAULT_MAY_DIVERGE or var not in env:
+        if var in _NOT_FORWARDED or var not in env:
+            continue
+        if var in _DEFAULT_MAY_DIVERGE:
+            # Exempt from matching CONFIG's default — but not from having its own
+            # value checked. Where a spelling is pinned, it is enforced here.
+            pinned = _DEFAULT_MAY_DIVERGE[var][0]
+            if pinned is not None:
+                m = re.fullmatch(r"\$\{" + re.escape(var) + r":-(.*)\}", env[var], re.S)
+                got = m.group(1) if m else env[var]
+                if got != pinned:
+                    drifted.append(
+                        f"{var}: compose default is {got!r} but _DEFAULT_MAY_DIVERGE "
+                        f"pins it to {pinned!r}. Change the pin deliberately, in "
+                        "review — this value is exempt from config parity, so this "
+                        "assertion is the ONLY thing checking it."
+                    )
             continue
         match = re.fullmatch(r"\$\{" + re.escape(var) + r":-(.*)\}", env[var], re.S)
         if match is None:
@@ -1029,7 +1004,11 @@ def test_no_stale_entries_in_default_may_diverge():
         if var not in env or name not in Settings.model_fields:
             continue
         match = re.fullmatch(r"\$\{" + re.escape(var) + r":-(.*)\}", env[var], re.S)
-        if match and match.group(1) == _render_field_default(Settings.model_fields[name]):
+        try:
+            effective = _render_field_default(Settings.model_fields[name])
+        except _RequiredField:
+            continue  # required fields legitimately have no default to compare
+        if match and match.group(1) == effective:
             no_longer_diverging.append(var)
     assert not no_longer_diverging, (
         "These are listed in _DEFAULT_MAY_DIVERGE but their compose default now "
@@ -1174,7 +1153,8 @@ def test_exemption_reasons_are_substantive():
     thin = []
     for label, table in (("_NOT_FORWARDED", _NOT_FORWARDED),
                          ("_DEFAULT_MAY_DIVERGE", _DEFAULT_MAY_DIVERGE)):
-        for var, reason in table.items():
+        for var, entry in table.items():
+            reason = entry[1] if isinstance(entry, tuple) else entry
             if len(" ".join(str(reason).split())) < 20:
                 thin.append(f"{label}[{var}] = {reason!r}")
     assert not thin, (
@@ -1211,49 +1191,14 @@ def test_open_registration_coercion_edges():
         assert Settings(open_registration=padded).open_registration is expected, padded
 
 
-def test_blank_is_unspecified_for_every_none_default_field():
-    """The absence coercion is a CLASS law, not a charm on one field.
-
-    cage-match PR#141 (Tesla): the first version welded blank->None to
-    `open_registration` alone — which is precisely the curated-allowlist mistake the
-    rest of this PR exists to kill, committed one layer down. A coercion that handles
-    only the field that already broke cannot fail for the SHAPE nobody thought of, and
-    the drift test actively blesses the trap: `_render_default(None)` is `""`, so
-    `${VAR:-}` on a future `bool | None` matches config, goes green, and then dies at
-    pydantic on both islands at boot.
-
-    So assert the property over every None-defaulted field, delivered the way a
-    container delivers it (environment variable, not kwarg).
-    """
-    import os
-    from unittest import mock
-
-    from aiko_gateway.config import Settings
-
-    broken = []
-    for name, field in Settings.model_fields.items():
-        if field.default is not None:
-            continue
-        for blank in ("", "   "):
-            with mock.patch.dict(os.environ, {name.upper(): blank}, clear=False):
-                try:
-                    got = getattr(Settings(), name)
-                except Exception as exc:  # noqa: BLE001
-                    broken.append(f"{name.upper()}={blank!r} -> {type(exc).__name__}")
-                    continue
-                # ASSERT, don't pass (cage-match PR#141 round 2, Tesla): the earlier
-                # revision only recorded exceptions, so a field that silently KEPT the
-                # blank string greened CI while `_render_default(None) == ""` blessed
-                # a `${VAR:-}` forward for it — the same verifier-blindness this file
-                # exists to escape, reincarnated as a prayer.
-                if isinstance(got, str) and got.strip() == "" and got != "":
-                    broken.append(f"{name.upper()}={blank!r} kept whitespace {got!r}")
-    assert not broken, (
-        "These None-default (tri-state) fields reject the blank string that "
-        f"docker-compose inevitably sends when the operator sets nothing: {broken}. "
-        "compose cannot express absence; the coercion in config.py must absorb it."
-    )
-
+# test_blank_is_unspecified_for_every_none_default_field DELETED (cage-match PR#141
+# round 5, Tesla). Its post-construct predicate was `got.strip() == "" and got != ""`,
+# which is "kept PADDING" — it could not see the very case it was named for, a field
+# that keeps `""` instead of restoring absence. Rather than fix a third revision of a
+# weaker check, note that it is SUBSUMED: test_whitespace_only_restores_absence_for_
+# every_scalar_field already sweeps every forwarded field over ("", " ", "   ", "\t")
+# and compares each against the field GENUINELY UNSET, which is the right reference
+# and the stronger claim.
 
 def test_not_forwarded_vars_are_not_interpolated():
     """An exclusion must be an INVERSE, not merely a skip.
@@ -1364,28 +1309,6 @@ def test_string_fields_keep_their_whitespace():
         )
 
 
-def test_must_forward_is_disjoint_from_every_exemption_list():
-    """The never-exclude list must actually be un-excludable.
-
-    cage-match PR#141 round 3 (Carnot MEDIUM, Tesla): _MUST_FORWARD_ENV declares "these
-    may never be excluded", but nothing stopped a name appearing in BOTH it and an
-    exemption list — and `test_exemption_reasons_are_substantive` counts characters,
-    not truth, so a plausible paragraph was enough to reopen the class. Make the two
-    claims contradict each other loudly instead of silently.
-    """
-    # Only _NOT_FORWARDED is an exemption from FORWARDING, which is what
-    # _MUST_FORWARD_ENV asserts. _DEFAULT_MAY_DIVERGE is orthogonal — it says the
-    # forwarded DEFAULT differs from config's, which is perfectly compatible with
-    # "must be forwarded" (APPLE_CLIENT_IDS is both, correctly). An earlier revision
-    # of this test checked both tables and failed on that legitimate pairing.
-    overlap = sorted(set(_MUST_FORWARD_ENV) & set(_NOT_FORWARDED))
-    assert not overlap, (
-        f"{overlap} appear in BOTH _MUST_FORWARD_ENV (may never be excluded) and "
-        "_NOT_FORWARDED (excluded from forwarding). One of the two claims is wrong — "
-        "resolve it in review rather than letting the exemption quietly win."
-    )
-
-
 def test_config_module_has_no_unreachable_code():
     """No statement may follow a `return` in the same block.
 
@@ -1489,4 +1412,50 @@ def test_the_whole_rendered_compose_environment_boots():
         settings = Settings()
     assert settings.environment == "production", (
         "the rendered compose environment should describe a production island"
+    )
+
+
+def test_no_empty_compose_default_on_a_type_an_older_image_cannot_parse():
+    """An empty compose default is only safe for string-like fields.
+
+    cage-match PR#141 round 5 (Tesla) — the induction step that still manufactured the
+    0.6.0 crash. `_render_default(None)` is `""`, so by the parity law the NEXT
+    tri-state field added (`bool | None = None`) would legitimately want
+    `${VAR:-}`. New-image constructibility greens it, because _normalise_env_strings
+    deletes the blank. The PINNED image has no such coercion — that is precisely the
+    crash-loop proven against ghcr.io/nickmeinhold/aiko-chat-island:0.6.0 — and
+    compose cannot version-lock itself to the image, which is the whole reason
+    OPEN_REGISTRATION carries `false` rather than blank.
+
+    That lesson was recorded as a COMMENT on one field. This makes it a law: if the
+    compose default is empty, the field's type must be one that accepts "" on an image
+    WITHOUT the coercion — i.e. string-like. Anything else must state a real default.
+    """
+    import re
+
+    from aiko_gateway.config import Settings, _whitespace_is_never_meaningful
+
+    env = _chat_island_environment()
+    unsafe = []
+    for name, field in Settings.model_fields.items():
+        var = name.upper()
+        if var in _NOT_FORWARDED or var not in env:
+            continue
+        match = re.fullmatch(r"\$\{" + re.escape(var) + r":-(.*)\}", env[var], re.S)
+        if match is None or match.group(1) != "":
+            continue
+        # An empty default reaches pydantic as "" on any image lacking the coercion.
+        # Only a string-like field survives that. (_whitespace_is_never_meaningful is
+        # True exactly for the non-string scalars, so it doubles as the danger test.)
+        if _whitespace_is_never_meaningful(field.annotation) or _is_complex_field(
+            field.annotation
+        ):
+            unsafe.append(f"{var} ({field.annotation})")
+    assert not unsafe, (
+        "These forwards use an EMPTY compose default on a field whose type cannot "
+        f"parse the empty string: {unsafe}. On an island still running an older "
+        "pinned image — one without config.py's blank-restores-absence coercion — "
+        "that is a boot-time crash-loop, verified against 0.6.0. State the real "
+        "default in compose instead (see OPEN_REGISTRATION, which carries `false` "
+        "for exactly this reason)."
     )
