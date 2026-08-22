@@ -794,7 +794,6 @@ _DEFAULT_MAY_DIVERGE: dict[str, str] = {
     "GOOGLE_CLIENT_IDS": "compose ships the real app identifiers; config default is []",
     "PASSKEY_EXTRA_ORIGINS": "compose ships the Android apk-key-hash origin",
     "PASSKEY_ANDROID_CERT_SHA256": "compose ships the Play signing cert fingerprint",
-    "ISLAND_SIGNING_SEED": "dev-seed default asserted by its own drift test above",
 }
 
 
@@ -889,3 +888,71 @@ def test_open_registration_blank_behaves_as_unset():
     # and an explicit value must still win in both directions
     assert Settings(open_registration="false").open_registration is False
     assert Settings(open_registration="true").open_registration is True
+
+
+def test_no_stale_entries_in_default_may_diverge():
+    """A divergence exemption must still name a field that still diverges.
+
+    Asymmetry caught by the invariant-lattice pass: _NOT_FORWARDED had a staleness
+    check and _DEFAULT_MAY_DIVERGE did not. Both are exemption lists, and a stale
+    exemption is worse than a missing one — it silently disarms the drift check for a
+    name that may later be reused, or keeps excusing a divergence someone has since
+    fixed, so the next real drift in that field goes unreported forever.
+
+    It found one on arrival: ISLAND_SIGNING_SEED was listed here while its compose
+    default in fact MATCHES config._DEV_ISLAND_SEED (which is precisely what
+    test_compose_island_signing_seed_default_matches_config_dev_seed asserts). The
+    exemption was excusing a divergence that did not exist, and disarming the check.
+    """
+    import json
+    import re
+
+    from aiko_gateway.config import Settings
+
+    stale = sorted(set(_DEFAULT_MAY_DIVERGE) - _settings_field_names())
+    assert not stale, (
+        f"_DEFAULT_MAY_DIVERGE names non-existent Settings field(s): {stale}."
+    )
+
+    def render(default) -> str:
+        if default is None:
+            return ""
+        if isinstance(default, bool):
+            return str(default).lower()
+        if isinstance(default, (list, dict)):
+            return json.dumps(default)
+        return str(default)
+
+    env = _chat_island_environment()
+    no_longer_diverging = []
+    for var in sorted(_DEFAULT_MAY_DIVERGE):
+        name = var.lower()
+        if var not in env or name not in Settings.model_fields:
+            continue
+        match = re.fullmatch(r"\$\{" + re.escape(var) + r":-(.*)\}", env[var], re.S)
+        if match and match.group(1) == render(Settings.model_fields[name].default):
+            no_longer_diverging.append(var)
+    assert not no_longer_diverging, (
+        "These are listed in _DEFAULT_MAY_DIVERGE but their compose default now "
+        f"MATCHES config.py: {no_longer_diverging}. Remove the exemption so the field "
+        "is protected by the drift check again — a stale exemption is a permanently "
+        "disarmed assertion."
+    )
+
+
+def test_no_forwarded_var_without_a_settings_field():
+    """The mirror direction: a forward for a name config.py does not read.
+
+    A typo'd forward (APNS_TOPICC), or one left behind after a setting is renamed,
+    passes every check above — the field it should protect is simply absent, and the
+    operator's value lands in the container where nothing reads it. Same inert-value
+    outcome as a missing forward, reached from the opposite side, and invisible
+    because each half looks fine on its own.
+    """
+    env = _chat_island_environment()
+    orphans = sorted(set(env) - _settings_field_names())
+    assert not orphans, (
+        f"docker-compose.yml forwards var(s) with no matching Settings field: "
+        f"{orphans}. Either config.py lost the field (delete the forward) or the "
+        "name is misspelt (the operator's value reaches the container unread)."
+    )
