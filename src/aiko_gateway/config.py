@@ -18,6 +18,41 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # config field and the manifest verifier can never drift.
 from .domain.island_mode import IslandMode
 
+
+def _whitespace_is_never_meaningful(annotation) -> bool:
+    """True when leading/trailing whitespace cannot carry meaning for this type.
+
+    Decided by INSPECTING the type, not by looking for the letters "str" inside
+    `str(annotation)` (cage-match PR#141 round 3, Tesla). That substring test was a
+    curated allowlist wearing a lab coat, and it was wrong in both directions:
+    `"str" in "SecretStr"` is False by case, so a PEM wrapped as SecretStr would have
+    been stripped of the trailing newline its own grammar requires; and any
+    NewType/alias without the letters s-t-r in its name would be treated as a scalar.
+
+    The rule: strip bool / int / float / Enum. Never strip anything that is, or
+    contains, a string type — a credential's edge bytes are the caller's business.
+    """
+    import enum
+    import typing
+
+    args = typing.get_args(annotation)
+    if args:  # Optional[...], unions, list[...] etc — safe only if EVERY arm is
+        return all(
+            a is type(None) or _whitespace_is_never_meaningful(a) for a in args
+        )
+    if isinstance(annotation, type):
+        # Enum FIRST: a str-Enum (class IslandMode(str, Enum)) is a str subclass, so
+        # testing str first would classify it as "do not touch" and `ISLAND_MODE=
+        # "moderator "` would fail its member lookup. No enum member carries
+        # whitespace, so stripping is always safe there.
+        if issubclass(annotation, enum.Enum):
+            return True
+        if issubclass(annotation, str):  # str, SecretStr — a credential's own bytes
+            return False
+        if issubclass(annotation, (bool, int, float)):
+            return True
+    return False  # unknown type — do not touch it (fail safe)
+
 # The dev-only JWT secret. Single source so the default and the fail-closed
 # guard below can never disagree (a prod boot with THIS value is rejected).
 _DEV_JWT_SECRET = "dev-insecure-change-me"
@@ -145,6 +180,66 @@ class Settings(BaseSettings):
     # Self-service registration. None → resolved by environment in the validator
     # (open in dev, closed in prod); set OPEN_REGISTRATION to override either way.
     open_registration: bool | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalise_env_strings(cls, data):
+        """Restore the one thing an environment variable cannot say: nothing.
+
+        docker-compose's `environment:` mapping has no "omit if unset" — an unset
+        host var interpolates to the empty string and the container var is still
+        SET. So "the operator configured nothing" arrives as `""` (or, if their
+        .env line has a stray space, as `"   "`), and pydantic is handed a value
+        where it should have been handed absence.
+
+        ONE RULE: a whitespace-only string means the operator said nothing, so the
+        key is DELETED and pydantic's own default applies — whatever the field's
+        type is. Earlier revisions of this validator asked "is the default None?"
+        (cage-match PR#141 round 1) and then "is it a bool?" (round 2), and both are
+        per-case allowlists inside a PR whose entire point is that allowlists cannot
+        fail for the case nobody thought of. Tesla found the second one within a
+        round: `RATE_LIMIT_ENABLED="   "` stripped to `""`, missed the None-default
+        branch, and crash-looped — verified. Deleting the key covers bool, int, enum,
+        tri-state and str in a single move, and needs no list to be kept current.
+
+        Separately, a NON-STRING scalar is stripped, because whitespace can never be
+        meaningful in a bool or an enum and `OPEN_REGISTRATION=false ` (one trailing
+        space in a .env) otherwise raises ValidationError — verified, Tesla round 1.
+        pydantic already tolerates padding on ints, but stripping is harmless there
+        and keeps the rule uniform. String-typed fields are deliberately NOT
+        stripped: APNS_PRIVATE_KEY is a PEM and GITHUB_CLIENT_SECRET is a
+        credential, and their leading/trailing bytes are the caller's business.
+
+        Fail-closed by construction: restoring absence for a REQUIRED field (say a
+        whitespace-only JWT_SECRET) lets it fall to its dev default, which
+        _harden_for_production then refuses to boot on — the loud failure, not the
+        silent one.
+
+        ON ERASING AN OPERATOR'S BYTES (cage-match PR#141 round 3, Carnot HIGH —
+        considered and deliberately kept): this does make a whitespace-only STRING
+        secret indistinguishable from unset. That is the intended reading. No field on
+        this model has a whitespace-only value that means anything — not a key id, not
+        a topic, not a PEM, not a client secret — so the choice is between "treat it
+        as absent" (feature cleanly off, or a loud fail-closed boot guard) and "keep
+        it" (a value that passes presence checks and then fails at the far end, at
+        Apple's door or an OAuth callback, where there is no user-visible surface to
+        explain it). Absence is the more honest of the two. Values with real content
+        are never erased, and never rewritten except for the non-string strip above.
+        """
+        if not isinstance(data, dict):
+            return data
+        for name, field in list(cls.model_fields.items()):
+            if name not in data:
+                continue
+            value = data[name]
+            if not isinstance(value, str):
+                continue
+            if value.strip() == "":
+                del data[name]          # the environment said nothing; make it so
+                continue
+            if _whitespace_is_never_meaningful(field.annotation):
+                data[name] = value.strip()
+        return data
 
     # --- social sign-in (#13: Apple + Google native ID-token flow) ---
     # Explicit on/off, default False, LOUD in prod (mirror open_registration's
