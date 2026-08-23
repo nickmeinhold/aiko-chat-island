@@ -35,9 +35,36 @@ trigger for building the above is the first island operator who is not Nick.
 
 ## Motivation
 
-The island gained an APNs send path (island #3267) and a credential went onto a
-production box on 2026-08-23. That immediately raises the question the design had
-not answered: **when there are other operators, how do they ring?**
+**The app tab named this hole two months before the credential existed.** App
+Design 06 (sovereign identity federation, captured 2026-06-29) points forward to
+Design 07 as "the one place this model meets a platform wall (APNs/FCM) that
+subtraction can't remove", and Design 07 (2026-06-30) states the thesis directly:
+
+> Everywhere else, federation gets simpler by moving cleverness to identity (06).
+> Notifications are the exception: APNs and FCM bind push delivery to one app
+> identity — one bundle id, one signing key, owned by the app vendor. […] the
+> design move here is not "decentralise it" — it's **quarantine the
+> centralisation**.
+
+So this is not a question raised by a deploy; it is a known, named gap in the
+federation model being answered at the moment it stopped being hypothetical. What
+made it urgent rather than merely open is that the island gained an APNs send path
+(island #3267) and a credential went onto a production box on 2026-08-23 — the
+first time the wall had anything real behind it. **When there are other operators,
+how do they ring?**
+
+**This ADR converges with Design 07 rather than originating.** Both were derived
+independently — Design 07 from the app side in June, this from the island side in
+August, off the `push-federation/RESEARCH.md` option space — and both land on the
+same architecture: a small relay quarantining the platform credential, everything
+else federated, explicitly copying Mastodon. Two independent derivations reaching
+the same shape is the strongest evidence either has, and it belongs in the record
+rather than being quietly re-presented as new. Where they differ is layering, and
+that difference is live, not settled: Design 07 models the registration wire on
+**Matrix's `pushers/set`**, while this ADR makes **Web Push (RFC 8030) the
+island's egress contract**. Those are compatible in principle — Design 07 already
+lists a UnifiedPush endpoint as a valid `pushkey` — but nobody has reconciled them
+line by line, and doing so is a precondition of filing, not a follow-up.
 
 Answering it badly is expensive in a specific way. Apple's `.p8` is issued to a
 Developer Team; you name the `apns-topic` per request; that is the entire access
@@ -110,8 +137,17 @@ is held by a foundation, not an individual.
 
 **In force immediately, because they cost nothing and preserve every option:**
 
-- **Do not copy the `.p8` to a second island.** Under every model here, one
-  credential = one publisher.
+- **Count key-holders in OPERATORS, not in boxes.** The `.p8` is currently on both
+  islands (imagineering and enspyr, 2026-08-23) and that is fine and consistent
+  with the decision above: "islands keep talking to APNs directly" *requires* the
+  credential on each island that rings. The revocation argument in the Motivation
+  is about **N operators**, not N machines — both boxes are Nick's, so N is still
+  1, and there is nobody to eject. What must not happen without revisiting this
+  ADR is the credential reaching a box **Nick does not control**, because that is
+  the step that makes rotation a multi-party outage instead of a redeploy.
+  *(An earlier draft said "do not copy the `.p8` to a second island" here, which
+  directly contradicted the decision two sections up and was reasonably read as
+  licensing the opposite. The commitment was wrong, not the deployment.)*
 - **Keep the island's APNs seam narrow.** It is currently four functions with one
   caller of `send()`; swapping direct-APNs for a Web Push client is one module.
 - **Do not regress the 410-only reaping rule.** Reaping a device on `400
@@ -141,6 +177,15 @@ is held by a foundation, not an individual.
   partitions publishers. Reach for the standard before the enclave.
 
 ## Prior art
+
+**Closest to home: app Design 07, "notifications — federation-ready" (2026-06-30),
+`aiko_chat_app/docs/design/07-notifications-federation-ready.html`.** It reaches
+this ADR's architecture from the app side, two months earlier and independently:
+quarantine the centralisation in one relay; keep accounts, channels, history,
+identity and notify logic (rules, mute, mentions) on each home gateway; copy
+Mastodon rather than invent. It also already sketches the registration wire on
+Matrix's `pushers/set`. Read it before filing this — see the Motivation note on
+reconciling its layering with Web-Push-as-egress.
 
 **Mastodon runs almost exactly this, in production, at fediverse scale.**
 
@@ -184,6 +229,14 @@ where possession is authority and there is nowhere for a bad ring to be caught.
 5. **Does this make `aiko_chat` the home of the project-level ADR series?** Filing
    0008 here implies it. Worth stating deliberately rather than establishing by
    accident.
+6. **Reconcile the registration wire with app Design 07. BLOCKS FILING.** Design 07
+   models it on Matrix's `pushers/set`; this ADR makes Web Push (RFC 8030) the
+   island's egress contract. Believed compatible — Design 07 already admits a
+   UnifiedPush endpoint as a `pushkey` — but "believed compatible" is exactly the
+   shape of claim that has cost this project rounds before. An ADR that becomes
+   the decision of record while silently diverging from a design doc in the same
+   repo family creates the drift it exists to prevent. One read-through of Design
+   07 §"Wire shapes" against the Proposal here settles it.
 
 ## Rejected ideas
 
