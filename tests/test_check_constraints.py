@@ -342,10 +342,19 @@ def _insert_fat_user() -> str:
 
 
 def _assert_fat_user_intact(conn) -> None:
-    """Every seeded value survives byte-identical, and the old default held."""
+    """Every seeded value survives EXACTLY, and the old default held.
+
+    Exact equality, not a date prefix: SQLite stores these DATETIME columns as the
+    text they were written with and hands the same text back, so `startswith` was
+    strictly weaker than the docstring claimed — a truncation, a dropped offset, or
+    a coercion to `2026-02-02 12:00:00` all passed a prefix check. And `created_at`
+    was seeded and written but never read back, so a copy overwriting it with
+    CURRENT_TIMESTAMP or NULL was invisible. (Carnot and Tesla independently, PR#142.)
+    """
     row = conn.execute(text(
         "SELECT username, display_name, password_hash, aiko_username, email, "
-        "banned_at, token_generation, handle_changed_at FROM users WHERE id='fat1'"
+        "created_at, banned_at, token_generation, handle_changed_at "
+        "FROM users WHERE id='fat1'"
     )).one()
     v = _FAT_USER_VALUES
     assert row[0] == v["username"]
@@ -353,11 +362,14 @@ def _assert_fat_user_intact(conn) -> None:
     assert row[2] == v["password_hash"], "password_hash lost or NULLed by the rebuild"
     assert row[3] == v["aiko_username"]
     assert row[4] == v["email"], "email lost or NULLed by the rebuild"
-    assert str(row[5]).startswith("2026-02-02"), "banned_at lost — a ban would silently lift"
-    assert row[6] == _FAT_TOKEN_GENERATION, (
+    assert str(row[5]) == v["created_at"], (
+        "created_at was rewritten by the rebuild — every account's age is wrong")
+    assert str(row[6]) == v["banned_at"], (
+        "banned_at lost or altered — a ban would silently lift")
+    assert row[7] == _FAT_TOKEN_GENERATION, (
         "token_generation was RESET by the rebuild — every session this user had "
         "revoked would silently start validating again")
-    assert str(row[7]).startswith("2026-03-03"), "handle_changed_at lost"
+    assert str(row[8]) == v["handle_changed_at"], "handle_changed_at lost or altered"
 
 
 def test_upgrade_0021_to_0022_preserves_populated_users_table(tmp_path, monkeypatch):
@@ -454,7 +466,17 @@ def test_upgrade_0021_to_0022_preserves_populated_users_table(tmp_path, monkeypa
                     "INSERT INTO users (id, username, display_name, aiko_username, "
                     f"created_at, kind) VALUES ('x3', 'x3', 'x3', 'x3@aiko', '{_TS}', "
                     "'daemon')"))
-        assert "ck_users_kind" in str(exc.value) or "CHECK" in str(exc.value)
+        assert "ck_users_kind" in str(exc.value)
+
+        # NOT NULL survived the rebuild too. Structural weakening is as silent as
+        # value loss: a rebuilt parent that dropped NOT NULL on a required column
+        # accepts junk rows forever and nothing above would notice. (Carnot, PR#142.)
+        with pytest.raises(IntegrityError) as exc:
+            with engine.begin() as c:
+                c.execute(text(
+                    "INSERT INTO users (id, username, aiko_username, created_at) "
+                    f"VALUES ('n1', 'n1', 'n1@aiko', '{_TS}')"))  # display_name omitted
+        assert "NOT NULL" in str(exc.value) and "display_name" in str(exc.value)
     finally:
         engine.dispose()
 
