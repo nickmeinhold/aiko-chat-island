@@ -214,6 +214,81 @@ services:
       # list[str] field, so the value MUST be a JSON array. Forwarded here AND asserted
       # by test_config.py invariant 7.
       AIKO_CHANNELS: ${AIKO_CHANNELS:-["general"]}
+      # --- COMPLETENESS SWEEP (2026-08-22). Everything below was a Settings field
+      # that docker-compose did not forward, so a host .env value was INERT — the
+      # PASSKEY_EXTRA_ORIGINS / MODERATOR_USER_IDS / ISLAND_SIGNING_SEED class for the
+      # FOURTH time, found by making invariant 7 TOTAL rather than curated. The
+      # curated allowlist could only ever assert the vars someone remembered; 30 of 62
+      # fields were unforwarded, including OPEN_REGISTRATION, RATE_LIMIT_ENABLED,
+      # AUTH_RATE_LIMIT, MAX_REQUEST_BYTES and PASSKEY_REQUIRE_USER_VERIFICATION.
+      #
+      # EVERY default here MUST equal config.py's default for the same field, and
+      # test_config.py asserts that field-by-field. A `${VAR:-}` under a field whose
+      # config default is non-empty does not "fall back" — it SETS the container var
+      # to the empty string and overrides the default, usually into a boot-time
+      # pydantic error. The compose default is not documentation; it is the value.
+      #
+      # Neither live island sets any of these today (checked on both boxes before the
+      # sweep), so this is behaviour-neutral on deploy — which is exactly why now was
+      # the cheap moment to close the class.
+      #
+      # APNs push wake (#3267 inc 2). Absent/blank => push OFF, not a boot failure;
+      # config.py refuses to boot on a HALF set. APNS_PRIVATE_KEY is a multi-line PEM:
+      # verified 2026-08-22 that a quoted multi-line .env value survives compose
+      # interpolation into the container with real newlines (docker compose v5.1.0).
+      APNS_KEY_ID: ${APNS_KEY_ID:-}
+      APNS_TEAM_ID: ${APNS_TEAM_ID:-}
+      APNS_TOPIC: ${APNS_TOPIC:-}
+      APNS_PRIVATE_KEY: ${APNS_PRIVATE_KEY:-}
+      # Sandbox vs production APNs host — an OPERATOR switch the code may not guess.
+      # A development-build device token is valid ONLY against the sandbox host.
+      APNS_USE_SANDBOX: ${APNS_USE_SANDBOX:-false}
+      APNS_WAKE_PER_RECIPIENT_PER_MINUTE: ${APNS_WAKE_PER_RECIPIENT_PER_MINUTE:-6}
+      # Auth/abuse policy — operator-tunable blast-radius caps (#28).
+      RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-true}
+      AUTH_RATE_LIMIT: ${AUTH_RATE_LIMIT:-20}
+      AUTH_RATE_LIMIT_WINDOW_SECONDS: ${AUTH_RATE_LIMIT_WINDOW_SECONDS:-60}
+      MAX_REQUEST_BYTES: ${MAX_REQUEST_BYTES:-65536}
+      # Registration posture. The field is TRI-STATE in config.py (None = "resolve
+      # from ENVIRONMENT": open in dev, closed in prod) but the compose default here
+      # is the RESOLVED prod value, deliberately, and NOT blank.
+      #
+      # WHY NOT BLANK (cage-match PR#141, Carnot P1 — verified against the real
+      # artifact, not reasoned about): a blank default is only safe if the RUNNING
+      # IMAGE contains this branch's _blank_is_unspecified coercion. The islands run
+      # pinned images, and the box's compose is not version-locked to them, so the new
+      # compose can land on an older image. Running the actually-deployed
+      # ghcr.io/nickmeinhold/aiko-chat-island:0.6.0 with OPEN_REGISTRATION="" returns
+      # `bool_parsing` ValidationError — i.e. the island CRASH-LOOPS. The neutrality
+      # proof that missed this constructed Settings from BRANCH source; the pinned
+      # image is a third state distinct from both repo and runtime.
+      #
+      # `false` is safe on BOTH images and changes nothing: ENVIRONMENT is statically
+      # production in this file, and prod resolves the tri-state to closed anyway. So
+      # this states the value prod already had, and removes the version coupling
+      # entirely rather than guarding it. `:-` (not `-`) so an operator's EMPTY .env
+      # entry also lands here instead of reaching pydantic as "".
+      OPEN_REGISTRATION: ${OPEN_REGISTRATION:-false}
+      # Island posture (crucible-09) — moderator vs the other modes.
+      ISLAND_MODE: ${ISLAND_MODE:-moderator}
+      # Passkey per-island binding (Design 06) — the RP-side identity the handset
+      # signs against. A wrong value here fails CREATE on the device, not at boot.
+      PASSKEY_RP_NAME: ${PASSKEY_RP_NAME:-Aiko Chat}
+      PASSKEY_IOS_APP_ID: ${PASSKEY_IOS_APP_ID:-SPL85G447K.cc.imagineering.aikoChatApp}
+      PASSKEY_ANDROID_PACKAGE: ${PASSKEY_ANDROID_PACKAGE:-cc.imagineering.aiko_chat_app}
+      PASSKEY_REQUIRE_USER_VERIFICATION: ${PASSKEY_REQUIRE_USER_VERIFICATION:-true}
+      PASSKEY_CHALLENGE_TTL_SECONDS: ${PASSKEY_CHALLENGE_TTL_SECONDS:-300}
+      # Session / OAuth / provisioning windows.
+      JWT_ACCESS_TTL_SECONDS: ${JWT_ACCESS_TTL_SECONDS:-900}
+      JWT_REFRESH_TTL_SECONDS: ${JWT_REFRESH_TTL_SECONDS:-2592000}
+      OAUTH_STATE_TTL_SECONDS: ${OAUTH_STATE_TTL_SECONDS:-600}
+      OAUTH_HANDOFF_TTL_SECONDS: ${OAUTH_HANDOFF_TTL_SECONDS:-120}
+      APP_OAUTH_CALLBACK_URL: ${APP_OAUTH_CALLBACK_URL:-aikochat://auth}
+      PROVISIONING_TTL_SECONDS: ${PROVISIONING_TTL_SECONDS:-600}
+      SOCIAL_NONCE_REQUIRED: ${SOCIAL_NONCE_REQUIRED:-false}
+      SOCIAL_NONCE_TTL_SECONDS: ${SOCIAL_NONCE_TTL_SECONDS:-600}
+      RECOVERY_VETO_WINDOW_SECONDS: ${RECOVERY_VETO_WINDOW_SECONDS:-259200}
+      GATEWAY_GOSSIP_INTERVAL_SECONDS: ${GATEWAY_GOSSIP_INTERVAL_SECONDS:-300}
     volumes:
       # Persist the SQLite store across container recreates. External + stably named
       # so the store survives any project/service rename (see volumes: block).

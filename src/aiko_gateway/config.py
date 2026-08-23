@@ -18,6 +18,41 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # config field and the manifest verifier can never drift.
 from .domain.island_mode import IslandMode
 
+
+def _whitespace_is_never_meaningful(annotation) -> bool:
+    """True when leading/trailing whitespace cannot carry meaning for this type.
+
+    Decided by INSPECTING the type, not by looking for the letters "str" inside
+    `str(annotation)` (cage-match PR#141 round 3, Tesla). That substring test was a
+    curated allowlist wearing a lab coat, and it was wrong in both directions:
+    `"str" in "SecretStr"` is False by case, so a PEM wrapped as SecretStr would have
+    been stripped of the trailing newline its own grammar requires; and any
+    NewType/alias without the letters s-t-r in its name would be treated as a scalar.
+
+    The rule: strip bool / int / float / Enum. Never strip anything that is, or
+    contains, a string type — a credential's edge bytes are the caller's business.
+    """
+    import enum
+    import typing
+
+    args = typing.get_args(annotation)
+    if args:  # Optional[...], unions, list[...] etc — safe only if EVERY arm is
+        return all(
+            a is type(None) or _whitespace_is_never_meaningful(a) for a in args
+        )
+    if isinstance(annotation, type):
+        # Enum FIRST: a str-Enum (class IslandMode(str, Enum)) is a str subclass, so
+        # testing str first would classify it as "do not touch" and `ISLAND_MODE=
+        # "moderator "` would fail its member lookup. No enum member carries
+        # whitespace, so stripping is always safe there.
+        if issubclass(annotation, enum.Enum):
+            return True
+        if issubclass(annotation, str):  # str, SecretStr — a credential's own bytes
+            return False
+        if issubclass(annotation, (bool, int, float)):
+            return True
+    return False  # unknown type — do not touch it (fail safe)
+
 # The dev-only JWT secret. Single source so the default and the fail-closed
 # guard below can never disagree (a prod boot with THIS value is rejected).
 _DEV_JWT_SECRET = "dev-insecure-change-me"
@@ -102,9 +137,109 @@ class Settings(BaseSettings):
     # by exactly the leeway; naming it keeps that from drifting).
     livekit_token_ttl_seconds: int = Field(default=600, ge=60, le=3600)
 
+    # --- APNs (push wake — #3267 increment 2) ---
+    # The island wakes a CLOSED handset. Apple is the only party that can reach a
+    # suspended iOS app, so APNs is a mandatory intermediary here in exactly the way
+    # an SFU is mandatory for a browser behind a NAT — it buys REACH, nothing else.
+    #
+    # We talk to APNs DIRECTLY rather than through Firebase's bridge. That is the app
+    # tab's recorded decision (`device_platform.dart`: "Google is not in the RUNTIME
+    # PATH on Apple platforms") and this half must not silently contradict it — the
+    # `Platform` enum's two values only mean something if each talks to its own
+    # service. Android/FCM is a separate transport behind the same door, NOT built yet.
+    #
+    # OPTIONAL, exactly like LiveKit above: absent credentials mean the island runs
+    # normally and simply never pushes. An operator standing up an island gets a
+    # working island without an Apple developer account; notifications are opt-in.
+    # This is why per-island credentials do not fight the one-script standup goal.
+    apns_key_id: str = ""        # the 10-char Key ID of the .p8 (the JWT `kid`)
+    apns_team_id: str = ""       # Apple Developer Team ID (the JWT `iss`)
+    # The app's bundle id — APNs `apns-topic`. NOT derived from any other setting:
+    # a device token is only valid for the topic it was issued under, so a wrong
+    # topic is a silent 400 for every send, and it must be stated, not inferred.
+    apns_topic: str = ""
+    # SECRET — the .p8 signing key, PEM contents (host .env / SOPS), not a path.
+    # Contents rather than a path deliberately: the container would otherwise need a
+    # bind-mount whose absence fails at first-send (a runtime surprise) instead of at
+    # boot, and the existing secret-delivery channel for this deployment is the .env.
+    apns_private_key: str = ""
+    # Sandbox vs production APNs host. A device token from a DEVELOPMENT build is
+    # ONLY valid against api.sandbox.push.apple.com, and a TestFlight/App Store build's
+    # token is ONLY valid against api.push.apple.com — the same token string against
+    # the wrong host is a 400 BadDeviceToken with no other clue. There is no way to
+    # tell the two apart by inspecting the token, so this is an explicit operator
+    # switch and not something the code may guess.
+    apns_use_sandbox: bool = False
+    # Per-RECIPIENT wake budget. Waking a handset is a strictly louder capability than
+    # delivering a message — a message you read when you choose, a push interrupts you
+    # wherever you are — so it gets its own cap, keyed on the person being woken rather
+    # than the sender's IP like the auth buckets. A DM peer who can legitimately send
+    # can still only ring you N times a minute. Not an authn control; a blast-radius cap.
+    apns_wake_per_recipient_per_minute: int = Field(default=6, ge=1, le=60)
+
     # Self-service registration. None → resolved by environment in the validator
     # (open in dev, closed in prod); set OPEN_REGISTRATION to override either way.
     open_registration: bool | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalise_env_strings(cls, data):
+        """Restore the one thing an environment variable cannot say: nothing.
+
+        docker-compose's `environment:` mapping has no "omit if unset" — an unset
+        host var interpolates to the empty string and the container var is still
+        SET. So "the operator configured nothing" arrives as `""` (or, if their
+        .env line has a stray space, as `"   "`), and pydantic is handed a value
+        where it should have been handed absence.
+
+        ONE RULE: a whitespace-only string means the operator said nothing, so the
+        key is DELETED and pydantic's own default applies — whatever the field's
+        type is. Earlier revisions of this validator asked "is the default None?"
+        (cage-match PR#141 round 1) and then "is it a bool?" (round 2), and both are
+        per-case allowlists inside a PR whose entire point is that allowlists cannot
+        fail for the case nobody thought of. Tesla found the second one within a
+        round: `RATE_LIMIT_ENABLED="   "` stripped to `""`, missed the None-default
+        branch, and crash-looped — verified. Deleting the key covers bool, int, enum,
+        tri-state and str in a single move, and needs no list to be kept current.
+
+        Separately, a NON-STRING scalar is stripped, because whitespace can never be
+        meaningful in a bool or an enum and `OPEN_REGISTRATION=false ` (one trailing
+        space in a .env) otherwise raises ValidationError — verified, Tesla round 1.
+        pydantic already tolerates padding on ints, but stripping is harmless there
+        and keeps the rule uniform. String-typed fields are deliberately NOT
+        stripped: APNS_PRIVATE_KEY is a PEM and GITHUB_CLIENT_SECRET is a
+        credential, and their leading/trailing bytes are the caller's business.
+
+        Fail-closed by construction: restoring absence for a REQUIRED field (say a
+        whitespace-only JWT_SECRET) lets it fall to its dev default, which
+        _harden_for_production then refuses to boot on — the loud failure, not the
+        silent one.
+
+        ON ERASING AN OPERATOR'S BYTES (cage-match PR#141 round 3, Carnot HIGH —
+        considered and deliberately kept): this does make a whitespace-only STRING
+        secret indistinguishable from unset. That is the intended reading. No field on
+        this model has a whitespace-only value that means anything — not a key id, not
+        a topic, not a PEM, not a client secret — so the choice is between "treat it
+        as absent" (feature cleanly off, or a loud fail-closed boot guard) and "keep
+        it" (a value that passes presence checks and then fails at the far end, at
+        Apple's door or an OAuth callback, where there is no user-visible surface to
+        explain it). Absence is the more honest of the two. Values with real content
+        are never erased, and never rewritten except for the non-string strip above.
+        """
+        if not isinstance(data, dict):
+            return data
+        for name, field in list(cls.model_fields.items()):
+            if name not in data:
+                continue
+            value = data[name]
+            if not isinstance(value, str):
+                continue
+            if value.strip() == "":
+                del data[name]          # the environment said nothing; make it so
+                continue
+            if _whitespace_is_never_meaningful(field.annotation):
+                data[name] = value.strip()
+        return data
 
     # --- social sign-in (#13: Apple + Google native ID-token flow) ---
     # Explicit on/off, default False, LOUD in prod (mirror open_registration's
@@ -424,6 +559,86 @@ class Settings(BaseSettings):
                         "gateway_id or they collide across islands (the empty default is the "
                         "fail-open case). Refusing to boot — set GATEWAY_ID."
                     )
+        # APNs, like LiveKit, is OPTIONAL — but HALF-configured is the dangerous
+        # state, not the absent one. Absent credentials are honest: is_configured()
+        # is False, nothing is sent, and the operator knows push is off. A partial
+        # set reads as "push is on" at every call site while every send fails at
+        # Apple's door, and the failure is INVISIBLE because a push has no user-
+        # visible success either — a missed call and a disabled feature look
+        # identical on the handset. So require all four together or none, at boot,
+        # where an operator is watching, rather than at first ring.
+        _apns = {
+            "apns_key_id": self.apns_key_id.strip(),
+            "apns_team_id": self.apns_team_id.strip(),
+            "apns_topic": self.apns_topic.strip(),
+            # NOT stripped: a PEM's trailing newline is part of the file and
+            # cryptography accepts either, but leading whitespace breaks the
+            # "-----BEGIN" header match. lstrip only.
+            "apns_private_key": self.apns_private_key.lstrip(),
+        }
+        for name, value in _apns.items():
+            setattr(self, name, value)
+        if any(_apns.values()) and not all(_apns.values()):
+            missing = sorted(k for k, v in _apns.items() if not v)
+            raise ValueError(
+                f"APNs is half-configured — missing {missing}. Set ALL of "
+                f"{sorted(_apns)} or NONE. A partial set silently fails every "
+                "push at Apple's door, which is indistinguishable on the handset "
+                "from push being switched off. Refusing to boot."
+            )
+        if all(_apns.values()):
+            # PRESENCE IS NOT PARSEABILITY (cage-match #139, Maxwell). The guard
+            # above earns its keep by failing "where an operator is watching,
+            # rather than at first ring" — but truthiness alone lets the single
+            # most common dotenv mistake straight through: a PEM pasted with
+            # literal backslash-n instead of real newlines. That boots clean,
+            # then `jwt.encode` raises on the first ring, gets swallowed by
+            # push_service's broad except, and logs "wake failed" forever. The
+            # invisible failure the guard exists to prevent, one layer deeper.
+            #
+            # So actually LOAD the key, and require it to be EC: ES256 is an
+            # elliptic-curve algorithm, and an RSA .p8 (or an App Store Connect
+            # key pasted by mistake — they look identical on disk) satisfies
+            # every presence check and cannot sign a single push.
+            from cryptography.hazmat.primitives.asymmetric import ec
+            from cryptography.hazmat.primitives.serialization import (
+                load_pem_private_key,
+            )
+            try:
+                _key = load_pem_private_key(
+                    self.apns_private_key.encode(), password=None)
+            except Exception as ex:
+                raise ValueError(
+                    "apns_private_key is not a readable PEM private key "
+                    f"({type(ex).__name__}). The usual cause is a .env that "
+                    r"contains the literal two characters \n instead of real "
+                    "newlines — check the key survived transport intact. "
+                    "Refusing to boot rather than failing invisibly at the "
+                    "first ring."
+                ) from ex
+            if not isinstance(_key, ec.EllipticCurvePrivateKey):
+                raise ValueError(
+                    "apns_private_key parses but is not an elliptic-curve key "
+                    f"(got {type(_key).__name__}). APNs provider tokens are "
+                    "ES256, so only an EC key can sign them — this is most "
+                    "likely the wrong .p8 (an App Store Connect API key looks "
+                    "identical on disk). Refusing to boot."
+                )
+            if not isinstance(_key.curve, ec.SECP256R1):
+                # PARSEABLE IS NOT USABLE (cage-match #139 round 2, Carnot) — the
+                # same ladder as presence-is-not-parseability one rung further
+                # down. ES256 is not "EC"; it is P-256 SPECIFICALLY. A P-384 or
+                # P-521 key is a real EC key, satisfies the isinstance check
+                # above, and still cannot sign a provider token — pushing the
+                # failure right back into the swallowed background send path this
+                # whole validator exists to keep it out of.
+                raise ValueError(
+                    "apns_private_key is an EC key on the wrong curve "
+                    f"({_key.curve.name}). ES256 requires P-256 (secp256r1) "
+                    "specifically, so this key parses but can never sign an APNs "
+                    "provider token. Refusing to boot."
+                )
+
         # A2 (crucible-09 Phase A): `e2ee` is schema-reserved for Phase B and
         # HARD-REJECTED in EVERY environment until MLS lands. Advertising an
         # unimplemented E2EE mode would be the exact mislabel this feature prevents
