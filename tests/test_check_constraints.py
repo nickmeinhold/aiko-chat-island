@@ -307,6 +307,15 @@ def test_users_kind_backfills_human(tmp_path, monkeypatch):
 # that are husks cannot detect losing any of them.
 _FAT_USER_COLS = ("id, username, display_name, password_hash, aiko_username, email, "
                   "created_at, banned_at, token_generation, handle_changed_at")
+# NON-ZERO on purpose. token_generation is the session-revocation counter (0015):
+# every token embeds the gen it was minted at and is honoured only while it still
+# equals this column, so bumping it invalidates every outstanding token for that
+# user (recovery finalize re-keys this way). A rebuild that RESET it to 0 would
+# silently UN-REVOKE every previously revoked session — and a fixture that seeds
+# the default 0 cannot tell "preserved" from "reset". Value-preservation and
+# default-preservation are two theorems; this seeds the first, and the
+# post-migration insert below proves the second. (Carnot, cage-match PR#142.)
+_FAT_TOKEN_GENERATION = 7
 _FAT_USER_VALUES = {
     "id": "fat1",
     "username": "fatuser",
@@ -317,23 +326,18 @@ _FAT_USER_VALUES = {
     "created_at": _TS,
     "banned_at": "2026-02-02T00:00:00+00:00",
     "handle_changed_at": "2026-03-03T00:00:00+00:00",
+    "token_generation": _FAT_TOKEN_GENERATION,
 }
 
 
 def _insert_fat_user() -> str:
-    """Every nullable column explicitly non-NULL, EXCEPT token_generation.
-
-    token_generation is deliberately omitted so it lands via the PRE-EXISTING
-    server default from migration 0015. Asserting it reads 0 after the rebuild is
-    what proves 0022 carried the OLD default across, not merely that it applied
-    its own new one.
-    """
+    """Every column explicitly set, including a NON-DEFAULT token_generation."""
     v = _FAT_USER_VALUES
     return (
-        f"INSERT INTO users ({_FAT_USER_COLS.replace(', token_generation', '')}) VALUES ("
+        f"INSERT INTO users ({_FAT_USER_COLS}) VALUES ("
         f"'{v['id']}', '{v['username']}', '{v['display_name']}', '{v['password_hash']}', "
         f"'{v['aiko_username']}', '{v['email']}', '{v['created_at']}', '{v['banned_at']}', "
-        f"'{v['handle_changed_at']}')"
+        f"{v['token_generation']}, '{v['handle_changed_at']}')"
     )
 
 
@@ -350,7 +354,9 @@ def _assert_fat_user_intact(conn) -> None:
     assert row[3] == v["aiko_username"]
     assert row[4] == v["email"], "email lost or NULLed by the rebuild"
     assert str(row[5]).startswith("2026-02-02"), "banned_at lost — a ban would silently lift"
-    assert row[6] == 0, "token_generation lost its PRE-EXISTING (0015) server default"
+    assert row[6] == _FAT_TOKEN_GENERATION, (
+        "token_generation was RESET by the rebuild — every session this user had "
+        "revoked would silently start validating again")
     assert str(row[7]).startswith("2026-03-03"), "handle_changed_at lost"
 
 
@@ -401,6 +407,25 @@ def test_upgrade_0021_to_0022_preserves_populated_users_table(tmp_path, monkeypa
             assert c.execute(text(
                 "SELECT count(*) FROM memberships m JOIN users u "
                 "ON u.id = m.user_id")).scalar_one() == 1
+
+        # BOTH SERVER DEFAULTS SURVIVED ONTO THE MIGRATED TABLE — a separate
+        # theorem from "existing values were preserved" above. A hand-written 0022
+        # could backfill every existing row and enforce the CHECK while dropping
+        # the defaults on the rebuilt table; nothing would go red until an older
+        # writer omitted a column in production and hit NOT NULL. The fresh-DB
+        # test cannot cover this: it never takes the rebuild path.
+        # (Carnot, cage-match PR#142.)
+        with engine.begin() as c:
+            c.execute(text(
+                "INSERT INTO users (id, username, display_name, aiko_username, "
+                f"created_at) VALUES ('d1', 'd1', 'd1', 'd1@aiko', '{_TS}')"))
+            defaults = c.execute(text(
+                "SELECT kind, token_generation FROM users WHERE id='d1'")).one()
+        assert defaults[0] == "human", (
+            "the MIGRATED table lost kind's server default — an omitting writer "
+            "now fails NOT NULL instead of getting the honest 'human'")
+        assert defaults[1] == 0, (
+            "the MIGRATED table lost token_generation's PRE-EXISTING (0015) default")
 
         # UNIQUE(username) IN ISOLATION: aiko_username is distinct, so only the
         # username constraint can reject this. Pin the column so a different
@@ -462,11 +487,32 @@ def test_downgrade_0022_to_0021_round_trips_a_fat_row(tmp_path, monkeypatch):
     try:
         with engine.begin() as c:
             _assert_fat_user_intact(c)
-            ddl = c.execute(text(
-                "SELECT sql FROM sqlite_master WHERE name='users'")).scalar_one()
-            assert "ck_users_kind" not in ddl, "downgrade left the CHECK behind"
-            assert "kind VARCHAR" not in ddl, "downgrade left the column behind"
-            # The uniques must survive the SECOND rebuild too.
-            assert "UNIQUE (username)" in ddl and "UNIQUE (aiko_username)" in ddl
+
+        # Column absence read STRUCTURALLY, not by substring. SQLite renders DDL in
+        # more than one way (quoted identifier, a different type spelling), so
+        # `"kind VARCHAR" not in ddl` can pass over a leftover `"kind" TEXT`.
+        # (Carnot, cage-match PR#142.)
+        cols = {c["name"] for c in inspect(engine).get_columns("users")}
+        assert "kind" not in cols, f"downgrade left the column behind: {sorted(cols)}"
+
+        # And the uniques survive the SECOND rebuild — asserted BEHAVIOURALLY, the
+        # same way the upgrade path does. DDL text is not the invariant anyone
+        # relies on; rejecting a duplicate is.
+        with engine.begin() as c:
+            c.execute(text(
+                "INSERT INTO users (id, username, display_name, aiko_username, "
+                f"created_at) VALUES ('dg1', 'dg1', 'dg1', 'dg1@aiko', '{_TS}')"))
+        with pytest.raises(IntegrityError) as exc:
+            with engine.begin() as c:
+                c.execute(text(
+                    "INSERT INTO users (id, username, display_name, aiko_username, "
+                    f"created_at) VALUES ('dg2', 'dg1', 'dg2', 'dg2@aiko', '{_TS}')"))
+        assert "users.username" in str(exc.value)
+        with pytest.raises(IntegrityError) as exc:
+            with engine.begin() as c:
+                c.execute(text(
+                    "INSERT INTO users (id, username, display_name, aiko_username, "
+                    f"created_at) VALUES ('dg3', 'dg3', 'dg3', 'dg1@aiko', '{_TS}')"))
+        assert "users.aiko_username" in str(exc.value)
     finally:
         engine.dispose()
