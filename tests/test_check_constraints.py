@@ -536,5 +536,37 @@ def test_downgrade_0022_to_0021_round_trips_a_fat_row(tmp_path, monkeypatch):
                     "INSERT INTO users (id, username, display_name, aiko_username, "
                     f"created_at) VALUES ('dg3', 'dg3', 'dg3', 'dg1@aiko', '{_TS}')"))
         assert "users.aiko_username" in str(exc.value)
+
+        # DEFAULT PRESERVATION ON THE REVERSE LEG. Carnot raised this for
+        # token_generation in round 3; it is the same theorem round 2 separated
+        # for the forward leg, so it is applied here as a CLASS rather than as
+        # the one instance reported. The downgrade is a second full rebuild and
+        # owes every invariant the forward one does:
+        #
+        #   invariant                 upgrade   downgrade
+        #   existing values           yes       yes  (_assert_fat_user_intact)
+        #   server defaults           yes       THIS
+        #   NOT NULL                  yes       BELOW
+        #   UNIQUEs (behavioural)     yes       above
+        #   CHECK present / absent    yes       column-absence above
+        #
+        # A downgrade that copies rows correctly while dropping DEFAULT 0 leaves
+        # rollback-era writers omitting token_generation either failing NOT NULL
+        # or storing the wrong revocation counter — on the exact path someone
+        # takes when something has already gone wrong.
+        with engine.begin() as c:
+            c.execute(text(
+                "INSERT INTO users (id, username, display_name, aiko_username, "
+                f"created_at) VALUES ('dgd', 'dgd', 'dgd', 'dgd@aiko', '{_TS}')"))
+            assert c.execute(text(
+                "SELECT token_generation FROM users WHERE id='dgd'")).scalar_one() == 0, (
+                "the downgraded table lost token_generation's 0015 default")
+
+        with pytest.raises(IntegrityError) as exc:
+            with engine.begin() as c:
+                c.execute(text(
+                    "INSERT INTO users (id, username, aiko_username, created_at) "
+                    f"VALUES ('dgn', 'dgn', 'dgn@aiko', '{_TS}')"))  # display_name omitted
+        assert "NOT NULL" in str(exc.value) and "display_name" in str(exc.value)
     finally:
         engine.dispose()
