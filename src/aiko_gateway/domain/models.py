@@ -65,7 +65,9 @@ class ChannelKind(enum.StrEnum):
 
     Members: 'standard' = an ordinary bus-reconciled channel (the only kind any writer
     produces today — verified against live prod: all channels are 'standard'); 'llm' /
-    'robot' = aiko actor channels (mapped to sender_kind by messages_service._kind_for);
+    'robot' = aiko actor channels (used by messages_service._kind_for as the sender_kind
+    fallback ONLY for a sender with no island account — an identified sender now answers
+    from its own users.kind, #3096);
     'dm' = a 1:1 direct-message channel (island-local, never federated).
 
     'group' is deliberately NOT pre-permitted (cage-match PR#124 Tesla): the member-set
@@ -490,7 +492,11 @@ class Message(Base):
     channel_id: Mapped[str] = mapped_column(ForeignKey("channels.id"), nullable=False, index=True)
     # Null when the sender is a non-gateway aiko actor (llm/robot/external REPL).
     sender_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
-    sender_kind: Mapped[str] = mapped_column(String(16), nullable=False)  # human|llm|robot|actor
+    # human|agent|llm|robot|actor. The first two come from the SENDER's own
+    # users.kind (#3096); the last three are CHANNEL-derived fallbacks used only
+    # when no island account identifies the sender (_kind_for). Still an
+    # unenforced open string at the DB — #3144 tracks the closed-set CHECK.
+    sender_kind: Mapped[str] = mapped_column(String(16), nullable=False)
     sender_label: Mapped[str | None] = mapped_column(String(128), nullable=True)
     body: Mapped[str] = mapped_column(Text, nullable=False)
     reply_to: Mapped[str | None] = mapped_column(ForeignKey("messages.id"), nullable=True)

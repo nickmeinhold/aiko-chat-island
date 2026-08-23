@@ -297,3 +297,74 @@ def test_users_kind_backfills_human(tmp_path, monkeypatch):
         assert got == "human"
     finally:
         engine.dispose()
+
+
+def test_upgrade_0021_to_0022_preserves_populated_users_table(tmp_path, monkeypatch):
+    """The EVOLUTION path 0021 -> 0022 on a table that already has rows.
+
+    The two tests above build a FRESH database straight to head, which proves the
+    end state but never exercises the path either live island will actually take:
+    a populated ``users`` table rebuilt in place. 0022 is a parent-table rebuild
+    (SQLite cannot ALTER TABLE ... ADD CONSTRAINT), so the rebuild has to carry
+    every pre-existing structure across by reflection — and SQLite reflection is
+    the weak instrument here. A test that only ever sees an empty fresh table
+    cannot fail if that carry-over breaks, so it cannot clear it either.
+
+    Asserts, on the upgraded copy: rows survive, they backfill to 'human', BOTH
+    pre-existing UNIQUE constraints still bite, the new CHECK bites, and a child
+    row still resolves to its parent across the swap (the FK-off application-
+    cascade premise in ADR-0002 — the parent is dropped and recreated mid-rebuild).
+    """
+    db = tmp_path / "evolve_0022.db"
+    monkeypatch.setattr(settings, "db_url", f"sqlite+aiosqlite:///{db}")
+    cfg = migrate._alembic_config()
+
+    command.upgrade(cfg, "0021")  # the revision both production islands sit at
+    engine = create_engine(f"sqlite:///{db}")
+    try:
+        with engine.begin() as c:
+            c.execute(text(_INSERT_CHANNEL), {"jp": "invite_only"})
+            c.execute(text(_insert_user("u1")))
+            c.execute(text(_insert_user("u2")))
+            c.execute(text(_insert_membership("u1")), {"role": "admin"})
+    finally:
+        engine.dispose()
+
+    command.upgrade(cfg, "0022")  # THE REBUILD
+
+    engine = create_engine(f"sqlite:///{db}")
+    try:
+        with engine.begin() as c:
+            # Data survived the parent-table swap, and backfilled honestly: no
+            # agent account can predate 0022, so every existing row is a human.
+            assert c.execute(text("SELECT count(*) FROM users")).scalar_one() == 2
+            kinds = c.execute(
+                text("SELECT kind FROM users ORDER BY id")).scalars().all()
+            assert kinds == ["human", "human"]
+            # The child row still resolves across the rebuild.
+            assert c.execute(text(
+                "SELECT count(*) FROM memberships m JOIN users u "
+                "ON u.id = m.user_id")).scalar_one() == 1
+
+        # Both pre-existing UNIQUE constraints survived the reflection round-trip.
+        # These are the ones a broken rebuild drops SILENTLY — nothing errors at
+        # migrate time, the island just starts accepting duplicate handles.
+        with pytest.raises(IntegrityError):
+            with engine.begin() as c:
+                c.execute(text(_insert_user("u3").replace("'u3', 'u3'", "'u3', 'u1'")))
+        with pytest.raises(IntegrityError):
+            with engine.begin() as c:
+                c.execute(text(
+                    "INSERT INTO users (id, username, display_name, aiko_username, "
+                    f"created_at) VALUES ('u4', 'u4', 'u4', 'u1', '{_TS}')"))
+
+        # And the new constraint is live on the MIGRATED (not freshly created) table.
+        with pytest.raises(IntegrityError) as exc:
+            with engine.begin() as c:
+                c.execute(text(
+                    "INSERT INTO users (id, username, display_name, aiko_username, "
+                    f"created_at, kind) VALUES ('u5', 'u5', 'u5', 'u5', '{_TS}', "
+                    "'daemon')"))
+        assert "ck_users_kind" in str(exc.value) or "CHECK" in str(exc.value)
+    finally:
+        engine.dispose()
