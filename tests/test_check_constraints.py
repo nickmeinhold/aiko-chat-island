@@ -299,21 +299,77 @@ def test_users_kind_backfills_human(tmp_path, monkeypatch):
         engine.dispose()
 
 
+# A FULLY-POPULATED user, as a live island actually holds one. The evolution tests
+# below seed with this rather than the skeleton `_insert_user` on purpose: 0022
+# rebuilds `users` by copy, and a copy that keeps a column but writes NULL into it
+# is invisible to a fixture that never wrote the column in the first place. Live
+# rows carry password hashes, emails, ban timestamps and handle clocks; test rows
+# that are husks cannot detect losing any of them.
+_FAT_USER_COLS = ("id, username, display_name, password_hash, aiko_username, email, "
+                  "created_at, banned_at, token_generation, handle_changed_at")
+_FAT_USER_VALUES = {
+    "id": "fat1",
+    "username": "fatuser",
+    "display_name": "Fat User",
+    "password_hash": "$argon2id$v=19$m=65536,t=3,p=4$c29tZXNhbHQ$fakehashfortests",
+    "aiko_username": "fatuser@aiko",
+    "email": "fat@example.test",
+    "created_at": _TS,
+    "banned_at": "2026-02-02T00:00:00+00:00",
+    "handle_changed_at": "2026-03-03T00:00:00+00:00",
+}
+
+
+def _insert_fat_user() -> str:
+    """Every nullable column explicitly non-NULL, EXCEPT token_generation.
+
+    token_generation is deliberately omitted so it lands via the PRE-EXISTING
+    server default from migration 0015. Asserting it reads 0 after the rebuild is
+    what proves 0022 carried the OLD default across, not merely that it applied
+    its own new one.
+    """
+    v = _FAT_USER_VALUES
+    return (
+        f"INSERT INTO users ({_FAT_USER_COLS.replace(', token_generation', '')}) VALUES ("
+        f"'{v['id']}', '{v['username']}', '{v['display_name']}', '{v['password_hash']}', "
+        f"'{v['aiko_username']}', '{v['email']}', '{v['created_at']}', '{v['banned_at']}', "
+        f"'{v['handle_changed_at']}')"
+    )
+
+
+def _assert_fat_user_intact(conn) -> None:
+    """Every seeded value survives byte-identical, and the old default held."""
+    row = conn.execute(text(
+        "SELECT username, display_name, password_hash, aiko_username, email, "
+        "banned_at, token_generation, handle_changed_at FROM users WHERE id='fat1'"
+    )).one()
+    v = _FAT_USER_VALUES
+    assert row[0] == v["username"]
+    assert row[1] == v["display_name"]
+    assert row[2] == v["password_hash"], "password_hash lost or NULLed by the rebuild"
+    assert row[3] == v["aiko_username"]
+    assert row[4] == v["email"], "email lost or NULLed by the rebuild"
+    assert str(row[5]).startswith("2026-02-02"), "banned_at lost — a ban would silently lift"
+    assert row[6] == 0, "token_generation lost its PRE-EXISTING (0015) server default"
+    assert str(row[7]).startswith("2026-03-03"), "handle_changed_at lost"
+
+
 def test_upgrade_0021_to_0022_preserves_populated_users_table(tmp_path, monkeypatch):
-    """The EVOLUTION path 0021 -> 0022 on a table that already has rows.
+    """The EVOLUTION path 0021 -> 0022 on a table that already has FAT rows.
 
     The two tests above build a FRESH database straight to head, which proves the
     end state but never exercises the path either live island will actually take:
     a populated ``users`` table rebuilt in place. 0022 is a parent-table rebuild
     (SQLite cannot ALTER TABLE ... ADD CONSTRAINT), so the rebuild has to carry
-    every pre-existing structure across by reflection — and SQLite reflection is
-    the weak instrument here. A test that only ever sees an empty fresh table
-    cannot fail if that carry-over breaks, so it cannot clear it either.
+    every pre-existing structure AND every existing value across by reflection —
+    and SQLite reflection is the weak instrument here.
 
-    Asserts, on the upgraded copy: rows survive, they backfill to 'human', BOTH
-    pre-existing UNIQUE constraints still bite, the new CHECK bites, and a child
-    row still resolves to its parent across the swap (the FK-off application-
-    cascade premise in ADR-0002 — the parent is dropped and recreated mid-rebuild).
+    EACH UNIQUE IS PROBED IN ISOLATION, AND EACH ASSERTION PINS THE COLUMN NAME.
+    An earlier version of this test collided on both unique columns at once and
+    only asserted ``IntegrityError``, so it stayed green with UNIQUE(username)
+    removed — it was firing on aiko_username the whole time. A test that cannot
+    produce the failure cannot clear it, and an untyped exception assertion cannot
+    tell which failure it produced. (Found by Tesla, cage-match PR#136 round 2.)
     """
     db = tmp_path / "evolve_0022.db"
     monkeypatch.setattr(settings, "db_url", f"sqlite+aiosqlite:///{db}")
@@ -324,9 +380,9 @@ def test_upgrade_0021_to_0022_preserves_populated_users_table(tmp_path, monkeypa
     try:
         with engine.begin() as c:
             c.execute(text(_INSERT_CHANNEL), {"jp": "invite_only"})
-            c.execute(text(_insert_user("u1")))
+            c.execute(text(_insert_fat_user()))
             c.execute(text(_insert_user("u2")))
-            c.execute(text(_insert_membership("u1")), {"role": "admin"})
+            c.execute(text(_insert_membership("fat1")), {"role": "admin"})
     finally:
         engine.dispose()
 
@@ -335,36 +391,82 @@ def test_upgrade_0021_to_0022_preserves_populated_users_table(tmp_path, monkeypa
     engine = create_engine(f"sqlite:///{db}")
     try:
         with engine.begin() as c:
-            # Data survived the parent-table swap, and backfilled honestly: no
-            # agent account can predate 0022, so every existing row is a human.
             assert c.execute(text("SELECT count(*) FROM users")).scalar_one() == 2
-            kinds = c.execute(
-                text("SELECT kind FROM users ORDER BY id")).scalars().all()
-            assert kinds == ["human", "human"]
-            # The child row still resolves across the rebuild.
+            # No agent account can predate 0022, so every existing row is a human.
+            assert c.execute(text(
+                "SELECT kind FROM users ORDER BY id")).scalars().all() == ["human", "human"]
+            # Every column value survived the copy — not just the column itself.
+            _assert_fat_user_intact(c)
+            # The child row still resolves across the parent swap (ADR-0002 FK-off).
             assert c.execute(text(
                 "SELECT count(*) FROM memberships m JOIN users u "
                 "ON u.id = m.user_id")).scalar_one() == 1
 
-        # Both pre-existing UNIQUE constraints survived the reflection round-trip.
-        # These are the ones a broken rebuild drops SILENTLY — nothing errors at
-        # migrate time, the island just starts accepting duplicate handles.
-        with pytest.raises(IntegrityError):
-            with engine.begin() as c:
-                c.execute(text(_insert_user("u3").replace("'u3', 'u3'", "'u3', 'u1'")))
-        with pytest.raises(IntegrityError):
-            with engine.begin() as c:
-                c.execute(text(
-                    "INSERT INTO users (id, username, display_name, aiko_username, "
-                    f"created_at) VALUES ('u4', 'u4', 'u4', 'u1', '{_TS}')"))
-
-        # And the new constraint is live on the MIGRATED (not freshly created) table.
+        # UNIQUE(username) IN ISOLATION: aiko_username is distinct, so only the
+        # username constraint can reject this. Pin the column so a different
+        # IntegrityError (NOT NULL, PK, the other unique) cannot pass as this one.
         with pytest.raises(IntegrityError) as exc:
             with engine.begin() as c:
                 c.execute(text(
                     "INSERT INTO users (id, username, display_name, aiko_username, "
-                    f"created_at, kind) VALUES ('u5', 'u5', 'u5', 'u5', '{_TS}', "
+                    f"created_at) VALUES ('x1', '{_FAT_USER_VALUES['username']}', "
+                    f"'x1', 'x1@aiko', '{_TS}')"))
+        assert "users.username" in str(exc.value)
+
+        # UNIQUE(aiko_username) IN ISOLATION: username is distinct this time.
+        with pytest.raises(IntegrityError) as exc:
+            with engine.begin() as c:
+                c.execute(text(
+                    "INSERT INTO users (id, username, display_name, aiko_username, "
+                    f"created_at) VALUES ('x2', 'x2', 'x2', "
+                    f"'{_FAT_USER_VALUES['aiko_username']}', '{_TS}')"))
+        assert "users.aiko_username" in str(exc.value)
+
+        # And the NEW constraint is live on the MIGRATED (not freshly created) table.
+        with pytest.raises(IntegrityError) as exc:
+            with engine.begin() as c:
+                c.execute(text(
+                    "INSERT INTO users (id, username, display_name, aiko_username, "
+                    f"created_at, kind) VALUES ('x3', 'x3', 'x3', 'x3@aiko', '{_TS}', "
                     "'daemon')"))
         assert "ck_users_kind" in str(exc.value) or "CHECK" in str(exc.value)
+    finally:
+        engine.dispose()
+
+
+def test_downgrade_0022_to_0021_round_trips_a_fat_row(tmp_path, monkeypatch):
+    """0021 -> 0022 -> 0021 keeps every value, and drops the column cleanly.
+
+    The downgrade is a SECOND parent rebuild, and it drop_constraint's a CHECK on
+    the dialect this file already documents as CHECK-blind. Production only ever
+    boots forward, so this is not an island-killer — it is the path someone takes
+    at 3am when something has already gone wrong, which is the worst moment to
+    discover it was never executed once. (Tesla's concern, cage-match PR#136.)
+    """
+    db = tmp_path / "roundtrip_0022.db"
+    monkeypatch.setattr(settings, "db_url", f"sqlite+aiosqlite:///{db}")
+    cfg = migrate._alembic_config()
+
+    command.upgrade(cfg, "0021")
+    engine = create_engine(f"sqlite:///{db}")
+    try:
+        with engine.begin() as c:
+            c.execute(text(_insert_fat_user()))
+    finally:
+        engine.dispose()
+
+    command.upgrade(cfg, "0022")
+    command.downgrade(cfg, "0021")  # the untested direction
+
+    engine = create_engine(f"sqlite:///{db}")
+    try:
+        with engine.begin() as c:
+            _assert_fat_user_intact(c)
+            ddl = c.execute(text(
+                "SELECT sql FROM sqlite_master WHERE name='users'")).scalar_one()
+            assert "ck_users_kind" not in ddl, "downgrade left the CHECK behind"
+            assert "kind VARCHAR" not in ddl, "downgrade left the column behind"
+            # The uniques must survive the SECOND rebuild too.
+            assert "UNIQUE (username)" in ddl and "UNIQUE (aiko_username)" in ddl
     finally:
         engine.dispose()
