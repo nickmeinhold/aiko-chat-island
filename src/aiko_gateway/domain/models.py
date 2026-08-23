@@ -65,7 +65,9 @@ class ChannelKind(enum.StrEnum):
 
     Members: 'standard' = an ordinary bus-reconciled channel (the only kind any writer
     produces today — verified against live prod: all channels are 'standard'); 'llm' /
-    'robot' = aiko actor channels (mapped to sender_kind by messages_service._kind_for);
+    'robot' = aiko actor channels (used by messages_service._kind_for as the sender_kind
+    fallback ONLY for a sender with no island account — an identified sender now answers
+    from its own users.kind, #3096);
     'dm' = a 1:1 direct-message channel (island-local, never federated).
 
     'group' is deliberately NOT pre-permitted (cage-match PR#124 Tesla): the member-set
@@ -160,8 +162,39 @@ def _in_check(column: str, values: type[enum.StrEnum]) -> str:
     return f"{column} IN ({rendered})"
 
 
+class UserKind(enum.StrEnum):
+    """Closed set of ACCOUNT kinds (#3096) — what an account *is*, not what it may do.
+
+    Grounded on the app tab's ADR-0005 (the identity graph), which decides bot
+    cardinality = **Model B**: every bot gets its own Principal, backed by a vouch
+    bond from its creator's. "The bot shares my identity" (Model A) is rejected
+    there because it "fails robots-first-class permanently" — a robot could never
+    earn standing of its own. So an agent is a first-class account here, not a flag
+    on a human's.
+
+    This carries NO trust claim and is NOT a badge. A 'verified' affordance is
+    explicitly out of scope (H3, #2403). The column exists so the wire can be
+    HONEST — see the ``_kind_for`` note in messages_service: before #3096 that
+    function returned the literal ``"human"`` for ANY authenticated account, so an
+    agent holding a User row would have worn a human badge on every message it sent.
+
+    Same single-source pattern as ChannelKind/Role/JoinPolicy: drives the DB CHECK
+    on users.kind via _in_check, so the constraint cannot drift from the Python set
+    and a direct SQL write cannot store an out-of-set kind.
+    """
+
+    HUMAN = "human"
+    AGENT = "agent"
+
+
 class User(Base):
     __tablename__ = "users"
+    __table_args__ = (
+        # Closed set at the DB, matching the posture ck_channels_kind already gives
+        # (#2633 cage-match: a rendering/authorization-relevant kind must not rest on
+        # an unenforced open string).
+        CheckConstraint(_in_check("kind", UserKind), name="ck_users_kind"),
+    )
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=new_ulid)
     username: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     display_name: Mapped[str] = mapped_column(String(128), nullable=False)
@@ -203,6 +236,15 @@ class User(Base):
     # stay stable (see project_identity_social_cluster).
     handle_changed_at: Mapped[dt.datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True)
+    # What this account IS (#3096). server_default 'human' so every pre-existing row
+    # backfills as a human account — the honest reading, since no agent account can
+    # exist before this migration. Set at CREATION only: there is deliberately no
+    # mutate path, because flipping a human account to an agent (or back) would be an
+    # identity change wearing an edit's clothes, and an authed human must never be
+    # able to attach an agent identity to their own account (#3096 acceptance).
+    kind: Mapped[str] = mapped_column(
+        String(16), nullable=False,
+        default=UserKind.HUMAN.value, server_default=UserKind.HUMAN.value)
 
 
 class SocialIdentity(Base):
@@ -450,7 +492,11 @@ class Message(Base):
     channel_id: Mapped[str] = mapped_column(ForeignKey("channels.id"), nullable=False, index=True)
     # Null when the sender is a non-gateway aiko actor (llm/robot/external REPL).
     sender_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
-    sender_kind: Mapped[str] = mapped_column(String(16), nullable=False)  # human|llm|robot|actor
+    # human|agent|llm|robot|actor. The first two come from the SENDER's own
+    # users.kind (#3096); the last three are CHANNEL-derived fallbacks used only
+    # when no island account identifies the sender (_kind_for). Still an
+    # unenforced open string at the DB — #3144 tracks the closed-set CHECK.
+    sender_kind: Mapped[str] = mapped_column(String(16), nullable=False)
     sender_label: Mapped[str | None] = mapped_column(String(128), nullable=True)
     body: Mapped[str] = mapped_column(Text, nullable=False)
     reply_to: Mapped[str | None] = mapped_column(ForeignKey("messages.id"), nullable=True)

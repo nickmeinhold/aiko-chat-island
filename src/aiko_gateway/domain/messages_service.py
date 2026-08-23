@@ -172,7 +172,12 @@ async def create_outbound(
         id=new_ulid(),
         channel_id=channel.id,
         sender_user_id=user.id,
-        sender_kind="human",
+        # The sender's OWN kind, never a hardcoded "human" (#3096). This is the
+        # local (authenticated) send path — the one an agent account will actually
+        # use — so hardcoding here is precisely how an agent would end up wearing a
+        # human badge. Kept identical in shape to _kind_for's identified-sender arm;
+        # both writers of sender_kind must answer "who sent it".
+        sender_kind=user.kind,
         sender_label=user.display_name,
         body=body,
         reply_to=reply_to,
@@ -193,8 +198,22 @@ async def create_outbound(
 
 
 def _kind_for(channel: Channel, sender_user: User | None) -> str:
+    """What KIND of sender produced this message, for honest client rendering.
+
+    An identified sender answers from its OWN account kind (#3096) — not the
+    literal "human" this returned for any authenticated account before, which
+    would have stamped a human badge on every message an agent sent the moment
+    agents got User rows. ADR-0005 (app tab) makes an agent a first-class
+    Principal, so it must be able to say so on the wire.
+
+    An UNidentified sender (sender_user is None) still falls back to the CHANNEL's
+    kind, because that is the only signal available: an anonymous bus speaker
+    carries no island identity to ask. That fallback answers "where was this
+    sent", not "who sent it", and is a known weakness rather than a design — it is
+    exactly what #3096 exists to retire, by giving bus actors real accounts.
+    """
     if sender_user is not None:
-        return "human"
+        return sender_user.kind
     if channel.kind in ("llm", "robot"):
         return channel.kind
     return "actor"  # external REPL / unknown bus participant

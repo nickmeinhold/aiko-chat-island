@@ -64,12 +64,18 @@ def _member_view(m, u) -> dict:
     # public channel's roster is enumerable by any member who can read it — public
     # channels are public by definition, so exposing member handles there is the
     # roster working as designed, not a global user-search surface.
+    # `kind` ('human' | 'agent') is surfaced so the roster is HONEST about who is in
+    # the room (#3096) — an agent must be legible as one without the client having to
+    # infer it from a name. It is a statement of what the account IS, carrying NO
+    # trust claim: there is deliberately no 'verified' affordance here (that is H3,
+    # #2403), and per ADR-0005 an agent is a first-class Principal, not a lesser one.
     return {
         "user_id": m.user_id,
         "role": m.role,
         "can_post": m.can_post,
         "handle": u.username,
         "display_name": u.display_name,
+        "kind": u.kind,
     }
 
 

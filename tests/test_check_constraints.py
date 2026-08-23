@@ -249,3 +249,122 @@ def test_upgrade_0001_to_0002_preserves_data_structure_and_applies_check(
                                .replace("'aiko/c'", "'aiko/c3'")), {"jp": "bogus"})
     finally:
         engine.dispose()
+
+
+def test_users_kind_check_rejects_out_of_set(tmp_path, monkeypatch):
+    """users.kind is a closed set at the DB (#3096, migration 0022).
+
+    The kind decides how a sender is RENDERED (human vs agent), so leaving it an
+    unenforced open string is the same posture the #2633 cage-match rejected for
+    channels.kind. A direct SQL writer must not be able to invent a third kind —
+    a client that switch-dispatches on it would fall through to whatever its
+    default branch is, which for a badge means guessing.
+    """
+    engine = _fresh_at_head(tmp_path, monkeypatch)
+    try:
+        with engine.begin() as c:
+            c.execute(text(_insert_user("u1")))  # default 'human' -> ok
+            c.execute(text(_insert_user("u2").replace(
+                "(id, username, display_name, aiko_username, created_at)",
+                "(id, username, display_name, aiko_username, created_at, kind)"
+            ).replace(f"'{_TS}')", f"'{_TS}', 'agent')")))  # explicit agent -> ok
+        # DISTINCT user id so a failure can only be the kind CHECK, never a PK
+        # collision masking it (the same trap Carnot found in PR#24).
+        with pytest.raises(IntegrityError) as exc:
+            with engine.begin() as c:
+                c.execute(text(_insert_user("u3").replace(
+                    "(id, username, display_name, aiko_username, created_at)",
+                    "(id, username, display_name, aiko_username, created_at, kind)"
+                ).replace(f"'{_TS}')", f"'{_TS}', 'daemon')")))
+        assert "ck_users_kind" in str(exc.value) or "CHECK" in str(exc.value)
+    finally:
+        engine.dispose()
+
+
+def test_users_kind_backfills_human(tmp_path, monkeypatch):
+    """A row inserted WITHOUT kind gets 'human' from the server_default (#3096).
+
+    Two things at once: the migration's backfill direction is the honest one (no
+    agent account can predate 0022), and the default is retained after backfill so
+    a writer that omits the column gets 'human' rather than an error — the safe
+    direction for a column that gates rendering.
+    """
+    engine = _fresh_at_head(tmp_path, monkeypatch)
+    try:
+        with engine.begin() as c:
+            c.execute(text(_insert_user("u1")))
+            got = c.execute(text("SELECT kind FROM users WHERE id='u1'")).scalar_one()
+        assert got == "human"
+    finally:
+        engine.dispose()
+
+
+def test_upgrade_0021_to_0022_preserves_populated_users_table(tmp_path, monkeypatch):
+    """The EVOLUTION path 0021 -> 0022 on a table that already has rows.
+
+    The two tests above build a FRESH database straight to head, which proves the
+    end state but never exercises the path either live island will actually take:
+    a populated ``users`` table rebuilt in place. 0022 is a parent-table rebuild
+    (SQLite cannot ALTER TABLE ... ADD CONSTRAINT), so the rebuild has to carry
+    every pre-existing structure across by reflection — and SQLite reflection is
+    the weak instrument here. A test that only ever sees an empty fresh table
+    cannot fail if that carry-over breaks, so it cannot clear it either.
+
+    Asserts, on the upgraded copy: rows survive, they backfill to 'human', BOTH
+    pre-existing UNIQUE constraints still bite, the new CHECK bites, and a child
+    row still resolves to its parent across the swap (the FK-off application-
+    cascade premise in ADR-0002 — the parent is dropped and recreated mid-rebuild).
+    """
+    db = tmp_path / "evolve_0022.db"
+    monkeypatch.setattr(settings, "db_url", f"sqlite+aiosqlite:///{db}")
+    cfg = migrate._alembic_config()
+
+    command.upgrade(cfg, "0021")  # the revision both production islands sit at
+    engine = create_engine(f"sqlite:///{db}")
+    try:
+        with engine.begin() as c:
+            c.execute(text(_INSERT_CHANNEL), {"jp": "invite_only"})
+            c.execute(text(_insert_user("u1")))
+            c.execute(text(_insert_user("u2")))
+            c.execute(text(_insert_membership("u1")), {"role": "admin"})
+    finally:
+        engine.dispose()
+
+    command.upgrade(cfg, "0022")  # THE REBUILD
+
+    engine = create_engine(f"sqlite:///{db}")
+    try:
+        with engine.begin() as c:
+            # Data survived the parent-table swap, and backfilled honestly: no
+            # agent account can predate 0022, so every existing row is a human.
+            assert c.execute(text("SELECT count(*) FROM users")).scalar_one() == 2
+            kinds = c.execute(
+                text("SELECT kind FROM users ORDER BY id")).scalars().all()
+            assert kinds == ["human", "human"]
+            # The child row still resolves across the rebuild.
+            assert c.execute(text(
+                "SELECT count(*) FROM memberships m JOIN users u "
+                "ON u.id = m.user_id")).scalar_one() == 1
+
+        # Both pre-existing UNIQUE constraints survived the reflection round-trip.
+        # These are the ones a broken rebuild drops SILENTLY — nothing errors at
+        # migrate time, the island just starts accepting duplicate handles.
+        with pytest.raises(IntegrityError):
+            with engine.begin() as c:
+                c.execute(text(_insert_user("u3").replace("'u3', 'u3'", "'u3', 'u1'")))
+        with pytest.raises(IntegrityError):
+            with engine.begin() as c:
+                c.execute(text(
+                    "INSERT INTO users (id, username, display_name, aiko_username, "
+                    f"created_at) VALUES ('u4', 'u4', 'u4', 'u1', '{_TS}')"))
+
+        # And the new constraint is live on the MIGRATED (not freshly created) table.
+        with pytest.raises(IntegrityError) as exc:
+            with engine.begin() as c:
+                c.execute(text(
+                    "INSERT INTO users (id, username, display_name, aiko_username, "
+                    f"created_at, kind) VALUES ('u5', 'u5', 'u5', 'u5', '{_TS}', "
+                    "'daemon')"))
+        assert "ck_users_kind" in str(exc.value) or "CHECK" in str(exc.value)
+    finally:
+        engine.dispose()
