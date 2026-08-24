@@ -117,6 +117,11 @@ def test_member_roster_carries_the_account_kind():
     assert view["kind"] == "agent", "an agent is invisible in the roster"
     assert view["kind"] == agent.kind, "roster kind must come FROM the account"
 
-    human = _user(UserKind.HUMAN, name="ada")
+    # SAME HANDLE, only the kind differs. With a differently-named human control, a
+    # view that INFERRED kind from the username would pass both assertions — so the
+    # "cause pin" above was a tautology (`view["kind"] == agent.kind` cannot fail
+    # when `view["kind"] == "agent"` passes). Holding the handle fixed is the one
+    # variable that discriminates reading the account from guessing at it.
+    human = _user(UserKind.HUMAN, name="armbot")
     assert _member_view(SimpleNamespace(
         user_id=human.id, role="member", can_post=True), human)["kind"] == "human"
