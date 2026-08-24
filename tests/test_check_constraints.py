@@ -341,6 +341,24 @@ def _insert_fat_user() -> str:
     )
 
 
+def _assert_fixture_mirrors_schema(conn) -> None:
+    """The fat row's column list must be a CENSUS, not a hymn.
+
+    _FAT_USER_COLS is hand-maintained, and the whole point of the fat row is that a
+    rebuild which KEEPS a column but writes NULL into it is invisible to a fixture
+    that never wrote that column. So a column added by some later migration and not
+    added here is silently uncovered on both legs — the suite stays green while
+    covering less, which is the exact failure the fat row exists to prevent, turned
+    on the fixture itself. Ask the live table who it is instead of trusting the list.
+    """
+    actual = {r[1] for r in conn.exec_driver_sql("PRAGMA table_info(users)")}
+    declared = {c.strip() for c in _FAT_USER_COLS.split(",")}
+    assert actual == declared, (
+        "users' columns and the fat-row fixture have diverged; the rebuild tests "
+        f"silently stopped covering {actual ^ declared}. Update _FAT_USER_COLS "
+        "and _assert_fat_user_intact together.")
+
+
 def _assert_husk_still_empty(conn, uid: str) -> None:
     """The THIRD theorem: a cell that was NULL before the rebuild is still NULL.
 
@@ -358,6 +376,15 @@ def _assert_husk_still_empty(conn, uid: str) -> None:
     assert row[2] is None, (
         "banned_at materialised by the rebuild — every ordinary account is now banned")
     assert row[3] is None, "handle_changed_at materialised by the rebuild"
+    # The husk's token_generation is 0 — the DEFAULT. The fat row is 7 precisely so
+    # preservation cannot impersonate a reset; the mirror image is a copy that
+    # stamps every row from the non-default witness, which leaves the fat row
+    # byte-identical at 7 and a post-rebuild insert still getting DEFAULT 0, while
+    # silently rewriting the revocation counter of every ordinary account.
+    assert conn.execute(text(
+        f"SELECT token_generation FROM users WHERE id='{uid}'")).scalar_one() == 0, (
+        "the husk's token_generation was rewritten — ordinary accounts had their "
+        "revocation counter changed by the rebuild")
 
 
 def _assert_fat_user_intact(conn) -> None:
@@ -416,6 +443,7 @@ def test_upgrade_0021_to_0022_preserves_populated_users_table(tmp_path, monkeypa
     engine = create_engine(f"sqlite:///{db}")
     try:
         with engine.begin() as c:
+            _assert_fixture_mirrors_schema(c)
             c.execute(text(_INSERT_CHANNEL), {"jp": "invite_only"})
             c.execute(text(_insert_fat_user()))
             c.execute(text(_insert_user("u2")))
@@ -550,6 +578,20 @@ def test_downgrade_0022_to_0021_round_trips_a_fat_row(tmp_path, monkeypatch):
         engine.dispose()
 
     command.upgrade(cfg, "0022")
+
+    # HIGH-WATER MARK. Without this the test cannot tell "downgrade removed kind"
+    # from "kind was never born": with BOTH upgrade() and downgrade() no-op'd, every
+    # assertion below still passes — revisions stamp, the fat row survives, and
+    # `kind not in cols` is trivially true. Sibling tests catching the no-op does
+    # not help; a different test is not this one's positive control.
+    engine = create_engine(f"sqlite:///{db}")
+    try:
+        assert "kind" in {c["name"] for c in inspect(engine).get_columns("users")}, (
+            "kind was never created, so this test's premise is unmet and its "
+            "post-downgrade assertions prove nothing")
+    finally:
+        engine.dispose()
+
     command.downgrade(cfg, "0021")  # the untested direction
 
     engine = create_engine(f"sqlite:///{db}")
