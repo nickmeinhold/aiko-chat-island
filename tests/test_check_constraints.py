@@ -71,7 +71,7 @@ def test_role_check_rejects_out_of_set(tmp_path, monkeypatch):
             c.execute(text(_insert_user("u2")))
             c.execute(text(_insert_membership("u1")), {"role": "member"})  # valid
         # DISTINCT user (u2) so a failure can ONLY be the role CHECK, never the
-        # composite-PK collision that masked it before (Carnot cage-match, PR#24).
+        # composite-PK collision that masked it before.
         with pytest.raises(IntegrityError) as exc:
             with engine.begin() as c:
                 c.execute(text(_insert_membership("u2")), {"role": "superadmin"})
@@ -183,7 +183,7 @@ def test_0009_rebuild_preserves_aiko_channel_unique(tmp_path, monkeypatch):
     UNIQUE from 0001. compare_metadata's unique-reflection on SQLite is exactly the
     kind of thing that can silently leak through a rebuild, so prove it directly
     (verify by RUNNING, not by trusting the parity gate): a duplicate aiko_channel
-    insert at head must be rejected (Carnot cage-match, PR#47)."""
+    insert at head must be rejected."""
     engine = _fresh_at_head(tmp_path, monkeypatch)
     try:
         with engine.begin() as c:
@@ -201,7 +201,7 @@ def test_upgrade_0001_to_0002_preserves_data_structure_and_applies_check(
         tmp_path, monkeypatch):
     """The evolution path: a DB at 0001 with data, upgraded one step to 0002.
     The batch table-rebuild must keep the rows AND the structure (memberships'
-    composite PK + both FKs) AND turn the CHECKs on (Carnot cage-match, PR#24)."""
+    composite PK + both FKs) AND turn the CHECKs on."""
     db = tmp_path / "evolve.db"
     monkeypatch.setattr(settings, "db_url", f"sqlite+aiosqlite:///{db}")
     cfg = migrate._alembic_config()
@@ -299,21 +299,141 @@ def test_users_kind_backfills_human(tmp_path, monkeypatch):
         engine.dispose()
 
 
+# A FULLY-POPULATED user, as a live island actually holds one. The evolution tests
+# below seed with this rather than the skeleton `_insert_user` on purpose: 0022
+# rebuilds `users` by copy, and a copy that keeps a column but writes NULL into it
+# is invisible to a fixture that never wrote the column in the first place. Live
+# rows carry password hashes, emails, ban timestamps and handle clocks; test rows
+# that are husks cannot detect losing any of them.
+_FAT_USER_COLS = ("id, username, display_name, password_hash, aiko_username, email, "
+                  "created_at, banned_at, token_generation, handle_changed_at")
+# NON-ZERO on purpose. token_generation is the session-revocation counter (0015):
+# every token embeds the gen it was minted at and is honoured only while it still
+# equals this column, so bumping it invalidates every outstanding token for that
+# user (recovery finalize re-keys this way). A rebuild that RESET it to 0 would
+# silently UN-REVOKE every previously revoked session — and a fixture that seeds
+# the default 0 cannot tell "preserved" from "reset". Value-preservation and
+# default-preservation are two theorems; this seeds the first, and the
+# post-migration insert below proves the second. (Carnot, cage-match PR#142.)
+_FAT_TOKEN_GENERATION = 7
+_FAT_USER_VALUES = {
+    "id": "fat1",
+    "username": "fatuser",
+    "display_name": "Fat User",
+    "password_hash": "$argon2id$v=19$m=65536,t=3,p=4$c29tZXNhbHQ$fakehashfortests",
+    "aiko_username": "fatuser@aiko",
+    "email": "fat@example.test",
+    "created_at": _TS,
+    "banned_at": "2026-02-02T00:00:00+00:00",
+    "handle_changed_at": "2026-03-03T00:00:00+00:00",
+    "token_generation": _FAT_TOKEN_GENERATION,
+}
+
+
+def _insert_fat_user() -> str:
+    """Every column explicitly set, including a NON-DEFAULT token_generation."""
+    v = _FAT_USER_VALUES
+    return (
+        f"INSERT INTO users ({_FAT_USER_COLS}) VALUES ("
+        f"'{v['id']}', '{v['username']}', '{v['display_name']}', '{v['password_hash']}', "
+        f"'{v['aiko_username']}', '{v['email']}', '{v['created_at']}', '{v['banned_at']}', "
+        f"{v['token_generation']}, '{v['handle_changed_at']}')"
+    )
+
+
+def _assert_fixture_mirrors_schema(conn) -> None:
+    """The fat row's column list must be a CENSUS, not a hymn.
+
+    _FAT_USER_COLS is hand-maintained, and the whole point of the fat row is that a
+    rebuild which KEEPS a column but writes NULL into it is invisible to a fixture
+    that never wrote that column. So a column added by some later migration and not
+    added here is silently uncovered on both legs — the suite stays green while
+    covering less, which is the exact failure the fat row exists to prevent, turned
+    on the fixture itself. Ask the live table who it is instead of trusting the list.
+    """
+    actual = {r[1] for r in conn.exec_driver_sql("PRAGMA table_info(users)")}
+    declared = {c.strip() for c in _FAT_USER_COLS.split(",")}
+    assert actual == declared, (
+        "users' columns and the fat-row fixture have diverged; the rebuild tests "
+        f"silently stopped covering {actual ^ declared}. Update _FAT_USER_COLS "
+        "and _assert_fat_user_intact together.")
+
+
+def _assert_husk_still_empty(conn, uid: str) -> None:
+    """The THIRD theorem: a cell that was NULL before the rebuild is still NULL.
+
+    _assert_fat_user_intact can only observe cells that were written non-NULL, so a
+    copy that materialises NULLs is invisible to it — and that failure is not
+    cosmetic: COALESCE-ing (or CURRENT_TIMESTAMP-ing) `banned_at` mass-BANS every
+    ordinary account on both live islands while the seeded banned user still
+    round-trips byte-identical and the suite stays green.
+    """
+    row = conn.execute(text(
+        "SELECT password_hash, email, banned_at, handle_changed_at "
+        f"FROM users WHERE id='{uid}'")).one()
+    assert row[0] is None, "password_hash materialised by the rebuild"
+    assert row[1] is None, "email materialised by the rebuild"
+    assert row[2] is None, (
+        "banned_at materialised by the rebuild — every ordinary account is now banned")
+    assert row[3] is None, "handle_changed_at materialised by the rebuild"
+    # The husk's token_generation is 0 — the DEFAULT. The fat row is 7 precisely so
+    # preservation cannot impersonate a reset; the mirror image is a copy that
+    # stamps every row from the non-default witness, which leaves the fat row
+    # byte-identical at 7 and a post-rebuild insert still getting DEFAULT 0, while
+    # silently rewriting the revocation counter of every ordinary account.
+    assert conn.execute(text(
+        f"SELECT token_generation FROM users WHERE id='{uid}'")).scalar_one() == 0, (
+        "the husk's token_generation was rewritten — ordinary accounts had their "
+        "revocation counter changed by the rebuild")
+
+
+def _assert_fat_user_intact(conn) -> None:
+    """Every seeded value survives EXACTLY.
+
+    Exact equality, not a date prefix: SQLite hands these DATETIME columns back as
+    the text they were written with, so a prefix check would pass a truncation, a
+    dropped offset, or a coercion to `2026-02-02 12:00:00`.
+
+    DEFAULT preservation is a separate theorem and is NOT checked here — it lives on
+    the post-rebuild inserts that omit the defaulted columns.
+    """
+    row = conn.execute(text(
+        "SELECT username, display_name, password_hash, aiko_username, email, "
+        "created_at, banned_at, token_generation, handle_changed_at "
+        "FROM users WHERE id='fat1'"
+    )).one()
+    v = _FAT_USER_VALUES
+    assert row[0] == v["username"]
+    assert row[1] == v["display_name"]
+    assert row[2] == v["password_hash"], "password_hash lost or NULLed by the rebuild"
+    assert row[3] == v["aiko_username"]
+    assert row[4] == v["email"], "email lost or NULLed by the rebuild"
+    assert str(row[5]) == v["created_at"], (
+        "created_at was rewritten by the rebuild — every account's age is wrong")
+    assert str(row[6]) == v["banned_at"], (
+        "banned_at lost or altered — a ban would silently lift")
+    assert row[7] == _FAT_TOKEN_GENERATION, (
+        "token_generation was RESET by the rebuild — every session this user had "
+        "revoked would silently start validating again")
+    assert str(row[8]) == v["handle_changed_at"], "handle_changed_at lost or altered"
+
+
 def test_upgrade_0021_to_0022_preserves_populated_users_table(tmp_path, monkeypatch):
-    """The EVOLUTION path 0021 -> 0022 on a table that already has rows.
+    """The EVOLUTION path 0021 -> 0022 on a table that already has FAT rows.
 
     The two tests above build a FRESH database straight to head, which proves the
     end state but never exercises the path either live island will actually take:
     a populated ``users`` table rebuilt in place. 0022 is a parent-table rebuild
     (SQLite cannot ALTER TABLE ... ADD CONSTRAINT), so the rebuild has to carry
-    every pre-existing structure across by reflection — and SQLite reflection is
-    the weak instrument here. A test that only ever sees an empty fresh table
-    cannot fail if that carry-over breaks, so it cannot clear it either.
+    every pre-existing structure AND every existing value across by reflection —
+    and SQLite reflection is the weak instrument here.
 
-    Asserts, on the upgraded copy: rows survive, they backfill to 'human', BOTH
-    pre-existing UNIQUE constraints still bite, the new CHECK bites, and a child
-    row still resolves to its parent across the swap (the FK-off application-
-    cascade premise in ADR-0002 — the parent is dropped and recreated mid-rebuild).
+    EACH UNIQUE IS PROBED IN ISOLATION, AND EACH ASSERTION PINS THE COLUMN NAME.
+    An earlier version of this test collided on both unique columns at once and
+    only asserted ``IntegrityError``, so it stayed green with UNIQUE(username)
+    removed — it was firing on aiko_username the whole time. A test that cannot
+    produce the failure cannot clear it, and an untyped exception assertion cannot
+    tell which failure it produced. (Found by Tesla, cage-match PR#136 round 2.)
     """
     db = tmp_path / "evolve_0022.db"
     monkeypatch.setattr(settings, "db_url", f"sqlite+aiosqlite:///{db}")
@@ -323,10 +443,11 @@ def test_upgrade_0021_to_0022_preserves_populated_users_table(tmp_path, monkeypa
     engine = create_engine(f"sqlite:///{db}")
     try:
         with engine.begin() as c:
+            _assert_fixture_mirrors_schema(c)
             c.execute(text(_INSERT_CHANNEL), {"jp": "invite_only"})
-            c.execute(text(_insert_user("u1")))
+            c.execute(text(_insert_fat_user()))
             c.execute(text(_insert_user("u2")))
-            c.execute(text(_insert_membership("u1")), {"role": "admin"})
+            c.execute(text(_insert_membership("fat1")), {"role": "admin"})
     finally:
         engine.dispose()
 
@@ -335,36 +456,239 @@ def test_upgrade_0021_to_0022_preserves_populated_users_table(tmp_path, monkeypa
     engine = create_engine(f"sqlite:///{db}")
     try:
         with engine.begin() as c:
-            # Data survived the parent-table swap, and backfilled honestly: no
-            # agent account can predate 0022, so every existing row is a human.
             assert c.execute(text("SELECT count(*) FROM users")).scalar_one() == 2
-            kinds = c.execute(
-                text("SELECT kind FROM users ORDER BY id")).scalars().all()
-            assert kinds == ["human", "human"]
-            # The child row still resolves across the rebuild.
+            # No agent account can predate 0022, so every existing row is a human.
+            assert c.execute(text(
+                "SELECT kind FROM users ORDER BY id")).scalars().all() == ["human", "human"]
+            # Every column value survived the copy — not just the column itself.
+            _assert_fat_user_intact(c)
+            # Theorem 3 on the husk seeded beside the fat row.
+            _assert_husk_still_empty(c, "u2")
+            # The child row still resolves across the parent swap (ADR-0002 FK-off).
             assert c.execute(text(
                 "SELECT count(*) FROM memberships m JOIN users u "
                 "ON u.id = m.user_id")).scalar_one() == 1
 
-        # Both pre-existing UNIQUE constraints survived the reflection round-trip.
-        # These are the ones a broken rebuild drops SILENTLY — nothing errors at
-        # migrate time, the island just starts accepting duplicate handles.
-        with pytest.raises(IntegrityError):
-            with engine.begin() as c:
-                c.execute(text(_insert_user("u3").replace("'u3', 'u3'", "'u3', 'u1'")))
-        with pytest.raises(IntegrityError):
-            with engine.begin() as c:
-                c.execute(text(
-                    "INSERT INTO users (id, username, display_name, aiko_username, "
-                    f"created_at) VALUES ('u4', 'u4', 'u4', 'u1', '{_TS}')"))
+        # BOTH SERVER DEFAULTS SURVIVED ONTO THE MIGRATED TABLE — a separate
+        # theorem from "existing values were preserved" above. A hand-written 0022
+        # could backfill every existing row and enforce the CHECK while dropping
+        # the defaults on the rebuilt table; nothing would go red until an older
+        # writer omitted a column in production and hit NOT NULL. The fresh-DB
+        # test cannot cover this: it never takes the rebuild path.
+        with engine.begin() as c:
+            c.execute(text(
+                "INSERT INTO users (id, username, display_name, aiko_username, "
+                f"created_at) VALUES ('d1', 'd1', 'd1', 'd1@aiko', '{_TS}')"))
+            defaults = c.execute(text(
+                "SELECT kind, token_generation FROM users WHERE id='d1'")).one()
+        assert defaults[0] == "human", (
+            "the MIGRATED table lost kind's server default — an omitting writer "
+            "now fails NOT NULL instead of getting the honest 'human'")
+        assert defaults[1] == 0, (
+            "the MIGRATED table lost token_generation's PRE-EXISTING (0015) default")
 
-        # And the new constraint is live on the MIGRATED (not freshly created) table.
+        # UNIQUE(username) IN ISOLATION: aiko_username is distinct, so only the
+        # username constraint can reject this. Pin the column so a different
+        # IntegrityError (NOT NULL, PK, the other unique) cannot pass as this one.
         with pytest.raises(IntegrityError) as exc:
             with engine.begin() as c:
                 c.execute(text(
                     "INSERT INTO users (id, username, display_name, aiko_username, "
-                    f"created_at, kind) VALUES ('u5', 'u5', 'u5', 'u5', '{_TS}', "
+                    f"created_at) VALUES ('x1', '{_FAT_USER_VALUES['username']}', "
+                    f"'x1', 'x1@aiko', '{_TS}')"))
+        assert "users.username" in str(exc.value)
+
+        # UNIQUE(aiko_username) IN ISOLATION: username is distinct this time.
+        with pytest.raises(IntegrityError) as exc:
+            with engine.begin() as c:
+                c.execute(text(
+                    "INSERT INTO users (id, username, display_name, aiko_username, "
+                    f"created_at) VALUES ('x2', 'x2', 'x2', "
+                    f"'{_FAT_USER_VALUES['aiko_username']}', '{_TS}')"))
+        assert "users.aiko_username" in str(exc.value)
+
+        # And the NEW constraint is live on the MIGRATED (not freshly created) table.
+        with pytest.raises(IntegrityError) as exc:
+            with engine.begin() as c:
+                c.execute(text(
+                    "INSERT INTO users (id, username, display_name, aiko_username, "
+                    f"created_at, kind) VALUES ('x3', 'x3', 'x3', 'x3@aiko', '{_TS}', "
                     "'daemon')"))
-        assert "ck_users_kind" in str(exc.value) or "CHECK" in str(exc.value)
+        assert "ck_users_kind" in str(exc.value)
+
+        # kind is CHECK-closed but the CHECK CANNOT close it against NULL: SQL
+        # three-valued logic makes `NULL IN ('human','agent')` UNKNOWN, and UNKNOWN
+        # is not FALSE, so the row is admitted. Verified directly: with NOT NULL
+        # dropped, 'daemon' is rejected by the CHECK and NULL sails through. Only
+        # NOT NULL closes the set — and it is THIS column that 0022 exists to add,
+        # so it needs its own probe rather than inheriting display_name's.
+        with pytest.raises(IntegrityError) as exc:
+            with engine.begin() as c:
+                c.execute(text(
+                    "INSERT INTO users (id, username, display_name, aiko_username, "
+                    f"created_at, kind) VALUES ('k1', 'k1', 'k1', 'k1@aiko', '{_TS}', "
+                    "NULL)"))
+        assert "NOT NULL" in str(exc.value) and "users.kind" in str(exc.value)
+
+        # NOT NULL survived the rebuild too. Structural weakening is as silent as
+        # value loss: a rebuilt parent that dropped NOT NULL on a required column
+        # accepts junk rows forever and nothing above would notice. (Carnot, PR#142.)
+        with pytest.raises(IntegrityError) as exc:
+            with engine.begin() as c:
+                c.execute(text(
+                    "INSERT INTO users (id, username, aiko_username, created_at) "
+                    f"VALUES ('n1', 'n1', 'n1@aiko', '{_TS}')"))  # display_name omitted
+        assert "NOT NULL" in str(exc.value) and "users.display_name" in str(exc.value)
+
+        # PRIMARY KEY survived. UNIQUE(username) does NOT cover this — a duplicate
+        # id under a fresh handle slips past every other assertion here and gives
+        # two accounts one identity.
+        with pytest.raises(IntegrityError) as exc:
+            with engine.begin() as c:
+                c.execute(text(
+                    "INSERT INTO users (id, username, display_name, aiko_username, "
+                    f"created_at) VALUES ('fat1', 'pk1', 'pk1', 'pk1@aiko', '{_TS}')"))
+        assert "users.id" in str(exc.value)
+    finally:
+        engine.dispose()
+
+
+def test_downgrade_0022_to_0021_round_trips_a_fat_row(tmp_path, monkeypatch):
+    """0021 -> 0022 -> 0021 keeps every value, and drops the column cleanly.
+
+    The downgrade is a SECOND parent rebuild, and it drop_constraint's a CHECK on
+    the dialect this file already documents as CHECK-blind. Production only ever
+    boots forward, so this is not an island-killer — it is the path someone takes
+    at 3am when something has already gone wrong, which is the worst moment to
+    discover it was never executed once. (Tesla's concern, cage-match PR#136.)
+    """
+    db = tmp_path / "roundtrip_0022.db"
+    monkeypatch.setattr(settings, "db_url", f"sqlite+aiosqlite:///{db}")
+    cfg = migrate._alembic_config()
+
+    command.upgrade(cfg, "0021")
+    engine = create_engine(f"sqlite:///{db}")
+    try:
+        with engine.begin() as c:
+            c.execute(text(_INSERT_CHANNEL), {"jp": "invite_only"})
+            c.execute(text(_insert_fat_user()))
+            c.execute(text(_insert_user("u2")))  # a husk, so theorem 3 has something to lose
+            c.execute(text(_insert_membership("fat1")), {"role": "admin"})
+    finally:
+        engine.dispose()
+
+    command.upgrade(cfg, "0022")
+
+    # HIGH-WATER MARK. Without this the test cannot tell "downgrade removed kind"
+    # from "kind was never born": with BOTH upgrade() and downgrade() no-op'd, every
+    # assertion below still passes — revisions stamp, the fat row survives, and
+    # `kind not in cols` is trivially true. Sibling tests catching the no-op does
+    # not help; a different test is not this one's positive control.
+    engine = create_engine(f"sqlite:///{db}")
+    try:
+        assert "kind" in {c["name"] for c in inspect(engine).get_columns("users")}, (
+            "kind was never created, so this test's premise is unmet and its "
+            "post-downgrade assertions prove nothing")
+        # SEED THE OTHER POLE OF THE CHECK. 0022 exists to add a TWO-valued closed
+        # set, and every other row on both legs is 'human' — so a reverse rebuild
+        # that copies `WHERE kind = 'human'`, or DELETEs agents before dropping the
+        # column, keeps every seeded value byte-identical, the husk empty, both
+        # defaults, both UNIQUEs, the PK and the membership JOIN, and still erases
+        # every agent. A fixture that never writes the other pole cannot see that
+        # pole deleted — the same law as the husk, one domain over.
+        with engine.begin() as c:
+            c.execute(text(
+                "INSERT INTO users (id, username, display_name, aiko_username, "
+                f"created_at, kind) VALUES ('bot1', 'armbot', 'Armbot', "
+                f"'armbot@aiko', '{_TS}', 'agent')"))
+    finally:
+        engine.dispose()
+
+    command.downgrade(cfg, "0021")  # the untested direction
+
+    engine = create_engine(f"sqlite:///{db}")
+    try:
+        with engine.begin() as c:
+            _assert_fat_user_intact(c)
+            _assert_husk_still_empty(c, "u2")
+            # The agent row survived the reverse rebuild. `kind` is gone by design
+            # here, so identity is what must persist: the ACCOUNT outlives the
+            # column that described it.
+            assert c.execute(text(
+                "SELECT username FROM users WHERE id='bot1'")).scalar_one() == "armbot", (
+                "the agent row did not survive the downgrade — a rollback erased "
+                "every non-human account")
+            assert c.execute(text("SELECT count(*) FROM users")).scalar_one() == 3, (
+                "the downgrade changed the row count; some account was dropped")
+
+        # Column absence read STRUCTURALLY, not by substring. SQLite renders DDL in
+        # more than one way (quoted identifier, a different type spelling), so
+        # `"kind VARCHAR" not in ddl` can pass over a leftover `"kind" TEXT`.
+        cols = {c["name"] for c in inspect(engine).get_columns("users")}
+        assert "kind" not in cols, f"downgrade left the column behind: {sorted(cols)}"
+
+        # And the uniques survive the SECOND rebuild — asserted BEHAVIOURALLY, the
+        # same way the upgrade path does. DDL text is not the invariant anyone
+        # relies on; rejecting a duplicate is.
+        with engine.begin() as c:
+            c.execute(text(
+                "INSERT INTO users (id, username, display_name, aiko_username, "
+                f"created_at) VALUES ('dg1', 'dg1', 'dg1', 'dg1@aiko', '{_TS}')"))
+        with pytest.raises(IntegrityError) as exc:
+            with engine.begin() as c:
+                c.execute(text(
+                    "INSERT INTO users (id, username, display_name, aiko_username, "
+                    f"created_at) VALUES ('dg2', 'dg1', 'dg2', 'dg2@aiko', '{_TS}')"))
+        assert "users.username" in str(exc.value)
+        with pytest.raises(IntegrityError) as exc:
+            with engine.begin() as c:
+                c.execute(text(
+                    "INSERT INTO users (id, username, display_name, aiko_username, "
+                    f"created_at) VALUES ('dg3', 'dg3', 'dg3', 'dg1@aiko', '{_TS}')"))
+        assert "users.aiko_username" in str(exc.value)
+
+        # DEFAULT PRESERVATION ON THE REVERSE LEG. The downgrade is a second full
+        # rebuild and owes every invariant the forward one does:
+        #
+        #   invariant                 upgrade   downgrade
+        #   existing values           yes       yes  (_assert_fat_user_intact)
+        #   server defaults           yes       THIS
+        #   NOT NULL                  yes       BELOW
+        #   UNIQUEs (behavioural)     yes       above
+        #   CHECK present / absent    yes       column-absence above
+        #
+        # A downgrade that copies rows correctly while dropping DEFAULT 0 leaves
+        # rollback-era writers omitting token_generation either failing NOT NULL
+        # or storing the wrong revocation counter — on the exact path someone
+        # takes when something has already gone wrong.
+        with engine.begin() as c:
+            c.execute(text(
+                "INSERT INTO users (id, username, display_name, aiko_username, "
+                f"created_at) VALUES ('dgd', 'dgd', 'dgd', 'dgd@aiko', '{_TS}')"))
+            assert c.execute(text(
+                "SELECT token_generation FROM users WHERE id='dgd'")).scalar_one() == 0, (
+                "the downgraded table lost token_generation's 0015 default")
+
+        with pytest.raises(IntegrityError) as exc:
+            with engine.begin() as c:
+                c.execute(text(
+                    "INSERT INTO users (id, username, aiko_username, created_at) "
+                    f"VALUES ('dgn', 'dgn', 'dgn@aiko', '{_TS}')"))  # display_name omitted
+        assert "NOT NULL" in str(exc.value) and "users.display_name" in str(exc.value)
+
+        with pytest.raises(IntegrityError) as exc:
+            with engine.begin() as c:
+                c.execute(text(
+                    "INSERT INTO users (id, username, display_name, aiko_username, "
+                    f"created_at) VALUES ('fat1', 'pk2', 'pk2', 'pk2@aiko', '{_TS}')"))
+        assert "users.id" in str(exc.value)
+
+        # The child still resolves after the SECOND rebuild. The upgrade leg
+        # asserted this; the downgrade leg did not, and it drops+recreates the
+        # same parent under the same FK-off premise (ADR-0002).
+        with engine.begin() as c:
+            assert c.execute(text(
+                "SELECT count(*) FROM memberships m JOIN users u "
+                "ON u.id = m.user_id")).scalar_one() == 1
     finally:
         engine.dispose()

@@ -91,3 +91,37 @@ async def test_sender_kind_prefers_the_account_over_the_channel(session):
     assert messages_service._kind_for(channel, agent) == "agent"
     # No account to ask -> the channel is the only signal left.
     assert messages_service._kind_for(channel, None) == "robot"
+
+
+def test_member_roster_carries_the_account_kind():
+    """The half of the acceptance criterion the message tests do not reach.
+
+    "member lists / message payloads carry the agent kind honestly" — the tests
+    above strike the message writers, but `_member_view` is where a roster says
+    who is in the room, and it is a one-line addition that a future serializer
+    refactor can silently drop. Without this, an agent in a member list becomes
+    invisible again and nothing goes red. (Tesla's concern, cage-match PR#136.)
+
+    Pins the CAUSE like its siblings: the view must read the USER's kind, not a
+    constant. Flip the agent to a human and the assertion moves with it.
+    """
+    from types import SimpleNamespace
+
+    from aiko_gateway.rest.members import _member_view
+
+    agent = _user(UserKind.AGENT, name="armbot")
+    membership = SimpleNamespace(user_id=agent.id, role="member", can_post=True)
+
+    view = _member_view(membership, agent)
+
+    assert view["kind"] == "agent", "an agent is invisible in the roster"
+    assert view["kind"] == agent.kind, "roster kind must come FROM the account"
+
+    # SAME HANDLE, only the kind differs. With a differently-named human control, a
+    # view that INFERRED kind from the username would pass both assertions — so the
+    # "cause pin" above was a tautology (`view["kind"] == agent.kind` cannot fail
+    # when `view["kind"] == "agent"` passes). Holding the handle fixed is the one
+    # variable that discriminates reading the account from guessing at it.
+    human = _user(UserKind.HUMAN, name="armbot")
+    assert _member_view(SimpleNamespace(
+        user_id=human.id, role="member", can_post=True), human)["kind"] == "human"
