@@ -589,6 +589,18 @@ def test_downgrade_0022_to_0021_round_trips_a_fat_row(tmp_path, monkeypatch):
         assert "kind" in {c["name"] for c in inspect(engine).get_columns("users")}, (
             "kind was never created, so this test's premise is unmet and its "
             "post-downgrade assertions prove nothing")
+        # SEED THE OTHER POLE OF THE CHECK. 0022 exists to add a TWO-valued closed
+        # set, and every other row on both legs is 'human' — so a reverse rebuild
+        # that copies `WHERE kind = 'human'`, or DELETEs agents before dropping the
+        # column, keeps every seeded value byte-identical, the husk empty, both
+        # defaults, both UNIQUEs, the PK and the membership JOIN, and still erases
+        # every agent. A fixture that never writes the other pole cannot see that
+        # pole deleted — the same law as the husk, one domain over.
+        with engine.begin() as c:
+            c.execute(text(
+                "INSERT INTO users (id, username, display_name, aiko_username, "
+                f"created_at, kind) VALUES ('bot1', 'armbot', 'Armbot', "
+                f"'armbot@aiko', '{_TS}', 'agent')"))
     finally:
         engine.dispose()
 
@@ -599,6 +611,15 @@ def test_downgrade_0022_to_0021_round_trips_a_fat_row(tmp_path, monkeypatch):
         with engine.begin() as c:
             _assert_fat_user_intact(c)
             _assert_husk_still_empty(c, "u2")
+            # The agent row survived the reverse rebuild. `kind` is gone by design
+            # here, so identity is what must persist: the ACCOUNT outlives the
+            # column that described it.
+            assert c.execute(text(
+                "SELECT username FROM users WHERE id='bot1'")).scalar_one() == "armbot", (
+                "the agent row did not survive the downgrade — a rollback erased "
+                "every non-human account")
+            assert c.execute(text("SELECT count(*) FROM users")).scalar_one() == 3, (
+                "the downgrade changed the row count; some account was dropped")
 
         # Column absence read STRUCTURALLY, not by substring. SQLite renders DDL in
         # more than one way (quoted identifier, a different type spelling), so
