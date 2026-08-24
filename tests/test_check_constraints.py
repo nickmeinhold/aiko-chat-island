@@ -71,7 +71,7 @@ def test_role_check_rejects_out_of_set(tmp_path, monkeypatch):
             c.execute(text(_insert_user("u2")))
             c.execute(text(_insert_membership("u1")), {"role": "member"})  # valid
         # DISTINCT user (u2) so a failure can ONLY be the role CHECK, never the
-        # composite-PK collision that masked it before (Carnot cage-match, PR#24).
+        # composite-PK collision that masked it before.
         with pytest.raises(IntegrityError) as exc:
             with engine.begin() as c:
                 c.execute(text(_insert_membership("u2")), {"role": "superadmin"})
@@ -183,7 +183,7 @@ def test_0009_rebuild_preserves_aiko_channel_unique(tmp_path, monkeypatch):
     UNIQUE from 0001. compare_metadata's unique-reflection on SQLite is exactly the
     kind of thing that can silently leak through a rebuild, so prove it directly
     (verify by RUNNING, not by trusting the parity gate): a duplicate aiko_channel
-    insert at head must be rejected (Carnot cage-match, PR#47)."""
+    insert at head must be rejected."""
     engine = _fresh_at_head(tmp_path, monkeypatch)
     try:
         with engine.begin() as c:
@@ -201,7 +201,7 @@ def test_upgrade_0001_to_0002_preserves_data_structure_and_applies_check(
         tmp_path, monkeypatch):
     """The evolution path: a DB at 0001 with data, upgraded one step to 0002.
     The batch table-rebuild must keep the rows AND the structure (memberships'
-    composite PK + both FKs) AND turn the CHECKs on (Carnot cage-match, PR#24)."""
+    composite PK + both FKs) AND turn the CHECKs on."""
     db = tmp_path / "evolve.db"
     monkeypatch.setattr(settings, "db_url", f"sqlite+aiosqlite:///{db}")
     cfg = migrate._alembic_config()
@@ -342,14 +342,14 @@ def _insert_fat_user() -> str:
 
 
 def _assert_fat_user_intact(conn) -> None:
-    """Every seeded value survives EXACTLY, and the old default held.
+    """Every seeded value survives EXACTLY.
 
-    Exact equality, not a date prefix: SQLite stores these DATETIME columns as the
-    text they were written with and hands the same text back, so `startswith` was
-    strictly weaker than the docstring claimed — a truncation, a dropped offset, or
-    a coercion to `2026-02-02 12:00:00` all passed a prefix check. And `created_at`
-    was seeded and written but never read back, so a copy overwriting it with
-    CURRENT_TIMESTAMP or NULL was invisible. (Carnot and Tesla independently, PR#142.)
+    Exact equality, not a date prefix: SQLite hands these DATETIME columns back as
+    the text they were written with, so a prefix check would pass a truncation, a
+    dropped offset, or a coercion to `2026-02-02 12:00:00`.
+
+    DEFAULT preservation is a separate theorem and is NOT checked here — it lives on
+    the post-rebuild inserts that omit the defaulted columns.
     """
     row = conn.execute(text(
         "SELECT username, display_name, password_hash, aiko_username, email, "
@@ -426,7 +426,6 @@ def test_upgrade_0021_to_0022_preserves_populated_users_table(tmp_path, monkeypa
         # the defaults on the rebuilt table; nothing would go red until an older
         # writer omitted a column in production and hit NOT NULL. The fresh-DB
         # test cannot cover this: it never takes the rebuild path.
-        # (Carnot, cage-match PR#142.)
         with engine.begin() as c:
             c.execute(text(
                 "INSERT INTO users (id, username, display_name, aiko_username, "
@@ -476,12 +475,11 @@ def test_upgrade_0021_to_0022_preserves_populated_users_table(tmp_path, monkeypa
                 c.execute(text(
                     "INSERT INTO users (id, username, aiko_username, created_at) "
                     f"VALUES ('n1', 'n1', 'n1@aiko', '{_TS}')"))  # display_name omitted
-        assert "NOT NULL" in str(exc.value) and "display_name" in str(exc.value)
+        assert "NOT NULL" in str(exc.value) and "users.display_name" in str(exc.value)
 
-        # PRIMARY KEY survived. Found by enumerating the lattice rather than by a
-        # reviewer: no test on either leg asserted the PK, and UNIQUE(username)
-        # does NOT cover it — a duplicate id under a fresh handle slips straight
-        # past every other assertion here and gives two accounts one identity.
+        # PRIMARY KEY survived. UNIQUE(username) does NOT cover this — a duplicate
+        # id under a fresh handle slips past every other assertion here and gives
+        # two accounts one identity.
         with pytest.raises(IntegrityError) as exc:
             with engine.begin() as c:
                 c.execute(text(
@@ -526,7 +524,6 @@ def test_downgrade_0022_to_0021_round_trips_a_fat_row(tmp_path, monkeypatch):
         # Column absence read STRUCTURALLY, not by substring. SQLite renders DDL in
         # more than one way (quoted identifier, a different type spelling), so
         # `"kind VARCHAR" not in ddl` can pass over a leftover `"kind" TEXT`.
-        # (Carnot, cage-match PR#142.)
         cols = {c["name"] for c in inspect(engine).get_columns("users")}
         assert "kind" not in cols, f"downgrade left the column behind: {sorted(cols)}"
 
@@ -550,11 +547,8 @@ def test_downgrade_0022_to_0021_round_trips_a_fat_row(tmp_path, monkeypatch):
                     f"created_at) VALUES ('dg3', 'dg3', 'dg3', 'dg1@aiko', '{_TS}')"))
         assert "users.aiko_username" in str(exc.value)
 
-        # DEFAULT PRESERVATION ON THE REVERSE LEG. Carnot raised this for
-        # token_generation in round 3; it is the same theorem round 2 separated
-        # for the forward leg, so it is applied here as a CLASS rather than as
-        # the one instance reported. The downgrade is a second full rebuild and
-        # owes every invariant the forward one does:
+        # DEFAULT PRESERVATION ON THE REVERSE LEG. The downgrade is a second full
+        # rebuild and owes every invariant the forward one does:
         #
         #   invariant                 upgrade   downgrade
         #   existing values           yes       yes  (_assert_fat_user_intact)
@@ -580,7 +574,7 @@ def test_downgrade_0022_to_0021_round_trips_a_fat_row(tmp_path, monkeypatch):
                 c.execute(text(
                     "INSERT INTO users (id, username, aiko_username, created_at) "
                     f"VALUES ('dgn', 'dgn', 'dgn@aiko', '{_TS}')"))  # display_name omitted
-        assert "NOT NULL" in str(exc.value) and "display_name" in str(exc.value)
+        assert "NOT NULL" in str(exc.value) and "users.display_name" in str(exc.value)
 
         with pytest.raises(IntegrityError) as exc:
             with engine.begin() as c:
