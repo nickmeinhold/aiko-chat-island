@@ -477,6 +477,17 @@ def test_upgrade_0021_to_0022_preserves_populated_users_table(tmp_path, monkeypa
                     "INSERT INTO users (id, username, aiko_username, created_at) "
                     f"VALUES ('n1', 'n1', 'n1@aiko', '{_TS}')"))  # display_name omitted
         assert "NOT NULL" in str(exc.value) and "display_name" in str(exc.value)
+
+        # PRIMARY KEY survived. Found by enumerating the lattice rather than by a
+        # reviewer: no test on either leg asserted the PK, and UNIQUE(username)
+        # does NOT cover it — a duplicate id under a fresh handle slips straight
+        # past every other assertion here and gives two accounts one identity.
+        with pytest.raises(IntegrityError) as exc:
+            with engine.begin() as c:
+                c.execute(text(
+                    "INSERT INTO users (id, username, display_name, aiko_username, "
+                    f"created_at) VALUES ('fat1', 'pk1', 'pk1', 'pk1@aiko', '{_TS}')"))
+        assert "users.id" in str(exc.value)
     finally:
         engine.dispose()
 
@@ -498,7 +509,9 @@ def test_downgrade_0022_to_0021_round_trips_a_fat_row(tmp_path, monkeypatch):
     engine = create_engine(f"sqlite:///{db}")
     try:
         with engine.begin() as c:
+            c.execute(text(_INSERT_CHANNEL), {"jp": "invite_only"})
             c.execute(text(_insert_fat_user()))
+            c.execute(text(_insert_membership("fat1")), {"role": "admin"})
     finally:
         engine.dispose()
 
@@ -568,5 +581,20 @@ def test_downgrade_0022_to_0021_round_trips_a_fat_row(tmp_path, monkeypatch):
                     "INSERT INTO users (id, username, aiko_username, created_at) "
                     f"VALUES ('dgn', 'dgn', 'dgn@aiko', '{_TS}')"))  # display_name omitted
         assert "NOT NULL" in str(exc.value) and "display_name" in str(exc.value)
+
+        with pytest.raises(IntegrityError) as exc:
+            with engine.begin() as c:
+                c.execute(text(
+                    "INSERT INTO users (id, username, display_name, aiko_username, "
+                    f"created_at) VALUES ('fat1', 'pk2', 'pk2', 'pk2@aiko', '{_TS}')"))
+        assert "users.id" in str(exc.value)
+
+        # The child still resolves after the SECOND rebuild. The upgrade leg
+        # asserted this; the downgrade leg did not, and it drops+recreates the
+        # same parent under the same FK-off premise (ADR-0002).
+        with engine.begin() as c:
+            assert c.execute(text(
+                "SELECT count(*) FROM memberships m JOIN users u "
+                "ON u.id = m.user_id")).scalar_one() == 1
     finally:
         engine.dispose()
