@@ -341,6 +341,25 @@ def _insert_fat_user() -> str:
     )
 
 
+def _assert_husk_still_empty(conn, uid: str) -> None:
+    """The THIRD theorem: a cell that was NULL before the rebuild is still NULL.
+
+    _assert_fat_user_intact can only observe cells that were written non-NULL, so a
+    copy that materialises NULLs is invisible to it — and that failure is not
+    cosmetic: COALESCE-ing (or CURRENT_TIMESTAMP-ing) `banned_at` mass-BANS every
+    ordinary account on both live islands while the seeded banned user still
+    round-trips byte-identical and the suite stays green.
+    """
+    row = conn.execute(text(
+        "SELECT password_hash, email, banned_at, handle_changed_at "
+        f"FROM users WHERE id='{uid}'")).one()
+    assert row[0] is None, "password_hash materialised by the rebuild"
+    assert row[1] is None, "email materialised by the rebuild"
+    assert row[2] is None, (
+        "banned_at materialised by the rebuild — every ordinary account is now banned")
+    assert row[3] is None, "handle_changed_at materialised by the rebuild"
+
+
 def _assert_fat_user_intact(conn) -> None:
     """Every seeded value survives EXACTLY.
 
@@ -415,6 +434,8 @@ def test_upgrade_0021_to_0022_preserves_populated_users_table(tmp_path, monkeypa
                 "SELECT kind FROM users ORDER BY id")).scalars().all() == ["human", "human"]
             # Every column value survived the copy — not just the column itself.
             _assert_fat_user_intact(c)
+            # Theorem 3 on the husk seeded beside the fat row.
+            _assert_husk_still_empty(c, "u2")
             # The child row still resolves across the parent swap (ADR-0002 FK-off).
             assert c.execute(text(
                 "SELECT count(*) FROM memberships m JOIN users u "
@@ -467,6 +488,20 @@ def test_upgrade_0021_to_0022_preserves_populated_users_table(tmp_path, monkeypa
                     "'daemon')"))
         assert "ck_users_kind" in str(exc.value)
 
+        # kind is CHECK-closed but the CHECK CANNOT close it against NULL: SQL
+        # three-valued logic makes `NULL IN ('human','agent')` UNKNOWN, and UNKNOWN
+        # is not FALSE, so the row is admitted. Verified directly: with NOT NULL
+        # dropped, 'daemon' is rejected by the CHECK and NULL sails through. Only
+        # NOT NULL closes the set — and it is THIS column that 0022 exists to add,
+        # so it needs its own probe rather than inheriting display_name's.
+        with pytest.raises(IntegrityError) as exc:
+            with engine.begin() as c:
+                c.execute(text(
+                    "INSERT INTO users (id, username, display_name, aiko_username, "
+                    f"created_at, kind) VALUES ('k1', 'k1', 'k1', 'k1@aiko', '{_TS}', "
+                    "NULL)"))
+        assert "NOT NULL" in str(exc.value) and "users.kind" in str(exc.value)
+
         # NOT NULL survived the rebuild too. Structural weakening is as silent as
         # value loss: a rebuilt parent that dropped NOT NULL on a required column
         # accepts junk rows forever and nothing above would notice. (Carnot, PR#142.)
@@ -509,6 +544,7 @@ def test_downgrade_0022_to_0021_round_trips_a_fat_row(tmp_path, monkeypatch):
         with engine.begin() as c:
             c.execute(text(_INSERT_CHANNEL), {"jp": "invite_only"})
             c.execute(text(_insert_fat_user()))
+            c.execute(text(_insert_user("u2")))  # a husk, so theorem 3 has something to lose
             c.execute(text(_insert_membership("fat1")), {"role": "admin"})
     finally:
         engine.dispose()
@@ -520,6 +556,7 @@ def test_downgrade_0022_to_0021_round_trips_a_fat_row(tmp_path, monkeypatch):
     try:
         with engine.begin() as c:
             _assert_fat_user_intact(c)
+            _assert_husk_still_empty(c, "u2")
 
         # Column absence read STRUCTURALLY, not by substring. SQLite renders DDL in
         # more than one way (quoted identifier, a different type spelling), so
