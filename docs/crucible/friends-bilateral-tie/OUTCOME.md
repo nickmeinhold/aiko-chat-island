@@ -89,3 +89,97 @@ reopen bar rather than a vague no:
 > is meaningfully greater than one, AND a server-side decision is named that must be
 > authoritative.** Absent both, increments 1–3 already deliver the product value with zero island
 > code.
+
+---
+
+# Addendum — 2026-08-25 19:30. C-5 RESOLVED, and a correction to this bundle
+
+The app tab (peer Claude session) answered the load-bearing premise. **Verified independently
+from this side before accepting it**, not taken on report.
+
+## C-5 is RESOLVED — reach WORKS, and was proven two days before this crucible ran
+
+```
+$ ssh nick-mel 'sudo docker logs aiko-chat-island-1 2>&1 | grep -c push.apple.com'
+1
+INFO:httpx:HTTP Request: POST https://api.sandbox.push.apple.com/3/device/d309f150…9effe "HTTP/2 200 OK"
+```
+
+**A ring reached a locked iPhone on 2026-08-23 13:36 AEST**, app closed, through the whole path:
+`POST /v1/devices 201`, a real signed call invite through `create_outbound` and all eight
+`push_service` gates, Apple returning 200. Nick, on the handset: *"it rang!"*
+
+`device_tokens` reads 0 because the app tab **deleted the row** at 2026-08-25 00:07 UTC as arm 1
+of a deliberate two-arm live test of app PR#156's teardown ordering. The test passed.
+
+## The error in this bundle, named
+
+`CRUCIBLE.md` and `DESIGN.md` (C-5) assert *"Nothing has ever registered"* and *"this design's
+primary consumer has never once worked end to end."* **Both are false.**
+
+I ran `select count(*) from device_tokens` → 0 and inferred a historical claim from a snapshot.
+**"Zero rows now" and "no row has ever existed" are different claims**, and only the second
+supports "never reached". The instrument was right; the inference was not. The cheap falsifier —
+the container's own retained log — was available and I did not run it.
+
+Treat every C-5 reference in this bundle as **superseded by this addendum**.
+
+## Does this reopen the island half?
+
+**No.** The ruling rested on two Fold findings, neither of which touches C-5:
+
+1. the null option was not null (increments 1–3 ride the existing message path), and
+2. the sender anonymity set is the concurrently-online population, which at N=33 can be one.
+
+If anything C-5 resolving makes the ruling **firmer**: reach is proven, so increments 1–3 deliver
+real value immediately on a foundation that demonstrably works.
+
+## Two refinements from the app tab, folded into the app-side inheritance
+
+**C-3 (recovery liveness) — a sharper failure mode than I priced.** They confirm the
+digest-intersect shape is right and should not change, but supply population evidence: *32 users,
+2 membership rows, most recent message four days old.* A recovery path requiring the counterparty
+to open the app mostly does not run on that usage. Their reframe is correct: it is not "recovery
+fails" but **"recovery has unbounded latency, decided by the least-active friend"** — soft and
+detectable rather than silent. Two consequences:
+- state it as a **named residual** in the same discipline as the IP one;
+- the re-pair prompt must be **durable and re-raisable**, never a one-shot notification dismissed
+  at a bad moment.
+
+**And the check they flagged, which is an ISLAND-side constraint even though the island builds
+nothing here:** if `GET /v1/rekeyed?since=` has any server-side **retention window**, a 90-day
+absent friend fetches an empty list and re-pairing silently never happens — converting the
+latency problem into exactly the silent failure C-3 feared. **Whoever builds the endpoint owes
+unbounded (or very long) retention of re-key entries.**
+
+**C-7 (block on the device) — strengthened, with an honest cost.** Their argument is better than
+mine: the island's block is **already not a delivery guarantee** — it is one of eight gates, and
+gate 6 unions the caller's fanout set with the service's own read precisely *because neither is
+trusted alone*. Moving enforcement to the device relocates a partial guarantee rather than
+removing a total one. Precedent in this codebase: the wake payload is **already deliberately
+opaque** (channel id only, no caller name) so Apple never learns who rings whom, with the cost
+stated honestly. The project has accepted "the intermediary learns less, the device does more"
+once already, for the same reason.
+**Honest cost to carry:** a device-enforced block cannot be enforced on a device that is not
+yours, so a blocked party still consumes the recipient's wake budget and causes a wake even
+though nothing is shown. An attacker cannot ring you, but can drain your battery.
+
+## New product thread surfaced by the app tab
+
+Nick wants **Dreamfinder to call him in the morning and wake him up.** This collides with the
+alert-not-PushKit decision: on iOS 13+ a PushKit VoIP push **must** call `reportNewIncomingCall`
+synchronously or the system terminates the app, and repeat offences stop VoIP delivery entirely —
+which is why this project chose alert notifications. But an alert notification does **not**
+reliably wake a sleeping person through Sleep Focus.
+
+**The `urgent` grade is the natural home for that question**, so increment 2 should be designed
+with the wake-me-up case explicitly in view rather than discovering it afterwards. This also
+confirms the app tab's recommendation (and mine) to **pull increment 2 to the front**.
+
+## The iOS claim I asked them to check — CONFIRMED
+
+They verified against their own record and Apple's docs: a PushKit push must report synchronously
+or the app is killed; repeat offences kill VoIP delivery. So an island-wide broadcast either
+raises a spurious CallKit UI on every handset (and terminates the ones that cannot decrypt and
+therefore do not report), or rides throttled silent pushes that will not reliably reach a closed
+app. **The fog does not come back. The sender-side simplification stands.**
