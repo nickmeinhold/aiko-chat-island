@@ -90,7 +90,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..config import settings
 from ..db import SessionLocal
 from . import apns, moderation_service
-from .models import Channel, ChannelKind, DeviceToken, Membership, Platform, User
+from .models import (Channel, ChannelKind, DeviceToken, Membership, Platform,
+                     PushEnvironment, User)
 from .rate_limit import limiter
 
 log = logging.getLogger("aiko_gateway.push")
@@ -374,8 +375,17 @@ async def _wake_user(session: AsyncSession, user_id: str, payload: dict,
     for row in tokens:
         observed = (row.id, row.token, row.updated_at)
         try:
+            # THE ORM EDGE (cage-match, Carnot MEDIUM). The column is
+            # `Mapped[str]` like every other closed-set column in this codebase
+            # (claude-tasks#3400 tracks that convention corpus-wide, so this one
+            # field does not get to deviate) — but the boundary out of the ORM is
+            # exactly where the string becomes the closed set again. A corrupted
+            # row raises HERE, inside the per-device try below, so it is logged,
+            # skipped and never reaped: identical blast radius to the old runtime
+            # check, one layer earlier and with the type system holding it.
             result = await apns.send(
-                row.token, payload, push_environment=row.push_environment,
+                row.token, payload,
+                push_environment=PushEnvironment(row.push_environment),
                 collapse_id=collapse_id)
         except Exception:
             # PER-DEVICE BOUNDARY (cage-match #139 round 6, Carnot). `apns.send`

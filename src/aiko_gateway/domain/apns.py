@@ -173,7 +173,7 @@ def _provider_token() -> str:
     return token
 
 
-def _host(push_environment: str) -> str:
+def _host(push_environment: PushEnvironment) -> str:
     """The APNs host for ONE token's environment (#3386).
 
     Reads the TOKEN's environment, never the island's `apns_use_sandbox` — that
@@ -182,12 +182,18 @@ def _host(push_environment: str) -> str:
     can therefore serve a debug build and a TestFlight build at once, which a
     single global switch made impossible.
 
-    Raises on an out-of-set value rather than falling back to a default. The only
-    ways to get here with one are a corrupted row or a new PushEnvironment member
-    added without teaching this function about it; both are bugs, and guessing a
-    host would hand a live credential to the wrong world. push_service already
-    treats a raising send as transient-and-skip, so a single bad row cannot take
-    down a fanout.
+    Takes the ENUM, not a str (cage-match, Carnot MEDIUM): a `str` signature lets
+    every caller pass 'prod' or 'production ' and pushes the whole closed set back
+    onto a runtime check. The conversion from the stored column happens once, at
+    the push_service call site (the ORM edge), so the invariant is established in
+    one place instead of re-defended at each use.
+
+    The `case _` arm still raises rather than falling back to a default. It is
+    reachable only via a new PushEnvironment member added without teaching this
+    function about it — the corrupted-row path now fails earlier, at the enum
+    conversion. Both are bugs, and guessing a host would hand a live credential to
+    the wrong world. push_service treats a raising send as transient-and-skip, so
+    neither can take down a fanout.
     """
     match push_environment:
         case PushEnvironment.SANDBOX:
@@ -281,7 +287,8 @@ def _verdict(status: int, reason: str) -> Verdict:
     return Verdict.REJECTED
 
 
-async def send(device_token: str, payload: dict, *, push_environment: str,
+async def send(device_token: str, payload: dict, *,
+               push_environment: PushEnvironment,
                collapse_id: str | None = None) -> SendResult:
     """Push one payload to one device, in THAT DEVICE's APNs environment (#3386 —
     ``push_environment`` is required, with no default, so no caller can silently

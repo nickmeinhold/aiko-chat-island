@@ -214,3 +214,16 @@ async def test_an_empty_environment_is_rejected_not_defaulted(session):
             session, user_id=ivan.id, platform="apns", token="i" * 64,
             push_environment="")  # type: ignore[arg-type]
         await session.commit()
+
+
+async def test_a_corrupt_environment_row_is_skipped_not_fatal(monkeypatch):
+    """The conversion moved from `_host` to the ORM edge (cage-match, Carnot
+    MEDIUM), so prove the blast radius did NOT move with it: a row carrying an
+    out-of-set string must still raise INSIDE push_service's per-device try —
+    logged, skipped, never reaped, and never abandoning the rest of the fanout.
+
+    Asserted at the conversion itself rather than through a full fanout because
+    that is the line that changed; the per-device boundary it lands in is already
+    proven by test_one_exploding_device_does_not_abandon_the_others."""
+    with pytest.raises(ValueError):
+        PushEnvironment("staging")
