@@ -186,6 +186,12 @@ async def lifespan(app: FastAPI):
         # creation/evolution; here we only VERIFY the live schema is migrated +
         # current, failing closed if not (#14).
         await verify_schema()
+        # Say it at boot if this island is holding device tokens it cannot reach
+        # (#3397). Silent unless there is something wrong — see warn_if_unreachable.
+        # Opens its own session: the request-scoped dependency does not exist yet.
+        from .domain import push_service as _push  # lazy: see the aclose() note
+        async with SessionLocal() as _session:
+            await _push.warn_if_unreachable(_session)
         # No independent seeding: channels are reconciled from the ChatServer
         # `channel_list` EC share once the bus client discovers it. An inbound
         # message for a not-yet-reconciled channel is upserted by persist_inbound
@@ -254,6 +260,7 @@ app.state.gw = state  # the WS endpoint reaches bus + hub via websocket.app.stat
 from .middleware import ContentSizeLimitMiddleware  # noqa: E402
 app.add_middleware(ContentSizeLimitMiddleware, max_bytes=settings.max_request_bytes)
 
+from .rest.deps import DbSession  # noqa: E402
 from .rest import auth as auth_routes  # noqa: E402
 from .rest import channels as channel_routes  # noqa: E402
 from .rest import communities as community_routes  # noqa: E402
@@ -293,12 +300,32 @@ app.include_router(ws_routes.router)
 app.include_router(well_known_routes.router)
 
 
+async def _reachability(session) -> dict:
+    """Lazy indirection so `main`'s module-level import graph stays exactly as it
+    was — the clean-checkout route-table tests introspect the real app without
+    `aiko_services` installed, and the header note asks that this graph not grow.
+    sys.modules caches after the first call, so the cost is a dict lookup."""
+    from .domain import push_service
+    return await push_service.reachability(session)
+
+
 @app.get("/health")
-def health() -> dict:
+async def health(session: DbSession) -> dict:
+    """Liveness plus the two things that are silently wrong more often than the
+    process is down.
+
+    `push` is READ LIVE on every call, never cached at boot (#3397). The standing
+    complaint about this endpoint is that it reports config INTENT rather than
+    reality (#3193) — a boot-time snapshot would answer "at startup" while the
+    operator is asking "now", and a device registered five minutes ago is exactly
+    the case worth surfacing. It costs one COUNT against a table that holds single
+    digits, which is cheaper than the four hours the silence cost once.
+    """
     return {
         "status": "ok",
         "aiko_connected": bool(state.bus and state.bus.connected),
         "channels": settings.aiko_channels,
+        "push": await _reachability(session),
     }
 
 
