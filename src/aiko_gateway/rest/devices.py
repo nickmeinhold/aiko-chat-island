@@ -44,8 +44,7 @@ async def register_device(
     Idempotent: re-registering the same token is a no-op reassign, still 201."""
     row = await svc.register_device(
         session, user_id=user.id, platform=req.platform.value, token=req.token,
-        push_environment=(req.push_environment.value
-                          if req.push_environment else None))
+        push_environment=req.push_environment)
     # Echo the RESOLVED environment, not the requested one: a client that sent
     # nothing learns what the island picked for it, which is the only way it can
     # notice a mismatch with the build it actually is.

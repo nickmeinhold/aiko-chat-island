@@ -35,7 +35,7 @@ def default_push_environment() -> str:
 
 async def register_device(
     session: AsyncSession, *, user_id: str, platform: str, token: str,
-    push_environment: str | None = None,
+    push_environment: PushEnvironment | None = None,
 ) -> DeviceToken:
     """Register (or re-register) a push token for ``user_id``. Idempotent and
     race-safe: keyed on the globally-unique token.
@@ -54,13 +54,29 @@ async def register_device(
     ``push_environment`` (#3386) is the APNs world the token was minted in, or None
     for "whatever this island is pinned to" — resolved HERE rather than at the
     router so the in-process and test paths get the same default as the wire path
-    (one door). It is refreshed on the reassign branch for the same reason
-    ``platform`` is: a phone that switches from a debug build to TestFlight
-    re-registers the SAME token string, and a row that kept the old environment
-    would route a live credential to the wrong host until the row was deleted."""
-    push_environment = push_environment or default_push_environment()
+    (one door). Typed as the enum, not ``str``: the closed set is the point, and a
+    caller holding a bare string has already lost the guarantee.
+
+    OMISSION PRESERVES, DECLARATION WINS (cage-match, Carnot + Maxwell). The
+    reassign branch does NOT re-resolve the default over an existing row. The two
+    directions have wildly asymmetric risk once you know how APNs mints tokens: a
+    sandbox token and a production token for the same app+device are DIFFERENT
+    STRINGS, so "same token, environment changed" — the case a blind refresh would
+    defend — is close to unreachable. Whereas "a client stops sending the field"
+    (an app rollback, an older code path) is an ordinary regression, and a blind
+    refresh would answer it by resetting an explicitly-declared production token to
+    the island default, breaking a live device until it re-registers. So an
+    explicit value always wins; an omitted one leaves the stored value alone.
+
+    ``is None``, not falsy (cage-match, Carnot HIGH). ``or`` would silently convert
+    an empty string into the island default — an invalid closed-set value quietly
+    becoming a valid one, inside the module that claims to be the single door. With
+    ``is None`` a bad value reaches the DB CHECK and is REJECTED, which is the
+    fail-closed direction."""
+    declared = push_environment.value if push_environment is not None else None
     row = DeviceToken(user_id=user_id, platform=platform, token=token,
-                      push_environment=push_environment)
+                      push_environment=(declared if declared is not None
+                                        else default_push_environment()))
     try:
         async with session.begin_nested():
             session.add(row)
@@ -87,7 +103,8 @@ async def register_device(
             raise
         existing.user_id = user_id
         existing.platform = platform
-        existing.push_environment = push_environment
+        if declared is not None:
+            existing.push_environment = declared
         existing.updated_at = _utcnow()  # explicit: onupdate fires only on a changed-col flush
         await session.commit()
         return existing

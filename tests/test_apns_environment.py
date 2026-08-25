@@ -172,5 +172,45 @@ async def test_service_stores_the_declared_environment(session, monkeypatch):
     gina = await _user(session, "gina")
     row = await devices_service.register_device(
         session, user_id=gina.id, platform="apns", token="g" * 64,
-        push_environment=PushEnvironment.SANDBOX.value)
+        push_environment=PushEnvironment.SANDBOX)
     assert row.push_environment == PushEnvironment.SANDBOX.value
+
+
+async def test_reregistration_without_a_declaration_preserves_the_stored_value(
+    client, session, monkeypatch
+):
+    """OMISSION PRESERVES (cage-match, Carnot + Maxwell). A device that declared
+    'production' and later re-registers WITHOUT the field must keep production —
+    re-resolving the island default would silently reset a live TestFlight token
+    to sandbox and break it until the app registered again.
+
+    Asymmetry is the argument: APNs mints a DIFFERENT token string per
+    environment, so "same token, environment changed" barely exists, while "a
+    client version stopped sending the field" is an ordinary regression."""
+    monkeypatch.setattr(settings, "apns_use_sandbox", True, raising=False)
+    heidi = await _user(session, "heidi")
+    first = await client.post(
+        "/v1/devices", headers=_headers(heidi),
+        json={"platform": "apns", "token": "h" * 64,
+              "push_environment": "production"})
+    again = await client.post("/v1/devices", headers=_headers(heidi),
+                              json={"platform": "apns", "token": "h" * 64})
+    assert first.json()["id"] == again.json()["id"]
+    row = await session.get(DeviceToken, again.json()["id"])
+    await session.refresh(row)
+    assert row.push_environment == PushEnvironment.PRODUCTION.value, (
+        "an omitted declaration re-resolved the island default over an "
+        "explicitly-registered environment")
+
+
+async def test_an_empty_environment_is_rejected_not_defaulted(session):
+    """`is None`, not falsy (cage-match, Carnot HIGH). An empty string is an
+    INVALID closed-set value; `or` would have quietly turned it into the island
+    default — an invalid value becoming a valid one inside the module that claims
+    to be the single door. It must reach the DB CHECK and be refused."""
+    ivan = await _user(session, "ivan")
+    with pytest.raises(Exception):
+        await devices_service.register_device(
+            session, user_id=ivan.id, platform="apns", token="i" * 64,
+            push_environment="")  # type: ignore[arg-type]
+        await session.commit()

@@ -21,6 +21,8 @@ shipped code path, not a reimplementation.
 """
 from __future__ import annotations
 
+import re
+
 from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.runtime.migration import MigrationContext
@@ -142,7 +144,14 @@ def test_fresh_db_upgrades_to_head(tmp_path, monkeypatch) -> None:
     # mid-fanout.
     assert "ck_device_tokens_push_environment" in device_sql
     assert "'sandbox'" in device_sql and "'production'" in device_sql
-    assert "push_environment" in device_sql and "NOT NULL" in device_sql
+    # COLUMN-SCOPED, not corpus-scoped (cage-match, Carnot). `"NOT NULL" in
+    # device_sql` was true of the whole CREATE TABLE — every other non-null column
+    # satisfied it, so the assertion could not go red if push_environment shipped
+    # nullable. Match the column's own clause instead: an instrument that cannot
+    # detect the failure is not a check.
+    assert re.search(r'push_environment\s+VARCHAR\(16\)\s+.*?NOT NULL',
+                     device_sql, re.IGNORECASE), (
+        f"push_environment is not NOT NULL in the migrated DDL:\n{device_sql}")
 
 
 def test_adopt_pre_alembic_db_stamps_baseline(tmp_path, monkeypatch) -> None:

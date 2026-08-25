@@ -189,11 +189,14 @@ def _host(push_environment: str) -> str:
     treats a raising send as transient-and-skip, so a single bad row cannot take
     down a fanout.
     """
-    if push_environment == PushEnvironment.SANDBOX:
-        return _SANDBOX_HOST
-    if push_environment == PushEnvironment.PRODUCTION:
-        return _PROD_HOST
-    raise ValueError(f"unknown APNs push_environment: {push_environment!r}")
+    match push_environment:
+        case PushEnvironment.SANDBOX:
+            return _SANDBOX_HOST
+        case PushEnvironment.PRODUCTION:
+            return _PROD_HOST
+        case _:
+            raise ValueError(
+                f"unknown APNs push_environment: {push_environment!r}")
 
 
 def _client() -> httpx.AsyncClient:
