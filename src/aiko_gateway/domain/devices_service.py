@@ -74,9 +74,9 @@ async def register_device(
     ``is None`` a bad value reaches the DB CHECK and is REJECTED, which is the
     fail-closed direction."""
     declared = push_environment.value if push_environment is not None else None
+    resolved = declared if declared is not None else default_push_environment()
     row = DeviceToken(user_id=user_id, platform=platform, token=token,
-                      push_environment=(declared if declared is not None
-                                        else default_push_environment()))
+                      push_environment=resolved)
     try:
         async with session.begin_nested():
             session.add(row)

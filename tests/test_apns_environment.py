@@ -227,3 +227,29 @@ async def test_a_corrupt_environment_row_is_skipped_not_fatal(monkeypatch):
     proven by test_one_exploding_device_does_not_abandon_the_others."""
     with pytest.raises(ValueError):
         PushEnvironment("staging")
+
+
+def test_host_accepts_an_in_set_bare_string_and_rejects_every_other(monkeypatch):
+    """PINS THE REAL CONTRACT (cage-match, Carnot round 3).
+
+    Carnot flagged that `PushEnvironment` is a `StrEnum`, so `_host("sandbox")`
+    matches `case PushEnvironment.SANDBOX` and the enum signature is not enforced
+    at runtime. The mechanism is TRUE — asserted below. The proposed remedy, an
+    `isinstance` guard, is rejected: it would make a CORRECT call raise while
+    buying no safety, because the property that actually matters is that every
+    value OUTSIDE the closed set fails closed, and it already does.
+
+    Carnot's round-2 wording said a `str` signature "allows every caller to pass
+    'prod', 'production '". It does not: both raise, as pinned here. So the leak
+    is one of type purity, not of behaviour — an in-set string produces the
+    correct host, and nothing else produces any host at all.
+
+    Python type hints are never runtime-enforced anywhere in this codebase;
+    guarding this one seam would be a mechanism where a statement does the job.
+    The statement is this test."""
+    monkeypatch.setattr(settings, "apns_use_sandbox", True, raising=False)
+    assert apns._host("sandbox") == apns._host(PushEnvironment.SANDBOX)
+    assert apns._host("production") == apns._host(PushEnvironment.PRODUCTION)
+    for bad in ("prod", "production ", " sandbox", "SANDBOX", "staging", ""):
+        with pytest.raises(ValueError):
+            apns._host(bad)  # type: ignore[arg-type]
