@@ -202,3 +202,107 @@ treated as a step from perfect to compromised.
 - [SpruceID — What Are Pairwise Identifiers?](https://spruceid.com/learn/pairwise-ids)
 - [OPPID: Single Sign-On with Oblivious Pairwise Pseudonyms (eprint 2024/1124)](https://eprint.iacr.org/2024/1124.pdf)
 - [Capability-Based Security (implementation notes)](https://oneuptime.com/blog/post/2026-01-30-capability-based-security/view)
+
+---
+
+# 6. Heat addendum — E2EE, moderation, and a conflated dial
+
+> Added 2026-08-25 17:32 after Nick pushed on three premises. Two of my earlier readings were
+> wrong; the third question opened a finding that is bigger than this candidate.
+
+## 6.1 CORRECTION — the mode election SHIPPED; only the implementation is bolted
+
+I earlier implied per-island E2EE configurability didn't exist. **It does.** `config.py:365`:
+
+```
+island_mode: IslandMode = IslandMode.MODERATOR
+```
+
+Signed into the island's self-manifest (`GET /v1/island`) so the posture is *"HONEST and LEGIBLE
+to clients before a user speaks"* — crucible-09 Phase A, live on both boxes. Two positions,
+`moderator` and `e2ee`. What did **not** ship is the E2EE implementation: `e2ee` is
+**hard-rejected at boot in every environment**, deliberately —
+
+> *"No encryption exists yet, so advertising it would be the exact mislabel this feature prevents
+> (users believing E2EE while the operator reads plaintext)… The value is in the enum only so the
+> wire/type vocabulary is forward-stable, **never selectable**."*
+
+**The dial exists, is signed, is legible — and one position is bolted shut.**
+
+## 6.2 How the field reconciles E2EE with moderation: MESSAGE FRANKING
+
+The standard answer, invented at Facebook, shipped in WhatsApp and Messenger Secret
+Conversations. The sender's message carries a **franking token** committing to both content and
+sender. The recipient's device verifies it. If the recipient reports, they hand over plaintext
+plus token, and the platform verifies **"this account sent exactly this"** — having never read
+it, and unable to be fooled by a forged report. Unreported messages stay deniable.
+
+**This does NOT contradict [[concept_confidential_xor_moderatable]], and the bundle must not
+claim it does.** That kill targeted a **proactive** moderator that can *read* content (the
+operator-blind enclave scanner, invalidated at Heat 2026-07-30). Franking grants no read access
+to anyone. It makes the **recipient** the sole party who can reveal, and makes their revelation
+*verifiable*. The dichotomy stands; franking sidesteps it by changing **who reveals**.
+
+**It also maps onto machinery already shipped here** — the report queue plus the #7
+takedown/retraction path are already *reactive and recipient-initiated*. Franking is the
+E2EE-compatible version of the flow this island already runs, not a new moderation philosophy.
+
+Active area, not fringe: Meta published on Scam Alert for WhatsApp with E2EE + verifiability
+guarantees on 2026-08-12; two SoK papers survey the space.
+
+## 6.3 An SFU is NOT an obstacle to E2EE calls — and LiveKit already ships it
+
+Correcting a second implicit assumption of mine. **LiveKit** — self-hosted on both our boxes —
+has **built-in E2EE**: room-level, automatically applied to all media tracks from all
+participants, plus data channels, via insertable streams. **The SFU forwards encrypted packets
+it cannot decrypt.** Group calls fully supported.
+
+Named trade-offs when E2EE is on: **server-side recording/egress, transcription, and simulcast
+layer switching become limited or unavailable.**
+
+## 6.4 THE FINDING — `island_mode` conflates two independent dials
+
+`island_mode` is one flag standing for two orthogonal properties:
+
+| dial | what it governs | what it costs to turn on |
+|---|---|---|
+| **message confidentiality** | gateway holds plaintext bodies (`models.py:501`, `Text`) | MLS client-side encryption — a large Phase B build, and it breaks today's proactive moderation posture |
+| **media confidentiality** | whether the SFU can decrypt call media | **a LiveKit room option.** No MLS. No message-path change. |
+
+**Media E2EE is separable from message E2EE and is available today.** Calls could be
+end-to-end encrypted without touching the message path, the report queue, or the moderator
+election — the `e2ee` bolt is holding the media door shut for a reason that only applies to the
+message door.
+
+**But turning it on silently would be the exact defect `config.py` guards against, inverted.** An
+island advertising a signed `moderator` manifest while its calls are actually E2EE is *mislabelled
+by omission* — under-claiming rather than over-claiming, but still a manifest that does not
+describe the island. So the honest version is **two dials, two signed manifest fields**, not one
+flag quietly acquiring a second meaning. That is a schema/wire change to a signed artifact and
+therefore not a side effect anyone should ship inside another feature.
+
+## 6.5 Consequence for THIS candidate
+
+1. The friends design now sits on a call path that **could plausibly be E2EE**, and the design
+   must not assume the island can see call media or call content.
+2. **An agent that participates in a call must be a KEYHOLDER, not an eavesdropper.** Under media
+   E2EE a pipeline that cannot decrypt cannot run inference — which collides with the `webrtc://`
+   DataScheme thread (#2828/#3157) where aiko pipelines *consume* media. Arguably the right
+   answer (an agent participates rather than wiretaps), but it is a constraint nobody has stated,
+   and it is the same question as the agent-identity thread approached from the other side.
+3. Franking is the moderation shape that survives if any of this becomes confidential — and it is
+   **reactive**, which is what the sender-anonymity ruling already assumes for rings.
+
+## 6.6 Filed rather than absorbed
+
+The two-dials finding (§6.4) is **not** part of this candidate's build and must not be smuggled
+into it. It wants its own ticket and its own decision from Nick.
+
+## Additional sources
+
+- [Meta Engineering — Scam Alert on WhatsApp with E2EE and verifiability (2026-08-12)](https://engineering.fb.com/2026/08/12/security/how-were-building-scam-alert-whatsapp/)
+- [SoK: Content Moderation Schemes in End-to-End Encrypted Systems (arXiv:2208.11147)](https://arxiv.org/pdf/2208.11147)
+- [SoK: Content Moderation for End-to-End Encryption (arXiv:2303.03979)](https://arxiv.org/pdf/2303.03979)
+- [Asymmetric Message Franking (UMD)](https://www.cs.umd.edu/~imiers/pdf/frank.pdf)
+- [LiveKit — End-to-end encryption](https://docs.livekit.io/home/client/tracks/encryption/)
+- [LiveKit — Encryption overview](https://docs.livekit.io/transport/encryption/)
