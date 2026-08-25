@@ -19,6 +19,15 @@ The honest value for rows that already exist is a different question: they were
 registered under whatever this island's global flag said, so a separate UPDATE
 sets them to exactly that. Static DDL, dynamic data.
 
+OPERATOR HAZARD, NAMED RATHER THAN GUARDED: the backfill reads the SAME process
+environment the gateway does. Run inside the container (which is how `migrate.run`
+fires at boot, and the only supported path) it sees the box's real
+`APNS_USE_SANDBOX`. Run by hand on the host with a bare shell it would see the
+Settings default (production) and stamp that onto rows a sandbox-pinned island
+registered. That mis-stamp costs one refused push per device — a 400
+BadDeviceToken, which the reaper deliberately does NOT act on — and is repaired by
+a one-line UPDATE, so it does not earn a guard. It does earn this paragraph.
+
 Both live islands hold ZERO device_tokens rows at authoring time (the app tab
 deleted the last one on 2026-08-25 as a deliberate teardown-test arm), so the
 UPDATE is expected to be a no-op in production today. It is written for
