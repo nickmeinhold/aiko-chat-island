@@ -21,6 +21,9 @@ shipped code path, not a reimplementation.
 """
 from __future__ import annotations
 
+import re
+
+from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.runtime.migration import MigrationContext
 from sqlalchemy import create_engine, inspect
@@ -133,6 +136,22 @@ def test_fresh_db_upgrades_to_head(tmp_path, monkeypatch) -> None:
     # time) fails here rather than at the first enrollment.
     assert "ck_users_kind" in users_sql
     assert "'human'" in users_sql and "'agent'" in users_sql
+    # device_tokens.push_environment closed set (#3386, migration 0023). Same
+    # CHECK-blind reasoning as above. The NOT NULL is asserted too, and it is not
+    # redundant with the CHECK: `NULL IN ('sandbox','production')` evaluates to
+    # UNKNOWN, which a CHECK constraint PASSES — so a nullable column would leave
+    # the closed set with a silent third member that `_host` would then raise on
+    # mid-fanout.
+    assert "ck_device_tokens_push_environment" in device_sql
+    assert "'sandbox'" in device_sql and "'production'" in device_sql
+    # COLUMN-SCOPED, not corpus-scoped (cage-match, Carnot). `"NOT NULL" in
+    # device_sql` was true of the whole CREATE TABLE — every other non-null column
+    # satisfied it, so the assertion could not go red if push_environment shipped
+    # nullable. Match the column's own clause instead: an instrument that cannot
+    # detect the failure is not a check.
+    assert re.search(r'push_environment\s+VARCHAR\(16\)\s+.*?NOT NULL',
+                     device_sql, re.IGNORECASE), (
+        f"push_environment is not NOT NULL in the migrated DDL:\n{device_sql}")
 
 
 def test_adopt_pre_alembic_db_stamps_baseline(tmp_path, monkeypatch) -> None:
@@ -316,3 +335,49 @@ def test_adopt_refuses_to_stamp_a_mismatched_db(tmp_path, monkeypatch) -> None:
     finally:
         engine.dispose()
     assert "alembic_version" not in tables
+
+
+def test_0023_backfills_existing_rows_from_the_island_setting(
+    tmp_path, monkeypatch
+) -> None:
+    """A row registered BEFORE the column existed was minted under whatever the
+    island's global flag said, so that is the only honest value to backfill it
+    with — not the DDL's static 'production' default (#3386).
+
+    Both live islands hold zero device_tokens rows today, so this is a
+    correctness test rather than a description of a migration anyone will watch
+    run. It pins the distinction that matters: static DDL (identical on every
+    island, so the parity gate cannot depend on a box's .env) and settings-aware
+    DATA. A migration that skipped the UPDATE would silently route every
+    pre-existing sandbox token to the production host on first ring.
+    """
+    _, sync_url = _point_app_at(tmp_path, monkeypatch)
+    monkeypatch.setattr(settings, "apns_use_sandbox", True, raising=False)
+
+    command.upgrade(migrate._alembic_config(), "0022")  # stop one short: no push_environment yet
+    engine = create_engine(sync_url)
+    try:
+        with engine.begin() as conn:
+            conn.exec_driver_sql(
+                "INSERT INTO users "
+                "(id, username, aiko_username, display_name, created_at, kind) "
+                "VALUES ('01USERAAAAAAAAAAAAAAAAAAAA', 'u', 'u', 'U', "
+                "'2026-08-25T00:00:00+00:00', 'human')")
+            conn.exec_driver_sql(
+                "INSERT INTO device_tokens "
+                "(id, user_id, platform, token, created_at, updated_at) VALUES "
+                "('01TOKENAAAAAAAAAAAAAAAAAAA', '01USERAAAAAAAAAAAAAAAAAAAA', "
+                "'apns', 'legacy-token', '2026-08-25T00:00:00+00:00', "
+                "'2026-08-25T00:00:00+00:00')")
+
+        command.upgrade(migrate._alembic_config(), "0023")
+
+        with engine.connect() as conn:
+            value = conn.exec_driver_sql(
+                "SELECT push_environment FROM device_tokens "
+                "WHERE id='01TOKENAAAAAAAAAAAAAAAAAAA'").scalar()
+    finally:
+        engine.dispose()
+    assert value == "sandbox", (
+        "a pre-existing row kept the static DDL default instead of the "
+        "environment it was actually registered under")

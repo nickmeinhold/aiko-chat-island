@@ -16,11 +16,26 @@ from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .models import DeviceToken, _utcnow
+from ..config import settings
+from .models import DeviceToken, PushEnvironment, _utcnow
+
+
+def default_push_environment() -> str:
+    """The APNs environment a client gets when it does not declare one (#3386).
+
+    The island's own `APNS_USE_SANDBOX`, which is the honest answer while there is
+    only one kind of build reaching a given box: the token was minted by whatever
+    build the operator pinned the box for. It stops being honest the moment a
+    debug build and a TestFlight build register against the same island — which is
+    exactly when the client starts declaring it and this default stops being read.
+    """
+    return (PushEnvironment.SANDBOX if settings.apns_use_sandbox
+            else PushEnvironment.PRODUCTION).value
 
 
 async def register_device(
-    session: AsyncSession, *, user_id: str, platform: str, token: str
+    session: AsyncSession, *, user_id: str, platform: str, token: str,
+    push_environment: PushEnvironment | None = None,
 ) -> DeviceToken:
     """Register (or re-register) a push token for ``user_id``. Idempotent and
     race-safe: keyed on the globally-unique token.
@@ -34,8 +49,34 @@ async def register_device(
     Insert inside a SAVEPOINT so a unique violation rolls back ONLY the failed
     insert, leaving the outer txn/greenlet intact — a plain commit-then-rollback
     breaks the subsequent re-fetch with MissingGreenlet on aiosqlite (the same
-    hazard handled in memberships_service._insert_idempotent)."""
-    row = DeviceToken(user_id=user_id, platform=platform, token=token)
+    hazard handled in memberships_service._insert_idempotent).
+
+    ``push_environment`` (#3386) is the APNs world the token was minted in, or None
+    for "whatever this island is pinned to" — resolved HERE rather than at the
+    router so the in-process and test paths get the same default as the wire path
+    (one door). Typed as the enum, not ``str``: the closed set is the point, and a
+    caller holding a bare string has already lost the guarantee.
+
+    OMISSION PRESERVES, DECLARATION WINS (cage-match, Carnot + Maxwell). The
+    reassign branch does NOT re-resolve the default over an existing row. The two
+    directions have wildly asymmetric risk once you know how APNs mints tokens: a
+    sandbox token and a production token for the same app+device are DIFFERENT
+    STRINGS, so "same token, environment changed" — the case a blind refresh would
+    defend — is close to unreachable. Whereas "a client stops sending the field"
+    (an app rollback, an older code path) is an ordinary regression, and a blind
+    refresh would answer it by resetting an explicitly-declared production token to
+    the island default, breaking a live device until it re-registers. So an
+    explicit value always wins; an omitted one leaves the stored value alone.
+
+    ``is None``, not falsy (cage-match, Carnot HIGH). ``or`` would silently convert
+    an empty string into the island default — an invalid closed-set value quietly
+    becoming a valid one, inside the module that claims to be the single door. With
+    ``is None`` a bad value reaches the DB CHECK and is REJECTED, which is the
+    fail-closed direction."""
+    declared = push_environment.value if push_environment is not None else None
+    resolved = declared if declared is not None else default_push_environment()
+    row = DeviceToken(user_id=user_id, platform=platform, token=token,
+                      push_environment=resolved)
     try:
         async with session.begin_nested():
             session.add(row)
@@ -62,6 +103,8 @@ async def register_device(
             raise
         existing.user_id = user_id
         existing.platform = platform
+        if declared is not None:
+            existing.push_environment = declared
         existing.updated_at = _utcnow()  # explicit: onupdate fires only on a changed-col flush
         await session.commit()
         return existing

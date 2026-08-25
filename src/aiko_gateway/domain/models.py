@@ -124,6 +124,35 @@ class Platform(enum.StrEnum):
     FCM = "fcm"
 
 
+class PushEnvironment(enum.StrEnum):
+    """Closed set of APNs environments (#3386) — which WORLD a push credential
+    belongs to. Same single-source-of-truth pattern as Platform: drives the DB
+    CHECK on device_tokens.push_environment via _in_check.
+
+    Apple runs two independent push services. A token minted by a development
+    build is valid ONLY against api.sandbox.push.apple.com; a TestFlight or App
+    Store build's token ONLY against api.push.apple.com. The same token string
+    against the wrong host is a 400 BadDeviceToken and nothing else — and a token
+    carries no marking that distinguishes them (see apns._verdict), so this can
+    never be inferred server-side. The CLIENT declares it; the island stores it.
+
+    NAMED push_environment, not `environment`, deliberately: Settings.environment
+    is the DEPLOYMENT environment and shares the literal value 'production' with
+    this closed set while meaning something entirely unrelated. Two meanings and
+    one word, colliding in a send path that already imports settings, is a bug
+    waiting for a tired reader.
+
+    INERT FOR FCM. The column is NOT NULL for every platform because a CHECK
+    alone cannot close a set against NULL, but Firebase has no environment split
+    — an 'fcm' row simply carries whichever default it registered under and no
+    code reads it. A conditional constraint would be machinery bought to express
+    "this field means nothing over here"; the sentence does the job.
+    """
+
+    SANDBOX = "sandbox"
+    PRODUCTION = "production"
+
+
 class PasskeyOperation(enum.StrEnum):
     """Closed set of WebAuthn ceremony types (#1471). Same single-source-of-truth
     pattern as Role/JoinPolicy/Platform: drives the DB CHECK on
@@ -683,6 +712,8 @@ class DeviceToken(Base):
         UniqueConstraint("token", name="uq_device_tokens_token"),
         CheckConstraint(_in_check("platform", Platform),
                         name="ck_device_tokens_platform"),
+        CheckConstraint(_in_check("push_environment", PushEnvironment),
+                        name="ck_device_tokens_push_environment"),
     )
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=new_ulid)
     user_id: Mapped[str] = mapped_column(
@@ -691,6 +722,15 @@ class DeviceToken(Base):
     # APNs tokens are 64 hex chars; FCM registration tokens are ~160+ and grow —
     # 512 is comfortable headroom. UNIQUE (named, above): one row per device token.
     token: Mapped[str] = mapped_column(String(512), nullable=False)
+    # Which of Apple's two push services minted this token (#3386). NOT NULL with a
+    # server_default so a direct SQL INSERT that omits it gets the safe value rather
+    # than failing: 'production' matches Settings.apns_use_sandbox's own default, so
+    # an omitted column and an omitted env var agree. Wrong-environment routing costs
+    # one refused request (400 BadDeviceToken, which the reaper deliberately does NOT
+    # act on) — it never destroys a row, so neither direction of a mistake here is
+    # irreversible.
+    push_environment: Mapped[str] = mapped_column(
+        String(16), nullable=False, server_default=PushEnvironment.PRODUCTION.value)
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[dt.datetime] = mapped_column(
