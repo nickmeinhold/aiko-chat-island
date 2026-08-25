@@ -255,3 +255,142 @@ value Nick asked for. Increment 4 is where the cost and the risk live, and it is
 5. Blind-signature scheme — RSA blind signatures vs VOPRF/Privacy Pass. Undecided; driven by what is credible in Dart.
 6. Does a tie need to be *provable to a third party* (a room admitting a guest on a friend's word), or is it purely two-party? Currently assumed two-party.
 7. Cross-island ring routing: which island mints the token when A and B are on different boxes?
+
+---
+
+# 8. FOLD — the author's own adversarial pass (2026-08-25, pre-Temper)
+
+> Movement 5. No round budget — this is just me, and it is cheap. Findings are folded back into
+> the design above where they change it, and recorded here where they change the *claims*.
+> Fold works the metal; it does not re-grade the ore.
+
+## 8.1 Degenerate states
+
+**F-1 — Bootstrap is undefined, and discovery is forbidden.** §2.3 hand-waves *"QR, deep link, or
+an in-band offer/accept pair"*. But an in-band offer must address a user id, and ADR-0004 forbids
+a central directory — so where does the id come from? **Answer, and it must be stated rather than
+assumed:** the only directory-shaped surface that exists is the **shared-channel roster**, and it
+is deliberately scoped (`members.py`: *"a public channel's roster is enumerable by any member who
+can read it — public channels are public by definition"*). So the bootstrap is **"you may offer a
+tie to someone you share a channel with, or to someone out-of-band via QR/link"** — and nothing
+else. This is a *narrowing* of the design, and it should be written into §2.3 rather than left
+open, because the obvious "friend search" affordance an app designer would reach for is exactly
+what ADR-0004 prohibits.
+
+**F-2 — Simultaneous offers create two ties.** A offers B while B offers A. Two half-ties, two
+keys; both decrypt (a device tries all held keys), but the *grades* diverge — A's grade for B sits
+on one tie and B's on the other. **Fix, folded in:** derive the tie key deterministically and
+symmetrically, `K_ab = KDF(ECDH(pk_A, pk_B) ‖ domain_tag)`, so simultaneous offers converge on the
+identical key and the ceremony is idempotent. This also removes any need for tie ids to be
+negotiated.
+
+**F-3 — Multi-device is entirely unaddressed, and it is also the cheapest backup.** A tie made on
+A's phone is invisible to A's laptop, which can neither ring nor be rung. Two consequences: (a)
+the design owes a device-to-device tie-sync story; (b) **a second device is itself a recovery
+mechanism** — strictly better than C-3's friends-re-hand-you-your-half, because it needs nobody
+else's liveness. §2.6 should present multi-device as the *first* line of recovery and social
+re-pairing as the fallback, not the only path.
+
+**F-4 — Double-spend is asserted, not designed.** §2.4 says *"mark T spent"*. Two concurrent POSTs
+with the same token is a classic TOCTOU, and this codebase already has the answer twice
+(`consume_challenge`, `_capped_insert`, and Design 05's C2 fix): **one guarded statement with the
+condition folded into the WHERE, arbitrated by rowcount, failing closed on `rowcount != 1`.**
+Folded into §2.4 as a requirement, not an implementation note.
+
+**F-5 — The spent-token set grows without bound.** Every ring writes a permanent replay-guard row.
+Prunable only because tokens expire: once a token is past TTL it cannot be spent regardless, so
+its spend record can be dropped. Needs an explicit retention rule tied to the TTL (open
+variable 4).
+
+**F-6 — Unauthenticated endpoint = account-enumeration oracle.** This is the worst of the
+degenerate cases. `POST /v1/ring` is unauthenticated, so response differences between *recipient
+exists*, *recipient exists but has no device* (**the current state of every user on both
+islands**), and *recipient does not exist* let an anonymous caller enumerate the user base — and
+map who has a handset registered. **Fix, folded in:** constant-shape, constant-status response for
+every one of those cases after token validation, matching Design 05's *"constant-shape errors"*
+convention. Spend the token either way, so timing and side effects do not distinguish.
+
+**F-7 — Ciphertext length leaks the caller.** The seal contains `caller_label`. Labels have
+different lengths, so an island watching sealed blobs can bucket senders by size and, over time,
+fingerprint them. Sender-anonymity leaking through a length field would be embarrassing and it is
+easy to close: **pad the seal to a fixed size.** Folded in.
+
+**F-8 — The re-key digest is public.** `GET /v1/rekeyed?since=` reveals *who recently lost their
+device or was compromised*, to anyone. The local-intersection property does not require the list
+be public — only that everyone fetch the **same** list. **Fix:** require a session. Folded in.
+
+**F-9 — Ringing a deleted account.** A is deleted; B still holds the tie. A can no longer mint
+tokens (no session), so nothing rings and the tie simply goes quiet. Acceptable, but B never
+learns A is gone. Named, not fixed — the alternative is telling B about A's deletion, which is an
+island-side statement about a relationship the island is not supposed to know.
+
+## 8.2 Stressing the claims
+
+**C-1 is WEAKER THAN CAST CLAIMED, in two ways — both mine to own.**
+
+1. **Token minting is authenticated, and correlates.** The island sees *A minted tokens at 19:04*
+   and *a ring arrived at B at 19:04*. If tokens are fetched on demand just before a ring, the
+   correlation is near-perfect and the whole property collapses. **Fix, folded in: mint in
+   batches, well in advance, on a schedule decoupled from use** (e.g. a daily top-up at an hour
+   the client picks). This is a *requirement*, not an optimisation.
+2. **The anonymity set is the concurrently-plausible sender population, and at N=33 that can be
+   one.** The island sees WebSocket presence. A ring landing at 03:00 when exactly one account is
+   online identifies the sender without any cryptography being broken. **This does not have a
+   fix at this scale** — it is a property of the population, not the protocol.
+
+   **Consequence, stated plainly: increment 4's value scales with population, and at 46 users it
+   buys much less than it costs.** That is not a reason to redesign it; it is a reason to keep it
+   last and to be honest that it may never be worth building. It also sharpens **C-6** from "is
+   the crypto worth its weight" to "the property being purchased is itself weak at current
+   scale."
+
+**C-3 is weakened by F-3 and should be demoted.** Multi-device is a better recovery story and
+needs no one else's liveness. Social re-pairing becomes the fallback for the genuinely
+single-device user.
+
+**C-5 is unchanged and remains the one that matters.** No amount of folding substitutes for a row
+in `device_tokens`.
+
+**C-7 (block moving to the device) survived the fold**, with one caveat worth handing the
+adversary: a device-enforced block cannot stop the *wake*, only the ring. A determined harasser
+can still cost a blocked recipient battery and a silent notification, bounded by the per-recipient
+budget. The island genuinely gives up the ability to stop that, and calling this purely "stronger"
+is an overclaim — it is **stronger against coercion and leakage, weaker against nuisance.**
+
+## 8.3 Trying to dissolve the problem with the simplest rejected alternative
+
+The null option in §5 was *"app-local contact list, no island change — rejected because it cannot
+ring."* Folding honestly: **that rejection was wrong, and it is the most important finding here.**
+
+Increments 1–3 route rings over the *existing* message path, which already reaches a handset
+through `create_outbound` → `push_service`. So increments 1–3 **are** the null option — an
+app-local contact list with grades — and they work. The island change is nil.
+
+Which means:
+
+> **The genuinely novel island-side content of this entire design is increment 4 — and §8.2 just
+> established that increment 4 buys a weak property at current scale.**
+
+Two honest readings, and I am not going to pick between them for Nick:
+
+- **The elegant reading.** The right island-side answer to "friends" is *almost nothing*, and this
+  forge's real output is knowing precisely which nothing, and which one thing the island must
+  never do (hold the pair). A design that ends in "don't build it here" is a result.
+- **The deflationary reading.** This candidate is mostly an app feature wearing an island
+  crucible's clothes, and the island half should be closed with a short ADR rather than a build.
+
+Either way **increments 1–3 remain worth shipping and are unaffected** — the product value Nick
+asked for (consented ties, graded reachability, being *asked* rather than added) survives
+completely and needs no island work.
+
+## 8.4 What Fold changed
+
+Folded into the design above: F-2 (deterministic symmetric key), F-4 (guarded single-statement
+spend), F-6 (constant-shape responses), F-7 (fixed-size padding), F-8 (authenticated digest),
+plus C-1's batched-minting requirement and F-1's explicit bootstrap narrowing.
+
+Recorded as weakened claims rather than fixes: C-1 (small anonymity set — unfixable at this
+scale), C-3 (demoted below multi-device), C-7 (nuisance caveat).
+
+**New open variable 8:** does increment 4 ever get built, given §8.3? That is Nick's call and it
+should be made *before* the crypto work is scoped, not after.

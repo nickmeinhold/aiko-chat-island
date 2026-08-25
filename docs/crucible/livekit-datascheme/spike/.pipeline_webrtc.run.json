@@ -1,0 +1,62 @@
+{
+  "version": 0,
+  "name": "p_webrtc_1",
+  "runtime": "python",
+  "graph": [
+    "(ImageReadZMQ PatternAssert)"
+  ],
+  "elements": [
+    {
+      "name": "ImageReadZMQ",
+      "#": "(zmq://localhost:6502) -> (webrtc://<room>). It has never heard of WebRTC.",
+      "parameters": {
+        "data_sources": "(webrtc://spike-pipeline-1787226546)",
+        "data_batch_size": 1,
+        "media_type": "image/pil",
+        "compressed": false,
+        "wire": "jpeg",
+        "rate": 10
+      },
+      "input": [
+        {
+          "name": "records",
+          "type": "[bytes]"
+        }
+      ],
+      "output": [
+        {
+          "name": "images",
+          "type": "[image]"
+        }
+      ],
+      "deploy": {
+        "local": {
+          "module": "element_webrtc"
+        }
+      }
+    },
+    {
+      "name": "PatternAssert",
+      "parameters": {
+        "assert_frames": 5
+      },
+      "input": [
+        {
+          "name": "images",
+          "type": "[image]"
+        }
+      ],
+      "output": [
+        {
+          "name": "images",
+          "type": "[image]"
+        }
+      ],
+      "deploy": {
+        "local": {
+          "module": "element_webrtc"
+        }
+      }
+    }
+  ]
+}
