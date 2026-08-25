@@ -13,7 +13,7 @@ from fastapi import APIRouter, status
 from pydantic import BaseModel, Field
 
 from ..domain import devices_service as svc
-from ..domain.models import Platform
+from ..domain.models import Platform, PushEnvironment
 from .deps import CurrentUser, DbSession
 
 router = APIRouter(prefix="/v1", tags=["devices"])
@@ -24,6 +24,12 @@ class RegisterDeviceReq(BaseModel):
     # not a silent store that the DB CHECK would later reject with a 500.
     platform: Platform
     token: str = Field(min_length=1, max_length=512)
+    # Which APNs environment minted this token (#3386). OPTIONAL, and None means
+    # "use this island's setting" — so an app built before this field existed
+    # keeps working unchanged and the island half ships without waiting for the
+    # app half. Typed as the enum so an out-of-set value is a 422 at the boundary
+    # rather than a 500 from the DB CHECK, same as `platform`. Inert for 'fcm'.
+    push_environment: PushEnvironment | None = None
 
 
 class UnregisterDeviceReq(BaseModel):
@@ -37,8 +43,14 @@ async def register_device(
     """Register (or re-register) this device's push token for the current user.
     Idempotent: re-registering the same token is a no-op reassign, still 201."""
     row = await svc.register_device(
-        session, user_id=user.id, platform=req.platform.value, token=req.token)
-    return {"id": row.id, "platform": row.platform}
+        session, user_id=user.id, platform=req.platform.value, token=req.token,
+        push_environment=(req.push_environment.value
+                          if req.push_environment else None))
+    # Echo the RESOLVED environment, not the requested one: a client that sent
+    # nothing learns what the island picked for it, which is the only way it can
+    # notice a mismatch with the build it actually is.
+    return {"id": row.id, "platform": row.platform,
+            "push_environment": row.push_environment}
 
 
 @router.delete("/devices", status_code=status.HTTP_204_NO_CONTENT)

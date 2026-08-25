@@ -374,7 +374,9 @@ async def _wake_user(session: AsyncSession, user_id: str, payload: dict,
     for row in tokens:
         observed = (row.id, row.token, row.updated_at)
         try:
-            result = await apns.send(row.token, payload, collapse_id=collapse_id)
+            result = await apns.send(
+                row.token, payload, push_environment=row.push_environment,
+                collapse_id=collapse_id)
         except Exception:
             # PER-DEVICE BOUNDARY (cage-match #139 round 6, Carnot). `apns.send`
             # swallows httpx errors itself, but it can still raise from provider-

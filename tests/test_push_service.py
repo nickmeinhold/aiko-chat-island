@@ -54,9 +54,14 @@ class FakeApns:
         # the reaper must treat as NO EVIDENCE rather than as the epoch.
         self.invalid_since_ms: int | None = None
         self.sent: list[tuple[str, dict, str | None]] = []
+        # The APNs environment the service asked for, per send (#3386). Recorded
+        # separately from `sent` so the existing unpacking sites stay a 3-tuple.
+        self.environments: list[str] = []
 
-    async def __call__(self, device_token, payload, *, collapse_id=None):
+    async def __call__(self, device_token, payload, *, push_environment,
+                       collapse_id=None):
         self.sent.append((device_token, payload, collapse_id))
+        self.environments.append(push_environment)
         # Returns the SAME shape the real transport returns. A fake whose
         # contract has drifted from the real API tests a system that does not
         # exist — this one drifted once already, when send() grew SendResult, and
@@ -310,7 +315,8 @@ async def test_a_row_re_registered_during_the_send_is_not_reaped(
     )).first()
     assert row is not None, "fixture precondition: bob has a registered device"
 
-    async def _send_then_reregister(device_token, payload, *, collapse_id=None):
+    async def _send_then_reregister(device_token, payload, *, push_environment,
+                                    collapse_id=None):
         # The device comes back to life while APNs is still answering.
         await session.execute(
             DeviceToken.__table__.update()
@@ -529,7 +535,8 @@ async def test_one_exploding_device_does_not_abandon_the_others(
 
     reached = []
 
-    async def _explode_on_first(device_token, payload, *, collapse_id=None):
+    async def _explode_on_first(device_token, payload, *, push_environment,
+                                collapse_id=None):
         if device_token.startswith("b"):
             raise RuntimeError("provider token signing blew up")
         reached.append(device_token)
@@ -775,3 +782,37 @@ async def test_a_push_failure_never_escapes(session, dm, configured, monkeypatch
 
     monkeypatch.setattr(apns, "send", _explode)
     await _wake(sender_id=alice.id)  # must not raise
+
+
+# ------------------------------------------------- per-token APNs environment
+
+
+async def test_the_send_carries_the_ROW_environment_not_the_island(
+    session, dm, configured, fake_apns, monkeypatch
+):
+    """#3386, at the seam that matters. `test_apns_environment` proves `_host`
+    maps an environment to a host; this proves the SERVICE hands it the token's
+    own value rather than the island's.
+
+    The island is pinned to sandbox and the row says production — deliberately
+    opposed, so a service that quietly kept reading `settings.apns_use_sandbox`
+    would still produce 'sandbox' here and fail. Both rows are woken in one
+    fanout, because the real hazard is not one wrong token, it is a fanout that
+    reads the environment ONCE and applies it to every device.
+    """
+    monkeypatch.setattr(settings, "apns_use_sandbox", True, raising=False)
+    _, bob = dm
+    session.add(DeviceToken(user_id=bob.id, platform="apns", token="p" * 64,
+                            push_environment="production"))
+    await session.execute(
+        DeviceToken.__table__.update()
+        .where(DeviceToken.token == "b" * 64)
+        .values(push_environment="sandbox"))
+    await session.commit()
+
+    await _wake(sender_id=dm[0].id)
+
+    by_token = dict(zip([t for t, _, _ in fake_apns.sent], fake_apns.environments))
+    assert by_token == {"b" * 64: "sandbox", "p" * 64: "production"}, (
+        "the fanout applied one environment to every device instead of reading "
+        "each row's own")

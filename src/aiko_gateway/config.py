@@ -163,12 +163,18 @@ class Settings(BaseSettings):
     # bind-mount whose absence fails at first-send (a runtime surprise) instead of at
     # boot, and the existing secret-delivery channel for this deployment is the .env.
     apns_private_key: str = ""
-    # Sandbox vs production APNs host. A device token from a DEVELOPMENT build is
-    # ONLY valid against api.sandbox.push.apple.com, and a TestFlight/App Store build's
-    # token is ONLY valid against api.push.apple.com — the same token string against
-    # the wrong host is a 400 BadDeviceToken with no other clue. There is no way to
-    # tell the two apart by inspecting the token, so this is an explicit operator
-    # switch and not something the code may guess.
+    # DEFAULT APNs environment for a device that does not declare one at
+    # registration. A token from a DEVELOPMENT build is ONLY valid against
+    # api.sandbox.push.apple.com, and a TestFlight/App Store build's token ONLY
+    # against api.push.apple.com — the same token string against the wrong host is
+    # a 400 BadDeviceToken with no other clue, and no inspection tells them apart.
+    #
+    # NO LONGER THE SEND SWITCH (#3386). The environment is a property of the TOKEN,
+    # so it lives on device_tokens.push_environment and `apns._host` reads it there;
+    # a box that answered this once globally could ring debug builds or TestFlight
+    # builds but never both. What survives here is the fallback the island applies
+    # when a client registers without saying — correct while only one kind of build
+    # reaches a given box, and simply unread once clients declare it.
     apns_use_sandbox: bool = False
     # Per-RECIPIENT wake budget. Waking a handset is a strictly louder capability than
     # delivering a message — a message you read when you choose, a push interrupts you
