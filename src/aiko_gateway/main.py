@@ -301,12 +301,43 @@ app.include_router(well_known_routes.router)
 
 
 async def _reachability(session) -> dict:
-    """Lazy indirection so `main`'s module-level import graph stays exactly as it
-    was — the clean-checkout route-table tests introspect the real app without
+    """The `push` block for /health — DEGRADES rather than failing the endpoint.
+
+    Lazy import so `main`'s module-level graph stays exactly as it was: the
+    clean-checkout route-table tests introspect the real app without
     `aiko_services` installed, and the header note asks that this graph not grow.
-    sys.modules caches after the first call, so the cost is a dict lookup."""
+    sys.modules caches after the first call, so the cost is a dict lookup.
+
+    NEVER RAISES, and that is the whole point of this wrapper. Before #3397 this
+    endpoint touched no database, so a DB problem could not affect it. It is also
+    the container's liveness probe (`curl -fsS /health`, compose healthcheck) AND
+    deploy/update.sh's post-deploy verification — so a raising /health turns a
+    transient SQLite lock into a container marked unhealthy and a SUCCESSFUL
+    deploy reported as a failure. Adding a subsystem dependency to a liveness
+    probe is how a dependency blip becomes an outage; the new information must
+    ride along without inheriting that power.
+
+    BOOLEANS, NOT COUNTS, on this endpoint specifically: /health is public and
+    unauthenticated (it already exposes `channels`, which is config). A live
+    device population is user-adjacent data and does not belong on it — this
+    island's grain is not leaking facts about its people. The COUNT, which is
+    what an operator acts on, goes to the boot log where box access is the
+    prerequisite. Tradeoff named rather than absorbed: a monitor scraping
+    /health learns THAT devices are unreachable, not how many.
+    """
     from .domain import push_service
-    return await push_service.reachability(session)
+    try:
+        report = await push_service.reachability(session)
+    except Exception:  # pragma: no cover - exercised via the raising-session test
+        # Unknown, not false: reporting `configured: false` here would invent an
+        # alarm out of a database hiccup, and a false alarm costs more than a
+        # missing one on a field that is advisory.
+        log.warning("/health could not read push reachability", exc_info=True)
+        return {"status": "unknown"}
+    return {
+        "configured": report["configured"],
+        "devices_unreachable": bool(report["unreachable_devices"]),
+    }
 
 
 @app.get("/health")

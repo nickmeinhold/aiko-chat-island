@@ -146,11 +146,11 @@ async def test_health_reports_live_reachability_not_a_boot_snapshot(
     value computed once at boot would answer "at boot", not "now", which is a
     different question from the one the operator is asking."""
     first = await health_client.get("/health")
-    assert first.json()["push"] == {"configured": False, "registered_devices": 0,
-                                    "unreachable_devices": 0}
+    assert first.json()["push"] == {"configured": False,
+                                    "devices_unreachable": False}
     await _user_with_devices(session, 1)
     second = await health_client.get("/health")
-    assert second.json()["push"]["unreachable_devices"] == 1, (
+    assert second.json()["push"]["devices_unreachable"] is True, (
         "/health served a boot-time snapshot instead of live state")
 
 
@@ -159,3 +159,55 @@ async def test_health_keeps_its_existing_shape(health_client, unconfigured):
     body = (await health_client.get("/health")).json()
     assert body["status"] == "ok"
     assert "aiko_connected" in body and "channels" in body
+
+
+# --------------------------------------------- /health must not become fragile
+
+async def test_health_survives_a_database_failure(session, unconfigured, caplog):
+    """SELF-REVIEW FINDING. /health is the container's liveness probe (compose
+    `curl -fsS http://127.0.0.1:8095/health`) AND deploy/update.sh's post-deploy
+    verification. Before #3397 it touched no database, so a DB problem could not
+    reach it; adding a COUNT gave a transient SQLite lock the power to mark the
+    container unhealthy and to report a SUCCESSFUL deploy as failed.
+
+    So the push block degrades and the endpoint still answers 200. Driven through
+    a session that raises, because the claim is about the failure path and a test
+    that cannot produce the failure cannot clear it."""
+    from fastapi import FastAPI
+    from httpx import ASGITransport, AsyncClient
+
+    from aiko_gateway import main as main_mod
+    from aiko_gateway.rest.deps import get_session
+
+    class _Exploding:
+        async def execute(self, *a, **kw):
+            raise RuntimeError("database is locked")
+
+    async def _override():
+        yield _Exploding()
+
+    app = FastAPI()
+    app.add_api_route("/health", main_mod.health, methods=["GET"])
+    app.dependency_overrides[get_session] = _override
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.get("/health")
+    assert resp.status_code == 200, "a DB hiccup took down the liveness probe"
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["push"] == {"status": "unknown"}, (
+        "a database failure must read as UNKNOWN, not as a false unreachable alarm")
+
+
+async def test_health_does_not_publish_a_device_population(
+    health_client, session, unconfigured
+):
+    """SELF-REVIEW FINDING. /health is public and unauthenticated. A live count
+    of registered devices is user-adjacent data and does not belong on it — the
+    actionable count goes to the boot log, where box access is the prerequisite.
+    Asserted on the serialized body so a nested count cannot slip back in."""
+    await _user_with_devices(session, 3)
+    body = (await health_client.get("/health")).text
+    assert "registered_devices" not in body
+    assert "unreachable_devices" not in body
+    assert '"3"' not in body and ": 3" not in body
