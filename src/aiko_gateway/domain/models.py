@@ -142,8 +142,10 @@ class ApnsEnvironment(enum.StrEnum):
     Nick's ruling 2026-08-26). It is also the more honest of the two: the split is
     an APNs fact, not a push fact — the `.p8` is environment-agnostic and FCM has
     no such division at all, so a name claiming the whole push domain describes
-    something no other transport has. The aiko_chat_app half carries the same name
-    end to end, agreed before either side merged.
+    something no other transport has. The aiko_chat_app tab AGREED to the same name
+    end to end before either side merged — an agreement, not yet a fact about their
+    code: their PR#162 was still open and still emitting the old key when this was
+    written. Check theirs, don't trust this sentence.
 
     NOT shortened to `environment`: Settings.environment is the DEPLOYMENT
     environment and shares the literal value 'production' with this closed set

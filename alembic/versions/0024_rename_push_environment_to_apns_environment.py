@@ -20,10 +20,12 @@ docstring in domain/models.py.
 
 THE WIRE FIELD MOVES WITH THE COLUMN, so this is a BREAKING contract change, and
 it is safe today for one reason that was measured rather than assumed: there is no
-deployed consumer. `git grep push_environment origin/main -- '*.dart'` in
-aiko_chat_app returns zero, its PR#162 is open and unmerged, and the last
-submitted IPA (0.0.3+11, 10 Aug) has no aps-environment entitlement at all, so it
-could not hold an APNs token. Confirmed with the app tab before this was written.
+deployed consumer. MEASURED 2026-08-26, not a standing invariant — `git grep
+push_environment origin/main -- '*.dart'` in aiko_chat_app returned zero, its
+PR#162 was open and unmerged, and the last submitted IPA (0.0.3+11, 10 Aug) had no
+aps-environment entitlement at all, so it could not hold an APNs token. The app tab
+confirmed each of those independently before this was written. If you are reading
+this while debugging a wire-compat bug, re-measure rather than inherit it.
 That is why NO dual-key compatibility window was built: accepting both keys for a
 release would be a mechanism for a state that cannot occur.
 
