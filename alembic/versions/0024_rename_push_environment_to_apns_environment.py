@@ -1,8 +1,17 @@
 """device_tokens.push_environment -> apns_environment (#3386, Nick's ruling)
 
-A NAME-ONLY reconciliation. No column is added or dropped, no value changes, no
-row is touched: this migration exists so the deployed schema says what #3386's
-body said it would say.
+A NAME-ONLY reconciliation. No column is added or dropped and no value changes:
+this migration exists so the deployed schema says what #3386's body said it would
+say.
+
+BUT IT IS NOT A NO-OP ON THE ROWS. SQLite cannot rename a column that a CHECK
+refers to, so batch mode REBUILDS the table — create new, copy EVERY row, swap. On
+both live islands `device_tokens` holds a handful of rows and the copy is
+instantaneous, but the mechanism is a full table rewrite, not an in-place rename,
+and anyone reading this before running it against a large table should price it as
+one. (Carnot caught the earlier draft of this docstring claiming "no row is
+touched" — true of the VALUES, false of the physical work, and a sentence that
+would have understated the cost to whoever runs it next.)
 
 WHY IT IS A MIGRATION AND NOT AN EDIT. v0.8.0 shipped `push_environment` — built
 from a later comment on #3386 rather than the issue body, which specified

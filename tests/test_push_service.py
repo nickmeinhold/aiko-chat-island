@@ -33,7 +33,7 @@ from aiko_gateway.domain import apns, push_service, users_service
 import sqlalchemy as sa
 
 from aiko_gateway.domain.models import (
-    Channel, ChannelKind, DeviceToken, Membership,
+    ApnsEnvironment, Channel, ChannelKind, DeviceToken, Membership,
 )
 
 CHANNEL = "01JDMCHANNELDM000000000000"
@@ -56,7 +56,7 @@ class FakeApns:
         self.sent: list[tuple[str, dict, str | None]] = []
         # The APNs environment the service asked for, per send (#3386). Recorded
         # separately from `sent` so the existing unpacking sites stay a 3-tuple.
-        self.environments: list[str] = []
+        self.environments: list[ApnsEnvironment] = []
 
     async def __call__(self, device_token, payload, *, apns_environment,
                        collapse_id=None):
