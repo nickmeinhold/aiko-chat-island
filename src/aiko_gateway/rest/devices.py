@@ -13,7 +13,7 @@ from fastapi import APIRouter, status
 from pydantic import BaseModel, Field
 
 from ..domain import devices_service as svc
-from ..domain.models import Platform, PushEnvironment
+from ..domain.models import Platform, ApnsEnvironment
 from .deps import CurrentUser, DbSession
 
 router = APIRouter(prefix="/v1", tags=["devices"])
@@ -29,7 +29,7 @@ class RegisterDeviceReq(BaseModel):
     # keeps working unchanged and the island half ships without waiting for the
     # app half. Typed as the enum so an out-of-set value is a 422 at the boundary
     # rather than a 500 from the DB CHECK, same as `platform`. Inert for 'fcm'.
-    push_environment: PushEnvironment | None = None
+    apns_environment: ApnsEnvironment | None = None
 
 
 class UnregisterDeviceReq(BaseModel):
@@ -44,12 +44,12 @@ async def register_device(
     Idempotent: re-registering the same token is a no-op reassign, still 201."""
     row = await svc.register_device(
         session, user_id=user.id, platform=req.platform.value, token=req.token,
-        push_environment=req.push_environment)
+        apns_environment=req.apns_environment)
     # Echo the RESOLVED environment, not the requested one: a client that sent
     # nothing learns what the island picked for it, which is the only way it can
     # notice a mismatch with the build it actually is.
     return {"id": row.id, "platform": row.platform,
-            "push_environment": row.push_environment}
+            "apns_environment": row.apns_environment}
 
 
 @router.delete("/devices", status_code=status.HTTP_204_NO_CONTENT)

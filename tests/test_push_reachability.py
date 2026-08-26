@@ -36,7 +36,7 @@ async def _user_with_devices(session, n: int):
         session, username="alice", display_name="Alice", password="pw")
     for i in range(n):
         session.add(DeviceToken(user_id=user.id, platform="apns",
-                                token=f"{i}" * 64, push_environment="sandbox"))
+                                token=f"{i}" * 64, apns_environment="sandbox"))
     await session.commit()
     return user
 

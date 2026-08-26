@@ -91,7 +91,7 @@ from ..config import settings
 from ..db import SessionLocal
 from . import apns, moderation_service
 from .models import (Channel, ChannelKind, DeviceToken, Membership, Platform,
-                     PushEnvironment, User)
+                     ApnsEnvironment, User)
 from .rate_limit import limiter
 
 log = logging.getLogger("aiko_gateway.push")
@@ -442,7 +442,7 @@ async def _wake_user(session: AsyncSession, user_id: str, payload: dict,
             # check, one layer earlier and with the type system holding it.
             result = await apns.send(
                 row.token, payload,
-                push_environment=PushEnvironment(row.push_environment),
+                apns_environment=ApnsEnvironment(row.apns_environment),
                 collapse_id=collapse_id)
         except Exception:
             # PER-DEVICE BOUNDARY (cage-match #139 round 6, Carnot). `apns.send`

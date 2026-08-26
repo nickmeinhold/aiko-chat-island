@@ -58,10 +58,10 @@ class FakeApns:
         # separately from `sent` so the existing unpacking sites stay a 3-tuple.
         self.environments: list[str] = []
 
-    async def __call__(self, device_token, payload, *, push_environment,
+    async def __call__(self, device_token, payload, *, apns_environment,
                        collapse_id=None):
         self.sent.append((device_token, payload, collapse_id))
-        self.environments.append(push_environment)
+        self.environments.append(apns_environment)
         # Returns the SAME shape the real transport returns. A fake whose
         # contract has drifted from the real API tests a system that does not
         # exist — this one drifted once already, when send() grew SendResult, and
@@ -315,7 +315,7 @@ async def test_a_row_re_registered_during_the_send_is_not_reaped(
     )).first()
     assert row is not None, "fixture precondition: bob has a registered device"
 
-    async def _send_then_reregister(device_token, payload, *, push_environment,
+    async def _send_then_reregister(device_token, payload, *, apns_environment,
                                     collapse_id=None):
         # The device comes back to life while APNs is still answering.
         await session.execute(
@@ -535,7 +535,7 @@ async def test_one_exploding_device_does_not_abandon_the_others(
 
     reached = []
 
-    async def _explode_on_first(device_token, payload, *, push_environment,
+    async def _explode_on_first(device_token, payload, *, apns_environment,
                                 collapse_id=None):
         if device_token.startswith("b"):
             raise RuntimeError("provider token signing blew up")
@@ -803,11 +803,11 @@ async def test_the_send_carries_the_ROW_environment_not_the_island(
     monkeypatch.setattr(settings, "apns_use_sandbox", True, raising=False)
     _, bob = dm
     session.add(DeviceToken(user_id=bob.id, platform="apns", token="p" * 64,
-                            push_environment="production"))
+                            apns_environment="production"))
     await session.execute(
         DeviceToken.__table__.update()
         .where(DeviceToken.token == "b" * 64)
-        .values(push_environment="sandbox"))
+        .values(apns_environment="sandbox"))
     await session.commit()
 
     await _wake(sender_id=dm[0].id)

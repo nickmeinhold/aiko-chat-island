@@ -37,7 +37,7 @@ import httpx
 import jwt
 
 from ..config import settings
-from .models import PushEnvironment
+from .models import ApnsEnvironment
 
 log = logging.getLogger("aiko_gateway.apns")
 
@@ -173,12 +173,12 @@ def _provider_token() -> str:
     return token
 
 
-def _host(push_environment: PushEnvironment) -> str:
+def _host(apns_environment: ApnsEnvironment) -> str:
     """The APNs host for ONE token's environment (#3386).
 
     Reads the TOKEN's environment, never the island's `apns_use_sandbox` — that
     flag is now only the default applied at REGISTRATION (see
-    devices_service.default_push_environment) and has no say at send time. A box
+    devices_service.default_apns_environment) and has no say at send time. A box
     can therefore serve a debug build and a TestFlight build at once, which a
     single global switch made impossible.
 
@@ -189,20 +189,20 @@ def _host(push_environment: PushEnvironment) -> str:
     one place instead of re-defended at each use.
 
     The `case _` arm still raises rather than falling back to a default. It is
-    reachable only via a new PushEnvironment member added without teaching this
+    reachable only via a new ApnsEnvironment member added without teaching this
     function about it — the corrupted-row path now fails earlier, at the enum
     conversion. Both are bugs, and guessing a host would hand a live credential to
     the wrong world. push_service treats a raising send as transient-and-skip, so
     neither can take down a fanout.
     """
-    match push_environment:
-        case PushEnvironment.SANDBOX:
+    match apns_environment:
+        case ApnsEnvironment.SANDBOX:
             return _SANDBOX_HOST
-        case PushEnvironment.PRODUCTION:
+        case ApnsEnvironment.PRODUCTION:
             return _PROD_HOST
         case _:
             raise ValueError(
-                f"unknown APNs push_environment: {push_environment!r}")
+                f"unknown APNs apns_environment: {apns_environment!r}")
 
 
 def _client() -> httpx.AsyncClient:
@@ -288,10 +288,10 @@ def _verdict(status: int, reason: str) -> Verdict:
 
 
 async def send(device_token: str, payload: dict, *,
-               push_environment: PushEnvironment,
+               apns_environment: ApnsEnvironment,
                collapse_id: str | None = None) -> SendResult:
     """Push one payload to one device, in THAT DEVICE's APNs environment (#3386 —
-    ``push_environment`` is required, with no default, so no caller can silently
+    ``apns_environment`` is required, with no default, so no caller can silently
     fall back to a global switch). Returns a [SendResult]; never raises for a
     protocol-level refusal — a failed push must not be able to fail the message
     send that triggered it (see `push_service.wake`).
@@ -325,7 +325,7 @@ async def send(device_token: str, payload: dict, *,
         headers["apns-collapse-id"] = collapse_id[:64]
 
     # Resolved BEFORE the request: an unknown environment must fail here, not send.
-    url = f"{_host(push_environment)}/3/device/{device_token}"
+    url = f"{_host(apns_environment)}/3/device/{device_token}"
     try:
         response = await _client().post(url, json=payload, headers=headers)
     except httpx.HTTPError as ex:
