@@ -84,7 +84,7 @@ import datetime as dt
 import logging
 from typing import Literal
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import settings
@@ -310,6 +310,63 @@ async def _recipients(session: AsyncSession, *, channel_id: str, sender_id: str,
     blocked = await moderation_service.blocked_pair_user_ids(session, sender_id)
     excluded = set(exclude_user_ids) | blocked
     return [uid for uid in live if uid not in excluded]
+
+
+async def reachability(session: AsyncSession) -> dict:
+    """Can this island actually reach the devices it is storing? (#3397)
+
+    Gate 1 of the send path declines EVERY wake when APNs is unconfigured, and
+    that decline is silent and total — correctly, because an operator who never
+    set up push should not get a crash. But an island holding registered tokens
+    with no credentials is DEAF while every other signal reads healthy:
+    registration returns 201, the message persists, /health says ok, and the
+    recipient never hears anything. A push has no user-visible success, so there
+    is nothing for anyone to notice the absence of.
+
+    The COUNT is what makes this actionable. "Push is off" is a shrug; "push is
+    off and 2 devices are registered to it" is a bug with an owner.
+
+    NO PER-ENVIRONMENT BREAKDOWN, deliberately. An APNs auth key (.p8) is
+    environment-AGNOSTIC — the same key authenticates against both hosts (proven
+    2026-08-23: identical key, BadDeviceToken from both, i.e. auth accepted at
+    each). So `configured` is reachability for every token this island holds,
+    sandbox and production alike, and a per-environment field would be machinery
+    describing a state that cannot occur.
+    """
+    configured = apns.is_configured()
+    registered = (await session.execute(
+        select(func.count()).select_from(DeviceToken))).scalar_one()
+    return {
+        "configured": configured,
+        "registered_devices": registered,
+        # Every stored token, or none — see the .p8 note above. Kept as its own
+        # field rather than left for the reader to derive: this is the number an
+        # operator acts on, and a signal you have to compute is one you skip.
+        "unreachable_devices": 0 if configured else registered,
+    }
+
+
+async def warn_if_unreachable(session: AsyncSession) -> None:
+    """Say it once at boot, loudly, and ONLY when there is something to say.
+
+    Called from the lifespan after verify_schema. On the enspyr incident this
+    would have printed the moment the process came up and ended a four-hour
+    investigation before it started.
+
+    SILENT ON THE HEALTHY CASES, and that is the load-bearing half. Push simply
+    not being configured is a legitimate, intended state for most islands; an
+    unconfigured island with zero tokens has nothing wrong with it. A warning
+    that fires on healthy boxes is one every operator learns to scroll past,
+    which is the original silence wearing a high-vis vest.
+    """
+    report = await reachability(session)
+    if report["unreachable_devices"]:
+        log.warning(
+            "%d device token(s) registered but APNs is NOT configured on this "
+            "island — those devices are UNREACHABLE and every wake will be "
+            "silently declined. Set APNS_KEY_ID / APNS_TEAM_ID / APNS_TOPIC / "
+            "APNS_PRIVATE_KEY, or unregister them.",
+            report["unreachable_devices"])
 
 
 async def _wake_user(session: AsyncSession, user_id: str, payload: dict,
