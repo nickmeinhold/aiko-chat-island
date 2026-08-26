@@ -170,7 +170,7 @@ class Settings(BaseSettings):
     # a 400 BadDeviceToken with no other clue, and no inspection tells them apart.
     #
     # NO LONGER THE SEND SWITCH (#3386). The environment is a property of the TOKEN,
-    # so it lives on device_tokens.push_environment and `apns._host` reads it there;
+    # so it lives on device_tokens.apns_environment and `apns._host` reads it there;
     # a box that answered this once globally could ring debug builds or TestFlight
     # builds but never both. What survives here is the fallback the island applies
     # when a client registers without saying — correct while only one kind of build

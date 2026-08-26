@@ -136,22 +136,22 @@ def test_fresh_db_upgrades_to_head(tmp_path, monkeypatch) -> None:
     # time) fails here rather than at the first enrollment.
     assert "ck_users_kind" in users_sql
     assert "'human'" in users_sql and "'agent'" in users_sql
-    # device_tokens.push_environment closed set (#3386, migration 0023). Same
+    # device_tokens.apns_environment closed set (#3386, migrations 0023+0024). Same
     # CHECK-blind reasoning as above. The NOT NULL is asserted too, and it is not
     # redundant with the CHECK: `NULL IN ('sandbox','production')` evaluates to
     # UNKNOWN, which a CHECK constraint PASSES — so a nullable column would leave
     # the closed set with a silent third member that `_host` would then raise on
     # mid-fanout.
-    assert "ck_device_tokens_push_environment" in device_sql
+    assert "ck_device_tokens_apns_environment" in device_sql
     assert "'sandbox'" in device_sql and "'production'" in device_sql
     # COLUMN-SCOPED, not corpus-scoped (cage-match, Carnot). `"NOT NULL" in
     # device_sql` was true of the whole CREATE TABLE — every other non-null column
-    # satisfied it, so the assertion could not go red if push_environment shipped
+    # satisfied it, so the assertion could not go red if apns_environment shipped
     # nullable. Match the column's own clause instead: an instrument that cannot
     # detect the failure is not a check.
-    assert re.search(r'push_environment\s+VARCHAR\(16\)\s+.*?NOT NULL',
+    assert re.search(r'apns_environment\s+VARCHAR\(16\)\s+.*?NOT NULL',
                      device_sql, re.IGNORECASE), (
-        f"push_environment is not NOT NULL in the migrated DDL:\n{device_sql}")
+        f"apns_environment is not NOT NULL in the migrated DDL:\n{device_sql}")
 
 
 def test_adopt_pre_alembic_db_stamps_baseline(tmp_path, monkeypatch) -> None:
@@ -381,3 +381,75 @@ def test_0023_backfills_existing_rows_from_the_island_setting(
     assert value == "sandbox", (
         "a pre-existing row kept the static DDL default instead of the "
         "environment it was actually registered under")
+
+
+def test_0024_rename_preserves_the_value_a_live_row_already_carries(
+    tmp_path, monkeypatch
+) -> None:
+    """0024 renames push_environment -> apns_environment by REBUILDING the table
+    (SQLite cannot alter a CHECK), and a rebuild is exactly where a value can be
+    silently re-defaulted. imagineering holds one real production APNs token that
+    0023 stamped 'sandbox'; if the copy dropped that and took the DDL default
+    ('production') instead, a live handset would move to the wrong Apple host and
+    every ring would 400 with nobody watching.
+
+    The island setting is flipped to production BETWEEN 0023 and 0024 on purpose.
+    That is what makes this able to go red: 0024 must be a pure name change that
+    never re-reads settings, so the row must still say 'sandbox' afterwards even
+    though the box now says otherwise. Without the flip the assertion would pass
+    for a migration that re-derived the value from config, which is the bug.
+
+    The downgrade is exercised in the same test rather than a separate one — the
+    rename is symmetric, and a reversal that lost the value would be a rollback
+    that costs a device its environment (this repo has a crucible that converged
+    FATAL on image-rollback-is-not-DB-rollback; a lossy downgrade is that hazard
+    at the column level).
+    """
+    _, sync_url = _point_app_at(tmp_path, monkeypatch)
+    monkeypatch.setattr(settings, "apns_use_sandbox", True, raising=False)
+
+    command.upgrade(migrate._alembic_config(), "0022")
+    engine = create_engine(sync_url)
+    try:
+        with engine.begin() as conn:
+            conn.exec_driver_sql(
+                "INSERT INTO users "
+                "(id, username, aiko_username, display_name, created_at, kind) "
+                "VALUES ('01USERAAAAAAAAAAAAAAAAAAAA', 'u', 'u', 'U', "
+                "'2026-08-25T00:00:00+00:00', 'human')")
+            conn.exec_driver_sql(
+                "INSERT INTO device_tokens "
+                "(id, user_id, platform, token, created_at, updated_at) VALUES "
+                "('01TOKENAAAAAAAAAAAAAAAAAAA', '01USERAAAAAAAAAAAAAAAAAAAA', "
+                "'apns', 'live-token', '2026-08-25T00:00:00+00:00', "
+                "'2026-08-25T00:00:00+00:00')")
+
+        command.upgrade(migrate._alembic_config(), "0023")
+        # The box changes its mind after the row was stamped. 0024 must not care.
+        monkeypatch.setattr(settings, "apns_use_sandbox", False, raising=False)
+        command.upgrade(migrate._alembic_config(), "0024")
+
+        with engine.connect() as conn:
+            value = conn.exec_driver_sql(
+                "SELECT apns_environment FROM device_tokens "
+                "WHERE id='01TOKENAAAAAAAAAAAAAAAAAAA'").scalar()
+            device_sql = conn.exec_driver_sql(
+                "SELECT sql FROM sqlite_master WHERE type='table' "
+                "AND name='device_tokens'").scalar()
+        assert value == "sandbox", (
+            "the rebuild lost the row's environment and re-defaulted it — a live "
+            "token just moved to the wrong APNs host")
+        assert "push_environment" not in device_sql, (
+            "the old column name survived the rename:\n" + device_sql)
+        assert "ck_device_tokens_apns_environment" in device_sql, (
+            "the CHECK was not renamed with its column:\n" + device_sql)
+
+        command.downgrade(migrate._alembic_config(), "0023")
+        with engine.connect() as conn:
+            back = conn.exec_driver_sql(
+                "SELECT push_environment FROM device_tokens "
+                "WHERE id='01TOKENAAAAAAAAAAAAAAAAAAA'").scalar()
+        assert back == "sandbox", (
+            "the downgrade lost the row's environment on the way back")
+    finally:
+        engine.dispose()

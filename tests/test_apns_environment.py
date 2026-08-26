@@ -22,7 +22,7 @@ from sqlalchemy import text
 
 from aiko_gateway.config import settings
 from aiko_gateway.domain import apns, devices_service, security, users_service
-from aiko_gateway.domain.models import DeviceToken, PushEnvironment
+from aiko_gateway.domain.models import DeviceToken, ApnsEnvironment
 from aiko_gateway.rest import devices as device_routes
 from aiko_gateway.rest.deps import get_session
 
@@ -59,8 +59,8 @@ def test_host_follows_the_token_not_the_island(monkeypatch, island_sandbox):
     whichever way the flag happens to sit — a single-arm test would pass by
     coincidence on the arm that agrees with the token."""
     monkeypatch.setattr(settings, "apns_use_sandbox", island_sandbox, raising=False)
-    assert apns._host(PushEnvironment.SANDBOX) == "https://api.sandbox.push.apple.com"
-    assert apns._host(PushEnvironment.PRODUCTION) == "https://api.push.apple.com"
+    assert apns._host(ApnsEnvironment.SANDBOX) == "https://api.sandbox.push.apple.com"
+    assert apns._host(ApnsEnvironment.PRODUCTION) == "https://api.push.apple.com"
 
 
 def test_host_rejects_an_unknown_environment(monkeypatch):
@@ -85,7 +85,7 @@ async def test_registration_defaults_to_the_island_setting(client, session, monk
                              json={"platform": "apns", "token": "a" * 64})
     assert resp.status_code == 201
     row = await session.get(DeviceToken, resp.json()["id"])
-    assert row.push_environment == PushEnvironment.SANDBOX.value
+    assert row.apns_environment == ApnsEnvironment.SANDBOX.value
 
 
 async def test_explicit_environment_overrides_the_island_setting(
@@ -97,10 +97,10 @@ async def test_explicit_environment_overrides_the_island_setting(
     bob = await _user(session, "bob")
     resp = await client.post(
         "/v1/devices", headers=_headers(bob),
-        json={"platform": "apns", "token": "b" * 64, "push_environment": "production"})
+        json={"platform": "apns", "token": "b" * 64, "apns_environment": "production"})
     assert resp.status_code == 201
     row = await session.get(DeviceToken, resp.json()["id"])
-    assert row.push_environment == PushEnvironment.PRODUCTION.value
+    assert row.apns_environment == ApnsEnvironment.PRODUCTION.value
 
 
 async def test_out_of_set_environment_is_422_at_the_boundary(client, session):
@@ -109,7 +109,7 @@ async def test_out_of_set_environment_is_422_at_the_boundary(client, session):
     carol = await _user(session, "carol")
     resp = await client.post(
         "/v1/devices", headers=_headers(carol),
-        json={"platform": "apns", "token": "c" * 64, "push_environment": "staging"})
+        json={"platform": "apns", "token": "c" * 64, "apns_environment": "staging"})
     assert resp.status_code == 422
 
 
@@ -124,11 +124,11 @@ async def test_reregistration_moves_the_environment(client, session, monkeypatch
                               json={"platform": "apns", "token": "d" * 64})
     again = await client.post(
         "/v1/devices", headers=_headers(dave),
-        json={"platform": "apns", "token": "d" * 64, "push_environment": "production"})
+        json={"platform": "apns", "token": "d" * 64, "apns_environment": "production"})
     assert first.json()["id"] == again.json()["id"]  # same row, upserted
     row = await session.get(DeviceToken, again.json()["id"])
     await session.refresh(row)
-    assert row.push_environment == PushEnvironment.PRODUCTION.value
+    assert row.apns_environment == ApnsEnvironment.PRODUCTION.value
 
 
 # ------------------------------------------------------------------- DB CHECK
@@ -140,12 +140,12 @@ async def test_db_check_rejects_an_out_of_set_environment(session):
     with pytest.raises(Exception) as exc:
         await session.execute(
             text("INSERT INTO device_tokens "
-                 "(id, user_id, platform, token, push_environment, created_at, updated_at) "
+                 "(id, user_id, platform, token, apns_environment, created_at, updated_at) "
                  "VALUES ('01AAAAAAAAAAAAAAAAAAAAAAAA', :u, 'apns', 'zzz', "
                  "'staging', :t, :t)"),
             {"u": erin.id, "t": "2026-08-25T00:00:00+00:00"})
         await session.commit()
-    assert "ck_device_tokens_push_environment" in str(exc.value) or "CHECK" in str(exc.value)
+    assert "ck_device_tokens_apns_environment" in str(exc.value) or "CHECK" in str(exc.value)
 
 
 async def test_db_rejects_a_null_environment(session):
@@ -156,7 +156,7 @@ async def test_db_rejects_a_null_environment(session):
     with pytest.raises(Exception):
         await session.execute(
             text("INSERT INTO device_tokens "
-                 "(id, user_id, platform, token, push_environment, created_at, updated_at) "
+                 "(id, user_id, platform, token, apns_environment, created_at, updated_at) "
                  "VALUES ('01BBBBBBBBBBBBBBBBBBBBBBBB', :u, 'apns', 'yyy', "
                  "NULL, :t, :t)"),
             {"u": frank.id, "t": "2026-08-25T00:00:00+00:00"})
@@ -172,8 +172,8 @@ async def test_service_stores_the_declared_environment(session, monkeypatch):
     gina = await _user(session, "gina")
     row = await devices_service.register_device(
         session, user_id=gina.id, platform="apns", token="g" * 64,
-        push_environment=PushEnvironment.SANDBOX)
-    assert row.push_environment == PushEnvironment.SANDBOX.value
+        apns_environment=ApnsEnvironment.SANDBOX)
+    assert row.apns_environment == ApnsEnvironment.SANDBOX.value
 
 
 async def test_reregistration_without_a_declaration_preserves_the_stored_value(
@@ -192,13 +192,13 @@ async def test_reregistration_without_a_declaration_preserves_the_stored_value(
     first = await client.post(
         "/v1/devices", headers=_headers(heidi),
         json={"platform": "apns", "token": "h" * 64,
-              "push_environment": "production"})
+              "apns_environment": "production"})
     again = await client.post("/v1/devices", headers=_headers(heidi),
                               json={"platform": "apns", "token": "h" * 64})
     assert first.json()["id"] == again.json()["id"]
     row = await session.get(DeviceToken, again.json()["id"])
     await session.refresh(row)
-    assert row.push_environment == PushEnvironment.PRODUCTION.value, (
+    assert row.apns_environment == ApnsEnvironment.PRODUCTION.value, (
         "an omitted declaration re-resolved the island default over an "
         "explicitly-registered environment")
 
@@ -207,13 +207,29 @@ async def test_an_empty_environment_is_rejected_not_defaulted(session):
     """`is None`, not falsy (cage-match, Carnot HIGH). An empty string is an
     INVALID closed-set value; `or` would have quietly turned it into the island
     default — an invalid value becoming a valid one inside the module that claims
-    to be the single door. It must reach the DB CHECK and be refused."""
+    to be the single door.
+
+    WHERE IT IS ACTUALLY REFUSED, corrected 2026-08-27 (cage-match PR#145, Carnot):
+    this docstring used to say the value "must reach the DB CHECK and be refused."
+    It does not, and cannot — `register_device` reads `.value` off the argument, so
+    a bare `""` dies with AttributeError at the service edge, before any SQL runs.
+    The old `pytest.raises(Exception)` passed on that AttributeError while claiming
+    to have proven a database boundary, so the test was green for a reason it did
+    not name. The PROPERTY under test is unchanged and still holds — an empty
+    string is never coerced to the island default — but it is enforced one layer
+    earlier than the prose said. Pinned to AttributeError so the test goes red if
+    the edge ever starts swallowing bare strings and defaulting them.
+
+    (The genuine DB-CHECK boundary is covered separately, by
+    test_db_check_rejects_an_out_of_set_environment, which writes raw SQL and
+    asserts the constraint name in the error.)"""
     ivan = await _user(session, "ivan")
-    with pytest.raises(Exception):
+    with pytest.raises(AttributeError):
         await devices_service.register_device(
             session, user_id=ivan.id, platform="apns", token="i" * 64,
-            push_environment="")  # type: ignore[arg-type]
-        await session.commit()
+            apns_environment="")  # type: ignore[arg-type]
+    # No commit here: the call above raises, so a commit inside the raises-block
+    # was unreachable — dead code that read like part of the assertion.
 
 
 async def test_a_corrupt_environment_row_is_skipped_not_fatal(monkeypatch):
@@ -226,14 +242,14 @@ async def test_a_corrupt_environment_row_is_skipped_not_fatal(monkeypatch):
     that is the line that changed; the per-device boundary it lands in is already
     proven by test_one_exploding_device_does_not_abandon_the_others."""
     with pytest.raises(ValueError):
-        PushEnvironment("staging")
+        ApnsEnvironment("staging")
 
 
 def test_host_accepts_an_in_set_bare_string_and_rejects_every_other(monkeypatch):
     """PINS THE REAL CONTRACT (cage-match, Carnot round 3).
 
-    Carnot flagged that `PushEnvironment` is a `StrEnum`, so `_host("sandbox")`
-    matches `case PushEnvironment.SANDBOX` and the enum signature is not enforced
+    Carnot flagged that `ApnsEnvironment` is a `StrEnum`, so `_host("sandbox")`
+    matches `case ApnsEnvironment.SANDBOX` and the enum signature is not enforced
     at runtime. The mechanism is TRUE — asserted below. The proposed remedy, an
     `isinstance` guard, is rejected: it would make a CORRECT call raise while
     buying no safety, because the property that actually matters is that every
@@ -248,8 +264,8 @@ def test_host_accepts_an_in_set_bare_string_and_rejects_every_other(monkeypatch)
     guarding this one seam would be a mechanism where a statement does the job.
     The statement is this test."""
     monkeypatch.setattr(settings, "apns_use_sandbox", True, raising=False)
-    assert apns._host("sandbox") == apns._host(PushEnvironment.SANDBOX)
-    assert apns._host("production") == apns._host(PushEnvironment.PRODUCTION)
+    assert apns._host("sandbox") == apns._host(ApnsEnvironment.SANDBOX)
+    assert apns._host("production") == apns._host(ApnsEnvironment.PRODUCTION)
     for bad in ("prod", "production ", " sandbox", "SANDBOX", "staging", ""):
         with pytest.raises(ValueError):
             apns._host(bad)  # type: ignore[arg-type]

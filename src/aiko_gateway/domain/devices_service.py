@@ -17,10 +17,10 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import settings
-from .models import DeviceToken, PushEnvironment, _utcnow
+from .models import DeviceToken, ApnsEnvironment, _utcnow
 
 
-def default_push_environment() -> str:
+def default_apns_environment() -> str:
     """The APNs environment a client gets when it does not declare one (#3386).
 
     The island's own `APNS_USE_SANDBOX`, which is the honest answer while there is
@@ -29,13 +29,13 @@ def default_push_environment() -> str:
     debug build and a TestFlight build register against the same island — which is
     exactly when the client starts declaring it and this default stops being read.
     """
-    return (PushEnvironment.SANDBOX if settings.apns_use_sandbox
-            else PushEnvironment.PRODUCTION).value
+    return (ApnsEnvironment.SANDBOX if settings.apns_use_sandbox
+            else ApnsEnvironment.PRODUCTION).value
 
 
 async def register_device(
     session: AsyncSession, *, user_id: str, platform: str, token: str,
-    push_environment: PushEnvironment | None = None,
+    apns_environment: ApnsEnvironment | None = None,
 ) -> DeviceToken:
     """Register (or re-register) a push token for ``user_id``. Idempotent and
     race-safe: keyed on the globally-unique token.
@@ -51,7 +51,7 @@ async def register_device(
     breaks the subsequent re-fetch with MissingGreenlet on aiosqlite (the same
     hazard handled in memberships_service._insert_idempotent).
 
-    ``push_environment`` (#3386) is the APNs world the token was minted in, or None
+    ``apns_environment`` (#3386) is the APNs world the token was minted in, or None
     for "whatever this island is pinned to" — resolved HERE rather than at the
     router so the in-process and test paths get the same default as the wire path
     (one door). Typed as the enum, not ``str``: the closed set is the point, and a
@@ -73,10 +73,10 @@ async def register_device(
     becoming a valid one, inside the module that claims to be the single door. With
     ``is None`` a bad value reaches the DB CHECK and is REJECTED, which is the
     fail-closed direction."""
-    declared = push_environment.value if push_environment is not None else None
-    resolved = declared if declared is not None else default_push_environment()
+    declared = apns_environment.value if apns_environment is not None else None
+    resolved = declared if declared is not None else default_apns_environment()
     row = DeviceToken(user_id=user_id, platform=platform, token=token,
-                      push_environment=resolved)
+                      apns_environment=resolved)
     try:
         async with session.begin_nested():
             session.add(row)
@@ -104,7 +104,7 @@ async def register_device(
         existing.user_id = user_id
         existing.platform = platform
         if declared is not None:
-            existing.push_environment = declared
+            existing.apns_environment = declared
         existing.updated_at = _utcnow()  # explicit: onupdate fires only on a changed-col flush
         await session.commit()
         return existing

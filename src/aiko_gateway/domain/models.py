@@ -124,10 +124,10 @@ class Platform(enum.StrEnum):
     FCM = "fcm"
 
 
-class PushEnvironment(enum.StrEnum):
+class ApnsEnvironment(enum.StrEnum):
     """Closed set of APNs environments (#3386) — which WORLD a push credential
     belongs to. Same single-source-of-truth pattern as Platform: drives the DB
-    CHECK on device_tokens.push_environment via _in_check.
+    CHECK on device_tokens.apns_environment via _in_check.
 
     Apple runs two independent push services. A token minted by a development
     build is valid ONLY against api.sandbox.push.apple.com; a TestFlight or App
@@ -136,11 +136,22 @@ class PushEnvironment(enum.StrEnum):
     carries no marking that distinguishes them (see apns._verdict), so this can
     never be inferred server-side. The CLIENT declares it; the island stores it.
 
-    NAMED push_environment, not `environment`, deliberately: Settings.environment
-    is the DEPLOYMENT environment and shares the literal value 'production' with
-    this closed set while meaning something entirely unrelated. Two meanings and
-    one word, colliding in a send path that already imports settings, is a bug
-    waiting for a tired reader.
+    NAMED apns_environment on two independent grounds. It is what #3386's body
+    specified, and that is the controlling authority (v0.8.0 shipped
+    `push_environment` off a later ticket COMMENT; migration 0024 reconciles it —
+    Nick's ruling 2026-08-26). It is also the more honest of the two: the split is
+    an APNs fact, not a push fact — the `.p8` is environment-agnostic and FCM has
+    no such division at all, so a name claiming the whole push domain describes
+    something no other transport has. The aiko_chat_app tab AGREED to the same name
+    end to end before either side merged — an agreement, not yet a fact about their
+    code: their PR#162 was still open and still emitting the old key when this was
+    written. Check theirs, don't trust this sentence.
+
+    NOT shortened to `environment`: Settings.environment is the DEPLOYMENT
+    environment and shares the literal value 'production' with this closed set
+    while meaning something entirely unrelated. Two meanings and one word,
+    colliding in a send path that already imports settings, is a bug waiting for a
+    tired reader.
 
     INERT FOR FCM. The column is NOT NULL for every platform because a CHECK
     alone cannot close a set against NULL, but Firebase has no environment split
@@ -712,8 +723,8 @@ class DeviceToken(Base):
         UniqueConstraint("token", name="uq_device_tokens_token"),
         CheckConstraint(_in_check("platform", Platform),
                         name="ck_device_tokens_platform"),
-        CheckConstraint(_in_check("push_environment", PushEnvironment),
-                        name="ck_device_tokens_push_environment"),
+        CheckConstraint(_in_check("apns_environment", ApnsEnvironment),
+                        name="ck_device_tokens_apns_environment"),
     )
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=new_ulid)
     user_id: Mapped[str] = mapped_column(
@@ -729,8 +740,8 @@ class DeviceToken(Base):
     # one refused request (400 BadDeviceToken, which the reaper deliberately does NOT
     # act on) — it never destroys a row, so neither direction of a mistake here is
     # irreversible.
-    push_environment: Mapped[str] = mapped_column(
-        String(16), nullable=False, server_default=PushEnvironment.PRODUCTION.value)
+    apns_environment: Mapped[str] = mapped_column(
+        String(16), nullable=False, server_default=ApnsEnvironment.PRODUCTION.value)
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[dt.datetime] = mapped_column(
