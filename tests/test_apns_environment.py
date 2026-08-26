@@ -207,13 +207,29 @@ async def test_an_empty_environment_is_rejected_not_defaulted(session):
     """`is None`, not falsy (cage-match, Carnot HIGH). An empty string is an
     INVALID closed-set value; `or` would have quietly turned it into the island
     default — an invalid value becoming a valid one inside the module that claims
-    to be the single door. It must reach the DB CHECK and be refused."""
+    to be the single door.
+
+    WHERE IT IS ACTUALLY REFUSED, corrected 2026-08-27 (cage-match PR#145, Carnot):
+    this docstring used to say the value "must reach the DB CHECK and be refused."
+    It does not, and cannot — `register_device` reads `.value` off the argument, so
+    a bare `""` dies with AttributeError at the service edge, before any SQL runs.
+    The old `pytest.raises(Exception)` passed on that AttributeError while claiming
+    to have proven a database boundary, so the test was green for a reason it did
+    not name. The PROPERTY under test is unchanged and still holds — an empty
+    string is never coerced to the island default — but it is enforced one layer
+    earlier than the prose said. Pinned to AttributeError so the test goes red if
+    the edge ever starts swallowing bare strings and defaulting them.
+
+    (The genuine DB-CHECK boundary is covered separately, by
+    test_db_check_rejects_an_out_of_set_environment, which writes raw SQL and
+    asserts the constraint name in the error.)"""
     ivan = await _user(session, "ivan")
-    with pytest.raises(Exception):
+    with pytest.raises(AttributeError):
         await devices_service.register_device(
             session, user_id=ivan.id, platform="apns", token="i" * 64,
             apns_environment="")  # type: ignore[arg-type]
-        await session.commit()
+    # No commit here: the call above raises, so a commit inside the raises-block
+    # was unreachable — dead code that read like part of the assertion.
 
 
 async def test_a_corrupt_environment_row_is_skipped_not_fatal(monkeypatch):

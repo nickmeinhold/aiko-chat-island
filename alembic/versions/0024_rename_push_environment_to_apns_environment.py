@@ -1,73 +1,28 @@
 """device_tokens.push_environment -> apns_environment (#3386, Nick's ruling)
 
-A NAME-ONLY reconciliation. No column is added or dropped and no value changes:
-this migration exists so the deployed schema says what #3386's body said it would
-say.
+A name-only reconciliation to what #3386's body specified. Rationale for the
+rename lives in the commit message; the naming argument lives on ApnsEnvironment
+in domain/models.py. What is here is only what an operator cannot derive.
 
-BUT IT IS NOT A NO-OP ON THE ROWS. SQLite cannot rename a column that a CHECK
-refers to, so batch mode REBUILDS the table — create new, copy EVERY row, swap. On
-both live islands `device_tokens` holds a handful of rows and the copy is
-instantaneous, but the mechanism is a full table rewrite, not an in-place rename,
-and anyone reading this before running it against a large table should price it as
-one. (Carnot caught the earlier draft of this docstring claiming "no row is
-touched" — true of the VALUES, false of the physical work, and a sentence that
-would have understated the cost to whoever runs it next.)
+NOT A NO-OP ON THE ROWS. SQLite cannot rename a column a CHECK refers to, so batch
+mode REBUILDS the table — create new, copy EVERY row, swap. Instantaneous at our
+row counts; price it as a full table rewrite before running it against a big one.
 
-WHY IT IS A MIGRATION AND NOT AN EDIT. v0.8.0 shipped `push_environment` — built
-from a later comment on #3386 rather than the issue body, which specified
-`device_tokens.apns_environment` verbatim. The name that shipped was then defended
-on its merits (Settings.environment collides on the literal 'production'), an
-argument that is true but was made in ignorance of the recorded choice. The
-collision argument survives and is why the column is not simply `environment`; it
-was never a reason to prefer `push_` over `apns_`. Both live islands already ran
-0023, so the reconciliation costs a revision.
+THE WIRE FIELD MOVES WITH THE COLUMN — a BREAKING contract change, safe only
+because there is no deployed consumer. MEASURED 2026-08-26, not a standing
+invariant: aiko_chat_app's origin/main had zero references, its PR#162 was
+unmerged, and the last submitted IPA carried no aps-environment entitlement. That
+is why no dual-key window exists. Re-measure before trusting this.
 
-`apns_` IS ALSO THE MORE HONEST HALF. The environment split is a property of APNs,
-not of push: the `.p8` signing key is valid in both worlds, and FCM has no such
-division — an 'fcm' row carries a value nothing reads. See the ApnsEnvironment
-docstring in domain/models.py.
+DESYNC FAILS SILENTLY, so the order is fixed. The field is OPTIONAL: an unknown
+key is ignored and the row takes the island default — so a stale app registers
+with a 200, looks healthy, and every push to its token 400s where nobody sees it.
+Island merges and DEPLOYS first, then aiko_chat_app#162.
 
-THE WIRE FIELD MOVES WITH THE COLUMN, so this is a BREAKING contract change, and
-it is safe today for one reason that was measured rather than assumed: there is no
-deployed consumer. MEASURED 2026-08-26, not a standing invariant — `git grep
-push_environment origin/main -- '*.dart'` in aiko_chat_app returned zero, its
-PR#162 was open and unmerged, and the last submitted IPA (0.0.3+11, 10 Aug) had no
-aps-environment entitlement at all, so it could not hold an APNs token. The app tab
-confirmed each of those independently before this was written. If you are reading
-this while debugging a wire-compat bug, re-measure rather than inherit it.
-That is why NO dual-key compatibility window was built: accepting both keys for a
-release would be a mechanism for a state that cannot occur.
-
-THE HAZARD IF THE TWO HALVES DESYNC IS SILENT, WHICH IS WHY THE ORDER IS FIXED.
-The field is OPTIONAL on the wire: an unknown key is ignored and the row falls
-back to the island's own default. So an app sending `push_environment` to an
-island reading `apns_environment` registers with a 200, looks healthy, and then
-fails every push to a release-build token with a 400 BadDeviceToken that no user
-sees — re-creating, by naming alone, the exact failure #3386 exists to remove.
-Agreed sequencing: the island merges and DEPLOYS first, then aiko_chat_app#162.
-The app tab holds a live drift test that asserts set-equality against this
-island's served /openapi.json; it goes RED the moment this deploys, which is what
-it was built for.
-
-SQLite CANNOT ALTER A CHECK, so batch_alter_table rebuilds the table (create new +
-copy + swap), the same shape as 0023 / 0022 / 0020. The constraint is renamed with
-the column — a constraint named for a column that no longer exists is a lie the
-next reader has to unpick. FK-safety is unchanged from 0023: `device_tokens` is a
-CHILD only (user_id -> users.id), nothing references it, so a swap cannot orphan a
-dependant; and the gateway does not enable SQLite PRAGMA foreign_keys anyway
-(ADR-0002, application-level cascades).
-
-DATA SURVIVES THE REBUILD. batch mode copies by column, and a rename is declared
-rather than inferred, so every existing row keeps its value — including
-imagineering's one real production token, which 0023's settings-aware UPDATE
-correctly stamped 'sandbox'. A rebuild that silently re-defaulted that row would
-put a live handset back on the wrong host, so tests/test_migrations asserts the
+FK-safety and the hand-written-not-autogenerated rule are unchanged from 0023 —
+see that file. The CHECK literal below must stay in sync with ApnsEnvironment;
+tests/test_migrations asserts it in the migrated DDL, and asserts a live row's
 value survives 0023 -> 0024 rather than trusting the copy.
-
-HAND-WRITTEN, not autogenerated: alembic's compare_metadata is CHECK-blind on
-SQLite (the deploy dialect), so --autogenerate emits no constraint. The literal
-below must stay in sync with the ApnsEnvironment enum in domain/models.py;
-tests/test_migrations asserts it structurally in the migrated DDL for that reason.
 
 Revision ID: 0024
 Revises: 0023
