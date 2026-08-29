@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings.sources import DotEnvSettingsSource, EnvSettingsSource
 
 # Leaf import (stdlib-only enum) — safe at module top, no config<->domain cycle. The
 # SINGLE source of truth for the mode vocabulary, shared with the signing codec so the
@@ -76,8 +77,88 @@ _NON_PROD_ENVIRONMENTS = frozenset({"dev", "development", "test", "local"})
 _MIN_PROD_SECRET_LEN = 32
 
 
+def _blank(value) -> bool:
+    """A raw env value that says nothing: whitespace-only, or empty."""
+    return isinstance(value, str) and value.strip() == ""
+
+
+# NOTE ON SHAPE: these two are near-identical and deliberately NOT unified behind a
+# mixin. `class _AbsenceAwareEnvSource(_Mixin, EnvSettingsSource)` raises
+# "object layout differs" on the `__class__` reassignment below — a mixin changes the
+# layout, so only a DIRECT subclass is re-classable. Three duplicated lines is the
+# price of the instance-preserving swap, and the shared predicate carries the rule.
+class _AbsenceAwareEnvSource(EnvSettingsSource):
+    """Treat a whitespace-only raw env value as ABSENT, before any decoding.
+
+    `Settings._normalise_env_strings` already applies this rule — but it is a model
+    validator, and pydantic-settings JSON-decodes COMPLEX fields (`list[str]`,
+    `dict`) inside the env SOURCE, which runs earlier. So `AIKO_CHANNELS="   "`
+    raised SettingsError upstream of the validator and crash-looped the island,
+    while `RATE_LIMIT_ENABLED="   "` was handled fine (claude-tasks#3358). Same
+    rule, two layers, and only the lower one could ever see the complex fields.
+
+    Returning None is the documented way to say "this source has nothing for that
+    field": pydantic-settings' base `__call__` gates on `if field_value is not
+    None` before writing into the source's data dict, so the key is simply omitted
+    and the field falls through to its default — genuinely absent, not None-valued.
+    (Read out of `sources/base.py` rather than assumed; a subtly different
+    behaviour here would restore absence for scalars and set None for complex
+    fields, which is the failure this exists to prevent.)
+
+    A `.env` file on a box can carry the same stray space a compose variable can, so
+    `_AbsenceAwareDotEnvSource` below applies the identical rule. Fixing one and not
+    the other would leave the class half closed for no reason.
+    """
+
+    def prepare_field_value(self, field_name, field, value, value_is_complex):
+        if _blank(value):
+            return None
+        return super().prepare_field_value(field_name, field, value, value_is_complex)
+
+
+class _AbsenceAwareDotEnvSource(DotEnvSettingsSource):
+    """`.env`-file twin of [_AbsenceAwareEnvSource] — same rule, same reasoning."""
+
+    def prepare_field_value(self, field_name, field, value, value_is_complex):
+        if _blank(value):
+            return None
+        return super().prepare_field_value(field_name, field, value, value_is_complex)
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    @classmethod
+    def settings_customise_sources(
+        cls, settings_cls, init_settings, env_settings, dotenv_settings,
+        file_secret_settings,
+    ):
+        """Swap both env sources for the absence-aware ones, order unchanged.
+
+        Order is load-bearing and deliberately identical to the default (init >
+        env > dotenv > secrets); this only changes how a whitespace-only RAW value
+        is read, never which source wins.
+
+        RE-CLASSES THE GIVEN INSTANCES RATHER THAN BUILDING NEW ONES, and that is
+        not a flourish. Constructing `_AbsenceAwareDotEnvSource(settings_cls)` would
+        take `env_file` from `model_config` (".env") and so DISCARD any per-instance
+        override — including `Settings(_env_file=None)`, which is exactly what the
+        test harness uses to measure a field against genuine absence. A fresh source
+        would quietly start reading the real .env off the developer's disk, turning
+        the harness's reference value into whatever that box happens to hold. Every
+        constructor override lives on the instance, so keeping the instance is the
+        only way to keep them all without enumerating them.
+
+        Safe ONLY because each subclass inherits DIRECTLY from its source and adds
+        no state: that keeps the object layout identical, which is what `__class__`
+        assignment requires. Verified the hard way — the first draft used a shared
+        mixin and CPython refused with "object layout differs". If you refactor
+        these two into a common base, this line stops working and the tests say so
+        immediately.
+        """
+        env_settings.__class__ = _AbsenceAwareEnvSource
+        dotenv_settings.__class__ = _AbsenceAwareDotEnvSource
+        return (init_settings, env_settings, dotenv_settings, file_secret_settings)
 
     # Deployment environment. Defaults to "production" so a deploy that FORGETS
     # to set ENVIRONMENT still arms the fail-closed guards (absence = unsafe ⇒
