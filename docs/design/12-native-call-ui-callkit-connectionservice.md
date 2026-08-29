@@ -375,6 +375,60 @@ cross-island call setup. If it is down the caller cannot place an outbound cross
 — acceptable, because a caller whose own island is down has no session and cannot do anything
 else either.
 
+### Decision 9b — the foreign-operator exposure, DISCLOSED
+
+Surfaced by the app tab from a question of Nick's, and written here rather than left to the
+parked ACL design, because **Decision 9 is what creates it.**
+
+**Measured, not assumed** (app tab, `livekit_call_service.dart:152`): `Room.connect` passes
+`connectOptions` and `fastConnectOptions` and **no `e2eeOptions`**; a grep for
+`e2ee|encrypt|frameCryptor|keyProvider` across `lib/features/call/` returns nothing. LiveKit
+decrypts at the SFU by default. So for a **cross-island** call the callee's operator holds:
+
+- the **caller's IP**, from a direct client→SFU connection;
+- **call timing and duration**;
+- **the audio and video in the clear**;
+- and under Decision 9a, an explicit island-A vouch **naming that caller**.
+
+For a person who is not their member, has no account with them, and never chose them.
+
+**Three precisions, because the honest version is narrower than the alarming one.**
+
+1. **Not a regression.** Cross-island calling does not work today (Decision 9), so there is
+   no working "before" being degraded. Same-island is unchanged — your own operator already
+   hosts the SFU and already reads message bodies (`should_wake` matches the invite sentinel
+   in cleartext; `messages.body` is plaintext). **Own-operator visibility was never the
+   protected property** — `_payload`'s opacity is aimed at Apple, and the thesis is that
+   these facts stay *with the operator*, not that they are hidden from it.
+2. **Not caused by 9a, or even by which side was picked.** The exposure is inherent to
+   per-island SFUs plus cross-island calls: whichever island hosts, *some* operator sees a
+   non-member's media. Mirroring it (caller's island hosts) moves the exposure to the
+   callee and breaks the ring-path argument that motivated the ruling. This is a property
+   of cross-island calling **existing at all**.
+3. **There IS a prior story, and naming it locates the defect exactly.** The friends
+   sender-anonymity ruling already records that IP exposure is *"an operator promise about
+   logging, not a property of the system."* That residual was accepted **about the user's
+   own operator** — a party they chose. What is new is that Decision 9 **extends that
+   promise-dependency to an operator the user never chose and has no relationship with.**
+   An accepted residual is transferred outside the trust relationship. That, precisely, is
+   the finding.
+
+   The adjacent prior is on a *different axis*: the full-federation ruling rejected a shared
+   SFU because it would make "one operator's box a hard dependency for every other operator"
+   — **availability**, not confidentiality. So the confidentiality axis genuinely has no
+   prior, and this is the first design to need one.
+
+**The available answer, and why it is not a flag.** LiveKit insertable-streams E2EE would
+reduce this to metadata only. It is a *design*, not a config switch: it lands the same
+pairwise-fanout-versus-broadcast key-management problem the group-E2EE crucible struck v1 of.
+Not proposed here.
+
+**Why it is written down now rather than solved.** Per the draft ADR-0008 on push topology,
+*"an unnamed centre gets discovered by an operator rather than disclosed to them"* — the same
+argument applies to an unnamed exposure discovered by a **user**. This is a
+**federation-thesis question for Nick**, not a call-feature one, and it is a precondition on
+shipping cross-island calling rather than on building it.
+
 **Scope — and this part is NOT settled.** "The callee" is well defined for a **1:1 ring**,
 which is what is shipped and what CallKit is about. But under "calls are gatherings, not
 channel properties" a call has its own participant set, and **a gathering across three or
@@ -427,6 +481,10 @@ Gated separately: **Decision 9 (#3196)** before shipping to cross-island pairs, 
   either way, not a branch on the review.
 
 **Still open:**
+
+- **Nick — the foreign-operator exposure** (Decision 9b): a cross-island call gives the
+  callee's operator a non-member's IP, timing, and unencrypted media. A federation-thesis
+  question, and a precondition on *shipping* cross-island calling rather than on building it.
 - **Host-selection for a gathering spanning 3+ islands** — for whenever the
   gathering-with-ACL design is cast (Decision 1b), not before.
 
