@@ -31,6 +31,7 @@ from __future__ import annotations
 import dataclasses
 import enum
 import logging
+import re
 import time
 
 import httpx
@@ -43,6 +44,56 @@ log = logging.getLogger("aiko_gateway.apns")
 
 _PROD_HOST = "https://api.push.apple.com"
 _SANDBOX_HOST = "https://api.sandbox.push.apple.com"
+
+# A device token is a CREDENTIAL, and APNs puts it in the URL PATH — so httpx's
+# own request logging writes the whole thing at INFO on every send. We never wrote
+# a `log.` call containing a token; it arrives through a dependency's logger, which
+# is exactly why it went unnoticed until someone read a real log (claude-tasks#3586).
+#
+# DELIBERATELY A REDACTION, NOT A SILENCE. Setting the httpx logger to WARNING would
+# remove the leak and the observability together — and that line is the ONLY direct
+# evidence of which Apple host a given row was sent to. It is what witnessed
+# `_host()` routing per row on 2026-08-29, the first production proof of #3386's
+# central claim. push_service also logs its own row-keyed line now, but this one
+# stays legible on purpose.
+#
+# MATCHES ANY LONG HEX RUN, not the `/3/device/<token>` path specifically. Anchoring
+# to today's APNs URL shape would let a renamed path leak straight through, and the
+# generic form also covers any other secret-shaped hex a future httpx call might
+# carry. Over-redaction risk is accepted: a >=32-char hex run in a URL is a token
+# far more often than it is anything a reader needs whole.
+_LONG_HEX = re.compile(r"\b([0-9a-fA-F]{12})[0-9a-fA-F]{20,}\b")
+
+
+class _RedactLongHex(logging.Filter):
+    """Trim any >=32-char hex run in a log record to its first 12 chars + '...'.
+
+    12 hex is 48 bits — nowhere near enough to reconstruct a 256-bit device token,
+    and empirically plenty to correlate a log line with a DB row (`substr(token,1,12)`
+    disambiguated instantly against the live table while debugging #3386).
+
+    Works on the FORMATTED message and then clears `args`, because httpx logs with
+    %-args rather than a pre-built string; redacting `record.msg` alone would leave
+    the token sitting in `record.args` for any other handler to format back out.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:  # pragma: no cover - a broken record must not kill a send
+            return True
+        redacted = _LONG_HEX.sub(r"\1...", message)
+        if redacted != message:
+            record.msg = redacted
+            record.args = ()
+        return True  # never drop the record; this filter only rewrites
+
+
+# Installed at IMPORT rather than at client construction: the filter has to be in
+# place before anything can log, and `_client()` is built lazily inside the first
+# send. Attached to the "httpx" logger by name because that is the logger httpx
+# itself uses; a filter on a Logger runs for records logged directly to it.
+logging.getLogger("httpx").addFilter(_RedactLongHex())
 
 # Apple rejects a provider JWT older than 1 hour, AND rejects a provider that mints
 # them more often than every 20 minutes. 50 minutes sits inside both bounds with
