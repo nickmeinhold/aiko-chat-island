@@ -391,11 +391,12 @@ Gated separately: **Decision 9 (#3196)** before shipping to cross-island pairs, 
 - **Cross-island calls are hosted on the CALLEE's island** (Decision 9). Settles
   host-selection for 1:1; **the gathering case is explicitly not settled.**
 
-**Still open:**
+- **Play `USE_FULL_SCREEN_INTENT` declaration: Nick submits, justification drafted**
+  (Decision 8) — claude-tasks#3615, slugged to `aiko_chat_app`. The runtime-prompt +
+  graceful-degradation path is required **regardless of the outcome**, so it is build work
+  either way, not a branch on the review.
 
-- **Nick — who owns the Play `USE_FULL_SCREEN_INTENT` declaration**, and starting it now
-  rather than at submission (Decision 8). It is a store-review dependency and slower than
-  the build.
+**Still open:**
 - **Host-selection for a gathering spanning 3+ islands** — for whenever the
   gathering-with-ACL design is cast (Decision 1b), not before.
 
