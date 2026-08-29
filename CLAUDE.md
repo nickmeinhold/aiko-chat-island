@@ -45,6 +45,24 @@ file is the working-context that isn't obvious from the code.
 ## Working conventions
 
 - **Conventional Commits.** Branch off `main`; commit + push proactively.
+- **Work is staged by VERSION, on `claude-tasks` milestones named `aiko-chat-island vX.Y.Z`**
+  (prefixed because that repo is shared across projects — a bare `v0.10.0` collides with the
+  app's). Nick's rule, 2026-08-29: *far off gets higher version numbers.* The ladder, and the
+  test for each rung:
+  - **`v0.9.1` (patch)** — no schema change, no wire change. Ships on any quiet day, needs no
+    coordination with the app tab.
+  - **`v0.10.0` (next increment)** — the live call/ring path. May change the wire; anything
+    that does gets agreed with `aiko_chat_app` BEFORE merge, and the island deploys FIRST
+    (silent-desync rule: an unknown wire key is ignored, not rejected, so a mismatch looks
+    healthy and fails at Apple where nobody sees it).
+  - **`v0.11.0` (structural)** — schema changes, agent identity, block/ban across media.
+    Cage-match by law.
+  - **`v1.0.0` (far off)** — blocked on something we do not control (a second island
+    operator, a federation design) or deferred by a recorded decision. Putting a thing here
+    asserts it is NOT next; it does not assert it is unimportant.
+  **Not everything gets a milestone, and that is deliberate.** Ops one-offs, cross-repo
+  handoffs, and chores are not island releases — forcing them onto the train makes the train
+  meaningless. Unmilestoned is a valid, and currently the most common, state.
 - **Trust boundaries are cage-match by law.** Auth, moderation, communities,
   account-deletion, wire-format, and state-lifecycle changes get an adversarial
   different-family review (`/cage-match`), not solo self-review. Doc-only and
