@@ -345,6 +345,36 @@ signed `/v1/island` manifests, `signing_keys`, and `origin` carriage. `room_for_
 `gateway_id` namespacing stops being a bug and becomes the *host designation*, once the rule
 says which gateway_id wins.
 
+### Decision 9a — the caller's island FORWARDS the token request (island-to-island)
+
+The app's `VideoToken.url` and `room` already come from the response, never from local
+config ("the deployment owns its transport"), so **the client's connect path already accepts
+a foreign SFU** and the ruling costs it nothing there. The seam is one layer up: the token
+request is a *relative* path on the authed client, bound to the user's own island, so a
+caller structurally cannot ask anywhere else.
+
+Two shapes were possible; **the caller's island forwards on the caller's behalf**, chosen
+here:
+
+- **the client keeps its invariant** — the app only ever talks to its own island, and never
+  has to weaken that anywhere else in the codebase;
+- **no foreign credential lands on the device.** The alternative (client talks to the callee's
+  island directly) still needs a home-island assertion to present, so it is this design plus
+  an extra hop, with a bearer artifact on a handset and a harder revocation story;
+- **the trust edge is island↔island, where the machinery already exists** — signed
+  `/v1/island` manifests, `/v1/keys`, `signing_keys`. The caller's island already
+  authenticates the caller; it vouches, it does not re-prove.
+
+So the island owes an endpoint on the **callee's** side that accepts an island-authenticated
+request — *island A asserts user U is its authenticated member; mint a room token for this
+call* — and mints against its own SFU. That is a federation trust boundary: **cage-match by
+law**, and the first place a forged vouch would buy a seat in someone else's room.
+
+**Cost, stated rather than buried:** the caller's island becomes a required participant in
+cross-island call setup. If it is down the caller cannot place an outbound cross-island call
+— acceptable, because a caller whose own island is down has no session and cannot do anything
+else either.
+
 **Scope — and this part is NOT settled.** "The callee" is well defined for a **1:1 ring**,
 which is what is shipped and what CallKit is about. But under "calls are gatherings, not
 channel properties" a call has its own participant set, and **a gathering across three or
