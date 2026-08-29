@@ -239,8 +239,9 @@ round-trip, and **nothing about who-calls-whom on Apple's wire** — `_payload` 
 refusal intact, unchanged.
 
 Three tiers, degrading honestly: Swift-readable local cache → `reportCall(with:updated:)`
-once Dart is up → a dignified placeholder (**the placeholder string is a product call, for
-Nick**).
+once Dart is up → **the placeholder string `Aiko`** (RULING: Nick, 2026-08-30). One word,
+names the product not the person, and says nothing about who is calling — so the tier-3
+fallback leaks no more than the payload already refuses to.
 
 **Verified against Apple's documentation JSON** (the HTML site is a JS-rendered SPA that
 returns title-only to both tabs' fetchers — a fact about the instrument, not the API):
@@ -263,14 +264,24 @@ var includesCallsInRecents: Bool { get set }
 > Recents list after the call ends."
 
 **Apple's own published documentation does not state its default** — the sentence in the
-JSON is literally `"The default value of this property is ."`, truncated at source. So the
-default cannot be relied on and **must be set explicitly**, whichever way Nick decides.
+JSON is literally `"The default value of this property is ."`, truncated at source.
 
-This is a genuine privacy surface on a product whose thesis is that who-calls-whom stays
-with the operator: a CallKit call can appear in the system Phone app's call history after
-it ends. **A product decision for Nick**, raised here because it is invisible until
-someone opens Recents. (Whether iOS then syncs that history off-device is *not* verified
-here and should not be assumed either way.)
+**RULING (Nick, 2026-08-30): appearing in Recents is fine.** A CallKit call landing in the
+system call history is accepted, on a product whose thesis is that who-calls-whom stays
+with the operator — the entry is local to the callee's own device and names a call they
+were party to.
+
+**It is still set EXPLICITLY**, to `true`. That is not hedging the ruling, it is the
+engineering half of it: Apple does not publish the default, so an unset property means
+"whatever this OS version happens to do" — the value would be a fact about the platform
+rather than a decision of ours, and it could change under us in a point release without
+anything failing. A ruling that says "fine" must still be written down somewhere the code
+can be read from.
+
+Residual, unverified and deliberately not assumed either way: whether iOS syncs that
+history off-device. The ruling above is scoped to the on-device entry, which is what was
+asked. If off-device sync turns out to be real it is a **new** question, not a settled
+one.
 
 ## Decision 7 — re-price the wake gate at the new blast radius
 
@@ -340,14 +351,19 @@ that review too: it is where a schema change becomes a stranger's phone ringing.
 Gated separately: **Decision 9 (#3196)** before shipping to cross-island pairs, and
 **Decision 1b** (the gathering ACL) which must not start before #3196 settles.
 
-## Open questions
+## Rulings and open questions
 
-- **Nick — the placeholder string** shown before a caller name resolves (Decision 6).
-- **Nick — `includesCallsInRecents`** (Decision 6a): a CallKit call can appear in the
-  system call history after it ends, and Apple does not document the default, so it gets
-  set explicitly either way.
+**Settled (Nick, 2026-08-30):**
+
+- **Placeholder string = `Aiko`** (Decision 6).
+- **`includesCallsInRecents`: appearing in Recents is fine** (Decision 6a). Set explicitly
+  to `true`, because Apple does not publish the default.
+
+**Still open:**
+
 - **Nick — who owns the Play `USE_FULL_SCREEN_INTENT` declaration**, and starting it now
-  (Decision 8).
+  rather than at submission (Decision 8). It is a store-review dependency and slower than
+  the build.
 
 ## Provenance
 
