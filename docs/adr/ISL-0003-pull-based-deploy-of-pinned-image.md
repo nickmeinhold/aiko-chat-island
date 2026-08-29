@@ -1,4 +1,4 @@
-# ADR-0003: Deploy by pulling a version-pinned published image
+# ISL-0003: Deploy by pulling a version-pinned published image
 
 | | |
 |---|---|
@@ -76,7 +76,7 @@ schema. Crash-loop or corruption. As Tesla put it: *"backup without
 restore-on-failure is a souvenir, not a spine."*
 
 Operator-opt-in auto-pull (default off) is the re-picked direction, gated on the
-additive-only migration lint from ADR-0001 (#3188 / #2615). See
+additive-only migration lint from ISL-0001 (#3188 / #2615). See
 `docs/crucible/reactive-deploy/`.
 
 ## Consequences, learned the hard way (2026-08-23)

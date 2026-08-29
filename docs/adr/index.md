@@ -24,11 +24,22 @@ they were written. Re-homing them is fine but is not this series' business.
 
 ## The series
 
+Numbered **`ISL-000N`**, and the prefix is load-bearing rather than decorative
+(claude-tasks#3432). Two series exist, both starting at 0001: the project tier in
+the app repo (federation vocabulary, identity graph, sybil resistance — co-owned
+with Andy) and this component tier. So a bare "ADR-0002" resolves to two different
+documents, and PR#136's body already had to write "App-repo ADR-0005" by hand to
+disambiguate. The prefix makes bare numbers mean the project series unambiguously,
+and this series say what it is.
+
+Citations inside this repo of the form `ADR-0004`, `ADR-0005`, `ADR-0008` are
+**app-tier and correct as written** — they are not missing a prefix.
+
 | ADR | Title | Status | Owner |
 |-----|-------|--------|-------|
-| 0001 | Alembic is the sole schema authority | Accepted (retroactive) | Nick |
-| 0002 | Prod runs SQLite with foreign keys OFF and application-level cascades | Accepted (retroactive) | Nick |
-| 0003 | Deploy by pulling a version-pinned published image | Accepted (retroactive) | Nick |
+| ISL-0001 | Alembic is the sole schema authority | Accepted (retroactive) | Nick |
+| ISL-0002 | Prod runs SQLite with foreign keys OFF and application-level cascades | Accepted (retroactive) | Nick |
+| ISL-0003 | Deploy by pulling a version-pinned published image | Accepted (retroactive) | Nick |
 
 ## Why these three first
 

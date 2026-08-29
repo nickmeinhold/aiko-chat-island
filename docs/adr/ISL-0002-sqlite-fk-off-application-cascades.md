@@ -1,4 +1,4 @@
-# ADR-0002: Prod runs SQLite with foreign keys OFF and application-level cascades
+# ISL-0002: Prod runs SQLite with foreign keys OFF and application-level cascades
 
 | | |
 |---|---|
@@ -23,10 +23,10 @@ An island is a sovereign node someone runs on a small box. A single-file store
 with no separate server process is the correct shape for that: it backs up by
 copying one file, it has no connection pool to exhaust, and it cannot be
 misconfigured into listening on a public port. Dev runs SQLite for the same reason
-it runs the same migration chain (ADR-0001) — **so that what you exercise locally
+it runs the same migration chain (ISL-0001) — **so that what you exercise locally
 is what production runs.**
 
-Foreign keys being off follows from what the migrations must do. Under ADR-0001,
+Foreign keys being off follows from what the migrations must do. Under ISL-0001,
 13 of 21 migrations rebuild a table via `batch_alter_table` — create new, copy,
 swap. With `PRAGMA foreign_keys` on, a parent-table swap can trip a child FK
 violation mid-migration; with it off, the swap is safe. Several migrations say so
