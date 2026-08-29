@@ -55,10 +55,29 @@ for k in APNS_KEY_ID APNS_TEAM_ID APNS_TOPIC APNS_PRIVATE_KEY; do
   # abort a deploy on a box that boots perfectly well.
   value=$(sed -nE "s/^[[:space:]]*(export[[:space:]]+)?${k}[[:space:]]*=[[:space:]]*//p" \
             "$env_file" | tail -1)
-  # Strip one layer of matching quotes the way dotenv does, THEN test for blank — so
-  # APNS_TOPIC="" and APNS_TOPIC="   " both read as unset, matching the island.
-  value="${value%\"}"; value="${value#\"}"
-  value="${value%\'}"; value="${value#\'}"
+  # QUOTES AND INLINE COMMENTS, to dotenv's actual rules — measured case by case, not
+  # inferred (cage-match PR#148 round 2, Carnot HIGH). The naive version stripped one
+  # leading and one trailing quote off the WHOLE remainder, which breaks the moment a
+  # comment follows the closing quote:
+  #
+  #   APNS_TOPIC="" # disabled   dotenv -> ''  (UNSET to the island)
+  #                              naive  -> '" # disabled'  (counted as SET)
+  #
+  # That is the SILENT-MISS direction: preflight exits 0, the island then sees a
+  # partial set and refuses to boot — the exact crash-loop this script exists to stop.
+  #
+  # Measured dotenv behaviour, all eight arms pinned in the test file:
+  #   a#b      -> 'a#b'   (a bare # is NOT a comment)
+  #   a #b     -> 'a'     (whitespace-preceded # IS a comment)
+  #   "" # c   -> ''      (quoted content only; the rest is discarded)
+  #   "  " # h -> '  '    (whitespace-only -> absence, per #3358)
+  #   = # f    -> '# f'   (NOT empty — an unquoted value that IS a comment-looking
+  #                        string; Carnot's example, and the one case it got wrong)
+  case "$value" in
+    \"*) value="${value#\"}"; value="${value%%\"*}" ;;
+    \'*) value="${value#\'}"; value="${value%%\'*}" ;;
+    *)   case "$value" in *[[:space:]]\#*) value="${value%%[[:space:]]\#*}" ;; esac ;;
+  esac
   value=$(printf '%s' "$value" | tr -d '[:space:]')
   if [ -n "$value" ]; then set_keys+=("$k"); else missing_keys+=("$k"); fi
 done

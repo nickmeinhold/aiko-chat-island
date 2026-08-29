@@ -136,3 +136,40 @@ def test_quoted_real_value_is_seen(tmp_path) -> None:
     """NULL ARM for the quote-stripping: a quoted REAL value must still count."""
     result = _run(tmp_path, [f'{k}="{v}"' for k, v in ALL_FOUR.items()])
     assert result.returncode == 0, result.stderr
+
+
+# --- dotenv parity, arm by arm (cage-match PR#148 round 2, Carnot HIGH) --------
+# The shell reader and python-dotenv must agree on ONE question: is this value blank
+# to the island? Each case below was MEASURED against python-dotenv, not inferred —
+# including the one Carnot's report got wrong (`KEY= # c` is NOT blank to dotenv).
+import pytest
+
+
+@pytest.mark.parametrize(
+    "line,blank_to_island",
+    [
+        ("APNS_TOPIC=a#b", False),          # a bare # is not a comment
+        ("APNS_TOPIC=a #b", False),         # whitespace-preceded # IS a comment -> 'a'
+        ('APNS_TOPIC="" # c', True),        # quoted-empty + comment -> '' THE SILENT MISS
+        ("APNS_TOPIC='' # d", True),        # single-quoted twin
+        ('APNS_TOPIC="v" # e', False),      # quoted value + comment -> 'v'
+        ("APNS_TOPIC= # f", False),         # unquoted -> '# f', NOT blank
+        ("APNS_TOPIC=  ", True),            # whitespace-only -> absence (#3358)
+        ('APNS_TOPIC="  " # h', True),      # quoted whitespace -> absence
+    ],
+)
+def test_blankness_matches_python_dotenv(tmp_path, line, blank_to_island) -> None:
+    """One question, two readers, no daylight between them.
+
+    The other three keys are always fully set, so the exit code isolates APNS_TOPIC:
+    if the reader calls it BLANK the set is partial and this must abort (1); if it
+    calls it SET the set is complete and this must pass (0). A disagreement here is
+    either a false abort of a healthy box or a silent pass on one that will
+    crash-loop."""
+    lines = [f"{k}={v}" for k, v in ALL_FOUR.items() if k != "APNS_TOPIC"]
+    lines.append(line)
+    result = _run(tmp_path, lines)
+    expected = 1 if blank_to_island else 0
+    assert result.returncode == expected, (
+        f"{line!r}: dotenv says blank={blank_to_island}, so exit should be "
+        f"{expected}; got {result.returncode}.\n{result.stderr}")
