@@ -153,7 +153,10 @@ import pytest
         ('APNS_TOPIC="" # c', True),        # quoted-empty + comment -> '' THE SILENT MISS
         ("APNS_TOPIC='' # d", True),        # single-quoted twin
         ('APNS_TOPIC="v" # e', False),      # quoted value + comment -> 'v'
-        ("APNS_TOPIC= # f", False),         # unquoted -> '# f', NOT blank
+        ("APNS_TOPIC= # f", False),
+        ("APNS_TOPIC=   # disabled", False),  # cage-match r3 reported this as a silent
+                                            # miss; MEASURED not blank, so both readers
+                                            # already agreed. Pinned so they keep agreeing.         # unquoted -> '# f', NOT blank
         ("APNS_TOPIC=  ", True),            # whitespace-only -> absence (#3358)
         ('APNS_TOPIC="  " # h', True),      # quoted whitespace -> absence
     ],
