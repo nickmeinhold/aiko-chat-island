@@ -464,7 +464,7 @@ def test_upgrade_0021_to_0022_preserves_populated_users_table(tmp_path, monkeypa
             _assert_fat_user_intact(c)
             # Theorem 3 on the husk seeded beside the fat row.
             _assert_husk_still_empty(c, "u2")
-            # The child row still resolves across the parent swap (ADR-0002 FK-off).
+            # The child row still resolves across the parent swap (ISL-0002 FK-off).
             assert c.execute(text(
                 "SELECT count(*) FROM memberships m JOIN users u "
                 "ON u.id = m.user_id")).scalar_one() == 1
@@ -685,7 +685,7 @@ def test_downgrade_0022_to_0021_round_trips_a_fat_row(tmp_path, monkeypatch):
 
         # The child still resolves after the SECOND rebuild. The upgrade leg
         # asserted this; the downgrade leg did not, and it drops+recreates the
-        # same parent under the same FK-off premise (ADR-0002).
+        # same parent under the same FK-off premise (ISL-0002).
         with engine.begin() as c:
             assert c.execute(text(
                 "SELECT count(*) FROM memberships m JOIN users u "

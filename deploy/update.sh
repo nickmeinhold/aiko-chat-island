@@ -67,6 +67,45 @@ $DOCKER compose version >/dev/null 2>&1 || die "docker compose v2 not available"
 $DOCKER compose ps --status running --services 2>/dev/null | grep -qx chat-island \
   || die "the 'chat-island' service isn't running — use deploy/standup.sh for a first standup"
 
+# --- preflight: a PARTIAL APNS_* set now refuses to boot --------------------
+#
+# claude-tasks#3366 (cage-match PR#141 round 3, Tesla — an accepted risk, recorded
+# rather than absorbed). APNS_* used to be dead ink on a host: compose did not
+# forward it, so a half-drafted credential set (key id and team id pasted in, the
+# private key still to come) sat harmlessly in .env and the island booted with push
+# simply off. PR#141 made compose forwarding total, so those bytes now reach the
+# container — where config.py's half-configured guard deliberately REFUSES TO BOOT.
+#
+# The guard is right and must not be weakened: a partial set reads as "push is on"
+# at every call site while every send fails at Apple's door, and on a handset a
+# missed call is indistinguishable from a disabled feature. What changed is WHEN it
+# fails — at boot instead of never. With `restart: always` that is a crash-loop, on
+# a box nobody touched, triggered by a version bump rather than by an edit.
+#
+# So catch it HERE, before the backup and before anything is pulled: an operator
+# reading this message still has a running island.
+# Extracted to its own script so it can be tested directly rather than only in situ
+# (tests/test_deploy_preflight.py exercises the all/none/partial arms). A check that
+# cannot be run in isolation tends to be a check nobody proves can fail.
+if [ -f "$SCRIPT_DIR/preflight-apns.sh" ]; then
+  # Present but not executable is a BROKEN install, not a legacy box — fail rather
+  # than skip (cage-match PR#148, Carnot MEDIUM).
+  [ -x "$SCRIPT_DIR/preflight-apns.sh" ] \
+    || die "preflight-apns.sh exists but is not executable — refusing to deploy with a disabled safety check. chmod +x it."
+  "$SCRIPT_DIR/preflight-apns.sh" "$REPO_ROOT/.env" \
+    || die "APNs preflight failed (see above) — aborting BEFORE the backup; the island is still running"
+else
+  # ABSENT means an older copy of this tree. Do NOT fail — that would block a deploy
+  # on a box whose update.sh predates the check, which is a worse outcome than the
+  # crash-loop it guards. But say so LOUDLY: the boxes most likely to be missing it
+  # are exactly the drifted ones it was written to protect (#2301 — update.sh's copy
+  # on each box is a separate artifact and does not sync itself). A silent skip here
+  # would let the guarantee evaporate precisely where it is needed, with no signal.
+  warn "APNs preflight NOT FOUND ($SCRIPT_DIR/preflight-apns.sh) — this box's deploy
+     tree predates it. A PARTIAL APNS_* set in .env will crash-loop the island after
+     the recreate. Check by hand, or refresh this box's deploy/ from the repo."
+fi
+
 # --- step 1: back up the sole-copy DB (fail-closed) -------------------------
 if [ "$DO_BACKUP" = "true" ]; then
   log "Step 1/3 — backing up the SQLite store (online hot copy) BEFORE any change"

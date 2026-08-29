@@ -89,9 +89,16 @@ async def create_video_token(
     # semantics on a SAFETY boundary. Fail closed to DMs (2-party, where blocks ARE
     # enforceable) until selective per-track subscription lands (#2731). The channel is
     # already readable here, so revealing "video is DM-only" leaks nothing.
-    # DM must ALSO be private (cage-match #122 rd8 Carnot): kind='dm' is not fully
-    # DB-constrained to is_private, so assert both — a malformed public kind='dm' row
-    # must not leak a subscribe token to any reader.
+    # DM must ALSO be private (cage-match #122 rd8 Carnot) — DEFENCE IN DEPTH, and
+    # stated honestly. This comment used to say kind='dm' was "not fully DB-constrained
+    # to is_private". That was true when written and stopped being true at migration
+    # 0020, which added `ck_channels_dm_private` (kind != 'dm' OR is_private): the
+    # malformed public DM row it warned about is now unrepresentable, and this branch
+    # is unreachable through the DB. The check STAYS — it costs one comparison, and a
+    # future writer path or a relaxed constraint would make it reachable again — but a
+    # reader was learning a false fact about the schema, which is how the next person
+    # mis-models the system (claude-tasks#3350; `push_service._recipients` carries the
+    # corrected wording this mirrors).
     if channel.kind != "dm" or not channel.is_private:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,

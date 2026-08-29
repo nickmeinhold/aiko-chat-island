@@ -1295,15 +1295,15 @@ def test_whitespace_only_restores_absence_for_every_scalar_field():
         # in the template, so the container never receives a host value for it at all.
         if name.upper() in _NOT_FORWARDED:
             continue
-        # COMPLEX fields (list/dict) are outside this rule's reach, honestly scoped:
-        # pydantic-settings JSON-decodes them inside the ENV SOURCE, which runs BEFORE
-        # any model validator, so a whitespace-only value raises SettingsError upstream
-        # of the coercion below and no amount of validator work can catch it. compose
-        # protects the common case (`:-` substitutes on empty as well as unset, so a
-        # blank .env line never reaches the container), leaving only a literally
-        # whitespace-only entry — narrow, and tracked rather than silently skipped.
-        if _is_complex_field(field.annotation):
-            continue
+        # COMPLEX fields (list/dict) are now IN SCOPE — the exclusion that used to sit
+        # here was the acceptance criterion for claude-tasks#3358, and removing it is
+        # the test. They were exempt because pydantic-settings JSON-decodes them inside
+        # the ENV SOURCE, which runs BEFORE any model validator, so `AIKO_CHANNELS="   "`
+        # raised SettingsError upstream of `_normalise_env_strings` and crash-looped the
+        # island while the identical scalar case was handled. The rule now also lives in
+        # the source layer (`_WhitespaceIsAbsence`), which is the only layer that can see
+        # them, so every forwarded field is covered by one property rather than by a
+        # scalar rule plus a documented hole.
         # The reference is the variable genuinely ABSENT from the environment — NOT
         # a plain Settings(_env_file=None), which in this harness already carries JWT_SECRET and
         # ISLAND_SIGNING_SEED. Comparing against harness-set values reported a
@@ -1567,4 +1567,31 @@ def test_the_exclusion_set_is_closed():
     assert not removed, (
         f"{removed} left _NOT_FORWARDED but is still in _EXPECTED_EXCLUSIONS. Drop it "
         "from the frozen set so the two agree."
+    )
+
+
+def test_a_custom_env_file_override_is_honoured(tmp_path):
+    """`settings_customise_sources` re-classes the GIVEN source instances instead of
+    building new ones, precisely so per-instance overrides survive. 72 tests already
+    exercise `_env_file=None`; this pins the other half — an explicit PATH — because a
+    reconstructed source would silently take `env_file` from model_config (".env") and
+    read the repo's file instead of this one (cage-match PR#148, Carnot).
+
+    Uses `gateway_display_name`: a plain str with a default, no validator, no
+    cross-field guard, and absent from the test process env (so the env source cannot
+    answer and the dotenv source must). Earlier drafts reached for AIKO_CHANNELS and
+    then APNS_TOPIC and went red on JSON decoding and on the half-configured guard
+    respectively — right answer, wrong failure mode, and a test with two ways to fail
+    proves neither.
+
+    Fails loudly if anyone "tidies" the re-classing into a fresh-instance construction.
+    """
+    from aiko_gateway.config import Settings
+
+    env = tmp_path / "custom.env"
+    env.write_text("GATEWAY_DISPLAY_NAME=from-the-custom-file\n")
+    s = Settings(_env_file=str(env))
+    assert s.gateway_display_name == "from-the-custom-file", (
+        f"the custom _env_file was not read; got {s.gateway_display_name!r} — the "
+        "source was probably reconstructed from model_config instead of re-classed"
     )

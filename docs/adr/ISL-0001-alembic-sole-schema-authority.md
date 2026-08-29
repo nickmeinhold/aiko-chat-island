@@ -1,4 +1,4 @@
-# ADR-0001: Alembic is the sole schema authority
+# ISL-0001: Alembic is the sole schema authority
 
 | | |
 |---|---|
@@ -30,7 +30,7 @@ not correct**, and the version-control system cannot tell you the difference.
 **SQLite is blind to several ALTERs.** It cannot drop a column, cannot alter a
 CHECK constraint in place, and cannot change a column type. A migration written
 against Postgres semantics silently does nothing useful, or fails, on the backend
-production actually runs (ADR-0002). Today **13 of 21 migrations** use
+production actually runs (ISL-0002). Today **13 of 21 migrations** use
 `batch_alter_table`, which rebuilds the table (create new, copy, swap) — that is
 not an exotic case, it is the normal case here.
 

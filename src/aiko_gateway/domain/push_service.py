@@ -454,6 +454,20 @@ async def _wake_user(session: AsyncSession, user_id: str, payload: dict,
             # boundary. Treated as transient: log, skip, keep going, never reap.
             log.exception("wake failed for one device user=%s", user_id)
             continue
+        # THE SEMANTIC RECORD OF A SEND, keyed by ROW ID rather than by token
+        # (claude-tasks#3586). httpx already logs the request, but it knows only the
+        # URL, so the best it can do is a redacted token prefix; the row id is a
+        # non-secret ULID that correlates EXACTLY with the table and leaks nothing.
+        # A prefix is a redaction — this is simply the right key.
+        #
+        # Logged for every outcome, not just failures: before this line a SUCCESSFUL
+        # send wrote nothing of our own, so "did the push go out?" was answerable only
+        # by the ABSENCE of a failure line, which is the silence-reads-as-success trap
+        # this repo has a standing rule against. It is per-device by construction
+        # because the fanout is; if that ever gets chatty, collapse to one summary
+        # line per wake rather than dropping back to logging nothing.
+        log.info("apns sent device=%s env=%s verdict=%s",
+                 row.id, row.apns_environment, result.verdict.value)
         if result.verdict is apns.Verdict.DEAD_TOKEN:
             dead.append((*observed, result.invalid_since_ms))
 
