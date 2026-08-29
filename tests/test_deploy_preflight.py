@@ -88,3 +88,51 @@ def test_a_missing_env_file_is_not_an_error(tmp_path) -> None:
     result = subprocess.run(
         [str(SCRIPT), str(tmp_path / "nope.env")], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
+
+
+# --- parser skew with python-dotenv (cage-match PR#148, Carnot) ---------------
+# This script is a SECOND reader of a file whose FIRST reader is python-dotenv. Every
+# form dotenv accepts and this misses makes the two disagree, in BOTH directions: a
+# missed key can mean a silent pass on a genuinely partial box, or a FALSE ABORT of a
+# healthy one. These arms pin the forms dotenv actually accepts.
+
+def test_export_prefixed_keys_are_seen(tmp_path) -> None:
+    """`export FOO=bar` is valid dotenv. If this script missed it, four exported keys
+    would read as 'none configured' — a silent pass on a box the island can boot, and
+    a false abort as soon as ONE of the four is written plainly."""
+    result = _run(tmp_path, [f"export {k}={v}" for k, v in ALL_FOUR.items()])
+    assert result.returncode == 0, result.stderr
+
+
+def test_mixed_export_and_plain_is_still_complete(tmp_path) -> None:
+    """THE FALSE-RED ARM. Three plain plus one exported is FOUR keys to the island —
+    it boots fine — so aborting here would block a deploy that would have worked."""
+    lines = [f"{k}={v}" for k, v in ALL_FOUR.items() if k != "APNS_PRIVATE_KEY"]
+    lines.append(f"export APNS_PRIVATE_KEY={ALL_FOUR['APNS_PRIVATE_KEY']}")
+    result = _run(tmp_path, lines)
+    assert result.returncode == 0, (
+        "an exported key is still a key; this aborted a deploy the island would have "
+        f"booted:\n{result.stderr}")
+
+
+def test_spaces_around_equals_are_seen(tmp_path) -> None:
+    """`FOO = bar` is accepted by dotenv (measured, not assumed)."""
+    result = _run(tmp_path, [f"{k} = {v}" for k, v in ALL_FOUR.items()])
+    assert result.returncode == 0, result.stderr
+
+
+def test_quoted_empty_value_counts_as_unset(tmp_path) -> None:
+    """dotenv strips surrounding quotes, so APNS_TOPIC="" is EMPTY to the island, not
+    the two-character string. Counting the quotes as content would call a partial box
+    complete and let the crash-loop through — the silent direction."""
+    lines = [f"{k}={v}" for k, v in ALL_FOUR.items() if k != "APNS_TOPIC"]
+    lines.append('APNS_TOPIC=""')
+    result = _run(tmp_path, lines)
+    assert result.returncode == 1, "a quoted-empty value is unset, so this set is partial"
+    assert "APNS_TOPIC" in result.stderr, result.stderr
+
+
+def test_quoted_real_value_is_seen(tmp_path) -> None:
+    """NULL ARM for the quote-stripping: a quoted REAL value must still count."""
+    result = _run(tmp_path, [f'{k}="{v}"' for k, v in ALL_FOUR.items()])
+    assert result.returncode == 0, result.stderr

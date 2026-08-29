@@ -89,11 +89,44 @@ class _RedactLongHex(logging.Filter):
         return True  # never drop the record; this filter only rewrites
 
 
+def _already_filtered(target) -> bool:
+    """Idempotence (cage-match PR#148, Carnot LOW). `addFilter` is called at import
+    and again from `install_log_redaction`; a module reload in a test would stack
+    duplicates. Harmless in effect — the first pass shortens the token below the
+    threshold — but a function that mutates GLOBAL logger state should be safe to
+    call twice, not merely survivable."""
+    return any(isinstance(f, _RedactLongHex) for f in target.filters)
+
+
+def install_log_redaction() -> None:
+    """Attach the redaction to the ROOT HANDLERS, which is the version that holds.
+
+    A filter on a LOGGER only runs for records logged DIRECTLY to it — verified, not
+    assumed: a filter on "demo" does not see "demo.child". httpx today logs under
+    exactly `getLogger("httpx")` (one call site, `_client.py`), so the import-time
+    attachment below works — but it guards THE LEAK WE FOUND rather than the class,
+    which is precisely the shape of the bug it exists to fix. This one leaked in
+    through a dependency's logger nobody had thought about; the next one will too.
+
+    A filter on a HANDLER sees every record that reaches it, whatever logger emitted
+    it (also verified). So this covers a future `httpx.client` submodule logger, and
+    any other library that ever puts a credential in a URL.
+
+    Called from main.py AFTER `logging.basicConfig`, because the root handler does
+    not exist before then. The import-time attachment stays as well: it costs nothing
+    and keeps any entrypoint that imports this module without going through main.py
+    (a script, a worker, the test suite) covered.
+    """
+    for handler in logging.getLogger().handlers:
+        if not _already_filtered(handler):
+            handler.addFilter(_RedactLongHex())
+
+
 # Installed at IMPORT rather than at client construction: the filter has to be in
 # place before anything can log, and `_client()` is built lazily inside the first
-# send. Attached to the "httpx" logger by name because that is the logger httpx
-# itself uses; a filter on a Logger runs for records logged directly to it.
-logging.getLogger("httpx").addFilter(_RedactLongHex())
+# send. See `install_log_redaction` for why this is the narrower of the two layers.
+if not _already_filtered(logging.getLogger("httpx")):
+    logging.getLogger("httpx").addFilter(_RedactLongHex())
 
 # Apple rejects a provider JWT older than 1 hour, AND rejects a provider that mints
 # them more often than every 20 minutes. 50 minutes sits inside both bounds with

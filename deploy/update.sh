@@ -87,9 +87,23 @@ $DOCKER compose ps --status running --services 2>/dev/null | grep -qx chat-islan
 # Extracted to its own script so it can be tested directly rather than only in situ
 # (tests/test_deploy_preflight.py exercises the all/none/partial arms). A check that
 # cannot be run in isolation tends to be a check nobody proves can fail.
-if [ -x "$SCRIPT_DIR/preflight-apns.sh" ]; then
+if [ -f "$SCRIPT_DIR/preflight-apns.sh" ]; then
+  # Present but not executable is a BROKEN install, not a legacy box — fail rather
+  # than skip (cage-match PR#148, Carnot MEDIUM).
+  [ -x "$SCRIPT_DIR/preflight-apns.sh" ] \
+    || die "preflight-apns.sh exists but is not executable — refusing to deploy with a disabled safety check. chmod +x it."
   "$SCRIPT_DIR/preflight-apns.sh" "$REPO_ROOT/.env" \
     || die "APNs preflight failed (see above) — aborting BEFORE the backup; the island is still running"
+else
+  # ABSENT means an older copy of this tree. Do NOT fail — that would block a deploy
+  # on a box whose update.sh predates the check, which is a worse outcome than the
+  # crash-loop it guards. But say so LOUDLY: the boxes most likely to be missing it
+  # are exactly the drifted ones it was written to protect (#2301 — update.sh's copy
+  # on each box is a separate artifact and does not sync itself). A silent skip here
+  # would let the guarantee evaporate precisely where it is needed, with no signal.
+  warn "APNs preflight NOT FOUND ($SCRIPT_DIR/preflight-apns.sh) — this box's deploy
+     tree predates it. A PARTIAL APNS_* set in .env will crash-loop the island after
+     the recreate. Check by hand, or refresh this box's deploy/ from the repo."
 fi
 
 # --- step 1: back up the sole-copy DB (fail-closed) -------------------------

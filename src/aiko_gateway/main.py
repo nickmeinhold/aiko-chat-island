@@ -34,10 +34,16 @@ if TYPE_CHECKING:
 from .config import settings
 from .db import SessionLocal, verify_schema
 from .worker_guard import acquire_single_worker_lock, release_single_worker_lock
-from .domain import channels_service, echo, messages_service, moderation_service
+from .domain import (apns, channels_service, echo, messages_service,
+                     moderation_service)
 from .realtime.hub import Hub
 
 logging.basicConfig(level=logging.INFO)
+# Redact credential-shaped hex from EVERY emitted record, not just httpx's
+# (claude-tasks#3586). Must run after basicConfig — it attaches to the root
+# HANDLERS, which do not exist until then, and a handler filter is the only kind
+# that sees records from loggers nobody anticipated. Idempotent.
+apns.install_log_redaction()
 log = logging.getLogger("aiko_gateway")
 
 settings.export_aiko_env()  # aiko_services reads AIKO_MQTT_* from os.environ

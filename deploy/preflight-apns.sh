@@ -27,13 +27,39 @@ set -euo pipefail
 env_file="${1:?usage: preflight-apns.sh <path-to-.env>}"
 [ -f "$env_file" ] || exit 0
 
+# PARSER SKEW IS THE REAL HAZARD HERE, and it is bidirectional (cage-match PR#148,
+# Carnot MEDIUM — verified, and worse than reported). This script is a SECOND reader of
+# a file whose FIRST reader is python-dotenv, via pydantic-settings. Any form dotenv
+# accepts and this misses makes the two disagree:
+#
+#   * all four written `export APNS_...=x` -> island sees four and boots; a naive
+#     `^KEY=` match sees ZERO and reports "none configured". Silent pass.
+#   * three plain, one `export` -> island sees four and boots; naive match sees three
+#     and ABORTS A HEALTHY DEPLOY. That false red is the worse direction: it blocks a
+#     box that was fine, and a safety check that cries wolf gets deleted.
+#
+# Measured against python-dotenv on a fixture: it read three keys where `^KEY=` read
+# one. So this matches dotenv's real grammar — optional leading whitespace, optional
+# `export `, optional spaces around `=`, optional surrounding quotes.
+#
+# RESIDUAL SKEW, named rather than pretended away: multi-line quoted values and
+# variable interpolation (`${OTHER}`) are NOT handled. Neither appears in either live
+# box's .env, and both would need a real parser rather than a regex. If a box ever
+# needs one, exec the check inside the running container and use the island's OWN
+# dotenv rather than growing a third parser here.
 set_keys=(); missing_keys=()
 for k in APNS_KEY_ID APNS_TEAM_ID APNS_TOPIC APNS_PRIVATE_KEY; do
   # Present AND non-blank. config.py restores absence for a whitespace-only value
   # (claude-tasks#3358), so a key with a blank value is "unset" to the island and must
   # not count as partially-configured here either — otherwise this preflight would
   # abort a deploy on a box that boots perfectly well.
-  value=$(sed -n "s/^${k}=//p" "$env_file" | tail -1 | tr -d '[:space:]')
+  value=$(sed -nE "s/^[[:space:]]*(export[[:space:]]+)?${k}[[:space:]]*=[[:space:]]*//p" \
+            "$env_file" | tail -1)
+  # Strip one layer of matching quotes the way dotenv does, THEN test for blank — so
+  # APNS_TOPIC="" and APNS_TOPIC="   " both read as unset, matching the island.
+  value="${value%\"}"; value="${value#\"}"
+  value="${value%\'}"; value="${value#\'}"
+  value=$(printf '%s' "$value" | tr -d '[:space:]')
   if [ -n "$value" ]; then set_keys+=("$k"); else missing_keys+=("$k"); fi
 done
 
