@@ -67,6 +67,31 @@ $DOCKER compose version >/dev/null 2>&1 || die "docker compose v2 not available"
 $DOCKER compose ps --status running --services 2>/dev/null | grep -qx chat-island \
   || die "the 'chat-island' service isn't running — use deploy/standup.sh for a first standup"
 
+# --- preflight: a PARTIAL APNS_* set now refuses to boot --------------------
+#
+# claude-tasks#3366 (cage-match PR#141 round 3, Tesla — an accepted risk, recorded
+# rather than absorbed). APNS_* used to be dead ink on a host: compose did not
+# forward it, so a half-drafted credential set (key id and team id pasted in, the
+# private key still to come) sat harmlessly in .env and the island booted with push
+# simply off. PR#141 made compose forwarding total, so those bytes now reach the
+# container — where config.py's half-configured guard deliberately REFUSES TO BOOT.
+#
+# The guard is right and must not be weakened: a partial set reads as "push is on"
+# at every call site while every send fails at Apple's door, and on a handset a
+# missed call is indistinguishable from a disabled feature. What changed is WHEN it
+# fails — at boot instead of never. With `restart: always` that is a crash-loop, on
+# a box nobody touched, triggered by a version bump rather than by an edit.
+#
+# So catch it HERE, before the backup and before anything is pulled: an operator
+# reading this message still has a running island.
+# Extracted to its own script so it can be tested directly rather than only in situ
+# (tests/test_deploy_preflight.py exercises the all/none/partial arms). A check that
+# cannot be run in isolation tends to be a check nobody proves can fail.
+if [ -x "$SCRIPT_DIR/preflight-apns.sh" ]; then
+  "$SCRIPT_DIR/preflight-apns.sh" "$REPO_ROOT/.env" \
+    || die "APNs preflight failed (see above) — aborting BEFORE the backup; the island is still running"
+fi
+
 # --- step 1: back up the sole-copy DB (fail-closed) -------------------------
 if [ "$DO_BACKUP" = "true" ]; then
   log "Step 1/3 — backing up the SQLite store (online hot copy) BEFORE any change"
