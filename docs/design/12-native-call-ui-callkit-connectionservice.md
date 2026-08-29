@@ -1,274 +1,361 @@
 # Design 12 — Native call UI (CallKit / ConnectionService) and what it costs the island
 
-**Status:** PROPOSED. Nothing built, nothing agreed. Written 2026-08-29 the day the
-platform choice was made, so the reasoning exists before the build rather than after.
-**Not yet grounded against the app tab's reply** — the questions put to it are in
-§Open questions, and its answers outrank anything asserted here about the client.
+**Status:** PROPOSED. Nothing built. **Revised 2026-08-29 after the app tab's answers**,
+which reversed two of the first draft's decisions and deleted a third — the revision is
+recorded in §What the first draft got wrong rather than quietly folded in.
 
 **Decision of record it rests on:** Nick, 2026-08-29 — the client will use **CallKit +
-PushKit on iOS** and **ConnectionService + full-screen intent on Android**. That is a
-client decision; this note records only what it forces on the *gateway*.
+PushKit on iOS** and **ConnectionService + full-screen intent on Android**.
 
-**Tier:** v0.11.0 (structural). It changes the schema, changes the wire, and re-prices a
-trust boundary — so by the working conventions it is cage-match by law, the wire half is
-agreed with `aiko_chat_app` before either side merges, and **the island deploys first**.
+**Tier:** v0.11.0 (structural). Schema change, wire change, and a re-priced trust
+boundary — cage-match by law, wire half agreed with `aiko_chat_app` before either merges,
+island deploys first.
 
 ---
 
 ## The one-sentence version
 
-Native call UI needs a *call* — an addressable object with an identity, a liveness
-state, and a cancel signal. The island has never had one: a ring is a direct message
-whose body happens to equal a pinned sentinel string, and the push that carries it
-names a channel, not a call. Everything expensive below follows from that single gap.
+Native call UI needs an addressable call with a liveness signal. The island has never had
+one — a ring is a direct message whose body equals a pinned sentinel, and the push names a
+channel, not a call. **But the id does not have to be the island's**, and that single
+correction is what takes this from "build a call object" to two small changes.
+
+## What the first draft got wrong
+
+Recorded because the reasoning matters more than the conclusion.
+
+1. **It framed the call-as-first-class-object DISSOLVE as needing *re-opening* on a
+   changed premise. Wrong — it needed reading correctly.** The strike killed a *decorative
+   server row*: objecthood kept as a word, not a property; a v2 call that "could not decide
+   anything, survive its own end, federate, or separate call N from N+1 at the SFU". It
+   never ruled against call identity as such. CallKit wants precisely what that design
+   refused to build — an id actually on the invite — so nothing needs re-litigating.
+2. **It proposed the island mint the call id.** Unnecessary. A client-minted ULID in the
+   signed invite body satisfies every constraint at a fraction of the cost (Decision 1).
+3. **It proposed an island identity-resolution endpoint for the CallKit UI.** Deleted —
+   it cannot work. On a push-woken cold start the CallKit report happens in Swift *before
+   the Flutter engine exists*, so no fetch, and no Dart cache read, can precede it
+   (Decision 6).
 
 ## Where the island actually is today
 
-Read from source, not recalled:
+Read from source:
 
 - **A ring is a message.** `push_service.CALL_INVITE_BODY` is the pinned sentinel
-  `"aiko:call/1 · 📞 started a call"`, compared with an exact match (never a prefix —
-  a prefix test hands an attacker a wake primitive with arbitrary trailing content).
-  `should_wake(channel_kind, body)` is true iff the channel is a DM **and** the body is
-  exactly those bytes.
-- **The push names a channel, not a call.** `_payload` is deliberately opaque and carries
-  a single custom field, `c` = channel_id. The docstring is explicit that naming the
-  caller is the thing being refused, because APNs can read everything we send it.
-- **It is an alert push, not a VoIP one.** `apns-push-type: alert`,
-  `apns-priority: 10`, `apns-expiration` = `_EXPIRATION_SECONDS` = 60, and **no retry**,
-  deliberately (a ring that surfaces late is worse than no ring).
-- **One token per device.** `device_tokens` has `UNIQUE(token)`, `platform`
-  (`Platform.APNS` | `Platform.FCM`), and `apns_environment` (#3386). Nothing records
-  what a token is *for*.
-- **Android is unbuilt.** `Platform.FCM` exists in the enum; `config.py` says plainly
-  that "Android/FCM is a separate transport behind the same door, NOT built yet".
-- **There is no call-end concept at all.** `CALL_INVITE_BODY` is the only sentinel the
-  island knows. A call-end message is an ordinary DM the island persists and fans out,
-  and it wakes nothing, because `should_wake` requires the invite bytes.
+  `"aiko:call/1 · 📞 started a call"`, matched exactly (never a prefix — that would hand
+  an attacker a wake primitive with arbitrary trailing content). `should_wake` is true iff
+  the channel is a DM **and** the body is exactly those bytes.
+- **The push names a channel, not a call** — `_payload` carries one custom field, `c`.
+  Deliberately opaque: naming the caller would tell Apple who calls whom.
+- **Alert push, not VoIP:** `apns-push-type: alert`, priority 10, `apns-expiration` = 60s,
+  and no retry, deliberately.
+- **One token per device.** `device_tokens`: `UNIQUE(token)`, `platform`, `apns_environment`
+  (#3386). Nothing records what a token is *for*.
+- **Android unbuilt.** `Platform.FCM` exists; `config.py` says FCM is "a separate transport
+  behind the same door, NOT built yet".
+- **No call-end concept at all.** `CALL_INVITE_BODY` is the only sentinel the island knows,
+  so a call-end message wakes nothing. **This is the real island blocker.**
 
 ## The thing that changes everything: the failure inverts
 
-Today a stale invite is a **silent non-event**. That is the live bug (2026-08-29, with
-the app tab): a push-woken invite can only arrive via REST history — it is `<= fence` by
-construction, so the island never emits it as a live frame — and its `created_at` is
-stamped at island-receive, so its measured age necessarily includes APNs delivery, human
-reaction, cold start, handshake and backfill. The client's 10s freshness window cannot
-admit the exact case push exists to serve. The user sees nothing.
+Today a stale invite is a **silent non-event** — the live bug (2026-08-29, with the app
+tab): a push-woken invite is `<= fence` by construction so it can only arrive via REST
+history, and `created_at` is stamped at island-receive, so its measured age necessarily
+includes APNs delivery, human reaction, cold start, handshake and backfill. The client's
+10s freshness window cannot admit the exact case push exists to serve.
 
-Under CallKit the *same* stale invite is a **full-screen ring, through silent mode and
-Do Not Disturb, for a call nobody is on.**
+Under CallKit the same stale invite is a **full-screen ring, through silent mode and Do Not
+Disturb, for a call nobody is on.**
 
-Same missing predicate, opposite sign. This is the strongest available evidence that the
-real work is a **call-liveness predicate**, not a tuned constant — and native UI attaches
-a deadline to it, because the new failure is one every user sees and none can explain.
+Same missing predicate, opposite sign. The work is a **call-liveness predicate**, not a
+tuned constant — and native UI attaches a deadline to it.
 
 ---
 
-## Decision 1 — a call becomes an addressable object, and it lands FIRST
+## Decision 1 — the call id is CLIENT-minted; the island carries it, and owns no call object
 
-CallKit and ConnectionService are both built around a **per-call UUID**. Cancellation
-needs to address one specific call. With only `c` (channel_id) the island can say
-"stop ringing for channel X", which is wrong under any concurrency and racy whenever a
-cancel overtakes its invite.
+The caller mints a ULID client-side and puts it in the signed invite body:
 
-So: **a call id is minted at invite time and carried by every push about that call** —
-the invite, the cancel, and any later state signal. Both platform APIs, the cancel path,
-and the client's liveness predicate are four things blocked on this one object, so it is
-the first increment and nothing else starts before it.
+```
+aiko:call/2 <ulid>          # invite wire v2 — the id is IN the signed body
+```
 
-This is deliberately the *smallest* version of "call as a first-class object" that the
-platform forces: an identity and a lifecycle signal, not a participant set, not a call
-table with policy on it. §Open questions Q1 asks the app tab whether that is enough.
+The end sentinel references the same id. ULID is 128 bits, so it maps losslessly onto the
+UUID CallKit and ConnectionService both require.
 
-**Cross-repo note, surfaced not resolved.** The `call as first-class object` crucible
-converged CANDIDATE INVALIDATED (3/4 DISSOLVE, 2026-08-16); #3170 and #3172 were closed
-and the product fix moved to a signed call-end sentinel in the app repo (#3198). That
-dissolve was argued on a **pre-CallKit premise**. The platform now demands a call
-identity and a cancel signal regardless of what either repo would prefer. That is a
-changed premise, not a reversal — and per the working conventions the app tab's record
-is the other half of the binding contract, so this note raises the conflict and does not
-tie-break it.
+This satisfies every finding the temper left standing:
 
-## Decision 2 — two token kinds per device, and the partial state is the risk
+| finding | how a client-minted id satisfies it |
+|---|---|
+| **D5** — objecthood kept as a word, not a property | the id IS on the invite, which is exactly what v2 refused |
+| **D1 (Tesla)** — a server liveness detector is blinded by its own trigger | there is no detector; cancellation is a **signed client message** |
+| **D4 (Carnot)** — "a write you may skip and a read you must not trust is not an API" | no `POST /v1/calls`, no `GET`, no webhook, **no schema** |
 
-PushKit issues a **VoIP token that is distinct from the APNs alert token**. So
-`device_tokens` gains a `token_kind` (`alert` | `voip`), NOT NULL with a server_default
-of `alert` so a direct INSERT that omits it gets the value every existing row already
-means — the same shape as `apns_environment` in #3386, and for the same reason.
+**The island's entire half is therefore two changes:** carry the id in the push payload,
+and learn to wake on the end sentinel. That is the whole cost of call identity.
 
-The column is the easy half. The risk is the **partial state**:
+**Wire v2 carries a permanent tail.** The v1 sentinel is already inside signed messages in
+history on enspyr, so a **v1 read path exists forever** — v2 adds, never edits. The
+sentinel was always a one-way door; this is the door being used, not bypassed.
 
-- registration is an UPSERT KEYED ON THE TOKEN that reassigns `user_id`, because a device
-  changes hands (logout A → login B on the same phone) and a push must reach the current
-  owner;
-- with two tokens per install, a handover must reassign **both**;
-- a device holding one but not the other is **half-reachable** — fine for messages,
-  unreachable for calls, or the reverse — and today's `/health`
-  `push.devices_unreachable` signal cannot express that.
+**#3171 fires now.** Its trigger was recorded as not firing because "there is no island
+call_id to carry". There still isn't — but there is now a *client* call_id to carry, which
+satisfies the trigger by a different route than the one it was written for.
 
-An island that holds devices it cannot reach already says so (#3397). It should say
-*which capability* it cannot reach them for, or the signal quietly becomes a lie the day
-the second token kind exists.
+## Decision 1b — the sanctioned future island object, and why it is NOT this work
 
-## Decision 3 — one credential, two topics (this part is cheap, and the preflight moves with it)
+**Both tabs initially under-read the record here, so it is written down.** Issue #3170's
+DISSOLVE set one reopening bar: *name a server-side decision that must be authoritative.*
+Nick's ruling of 2026-08-17 states **that bar has been met** — under "calls are gatherings,
+not channel properties", **per-call membership** is that decision, because who may join
+*this gathering* can no longer be inherited from channel membership. The ruling says
+explicitly that **Carnot's D4 objection does not apply to an ACL.**
+
+So "the island may never hold call state" is **too strong**, and quoting D4 as a permanent
+ban misreads it. What is true is narrower and load-bearing:
+
+- an authoritative **per-call ACL** is sanctioned, and is a *new* design
+  (gathering-with-its-own-ACL) rather than round 3 of the dissolved one;
+- it **must not start before #3196 settles whether a gathering can span islands**, by that
+  same ruling;
+- **Decision 1 is deliberately not that design.** It is the minimum the platform forces,
+  and it is forward-compatible with the ACL rather than a substitute for it.
+
+## Decision 1c — CallKit weakens one of the DISSOLVE's own pillars (flagged, not acted on)
+
+Maxwell's DISSOLVE pillar was *there was no server-only fact anyway*: "the shipped app
+carries `kCallRingDuration = 30s`; a crashed caller rings for at most 30 seconds with no
+island involvement."
+
+That argument rests on a **Dart-side ceiling**. A CallKit ring is system UI drawn before
+Dart exists and **does not self-expire** — it ends only when something calls
+`reportCall(with:endedAt:reason:)`. So the 30s ceiling has to be re-established somewhere
+that survives app suspension.
+
+The app tab owns re-establishing it and has taken it. Recorded here because it means one
+of the three DISSOLVE pillars is **weaker under CallKit than when it was cast** — which
+does not reopen anything today, but is exactly the kind of premise-shift that should be on
+the record before the gathering design is cast.
+
+## Decision 2 — two token kinds, and PARTIAL IS THE DEFAULT
+
+`device_tokens` gains `token_kind` (`alert` | `voip`), NOT NULL, `server_default='alert'`
+so an existing row means what it already meant — same shape as `apns_environment` (#3386).
+
+The first draft treated a half-registered device as an edge case. **The app tab's reading
+of its own registration path says it is the normal case**, and one arm is permanent:
+
+1. **Permission asymmetry — not a race.** The APNs alert token requires the user to grant
+   notification permission. **A PushKit VoIP token requires no permission at all.** A user
+   who declines notifications has a VoIP token and will *never* have an alert token.
+2. **Two independent async callbacks** (`didRegisterForRemoteNotifications…` and
+   `pushRegistry(_:didUpdate:for:)`); whichever lands first registers alone.
+3. **Independent rotation** — either token can rotate without the other.
+4. **Android has exactly one token.** FCM has no VoIP equivalent, so `token_kind` must not
+   imply both-required *anywhere* in the model.
+
+Therefore **"reachable for messages, unreachable for calls" is a legitimate state, not a
+degraded one**, and `/health`'s `push.devices_unreachable` (#3397) must say *which
+capability* it cannot reach a device for. An island that reports it holds devices it
+cannot reach should not start lying the day there are two ways to be unreachable.
+
+### Decision 2a — the worst state in the system
+
+The app half maintains a durable unregister debt (`PendingUnregisterStore`) recording **a
+set of tokens per island, with no kind**, and its correctness argument leans on the
+island's upsert-on-token reassigning `user_id`.
+
+Add a second token kind, and **a sign-out that discharges only one kind leaves a routable
+VoIP row for a handset that has been signed out.** Today that mis-delivers a silent data
+push. Under CallKit it is **a stranger's phone ringing full-screen, through silent mode,
+for a call meant for the previous owner.**
+
+The island must therefore **assume the debt can be partial** rather than assume pairing —
+tear down by `(token)` as now, but never infer that discharging one kind discharged the
+other. The app tab carries the client half.
+
+## Decision 3 — one credential, two topics; the preflight moves in the same change
 
 VoIP needs `apns-topic: <bundle-id>.voip` and `apns-push-type: voip`. Because the island
-authenticates with a **`.p8` token (JWT)** rather than a certificate, **the same signing
-key covers VoIP** — there is no second credential set to provision, rotate or leak. The
-config gains one field (the VoIP topic); `apns_key_id`, `apns_team_id` and
-`apns_private_key` are untouched.
+authenticates with a **`.p8` token (JWT)** rather than a certificate, **the same signing key
+covers VoIP** — no second credential set to provision, rotate or leak. Config gains one
+field.
 
-Two consequences that must not drift apart:
+Two things that must not drift apart:
 
-1. The half-configured guard is **all-or-none** by design, and it now has a fifth member.
-   A partial set refuses to boot — correct, and must not be weakened.
-2. **`deploy/preflight-apns.sh` must gain the same member in the same change.** It shipped
-   in v0.9.1 (live on both islands 2026-08-29) precisely so a partial set aborts the
-   deploy while the operator still has a running island. A preflight that checks four of
-   five keys passes a config that cannot ring — a check that cannot detect the failure it
-   exists for. Its tests (`tests/test_deploy_preflight.py`) exercise all/none/partial and
-   must be extended in lockstep.
+1. The half-configured guard is all-or-none by design and gains a fifth member. A partial
+   set refuses to boot — correct, and must not be weakened.
+2. **`deploy/preflight-apns.sh` gains the same member in the same change.** It shipped in
+   v0.9.1 (live both islands, 2026-08-29) so a partial set aborts the deploy while the
+   operator still has a running island. A preflight checking four of five keys passes a
+   config that cannot ring — a check blind to the failure it exists for.
+   `tests/test_deploy_preflight.py` (all/none/partial arms) extends with it.
 
 ## Decision 4 — the send path forks at the door, and VoIP is calls only
 
-Apple's contract, which has no slack in it: since iOS 13 **every VoIP push must be
-reported to CallKit immediately** on receipt. Miss it and the app is terminated; do it
-repeatedly and VoIP push privileges are revoked. Apple's policy is likewise that VoIP
-pushes carry calls and nothing else.
-
-So the island can never send a VoIP push that *might* not be a call, and the alert/VoIP
-decision is made **at the island, correctly, every time**:
+Since iOS 13, **every VoIP push must be reported to CallKit before the delivery handler
+returns**, or the system terminates the app; repeated violations revoke VoIP push
+privileges. Apple's policy is likewise that VoIP pushes carry calls and nothing else.
 
 ```
 is this a call?  -> voip token  + <bundle>.voip topic + push-type voip
 otherwise        -> alert token + <bundle> topic      + push-type alert
 ```
 
-`should_wake` already holds the call predicate, so the fork belongs beside it, inside the
-one door every send path passes — the same discipline as `should_federate`. A second send
-path must not be able to forget which kind of push it is making.
+`should_wake` already holds the call predicate, so the fork belongs beside it inside the
+one door every send path passes — the same discipline as `should_federate`.
 
-The deeper consequence: **there is no on-device window in which to reconsider.** The
-client cannot receive a VoIP push, check whether the call is still live, and decline to
-ring — it must ring first. Send-time correctness therefore moves onto the island, at
-exactly the point where it has no call model. Decision 1 is what makes Decision 4
-implementable.
+The deeper consequence: **there is no on-device window in which to reconsider.** The client
+cannot receive a VoIP push, check liveness, and decline to ring — it must ring first. So
+send-time correctness moves onto the island.
 
-## Decision 5 — cancellation is a first-class push, with its own gates
+## Decision 5 — waking on the end sentinel is the island's real blocker
 
 A cancel is not an ordinary message that happens to be fanned out. It must:
 
-- **reach a device that may never have received the invite** (the invite push expired,
-  was dropped — there is no retry — or the device was off);
+- **reach a device that never received the invite** (expired at 60s, dropped — there is no
+  retry — or the device was off);
 - **be idempotent and ordered against its invite**, since a cancel can overtake it;
-- **carry the call id from Decision 1**, never just a channel;
-- **pass its own admission gate.** `should_wake` is written for the invite bytes; a cancel
-  is a second wake reason and inherits none of that reasoning for free.
+- **carry the call id** from Decision 1, never just a channel;
+- **pass its own admission gate** — `should_wake` is written for the invite bytes and a
+  cancel inherits none of that reasoning for free;
+- **remain a signed client message.** Per D1, the island never *infers* an end. It carries
+  and wakes on one.
 
 A cancel that cannot be addressed, or that arrives for a call the device never learned
-about, is the mechanism by which the inverted failure becomes permanent — a phone ringing
-with nothing able to stop it.
+about, is how the inverted failure becomes permanent: a phone ringing with nothing able to
+stop it.
 
-## Decision 6 — the opaque payload survives, via placeholder-then-update
+## Decision 6 — the opaque payload survives, and the island owes NOTHING for it
 
-`_payload` refuses to name the caller: a payload saying "Alice is calling you" tells Apple
-who calls whom, on a product whose thesis is that such facts stay with the operator. The
-accepted cost, stated honestly in the code, is that the lock-screen banner reads
-"Incoming call". CallKit raises the stakes because its full-screen UI **wants a caller
-name**.
+The first draft's island identity-resolution endpoint is **deleted**: on a push-woken cold
+start the report happens in Swift before the Flutter engine exists, so nothing — network or
+Dart cache — can precede it.
 
-Three options, and the recommendation is the middle one:
+The app tab's exit is better and entirely client-side: **a small Swift-readable caller-name
+cache** (App Group / `UserDefaults`, keyed by channel id) that Dart maintains as the roster
+updates. The synchronous report reads it and already has the right name. No network, no
+round-trip, and **nothing about who-calls-whom on Apple's wire** — `_payload` keeps its
+refusal intact, unchanged.
 
-| | keeps the thesis | cost |
-|---|---|---|
-| put the handle in the VoIP payload | **no** | tells Apple who calls whom |
-| **report placeholder, then `reportCall(with:updated:)` after fetching from the island** | **yes** | a round-trip inside the PushKit handler |
-| show the island name only ("Aiko call") | yes | worst UX, no caller ever named |
+Three tiers, degrading honestly: Swift-readable local cache → `reportCall(with:updated:)`
+once Dart is up → a dignified placeholder (**the placeholder string is a product call, for
+Nick**).
 
-The middle path satisfies report-immediately *and* keeps the identity off Apple's wire,
-by making the anonymous window short rather than by filling it. It is the same mechanism
-as the Notification Service Extension previously scoped out for the banner — one
-mechanism serving both surfaces.
+**Verified against Apple's documentation JSON** (the HTML site is a JS-rendered SPA that
+returns title-only to both tabs' fetchers — a fact about the instrument, not the API):
 
-**This is a client-side viability question inside a window the island cannot see**, so it
-is Q2 to the app tab, not a decision this note gets to make. What the island owes it is
-an endpoint that resolves a call id to a display identity for an authorised member,
-fast — and, notably, *nothing new on the wire to Apple*.
+```
+func reportCall(with UUID: UUID, updated update: CXCallUpdate)
+```
+
+Tier 2 is real and does what it is being asked to do.
+
+### Decision 6a — CallKit calls land in the system Recents list, and Apple does not document the default
+
+Also verified from the same JSON:
+
+```
+var includesCallsInRecents: Bool { get set }
+```
+
+> "A Boolean value that indicates whether the provider includes a call in the system's
+> Recents list after the call ends."
+
+**Apple's own published documentation does not state its default** — the sentence in the
+JSON is literally `"The default value of this property is ."`, truncated at source. So the
+default cannot be relied on and **must be set explicitly**, whichever way Nick decides.
+
+This is a genuine privacy surface on a product whose thesis is that who-calls-whom stays
+with the operator: a CallKit call can appear in the system Phone app's call history after
+it ends. **A product decision for Nick**, raised here because it is invisible until
+someone opens Recents. (Whether iOS then syncs that history off-device is *not* verified
+here and should not be assumed either way.)
 
 ## Decision 7 — re-price the wake gate at the new blast radius
 
 The existing gates — DM-only, exact sentinel, not-a-blocked-pair — were priced against a
-**banner**. One accepted risk is recorded explicitly in `push_service`: a muted DM still
-wakes the handset, because the mute is client state and you cannot un-ring a phone.
+**banner**, including the accepted risk recorded in `push_service`: a muted DM still wakes
+the handset, because mute is client state and you cannot un-ring a phone.
 
-Under CallKit that same wake is a full-screen ring that punches through silent and Do Not
-Disturb. **A hole in `should_wake` stops being a spam vector and becomes a remote
-full-screen-ring primitive against an arbitrary user** — a harassment tool, not a
-nuisance. The accepted risk was priced at the old radius and does not carry forward by
-default; it gets re-argued at the cage-match, with mute re-examined now that the cost of
-honouring it has changed sign.
+Under CallKit that wake is a full-screen ring punching through silent and DND. **A hole in
+`should_wake` stops being a spam vector and becomes a remote full-screen-ring primitive
+against an arbitrary user** — harassment, not nuisance. That accepted risk does not carry
+forward by default; it is re-argued at the cage-match, with mute re-examined now that the
+cost of honouring it has changed sign.
 
-## Decision 8 — Android is a new transport, not a modification
+## Decision 8 — Android is a new transport, and its gate is store review
 
-`Platform.FCM` exists in the enum and nothing implements it. ConnectionService therefore
-means building the FCM send path from zero: credentials, send, the token lifecycle, the
-reaper's equivalent of APNs' 410/`BadDeviceToken` handling, and the same alert/VoIP-shaped
-fork (FCM high-priority data message for a call, notification message otherwise).
+`Platform.FCM` exists and nothing implements it: credentials, send path, token lifecycle,
+the equivalent of APNs' 410/`BadDeviceToken` reaping, and the same call/non-call fork.
 
-**Confidence marker, stated rather than buried:** Android 14+ gates
-`USE_FULL_SCREEN_INTENT` — it is no longer freely granted, non-calling apps must request
-it, and Play reviews the declaration. A calling app should qualify. My confidence on the
-*current* gating and review criteria is moderate, and it is policy that moves; it must be
-checked against current documentation by whoever owns the Android half rather than taken
-from this note. Failure there is silent — the notification simply does not go full-screen.
+The first draft flagged thin confidence on `USE_FULL_SCREEN_INTENT`. **The app tab checked
+it and the shape is sharper than the odds:** it became a *special access permission* in
+Android 14, auto-granted only to apps whose core function is calling or alarms; a **Play
+Console declaration has been required since 31 May 2024**, with default-grant tightening
+again from 22 Jan 2025; unapproved apps must prompt at runtime and degrade gracefully.
+
+We plausibly qualify — this is genuinely a calling app. The finding is that **this is a
+store-review dependency, not a code dependency, and it is slower than the build.** Whoever
+owns the Play declaration should start it now rather than discover it at submission.
+
+## Decision 9 — #3196 is a hard gate, and CallKit makes it louder
+
+Cross-island calling is **broken today**: `room_for_channel()` is gateway_id-namespaced
+(`imagineering:` vs `enspyr:`) and the two islands run separate SFUs. That was found during
+the temper and filed as #3196, and it is the reason the gathering design is held.
+
+Under CallKit the failure gets much louder: **a full-screen ring, through DND, for a call
+the callee physically cannot join.** Today the same failure is a quiet dead end.
+
+So #3196 is not only the gate on the *future* ACL design (Decision 1b) — it is a
+precondition on shipping native call UI to any pair of users who might not share an island.
+Worth knowing before this ships, not after.
 
 ---
 
 ## What gets better
 
 `_EXPIRATION_SECONDS = 60` (island) and `kCallInviteFreshness = 10s` (app) are two answers
-to one question — *how late is too late for a ring?* — decided in different repos, 6×
-apart, each with a written justification, neither aware of the other. The gap between them
-is where the current bug lives.
-
-Native call UI **forces the reconciliation**, because a VoIP push should expire exactly
-when the ring stops. The two constants collapse into one number with a physical meaning
-(ring duration), derived from call semantics rather than from wire latency. That is a
-genuine simplification arriving with the cost.
+to one question — *how late is too late for a ring?* — 6× apart, in different repos,
+neither aware of the other. The gap between them is where the current bug lives. Native
+call UI forces the reconciliation, because a VoIP push should expire exactly when the ring
+stops; the two collapse into one number with a physical meaning (ring duration), derived
+from call semantics rather than wire latency.
 
 ## Sequencing
 
-1. **Call identity** (Decision 1) — schema + wire. Everything else is blocked on it.
-2. **Token kind + half-reachable signal** (Decision 2) — schema, and the `/health` change.
-3. **Topic + preflight** (Decision 3) — config, moving in ONE change with its own test.
-4. **Send-path fork** (Decision 4) and **cancel push** (Decision 5) — the trust-boundary
-   work, cage-matched together because they share a gate.
-5. **Identity-resolution endpoint** (Decision 6) — gated on the app tab's answer to Q2.
-6. **FCM transport** (Decision 8) — independent of 1-5 once the call object exists.
+1. **Carry the call id** (Decision 1) — push payload + v2 sentinel read path. Small.
+2. **Wake on the end sentinel** (Decision 5) — the actual island blocker.
+3. **`token_kind` + partial-debt safety + capability-aware `/health`** (Decisions 2, 2a).
+4. **VoIP topic + preflight, in ONE change with its tests** (Decision 3).
+5. **Send-path fork** (Decision 4).
+6. **FCM transport** (Decision 8) — independent once 1-2 exist; start the Play declaration
+   in parallel, since it is slower than the code.
 
-Decisions 4, 5 and 7 are one cage-match, not three: they are the same trust boundary seen
-from three sides, and reviewing them apart is how a fix for one re-opens another.
+Decisions 4, 5 and 7 are **one cage-match, not three** — the same trust boundary from three
+sides; reviewing them apart is how a fix for one re-opens another. Decision 2a belongs in
+that review too: it is where a schema change becomes a stranger's phone ringing.
 
-## Open questions — for the app tab, sent 2026-08-29
+Gated separately: **Decision 9 (#3196)** before shipping to cross-island pairs, and
+**Decision 1b** (the gathering ACL) which must not start before #3196 settles.
 
-- **Q1.** Does the crucible's DISSOLVE of call-as-first-class-object survive the CallKit
-  premise, or does it need re-opening? Decision 1 assumes the *minimum* object (identity +
-  lifecycle signal) and no more. The app tab owns that record.
-- **Q2.** Is placeholder-then-`reportCall(with:updated:)` viable inside the window PushKit
-  allows? Decision 6 depends on it; if not, the privacy decision itself needs re-opening
-  with Nick.
-- **Q3.** Can the client's registration path ever land one token kind without the other? If
-  yes, the half-reachable state in Decision 2 is real and gets modelled rather than
-  discovered in production.
-- **Q4.** How is #3588's notification-tap handler scoped now? Under CallKit the ring no
-  longer arrives via a tap; the handler stays correct for ordinary message pushes but
-  stops being the ring's entry point.
+## Open questions
+
+- **Nick — the placeholder string** shown before a caller name resolves (Decision 6).
+- **Nick — `includesCallsInRecents`** (Decision 6a): a CallKit call can appear in the
+  system call history after it ends, and Apple does not document the default, so it gets
+  set explicitly either way.
+- **Nick — who owns the Play `USE_FULL_SCREEN_INTENT` declaration**, and starting it now
+  (Decision 8).
 
 ## Provenance
 
-Written by Claude (island tab) 2026-08-29, from a decision Nick made the same day, and
-grounded in `push_service.py`, `apns.py`, `models.py`, `config.py` and the live 2026-08-29
-cross-tab diagnosis with `aiko_chat_app`. Claims about the client are the island's *reading*
-of the client and are marked as questions where they matter. High confidence on the PushKit
-report-immediately contract, the distinct VoIP token, and `.p8` auth covering VoIP with only
-a topic change; explicitly thinner on current Android full-screen-intent policy (Decision 8).
+Claude (island tab), 2026-08-29, revised the same evening after the app tab's answers.
+Grounded in `push_service.py`, `apns.py`, `models.py`, `config.py`, tracker #3170 read
+end-to-end (both comments — the second is where Decision 1b comes from), and Apple's
+documentation JSON for the two CallKit symbols quoted. Claims about client internals are
+the app tab's, attributed as such. The `reportCall(with:updated:)` and
+`includesCallsInRecents` declarations are verified; `includesCallsInRecents`'s **default is
+NOT verified because Apple does not publish it**, and no behaviour beyond the quoted
+abstract should be inferred from this note.
