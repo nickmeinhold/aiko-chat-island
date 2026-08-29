@@ -375,59 +375,91 @@ cross-island call setup. If it is down the caller cannot place an outbound cross
 — acceptable, because a caller whose own island is down has no session and cannot do anything
 else either.
 
-### Decision 9b — the foreign-operator exposure, DISCLOSED
+### Decision 9b — the foreign-operator exposure, and the answer that is already filed
 
-Surfaced by the app tab from a question of Nick's, and written here rather than left to the
-parked ACL design, because **Decision 9 is what creates it.**
+Surfaced by the app tab from a question of Nick's. **Rewritten after a bad first draft** —
+the error is kept below rather than quietly replaced, because it is the more useful half.
 
 **Measured, not assumed** (app tab, `livekit_call_service.dart:152`): `Room.connect` passes
-`connectOptions` and `fastConnectOptions` and **no `e2eeOptions`**; a grep for
-`e2ee|encrypt|frameCryptor|keyProvider` across `lib/features/call/` returns nothing. LiveKit
-decrypts at the SFU by default. So for a **cross-island** call the callee's operator holds:
+no `e2eeOptions`, and a grep for `e2ee|encrypt|frameCryptor|keyProvider` across
+`lib/features/call/` returns nothing. LiveKit decrypts at the SFU by default.
 
-- the **caller's IP**, from a direct client→SFU connection;
-- **call timing and duration**;
-- **the audio and video in the clear**;
-- and under Decision 9a, an explicit island-A vouch **naming that caller**.
+#### The exposure, split into two halves that differ in KIND
+
+Collapsing them lets this read as "same known residual, new recipient", which understates it
+exactly where the decision is being made.
+
+| | what the callee's operator gets | covered by an existing accepted residual? | does media E2EE fix it? |
+|---|---|---|---|
+| **IP + call metadata** | caller's IP (direct client→SFU), timing, duration; under 9a an island-A vouch naming the caller | **Yes** — recorded as *"an operator promise about logging, not a property of the system"* | **No** |
+| **Audio + video content** | the media **in the clear** | **No** — same-island hosting meant media only ever reached the operator the user chose | **Yes** |
 
 For a person who is not their member, has no account with them, and never chose them.
 
-**Three precisions, because the honest version is narrower than the alarming one.**
+- **The metadata half** is an accepted residual **transferred outside the trust
+  relationship.** It was accepted about the user's *own* operator, a party they chose; a
+  logging promise from a stranger is worth less than one from your own operator, and E2EE
+  does not touch it.
+- **The content half is the bigger one, and it was never covered by anything.**
 
-1. **Not a regression.** Cross-island calling does not work today (Decision 9), so there is
-   no working "before" being degraded. Same-island is unchanged — your own operator already
-   hosts the SFU and already reads message bodies (`should_wake` matches the invite sentinel
-   in cleartext; `messages.body` is plaintext). **Own-operator visibility was never the
-   protected property** — `_payload`'s opacity is aimed at Apple, and the thesis is that
-   these facts stay *with the operator*, not that they are hidden from it.
-2. **Not caused by 9a, or even by which side was picked.** The exposure is inherent to
-   per-island SFUs plus cross-island calls: whichever island hosts, *some* operator sees a
-   non-member's media. Mirroring it (caller's island hosts) moves the exposure to the
-   callee and breaks the ring-path argument that motivated the ruling. This is a property
-   of cross-island calling **existing at all**.
-3. **There IS a prior story, and naming it locates the defect exactly.** The friends
-   sender-anonymity ruling already records that IP exposure is *"an operator promise about
-   logging, not a property of the system."* That residual was accepted **about the user's
-   own operator** — a party they chose. What is new is that Decision 9 **extends that
-   promise-dependency to an operator the user never chose and has no relationship with.**
-   An accepted residual is transferred outside the trust relationship. That, precisely, is
-   the finding.
+#### What the first draft got wrong
 
-   The adjacent prior is on a *different axis*: the full-federation ruling rejected a shared
-   SFU because it would make "one operator's box a hard dependency for every other operator"
-   — **availability**, not confidentiality. So the confidentiality axis genuinely has no
-   prior, and this is the first design to need one.
+1. **"The confidentiality axis genuinely has no prior" — FALSE.** The prior is
+   **claude-tasks#3426**, OPEN, labelled `project:aiko-chat-island`, filed by Nick on
+   2026-08-25 out of the *same* friends crucible whose residual this section quotes — five
+   rows below the line cited, in the same table: *"Media E2EE is orthogonal | Not part of
+   this build | Filed as #3426, must not be smuggled in."* The table was read to the row that
+   answered the question and no further. Same failure as missing #3170's second comment, in
+   the same session.
+2. **"E2EE is a design, not a flag" — also false**, and it conflated LiveKit **room-level
+   media** E2EE with the **group-message** crucible's pairwise-fanout key-management problem.
+   #3426 exists precisely to say those are different doors.
 
-**The available answer, and why it is not a flag.** LiveKit insertable-streams E2EE would
-reduce this to metadata only. It is a *design*, not a config switch: it lands the same
-pairwise-fanout-versus-broadcast key-management problem the group-E2EE crucible struck v1 of.
-Not proposed here.
+#### What #3426 actually says
 
-**Why it is written down now rather than solved.** Per the draft ADR-0008 on push topology,
-*"an unnamed centre gets discovered by an operator rather than disclosed to them"* — the same
-argument applies to an unnamed exposure discovered by a **user**. This is a
-**federation-thesis question for Nick**, not a call-feature one, and it is a precondition on
-shipping cross-island calling rather than on building it.
+LiveKit — already self-hosted on both boxes — has **built-in room-level E2EE via insertable
+streams**: applied automatically to all media tracks from all participants plus data channels,
+with the SFU forwarding packets it cannot decrypt, and group calls fully supported. So **calls
+could be end-to-end encrypted without touching the message path**, the report queue, or the
+moderator election. `island_mode` is one flag standing for two orthogonal dials, and the `e2ee`
+bolt is holding the *media* door shut for a reason that only applies to the *message* door.
+
+#### So the finding is not "we have no answer" — it is a RE-PRICING
+
+The answer is filed, and its deferral was reasoned. What Decision 9 changes is the **benefit**
+side of a question already in front of Nick — #3426's own decision 2, *"Is media E2EE wanted
+before Phase B MLS?"*, was priced when the only operator seeing your media was the one you
+chose. Under cross-island calling it becomes the thing that keeps an **unchosen foreign
+operator** out of your call content.
+
+**The costs in #3426 are unchanged and must not be understated:** server-side recording/egress,
+transcription and simulcast layer switching become limited; and splitting `island_mode` into two
+signed manifest fields is a **schema + wire change to a signed artifact** — enabling media E2EE
+while the manifest still advertises `moderator` is mislabel by omission. The friends crucible's
+instruction stands: **it must not be smuggled into another feature, and design 12 does not.**
+
+#### The collision Nick should see as part of the same decision
+
+#3426 names it: under media E2EE **an agent that participates in a call must be a KEYHOLDER,
+not an eavesdropper — a pipeline that cannot decrypt cannot run inference.** Resident agents
+are shipped (#3096) and the `webrtc://` DataScheme thread has aiko pipelines *consuming* media.
+#3426 reads keyholder-not-eavesdropper as *"arguably the right answer"*, but it is a real cost
+this product carries that a plain chat product would not — and it should be visible before the
+decision, not after.
+
+#### Unchanged from the first draft, and still the fair framing
+
+- **Not a regression.** Cross-island calling does not work today (Decision 9), so there is no
+  working "before". Same-island is unchanged: your own operator already hosts the SFU and reads
+  message bodies in cleartext (`should_wake`, `messages.body`). **Own-operator visibility was
+  never the protected property** — `_payload`'s opacity is aimed at Apple.
+- **Not caused by 9a or by which side was picked.** Whichever island hosts, *some* operator
+  sees a non-member's media; mirroring it moves the exposure to the callee and breaks the
+  ring-path argument. This is a property of cross-island calling **existing at all**.
+
+Disclosed here per draft ADR-0008's own argument — *"an unnamed centre gets discovered by an
+operator rather than disclosed to them"* — which holds equally for an exposure discovered by a
+**user**. Gates *shipping* cross-island calling, not building it.
 
 **Scope — and this part is NOT settled.** "The callee" is well defined for a **1:1 ring**,
 which is what is shipped and what CallKit is about. But under "calls are gatherings, not
@@ -482,9 +514,10 @@ Gated separately: **Decision 9 (#3196)** before shipping to cross-island pairs, 
 
 **Still open:**
 
-- **Nick — the foreign-operator exposure** (Decision 9b): a cross-island call gives the
-  callee's operator a non-member's IP, timing, and unencrypted media. A federation-thesis
-  question, and a precondition on *shipping* cross-island calling rather than on building it.
+- **Nick — media E2EE, re-priced** (Decision 9b): cross-island calling gives an **unchosen**
+  operator a non-member's media in the clear. The answer is already filed as **#3426** with
+  three decision questions; Decision 9 changes the benefit side of its question 2. Gates
+  *shipping* cross-island calling, not building it. Carries the agent-as-keyholder collision.
 - **Host-selection for a gathering spanning 3+ islands** — for whenever the
   gathering-with-ACL design is cast (Decision 1b), not before.
 
