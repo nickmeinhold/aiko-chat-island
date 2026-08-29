@@ -319,9 +319,38 @@ the temper and filed as #3196, and it is the reason the gathering design is held
 Under CallKit the failure gets much louder: **a full-screen ring, through DND, for a call
 the callee physically cannot join.** Today the same failure is a quiet dead end.
 
-So #3196 is not only the gate on the *future* ACL design (Decision 1b) — it is a
-precondition on shipping native call UI to any pair of users who might not share an island.
-Worth knowing before this ships, not after.
+### RULING (Nick, 2026-08-30): the CALLEE's island hosts the call
+
+This settles host-selection, which was the fork #3196 needed.
+
+**Why it is the right pick.** Under CallKit the callee's island *already owns the leg that
+must work*: it holds the callee's device tokens and sends the wake. Hosting the room there
+puts the push and the SFU on the same island, so the ring path carries **no cross-island
+dependency at all**. The caller — awake, in the app, and acting — is the party made to
+reach across.
+
+**And it retires the hard part.** The caller's app connects to the callee's island's
+LiveKit directly, over the public internet: an ordinary client→SFU connection. Both islands
+already serve `turns:<domain>:443` publicly with real relay-only calls proven end to end.
+So **there is no SFU-to-SFU federation, no clustering, and no new transport** — one call,
+one SFU, chosen by a rule. That retires the open premise recorded against the media-topology
+ruling ("self-hosted LiveKit may only cluster within one trust domain — verify before
+designing"): under this ruling you never cluster, so the premise stops being load-bearing
+rather than needing an answer.
+
+**What remains is an AUTH problem, not a media one.** The callee's island must mint a room
+token for **a user it does not own**, authenticated by the caller's home island. That is a
+federation trust boundary — cage-match by law — and it rides machinery that already exists:
+signed `/v1/island` manifests, `signing_keys`, and `origin` carriage. `room_for_channel()`'s
+`gateway_id` namespacing stops being a bug and becomes the *host designation*, once the rule
+says which gateway_id wins.
+
+**Scope — and this part is NOT settled.** "The callee" is well defined for a **1:1 ring**,
+which is what is shipped and what CallKit is about. But under "calls are gatherings, not
+channel properties" a call has its own participant set, and **a gathering across three or
+more islands has no single callee.** Host-selection for the gathering case is open, and this
+ruling must not be generalised to it. Not urgent — the gathering design is separately gated
+on #3196 (Decision 1b) — but it is the first question that design has to answer.
 
 ---
 
@@ -359,11 +388,16 @@ Gated separately: **Decision 9 (#3196)** before shipping to cross-island pairs, 
 - **`includesCallsInRecents`: appearing in Recents is fine** (Decision 6a). Set explicitly
   to `true`, because Apple does not publish the default.
 
+- **Cross-island calls are hosted on the CALLEE's island** (Decision 9). Settles
+  host-selection for 1:1; **the gathering case is explicitly not settled.**
+
 **Still open:**
 
 - **Nick — who owns the Play `USE_FULL_SCREEN_INTENT` declaration**, and starting it now
   rather than at submission (Decision 8). It is a store-review dependency and slower than
   the build.
+- **Host-selection for a gathering spanning 3+ islands** — for whenever the
+  gathering-with-ACL design is cast (Decision 1b), not before.
 
 ## Provenance
 
