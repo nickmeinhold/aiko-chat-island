@@ -117,12 +117,32 @@ ok "docker, git, openssl, curl, docker compose present"
 # --- preflight: media preconditions (only when we run the bundled SFU) -------
 # Same discipline as the TLS block: these matter ONLY under --with-media. An
 # island pointing LIVEKIT_URL at someone else's SFU owes none of it.
+lk_env="$SCRIPT_DIR/livekit/.env"
+_read_kv() { [ -f "$1" ] && grep -E "^$2=" "$1" 2>/dev/null | tail -n1 | cut -d= -f2- || true; }
+
 if [ "$DO_MEDIA" = "true" ]; then
+  # RESOLUTION ORDER for both hostnames: flag, then the value this island RECORDED,
+  # then convention. The middle rung is the one that was missing.
+  #
+  # Round 3 added persistence of LIVEKIT_DOMAIN and taught the RECOVERY branch (the
+  # no---with-media re-run) to read it back. The --with-media path was never taught,
+  # so an operator who stood up with --livekit-domain sfu.example.org and then re-ran
+  # WITH --with-media but WITHOUT repeating the flag had it silently reset to
+  # livekit.<domain> — and the .env write below then overwrote the recorded value with
+  # the convention one, destroying the only record of it. The gateway was handed a
+  # LIVEKIT_URL pointing at a host that may not serve the SFU, which fails at CONNECT.
+  #
+  # That is the round-1 hostname-derivation bug reappearing inside the round-3 fix, on
+  # the MORE likely path: --with-media is the documented safe-to-re-run invocation.
+  # Fixed as a class here rather than as a third instance — both hostnames, both
+  # branches, one resolution order.
+  [ -n "$TURN_DOMAIN" ]    || TURN_DOMAIN="$(_read_kv "$lk_env" LIVEKIT_TURN_DOMAIN)"
   [ -n "$TURN_DOMAIN" ]    || TURN_DOMAIN="turn.$DOMAIN"
   # SEPARATE name, not a synonym. Both live islands serve the SFU websocket on
   # livekit.<host> and TURN on turn.<host>; an earlier draft set LIVEKIT_URL to the
   # TURN name and would have handed every client the wrong endpoint (cage-match
   # PR#151, Carnot — verified against both live islands' .env).
+  [ -n "$LIVEKIT_DOMAIN" ] || LIVEKIT_DOMAIN="$(_read_kv "$lk_env" LIVEKIT_DOMAIN)"
   [ -n "$LIVEKIT_DOMAIN" ] || LIVEKIT_DOMAIN="livekit.$DOMAIN"
   log "Preflight — media (SFU on $LIVEKIT_DOMAIN, TURN on $TURN_DOMAIN)"
 
@@ -242,8 +262,8 @@ fi
 #      and a conflict between two non-empty pairs FAILS CLOSED rather than silently
 #      picking one — a wrong pick is a media plane that authenticates nothing.
 LIVEKIT_ENV_BLOCK=""
-lk_env="$SCRIPT_DIR/livekit/.env"
-_read_kv() { [ -f "$1" ] && grep -E "^$2=" "$1" 2>/dev/null | tail -n1 | cut -d= -f2- || true; }
+# lk_env and _read_kv are defined above the media preflight, which needs them to
+# recover the recorded hostnames before defaulting by convention.
 
 # A CREDENTIAL IS A PAIR, NOT TWO FIELDS. Resolving key and secret independently lets
 # a half-written file on one side combine with the other side into a HYBRID that
