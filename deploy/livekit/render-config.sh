@@ -69,10 +69,19 @@ if [ -n "$leftovers" ]; then
 fi
 
 if [ "$CHECK_ONLY" = "true" ]; then
-  printf '%s\n' "$rendered"
+  # REDACT the secret. --check answers "does this render?", never "show me the
+  # credential" — and its output goes to a terminal, a pipe, or a CI log. Printing a
+  # live media secret to stdout to prove the file is well-formed is a bad trade
+  # (cage-match PR#151, Carnot). --check is used by the tests, which assert on
+  # structure, not on the secret's value.
+  printf '%s\n' "$rendered" | sed -E "s|(^  ${LIVEKIT_API_KEY_ID}: ).*|\\1<redacted>|"
   exit 0
 fi
 
-printf '%s\n' "$rendered" > "$OUTPUT"
-chmod 600 "$OUTPUT"   # contains the API secret
+# umask BEFORE creating the file, not chmod after. A chmod-after leaves a window in
+# which the secret exists at the default mode — short, but real, and free to close
+# (cage-match PR#151, Carnot). The chmod stays as a belt for a pre-existing file,
+# whose mode a fresh umask would not change.
+( umask 077; printf '%s\n' "$rendered" > "$OUTPUT" )
+chmod 600 "$OUTPUT"
 ok "rendered $OUTPUT (mode 600)"
