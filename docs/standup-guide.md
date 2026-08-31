@@ -156,6 +156,13 @@ curl -s https://chat.example.org/.well-known/assetlinks.json | jq   # non-empty 
 # 2. advertise passkey sign-in:
 ./deploy/standup.sh --domain chat.example.org --name "Example Island" --enable-passkeys
 # (equivalently: set PASSKEY_ENABLED=true in .env and `docker compose up -d --build`)
+#
+# Note this re-run does NOT repeat --seed-peers, and does not need to: a re-run
+# preserves the federation peers and the passkey setting this island already
+# recorded in .env, and a flag is only needed to CHANGE one. Before #3734 that was
+# not true and this exact invocation silently emptied GATEWAY_SEED_PEERS.
+# To stop advertising passkeys later, pass --no-passkeys — omitting --enable-passkeys
+# is not "off", it means "leave it as recorded".
 
 # 3. confirm it's advertised:
 curl -s https://chat.example.org/v1/auth/providers | jq   # includes {"slug":"passkey"}

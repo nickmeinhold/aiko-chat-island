@@ -15,7 +15,11 @@
 #   4. brings up Caddy for HTTPS (skippable) and verifies.
 #
 # Design goal (from docker-compose.yml): "one script, and it just works." Safe to
-# re-run — it never rotates an existing JWT secret and skips work already done.
+# re-run: it never rotates an existing JWT secret, skips work already done, and
+# PRESERVES the operator choices already recorded in .env (federation peers, passkey
+# advertisement) unless a flag overrides them. Before #3734 that last clause was not
+# true, and the failure was silent — a re-run without --seed-peers emptied the
+# federation link while every health check stayed green.
 #
 # Usage:
 #   deploy/standup.sh --domain chat.example.org --name "Example Island"
@@ -30,6 +34,8 @@
 #   --name "<label>"      human label the app's island picker shows
 #   --seed-peers <json>   JSON array of {"id","display_name","base_url"} to federate with
 #   --enable-passkeys     advertise passkey sign-in (only after well-known files serve; see guide)
+#   --no-passkeys         stop advertising passkey sign-in. Passing NEITHER flag keeps
+#                         whatever this island already recorded — absence is not "off".
 #   --no-tls              skip the bundled Caddy step (you run your own reverse proxy)
 #   --with-media          also stand up a bundled LiveKit SFU for calls (OFF by default;
 #                         without it the island has no video and the token endpoint 503s,
@@ -53,13 +59,24 @@ warn() { printf '%s warn%s %s\n' "$c_ylw" "$c_rst" "$*" >&2; }
 die()  { printf '%s fail%s %s\n' "$c_red" "$c_rst" "$*" >&2; exit 1; }
 
 # --- locate repo root (this script lives in deploy/) ------------------------
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve symlinks before dirname: bash reports the LINK path in BASH_SOURCE, so a
+# script reached through a ~/bin shortcut would look for deploy/lib/ beside the link.
+_src="${BASH_SOURCE[0]}"
+while [ -L "$_src" ]; do
+  _d="$(cd -P "$(dirname "$_src")" && pwd)"; _src="$(readlink "$_src")"
+  case "$_src" in /*) ;; *) _src="$_d/$_src" ;; esac
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$_src")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 [ -f docker-compose.yml ] || die "docker-compose.yml not found in $REPO_ROOT — run from the aiko-chat-island checkout"
 
 # --- defaults + arg parsing -------------------------------------------------
-DOMAIN=""; DISPLAY_NAME=""; SEED_PEERS="[]"; ENABLE_PASSKEYS="false"; DO_TLS="true"; INTERACTIVE="true"; FROM_SOURCE="false"
+# SEED_PEERS and ENABLE_PASSKEYS default to EMPTY, not to their conventional values.
+# Empty means "the operator said nothing this run" and must consult the recorded
+# value (deploy/resolve-gateway-env.sh); "[]" / "false" are real choices that win.
+# Collapsing those two is #3734 — a re-run silently dropped the federation link.
+DOMAIN=""; DISPLAY_NAME=""; SEED_PEERS=""; ENABLE_PASSKEYS=""; DO_TLS="true"; INTERACTIVE="true"; FROM_SOURCE="false"
 # Media is OFF by default, unlike TLS. An island without HTTPS is broken; an island
 # without an SFU is a supported configuration the code already models
 # (livekit_tokens.is_configured() -> 503 "capability disabled"). Defaulting it ON
@@ -72,8 +89,15 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --domain)         DOMAIN="${2:-}"; shift 2 ;;
     --name)           DISPLAY_NAME="${2:-}"; shift 2 ;;
-    --seed-peers)     SEED_PEERS="${2:-[]}"; shift 2 ;;
+    # ${2:?} not ${2:-[]}: a flag with no value is a MALFORMED COMMAND, not a
+    # request to erase the peer list. Going solo stays expressible as an
+    # explicit --seed-peers '[]'. Matches --turn-domain/--livekit-domain.
+    # Newline normalisation for the guide's documented MULTILINE array is NOT done
+    # here: resolve-gateway-env.sh owns that invariant for every caller, and stating
+    # it twice would be two places to forget it. One door.
+    --seed-peers)     SEED_PEERS="${2:?--seed-peers needs a value}"; shift 2 ;;
     --enable-passkeys) ENABLE_PASSKEYS="true"; shift ;;
+    --no-passkeys)    ENABLE_PASSKEYS="false"; shift ;;
     --no-tls)         DO_TLS="false"; shift ;;
     --with-media)     DO_MEDIA="true"; shift ;;
     --turn-domain)    TURN_DOMAIN="${2:?--turn-domain needs a value}"; shift 2 ;;
@@ -118,7 +142,8 @@ ok "docker, git, openssl, curl, docker compose present"
 # Same discipline as the TLS block: these matter ONLY under --with-media. An
 # island pointing LIVEKIT_URL at someone else's SFU owes none of it.
 lk_env="$SCRIPT_DIR/livekit/.env"
-_read_kv() { [ -f "$1" ] && grep -E "^$2=" "$1" 2>/dev/null | tail -n1 | cut -d= -f2- || true; }
+. "$SCRIPT_DIR/lib/dotenv-read.sh"   # ONE .env grammar for every reader (see that file)
+_read_kv() { dotenv_read "$1" "$2"; }
 
 # Hostname order and credential-source choice live in deploy/resolve-media-env.sh,
 # which is TESTED (tests/test_resolve_media_env.py, both controls, mutation-proven).
@@ -368,8 +393,40 @@ ENV_FILE="$REPO_ROOT/.env"
 # live session. Only mint a new one on the very first run.
 existing_secret=""
 if [ -f "$ENV_FILE" ]; then
-  existing_secret="$(grep -E '^JWT_SECRET=' "$ENV_FILE" | head -1 | cut -d= -f2- || true)"
+  # An UNREADABLE .env must never read as "first run". dotenv_read cannot distinguish
+  # absent-key from unreadable-file, and here that difference is a live secret: a
+  # permissions error would otherwise mint a fresh JWT_SECRET and invalidate every
+  # session (cage-match round 5, Carnot — the same non-match-is-absence shape as round 4,
+  # one layer up). Absence is only benign when we can actually read the file.
+  [ -r "$ENV_FILE" ] || die "$ENV_FILE exists but is not readable — refusing to continue, because an unreadable .env is indistinguishable from a fresh island and would mint a NEW JWT_SECRET, logging out every user. Fix the permissions (chmod 600, owned by you) and re-run."
+  # dotenv_read, NOT a bespoke grep: `^JWT_SECRET=` missed `export JWT_SECRET=…` and a
+  # leading space, read as absent, and MINTED A NEW SECRET — under a header promising it
+  # never rotates one (cage-match round 4, Tesla).
+  existing_secret="$(dotenv_read "$ENV_FILE" JWT_SECRET)"
 fi
+# Resolve the operator CHOICES that survive a re-run. Must happen BEFORE the heredoc
+# below rewrites $ENV_FILE, since the record it reads is that same file (#3734).
+# FAIL CLOSED. `done < <(cmd)` swallows cmd's exit status even under
+# `set -euo pipefail` — the loop simply reads nothing, both variables stay empty,
+# and the heredoc below then writes `GATEWAY_SEED_PEERS=` … which compose reads
+# through `${GATEWAY_SEED_PEERS:-[]}` as `[]`. That is #3734 itself, reintroduced
+# through the ERROR PATH of the code that exists to prevent it. So: capture to a
+# file, CHECK the status, and die rather than write unresolved choices.
+RESOLVED_ENV="$(mktemp "${TMPDIR:-/tmp}/aiko-resolved.XXXXXX")"
+if ! "$SCRIPT_DIR/resolve-gateway-env.sh" "$ENV_FILE" "$SEED_PEERS" "$ENABLE_PASSKEYS" > "$RESOLVED_ENV"; then
+  rm -f "$RESOLVED_ENV"
+  die "resolve-gateway-env.sh failed — refusing to write .env with unresolved operator choices"
+fi
+# Prefix-strip rather than IFS='=' split: read strips TRAILING IFS characters, which
+# would silently truncate any value ending in '='.
+while IFS= read -r _line; do   # IFS= so trailing whitespace in a value survives
+  case "$_line" in
+    SEED_PEERS=*)      SEED_PEERS="${_line#SEED_PEERS=}" ;;
+    PASSKEY_ENABLED=*) ENABLE_PASSKEYS="${_line#PASSKEY_ENABLED=}" ;;
+  esac
+done < "$RESOLVED_ENV"
+rm -f "$RESOLVED_ENV"
+
 if [ -n "$existing_secret" ] && [ "${#existing_secret}" -ge 32 ]; then
   JWT_SECRET="$existing_secret"
   ok "reusing existing JWT_SECRET from .env (not rotated)"
@@ -383,6 +440,29 @@ fi
 # Same fresh-file-then-rename discipline as the SFU env above: this file holds
 # JWT_SECRET and (when media is on) the LiveKit secret, and `cat >` on a
 # pre-existing 0644 .env would expose both until the chmod.
+# QUOTE-ON-WRITE, for every value that can carry arbitrary operator text.
+# python-dotenv ends an UNQUOTED value at whitespace-then-`#`, so a legal display name or
+# peer name containing " #" was truncated when the GATEWAY read the file we wrote:
+#   --name "Island #1"        -> gateway reads  Island
+#   --seed-peers '[… "Island #1" …]' -> gateway reads a half-array, peers_service serves
+#                                       self, health check still green. #3734 again.
+# Five cage-match rounds missed it because they all tested the RESOLVER; the defect was in
+# what the heredoc EMITS, which is only visible by asking python-dotenv what it reads back
+# (tests/test_standup_env.py). Found by Tesla, round 5.
+#
+# Single quotes, not double: the payload is JSON full of double quotes, and dotenv decodes
+# backslash escapes inside double quotes while our reader deliberately does not — so a
+# double-quoted round-trip would grow an escape level every re-run. Single-quoted values
+# are taken literally by both, and the reader already strips one matching pair.
+#
+# The one shape single quotes cannot carry is a literal apostrophe, so it is REFUSED
+# loudly with the escape named, rather than silently mangled.
+for _v in "$DISPLAY_NAME" "$SEED_PEERS"; do
+  case "$_v" in
+    *"'"*) die "a single quote (') cannot be represented in this island's .env. Rename, or use the JSON escape \\u0027 inside --seed-peers. Offending value: $_v" ;;
+  esac
+done
+
 umask 077   # .env holds the JWT secret — owner-only
 ENV_TMP="$(mktemp "${ENV_FILE}.XXXXXX")"
 cat > "$ENV_TMP" <<EOF
@@ -394,12 +474,12 @@ JWT_SECRET=$JWT_SECRET
 
 # --- island identity (this compose is the island template) ---
 GATEWAY_BASE_URL=$BASE_URL
-GATEWAY_DISPLAY_NAME=$DISPLAY_NAME
+GATEWAY_DISPLAY_NAME='$DISPLAY_NAME'
 PASSKEY_RP_ID=$DOMAIN
 
 # Federation: operator-curated peers this island advertises in its directory.
 # JSON array of {"id","display_name","base_url"}. Empty [] = solo island.
-GATEWAY_SEED_PEERS=$SEED_PEERS
+GATEWAY_SEED_PEERS='$SEED_PEERS'
 
 # Passkeys: advertise passkey sign-in via /v1/auth/providers. Leave false until
 # this island serves valid /.well-known assetlinks.json + AASA for its domain
@@ -504,5 +584,8 @@ Next steps:
                         && echo "bundled SFU is up on $TURN_DOMAIN. Open UDP 3478, 7882-7892 and 50000-60000, and put TLS in front of 5349." \
                         || echo "no SFU — /v1/channels/*/video-token returns 503 (a supported state). Re-run with --with-media, or set LIVEKIT_URL/LIVEKIT_API_KEY/LIVEKIT_API_SECRET to use an existing one." )
 
-Re-running this script is safe: it won't rotate your JWT secret or wipe data.
+Re-running this script is safe: it won't rotate your JWT secret, wipe data, or
+  reset the choices already recorded in .env (federation peers, passkey sign-in).
+  Pass a flag only to CHANGE one — omitting --seed-peers or --enable-passkeys now
+  means "leave it as recorded", not "turn it off".
 EOF
