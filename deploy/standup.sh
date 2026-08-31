@@ -135,7 +135,8 @@ ok "docker, git, openssl, curl, docker compose present"
 # Same discipline as the TLS block: these matter ONLY under --with-media. An
 # island pointing LIVEKIT_URL at someone else's SFU owes none of it.
 lk_env="$SCRIPT_DIR/livekit/.env"
-_read_kv() { [ -f "$1" ] && grep -E "^$2=" "$1" 2>/dev/null | tail -n1 | cut -d= -f2- || true; }
+. "$SCRIPT_DIR/lib/dotenv-read.sh"   # ONE .env grammar for every reader (see that file)
+_read_kv() { dotenv_read "$1" "$2"; }
 
 # Hostname order and credential-source choice live in deploy/resolve-media-env.sh,
 # which is TESTED (tests/test_resolve_media_env.py, both controls, mutation-proven).
@@ -385,7 +386,10 @@ ENV_FILE="$REPO_ROOT/.env"
 # live session. Only mint a new one on the very first run.
 existing_secret=""
 if [ -f "$ENV_FILE" ]; then
-  existing_secret="$(grep -E '^JWT_SECRET=' "$ENV_FILE" | head -1 | cut -d= -f2- || true)"
+  # dotenv_read, NOT a bespoke grep: `^JWT_SECRET=` missed `export JWT_SECRET=…` and a
+  # leading space, read as absent, and MINTED A NEW SECRET — invalidating every live
+  # session under a header promising it never rotates one (cage-match round 4, Tesla).
+  existing_secret="$(dotenv_read "$ENV_FILE" JWT_SECRET)"
 fi
 # Resolve the operator CHOICES that survive a re-run. Must happen BEFORE the heredoc
 # below rewrites $ENV_FILE, since the record it reads is that same file (#3734).
@@ -402,7 +406,7 @@ if ! "$SCRIPT_DIR/resolve-gateway-env.sh" "$ENV_FILE" "$SEED_PEERS" "$ENABLE_PAS
 fi
 # Prefix-strip rather than IFS='=' split: read strips TRAILING IFS characters, which
 # would silently truncate any value ending in '='.
-while read -r _line; do
+while IFS= read -r _line; do   # IFS= so trailing whitespace in a value survives
   case "$_line" in
     SEED_PEERS=*)      SEED_PEERS="${_line#SEED_PEERS=}" ;;
     PASSKEY_ENABLED=*) ENABLE_PASSKEYS="${_line#PASSKEY_ENABLED=}" ;;
@@ -544,5 +548,8 @@ Next steps:
                         && echo "bundled SFU is up on $TURN_DOMAIN. Open UDP 3478, 7882-7892 and 50000-60000, and put TLS in front of 5349." \
                         || echo "no SFU — /v1/channels/*/video-token returns 503 (a supported state). Re-run with --with-media, or set LIVEKIT_URL/LIVEKIT_API_KEY/LIVEKIT_API_SECRET to use an existing one." )
 
-Re-running this script is safe: it won't rotate your JWT secret or wipe data.
+Re-running this script is safe: it won't rotate your JWT secret, wipe data, or
+  reset the choices already recorded in .env (federation peers, passkey sign-in).
+  Pass a flag only to CHANGE one — omitting --seed-peers or --enable-passkeys now
+  means "leave it as recorded", not "turn it off".
 EOF

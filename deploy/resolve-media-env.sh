@@ -31,7 +31,8 @@ domain="${3:?missing <domain>}"
 turn_flag="${4:-}"
 livekit_flag="${5:-}"
 
-_read_kv() { [ -f "$1" ] && grep -E "^$2=" "$1" 2>/dev/null | tail -n1 | cut -d= -f2- || true; }
+. "$(dirname "${BASH_SOURCE[0]}")/lib/dotenv-read.sh"   # ONE .env grammar (see that file)
+_read_kv() { dotenv_read "$1" "$2"; }
 
 # RESOLUTION ORDER, one order for both hostnames: flag, then the value this island
 # RECORDED, then convention.

@@ -43,52 +43,11 @@ gw_env="${1:?usage: resolve-gateway-env.sh <gateway-env> [seed-peers-flag] [pass
 seed_flag="${2:-}"
 passkeys_flag="${3:-}"
 
-# Read the LAST assignment of a key, matching how python-dotenv resolves duplicates,
-# and strip ONE matching pair of surrounding quotes, as python-dotenv also does.
-#
-# DEBT, NAMED RATHER THAN HIDDEN (#3592 — "Two parsers for one .env: the deploy
-# preflight re-implements python-dotenv in shell"). This is now the THIRD shell
-# approximation of that parser, and the divergence is DEMONSTRATED, not theoretical:
-# before the strip below, a hand-edited PASSKEY_ENABLED="true" — which python-dotenv
-# reads as true — was read here as the literal "true" and ABORTED standup. The guide
-# explicitly invites that hand edit ("equivalently: set PASSKEY_ENABLED=true in .env").
-#
-# Quote-stripping closes the case that actually bites. TWO divergences from
-# python-dotenv remain, both measured and both deliberate stopping points rather than
-# oversights: inline comments (PASSKEY_ENABLED=true  # why) are read literally, and
-# backslash escapes inside double quotes are not decoded, so a quoted JSON value
-# ("[{\"id\":\"e\"}]") keeps its backslashes here while python-dotenv strips them.
-# Neither shape is ever produced by the heredoc that writes this file. Every further
-# case is one more parameter in a parser we should not be growing; the real fix is
-# #3592's, one parser rather than four.
-_read_kv() {
-  local v q
-  # WHY A GRAMMAR AND NOT A LIST OF CASES. Every shape python-dotenv accepts that this
-  # reader does not is a chance to read NOTHING, fall through to convention, and write
-  # PASSKEY_ENABLED=false + GATEWAY_SEED_PEERS=[] — #3734 itself, silently, through
-  # supported .env syntax. Found one at a time, in this order:
-  #   `export KEY=v`        — cage-match round 3 (Carnot)
-  #   `  KEY=v`             — the parity corpus, in seconds, after three rounds missed it
-  #   `KEY = v` / `KEY =v`  — cage-match round 4 (Carnot), and SILENT
-  # The round-4 one is the instructive failure: the corpus varied PREFIX and QUOTING and
-  # whitespace-before-KEY, but never DELIMITER SPACING. Twelve rows along one axis is not
-  # a bounded class. Carnot: "the number of corpus rows is less important than the
-  # grammar boundary." So the grammar is written once, above, and the corpus now varies
-  # the axis rather than sampling the shape.
-  # ONE grammar, matched and stripped by the same expression so they cannot drift:
-  #   [ws] [export ws] KEY [ws] = [ws] VALUE [ws]
-  # Every element is optional-whitespace-tolerant because python-dotenv is. Trailing
-  # whitespace and a stray CR are stripped too, so a .env touched on Windows or moved
-  # badly does not abort a deploy.
-  local _re="^[[:space:]]*(export[[:space:]]+)?$2[[:space:]]*=[[:space:]]*"
-  v=$([ -f "$1" ] && grep -E "$_re" "$1" 2>/dev/null | tail -n1 | sed -E "s/$_re//; s/[[:space:]]*\r?$//" || true)
-  for q in '"' "'"; do
-    if [ ${#v} -ge 2 ] && [ "${v#"$q"}" != "$v" ] && [ "${v%"$q"}" != "$v" ]; then
-      v="${v#"$q"}"; v="${v%"$q"}"; break
-    fi
-  done
-  printf '%s' "$v"
-}
+# ONE reader, sourced not copied — deploy/lib/dotenv-read.sh carries the grammar and the
+# reason it exists. Four copies of this used to exist across deploy/, each treating a
+# matcher miss as "never recorded"; the worst instance minted a fresh JWT secret.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/dotenv-read.sh"
+_read_kv() { dotenv_read "$1" "$2"; }
 
 # RESOLUTION ORDER, identical for both: flag, then the value this island RECORDED,
 # then convention. The middle rung is the one that was missing.

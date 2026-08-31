@@ -386,3 +386,33 @@ def test_the_class_guard_can_actually_fail(tmp_path) -> None:
         assert got == "true", "silent divergence went undetected — the class guard is blind"
     else:
         assert "must be true or false" in result.stderr
+
+
+def test_the_class_guard_detects_a_wrong_value_not_only_a_refusal(tmp_path) -> None:
+    """TESLA'S ROUND-4 ASK, verbatim: "point the class-guard must-fail arm at a shape that
+    exits 0 with the wrong value, and the bound will finally be able to bleed."
+
+    The previous must-fail arm aimed at inline comments, which this reader REFUSES — so it
+    exercised the refusal branch and never the `got != want` comparison. A guard whose
+    divergence-detection path is never executed is not known to work.
+
+    This uses the one shape that genuinely exits 0 with a value python-dotenv reads
+    differently: backslash escapes inside double quotes, which dotenv decodes and this
+    reader does not. It is a DECLARED divergence, so its presence here is deliberate — it
+    is the only live proof that the comparison discriminates rather than the assertion
+    passing because nothing ever reaches it."""
+    from dotenv import dotenv_values
+    env = tmp_path / "escapes.env"
+    env.write_text('GATEWAY_SEED_PEERS="[{\\"id\\":\\"e\\"}]"\n')
+
+    want = dotenv_values(str(env))["GATEWAY_SEED_PEERS"]
+    result = subprocess.run([str(SCRIPT), str(env), "", ""], capture_output=True, text=True)
+    assert result.returncode == 0, "this shape must EXIT 0 — a refusal would not test the branch"
+    got = dict(l.split("=", 1) for l in result.stdout.strip().splitlines())["SEED_PEERS"]
+
+    assert got != want, (
+        "the declared backslash divergence has disappeared — either the reader gained "
+        "escape decoding (delete this test and the declaration in the header) or "
+        "python-dotenv changed. Either way the guard's must-fail arm must be re-pointed."
+    )
+    assert "\\" in got and "\\" not in want, "the divergence is not the one documented"
