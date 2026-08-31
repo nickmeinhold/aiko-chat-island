@@ -440,6 +440,29 @@ fi
 # Same fresh-file-then-rename discipline as the SFU env above: this file holds
 # JWT_SECRET and (when media is on) the LiveKit secret, and `cat >` on a
 # pre-existing 0644 .env would expose both until the chmod.
+# QUOTE-ON-WRITE, for every value that can carry arbitrary operator text.
+# python-dotenv ends an UNQUOTED value at whitespace-then-`#`, so a legal display name or
+# peer name containing " #" was truncated when the GATEWAY read the file we wrote:
+#   --name "Island #1"        -> gateway reads  Island
+#   --seed-peers '[… "Island #1" …]' -> gateway reads a half-array, peers_service serves
+#                                       self, health check still green. #3734 again.
+# Five cage-match rounds missed it because they all tested the RESOLVER; the defect was in
+# what the heredoc EMITS, which is only visible by asking python-dotenv what it reads back
+# (tests/test_standup_env.py). Found by Tesla, round 5.
+#
+# Single quotes, not double: the payload is JSON full of double quotes, and dotenv decodes
+# backslash escapes inside double quotes while our reader deliberately does not — so a
+# double-quoted round-trip would grow an escape level every re-run. Single-quoted values
+# are taken literally by both, and the reader already strips one matching pair.
+#
+# The one shape single quotes cannot carry is a literal apostrophe, so it is REFUSED
+# loudly with the escape named, rather than silently mangled.
+for _v in "$DISPLAY_NAME" "$SEED_PEERS"; do
+  case "$_v" in
+    *"'"*) die "a single quote (') cannot be represented in this island's .env. Rename, or use the JSON escape \\u0027 inside --seed-peers. Offending value: $_v" ;;
+  esac
+done
+
 umask 077   # .env holds the JWT secret — owner-only
 ENV_TMP="$(mktemp "${ENV_FILE}.XXXXXX")"
 cat > "$ENV_TMP" <<EOF
@@ -451,12 +474,12 @@ JWT_SECRET=$JWT_SECRET
 
 # --- island identity (this compose is the island template) ---
 GATEWAY_BASE_URL=$BASE_URL
-GATEWAY_DISPLAY_NAME=$DISPLAY_NAME
+GATEWAY_DISPLAY_NAME='$DISPLAY_NAME'
 PASSKEY_RP_ID=$DOMAIN
 
 # Federation: operator-curated peers this island advertises in its directory.
 # JSON array of {"id","display_name","base_url"}. Empty [] = solo island.
-GATEWAY_SEED_PEERS=$SEED_PEERS
+GATEWAY_SEED_PEERS='$SEED_PEERS'
 
 # Passkeys: advertise passkey sign-in via /v1/auth/providers. Leave false until
 # this island serves valid /.well-known assetlinks.json + AASA for its domain
