@@ -132,7 +132,7 @@ if [ "$DO_MEDIA" = "true" ]; then
   # bind, and it surfaces only as "calls don't connect". imagineering runs
   # exactly this shape (an SFU shared with another product), which is why the
   # bundled arm is opt-in rather than default.
-  ours_lk="$(docker compose -f "$SCRIPT_DIR/livekit/docker-compose.livekit.yml" ps -q livekit 2>/dev/null || true)"
+  ours_lk="$(docker compose -f "$SCRIPT_DIR/livekit/docker-compose.livekit.yml" ps -q --status running livekit 2>/dev/null || true)"
   if [ -z "$ours_lk" ]; then
     # FAIL CLOSED when we cannot look (cage-match PR#151, Carnot): with neither ss
     # nor lsof the old loop reported success, which defeats the whole preflight for
@@ -245,26 +245,47 @@ LIVEKIT_ENV_BLOCK=""
 lk_env="$SCRIPT_DIR/livekit/.env"
 _read_kv() { [ -f "$1" ] && grep -E "^$2=" "$1" 2>/dev/null | tail -n1 | cut -d= -f2- || true; }
 
-# What each side currently believes, read before anything is written.
+# A CREDENTIAL IS A PAIR, NOT TWO FIELDS. Resolving key and secret independently lets
+# a half-written file on one side combine with the other side into a HYBRID that
+# matches neither — and the script would then write that invented pair to both files,
+# authenticating nothing (cage-match PR#151 round 2, Carnot). So each file is read as
+# a whole: complete, empty, or INVALID. A half-populated file is never a source.
+gw_url="$(_read_kv "$REPO_ROOT/.env" LIVEKIT_URL)"
 gw_key="$(_read_kv "$REPO_ROOT/.env" LIVEKIT_API_KEY)"
 gw_secret="$(_read_kv "$REPO_ROOT/.env" LIVEKIT_API_SECRET)"
-gw_url="$(_read_kv "$REPO_ROOT/.env" LIVEKIT_URL)"
 sfu_key="$(_read_kv "$lk_env" LIVEKIT_API_KEY_ID)"
 sfu_secret="$(_read_kv "$lk_env" LIVEKIT_API_SECRET)"
 
-# Conflict: both sides hold a pair and they disagree. Refuse — either could be the
-# live one, and choosing wrong breaks every join with a token the SFU rejects.
-if [ -n "$gw_key" ] && [ -n "$sfu_key" ] \
-   && { [ "$gw_key" != "$sfu_key" ] || [ "$gw_secret" != "$sfu_secret" ]; }; then
-  die "the gateway .env and $lk_env hold DIFFERENT LiveKit key pairs.
-     Refusing to guess which is live — the wrong choice mints tokens the running SFU
-     rejects, and every call fails at CONNECT with no error anywhere.
-     Reconcile them by hand (make both match the pair the RUNNING SFU was started
-     with), then re-run."
+_pair_state() {  # $1=key $2=secret -> complete | empty | partial
+  if   [ -n "$1" ] && [ -n "$2" ]; then echo complete
+  elif [ -z "$1" ] && [ -z "$2" ]; then echo empty
+  else echo partial; fi
+}
+gw_state="$(_pair_state "$gw_key" "$gw_secret")"
+sfu_state="$(_pair_state "$sfu_key" "$sfu_secret")"
+
+# A partial pair is CORRUPTION, not a starting point — half a credential cannot be
+# completed from the other file without inventing one.
+if [ "$gw_state" = partial ] || [ "$sfu_state" = partial ]; then
+  die "a LiveKit credential is half-present: gateway .env is '$gw_state', $lk_env is '$sfu_state'.
+     A key without its secret (or the reverse) cannot be completed from the other file
+     without inventing a pair that authenticates nothing. Restore or clear the damaged
+     file, then re-run."
 fi
 
-lk_key="${sfu_key:-$gw_key}"
-lk_secret="${sfu_secret:-$gw_secret}"
+# Both complete and disagreeing: refuse. Either could be the live one, and the wrong
+# choice mints tokens the running SFU rejects, with no error anywhere.
+if [ "$gw_state" = complete ] && [ "$sfu_state" = complete ] \
+   && { [ "$gw_key" != "$sfu_key" ] || [ "$gw_secret" != "$sfu_secret" ]; }; then
+  die "the gateway .env and $lk_env hold DIFFERENT LiveKit key pairs.
+     Refusing to guess which is live. Reconcile them by hand (make both match the pair
+     the RUNNING SFU was started with), then re-run."
+fi
+
+# Exactly one complete pair, or two identical ones — take it atomically.
+if [ "$sfu_state" = complete ]; then lk_key="$sfu_key"; lk_secret="$sfu_secret"
+elif [ "$gw_state" = complete ]; then lk_key="$gw_key"; lk_secret="$gw_secret"
+else lk_key=""; lk_secret=""; fi
 
 if [ "$DO_MEDIA" = "true" ]; then
   if [ -n "$lk_key" ] && [ -n "$lk_secret" ]; then
@@ -297,17 +318,31 @@ LIVEKIT_URL=wss://$LIVEKIT_DOMAIN
 LIVEKIT_API_KEY=$lk_key
 LIVEKIT_API_SECRET=$lk_secret"
 
-elif [ -n "$gw_key" ] && [ -n "$gw_secret" ]; then
-  # Media NOT requested this run, but this island already has credentials — carry
-  # them forward verbatim, including a BYO LIVEKIT_URL pointing at someone else's
-  # SFU. Dropping them here is the torn-media-plane bug above; and an island using
-  # an existing LiveKit is a first-class configuration, not a leftover to clean up.
+elif [ -n "$lk_key" ]; then
+  # Media NOT requested this run, but this island already has a credential somewhere.
+  # Carry it forward — including a BYO LIVEKIT_URL pointing at someone else's SFU.
+  #
+  # Note the source is $lk_key, NOT $gw_key: an earlier fix covered only the case
+  # where the GATEWAY .env survived. If the gateway .env was deleted while
+  # deploy/livekit/.env survived, that version wrote a fresh .env with no media lines
+  # and left a running SFU beside a 503ing gateway — the same torn media plane by the
+  # other route (cage-match PR#151 round 2, Carnot). Recovering from either side
+  # closes both directions.
+  if [ -n "$gw_url" ]; then
+    lk_url="$gw_url"
+  else
+    # Gateway .env gone: reconstruct the SFU URL from the bundled config's own TURN
+    # domain, which is the only surviving statement of this island's media hostnames.
+    lk_turn="$(_read_kv "$lk_env" LIVEKIT_TURN_DOMAIN)"
+    lk_url="wss://${LIVEKIT_DOMAIN:-livekit.$DOMAIN}"
+    [ -n "$lk_turn" ] && warn "gateway .env had no LIVEKIT_URL; reconstructed $lk_url from the island domain (bundled TURN is $lk_turn). Verify it before relying on calls."
+  fi
   LIVEKIT_ENV_BLOCK="
-# --- media: preserved from the previous .env (not re-run with --with-media) ---
-LIVEKIT_URL=${gw_url:-}
-LIVEKIT_API_KEY=$gw_key
-LIVEKIT_API_SECRET=$gw_secret"
-  ok "preserved existing LIVEKIT_* in the gateway .env (media untouched this run)"
+# --- media: preserved across a re-run (not re-run with --with-media) ---
+LIVEKIT_URL=$lk_url
+LIVEKIT_API_KEY=$lk_key
+LIVEKIT_API_SECRET=$lk_secret"
+  ok "preserved this island's LIVEKIT_* credentials (media untouched this run)"
 fi
 
 log "Step 2/$TOTAL — writing .env (island identity + secrets)"
