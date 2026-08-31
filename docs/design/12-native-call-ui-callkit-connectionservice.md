@@ -562,11 +562,46 @@ falling into. So:
 costing 100% of media egress.** Nick's economic instinct is right for a reason he did not
 have to hand.
 
-**Scope of that claim, stated honestly:** verified from the documented topology, **not from
-a packet capture**. It is strong enough to reopen the decision and *not* strong enough to
-flip a hard privacy ruling on its own — a wrong reading re-opens exactly the leak the
-2026-08-11 ruling closed. Confirm with a capture, or take it as Nick's call, before changing
-the policy.
+##### Strengthened 2026-08-31 — from vendor prose to structure and to the live boxes
+
+The claim above rested on LiveKit's documentation. Three checks since have moved it onto
+harder ground:
+
+1. **Structural, not prose.** `livekit/protocol` `livekit_rtc.proto` defines
+   `TrickleRequest { candidateInit, SignalTarget target }`, and `SignalTarget` has exactly
+   two values — `PUBLISHER` and `SUBSCRIBER`. There is **no participant-scoped candidate
+   message anywhere in the signalling proto.** Two participants cannot exchange ICE
+   candidates on this stack even in principle.
+2. **The other leak channel is closed too.** `livekit_models.proto`: `ParticipantInfo` —
+   the struct the server broadcasts *about* you to everyone else — has no address field.
+   The only `address` in the file is on `ClientInfo`, which travels client→server in the
+   join request and is never forwarded on.
+3. **Same process, not merely the same box** (verified on both islands, 2026-08-31). The
+   TURN is LiveKit's **embedded** TURN: the `turn:` block lives inside each box's
+   `livekit.yaml`, and `docker ps` shows one `livekit/livekit-server:v1.13.5` container per
+   box with **no coturn anywhere**. So force-relay does not route you past the operator's
+   SFU — it routes you *through the same process*.
+
+The supporting mechanism is worth stating because it also closes the loop with 9b: an SFU
+**terminates and re-originates** rather than forwarding. Separate ICE, DTLS and SRTP per
+`PeerConnection`; the callee's socket only ever receives packets sourced from the SFU.
+**The existence of insertable-streams E2EE is itself the proof of termination** — there
+would be nothing to encrypt against, and no simulcast question, if the server were merely
+passing packets through.
+
+**Scope of that claim, stated honestly:** still **not a packet capture**, and this does not
+license flipping the policy on its own. But the *reason* to keep `.relay` has changed. It
+buys approximately nothing on peer-IP privacy; it does buy **NAT traversal from restrictive
+networks** and, on our boxes, **forcing media over 443 through the SNI mux** so it reads as
+HTTPS to a middlebox. Those are reachability and traffic-shape properties, they are real,
+and they are not what the docstring claims.
+
+That inversion is the actual defect, and it is more dangerous than a wrong comment: the next
+reader to falsify *"it protects peer IPs"* — as this section just did — has a clean-looking
+argument for deleting something we need. **Keep the constant; fix the reason.** What the
+capture on claude-tasks#3717 is still for is narrower than when it was filed — whether `.all`
+would ever beat `.relay` on connect success or setup latency. The privacy half no longer
+needs sniffing.
 
 ##### Separate the axes before designing the control
 
@@ -663,9 +698,17 @@ Gated separately: **Decision 9 (#3196)** before shipping to cross-island pairs, 
 - **Media E2EE on/off** (#3426 Q2, Decision 9b) — a policy call, not a build. **Q3 is
   ANSWERED** (2026-08-31): nothing relies on server-side media access — the island's whole
   LiveKit surface is minting JWTs, and there is no egress config or container on either box,
-  no recording, no transcription. The one real cost is **simulcast**, which the client
-  deliberately enables; LiveKit's own E2EE docs do not state that limitation, so it is
-  unverified in both directions. Carries the **agent-as-keyholder** collision, which wants
+  no recording, no transcription. **The simulcast cost is now ANSWERED too** (2026-08-31,
+  claude-tasks#3715): it is not real for VP8, which is what the client publishes. LiveKit's
+  frame cryptor leaves the VP8 payload descriptor — temporal-layer id and keyframe bits —
+  outside the ciphertext *by design* (`FrameCryptor.ts`: *"This is fine as the SFU keeps
+  having access to it for routing"*), the native cryptor the Flutter client actually runs
+  carves out the same 10/3 header bytes, and `encryption path:pkg/sfu` returns **zero
+  results** across the server's entire forwarding subsystem. The real E2EE costs are **AV1**
+  (refused outright) and H.264/H.265 (NALU handling) — neither is our codec, which makes the
+  client's `videoCodec: 'vp8'` pin load-bearing if E2EE is enabled. **So Q2's cost column is
+  empty and its benefit side has risen; it is now a pure policy call.** Scope: a source read
+  of both cryptors and the server, not a live A/B capture of layer switching. Carries the **agent-as-keyholder** collision, which wants
   its own design and must not ride along.
 - **Call-egress metering** (Decision 9f) — nothing on either box meters it, and it is the
   precondition for the charge-or-cap Nick names. Island-side.
