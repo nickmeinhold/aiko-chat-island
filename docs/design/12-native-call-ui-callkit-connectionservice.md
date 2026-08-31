@@ -447,6 +447,71 @@ are shipped (#3096) and the `webrtc://` DataScheme thread has aiko pipelines *co
 this product carries that a plain chat product would not — and it should be visible before the
 decision, not after.
 
+#### Decision 9c — THE SHIPPING GATE (the thing neither tab put in)
+
+**Cross-island calling MUST NOT ship until #3426 is decided.** Either media E2EE is on, or
+the 9d disclosure ships with it and the user consents per call. Shipping with **neither** is
+the state this gate exists to prevent.
+
+Recorded as a **precondition**, not a decision, because 9b carried the exposure as *a
+decision for Nick* — and **an open decision does not stop a build.** A cold reader on the
+app tab's consolidation put it as *"a beautiful, well-logged front door on a house with no
+walls."* That overstates today: nothing is built, cross-island calling does not work at all
+(Decision 9), same-island calls route through the operator the user chose, and the exposure
+was disclosed and re-priced rather than deferred silently. The app tab rejected it on those
+grounds and was right to.
+
+**But the structure holds.** If cross-island calling ever ships before #3426 is decided,
+that sentence becomes exactly accurate, and nothing in this document would have stopped it.
+So the gate is written down as a gate.
+
+E2EE and disclosure **compose rather than duplicate**: E2EE removes the exposure,
+disclosure makes it consented. Either satisfies the gate; neither is redundant.
+
+#### Decision 9d — RULING: the user is told, at call time
+
+> **"The user should always know if their call is going to go through an island
+> unencrypted."** — Nick, 2026-08-31
+
+*(Given to the app tab and relayed here; recorded with that provenance so a later reader
+knows which tab heard it first.)*
+
+Disclosure **at call time, not in a document**. It applies to both parties and bites
+hardest under Decision 9, where the hosting operator is one the **caller never chose**.
+
+**This gives #3426's manifest split a job it did not have.** The split has so far been
+argued only as *"a manifest must not lie"* — a correctness point. Under this ruling it
+becomes **user-facing machinery**: the app reads the signed self-manifest of whichever
+island will host and tells the user, before connect, whether media is end-to-end encrypted.
+The split stops being a tidiness fix and becomes a **precondition for the disclosure** — a
+stronger justification than the one on the ticket, now recorded there.
+
+**Division of labour.** App side: read the hosting island's manifest at video-token time and
+surface it before connect *and* in the ring UI for an incoming cross-island call (the callee
+is deciding whether to answer), **failing closed** — an absent or unreadable
+media-confidentiality field reads as NOT encrypted, never as encrypted. Island side:
+**make the field exist, signed, and readable.** That is the whole island half, and it is the
+Q1 split already ruled on.
+
+#### Decision 9e — there is no "mostly peer-to-peer anyway" softener
+
+Verified in the client, in code rather than prose (`livekit_call_service.dart:25`, the const
+passed at `:156`):
+
+> *"Peer-IP privacy is a HARD requirement (Nick, 2026-08-11): media must never traverse a
+> direct path that exposes participant IPs, so all media is forced through TURN. NOT
+> flippable and NOT per-island adaptive — `.all` is an explicitly REJECTED fallback."*
+
+`kCallIceTransportPolicy = RTCIceTransportPolicy.relay`. Every call takes **two server hops
+by design** — forced TURN relay, then the SFU — and `Room.connect` passes no `e2eeOptions`.
+
+**The mechanism guaranteeing the operator sees everything is the one added to protect
+privacy.** Force-relay traded peer-IP visibility for operator visibility, which was the right
+trade while the operator was yours. Decision 9 changes who that operator is, and because the
+direct path was removed deliberately there is no partial-P2P mitigation to fall back on. That
+is why insertable-streams E2EE is not *a* route to content confidentiality here — **it is the
+only one.**
+
 #### Unchanged from the first draft, and still the fair framing
 
 - **Not a regression.** Cross-island calling does not work today (Decision 9), so there is no
@@ -514,6 +579,8 @@ Gated separately: **Decision 9 (#3196)** before shipping to cross-island pairs, 
 
 **Settled (Nick, 2026-08-31):**
 
+- **The user is told at call time whether media is unencrypted** (Decision 9d) — which makes
+  the Q1 split below a precondition for that disclosure, not a tidiness fix.
 - **`island_mode` SPLITS into two signed manifest fields** (#3426 Q1) — decided *ahead* of
   whether media E2EE is ever enabled, because one flag governing two orthogonal properties is
   a manifest that eventually lies. Additive migration + two signed fields; wire half agreed
@@ -526,11 +593,15 @@ Gated separately: **Decision 9 (#3196)** before shipping to cross-island pairs, 
 
 **Still open:**
 
-- **Media E2EE on/off** (#3426 Q2, Decision 9b) — now a policy call, not a build. Blocked on
-  **Q3**, *"is anything relying on server-side media access today?"*, which is a factual check
-  rather than a judgement. Gates *shipping* cross-island calling, not building it. Carries the
-  **agent-as-keyholder** collision (a pipeline that cannot decrypt cannot run inference, and
-  resident agents are shipped), which wants its own design and must not ride along.
+- **Media E2EE on/off** (#3426 Q2, Decision 9b) — a policy call, not a build. **Q3 is
+  ANSWERED** (2026-08-31): nothing relies on server-side media access — the island's whole
+  LiveKit surface is minting JWTs, and there is no egress config or container on either box,
+  no recording, no transcription. The one real cost is **simulcast**, which the client
+  deliberately enables; LiveKit's own E2EE docs do not state that limitation, so it is
+  unverified in both directions. Carries the **agent-as-keyholder** collision, which wants
+  its own design and must not ride along.
+- **GATE (Decision 9c): cross-island calling does not ship until #3426 is decided** — media
+  E2EE on, or the 9d disclosure shipping with it. Neither is what the gate prevents.
 - **The Play `USE_FULL_SCREEN_INTENT` declaration** — Nick submits (#3615). Listed here only
   because it is unsubmitted; nothing waits on the outcome, since prompt-and-degrade is build
   work either way.
