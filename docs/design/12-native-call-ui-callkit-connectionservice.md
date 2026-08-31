@@ -582,6 +582,15 @@ harder ground:
    box with **no coturn anywhere**. So force-relay does not route you past the operator's
    SFU — it routes you *through the same process*.
 
+4. **Neither remaining leak channel is open** (checked 2026-08-31 rather than delegated).
+   In the pinned SDK (`livekit_client-2.8.1`) every candidate path is scoped to
+   `SignalTarget.PUBLISHER` or `SUBSCRIBER` — the two local `PeerConnection`s — and inbound
+   `trickle` is routed to one of those two and nowhere else (`signal_client.dart:276`,
+   `engine.dart:634-648`). There is no participant dimension, and nothing is exposed to app
+   code. Server-side, the **only** use of `ClientInfo.Address` in `livekit/livekit` is
+   `GetRegionSettings(p.params.ClientInfo.Address)` in `participant_signal.go:281` — geo
+   region selection returned to *that same participant*, never broadcast.
+
 The supporting mechanism is worth stating because it also closes the loop with 9b: an SFU
 **terminates and re-originates** rather than forwarding. Separate ICE, DTLS and SRTP per
 `PeerConnection`; the callee's socket only ever receives packets sourced from the SFU.
