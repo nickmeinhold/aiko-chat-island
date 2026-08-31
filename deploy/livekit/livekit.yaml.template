@@ -1,0 +1,66 @@
+# LiveKit SFU config for an aiko island — the BUNDLED arm.
+#
+# This is a TEMPLATE, not a config. `render-config.sh` substitutes the four
+# per-island values below from deploy/livekit/.env and writes livekit.yaml
+# (gitignored). Rendering rather than shipping a finished file is deliberate:
+#
+#   1. The API secret must never enter git. LiveKit reads keys from the config
+#      file, and does NOT document environment substitution INSIDE the YAML
+#      (only `LIVEKIT_CONFIG`, which takes the whole body and would defeat the
+#      point of a repo-authoritative source). Rendering keeps the structure in
+#      git and the secret in .env, which is where every other island secret
+#      already lives.
+#   2. node_ip and the TURN domain are genuinely per-host. A finished file could
+#      only ever be right for one box, which is how the two existing islands
+#      drifted apart in the first place (#3685).
+#
+# ${VARS} here are consumed by envsubst. render-config.sh fails closed if any of
+# them is unset or empty — a LiveKit that boots with a blank node_ip advertises
+# an unreachable candidate and every call fails at connect, silently.
+
+port: 7880
+
+rtc:
+  port_range_start: 7882
+  port_range_end: 7892
+  # true = LiveKit discovers the public IP itself and advertises it. node_ip is
+  # still set explicitly below because discovery is a network call at boot; a
+  # stated value is the thing that must agree with the TURN advertisement, and
+  # a mismatch between them silently kills the UDP relay
+  # (reference: LiveKit always advertises turns:<domain>:443 regardless of
+  # tls_port, so node_ip alignment is load-bearing, not cosmetic).
+  use_external_ip: true
+  node_ip: ${LIVEKIT_NODE_IP}
+  tcp_port: 7881
+
+turn:
+  enabled: true
+  domain: ${LIVEKIT_TURN_DOMAIN}
+  udp_port: 3478
+  tls_port: 5349
+  # external_tls: the TLS terminator in front (haproxy on the live islands)
+  # holds the cert and speaks plaintext to LiveKit on tls_port. The alternative
+  # shape — LiveKit holding cert_file/key_file itself and binding 443 directly —
+  # is what imagineering runs. Both work; they are not interchangeable, and
+  # which one an island should use is #3052/#3119, NOT a choice this template
+  # makes. The bundled arm encodes the external_tls shape because that is the
+  # one the reference deployment (enspyr) proves.
+  external_tls: true
+  relay_range_start: 50000
+  relay_range_end: 60000
+  # SSRF hardening (task #6): refuse to relay to CGNAT space. A TURN server is
+  # an open proxy by design; without this an attacker can use the relay to reach
+  # carrier-internal hosts that are not routable from the internet.
+  deny_peer_cidrs:
+    - 100.64.0.0/10
+
+keys:
+  # ONE key pair per island, never shared between islands (#2732 — a shared
+  # HS256 media secret across independently-operated boxes is a mesh-wide
+  # forgery domain: any operator holding it can mint a join token for any
+  # other island's rooms).
+  ${LIVEKIT_API_KEY_ID}: ${LIVEKIT_API_SECRET}
+
+logging:
+  level: info
+  json: true
