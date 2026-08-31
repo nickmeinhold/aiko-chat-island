@@ -46,7 +46,12 @@ passkeys_flag="${3:-}"
 # ONE reader, sourced not copied — deploy/lib/dotenv-read.sh carries the grammar and the
 # reason it exists. Four copies of this used to exist across deploy/, each treating a
 # matcher miss as "never recorded"; the worst instance minted a fresh JWT secret.
-. "$(dirname "${BASH_SOURCE[0]}")/lib/dotenv-read.sh"
+_src="${BASH_SOURCE[0]}"
+while [ -L "$_src" ]; do
+  _d="$(cd -P "$(dirname "$_src")" && pwd)"; _src="$(readlink "$_src")"
+  case "$_src" in /*) ;; *) _src="$_d/$_src" ;; esac
+done
+. "$(cd -P "$(dirname "$_src")" && pwd)/lib/dotenv-read.sh"
 _read_kv() { dotenv_read "$1" "$2"; }
 
 # RESOLUTION ORDER, identical for both: flag, then the value this island RECORDED,
@@ -79,15 +84,21 @@ case "$passkey_enabled" in
   *) echo "resolve-gateway-env: PASSKEY_ENABLED must be true or false, got '$passkey_enabled'" >&2; exit 1 ;;
 esac
 
-# REFUSE a seed list that is not a JSON array. An island stood up before this fix with
+# REFUSE a seed list that is not BRACKET-DELIMITED. Scope stated exactly, because Carnot
+# (round 5) correctly caught the earlier wording claiming "must be a JSON array" while the
+# check only looks at the first and last character — so `[not-json]` passes.
+#
+# That gap is DELIBERATE and stays. This guard exists for ONE historic corruption: An island stood up before this fix with
 # the guide's multiline invocation has `GATEWAY_SEED_PEERS=[` in its .env (the body
 # lines were orphaned and unparseable by python-dotenv too). Reading that back and
 # writing it out again would launder a broken value into a deliberate-looking one, and
-# peers_service would keep serving self. Shape-only: this is not a JSON parser, and
-# growing one here is exactly what #3592 says not to do.
+# peers_service would keep serving self. Validating the JSON *body* means a JSON parser in
+# shell, which is precisely what #3592 says not to build — so the check is bracket-shape
+# only and the message, the comments and the test names all now say bracket-delimited
+# rather than JSON. Prose matching code is the fix here, not more code.
 case "$seed_peers" in
   "["*"]") ;;
-  *) echo "resolve-gateway-env: GATEWAY_SEED_PEERS must be a JSON array (starts '[', ends ']'), got '$seed_peers'. A pre-2026-09 standup with a multiline --seed-peers left a truncated value; pass --seed-peers with the intended array to repair it." >&2; exit 1 ;;
+  *) echo "resolve-gateway-env: GATEWAY_SEED_PEERS is not bracket-delimited (must start '[' and end ']'), got '$seed_peers'. A pre-2026-09 standup with a multiline --seed-peers left a truncated value; pass --seed-peers with the intended array to repair it." >&2; exit 1 ;;
 esac
 
 printf 'SEED_PEERS=%s\n' "$seed_peers"

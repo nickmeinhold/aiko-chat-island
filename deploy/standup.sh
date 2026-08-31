@@ -59,7 +59,14 @@ warn() { printf '%s warn%s %s\n' "$c_ylw" "$c_rst" "$*" >&2; }
 die()  { printf '%s fail%s %s\n' "$c_red" "$c_rst" "$*" >&2; exit 1; }
 
 # --- locate repo root (this script lives in deploy/) ------------------------
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve symlinks before dirname: bash reports the LINK path in BASH_SOURCE, so a
+# script reached through a ~/bin shortcut would look for deploy/lib/ beside the link.
+_src="${BASH_SOURCE[0]}"
+while [ -L "$_src" ]; do
+  _d="$(cd -P "$(dirname "$_src")" && pwd)"; _src="$(readlink "$_src")"
+  case "$_src" in /*) ;; *) _src="$_d/$_src" ;; esac
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$_src")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 [ -f docker-compose.yml ] || die "docker-compose.yml not found in $REPO_ROOT — run from the aiko-chat-island checkout"
@@ -386,9 +393,15 @@ ENV_FILE="$REPO_ROOT/.env"
 # live session. Only mint a new one on the very first run.
 existing_secret=""
 if [ -f "$ENV_FILE" ]; then
+  # An UNREADABLE .env must never read as "first run". dotenv_read cannot distinguish
+  # absent-key from unreadable-file, and here that difference is a live secret: a
+  # permissions error would otherwise mint a fresh JWT_SECRET and invalidate every
+  # session (cage-match round 5, Carnot — the same non-match-is-absence shape as round 4,
+  # one layer up). Absence is only benign when we can actually read the file.
+  [ -r "$ENV_FILE" ] || die "$ENV_FILE exists but is not readable — refusing to continue, because an unreadable .env is indistinguishable from a fresh island and would mint a NEW JWT_SECRET, logging out every user. Fix the permissions (chmod 600, owned by you) and re-run."
   # dotenv_read, NOT a bespoke grep: `^JWT_SECRET=` missed `export JWT_SECRET=…` and a
-  # leading space, read as absent, and MINTED A NEW SECRET — invalidating every live
-  # session under a header promising it never rotates one (cage-match round 4, Tesla).
+  # leading space, read as absent, and MINTED A NEW SECRET — under a header promising it
+  # never rotates one (cage-match round 4, Tesla).
   existing_secret="$(dotenv_read "$ENV_FILE" JWT_SECRET)"
 fi
 # Resolve the operator CHOICES that survive a re-run. Must happen BEFORE the heredoc

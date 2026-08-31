@@ -99,3 +99,28 @@ def test_the_jwt_test_can_actually_fail(tmp_path) -> None:
     assertions above could never distinguish found from re-minted."""
     assert _read(tmp_path, "OTHER=x\n", key="JWT_SECRET") == ""
     assert len(SECRET) >= 32, "the fixture must clear standup's 32-char floor"
+
+
+def test_an_unreadable_file_reads_as_empty_which_is_why_callers_must_check(tmp_path) -> None:
+    """CARNOT'S ROUND-5 FINDING, pinned as a CONTRACT rather than papered over.
+
+    `dotenv_read` cannot distinguish "key absent" from "file unreadable" — both give "".
+    Carnot found the consequence: standup's JWT path treated that as "first run" and MINTED
+    A NEW SECRET on a permissions error, logging out every user. Same non-match-is-absence
+    shape Tesla named in round 4, one layer up.
+
+    The reader deliberately stays pure — only the caller knows whether absence is benign (a
+    brand-new island legitimately has no JWT_SECRET; an unreadable .env never is). So
+    standup.sh now refuses on `[ -r "$ENV_FILE" ]` before treating absence as a fresh
+    install. This test pins the ambiguity so nobody later 'fixes' the reader and leaves the
+    caller's guard looking redundant."""
+    env = tmp_path / ".env"
+    env.write_text("JWT_SECRET=" + "a" * 64 + "\n")
+    env.chmod(0o000)
+    try:
+        got = subprocess.run(
+            ["bash", "-c", f'. "{LIB}"; dotenv_read "{env}" JWT_SECRET'],
+            capture_output=True, text=True, check=True).stdout
+    finally:
+        env.chmod(0o600)
+    assert got == "", "if this now reports an error, standup's -r guard can be simplified"

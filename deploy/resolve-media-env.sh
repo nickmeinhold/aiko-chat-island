@@ -31,7 +31,12 @@ domain="${3:?missing <domain>}"
 turn_flag="${4:-}"
 livekit_flag="${5:-}"
 
-. "$(dirname "${BASH_SOURCE[0]}")/lib/dotenv-read.sh"   # ONE .env grammar (see that file)
+_src="${BASH_SOURCE[0]}"
+while [ -L "$_src" ]; do
+  _d="$(cd -P "$(dirname "$_src")" && pwd)"; _src="$(readlink "$_src")"
+  case "$_src" in /*) ;; *) _src="$_d/$_src" ;; esac
+done
+. "$(cd -P "$(dirname "$_src")" && pwd)/lib/dotenv-read.sh"   # ONE .env grammar (see that file)
 _read_kv() { dotenv_read "$1" "$2"; }
 
 # RESOLUTION ORDER, one order for both hostnames: flag, then the value this island

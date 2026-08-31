@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
+# NOTE ON LOCATING THIS FILE: callers must resolve symlinks before dirname'ing
+# ${BASH_SOURCE[0]} — bash reports the symlink path, not the target, so a script reached
+# through a symlink (a ~/bin shortcut, a packaging step) would look for lib/ beside the
+# LINK and die. Each caller does that resolution inline because a shared helper cannot be
+# sourced before you have found the thing to source. Found by the author's own round-5
+# pass; it fails loudly, but it is a coupling this PR introduced.
 # ONE reader for a .env file. Source it; do not copy it.
 #
 # WHY THIS FILE EXISTS. Four copies of `grep -E "^KEY=" | cut -d= -f2-` existed across
@@ -30,7 +36,18 @@
 # over the grammar's axes in tests/test_resolve_gateway_env.py — adding an AXIS is how the
 # class stays bounded; adding a row is how it stops being.
 
-# dotenv_read <file> <key> — echoes the value, or nothing if absent/unreadable.
+# dotenv_read <file> <key> — echoes the value, or nothing if the key is absent.
+#
+# IT CANNOT TELL YOU WHY IT IS EMPTY, and that is load-bearing for callers. An empty
+# result means "no such key" OR "no such file" OR "file not readable" — and Carnot
+# (round 5) found the consequence: in standup's JWT path, a PERMISSIONS ERROR silently
+# became "mint a new secret", invalidating every live session. That is the same
+# non-match-is-absence shape Tesla named in round 4, one layer up: unreadable ≡ absent.
+#
+# The fix is at the CALLER, deliberately, because only the caller knows whether absence is
+# benign. A brand-new island legitimately has no JWT_SECRET; an unreadable .env is never
+# benign. So `dotenv_read` stays a pure reader and standup.sh checks readability before
+# treating absence as "first run" (see the existing_secret block there).
 dotenv_read() {
   local v q _re="^[[:space:]]*(export[[:space:]]+)?$2[[:space:]]*=[[:space:]]*"
   v=$([ -f "$1" ] && grep -E "$_re" "$1" 2>/dev/null | tail -n1 | sed -E "s/$_re//; s/[[:space:]]*\r?$//" || true)

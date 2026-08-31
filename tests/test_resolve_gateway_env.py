@@ -244,7 +244,7 @@ def test_a_seed_list_with_an_unbalanced_quote_is_refused(tmp_path) -> None:
     than laundering a corrupt value into .env."""
     result = _run(tmp_path, gw={"GATEWAY_SEED_PEERS": '"unbalanced'})
     assert result.returncode == 1
-    assert "must be a JSON array" in result.stderr
+    assert "not bracket-delimited" in result.stderr
 
 
 def test_an_export_prefixed_recorded_value_is_honoured(tmp_path) -> None:
@@ -270,7 +270,7 @@ def test_the_export_test_can_actually_fail(tmp_path) -> None:
     assert plain["PASSKEY_ENABLED"] != "false"
 
 
-def test_a_truncated_multiline_seed_list_is_refused(tmp_path) -> None:
+def test_a_truncated_seed_list_is_refused_by_the_bracket_check(tmp_path) -> None:
     """CARNOT'S ROUND-3 RECOVERY CASE. An island stood up before this fix, using the
     guide's multiline --seed-peers, has a literal `GATEWAY_SEED_PEERS=[` in .env with the
     array body orphaned on following lines (unparseable by python-dotenv too). Reading
@@ -279,7 +279,7 @@ def test_a_truncated_multiline_seed_list_is_refused(tmp_path) -> None:
     how to repair it."""
     result = _run(tmp_path, gw={"GATEWAY_SEED_PEERS": "["})
     assert result.returncode == 1
-    assert "must be a JSON array" in result.stderr
+    assert "not bracket-delimited" in result.stderr
     assert "--seed-peers" in result.stderr, "the refusal must say how to repair it"
 
 
@@ -416,3 +416,49 @@ def test_the_class_guard_detects_a_wrong_value_not_only_a_refusal(tmp_path) -> N
         "python-dotenv changed. Either way the guard's must-fail arm must be re-pointed."
     )
     assert "\\" in got and "\\" not in want, "the divergence is not the one documented"
+
+
+def test_the_bracket_check_is_bracket_shaped_and_says_so(tmp_path) -> None:
+    """CARNOT'S ROUND-5 FINDING, fixed as a SCOPE correction rather than more code.
+
+    The guard's message and these test names previously said "must be a JSON array" while
+    the check looks only at the first and last character — so `[not-json]` passes. Carnot
+    was right that prose overclaimed the code.
+
+    The gap stays deliberately. The guard exists for ONE historic corruption — a
+    pre-2026-09 standup with the guide's multiline `--seed-peers` leaving a literal `[` in
+    .env. Validating the JSON body means a JSON parser in shell, which is exactly what
+    #3592 says not to build. So the fix was to make every claim match the check.
+
+    This test PINS THE DECLARED SCOPE, so that if someone later reads the guard as
+    validating JSON, the suite says otherwise in writing."""
+    out = _parsed(_run(tmp_path, gw={"GATEWAY_SEED_PEERS": "[not-json]"}))
+    assert out["SEED_PEERS"] == "[not-json]", (
+        "the guard now validates JSON bodies — good, but update the message, the header "
+        "comment and this test, which all declare it as bracket-shape only"
+    )
+
+
+def test_the_resolver_works_when_invoked_through_a_symlink(tmp_path) -> None:
+    """AUTHOR'S OWN ROUND-5 FINDING. Sourcing deploy/lib/dotenv-read.sh is a cross-file
+    coupling this PR introduced — before it, each script was self-contained. bash reports
+    the LINK path in BASH_SOURCE, so a resolver reached through a ~/bin shortcut looked for
+    lib/ beside the link and died. Loud, not silent, but new fragility we added."""
+    link = tmp_path / "linked-resolver.sh"
+    link.symlink_to(SCRIPT)
+    env = _write(tmp_path / "gateway.env", {"PASSKEY_ENABLED": "true", "GATEWAY_SEED_PEERS": PEERS_A})
+    result = subprocess.run([str(link), str(env), "", ""], capture_output=True, text=True)
+    assert result.returncode == 0, f"symlink invocation failed: {result.stderr}"
+    out = dict(l.split("=", 1) for l in result.stdout.strip().splitlines())
+    assert out["PASSKEY_ENABLED"] == "true" and out["SEED_PEERS"] == PEERS_A
+
+
+def test_the_symlink_test_can_actually_fail(tmp_path) -> None:
+    """MUST-FAIL ARM. Pins that the link really is a symlink pointing elsewhere — if it
+    resolved to a copy in the same directory, lib/ would be found for the wrong reason and
+    the test above would pass without exercising the resolution."""
+    link = tmp_path / "l.sh"
+    link.symlink_to(SCRIPT)
+    assert link.is_symlink()
+    assert link.parent != SCRIPT.parent, "the link must NOT sit beside the real lib/"
+    assert not (tmp_path / "lib" / "dotenv-read.sh").exists()
