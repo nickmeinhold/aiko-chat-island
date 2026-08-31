@@ -715,9 +715,20 @@ Gated separately: **Decision 9 (#3196)** before shipping to cross-island pairs, 
   carves out the same 10/3 header bytes, and `encryption path:pkg/sfu` returns **zero
   results** across the server's entire forwarding subsystem. The real E2EE costs are **AV1**
   (refused outright) and H.264/H.265 (NALU handling) — neither is our codec, which makes the
-  client's `videoCodec: 'vp8'` pin load-bearing if E2EE is enabled. **So Q2's cost column is
-  empty and its benefit side has risen; it is now a pure policy call.** Scope: a source read
-  of both cryptors and the server, not a live A/B capture of layer switching. Carries the **agent-as-keyholder** collision, which wants
+  client's `videoCodec: 'vp8'` pin load-bearing if E2EE is enabled. The app tab reached the same conclusion by a
+  different route — reading the shipped SDK rather than the cryptors — and found the only
+  two things `e2eeOptions` changes at all: `backupVideoCodec: enabled: false` and
+  `disableRed: true`. Simulcast is never touched. The backup codec is already inert for us
+  *because* of the `vp8` pin (it exists to fall back from VP9/AV1 **to** VP8, and we are
+  already at the floor). **Audio RED is also a non-cost here, checked against the version
+  the app actually resolves** (`livekit_client 2.10.0`, per `pubspec.lock` — not the 2.11.0
+  sitting beside it in the pub cache): `AudioPublishOptions.red` defaults to `true` and
+  `local.dart:189` reads `disableRed: room.e2eeManager != null ? true : publishOptions.red
+  ?? true`, so RED is already disabled on our path with or without E2EE. (That inversion —
+  `red: true` producing `disableRed: true` — looks like an SDK bug, but it makes the cost
+  zero either way.) **So Q2's cost column is empty and its benefit side has risen; it is now
+  a pure policy call.** Scope: a source read of both cryptors, the server, and the resolved
+  client SDK — not a live A/B capture of layer switching. Carries the **agent-as-keyholder** collision, which wants
   its own design and must not ride along.
 - **Call-egress metering** (Decision 9f) — nothing on either box meters it, and it is the
   precondition for the charge-or-cap Nick names. Island-side.
