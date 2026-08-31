@@ -323,7 +323,13 @@ the callee physically cannot join.** Today the same failure is a quiet dead end.
 
 This settles host-selection, which was the fork #3196 needed.
 
-**Why it is the right pick.** Under CallKit the callee's island *already owns the leg that
+**Attribution, because it matters downstream:** the RULING is Nick's. The argument below is
+**Claude's reconstruction**, not his stated reasoning — he confirmed 2026-08-31 that the call
+was fast intuition and the justification came after. Recorded this way so a later reader can
+re-examine the argument on its merits without believing they are overturning a ruling. If the
+reasoning is wrong, the ruling may still be right.
+
+**Why it looks like the right pick.** Under CallKit the callee's island *already owns the leg that
 must work*: it holds the callee's device tokens and sends the wake. Hosting the room there
 puts the push and the SFU on the same island, so the ring path carries **no cross-island
 dependency at all**. The caller — awake, in the app, and acting — is the party made to
