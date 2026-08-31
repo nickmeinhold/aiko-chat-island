@@ -120,30 +120,29 @@ ok "docker, git, openssl, curl, docker compose present"
 lk_env="$SCRIPT_DIR/livekit/.env"
 _read_kv() { [ -f "$1" ] && grep -E "^$2=" "$1" 2>/dev/null | tail -n1 | cut -d= -f2- || true; }
 
+# Hostname order and credential-source choice live in deploy/resolve-media-env.sh,
+# which is TESTED (tests/test_resolve_media_env.py, both controls, mutation-proven).
+# They used to be inlined here, and every finding across three cage-match rounds on
+# PR#151 was in this wiring — including round 1's hostname bug reappearing inside
+# round 3's fix, because nothing here could go red. Calling the tested script means
+# the code under test IS the code that runs; a second copy would be worse than none.
+#
+# It runs unconditionally, not just under --with-media: the no---with-media re-run
+# needs the same credential decision to carry an existing pair forward.
+# ONE invocation, and stderr is NOT captured — the refusal messages name which file is
+# damaged and what to do, so they belong on the operator's terminal, not swallowed into
+# a variable this script would have to re-print.
+set +e
+_media_env="$("$SCRIPT_DIR/resolve-media-env.sh" \
+    "$REPO_ROOT/.env" "$lk_env" "$DOMAIN" "$TURN_DOMAIN" "$LIVEKIT_DOMAIN")"
+_media_rc=$?
+set -e
+[ "$_media_rc" -eq 0 ] || die "media environment could not be resolved — see the refusal above."
+TURN_DOMAIN="$(printf '%s\n' "$_media_env" | grep '^TURN_DOMAIN=' | cut -d= -f2-)"
+LIVEKIT_DOMAIN="$(printf '%s\n' "$_media_env" | grep '^LIVEKIT_DOMAIN=' | cut -d= -f2-)"
+CRED_SOURCE="$(printf '%s\n' "$_media_env" | grep '^CRED_SOURCE=' | cut -d= -f2-)"
+
 if [ "$DO_MEDIA" = "true" ]; then
-  # RESOLUTION ORDER for both hostnames: flag, then the value this island RECORDED,
-  # then convention. The middle rung is the one that was missing.
-  #
-  # Round 3 added persistence of LIVEKIT_DOMAIN and taught the RECOVERY branch (the
-  # no---with-media re-run) to read it back. The --with-media path was never taught,
-  # so an operator who stood up with --livekit-domain sfu.example.org and then re-ran
-  # WITH --with-media but WITHOUT repeating the flag had it silently reset to
-  # livekit.<domain> — and the .env write below then overwrote the recorded value with
-  # the convention one, destroying the only record of it. The gateway was handed a
-  # LIVEKIT_URL pointing at a host that may not serve the SFU, which fails at CONNECT.
-  #
-  # That is the round-1 hostname-derivation bug reappearing inside the round-3 fix, on
-  # the MORE likely path: --with-media is the documented safe-to-re-run invocation.
-  # Fixed as a class here rather than as a third instance — both hostnames, both
-  # branches, one resolution order.
-  [ -n "$TURN_DOMAIN" ]    || TURN_DOMAIN="$(_read_kv "$lk_env" LIVEKIT_TURN_DOMAIN)"
-  [ -n "$TURN_DOMAIN" ]    || TURN_DOMAIN="turn.$DOMAIN"
-  # SEPARATE name, not a synonym. Both live islands serve the SFU websocket on
-  # livekit.<host> and TURN on turn.<host>; an earlier draft set LIVEKIT_URL to the
-  # TURN name and would have handed every client the wrong endpoint (cage-match
-  # PR#151, Carnot — verified against both live islands' .env).
-  [ -n "$LIVEKIT_DOMAIN" ] || LIVEKIT_DOMAIN="$(_read_kv "$lk_env" LIVEKIT_DOMAIN)"
-  [ -n "$LIVEKIT_DOMAIN" ] || LIVEKIT_DOMAIN="livekit.$DOMAIN"
   log "Preflight — media (SFU on $LIVEKIT_DOMAIN, TURN on $TURN_DOMAIN)"
 
   # The collision this whole overlay exists to avoid: a LiveKit already running
@@ -265,47 +264,25 @@ LIVEKIT_ENV_BLOCK=""
 # lk_env and _read_kv are defined above the media preflight, which needs them to
 # recover the recorded hostnames before defaulting by convention.
 
-# A CREDENTIAL IS A PAIR, NOT TWO FIELDS. Resolving key and secret independently lets
-# a half-written file on one side combine with the other side into a HYBRID that
-# matches neither — and the script would then write that invented pair to both files,
-# authenticating nothing (cage-match PR#151 round 2, Carnot). So each file is read as
-# a whole: complete, empty, or INVALID. A half-populated file is never a source.
+# The pair's SOURCE was decided by resolve-media-env.sh in the preflight above, which
+# is tested with both controls and mutation-proven. Every refusal case — a half-present
+# pair on either file, two complete pairs that disagree — has already aborted there, so
+# all that is left here is to read the pair from the file that won.
+#
+# This block used to re-implement that state machine inline, untested. Deleting the copy
+# is the point of the extraction: a test that exercises a parallel implementation is
+# worse than no test, because it reports green about code nobody runs.
 gw_url="$(_read_kv "$REPO_ROOT/.env" LIVEKIT_URL)"
-gw_key="$(_read_kv "$REPO_ROOT/.env" LIVEKIT_API_KEY)"
-gw_secret="$(_read_kv "$REPO_ROOT/.env" LIVEKIT_API_SECRET)"
-sfu_key="$(_read_kv "$lk_env" LIVEKIT_API_KEY_ID)"
-sfu_secret="$(_read_kv "$lk_env" LIVEKIT_API_SECRET)"
-
-_pair_state() {  # $1=key $2=secret -> complete | empty | partial
-  if   [ -n "$1" ] && [ -n "$2" ]; then echo complete
-  elif [ -z "$1" ] && [ -z "$2" ]; then echo empty
-  else echo partial; fi
-}
-gw_state="$(_pair_state "$gw_key" "$gw_secret")"
-sfu_state="$(_pair_state "$sfu_key" "$sfu_secret")"
-
-# A partial pair is CORRUPTION, not a starting point — half a credential cannot be
-# completed from the other file without inventing one.
-if [ "$gw_state" = partial ] || [ "$sfu_state" = partial ]; then
-  die "a LiveKit credential is half-present: gateway .env is '$gw_state', $lk_env is '$sfu_state'.
-     A key without its secret (or the reverse) cannot be completed from the other file
-     without inventing a pair that authenticates nothing. Restore or clear the damaged
-     file, then re-run."
-fi
-
-# Both complete and disagreeing: refuse. Either could be the live one, and the wrong
-# choice mints tokens the running SFU rejects, with no error anywhere.
-if [ "$gw_state" = complete ] && [ "$sfu_state" = complete ] \
-   && { [ "$gw_key" != "$sfu_key" ] || [ "$gw_secret" != "$sfu_secret" ]; }; then
-  die "the gateway .env and $lk_env hold DIFFERENT LiveKit key pairs.
-     Refusing to guess which is live. Reconcile them by hand (make both match the pair
-     the RUNNING SFU was started with), then re-run."
-fi
-
-# Exactly one complete pair, or two identical ones — take it atomically.
-if [ "$sfu_state" = complete ]; then lk_key="$sfu_key"; lk_secret="$sfu_secret"
-elif [ "$gw_state" = complete ]; then lk_key="$gw_key"; lk_secret="$gw_secret"
-else lk_key=""; lk_secret=""; fi
+case "$CRED_SOURCE" in
+  sfu)
+    lk_key="$(_read_kv "$lk_env" LIVEKIT_API_KEY_ID)"
+    lk_secret="$(_read_kv "$lk_env" LIVEKIT_API_SECRET)" ;;
+  gateway)
+    lk_key="$(_read_kv "$REPO_ROOT/.env" LIVEKIT_API_KEY)"
+    lk_secret="$(_read_kv "$REPO_ROOT/.env" LIVEKIT_API_SECRET)" ;;
+  *)
+    lk_key=""; lk_secret="" ;;
+esac
 
 if [ "$DO_MEDIA" = "true" ]; then
   if [ -n "$lk_key" ] && [ -n "$lk_secret" ]; then
@@ -353,8 +330,9 @@ elif [ -n "$lk_key" ]; then
   # Media NOT requested this run, but this island already has a credential somewhere.
   # Carry it forward — including a BYO LIVEKIT_URL pointing at someone else's SFU.
   #
-  # Note the source is $lk_key, NOT $gw_key: an earlier fix covered only the case
-  # where the GATEWAY .env survived. If the gateway .env was deleted while
+  # The branch keys on $lk_key — the pair from WHICHEVER file the resolver chose — not
+  # on the gateway .env specifically. An earlier fix covered only the case where the
+  # GATEWAY .env survived. If the gateway .env was deleted while
   # deploy/livekit/.env survived, that version wrote a fresh .env with no media lines
   # and left a running SFU beside a 503ing gateway — the same torn media plane by the
   # other route (cage-match PR#151 round 2, Carnot). Recovering from either side
