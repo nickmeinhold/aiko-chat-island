@@ -512,6 +512,67 @@ direct path was removed deliberately there is no partial-P2P mitigation to fall 
 is why insertable-streams E2EE is not *a* route to content confidentiality here — **it is the
 only one.**
 
+#### Decision 9f — force-relay is also a BILLING decision, and its stated rationale does not survive the topology
+
+> **RULING (Nick, 2026-08-31):** *"an app user should be able to decide if they care if they
+> expose their IP bc we don't have infinite egress so will have to charge or cap minutes if
+> we're passing packets."*
+
+*(Given to the app tab, relayed; provenance recorded.)*
+
+**This amends his own 2026-08-11 ruling**, which 9e quotes and which the client enforces as
+`const RTCIceTransportPolicy.relay`, documented *"NOT flippable and NOT per-island
+adaptive"*. His to amend — flagged here so the docstring is updated **deliberately** rather
+than left citing him as the authority for the opposite of his current position.
+
+**The economic fact nobody priced.** Force-relay means every byte of every call traverses
+the island's TURN server, so **egress cost is linear in call-minutes with no direct path to
+amortise it.** A decision framed purely as privacy was also a billing decision. Nick's
+consequence: charge, or cap minutes. **Nothing on either box meters call egress today** —
+that is island-side work and a precondition for any charge-or-cap.
+
+##### And the rationale is calibrated for the wrong topology — VERIFIED
+
+The docstring's reason is that *"`.all` leaks peer IPs"*. The app tab hypothesised that this
+is a **mesh/P2P rationale applied to an SFU**, and flagged it explicitly as unverified. It
+checks out against LiveKit's primary documentation (`docs.livekit.io/reference/internals/
+client-protocol/`):
+
+> a client establishes *"up to two separate `PeerConnection` objects. One for publishing
+> tracks to the server, and the other for receiving subscribed tracks"*, and *"client and
+> server will exchange ICE candidates via `trickle`"*.
+
+**ICE candidates are exchanged client↔server only. No participant-to-participant path
+exists**, and P2P support is an open LiveKit *feature request*, not a mode we could be
+falling into. So:
+
+- under `.all`, the party that learns your address is the **operator's SFU**;
+- under `.relay`, it is the **operator's TURN server** — the same operator, and on both live
+  islands the same physical box (`turn.<domain>` and `livekit.<domain>` resolve together);
+- **under neither does another participant learn it**, because there is no channel by which
+  they could.
+
+**So force-relay buys approximately nothing on peer-IP privacy in this topology, while
+costing 100% of media egress.** Nick's economic instinct is right for a reason he did not
+have to hand.
+
+**Scope of that claim, stated honestly:** verified from the documented topology, **not from
+a packet capture**. It is strong enough to reopen the decision and *not* strong enough to
+flip a hard privacy ruling on its own — a wrong reading re-opens exactly the leak the
+2026-08-11 ruling closed. Confirm with a capture, or take it as Nick's call, before changing
+the policy.
+
+##### Separate the axes before designing the control
+
+- **Privacy** — who sees my IP: the **operator** (unavoidable in an SFU, under either
+  policy) versus the **other participant** (already zero, under either policy).
+- **Cost** — who pays for the bytes: relay is 100% egress; direct-to-SFU still hits the
+  server; only true P2P is cheap, and an SFU does not offer it.
+
+These are **not the same toggle**. A single "protect my IP" switch that silently also means
+"cost the operator egress" misrepresents the trade. Nick's 9d disclosure ruling points at
+**one preference surface serving both exposures**, rather than two controls.
+
 #### Unchanged from the first draft, and still the fair framing
 
 - **Not a regression.** Cross-island calling does not work today (Decision 9), so there is no
@@ -600,6 +661,11 @@ Gated separately: **Decision 9 (#3196)** before shipping to cross-island pairs, 
   deliberately enables; LiveKit's own E2EE docs do not state that limitation, so it is
   unverified in both directions. Carries the **agent-as-keyholder** collision, which wants
   its own design and must not ride along.
+- **Call-egress metering** (Decision 9f) — nothing on either box meters it, and it is the
+  precondition for the charge-or-cap Nick names. Island-side.
+- **Whether force-relay stays** (Decision 9f) — its stated rationale does not survive the SFU
+  topology, and Nick has already moved to making IP exposure a user choice. Needs a packet
+  capture or his explicit call; **do not flip it on the doc reading alone.**
 - **GATE (Decision 9c): cross-island calling does not ship until #3426 is decided** — media
   E2EE on, or the 9d disclosure shipping with it. Neither is what the gate prevents.
 - **The Play `USE_FULL_SCREEN_INTENT` declaration** — Nick submits (#3615). Listed here only
