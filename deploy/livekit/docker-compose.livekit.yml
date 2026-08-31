@@ -1,0 +1,39 @@
+# Standalone LiveKit SFU for an aiko island — OPT-IN, separate from the gateway
+# compose on purpose. Mirrors deploy/caddy/docker-compose.caddy.yml exactly, and
+# for the same reason.
+#
+# Why its own project (not a service in the main docker-compose.yml): the live
+# islands already run a LiveKit as a separate host stack — and on imagineering
+# that instance is SHARED with another product (#3688). Folding an SFU into the
+# gateway compose would make the next `docker compose up` on those hosts try to
+# bind 7880/7881/3478 and collide with the SFU already there. Keeping it separate
+# means a NEW island opts in here while the live islands are untouched.
+#
+# BRING-YOUR-OWN IS THE OTHER ARM, and it is already supported: set LIVEKIT_URL +
+# LIVEKIT_API_KEY/SECRET in the gateway's .env to point at any SFU, anywhere, and
+# do not bring this file up. Both islands run that arm today. An island with
+# neither is also fine — livekit_tokens.is_configured() is False and the
+# video-token endpoint returns 503 (capability disabled), which is an expected
+# state, not a fault.
+#
+# `network_mode: host` is deliberate and NOT the same reason as Caddy's: an SFU
+# needs a wide UDP range (rtc 7882-7892, TURN relay 50000-60000) plus 3478 and
+# 7881. Publishing that range through Docker's userland proxy is both a large
+# per-port cost and a source of wrong source-addresses in ICE candidates. Host
+# networking is what the live islands run and what LiveKit's own docs recommend
+# for a self-hosted SFU.
+name: aiko-livekit
+
+services:
+  livekit:
+    # PINNED. The two live islands both happen to run v1.13.5 today by luck
+    # rather than enforcement (#3685) — a version an operator can read off a
+    # file is the point of the bundled arm.
+    image: livekit/livekit-server:${LIVEKIT_SERVER_VERSION:-v1.13.5}
+    restart: always
+    network_mode: host
+    command: --config /etc/livekit.yaml
+    volumes:
+      # Rendered from livekit.yaml.template by render-config.sh — NOT in git,
+      # because it carries the API secret. Read-only in the container.
+      - ./livekit.yaml:/etc/livekit.yaml:ro

@@ -22,6 +22,8 @@
 #   deploy/standup.sh --domain chat.example.org --name "Example Island" \
 #       --seed-peers '[{"id":"chat.imagineering.cc","display_name":"Aiko","base_url":"https://chat.imagineering.cc"}]'
 #   deploy/standup.sh --domain chat.example.org --name "Example Island" --no-tls
+#   deploy/standup.sh --domain chat.example.org --name "Example Island" \
+#       --with-media --turn-domain turn.example.org
 #
 # Flags (all optional except --domain and --name, which prompt if omitted):
 #   --domain <host>       public hostname for this island (DNS A record -> this host)
@@ -29,6 +31,15 @@
 #   --seed-peers <json>   JSON array of {"id","display_name","base_url"} to federate with
 #   --enable-passkeys     advertise passkey sign-in (only after well-known files serve; see guide)
 #   --no-tls              skip the bundled Caddy step (you run your own reverse proxy)
+#   --with-media          also stand up a bundled LiveKit SFU for calls (OFF by default;
+#                         without it the island has no video and the token endpoint 503s,
+#                         which is a supported state — or point LIVEKIT_URL at your own SFU)
+#   --turn-domain <host>  public hostname for TURN when --with-media (default: turn.<domain>)
+#   --livekit-domain <host>  public hostname for the SFU WEBSOCKET when --with-media
+#                         (default: livekit.<domain>). SEPARATE from --turn-domain:
+#                         both live islands serve the SFU on livekit.<host> and TURN on
+#                         turn.<host>, and handing clients the TURN name as LIVEKIT_URL
+#                         points them at the wrong endpoint.
 #   --from-source         build the island image from this checkout instead of pulling
 #   --yes                 non-interactive; fail instead of prompting for missing values
 
@@ -49,6 +60,12 @@ cd "$REPO_ROOT"
 
 # --- defaults + arg parsing -------------------------------------------------
 DOMAIN=""; DISPLAY_NAME=""; SEED_PEERS="[]"; ENABLE_PASSKEYS="false"; DO_TLS="true"; INTERACTIVE="true"; FROM_SOURCE="false"
+# Media is OFF by default, unlike TLS. An island without HTTPS is broken; an island
+# without an SFU is a supported configuration the code already models
+# (livekit_tokens.is_configured() -> 503 "capability disabled"). Defaulting it ON
+# would also fail preflight for most new islands, which need a turn.<host> DNS
+# record and open UDP ranges before an SFU can do anything.
+DO_MEDIA="false"; TURN_DOMAIN=""; LIVEKIT_DOMAIN=""
 DATA_VOLUME="aiko_data"
 
 while [ $# -gt 0 ]; do
@@ -58,6 +75,9 @@ while [ $# -gt 0 ]; do
     --seed-peers)     SEED_PEERS="${2:-[]}"; shift 2 ;;
     --enable-passkeys) ENABLE_PASSKEYS="true"; shift ;;
     --no-tls)         DO_TLS="false"; shift ;;
+    --with-media)     DO_MEDIA="true"; shift ;;
+    --turn-domain)    TURN_DOMAIN="${2:?--turn-domain needs a value}"; shift 2 ;;
+    --livekit-domain) LIVEKIT_DOMAIN="${2:?--livekit-domain needs a value}"; shift 2 ;;
     --from-source)    FROM_SOURCE="true"; shift ;;
     --yes)            INTERACTIVE="false"; shift ;;
     -h|--help)        sed -n '2,/^set -euo/p' "$0" | sed 's/^# \{0,1\}//;/^set -euo/d'; exit 0 ;;
@@ -94,6 +114,85 @@ ok "docker, git, openssl, curl, docker compose present"
 # Both checks below matter ONLY under the bundled Caddy; --no-tls means the
 # operator brings their own proxy, so neither DNS-points-here nor ports-80/443-free
 # is our concern.
+# --- preflight: media preconditions (only when we run the bundled SFU) -------
+# Same discipline as the TLS block: these matter ONLY under --with-media. An
+# island pointing LIVEKIT_URL at someone else's SFU owes none of it.
+lk_env="$SCRIPT_DIR/livekit/.env"
+_read_kv() { [ -f "$1" ] && grep -E "^$2=" "$1" 2>/dev/null | tail -n1 | cut -d= -f2- || true; }
+
+if [ "$DO_MEDIA" = "true" ]; then
+  # RESOLUTION ORDER for both hostnames: flag, then the value this island RECORDED,
+  # then convention. The middle rung is the one that was missing.
+  #
+  # Round 3 added persistence of LIVEKIT_DOMAIN and taught the RECOVERY branch (the
+  # no---with-media re-run) to read it back. The --with-media path was never taught,
+  # so an operator who stood up with --livekit-domain sfu.example.org and then re-ran
+  # WITH --with-media but WITHOUT repeating the flag had it silently reset to
+  # livekit.<domain> — and the .env write below then overwrote the recorded value with
+  # the convention one, destroying the only record of it. The gateway was handed a
+  # LIVEKIT_URL pointing at a host that may not serve the SFU, which fails at CONNECT.
+  #
+  # That is the round-1 hostname-derivation bug reappearing inside the round-3 fix, on
+  # the MORE likely path: --with-media is the documented safe-to-re-run invocation.
+  # Fixed as a class here rather than as a third instance — both hostnames, both
+  # branches, one resolution order.
+  [ -n "$TURN_DOMAIN" ]    || TURN_DOMAIN="$(_read_kv "$lk_env" LIVEKIT_TURN_DOMAIN)"
+  [ -n "$TURN_DOMAIN" ]    || TURN_DOMAIN="turn.$DOMAIN"
+  # SEPARATE name, not a synonym. Both live islands serve the SFU websocket on
+  # livekit.<host> and TURN on turn.<host>; an earlier draft set LIVEKIT_URL to the
+  # TURN name and would have handed every client the wrong endpoint (cage-match
+  # PR#151, Carnot — verified against both live islands' .env).
+  [ -n "$LIVEKIT_DOMAIN" ] || LIVEKIT_DOMAIN="$(_read_kv "$lk_env" LIVEKIT_DOMAIN)"
+  [ -n "$LIVEKIT_DOMAIN" ] || LIVEKIT_DOMAIN="livekit.$DOMAIN"
+  log "Preflight — media (SFU on $LIVEKIT_DOMAIN, TURN on $TURN_DOMAIN)"
+
+  # The collision this whole overlay exists to avoid: a LiveKit already running
+  # on this host. With network_mode: host, docker CANNOT detect the clash at
+  # create time — `up -d` reports success while the new server crash-loops on
+  # bind, and it surfaces only as "calls don't connect". imagineering runs
+  # exactly this shape (an SFU shared with another product), which is why the
+  # bundled arm is opt-in rather than default.
+  ours_lk="$(docker compose -f "$SCRIPT_DIR/livekit/docker-compose.livekit.yml" ps -q --status running livekit 2>/dev/null || true)"
+  if [ -z "$ours_lk" ]; then
+    # FAIL CLOSED when we cannot look (cage-match PR#151, Carnot): with neither ss
+    # nor lsof the old loop reported success, which defeats the whole preflight for
+    # a host-network service whose failure mode is crash-loop-AFTER-success.
+    if ! command -v ss >/dev/null 2>&1 && ! command -v lsof >/dev/null 2>&1; then
+      die "neither 'ss' nor 'lsof' is available, so the media port check cannot run.
+     Refusing --with-media rather than reporting a clean preflight we did not perform.
+     Install iproute2 (ss) or lsof, or use an existing SFU via LIVEKIT_URL."
+    fi
+    for p in 7880 7881 3478; do
+      # Isolate the port FIELD then match it exactly — the same idiom this script
+      # already uses for 80/443 below, rather than a second weaker one grepping the
+      # raw line (cage-match PR#151, Kelvin: the repo's own pattern was better).
+      # -lntu covers UDP, so TURN's 3478 is actually checked; the lsof fallback adds
+      # -iUDP for the same reason (an -iTCP-only check misses a UDP TURN collision).
+      if (command -v ss >/dev/null 2>&1 \
+            && ss -lntuH 2>/dev/null | awk '{n=split($5,a,":"); print a[n]}' | grep -qxF "$p") \
+      || (command -v lsof >/dev/null 2>&1 \
+            && lsof -nP -iTCP:"$p" -sTCP:LISTEN -t >/dev/null 2>&1) \
+      || (command -v lsof >/dev/null 2>&1 \
+            && lsof -nP -iUDP:"$p" -t >/dev/null 2>&1); then
+        die "port $p is already in use on this host — something is already serving media here.
+     If that is an SFU you already run, do NOT pass --with-media: set LIVEKIT_URL,
+     LIVEKIT_API_KEY and LIVEKIT_API_SECRET in the island's .env to point at it."
+      fi
+    done
+    ok "media ports 7880/7881/3478 are free"
+  else
+    ok "our own bundled SFU already holds the ports (re-run is idempotent)"
+  fi
+
+  # DNS advisory for TURN. Not fatal: certs and DNS often land after standup.
+  turn_ip="$(getent hosts "$TURN_DOMAIN" 2>/dev/null | awk '{print $1; exit}' || true)"
+  if [ -n "$turn_ip" ]; then
+    ok "$TURN_DOMAIN resolves to $turn_ip"
+  else
+    warn "$TURN_DOMAIN does not resolve yet. Relay will fail until it points at this host."
+  fi
+fi
+
 if [ "$DO_TLS" = "true" ]; then
   # DNS advisory (does the domain point here?)
   log "Preflight — DNS advisory for $DOMAIN"
@@ -133,7 +232,10 @@ if [ "$DO_TLS" = "true" ]; then
 fi
 
 # --- step 1: external data volume ------------------------------------------
-log "Step 1/4 — persistent data volume ($DATA_VOLUME)"
+# Step count depends on whether the optional media step runs, so the labels stay
+# honest in both modes rather than saying "4/4" while a fifth step follows.
+TOTAL=4; [ "$DO_MEDIA" = "true" ] && TOTAL=5
+log "Step 1/$TOTAL — persistent data volume ($DATA_VOLUME)"
 if docker volume inspect "$DATA_VOLUME" >/dev/null 2>&1; then
   ok "volume $DATA_VOLUME already exists — leaving it (never re-created; it holds the DB)"
 else
@@ -142,7 +244,146 @@ else
 fi
 
 # --- step 2: write the production .env --------------------------------------
-log "Step 2/4 — writing .env (island identity + secrets)"
+# --- media credentials, resolved BEFORE the .env write ---------------------
+# The SFU and the gateway must hold the SAME pair: the gateway mints join tokens the
+# SFU has to accept. The gateway .env is written wholesale below, so this is decided
+# here rather than patched in afterwards.
+#
+# Two re-run hazards, both found by the cage-match on PR#151 (Kelvin + Carnot, both
+# rated ship-blocking) and both fixed here rather than documented:
+#
+#   1. OMITTING --with-media on a re-run of an island that HAS media used to leave
+#      LIVEKIT_ENV_BLOCK empty, and the wholesale .env rewrite then SILENTLY STRIPPED
+#      LIVEKIT_*. The SFU kept running while the gateway went 503 — a torn media plane
+#      produced by a command advertised as safe to re-run. So credentials already in
+#      the gateway .env are now CARRIED FORWARD whether or not the flag is passed.
+#   2. Losing deploy/livekit/.env while the gateway .env survived used to mint a FRESH
+#      pair, rotating a live media secret. The pair is now recovered from EITHER file,
+#      and a conflict between two non-empty pairs FAILS CLOSED rather than silently
+#      picking one — a wrong pick is a media plane that authenticates nothing.
+LIVEKIT_ENV_BLOCK=""
+# lk_env and _read_kv are defined above the media preflight, which needs them to
+# recover the recorded hostnames before defaulting by convention.
+
+# A CREDENTIAL IS A PAIR, NOT TWO FIELDS. Resolving key and secret independently lets
+# a half-written file on one side combine with the other side into a HYBRID that
+# matches neither — and the script would then write that invented pair to both files,
+# authenticating nothing (cage-match PR#151 round 2, Carnot). So each file is read as
+# a whole: complete, empty, or INVALID. A half-populated file is never a source.
+gw_url="$(_read_kv "$REPO_ROOT/.env" LIVEKIT_URL)"
+gw_key="$(_read_kv "$REPO_ROOT/.env" LIVEKIT_API_KEY)"
+gw_secret="$(_read_kv "$REPO_ROOT/.env" LIVEKIT_API_SECRET)"
+sfu_key="$(_read_kv "$lk_env" LIVEKIT_API_KEY_ID)"
+sfu_secret="$(_read_kv "$lk_env" LIVEKIT_API_SECRET)"
+
+_pair_state() {  # $1=key $2=secret -> complete | empty | partial
+  if   [ -n "$1" ] && [ -n "$2" ]; then echo complete
+  elif [ -z "$1" ] && [ -z "$2" ]; then echo empty
+  else echo partial; fi
+}
+gw_state="$(_pair_state "$gw_key" "$gw_secret")"
+sfu_state="$(_pair_state "$sfu_key" "$sfu_secret")"
+
+# A partial pair is CORRUPTION, not a starting point — half a credential cannot be
+# completed from the other file without inventing one.
+if [ "$gw_state" = partial ] || [ "$sfu_state" = partial ]; then
+  die "a LiveKit credential is half-present: gateway .env is '$gw_state', $lk_env is '$sfu_state'.
+     A key without its secret (or the reverse) cannot be completed from the other file
+     without inventing a pair that authenticates nothing. Restore or clear the damaged
+     file, then re-run."
+fi
+
+# Both complete and disagreeing: refuse. Either could be the live one, and the wrong
+# choice mints tokens the running SFU rejects, with no error anywhere.
+if [ "$gw_state" = complete ] && [ "$sfu_state" = complete ] \
+   && { [ "$gw_key" != "$sfu_key" ] || [ "$gw_secret" != "$sfu_secret" ]; }; then
+  die "the gateway .env and $lk_env hold DIFFERENT LiveKit key pairs.
+     Refusing to guess which is live. Reconcile them by hand (make both match the pair
+     the RUNNING SFU was started with), then re-run."
+fi
+
+# Exactly one complete pair, or two identical ones — take it atomically.
+if [ "$sfu_state" = complete ]; then lk_key="$sfu_key"; lk_secret="$sfu_secret"
+elif [ "$gw_state" = complete ]; then lk_key="$gw_key"; lk_secret="$gw_secret"
+else lk_key=""; lk_secret=""; fi
+
+if [ "$DO_MEDIA" = "true" ]; then
+  if [ -n "$lk_key" ] && [ -n "$lk_secret" ]; then
+    ok "reusing the existing SFU key pair (a re-run never rotates a live media secret)"
+  else
+    lk_key="API$(openssl rand -hex 8)"
+    lk_secret="$(openssl rand -base64 48 | tr -d '\n')"
+    ok "generated a fresh SFU key pair for this island"
+  fi
+
+  node_ip="$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null || true)"
+  [ -n "$node_ip" ] || die "could not determine this host's public IP for node_ip.
+     A blank node_ip advertises an unreachable ICE candidate and every call fails at
+     CONNECT, silently. Set LIVEKIT_NODE_IP by hand in $lk_env and re-run."
+
+  # Write to a FRESH file then rename, never `cat >` an existing one: redirection
+  # truncates and writes into the EXISTING inode, so a .env already sitting at 0644
+  # from a manual copy holds the new secret world-readable until the chmod lands.
+  # umask only governs files it CREATES (cage-match PR#151 round 3, Carnot).
+  umask 077
+  lk_env_tmp="$(mktemp "${lk_env}.XXXXXX")"
+  cat > "$lk_env_tmp" <<EOF_LK
+# Generated by deploy/standup.sh — per-island values for the bundled SFU.
+LIVEKIT_NODE_IP=$node_ip
+LIVEKIT_TURN_DOMAIN=$TURN_DOMAIN
+# Persisted so a later recovery reads the hostname this island ACTUALLY uses
+# rather than re-deriving livekit.<domain> by convention — an operator who passed
+# --livekit-domain would otherwise have it silently replaced on recovery, sending
+# clients to the wrong websocket host (cage-match PR#151 round 3, Carnot).
+LIVEKIT_DOMAIN=$LIVEKIT_DOMAIN
+LIVEKIT_API_KEY_ID=$lk_key
+LIVEKIT_API_SECRET=$lk_secret
+EOF_LK
+  chmod 600 "$lk_env_tmp"
+  mv "$lk_env_tmp" "$lk_env"
+  ok "wrote $lk_env (mode 600, via atomic rename)"
+
+  LIVEKIT_ENV_BLOCK="
+# --- media (bundled SFU, --with-media). MUST match deploy/livekit/.env. ---
+LIVEKIT_URL=wss://$LIVEKIT_DOMAIN
+LIVEKIT_API_KEY=$lk_key
+LIVEKIT_API_SECRET=$lk_secret"
+
+elif [ -n "$lk_key" ]; then
+  # Media NOT requested this run, but this island already has a credential somewhere.
+  # Carry it forward — including a BYO LIVEKIT_URL pointing at someone else's SFU.
+  #
+  # Note the source is $lk_key, NOT $gw_key: an earlier fix covered only the case
+  # where the GATEWAY .env survived. If the gateway .env was deleted while
+  # deploy/livekit/.env survived, that version wrote a fresh .env with no media lines
+  # and left a running SFU beside a 503ing gateway — the same torn media plane by the
+  # other route (cage-match PR#151 round 2, Carnot). Recovering from either side
+  # closes both directions.
+  if [ -n "$gw_url" ]; then
+    lk_url="$gw_url"
+  else
+    # Gateway .env gone: reconstruct the SFU URL from the bundled config's own TURN
+    # domain, which is the only surviving statement of this island's media hostnames.
+    # Prefer the hostname the bundled SFU RECORDED; fall back to convention only
+    # when nothing recorded one (a BYO island whose gateway .env was deleted).
+    lk_dom="$(_read_kv "$lk_env" LIVEKIT_DOMAIN)"
+    if [ -n "$lk_dom" ]; then
+      lk_url="wss://$lk_dom"
+      ok "recovered LIVEKIT_URL from the bundled SFU env ($lk_url)"
+    else
+      lk_url="wss://${LIVEKIT_DOMAIN:-livekit.$DOMAIN}"
+      warn "no LIVEKIT_URL or LIVEKIT_DOMAIN was recorded anywhere; guessed $lk_url by convention. VERIFY it before relying on calls."
+    fi
+  fi
+  LIVEKIT_ENV_BLOCK="
+# --- media: preserved across a re-run (not re-run with --with-media) ---
+LIVEKIT_URL=$lk_url
+LIVEKIT_API_KEY=$lk_key
+LIVEKIT_API_SECRET=$lk_secret"
+  ok "preserved this island's LIVEKIT_* credentials (media untouched this run)"
+fi
+
+log "Step 2/$TOTAL — writing .env (island identity + secrets)"
 ENV_FILE="$REPO_ROOT/.env"
 
 # Preserve an existing JWT secret across re-runs — rotating it invalidates every
@@ -161,8 +402,12 @@ fi
 
 # NOTE: no ENVIRONMENT line — absence means production, which arms the fail-closed
 # JWT guard. Setting ENVIRONMENT=dev here would DISABLE that guard. Never do it.
+# Same fresh-file-then-rename discipline as the SFU env above: this file holds
+# JWT_SECRET and (when media is on) the LiveKit secret, and `cat >` on a
+# pre-existing 0644 .env would expose both until the chmod.
 umask 077   # .env holds the JWT secret — owner-only
-cat > "$ENV_FILE" <<EOF
+ENV_TMP="$(mktemp "${ENV_FILE}.XXXXXX")"
+cat > "$ENV_TMP" <<EOF
 # Generated by deploy/standup.sh for island: $DOMAIN
 # Production config. ENVIRONMENT is intentionally UNSET (absence => production =>
 # fail-closed JWT guard armed). Do NOT add ENVIRONMENT=dev here.
@@ -182,16 +427,18 @@ GATEWAY_SEED_PEERS=$SEED_PEERS
 # this island serves valid /.well-known assetlinks.json + AASA for its domain
 # (see docs/standup-guide.md) — advertising before that dies mid-ceremony.
 PASSKEY_ENABLED=$ENABLE_PASSKEYS
+$LIVEKIT_ENV_BLOCK
 EOF
-chmod 600 "$ENV_FILE"
-ok "wrote $ENV_FILE (mode 600)"
+chmod 600 "$ENV_TMP"
+mv "$ENV_TMP" "$ENV_FILE"
+ok "wrote $ENV_FILE (mode 600, via atomic rename)"
 
 # --- step 3: bring the island up (4 containers, 1 image + stock mosquitto) ---
 if [ "$FROM_SOURCE" = "true" ]; then
-  log "Step 3/4 — building the island image from source + starting (gateway + broker + registrar + ChatServer)"
+  log "Step 3/$TOTAL — building the island image from source + starting (gateway + broker + registrar + ChatServer)"
   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 else
-  log "Step 3/4 — pulling the published island image + starting (gateway + broker + registrar + ChatServer)"
+  log "Step 3/$TOTAL — pulling the published island image + starting (gateway + broker + registrar + ChatServer)"
   docker compose pull
   docker compose up -d
 fi
@@ -213,7 +460,7 @@ fi
 
 # --- step 5: TLS via Caddy (optional) --------------------------------------
 if [ "$DO_TLS" = "true" ]; then
-  log "Step 4/4 — TLS reverse proxy (Caddy, host network)"
+  log "Step 4/$TOTAL — TLS reverse proxy (Caddy, host network)"
   caddy_env="$SCRIPT_DIR/caddy/.env"
   printf 'ISLAND_DOMAIN=%s\n' "$DOMAIN" > "$caddy_env"
   docker compose -f "$SCRIPT_DIR/caddy/docker-compose.caddy.yml" up -d
@@ -232,7 +479,34 @@ if [ "$DO_TLS" = "true" ]; then
     warn "https://$DOMAIN/health not answering yet. Check: DNS points here, ports 80+443 open, then: docker compose -f deploy/caddy/docker-compose.caddy.yml logs"
   fi
 else
-  log "Step 4/4 — TLS skipped (--no-tls). Point your own proxy at 127.0.0.1:8095."
+  log "Step 4/$TOTAL — TLS skipped (--no-tls). Point your own proxy at 127.0.0.1:8095."
+fi
+
+# --- step 5: bundled LiveKit SFU (optional, OFF by default) -----------------
+# The key pair and both .env files were resolved before step 2 (the gateway .env
+# is written wholesale there, so the pair has to exist first). All that is left
+# here is rendering the config and bringing the SFU up.
+if [ "$DO_MEDIA" = "true" ]; then
+  log "Step 5/$TOTAL — bundled LiveKit SFU (host network)"
+  lk_dir="$SCRIPT_DIR/livekit"
+  "$lk_dir/render-config.sh"
+
+  # --force-recreate is load-bearing, not belt-and-braces. livekit.yaml is a BIND
+  # MOUNT, so re-rendering it changes no compose spec — a plain `up -d` sees an
+  # up-to-date container and leaves the old one running with the OLD keys, while the
+  # gateway has just been written the new ones. Every join would then be rejected by
+  # a healthy-looking SFU. LiveKit reads its config only at boot, so the recreate IS
+  # the mechanism by which a re-render takes effect.
+  docker compose -f "$lk_dir/docker-compose.livekit.yml" up -d --force-recreate
+  ok "SFU (re)created against the freshly rendered config; the gateway already has LIVEKIT_* from step 2"
+
+  # Verify the CAPABILITY, not the container: a running SFU the gateway cannot
+  # mint for is the exact failure this step exists to prevent.
+  if curl -fsS --max-time 5 http://127.0.0.1:7880 >/dev/null 2>&1; then
+    ok "SFU answering on 127.0.0.1:7880"
+  else
+    warn "SFU not answering on 7880 yet — docker compose -f deploy/livekit/docker-compose.livekit.yml logs"
+  fi
 fi
 
 # --- done -------------------------------------------------------------------
@@ -248,6 +522,9 @@ Next steps:
                    See docs/standup-guide.md § Passkeys.
   • Backups:       the SQLite store lives in volume '$DATA_VOLUME'. Set up a backup
                    before real users arrive — see docs/deploy-passkeys-runbook.md.
+  • Calls:         $( [ "$DO_MEDIA" = "true" ] \
+                        && echo "bundled SFU is up on $TURN_DOMAIN. Open UDP 3478, 7882-7892 and 50000-60000, and put TLS in front of 5349." \
+                        || echo "no SFU — /v1/channels/*/video-token returns 503 (a supported state). Re-run with --with-media, or set LIVEKIT_URL/LIVEKIT_API_KEY/LIVEKIT_API_SECRET to use an existing one." )
 
 Re-running this script is safe: it won't rotate your JWT secret or wipe data.
 EOF
