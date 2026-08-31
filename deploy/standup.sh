@@ -82,7 +82,15 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --domain)         DOMAIN="${2:-}"; shift 2 ;;
     --name)           DISPLAY_NAME="${2:-}"; shift 2 ;;
-    --seed-peers)     SEED_PEERS="${2:-[]}"; shift 2 ;;
+    # ${2:?} not ${2:-[]}: a flag with no value is a MALFORMED COMMAND, not a
+    # request to erase the peer list. Going solo stays expressible as an
+    # explicit --seed-peers '[]'. Matches --turn-domain/--livekit-domain.
+    # tr: the guide documents a MULTILINE JSON array, and a newline-bearing
+    # value cannot survive .env (line-oriented) OR the resolver protocol —
+    # it truncated to "[". Newlines are insignificant whitespace outside a
+    # JSON string (a literal newline inside one must be escaped), so
+    # collapsing them is safe and makes the documented invocation work.
+    --seed-peers)     SEED_PEERS="$(printf '%s' "${2:?--seed-peers needs a value}" | tr '\n' ' ')"; shift 2 ;;
     --enable-passkeys) ENABLE_PASSKEYS="true"; shift ;;
     --no-passkeys)    ENABLE_PASSKEYS="false"; shift ;;
     --no-tls)         DO_TLS="false"; shift ;;
@@ -383,6 +391,17 @@ if [ -f "$ENV_FILE" ]; then
 fi
 # Resolve the operator CHOICES that survive a re-run. Must happen BEFORE the heredoc
 # below rewrites $ENV_FILE, since the record it reads is that same file (#3734).
+# FAIL CLOSED. `done < <(cmd)` swallows cmd's exit status even under
+# `set -euo pipefail` — the loop simply reads nothing, both variables stay empty,
+# and the heredoc below then writes `GATEWAY_SEED_PEERS=` … which compose reads
+# through `${GATEWAY_SEED_PEERS:-[]}` as `[]`. That is #3734 itself, reintroduced
+# through the ERROR PATH of the code that exists to prevent it. So: capture to a
+# file, CHECK the status, and die rather than write unresolved choices.
+RESOLVED_ENV="$(mktemp "${TMPDIR:-/tmp}/aiko-resolved.XXXXXX")"
+if ! "$SCRIPT_DIR/resolve-gateway-env.sh" "$ENV_FILE" "$SEED_PEERS" "$ENABLE_PASSKEYS" > "$RESOLVED_ENV"; then
+  rm -f "$RESOLVED_ENV"
+  die "resolve-gateway-env.sh failed — refusing to write .env with unresolved operator choices"
+fi
 # Prefix-strip rather than IFS='=' split: read strips TRAILING IFS characters, which
 # would silently truncate any value ending in '='.
 while read -r _line; do
@@ -390,7 +409,8 @@ while read -r _line; do
     SEED_PEERS=*)      SEED_PEERS="${_line#SEED_PEERS=}" ;;
     PASSKEY_ENABLED=*) ENABLE_PASSKEYS="${_line#PASSKEY_ENABLED=}" ;;
   esac
-done < <("$SCRIPT_DIR/resolve-gateway-env.sh" "$ENV_FILE" "$SEED_PEERS" "$ENABLE_PASSKEYS")
+done < "$RESOLVED_ENV"
+rm -f "$RESOLVED_ENV"
 
 if [ -n "$existing_secret" ] && [ "${#existing_secret}" -ge 32 ]; then
   JWT_SECRET="$existing_secret"

@@ -156,3 +156,41 @@ def test_a_json_value_containing_equals_survives_intact(tmp_path) -> None:
     tricky = '[{"id":"x","display_name":"X","base_url":"https://x.example.org/?a=b"}]'
     out = _parsed(_run(tmp_path, gw={"GATEWAY_SEED_PEERS": tricky}))
     assert out["SEED_PEERS"] == tricky
+
+
+def test_a_multiline_seed_peers_value_is_collapsed_to_one_line(tmp_path) -> None:
+    """CARNOT'S BLOCKING FINDING (cage-match round 1). `docs/standup-guide.md` documents
+    a MULTILINE `--seed-peers` array. The resolver emits a newline-delimited KEY=VALUE
+    stream and the caller reads it line by line, so a newline-bearing value was read
+    back as `SEED_PEERS=[` — silently replacing the federation list with malformed JSON
+    that `peers_service` rejects, back to serving self. The documented invocation was
+    the trigger.
+
+    Newlines are insignificant whitespace outside a JSON string, so collapsing them is
+    safe, and a line-oriented `.env` could never have carried a multiline value anyway.
+    The guarantee lives in the resolver rather than in each caller — one door."""
+    multiline = '[\n  {"id":"a","display_name":"A","base_url":"https://a.example.org"},\n  {"id":"b","display_name":"B","base_url":"https://b.example.org"}\n]'
+    out = _parsed(_run(tmp_path, seed_flag=multiline))
+    assert "\n" not in out["SEED_PEERS"], "a newline survived into the KEY=VALUE stream"
+    assert out["SEED_PEERS"].startswith("[{") or out["SEED_PEERS"].startswith("[ ")
+    assert '"id":"b"' in out["SEED_PEERS"], "the tail of the array was truncated away"
+
+
+def test_the_multiline_test_can_actually_fail(tmp_path) -> None:
+    """MUST-FAIL ARM for the test above. Pins that the input genuinely CONTAINED the
+    newlines being collapsed — otherwise the assertion would pass against any value
+    and could never go red."""
+    multiline = '[\n  {"id":"a"}\n]'
+    assert "\n" in multiline
+    out = _parsed(_run(tmp_path, seed_flag=multiline))
+    assert len(out["SEED_PEERS"].splitlines()) == 1
+
+
+def test_a_stdout_only_protocol_never_emits_a_bare_newline(tmp_path) -> None:
+    """The caller's line-oriented read is only safe if the resolver's contract holds for
+    BOTH keys. Assert the whole stream is exactly two lines regardless of input shape,
+    so a future key added without normalisation trips this rather than the federation
+    link."""
+    result = _run(tmp_path, seed_flag='[\n{"id":"x"}\n]', passkeys_flag="true")
+    assert result.returncode == 0, result.stderr
+    assert len(result.stdout.strip().splitlines()) == 2

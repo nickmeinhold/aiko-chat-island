@@ -60,6 +60,17 @@ passkey_enabled="$passkeys_flag"
 [ -n "$passkey_enabled" ] || passkey_enabled="$(_read_kv "$gw_env" PASSKEY_ENABLED)"
 [ -n "$passkey_enabled" ] || passkey_enabled="false"
 
+# SINGLE-LINE GUARANTEE, enforced HERE rather than trusted of every caller. Output
+# is a newline-delimited KEY=VALUE stream, so a value containing a newline would be
+# read back as a truncated first line — `GATEWAY_SEED_PEERS=[` silently replacing the
+# federation list, which is the very failure this script exists to prevent. The guide
+# documents a MULTILINE --seed-peers array (docs/standup-guide.md), so this is the
+# documented path, not a hostile edge. Newlines are insignificant whitespace outside a
+# JSON string (a literal newline inside one must be escaped as \n), so collapsing them
+# is safe. A `.env` is line-oriented too, so a multiline value could never round-trip
+# anyway — normalising makes the documented invocation work for the first time.
+seed_peers="$(printf '%s' "$seed_peers" | tr '\n\r' '  ')"
+
 case "$passkey_enabled" in
   true|false) ;;
   *) echo "resolve-gateway-env: PASSKEY_ENABLED must be true or false, got '$passkey_enabled'" >&2; exit 1 ;;
