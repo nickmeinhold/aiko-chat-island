@@ -43,8 +43,34 @@ gw_env="${1:?usage: resolve-gateway-env.sh <gateway-env> [seed-peers-flag] [pass
 seed_flag="${2:-}"
 passkeys_flag="${3:-}"
 
-# Read the LAST assignment of a key, matching how python-dotenv resolves duplicates.
-_read_kv() { [ -f "$1" ] && grep -E "^$2=" "$1" 2>/dev/null | tail -n1 | cut -d= -f2- || true; }
+# Read the LAST assignment of a key, matching how python-dotenv resolves duplicates,
+# and strip ONE matching pair of surrounding quotes, as python-dotenv also does.
+#
+# DEBT, NAMED RATHER THAN HIDDEN (#3592 — "Two parsers for one .env: the deploy
+# preflight re-implements python-dotenv in shell"). This is now the THIRD shell
+# approximation of that parser, and the divergence is DEMONSTRATED, not theoretical:
+# before the strip below, a hand-edited PASSKEY_ENABLED="true" — which python-dotenv
+# reads as true — was read here as the literal "true" and ABORTED standup. The guide
+# explicitly invites that hand edit ("equivalently: set PASSKEY_ENABLED=true in .env").
+#
+# Quote-stripping closes the case that actually bites. TWO divergences from
+# python-dotenv remain, both measured and both deliberate stopping points rather than
+# oversights: inline comments (PASSKEY_ENABLED=true  # why) are read literally, and
+# backslash escapes inside double quotes are not decoded, so a quoted JSON value
+# ("[{\"id\":\"e\"}]") keeps its backslashes here while python-dotenv strips them.
+# Neither shape is ever produced by the heredoc that writes this file. Every further
+# case is one more parameter in a parser we should not be growing; the real fix is
+# #3592's, one parser rather than four.
+_read_kv() {
+  local v q
+  v=$([ -f "$1" ] && grep -E "^$2=" "$1" 2>/dev/null | tail -n1 | cut -d= -f2- || true)
+  for q in '"' "'"; do
+    if [ ${#v} -ge 2 ] && [ "${v#"$q"}" != "$v" ] && [ "${v%"$q"}" != "$v" ]; then
+      v="${v#"$q"}"; v="${v%"$q"}"; break
+    fi
+  done
+  printf '%s' "$v"
+}
 
 # RESOLUTION ORDER, identical for both: flag, then the value this island RECORDED,
 # then convention. The middle rung is the one that was missing.

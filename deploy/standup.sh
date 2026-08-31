@@ -85,12 +85,10 @@ while [ $# -gt 0 ]; do
     # ${2:?} not ${2:-[]}: a flag with no value is a MALFORMED COMMAND, not a
     # request to erase the peer list. Going solo stays expressible as an
     # explicit --seed-peers '[]'. Matches --turn-domain/--livekit-domain.
-    # tr: the guide documents a MULTILINE JSON array, and a newline-bearing
-    # value cannot survive .env (line-oriented) OR the resolver protocol —
-    # it truncated to "[". Newlines are insignificant whitespace outside a
-    # JSON string (a literal newline inside one must be escaped), so
-    # collapsing them is safe and makes the documented invocation work.
-    --seed-peers)     SEED_PEERS="$(printf '%s' "${2:?--seed-peers needs a value}" | tr '\n' ' ')"; shift 2 ;;
+    # Newline normalisation for the guide's documented MULTILINE array is NOT done
+    # here: resolve-gateway-env.sh owns that invariant for every caller, and stating
+    # it twice would be two places to forget it. One door.
+    --seed-peers)     SEED_PEERS="${2:?--seed-peers needs a value}"; shift 2 ;;
     --enable-passkeys) ENABLE_PASSKEYS="true"; shift ;;
     --no-passkeys)    ENABLE_PASSKEYS="false"; shift ;;
     --no-tls)         DO_TLS="false"; shift ;;

@@ -194,3 +194,40 @@ def test_a_stdout_only_protocol_never_emits_a_bare_newline(tmp_path) -> None:
     result = _run(tmp_path, seed_flag='[\n{"id":"x"}\n]', passkeys_flag="true")
     assert result.returncode == 0, result.stderr
     assert len(result.stdout.strip().splitlines()) == 2
+
+
+def test_a_quoted_recorded_value_matches_python_dotenv(tmp_path) -> None:
+    """CARNOT'S ROUND-2 FINDING. `PASSKEY_ENABLED="true"` is a valid .env line —
+    python-dotenv strips the quotes and reads `true`. Before the strip, this resolver
+    read the literal `"true"`, failed its own boolean check, and ABORTED standup on a
+    file the guide explicitly invites operators to hand-edit. Fail-closed, so loud
+    rather than silent, but a hard stop for no good reason.
+
+    This is #3592's class (shell re-implementing python-dotenv) and this resolver is
+    the third instance — so the parity that IS claimed gets a test."""
+    for quoted in ('"true"', "'true'"):
+        out = _parsed(_run(tmp_path, gw={"PASSKEY_ENABLED": quoted}))
+        assert out["PASSKEY_ENABLED"] == "true", f"{quoted} did not match python-dotenv"
+
+
+def test_the_quote_test_can_actually_fail(tmp_path) -> None:
+    """MUST-FAIL ARM. Pins that an unquoted value and a quoted one are genuinely
+    different input strings, so the assertion above discriminates."""
+    assert '"true"' != "true"
+    out = _parsed(_run(tmp_path, gw={"PASSKEY_ENABLED": '"false"'}))
+    assert out["PASSKEY_ENABLED"] == "false"
+
+
+def test_quotes_are_stripped_from_seed_peers_too(tmp_path) -> None:
+    """The strip is in the shared reader, so it must hold for BOTH keys — otherwise a
+    quoted peer list would round-trip its quotes into .env and back out again, growing
+    a pair each run."""
+    out = _parsed(_run(tmp_path, gw={"GATEWAY_SEED_PEERS": f'"{PEERS_A}"'}))
+    assert out["SEED_PEERS"] == PEERS_A
+
+
+def test_an_unbalanced_quote_is_left_alone(tmp_path) -> None:
+    """Only a MATCHING pair is stripped. A value that merely starts with a quote is not
+    a quoted value, and eating one end would corrupt it."""
+    out = _parsed(_run(tmp_path, gw={"GATEWAY_SEED_PEERS": '"unbalanced'}))
+    assert out["SEED_PEERS"] == '"unbalanced'
