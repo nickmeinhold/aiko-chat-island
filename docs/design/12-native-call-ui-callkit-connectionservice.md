@@ -239,7 +239,7 @@ round-trip, and **nothing about who-calls-whom on Apple's wire** — `_payload` 
 refusal intact, unchanged.
 
 Three tiers, degrading honestly: Swift-readable local cache → `reportCall(with:updated:)`
-once Dart is up → **the placeholder string `Aiko`** (RULING: Nick, 2026-08-30). One word,
+once Dart is up → **the placeholder string `Aiko`** (Nick decided, 2026-08-30). One word,
 names the product not the person, and says nothing about who is calling — so the tier-3
 fallback leaks no more than the payload already refuses to.
 
@@ -266,7 +266,7 @@ var includesCallsInRecents: Bool { get set }
 **Apple's own published documentation does not state its default** — the sentence in the
 JSON is literally `"The default value of this property is ."`, truncated at source.
 
-**RULING (Nick, 2026-08-30): appearing in Recents is fine.** A CallKit call landing in the
+**DECIDED (Nick, 2026-08-30): appearing in Recents is fine.** A CallKit call landing in the
 system call history is accepted, on a product whose thesis is that who-calls-whom stays
 with the operator — the entry is local to the callee's own device and names a call they
 were party to.
@@ -310,165 +310,37 @@ We plausibly qualify — this is genuinely a calling app. The finding is that **
 store-review dependency, not a code dependency, and it is slower than the build.** Whoever
 owns the Play declaration should start it now rather than discover it at submission.
 
-## Decision 9 — #3196 is a hard gate, and CallKit makes it louder
-
-Cross-island calling is **broken today**: `room_for_channel()` is gateway_id-namespaced
-(`imagineering:` vs `enspyr:`) and the two islands run separate SFUs. That was found during
-the temper and filed as #3196, and it is the reason the gathering design is held.
-
-Under CallKit the failure gets much louder: **a full-screen ring, through DND, for a call
-the callee physically cannot join.** Today the same failure is a quiet dead end.
-
-### RULING (Nick, 2026-08-30): the CALLEE's island hosts the call
-
-This settles host-selection, which was the fork #3196 needed.
-
-**Why it is the right pick.** Under CallKit the callee's island *already owns the leg that
-must work*: it holds the callee's device tokens and sends the wake. Hosting the room there
-puts the push and the SFU on the same island, so the ring path carries **no cross-island
-dependency at all**. The caller — awake, in the app, and acting — is the party made to
-reach across.
-
-**And it retires the hard part.** The caller's app connects to the callee's island's
-LiveKit directly, over the public internet: an ordinary client→SFU connection. Both islands
-already serve `turns:<domain>:443` publicly with real relay-only calls proven end to end.
-So **there is no SFU-to-SFU federation, no clustering, and no new transport** — one call,
-one SFU, chosen by a rule. That retires the open premise recorded against the media-topology
-ruling ("self-hosted LiveKit may only cluster within one trust domain — verify before
-designing"): under this ruling you never cluster, so the premise stops being load-bearing
-rather than needing an answer.
-
-**What remains is an AUTH problem, not a media one.** The callee's island must mint a room
-token for **a user it does not own**, authenticated by the caller's home island. That is a
-federation trust boundary — cage-match by law — and it rides machinery that already exists:
-signed `/v1/island` manifests, `signing_keys`, and `origin` carriage. `room_for_channel()`'s
-`gateway_id` namespacing stops being a bug and becomes the *host designation*, once the rule
-says which gateway_id wins.
-
-### Decision 9a — the caller's island FORWARDS the token request (island-to-island)
-
-The app's `VideoToken.url` and `room` already come from the response, never from local
-config ("the deployment owns its transport"), so **the client's connect path already accepts
-a foreign SFU** and the ruling costs it nothing there. The seam is one layer up: the token
-request is a *relative* path on the authed client, bound to the user's own island, so a
-caller structurally cannot ask anywhere else.
-
-Two shapes were possible; **the caller's island forwards on the caller's behalf**, chosen
-here:
-
-- **the client keeps its invariant** — the app only ever talks to its own island, and never
-  has to weaken that anywhere else in the codebase;
-- **no foreign credential lands on the device.** The alternative (client talks to the callee's
-  island directly) still needs a home-island assertion to present, so it is this design plus
-  an extra hop, with a bearer artifact on a handset and a harder revocation story;
-- **the trust edge is island↔island, where the machinery already exists** — signed
-  `/v1/island` manifests, `/v1/keys`, `signing_keys`. The caller's island already
-  authenticates the caller; it vouches, it does not re-prove.
-
-So the island owes an endpoint on the **callee's** side that accepts an island-authenticated
-request — *island A asserts user U is its authenticated member; mint a room token for this
-call* — and mints against its own SFU. That is a federation trust boundary: **cage-match by
-law**, and the first place a forged vouch would buy a seat in someone else's room.
-
-**Cost, stated rather than buried:** the caller's island becomes a required participant in
-cross-island call setup. If it is down the caller cannot place an outbound cross-island call
-— acceptable, because a caller whose own island is down has no session and cannot do anything
-else either.
-
-### Decision 9b — the foreign-operator exposure, and the answer that is already filed
-
-Surfaced by the app tab from a question of Nick's. **Rewritten after a bad first draft** —
-the error is kept below rather than quietly replaced, because it is the more useful half.
-
-**Measured, not assumed** (app tab, `livekit_call_service.dart:152`): `Room.connect` passes
-no `e2eeOptions`, and a grep for `e2ee|encrypt|frameCryptor|keyProvider` across
-`lib/features/call/` returns nothing. LiveKit decrypts at the SFU by default.
-
-#### The exposure, split into two halves that differ in KIND
-
-Collapsing them lets this read as "same known residual, new recipient", which understates it
-exactly where the decision is being made.
-
-| | what the callee's operator gets | covered by an existing accepted residual? | does media E2EE fix it? |
-|---|---|---|---|
-| **IP + call metadata** | caller's IP (direct client→SFU), timing, duration; under 9a an island-A vouch naming the caller | **Yes** — recorded as *"an operator promise about logging, not a property of the system"* | **No** |
-| **Audio + video content** | the media **in the clear** | **No** — same-island hosting meant media only ever reached the operator the user chose | **Yes** |
-
-For a person who is not their member, has no account with them, and never chose them.
-
-- **The metadata half** is an accepted residual **transferred outside the trust
-  relationship.** It was accepted about the user's *own* operator, a party they chose; a
-  logging promise from a stranger is worth less than one from your own operator, and E2EE
-  does not touch it.
-- **The content half is the bigger one, and it was never covered by anything.**
-
-#### What the first draft got wrong
-
-1. **"The confidentiality axis genuinely has no prior" — FALSE.** The prior is
-   **claude-tasks#3426**, OPEN, labelled `project:aiko-chat-island`, filed by Nick on
-   2026-08-25 out of the *same* friends crucible whose residual this section quotes — five
-   rows below the line cited, in the same table: *"Media E2EE is orthogonal | Not part of
-   this build | Filed as #3426, must not be smuggled in."* The table was read to the row that
-   answered the question and no further. Same failure as missing #3170's second comment, in
-   the same session.
-2. **"E2EE is a design, not a flag" — also false**, and it conflated LiveKit **room-level
-   media** E2EE with the **group-message** crucible's pairwise-fanout key-management problem.
-   #3426 exists precisely to say those are different doors.
-
-#### What #3426 actually says
-
-LiveKit — already self-hosted on both boxes — has **built-in room-level E2EE via insertable
-streams**: applied automatically to all media tracks from all participants plus data channels,
-with the SFU forwarding packets it cannot decrypt, and group calls fully supported. So **calls
-could be end-to-end encrypted without touching the message path**, the report queue, or the
-moderator election. `island_mode` is one flag standing for two orthogonal dials, and the `e2ee`
-bolt is holding the *media* door shut for a reason that only applies to the *message* door.
-
-#### So the finding is not "we have no answer" — it is a RE-PRICING
-
-The answer is filed, and its deferral was reasoned. What Decision 9 changes is the **benefit**
-side of a question already in front of Nick — #3426's own decision 2, *"Is media E2EE wanted
-before Phase B MLS?"*, was priced when the only operator seeing your media was the one you
-chose. Under cross-island calling it becomes the thing that keeps an **unchosen foreign
-operator** out of your call content.
-
-**The costs in #3426 are unchanged and must not be understated:** server-side recording/egress,
-transcription and simulcast layer switching become limited; and splitting `island_mode` into two
-signed manifest fields is a **schema + wire change to a signed artifact** — enabling media E2EE
-while the manifest still advertises `moderator` is mislabel by omission. The friends crucible's
-instruction stands: **it must not be smuggled into another feature, and design 12 does not.**
-
-#### The collision Nick should see as part of the same decision
-
-#3426 names it: under media E2EE **an agent that participates in a call must be a KEYHOLDER,
-not an eavesdropper — a pipeline that cannot decrypt cannot run inference.** Resident agents
-are shipped (#3096) and the `webrtc://` DataScheme thread has aiko pipelines *consuming* media.
-#3426 reads keyholder-not-eavesdropper as *"arguably the right answer"*, but it is a real cost
-this product carries that a plain chat product would not — and it should be visible before the
-decision, not after.
-
-#### Unchanged from the first draft, and still the fair framing
-
-- **Not a regression.** Cross-island calling does not work today (Decision 9), so there is no
-  working "before". Same-island is unchanged: your own operator already hosts the SFU and reads
-  message bodies in cleartext (`should_wake`, `messages.body`). **Own-operator visibility was
-  never the protected property** — `_payload`'s opacity is aimed at Apple.
-- **Not caused by 9a or by which side was picked.** Whichever island hosts, *some* operator
-  sees a non-member's media; mirroring it moves the exposure to the callee and breaks the
-  ring-path argument. This is a property of cross-island calling **existing at all**.
-
-Disclosed here per draft ADR-0008's own argument — *"an unnamed centre gets discovered by an
-operator rather than disclosed to them"* — which holds equally for an exposure discovered by a
-**user**. Gates *shipping* cross-island calling, not building it.
-
-**Scope — and this part is NOT settled.** "The callee" is well defined for a **1:1 ring**,
-which is what is shipped and what CallKit is about. But under "calls are gatherings, not
-channel properties" a call has its own participant set, and **a gathering across three or
-more islands has no single callee.** Host-selection for the gathering case is open, and this
-ruling must not be generalised to it. Not urgent — the gathering design is separately gated
-on #3196 (Decision 1b) — but it is the first question that design has to answer.
 
 ---
+
+## Decision 9 and cross-island calling — moved to design 13
+
+Everything from `Decision 9` through `Decision 9f` now lives in
+[`13-cross-island-calling-host-selection-and-exposure.md`](13-cross-island-calling-host-selection-and-exposure.md):
+host selection (the callee's island hosts), island-to-island token forwarding, the
+foreign-operator exposure, the disclosure decision, the force-relay finding, and call
+egress economics.
+
+They were written here because CallKit made them urgent, not because they are about
+CallKit. They are the **#3196 cross-island calling design** and would be equally true if
+this feature were cancelled. Decision numbers are unchanged so existing citations still
+resolve.
+
+**One paragraph is duplicated rather than pointed at, on purpose:**
+
+> ### THE SHIPPING GATE (Decision 9c)
+>
+> **Cross-island calling MUST NOT ship until claude-tasks#3426 is decided.** Either media
+> E2EE is on, or the per-call disclosure ships with it and the user consents. Shipping with
+> **neither** is the state this gate exists to prevent.
+>
+> This is restated here, in full, because a gate a builder never reads is worse than a
+> cluttered document. Design 13 holds the reasoning; this holds the sentence that stops a
+> merge. If the two ever disagree, design 13 is the record — but neither should be edited
+> without the other.
+
+Note the gate binds **cross-island** calling. Nothing in §1-§8 above is gated by it: the
+1:1 same-island ring is shipped, and CallKit on top of it is buildable today.
 
 ## What gets better
 
@@ -493,20 +365,22 @@ Decisions 4, 5 and 7 are **one cage-match, not three** — the same trust bounda
 sides; reviewing them apart is how a fix for one re-opens another. Decision 2a belongs in
 that review too: it is where a schema change becomes a stranger's phone ringing.
 
-Gated separately: **Decision 9 (#3196)** before shipping to cross-island pairs, and
-**Decision 1b** (the gathering ACL) which must not start before #3196 settles.
+Gated separately: **Decision 9 (#3196)** before shipping to cross-island pairs — see
+[design 13](13-cross-island-calling-host-selection-and-exposure.md), and note the shipping
+gate restated above — and **Decision 1b** (the gathering ACL), which must not start before
+#3196 settles.
 
-## Rulings and open questions
+## Decisions and open questions
+
+*(Cross-island items — Decision 9 and its children, #3426, #3685 — moved to
+[design 13](13-cross-island-calling-host-selection-and-exposure.md) with the decisions they
+belong to. This list is §1-§8 only.)*
 
 **Settled (Nick, 2026-08-30):**
 
 - **Placeholder string = `Aiko`** (Decision 6).
 - **`includesCallsInRecents`: appearing in Recents is fine** (Decision 6a). Set explicitly
   to `true`, because Apple does not publish the default.
-
-- **Cross-island calls are hosted on the CALLEE's island** (Decision 9). Settles
-  host-selection for 1:1; **the gathering case is explicitly not settled.**
-
 - **Play `USE_FULL_SCREEN_INTENT` declaration: Nick submits, justification drafted**
   (Decision 8) — claude-tasks#3615, slugged to `aiko_chat_app`. The runtime-prompt +
   graceful-degradation path is required **regardless of the outcome**, so it is build work
@@ -514,12 +388,11 @@ Gated separately: **Decision 9 (#3196)** before shipping to cross-island pairs, 
 
 **Still open:**
 
-- **Nick — media E2EE, re-priced** (Decision 9b): cross-island calling gives an **unchosen**
-  operator a non-member's media in the clear. The answer is already filed as **#3426** with
-  three decision questions; Decision 9 changes the benefit side of its question 2. Gates
-  *shipping* cross-island calling, not building it. Carries the agent-as-keyholder collision.
-- **Host-selection for a gathering spanning 3+ islands** — for whenever the
-  gathering-with-ACL design is cast (Decision 1b), not before.
+- **The Play `USE_FULL_SCREEN_INTENT` declaration** — Nick submits (#3615). Listed here only
+  because it is unsubmitted; nothing waits on the outcome, since prompt-and-degrade is build
+  work either way.
+- **The shipping gate (Decision 9c)** applies to cross-island calling only and is restated in
+  full above. Nothing in §1-§8 is gated by it.
 
 ## Provenance
 
