@@ -15,7 +15,11 @@
 #   4. brings up Caddy for HTTPS (skippable) and verifies.
 #
 # Design goal (from docker-compose.yml): "one script, and it just works." Safe to
-# re-run — it never rotates an existing JWT secret and skips work already done.
+# re-run: it never rotates an existing JWT secret, skips work already done, and
+# PRESERVES the operator choices already recorded in .env (federation peers, passkey
+# advertisement) unless a flag overrides them. Before #3734 that last clause was not
+# true, and the failure was silent — a re-run without --seed-peers emptied the
+# federation link while every health check stayed green.
 #
 # Usage:
 #   deploy/standup.sh --domain chat.example.org --name "Example Island"
@@ -30,6 +34,8 @@
 #   --name "<label>"      human label the app's island picker shows
 #   --seed-peers <json>   JSON array of {"id","display_name","base_url"} to federate with
 #   --enable-passkeys     advertise passkey sign-in (only after well-known files serve; see guide)
+#   --no-passkeys         stop advertising passkey sign-in. Passing NEITHER flag keeps
+#                         whatever this island already recorded — absence is not "off".
 #   --no-tls              skip the bundled Caddy step (you run your own reverse proxy)
 #   --with-media          also stand up a bundled LiveKit SFU for calls (OFF by default;
 #                         without it the island has no video and the token endpoint 503s,
@@ -59,7 +65,11 @@ cd "$REPO_ROOT"
 [ -f docker-compose.yml ] || die "docker-compose.yml not found in $REPO_ROOT — run from the aiko-chat-island checkout"
 
 # --- defaults + arg parsing -------------------------------------------------
-DOMAIN=""; DISPLAY_NAME=""; SEED_PEERS="[]"; ENABLE_PASSKEYS="false"; DO_TLS="true"; INTERACTIVE="true"; FROM_SOURCE="false"
+# SEED_PEERS and ENABLE_PASSKEYS default to EMPTY, not to their conventional values.
+# Empty means "the operator said nothing this run" and must consult the recorded
+# value (deploy/resolve-gateway-env.sh); "[]" / "false" are real choices that win.
+# Collapsing those two is #3734 — a re-run silently dropped the federation link.
+DOMAIN=""; DISPLAY_NAME=""; SEED_PEERS=""; ENABLE_PASSKEYS=""; DO_TLS="true"; INTERACTIVE="true"; FROM_SOURCE="false"
 # Media is OFF by default, unlike TLS. An island without HTTPS is broken; an island
 # without an SFU is a supported configuration the code already models
 # (livekit_tokens.is_configured() -> 503 "capability disabled"). Defaulting it ON
@@ -74,6 +84,7 @@ while [ $# -gt 0 ]; do
     --name)           DISPLAY_NAME="${2:-}"; shift 2 ;;
     --seed-peers)     SEED_PEERS="${2:-[]}"; shift 2 ;;
     --enable-passkeys) ENABLE_PASSKEYS="true"; shift ;;
+    --no-passkeys)    ENABLE_PASSKEYS="false"; shift ;;
     --no-tls)         DO_TLS="false"; shift ;;
     --with-media)     DO_MEDIA="true"; shift ;;
     --turn-domain)    TURN_DOMAIN="${2:?--turn-domain needs a value}"; shift 2 ;;
@@ -370,6 +381,17 @@ existing_secret=""
 if [ -f "$ENV_FILE" ]; then
   existing_secret="$(grep -E '^JWT_SECRET=' "$ENV_FILE" | head -1 | cut -d= -f2- || true)"
 fi
+# Resolve the operator CHOICES that survive a re-run. Must happen BEFORE the heredoc
+# below rewrites $ENV_FILE, since the record it reads is that same file (#3734).
+# Prefix-strip rather than IFS='=' split: read strips TRAILING IFS characters, which
+# would silently truncate any value ending in '='.
+while read -r _line; do
+  case "$_line" in
+    SEED_PEERS=*)      SEED_PEERS="${_line#SEED_PEERS=}" ;;
+    PASSKEY_ENABLED=*) ENABLE_PASSKEYS="${_line#PASSKEY_ENABLED=}" ;;
+  esac
+done < <("$SCRIPT_DIR/resolve-gateway-env.sh" "$ENV_FILE" "$SEED_PEERS" "$ENABLE_PASSKEYS")
+
 if [ -n "$existing_secret" ] && [ "${#existing_secret}" -ge 32 ]; then
   JWT_SECRET="$existing_secret"
   ok "reusing existing JWT_SECRET from .env (not rotated)"
