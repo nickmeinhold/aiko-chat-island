@@ -307,20 +307,33 @@ def test_the_refusal_does_not_reject_valid_arrays(tmp_path) -> None:
 # The real fix remains #3592's: one parser, not four. This makes the debt measurable
 # until then, and #3761 covers the untested caller wiring.
 
-DOTENV_CORPUS = [
-    ("plain",              'PASSKEY_ENABLED=true'),
-    ("double quoted",      'PASSKEY_ENABLED="true"'),
-    ("single quoted",      "PASSKEY_ENABLED='true'"),
-    ("export prefix",      'export PASSKEY_ENABLED=true'),
-    ("export + quotes",    'export PASSKEY_ENABLED="true"'),
-    ("export extra space", 'export   PASSKEY_ENABLED=true'),
-    ("duplicate keys",     'PASSKEY_ENABLED=false\nPASSKEY_ENABLED=true'),
-    ("trailing blank",     'PASSKEY_ENABLED=true\n\n'),
-    ("preceded by comment",'# a note\nPASSKEY_ENABLED=true'),
-    ("other keys around",  'JWT_SECRET=x\nPASSKEY_ENABLED=true\nGATEWAY_ID=y'),
-    ("inline comment",     'PASSKEY_ENABLED=true  # after well-known verification'),
-    ("leading space",      '  PASSKEY_ENABLED=true'),
-]
+# AXES, not shapes. Round 4 found `KEY = true` reading as nothing and silently resolving
+# to `false` — missed by the previous twelve-row corpus because that corpus varied PREFIX,
+# QUOTING and WHITESPACE-BEFORE-KEY and never varied DELIMITER SPACING. Twelve rows along
+# one axis is not a bounded class; it is a sample with good manners.
+#
+# Carnot, round 4: "the number of corpus rows is less important than the grammar boundary."
+# So enumerate the GRAMMAR and take its product. Adding an axis here is how the class stays
+# bounded when someone discovers a new one — adding a row is how it stops being bounded.
+_PREFIX      = ["", "export "]
+_WS_PRE_KEY  = ["", "  "]
+_WS_PRE_EQ   = ["", " "]
+_WS_POST_EQ  = ["", " "]
+_QUOTE       = ["", '"', "'"]
+_TRAILING    = ["", "  "]
+_EOL         = ["\n", "\r\n"]
+
+
+def _corpus():
+    from itertools import product
+    for pre, wk, we, wq, q, tr, eol in product(
+            _PREFIX, _WS_PRE_KEY, _WS_PRE_EQ, _WS_POST_EQ, _QUOTE, _TRAILING, _EOL):
+        line = f"{wk}{pre}PASSKEY_ENABLED{we}={wq}{q}true{q}{tr}{eol}"
+        label = f"prefix={pre!r} wsKey={wk!r} wsEq={we!r} wsVal={wq!r} quote={q!r} trail={tr!r} eol={eol!r}"
+        yield label, line
+
+
+DOTENV_CORPUS = list(_corpus())
 
 
 def _dotenv_says(path: Path) -> str | None:
@@ -328,17 +341,26 @@ def _dotenv_says(path: Path) -> str | None:
     return dotenv_values(str(path)).get("PASSKEY_ENABLED")
 
 
-def test_the_shell_reader_agrees_with_python_dotenv_or_refuses(tmp_path) -> None:
-    """THE CLASS GUARD. For each shape: agree with python-dotenv, or exit non-zero.
-    Never silently resolve to something the gateway would read differently."""
+def test_the_shell_reader_agrees_with_python_dotenv_across_the_grammar(tmp_path) -> None:
+    """THE CLASS GUARD. Every row of the grammar product must resolve to exactly what
+    python-dotenv resolves. Neither a silent disagreement NOR a refusal is acceptable
+    here, because every shape in the product is one we claim parity for — the
+    declared-unsupported shapes are asserted separately, in their own test."""
     divergences = []
     for name, body in DOTENV_CORPUS:
-        env = tmp_path / f"{name.replace(' ', '_')}.env"
-        env.write_text(body + "\n")
+        env = tmp_path / f"case_{abs(hash(name))}.env"
+        env.write_text(body)
         expected = _dotenv_says(env)
         result = subprocess.run([str(SCRIPT), str(env), "[]", ""], capture_output=True, text=True)
         if result.returncode != 0:
-            continue  # refusing is always allowed — it is loud
+            # Refusal is NOT a universal escape. Every shape in the product is one we
+            # CLAIM parity for, so refusing one is a regression — just a loud one rather
+            # than a dangerous one. Found by mutation: deleting the trailing/CR strip
+            # turned agreement into refusal and this guard stayed green, because the
+            # escape hatch that made it safe also made it blind. Declared-unsupported
+            # shapes (inline comments, backslash escapes) are asserted separately.
+            divergences.append(f"{name}: shell REFUSED a shape we claim parity for -- {result.stderr.strip()[:80]}")
+            continue
         got = dict(l.split("=", 1) for l in result.stdout.strip().splitlines())["PASSKEY_ENABLED"]
         # python-dotenv absent => our convention default "false" is the agreed answer
         want = expected if expected is not None else "false"

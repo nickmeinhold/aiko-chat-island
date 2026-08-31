@@ -63,14 +63,25 @@ passkeys_flag="${3:-}"
 # #3592's, one parser rather than four.
 _read_kv() {
   local v q
-  # Leading whitespace and an `export ` prefix are both valid dotenv and both honoured
-  # by python-dotenv. Matching only "^KEY=" read NOTHING from such a file, fell through
-  # to convention, and wrote PASSKEY_ENABLED=false + GATEWAY_SEED_PEERS=[] — #3734
-  # itself, silently, via supported .env syntax. The `export` case came from a reviewer;
-  # the LEADING-SPACE case came from the parity corpus in the test suite, which found in
-  # seconds what three adversarial rounds did not. That is the argument for bounding a
-  # class instead of patching its instances.
-  v=$([ -f "$1" ] && grep -E "^[[:space:]]*(export[[:space:]]+)?$2=" "$1" 2>/dev/null | tail -n1 | sed -E "s/^[[:space:]]*(export[[:space:]]+)?$2=//" || true)
+  # WHY A GRAMMAR AND NOT A LIST OF CASES. Every shape python-dotenv accepts that this
+  # reader does not is a chance to read NOTHING, fall through to convention, and write
+  # PASSKEY_ENABLED=false + GATEWAY_SEED_PEERS=[] — #3734 itself, silently, through
+  # supported .env syntax. Found one at a time, in this order:
+  #   `export KEY=v`        — cage-match round 3 (Carnot)
+  #   `  KEY=v`             — the parity corpus, in seconds, after three rounds missed it
+  #   `KEY = v` / `KEY =v`  — cage-match round 4 (Carnot), and SILENT
+  # The round-4 one is the instructive failure: the corpus varied PREFIX and QUOTING and
+  # whitespace-before-KEY, but never DELIMITER SPACING. Twelve rows along one axis is not
+  # a bounded class. Carnot: "the number of corpus rows is less important than the
+  # grammar boundary." So the grammar is written once, above, and the corpus now varies
+  # the axis rather than sampling the shape.
+  # ONE grammar, matched and stripped by the same expression so they cannot drift:
+  #   [ws] [export ws] KEY [ws] = [ws] VALUE [ws]
+  # Every element is optional-whitespace-tolerant because python-dotenv is. Trailing
+  # whitespace and a stray CR are stripped too, so a .env touched on Windows or moved
+  # badly does not abort a deploy.
+  local _re="^[[:space:]]*(export[[:space:]]+)?$2[[:space:]]*=[[:space:]]*"
+  v=$([ -f "$1" ] && grep -E "$_re" "$1" 2>/dev/null | tail -n1 | sed -E "s/$_re//; s/[[:space:]]*\r?$//" || true)
   for q in '"' "'"; do
     if [ ${#v} -ge 2 ] && [ "${v#"$q"}" != "$v" ] && [ "${v%"$q"}" != "$v" ]; then
       v="${v#"$q"}"; v="${v%"$q"}"; break
