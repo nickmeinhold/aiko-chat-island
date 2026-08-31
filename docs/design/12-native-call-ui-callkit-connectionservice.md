@@ -512,14 +512,33 @@ Gated separately: **Decision 9 (#3196)** before shipping to cross-island pairs, 
   graceful-degradation path is required **regardless of the outcome**, so it is build work
   either way, not a branch on the review.
 
+**Settled (Nick, 2026-08-31):**
+
+- **`island_mode` SPLITS into two signed manifest fields** (#3426 Q1) — decided *ahead* of
+  whether media E2EE is ever enabled, because one flag governing two orthogonal properties is
+  a manifest that eventually lies. Additive migration + two signed fields; wire half agreed
+  with the app tab before either merges, island deploys first. It also converts Q2 from a
+  schema change into a policy call against a field that will already exist.
+- **Gathering host-selection across 3+ islands — CLOSED as a live question.** Never a
+  decision anyone was waiting on: it is the first question the *gathering-with-ACL* design
+  must answer, and that design is gated on #3196. It stays recorded in Decision 9's scope
+  note; carrying it on an open list only inflated the list.
+
 **Still open:**
 
-- **Nick — media E2EE, re-priced** (Decision 9b): cross-island calling gives an **unchosen**
-  operator a non-member's media in the clear. The answer is already filed as **#3426** with
-  three decision questions; Decision 9 changes the benefit side of its question 2. Gates
-  *shipping* cross-island calling, not building it. Carries the agent-as-keyholder collision.
-- **Host-selection for a gathering spanning 3+ islands** — for whenever the
-  gathering-with-ACL design is cast (Decision 1b), not before.
+- **Media E2EE on/off** (#3426 Q2, Decision 9b) — now a policy call, not a build. Blocked on
+  **Q3**, *"is anything relying on server-side media access today?"*, which is a factual check
+  rather than a judgement. Gates *shipping* cross-island calling, not building it. Carries the
+  **agent-as-keyholder** collision (a pipeline that cannot decrypt cannot run inference, and
+  resident agents are shipped), which wants its own design and must not ride along.
+- **The Play `USE_FULL_SCREEN_INTENT` declaration** — Nick submits (#3615). Listed here only
+  because it is unsubmitted; nothing waits on the outcome, since prompt-and-degrade is build
+  work either way.
+- **The media plane has no authoritative config source** (#3685, found 2026-08-31) — neither
+  box is a git checkout, and the two `livekit.yaml` files have structurally diverged (40 lines
+  vs 23; `redis` and `webhook` sections present on one island, absent on the other). Not a
+  blocker on this design, but it is the substrate every call in it runs on — and Decision 9
+  now puts a foreign island's users onto it.
 
 ## Provenance
 
