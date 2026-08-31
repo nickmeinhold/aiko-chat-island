@@ -63,11 +63,14 @@ passkeys_flag="${3:-}"
 # #3592's, one parser rather than four.
 _read_kv() {
   local v q
-  # `export KEY=v` is valid dotenv and python-dotenv honours it. Matching only
-  # "^KEY=" read NOTHING from such a file, fell through to convention, and wrote
-  # PASSKEY_ENABLED=false + GATEWAY_SEED_PEERS=[] — #3734 itself, silently, via a
-  # supported .env syntax. Optional prefix, then strip it from the captured line.
-  v=$([ -f "$1" ] && grep -E "^(export[[:space:]]+)?$2=" "$1" 2>/dev/null | tail -n1 | sed -E "s/^(export[[:space:]]+)?$2=//" || true)
+  # Leading whitespace and an `export ` prefix are both valid dotenv and both honoured
+  # by python-dotenv. Matching only "^KEY=" read NOTHING from such a file, fell through
+  # to convention, and wrote PASSKEY_ENABLED=false + GATEWAY_SEED_PEERS=[] — #3734
+  # itself, silently, via supported .env syntax. The `export` case came from a reviewer;
+  # the LEADING-SPACE case came from the parity corpus in the test suite, which found in
+  # seconds what three adversarial rounds did not. That is the argument for bounding a
+  # class instead of patching its instances.
+  v=$([ -f "$1" ] && grep -E "^[[:space:]]*(export[[:space:]]+)?$2=" "$1" 2>/dev/null | tail -n1 | sed -E "s/^[[:space:]]*(export[[:space:]]+)?$2=//" || true)
   for q in '"' "'"; do
     if [ ${#v} -ge 2 ] && [ "${v#"$q"}" != "$v" ] && [ "${v%"$q"}" != "$v" ]; then
       v="${v#"$q"}"; v="${v%"$q"}"; break

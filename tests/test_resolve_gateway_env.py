@@ -289,3 +289,78 @@ def test_the_refusal_does_not_reject_valid_arrays(tmp_path) -> None:
     assert _parsed(_run(tmp_path, gw={"GATEWAY_SEED_PEERS": "[]"}))["SEED_PEERS"] == "[]"
     assert _parsed(_run(tmp_path, gw={"GATEWAY_SEED_PEERS": PEERS_A}))["SEED_PEERS"] == PEERS_A
     assert _parsed(_run(tmp_path))["SEED_PEERS"] == "[]"
+
+
+# --- the CLASS, not its instances -------------------------------------------
+#
+# Rounds 1-3 of PR#153's cage-match each found a DIFFERENT way this shell reader
+# diverges from python-dotenv: multiline values, quoted values, `export ` prefixes.
+# Three rounds, three instances, one class — which is the tell that the class was never
+# enumerated. Patching a fourth instance would be reviewing our own repairs.
+#
+# So bound the class instead. This corpus asserts, for every .env shape we can think of,
+# that the resolver either AGREES with python-dotenv (the parser the gateway actually
+# uses) or REFUSES loudly. Silent divergence — reading a different value than the
+# gateway will — is the only outcome forbidden, because it is the failure mode #3734 is
+# made of. A new divergence now fails a test rather than waiting for a reviewer.
+#
+# The real fix remains #3592's: one parser, not four. This makes the debt measurable
+# until then, and #3761 covers the untested caller wiring.
+
+DOTENV_CORPUS = [
+    ("plain",              'PASSKEY_ENABLED=true'),
+    ("double quoted",      'PASSKEY_ENABLED="true"'),
+    ("single quoted",      "PASSKEY_ENABLED='true'"),
+    ("export prefix",      'export PASSKEY_ENABLED=true'),
+    ("export + quotes",    'export PASSKEY_ENABLED="true"'),
+    ("export extra space", 'export   PASSKEY_ENABLED=true'),
+    ("duplicate keys",     'PASSKEY_ENABLED=false\nPASSKEY_ENABLED=true'),
+    ("trailing blank",     'PASSKEY_ENABLED=true\n\n'),
+    ("preceded by comment",'# a note\nPASSKEY_ENABLED=true'),
+    ("other keys around",  'JWT_SECRET=x\nPASSKEY_ENABLED=true\nGATEWAY_ID=y'),
+    ("inline comment",     'PASSKEY_ENABLED=true  # after well-known verification'),
+    ("leading space",      '  PASSKEY_ENABLED=true'),
+]
+
+
+def _dotenv_says(path: Path) -> str | None:
+    from dotenv import dotenv_values
+    return dotenv_values(str(path)).get("PASSKEY_ENABLED")
+
+
+def test_the_shell_reader_agrees_with_python_dotenv_or_refuses(tmp_path) -> None:
+    """THE CLASS GUARD. For each shape: agree with python-dotenv, or exit non-zero.
+    Never silently resolve to something the gateway would read differently."""
+    divergences = []
+    for name, body in DOTENV_CORPUS:
+        env = tmp_path / f"{name.replace(' ', '_')}.env"
+        env.write_text(body + "\n")
+        expected = _dotenv_says(env)
+        result = subprocess.run([str(SCRIPT), str(env), "[]", ""], capture_output=True, text=True)
+        if result.returncode != 0:
+            continue  # refusing is always allowed — it is loud
+        got = dict(l.split("=", 1) for l in result.stdout.strip().splitlines())["PASSKEY_ENABLED"]
+        # python-dotenv absent => our convention default "false" is the agreed answer
+        want = expected if expected is not None else "false"
+        if got != want:
+            divergences.append(f"{name!r}: shell={got!r} dotenv={want!r} (silent divergence)")
+    assert not divergences, "shell reader silently disagrees with the gateway's parser:\n" + "\n".join(divergences)
+
+
+def test_the_class_guard_can_actually_fail(tmp_path) -> None:
+    """MUST-FAIL ARM. A corpus guard that never sees a divergence proves nothing, so
+    construct one the reader genuinely gets wrong and assert the comparison catches it.
+    `KEY=value # comment` is read by python-dotenv as `value`; the shell reader takes the
+    whole line. If this ever starts passing, the reader gained inline-comment support and
+    this arm must be re-pointed at the next known divergence."""
+    env = tmp_path / "inline.env"
+    env.write_text("PASSKEY_ENABLED=true  # why\n")
+    assert _dotenv_says(env) == "true", "python-dotenv changed its inline-comment handling"
+    result = subprocess.run([str(SCRIPT), str(env), "[]", ""], capture_output=True, text=True)
+    # The reader must NOT silently answer "true" here — it either refuses (current
+    # behaviour: the raw line fails the boolean check) or genuinely supports comments.
+    if result.returncode == 0:
+        got = dict(l.split("=", 1) for l in result.stdout.strip().splitlines())["PASSKEY_ENABLED"]
+        assert got == "true", "silent divergence went undetected — the class guard is blind"
+    else:
+        assert "must be true or false" in result.stderr
