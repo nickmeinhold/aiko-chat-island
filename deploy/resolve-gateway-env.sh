@@ -63,7 +63,11 @@ passkeys_flag="${3:-}"
 # #3592's, one parser rather than four.
 _read_kv() {
   local v q
-  v=$([ -f "$1" ] && grep -E "^$2=" "$1" 2>/dev/null | tail -n1 | cut -d= -f2- || true)
+  # `export KEY=v` is valid dotenv and python-dotenv honours it. Matching only
+  # "^KEY=" read NOTHING from such a file, fell through to convention, and wrote
+  # PASSKEY_ENABLED=false + GATEWAY_SEED_PEERS=[] — #3734 itself, silently, via a
+  # supported .env syntax. Optional prefix, then strip it from the captured line.
+  v=$([ -f "$1" ] && grep -E "^(export[[:space:]]+)?$2=" "$1" 2>/dev/null | tail -n1 | sed -E "s/^(export[[:space:]]+)?$2=//" || true)
   for q in '"' "'"; do
     if [ ${#v} -ge 2 ] && [ "${v#"$q"}" != "$v" ] && [ "${v%"$q"}" != "$v" ]; then
       v="${v#"$q"}"; v="${v%"$q"}"; break
@@ -100,6 +104,17 @@ seed_peers="$(printf '%s' "$seed_peers" | tr '\n\r' '  ')"
 case "$passkey_enabled" in
   true|false) ;;
   *) echo "resolve-gateway-env: PASSKEY_ENABLED must be true or false, got '$passkey_enabled'" >&2; exit 1 ;;
+esac
+
+# REFUSE a seed list that is not a JSON array. An island stood up before this fix with
+# the guide's multiline invocation has `GATEWAY_SEED_PEERS=[` in its .env (the body
+# lines were orphaned and unparseable by python-dotenv too). Reading that back and
+# writing it out again would launder a broken value into a deliberate-looking one, and
+# peers_service would keep serving self. Shape-only: this is not a JSON parser, and
+# growing one here is exactly what #3592 says not to do.
+case "$seed_peers" in
+  "["*"]") ;;
+  *) echo "resolve-gateway-env: GATEWAY_SEED_PEERS must be a JSON array (starts '[', ends ']'), got '$seed_peers'. A pre-2026-09 standup with a multiline --seed-peers left a truncated value; pass --seed-peers with the intended array to repair it." >&2; exit 1 ;;
 esac
 
 printf 'SEED_PEERS=%s\n' "$seed_peers"

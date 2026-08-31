@@ -227,7 +227,65 @@ def test_quotes_are_stripped_from_seed_peers_too(tmp_path) -> None:
 
 
 def test_an_unbalanced_quote_is_left_alone(tmp_path) -> None:
-    """Only a MATCHING pair is stripped. A value that merely starts with a quote is not
-    a quoted value, and eating one end would corrupt it."""
-    out = _parsed(_run(tmp_path, gw={"GATEWAY_SEED_PEERS": '"unbalanced'}))
-    assert out["SEED_PEERS"] == '"unbalanced'
+    """Only a MATCHING pair is stripped — eating one end would corrupt the value.
+
+    Asserted via PASSKEY_ENABLED because it has its own strict validation: if the lone
+    leading quote were wrongly stripped the value would become the valid `true` and be
+    accepted, so the refusal below is positive evidence that it was NOT stripped. (This
+    case originally used a seed-peers value; the array-shape guard added for Carnot's
+    round-3 recovery finding legitimately refuses that, which is the guard working.)"""
+    result = _run(tmp_path, gw={"PASSKEY_ENABLED": '"true'})
+    assert result.returncode == 1, "an unbalanced quote was stripped and the value accepted"
+    assert "must be true or false" in result.stderr
+
+
+def test_a_seed_list_with_an_unbalanced_quote_is_refused(tmp_path) -> None:
+    """The companion case on the other key: not an array shape, so it refuses rather
+    than laundering a corrupt value into .env."""
+    result = _run(tmp_path, gw={"GATEWAY_SEED_PEERS": '"unbalanced'})
+    assert result.returncode == 1
+    assert "must be a JSON array" in result.stderr
+
+
+def test_an_export_prefixed_recorded_value_is_honoured(tmp_path) -> None:
+    """CARNOT'S ROUND-3 FINDING, and the most severe of the three rounds because it is
+    SILENT. `export KEY=v` is valid dotenv and python-dotenv honours it. Matching only
+    `^KEY=` read nothing from such a file, fell through to convention, and wrote
+    PASSKEY_ENABLED=false AND GATEWAY_SEED_PEERS=[] — #3734 itself, reachable through a
+    supported .env syntax, on the very code paths this PR exists to protect."""
+    env = tmp_path / "gateway.env"
+    env.write_text(f"export PASSKEY_ENABLED=true\nexport GATEWAY_SEED_PEERS={PEERS_A}\n")
+    out = _parsed(subprocess.run([str(SCRIPT), str(env), "", ""], capture_output=True, text=True))
+    assert out["PASSKEY_ENABLED"] == "true", "an export-prefixed passkey setting was silently downgraded"
+    assert out["SEED_PEERS"] == PEERS_A, "an export-prefixed peer list was silently emptied"
+
+
+def test_the_export_test_can_actually_fail(tmp_path) -> None:
+    """MUST-FAIL ARM. Without the `export ` prefix support the same file resolves to the
+    convention values, so the assertion above discriminates between the two."""
+    env = tmp_path / "plain.env"
+    env.write_text(f"PASSKEY_ENABLED=true\nGATEWAY_SEED_PEERS={PEERS_A}\n")
+    plain = _parsed(subprocess.run([str(SCRIPT), str(env), "", ""], capture_output=True, text=True))
+    assert plain["PASSKEY_ENABLED"] == "true"
+    assert plain["PASSKEY_ENABLED"] != "false"
+
+
+def test_a_truncated_multiline_seed_list_is_refused(tmp_path) -> None:
+    """CARNOT'S ROUND-3 RECOVERY CASE. An island stood up before this fix, using the
+    guide's multiline --seed-peers, has a literal `GATEWAY_SEED_PEERS=[` in .env with the
+    array body orphaned on following lines (unparseable by python-dotenv too). Reading
+    that back and writing it out again would launder a broken value into a
+    deliberate-looking one while peers_service kept serving self. Refuse instead, and say
+    how to repair it."""
+    result = _run(tmp_path, gw={"GATEWAY_SEED_PEERS": "["})
+    assert result.returncode == 1
+    assert "must be a JSON array" in result.stderr
+    assert "--seed-peers" in result.stderr, "the refusal must say how to repair it"
+
+
+def test_the_refusal_does_not_reject_valid_arrays(tmp_path) -> None:
+    """MUST-FAIL ARM for the refusal — a guard that rejects everything is not a guard.
+    Both the empty array and a populated one must pass."""
+    assert _parsed(_run(tmp_path, gw={"GATEWAY_SEED_PEERS": "[]"}))["SEED_PEERS"] == "[]"
+    assert _parsed(_run(tmp_path, gw={"GATEWAY_SEED_PEERS": PEERS_A}))["SEED_PEERS"] == PEERS_A
+    assert _parsed(_run(tmp_path))["SEED_PEERS"] == "[]"
