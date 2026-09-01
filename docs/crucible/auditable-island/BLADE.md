@@ -1,98 +1,82 @@
-# 🜂 Blade — what to actually do
+# 🜂 Blade — an honest negative result
 
-*Movement 7. Plan mode was not entered: Nick was asleep for this run and a plan he
-cannot approve is not a plan. Presented as prose per the skill's fallback. **Nothing
-below has been built.***
+*Movement 7. **CANDIDATE INVALIDATED** (2 of 4 families DISSOLVE). There is no blade:
+the forge produced a plan that did not survive its own fire, which is the outcome this
+skill exists to be capable of reaching. Plan mode was not entered — there is nothing to
+approve. **No code was written.***
 
-## The one-paragraph version
+## What to do
 
-The thesis Nick and I landed on last session — *auditability by construction dissolves
-reputation* — **is refuted**, from outside (every deployed transparency system kept an
-admission layer; at N=2 split-view detection is theatre) and from inside (`docs/design/06`
-already held a more careful version of the same idea and we talked past it). The
-incumbent answer, Design 06's KT log, is **right and currently unbuildable** — five gates,
-in two repos. What the forge then invented to have something to build (a signed ack) was
-struck down by both live adversaries as defending against an adversary who does not exist.
-**What survives is one real defect repair, one overdue conversation, and a deferral with a
-named trigger.** That is a smaller result than the run set out for, and it is the honest one.
+### 1. Send Andy the answer to his own question — the only unambiguous action
 
----
+claude-tasks **#2161**, steps 3–4, outstanding since **2026-07-17**. Andy raised the
+"softened CA" question; the answer is written and sourced in `docs/design/06` where he
+cannot see it. **All three adversaries independently called this the most valuable item
+in the bundle** — Tesla, characteristically, adding *"it does not rescue Tiers 1–3."*
 
-## Do now
+Nick's to send, through the draft gate: I draft the Discussions post from Design 06, he
+edits, then it posts. It should carry Design 06's own honest limit (*"'No central point'
+is not a shipped outcome"*), not the stronger claim, because Andy will find it otherwise.
 
-### 1. Tier 0 — send Andy the answer to his own question *(no code, highest value/hour)*
+### 2. Carry one finding that is real and independent of this whole design
 
-claude-tasks **#2161** steps 3–4 have been outstanding since **2026-07-17**: *show Nick,
-then post to `aiko_chat` Discussions*. Andy raised the "softened CA" question; the answer
-is written and sourced in Design 06 where he cannot see it. Both adversaries independently
-called this the most valuable item in the bundle.
+`origin.client_msg_id` **survives account deletion** while the row's column is nulled
+(`accounts_service.py:157-159` tombstones the column precisely because it *"can hold an
+email/phone/handle"*). The tombstone is therefore leakier than the deletion code intends.
+This has nothing to do with auditability, was surfaced by the strike, and is arguably the
+most actionable thing the night produced. Not yet filed — it wants its own verification
+pass first, and I would rather file it right than fast.
 
-**This is Nick's to send, not mine** — and it goes through the draft gate first.
-Concretely: I draft the Discussions post from Design 06, show him, he edits, then it posts.
+### 3. Build nothing else from this bundle
 
-### 2. Tier 1 — echo the row's `client_msg_id`, scoped to origin-present *(a defect repair)*
+- **Signed ack + prober — dead for now.** A voluntary proof is theatre against an
+  operator who is the adversary. The fix is known (client-side refusal, how Chrome forced
+  CAs to log) and meaningless while Nick runs every island. Trigger: first non-Nick
+  operator (#3387).
+- **Echo the row's `client_msg_id` — do NOT build as specified** (#3805, re-scoped from
+  task to finding). It broadcasts a field the deletion path treats as PII, and it does not
+  defeat a motivated operator anyway, because `origin` signs `client_msg_id` but not
+  `msg_id`.
+- **Design 06's KT log stays the long-run answer**, gated on five unbuilt things across
+  two repos — and it must ship with an honest statement that **N=2 has no split-view
+  protection**.
 
-One field in `messages_service.message_view()`, emitted **only when `origin` is present.**
+## What this run is actually worth
 
-- **Why it is a defect:** the write path enforces `origin.client_msg_id == frame.client_msg_id`
-  fail-closed (`signing.py:297`) and the column is `UNIQUE(channel_id, client_msg_id)`
-  (`models.py:531`), but the read path never echoes the *row's* value — so the signed
-  envelope only ever agrees with **itself**, and a dishonest island can attach a validly
-  signed origin to a different row undetectably. The app tab measured this and nobody
-  owned the fix.
-- **Why origin-present scoping:** the value is *already* on the wire inside `origin`
-  (`models.py:549`, echoed at `message_view:57-58`), so there is **zero marginal
-  disclosure** — which answers both adversaries' privacy objection instead of trading
-  against it. And an unsigned message has no signature to relocate, so the field would be
-  pure leakage there.
-- **Ship it standalone.** Both reviewers were explicit: sever it from the speculative
-  work. It is a bug fix, not a feature.
-- **Gates:** wire-visible ⇒ app-tab agreement **before** merge, island deploys first
-  (silent-desync rule). Trust-boundary-adjacent ⇒ cage-match by law.
+Nothing was built and one thing was un-learned, which is a real return on a night:
 
-## Defer, with a trigger — not abandon
+1. **The thesis was refuted twice** — externally (every deployed transparency system kept
+   an admission layer; N=2 gossip is a single edge) and internally (**Design 06 already
+   held a more careful version of this idea and we talked past it**).
+2. **Nick's by-product died on its own falsifier**, written before the research and fired
+   exactly as written: age-of-attested-history requires comparing islands, a comparison is
+   a ranking, a ranking is the reputation system #1569 already refuted.
+3. **A three-family strike caught what I could not.** Kelvin and Carnot found the design's
+   fatal property; Tesla found that my *fix* was both ineffective and harmful, using two
+   citations I had not read.
 
-### 3. The signed ack (old Tier 2) and the prober (old Tier 3)
+## What I got wrong, which is the transferable part
 
-**HALTED.** Carnot: DISSOLVE. Kelvin: RECAST-halt. Both correct that a voluntary proof is
-theatre against an operator who is the adversary.
+1. **I called the verdict before the last adversary finished, and the reading I accepted
+   was the one I had a motive to accept.** A dark seat is a shorter path to a finished
+   verdict than a live one. I spot-checked instead of waiting for completion, and wrote
+   the wrong call into five artifacts before it landed.
+2. **I read a doc comment and reported it as the code.** `redacting_log_sink.dart:30`
+   describes `client_msg_id` as a ULID; the generator is `_uuid.v4()`. I then built a
+   design refinement on the wrong fact and published it to the tracker.
+3. **I filed a disqualifying flaw as a scope note.** Fold found *"an island cannot be made
+   to sign"* and I carried it as a stated limit. Naming a flaw is not pricing it.
+4. **I invented a tier to have something to build.** Tesla: *"the author could not let a
+   crucible end at a message to Andy plus a one-field tautology."* That is exactly what
+   happened, and it should have ended there.
+5. **The thesis itself was a regression of a better position this repo already held** —
+   last session's crux recurring at the level of a thesis rather than a file path.
 
-The missing component is known and precedented — **client-side enforcement**, exactly how
-CT forced CAs to log (Chrome requires SCTs; nothing else compelled anyone). But that only
-means anything against an operator Nick does not control, and today he runs every island.
-
-**Revisit trigger: the first non-Nick island operator.** Same gate #3387 already waits on.
-
-### 4. Design 06's KT log stays the long-run answer
-
-Unblocked only by: key rotation/revocation (#3589, #1972, #1865), the multi-device model
-(#17), a real gossip transport (#1578, #3800), island-side key→account binding (#3774),
-and the app tab lifting its recorded WAIT. **Plus an honest statement that N=2 has no
-split-view protection** — both the external research and Design 06's own risk section say
-so, and neither the design nor the marketing should imply otherwise.
-
-## Owed to the app tab
-
-- **T-2:** a wire-contract rule that `client_msg_id` must be high-entropy and
-  non-correlatable — no embedded account/device/channel semantics, no cross-channel reuse.
-  Today's client uses a ULID, which embeds a millisecond timestamp; that is already
-  published inside `origin`, so this is about *future* clients, not this one.
-
-## What I got wrong, recorded because it is the transferable part
-
-1. **I filed a disqualifying flaw as a scope note.** Fold found "an island cannot be made
-   to sign" and I carried it openly as a stated limit — which felt like rigor and was
-   actually the whole mechanism failing. **Naming a flaw is not pricing it.** Both
-   adversaries went straight to it.
-2. **I invented Tier 2 to have something to build.** Carnot: *"The design should have
-   stopped at 'KT later; fix position binding now.'"* Ship-momentum, in a design doc
-   instead of a PR, and neither my enthusiasm nor my own Fold caught it.
-3. **The thesis itself was a regression of a better position this repo already held.**
-   Design 06 had already written the honest limit. That is last session's crux —
-   *recollection impersonating a checked record* — recurring one level up, at the level
-   of a thesis rather than a file path, and it is the single most transferable finding here.
+Points 2 and 5 are the same failure at different scales, and point 1 is its cousin: three
+times in one night I trusted a reading I had not earned. **The forge caught all three,
+but only because the cold pole was real.**
 
 ## Scope stamp
 
-**DESIGN-ONLY. IMPLEMENTATION UNPROVEN.** No code was written. A green design pass is not
-a green code pass; Tier 1 gets a real cage-match when it is built.
+**DESIGN-ONLY. IMPLEMENTATION UNPROVEN. CANDIDATE INVALIDATED.** Do not build from this
+bundle without re-reading `TEMPER.md`.
