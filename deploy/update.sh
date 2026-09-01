@@ -153,8 +153,24 @@ ok "stack recreated (entrypoint migrates fail-closed before serving)"
 # --- step 3: verify ---------------------------------------------------------
 log "Step 3/3 — verifying /health (a failed migration keeps the container from serving)"
 for _ in $(seq 1 30); do
-  if curl -fsS --max-time 3 http://127.0.0.1:8095/health >/dev/null 2>&1; then
+  if health="$(curl -fsS --max-time 3 http://127.0.0.1:8095/health 2>/dev/null)"; then
     ok "gateway healthy on 127.0.0.1:8095 — update complete 🎉"
+    # Say WHICH CODE is now serving. This script pulls an image and does not sync
+    # docker-compose.yml (#2301), so "the deploy succeeded" has never been the same
+    # claim as "the intended commit is running" — on 2026-08-29 the deploy tree was
+    # a month stale and nothing said so. /health now carries the provenance baked
+    # into the image at build time, so the answer comes from the running container
+    # rather than from a file on the host beside it.
+    # Parsed with sed, not jq: jq is not guaranteed on an island box, and this is
+    # informational — a parse miss must never fail a good deploy.
+    sha="$(printf '%s' "$health" | sed -n 's/.*"git_sha":"\([^"]*\)".*/\1/p')"
+    ref="$(printf '%s' "$health" | sed -n 's/.*"ref":"\([^"]*\)".*/\1/p')"
+    if [ -n "$sha" ]; then
+      ok "running ${ref:-(no ref)} @ ${sha}"
+    else
+      warn "this image reports no build provenance — a local build, or an image from
+       before /health carried it. Compare against the tag you meant to deploy by hand."
+    fi
     exit 0
   fi
   sleep 2

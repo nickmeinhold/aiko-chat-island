@@ -53,6 +53,22 @@ COPY alembic ./alembic
 COPY entrypoint.sh ./
 RUN chmod +x entrypoint.sh
 
+# BUILD PROVENANCE — baked LAST so a new sha invalidates only this layer, never the
+# expensive pip installs above. Written as a FILE, deliberately, not as ENV: compose
+# `environment:` and the box's .env are the OPERATOR's surface, so a value read from
+# there would report the host's belief about the artifact rather than the artifact
+# (the #2301 failure mode exactly). A file in an image layer can only be changed by
+# rebuilding. Served unsigned at /health as `build`; see src/aiko_gateway/build_info.py.
+#
+# Unset in a plain `docker build` — the app then reports null for those fields, which
+# is honest. CI (.github/workflows/release.yml) passes the real values.
+ARG GIT_SHA=
+ARG BUILD_REF=
+ARG BUILT_AT=
+RUN printf '{"git_sha":"%s","ref":"%s","built_at":"%s","aiko_services_ref":"%s","aiko_chat_ref":"%s"}\n' \
+        "$GIT_SHA" "$BUILD_REF" "$BUILT_AT" "$AIKO_SERVICES_REF" "$AIKO_CHAT_REF" \
+        > /app/build-info.json
+
 # Bind on all interfaces inside the container; the compose port publish keeps it
 # private (127.0.0.1:8095 on the host). ENVIRONMENT is unset → defaults to
 # "production" → the config.py fail-closed JWT guard is armed.
