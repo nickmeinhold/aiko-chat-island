@@ -16,8 +16,8 @@ more than the first.**
 
 - **Externally** (`RESEARCH-priorart.md`): every *deployed* transparency system kept an
   admission layer for its proof-sources. Chrome admits CT logs at its own discretion,
-  with uptime SLAs and an operator-diversity rule; Signal's 2026 KT names three
-  auditors in the client. CONIKS promised no auditor class and every production
+  with uptime SLAs and an operator-diversity rule; Signal's 2026 KT routes client verification through two
+  named third-party auditors, Cloudflare and Trail of Bits. CONIKS promised no auditor class and every production
   descendant hired one, because self-monitoring cannot supply cross-client agreement.
   At **N=2 the gossip graph is a single edge**, so split-view detection is theatre here.
 - **Internally** (`RESEARCH-crosstab.md`): `docs/design/06-identity-and-trust.md`

@@ -158,7 +158,7 @@ Every production descendant added a third party anyway:
   property self-monitoring **cannot** provide: a client sees only its own view.
 - **Apple CKV** → "We plan to share more details about our public auditing
   strategy in 2024" (https://security.apple.com/blog/imessage-contact-key-verification/).
-- **Signal** → three-auditor quorum (1b).
+- **Signal** → named third-party auditors, Cloudflare + Trail of Bits (1b, and see the CORRECTION at the end of this file — the "three" and the quorum threshold were secondary-source overclaims).
 
 **Direct answer to the question asked:** yes, "no auditor class" has become
 "trust Cloudflare" (and Trail of Bits, and Signal itself). The auditor exists to
@@ -311,3 +311,30 @@ is currently theatre. Design against that table, not against the slogan.
 - https://datatracker.ietf.org/doc/html/draft-ietf-trans-gossip-05
 - https://slsa.dev/spec/v1.0/levels
 - https://engineering.fb.com/2023/04/13/security/whatsapp-key-transparency/
+
+
+---
+
+## ⚠️ CORRECTION — Finding 1b overstated, verified against the primary source 2026-09-02
+
+The researcher flagged its own sourcing on Finding 1b (*"the 'three, and the client
+requires all three' phrasing comes from secondary reporting… worth a direct check before
+the Cast leans on it"*). **The Cast leaned on it anyway, and it was wrong.** Fetched
+`https://signal.org/blog/automatic-key-verification/` directly:
+
+- **TWO named auditors, not three:** *"For Signal's implementation of key transparency,
+  Cloudflare and Trail of Bits serve as trusted third-party auditors."*
+- **No threshold is stated.** The blog says only that auditors sign, and that *"By
+  checking for and verifying these auditor signatures, Alice and Bob can be assured that
+  the clerk is maintaining exactly one ledger."* Nothing about 3-of-3, or any quorum.
+- **Nothing about hardcoding** the auditor set in the client.
+
+**What survives, and it is still the point:** named third-party auditors sit in the
+client's verification path. That is an admission decision made out-of-band, which is the
+Q1 finding. The Chrome/CT evidence is primary-sourced and unaffected, and it carries the
+argument on its own.
+
+**Process note.** This is the fourth instance in one run of an unearned reading being
+propagated — and the worst-shaped one, because it was not a missing check: **the
+researcher explicitly warned me and I stated the claim as fact anyway.** A caveat
+delivered and overridden is a different failure from a caveat never sought.
