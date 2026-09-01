@@ -4,17 +4,37 @@
 bundle was handed over — including `CRUCIBLE.md`'s enthusiasm — so a laundered
 assumption could be caught at its source.*
 
-## Verdict: **RECAST — Tiers 0 and 1 survive and ship; Tiers 2 and 3 are HALTED**
+## Verdict: **CANDIDATE INVALIDATED** — 2 of 4 families DISSOLVE
 
 | Reviewer | Family | Verdict |
 |---|---|---|
 | **Carnot** | GPT / Codex | **DISSOLVE** |
+| **Tesla** | xAI Grok | **DISSOLVE** |
 | **Kelvin** | Gemini 3 Pro | **RECAST** |
-| **Tesla** | xAI Grok | **NO VERDICT — instrument failure** |
-| **Maxwell** | Claude (author) | **RECAST — concur, with one dissent from Carnot** |
+| **Maxwell** | Claude (author) | **concur with DISSOLVE** after verifying Tesla's citations |
 
-Not auto-invalidated (that needs ≥2 DISSOLVE), but **the two live families converge
-completely on what dies and what lives**, and they got there independently.
+The skill's binding rule fires: **≥2 families DISSOLVE ⇒ stop and report the candidate
+invalidated.** That is an honest negative result, and it is recorded rather than
+softened.
+
+> ### ⚠️ Author error, corrected — I nearly published the wrong verdict
+>
+> An earlier draft of this file recorded **RECAST**, with Tesla as a dark seat and an
+> "instrument failure" note citing task #3503. **That was wrong.** Tesla had not
+> stalled; it was still running. I spot-checked its output file at ~60 words, saw
+> preamble, and declared it dead. It finished minutes later with **919 words and the
+> sharpest strike of the three** — including two findings that neither other family nor
+> my own Fold caught, and that invert the verdict.
+>
+> I had already written the wrong call into `TEMPER.md`, `BLADE.md`, PR#155, a new
+> tracker issue (#3805) and a comment on #3503 before it landed. All are corrected.
+>
+> **The lesson is not "Grok is slow."** It is that *I manufactured a false negative by
+> measuring too early, and the reading I got was one I had a motive to accept* — a dark
+> seat is a shorter path to a finished verdict than a live one. A wait-for-completion
+> loop, not a spot check, is the correct instrument, and the memory's own warning that
+> availability and value run **anti-correlated** across reviewer seats was sitting right
+> there.
 
 ---
 
@@ -70,7 +90,7 @@ That is a real difference from DISSOLVE: *do not build it now*, versus *do not b
 
 ---
 
-## Second convergent finding: Tier 1 is a defect repair, must be SEVERED, and is blocked on a privacy answer
+## Second finding: Tier 1 is a real DEFECT, but the fix as cast is refuted
 
 Both reviewers independently upgraded Tier 1 and independently refused to let it ship as
 written.
@@ -91,7 +111,14 @@ And both hit C-5 hard, correctly:
 > device/session prefixes, timestamps, counters, database IDs, or library fingerprints…
 > Tier 1 may fix integrity by expanding metadata leakage."*
 
-### The C-5 answer, measured after the strike was launched — and it improves the fix
+### ~~The C-5 answer~~ — **SUPERSEDED AND WRONG, kept for the record (see T-B below)**
+
+> **This subsection is retained deliberately rather than deleted.** Everything in it is
+> wrong, it was written with confidence, and it is the clearest artifact in this bundle of
+> the exact failure the run's headline finding is about: I read a *doc comment* about
+> `client_msg_id` and reported it as the *generator*, then built a design refinement on
+> it. Tesla caught it. Deleting it would hide the instance.
+
 
 I checked rather than conceding, and the picture is better than either reviewer assumed,
 in a way that yields a cleaner design than the one I cast:
@@ -120,6 +147,64 @@ contract does not *constrain* what a client puts in that field, and a different 
 implementation could put something correlatable there. That is a spec rule owed to the
 app tab (V-6 below), not a blocker on the island-side fix under the origin-present
 scoping.
+
+---
+
+## Tesla's strike — the two findings that inverted the verdict
+
+Both were verified in the code by me before being accepted. **Both hold.**
+
+### T-A — the fix does not stop the attack it was written for
+
+> *"Origin signs those content fields plus `client_msg_id`, **not** `msg_id` or
+> `created_at`… Echoing the row's `client_msg_id` catches a sloppy transplant that
+> forgets to copy the stored id. A motivated operator copies `client_msg_id` with the
+> origin, drops the old row, inserts a new ULID. Uniqueness holds. Echo matches.
+> Position moved. Undetected."*
+
+And the constraint I leaned on in Fold F-4 is not a boundary at all against this
+adversary: *"The `UniqueConstraint` … is not a security boundary on a box the operator
+owns. ISL-0002: FK off, they have the DB."* Correct — I used a database invariant as a
+defence against the party who administers the database.
+
+Plus a client half I never specified: `validateOrigin` currently feeds
+`origin.client_msg_id` back in *as* the frame id (`origin_envelope.dart:243-251`), so
+the comparison stays self-referential until the app compares the **outer** field and
+fails closed. *"Echo is not the capability."*
+
+### T-B — C-5 is wrong, and this repo already recorded the right answer
+
+I claimed `client_msg_id` is a ULID, so echoing it disclosed only a timestamp already
+published inside `origin`. **False, and I got it from a doc comment rather than the
+code.** The app generates a **UUIDv4** — `chat_providers.dart:566`,
+`newTempId: () => _uuid.v4()`. I had read `redacting_log_sink.dart:30`, a
+*log-redaction* comment, and treated it as the generator.
+
+And the island's own account-deletion path already classifies this column as PII —
+`accounts_service.py:157-159`, verbatim:
+
+> *"`client_msg_id` — a 64-char client-supplied string (validated only as \"a string\")
+> that can hold an email/phone/handle. **Naming a column `*_id` does not make
+> attacker-controlled input non-PII.**"*
+
+Deletion **nulls this field specifically because it carries the person**. My design
+proposed broadcasting it to every channel member on every read path forever. Those two
+positions cannot both stand and the deletion code's is right.
+
+Tesla also names the enthusiasm tell precisely: Fold *celebrated* that the fix would
+help unsigned traffic too (F-4), when unsigned traffic is exactly where the echo is
+**pure new leakage with no security benefit**. *"That is enthusiasm smuggling."*
+
+### T-C — what Fold missed
+
+- The ack is **WS-only** (`ws.py:225`); REST and bus-born messages get no receipt at all.
+- **Reactions carry the same origin/cmid tautology** and go unmentioned in the design.
+- A signed ack would inherit the `island_pubkey` TOFU problem: verifying a manifest
+  proves it is self-consistent, *"NOT … the island you meant to reach"*
+  (`island_identity.py`), and the app deliberately does not verify the manifest it
+  already fetches.
+- `origin.client_msg_id` **survives account deletion** (origin is kept; the row's column
+  is nulled) — so the PII tombstone is already leakier than the deletion code intends.
 
 ---
 
@@ -160,23 +245,29 @@ a PR, and neither the enthusiasm case nor Fold caught it; it took an outside fam
 
 ## Named tradeoffs (owner + accepted cost + rationale)
 
-- **T-1 — the signed ack is deferred, not abandoned.** Owner: Nick. Cost: the conviction
-  story does not exist until a third-party operator does. Rationale: client-side
-  enforcement is the known fix (CT precedent) and is meaningless while one person runs
-  every island. **Revisit trigger: the first non-Nick island operator** — the same gate
-  #3387 waits on.
-- **T-2 — `client_msg_id` remains client-chosen and unconstrained by the wire contract.**
-  Owner: app tab. Cost: a non-conforming client could place correlatable data in a field
-  the island now echoes. Mitigation: origin-present scoping bounds it to values already
-  published; a spec rule is owed.
-- **T-3 — Tesla's seat was dark.** Cost: three of four families struck, not four.
-  Rationale: recorded, not papered over — and the availability/value anti-correlation
-  warning in memory says a dark seat is not a neutral one.
+- **T-1 — the signed ack is dead for now, not forever.** Owner: Nick. Cost: no conviction
+  story exists. Rationale: a voluntary proof is theatre against an operator who is the
+  adversary; the known fix is **client-side refusal** (how Chrome forced CAs to log), and
+  it is meaningless while one person runs every island. **Revisit trigger: the first
+  non-Nick island operator** — the same gate #3387 waits on.
+- **T-2 — the position-binding tautology stays OPEN and unowned.** Owner: unassigned.
+  Cost: a dishonest island can relocate a validly-signed origin and no reader can tell —
+  the app tab's "reason 2", still unfixed. Rationale: the obvious fix (echo the row's
+  `client_msg_id`) **publishes a field this repo's own deletion path tombstones as PII**
+  and does not defeat a motivated operator anyway. A real fix must bind position *without*
+  broadcasting free-text client input. Recorded on #3805, re-scoped from task to finding.
+- **T-3 — `client_msg_id` is unconstrained free text on the wire contract.** Owner: app
+  tab. Cost: `accounts_service.py:157` already treats it as PII, and `origin.client_msg_id`
+  **survives account deletion** while the row's column is nulled — so the tombstone is
+  already leakier than the deletion code intends. That is a live finding independent of
+  this whole design, and arguably the most actionable thing the strike surfaced.
 
-## Instrument failure (recorded, not hidden)
+## Instrument note (corrected)
 
-Tesla (Grok) answered a trivial liveness prompt with `PONG` but produced **no verdict**
-against either the Spark seed (0 bytes) or the Temper bundle (60 words of preamble, then
-an agentic loop that never emitted). This is claude-tasks task **#5** reproducing twice in
-one run, and the second instance disproves any residual "it is just size" reading — it
-entered the loop after successfully reading the bundle. No verdict was fabricated for it.
+Tesla produced **0 bytes** against the *Spark* seed (~3.5KB, generative, timed out at
+400s) — a real failure, and the one genuine data point for claude-tasks#3503. But it
+**completed the Temper strike** (~75KB, ~15 min, 919 words). That inverts the
+size hypothesis rather than supporting it: the large agentic task succeeded and the
+small pure-generation one did not. #3503 has been corrected accordingly.
+
+**The dark seat in this run was mine, not Grok's.** See the verdict header.
