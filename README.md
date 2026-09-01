@@ -257,9 +257,17 @@ only requirement is that if you **modify** it **and serve it to others**, you pu
 changes.
 
 **Commons-owned — there is no contributor licence agreement and no copyright assignment**
-(the Linux model). Contributions stay owned by whoever wrote them, which makes the licence
-effectively permanent once outside contributions arrive: nobody, including the original
-authors, can later take it proprietary. That is deliberate, and it is the point.
+(the Linux model). Contributions stay owned by whoever wrote them. **The intent** is that
+this makes the licence effectively permanent once outside contributions arrive: nobody,
+including the original authors, takes it proprietary later. That is deliberate, and it is
+the point.
+
+That paragraph states an intent, not a legal guarantee. Much of this codebase was written
+by an AI agent under human direction, and **enforceability of copyleft over agent-written
+portions is untested and jurisdiction-dependent.** That is a question for counsel, not for
+a README — nothing here is legal advice. The licence was chosen for the culture it
+encodes, not for its enforcement strength, and it does that job regardless of how the
+enforceability question lands.
 
 **A linking exception is intended and not yet written.** The agreement was "AGPL-3.0 with a
 ClassPath-style exception (or similar)", so that genuinely independent work — Agents,
