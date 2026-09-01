@@ -56,6 +56,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Stamped here rather than in the Dockerfile: a RUN-time `date` would differ
+      # per arch and make the two per-arch images gratuitously non-identical.
+      - name: Stamp build time
+        id: stamp
+        run: echo "at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
       # Build this arch and push it to GHCR addressed only by digest (no tag yet).
       # The merge job collects the per-arch digests into the human tags.
       - name: Build and push by digest
@@ -64,6 +70,14 @@ jobs:
         with:
           context: .
           platforms: ${{ matrix.platform }}
+          # Build provenance baked into the image so the running island can name its
+          # own code at /health (src/aiko_gateway/build_info.py). github.sha is the
+          # merge/push commit these bytes were built from — the fact an auditor (or a
+          # deploy) actually wants, and the one nothing served previously.
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            BUILD_REF=${{ github.ref_name }}
+            BUILT_AT=${{ steps.stamp.outputs.at }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
 
       - name: Export digest
