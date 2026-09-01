@@ -248,6 +248,30 @@ docs/             design docs + deploy runbook
 tests/            unit + route + wire-e2e
 ```
 
+## License
+
+**GNU AGPL-3.0** ([`LICENSE`](LICENSE)). Decided 2026-07-17/20 with the AI+ML+Robots squad,
+as a choice about culture rather than about law: *anyone can run an island, nobody can
+capture one.* Running an unmodified island is completely free, with no obligations. The
+only requirement is that if you **modify** it **and serve it to others**, you publish your
+changes.
+
+**Commons-owned — there is no contributor licence agreement and no copyright assignment**
+(the Linux model). Contributions stay owned by whoever wrote them, which makes the licence
+effectively permanent once outside contributions arrive: nobody, including the original
+authors, can later take it proprietary. That is deliberate, and it is the point.
+
+**A linking exception is intended and not yet written.** The agreement was "AGPL-3.0 with a
+ClassPath-style exception (or similar)", so that genuinely independent work — Agents,
+Robots, PipelineElements, Actors that link against or run on an island without being
+modifications of it — is not forced to adopt this licence. That wording is still being
+settled. Adding permissions later is always possible under the licence; removing them is
+not, so the base licence lands first and the exception follows.
+
+Sibling projects are deliberately licensed differently:
+[`aiko_services`](https://github.com/geekscape/aiko_services) is Apache-2.0 under a
+stewardship model, which is a different bet, made on purpose.
+
 ---
 
 Part of the aiko mesh: [`aiko_services`](https://github.com/geekscape/aiko_services)
