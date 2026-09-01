@@ -14,7 +14,15 @@ file is the working-context that isn't obvious from the code.
   (round-trip). Don't merge over a red check. STILL verify LOCALLY first (`pytest`)
   and report that as your gate — but green-locally ≠ green-on-CI: a fresh
   low-uptime CI runner surfaced a `time.monotonic()` JWKS bug that passed on
-  high-uptime dev boxes (#64). Local pytest is the habit; CI is the confirmation.
+  high-uptime dev boxes (#64). Local pytest is the habit; CI is the confirmation. **KEEP
+  IT — decided 2026-09-01: this project is meant to have outside contributors, so CI is
+  what makes a stranger's PR safe to merge.** That reason is the inverse of the sibling
+  ruling that deleted `downstream`'s CI (*"solo project on one computer"*) — do not
+  transplant it here. The cost objection is SETTLED and should not be re-opened: this repo
+  is public, so its Actions minutes are fully discounted (1,323 min / **$0.00 net**, Aug
+  2026); the minutes that were actually being burned were `downstream`'s private ones, and
+  97% of that stopped when its CI was deleted on 2026-08-17. Detail:
+  `memory/reference_gha_timing_endpoint_reports_zero_billable.md`.
 - **Deploy is PULL-BASED; `--build` is wrong here** — there is NO `build:` on the
   box. Ship a fix: merge → cut `vX.Y.Z` → bump the box's `ISLAND_VERSION` →
   `deploy/update.sh`. **`update.sh` pulls the IMAGE and does NOT sync
