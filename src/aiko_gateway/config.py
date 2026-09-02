@@ -440,9 +440,15 @@ class Settings(BaseSettings):
     # lacks the blank-coercion, which this repo's rollback path can pull (proven
     # against :0.6.0). Trading a proven crash-loop for a narrow window is a bad deal.
     #
+    # A presence-preserving settings source (Carnot's round-2 remedy) does not help
+    # either, and this is MEASURED rather than argued: compose forwards
+    # `${ISLAND_SEED_PEERS:-[]}`, so BOTH "operator said nothing" and "operator set
+    # []" reach the container as the same PRESENT key holding the same "[]". Presence
+    # is constant TRUE, so preserving it separates nothing.
+    #
     # The operator workaround is the documented cutover itself: REPLACE the legacy
     # line rather than adding the canonical one beside it. The limitation disappears
-    # with the legacy field.
+    # with the legacy field — it is bounded by that deletion, not open-ended.
     island_seed_peers: list[dict] = []
 
     # --- LEGACY identity vars, read ONLY by _adopt_legacy_gateway_identity ---
