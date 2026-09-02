@@ -88,7 +88,7 @@ def test_dev_with_default_secret_boots():
 
 # --- LiveKit prod fail-closed (cage-match #122 rd2) --------------------------
 # WHEN configured, LiveKit mints bearer capabilities to a SHARED SFU, so prod boots
-# demand a strong secret + a gateway_id namespace + wss + both-or-neither creds.
+# demand a strong secret + a island_id namespace + wss + both-or-neither creds.
 
 _LK_SECRET_STRONG = "livekit-prod-secret-32-bytes-plus!"  # 34 chars >= 32
 
@@ -96,20 +96,20 @@ _LK_SECRET_STRONG = "livekit-prod-secret-32-bytes-plus!"  # 34 chars >= 32
 def _prod_lk(**over):
     base = dict(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
                 passkey_enabled=True, livekit_api_key="APIabc123",
-                livekit_api_secret=_LK_SECRET_STRONG, gateway_id="island-a", **_PROD_MOD)
+                livekit_api_secret=_LK_SECRET_STRONG, island_id="island-a", **_PROD_MOD)
     base.update(over)
     return Settings(**base)
 
 
 def test_prod_livekit_fully_configured_boots():
     s = _prod_lk()
-    assert s.livekit_api_key == "APIabc123" and s.gateway_id == "island-a"
+    assert s.livekit_api_key == "APIabc123" and s.island_id == "island-a"
 
 
 def test_prod_livekit_without_gateway_id_raises():
-    # Empty gateway_id on a shared SFU = fail-open cross-island room/identity collision.
+    # Empty island_id on a shared SFU = fail-open cross-island room/identity collision.
     with pytest.raises(ValidationError):
-        _prod_lk(gateway_id="")
+        _prod_lk(island_id="")
 
 
 def test_prod_livekit_weak_secret_raises():
@@ -129,7 +129,7 @@ def test_prod_livekit_non_wss_url_raises():
 
 
 def test_prod_without_livekit_boots_unaffected():
-    # The guard is skipped entirely when LiveKit is unconfigured — no gateway_id needed.
+    # The guard is skipped entirely when LiveKit is unconfigured — no island_id needed.
     s = Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
                  passkey_enabled=True, **_PROD_MOD)
     assert s.livekit_api_key == "" and s.is_production is True
@@ -137,21 +137,21 @@ def test_prod_without_livekit_boots_unaffected():
 
 def test_nonprod_livekit_remote_sfu_without_gateway_id_raises():
     # Wu F1: the shared-SFU guard is NOT gated on ENVIRONMENT. A test/dev box with the
-    # real shared creds pointed at the remote SFU + no gateway_id would merge its users
+    # real shared creds pointed at the remote SFU + no island_id would merge its users
     # into prod's rooms — so it must fail closed in a NON-prod env too.
     with pytest.raises(ValidationError):
         Settings(_env_file=None, environment="test", jwt_secret=_STRONG_SECRET,
                  livekit_api_key="APIabc", livekit_api_secret=_LK_SECRET_STRONG,
-                 livekit_url="wss://livekit.imagineering.cc", gateway_id="")
+                 livekit_url="wss://livekit.imagineering.cc", island_id="")
 
 
 def test_livekit_loopback_sfu_is_exempt():
     # A loopback dev SFU carries no cross-island collision / forgery risk, so the
-    # gateway_id / wss / secret-strength guards relax (ws://localhost, short secret ok).
+    # island_id / wss / secret-strength guards relax (ws://localhost, short secret ok).
     s = Settings(_env_file=None, environment="dev", jwt_secret=_DEV_JWT_SECRET,
                  livekit_api_key="devkey", livekit_api_secret="short-dev",
-                 livekit_url="ws://localhost:7880", gateway_id="")
-    assert s.livekit_api_key == "devkey" and s.gateway_id == ""
+                 livekit_url="ws://localhost:7880", island_id="")
+    assert s.livekit_api_key == "devkey" and s.island_id == ""
 
 
 def test_livekit_url_empty_host_raises():
@@ -1349,7 +1349,7 @@ def test_string_fields_keep_their_whitespace():
     from aiko_gateway.config import Settings
 
     with mock.patch.dict(os.environ, {"GATEWAY_DISPLAY_NAME": "  Padded  "}, clear=False):
-        assert Settings(_env_file=None).gateway_display_name == "  Padded  ", (
+        assert Settings(_env_file=None).island_display_name == "  Padded  ", (
             "a string field must not be silently stripped"
         )
 
@@ -1577,7 +1577,7 @@ def test_a_custom_env_file_override_is_honoured(tmp_path):
     reconstructed source would silently take `env_file` from model_config (".env") and
     read the repo's file instead of this one (cage-match PR#148, Carnot).
 
-    Uses `gateway_display_name`: a plain str with a default, no validator, no
+    Uses `island_display_name`: a plain str with a default, no validator, no
     cross-field guard, and absent from the test process env (so the env source cannot
     answer and the dotenv source must). Earlier drafts reached for AIKO_CHANNELS and
     then APNS_TOPIC and went red on JSON decoding and on the half-configured guard
@@ -1591,7 +1591,111 @@ def test_a_custom_env_file_override_is_honoured(tmp_path):
     env = tmp_path / "custom.env"
     env.write_text("GATEWAY_DISPLAY_NAME=from-the-custom-file\n")
     s = Settings(_env_file=str(env))
-    assert s.gateway_display_name == "from-the-custom-file", (
-        f"the custom _env_file was not read; got {s.gateway_display_name!r} — the "
+    assert s.island_display_name == "from-the-custom-file", (
+        f"the custom _env_file was not read; got {s.island_display_name!r} — the "
         "source was probably reconstructed from model_config instead of re-classed"
     )
+
+
+# --- legacy GATEWAY_* identity adoption (docs/island-vs-gateway.md) --------------
+#
+# GATEWAY_ID / GATEWAY_DISPLAY_NAME / GATEWAY_SEED_PEERS named the ISLAND, not the
+# gateway edge, so they became ISLAND_*. Both names are forwarded by compose during
+# the cutover window and resolved by Settings._adopt_legacy_gateway_identity.
+#
+# THESE ARE REGRESSION TESTS FOR A MEASURED NEAR-MISS, not speculative coverage.
+# The obvious implementation — pydantic's AliasChoices("ISLAND_ID", "GATEWAY_ID") —
+# is WRONG here, and silently: compose forwards an unset var as the EMPTY STRING,
+# AliasChoices takes the first key PRESENT, so `ISLAND_ID: ${ISLAND_ID:-}` always
+# wins and is always empty. Both live islands, whose .env still says GATEWAY_ID,
+# would have booted with no identity — which fails the LiveKit remote-SFU boot guard
+# and drops directory self-identity to a host-derived id. The absence-aware source
+# does not rescue it either: returning None means "this source has no value", not
+# "try the next alias". Hence two real fields and an explicit resolver.
+
+def _settings_with(**env):
+    import os
+    from unittest import mock
+
+    from aiko_gateway.config import Settings
+
+    with mock.patch.dict(os.environ, env, clear=False):
+        return Settings(_env_file=None)
+
+
+_SEED = '[{"id":"x","display_name":"X","base_url":"https://x.example"}]'
+
+
+def test_legacy_gateway_id_is_adopted_when_canonical_is_unset():
+    assert _settings_with(GATEWAY_ID="legacy-id").island_id == "legacy-id"
+
+
+def test_canonical_island_id_wins_over_legacy():
+    assert _settings_with(ISLAND_ID="new", GATEWAY_ID="legacy-id").island_id == "new"
+
+
+def test_empty_canonical_does_not_shadow_a_live_legacy_identity():
+    """THE regression: compose forwards an unset ISLAND_ID as "".
+
+    If this goes red, every box still on a GATEWAY_* .env loses its identity on the
+    next deploy — silently, because an empty id is a valid-looking value.
+    """
+    assert _settings_with(ISLAND_ID="", GATEWAY_ID="legacy-id").island_id == "legacy-id"
+    assert _settings_with(ISLAND_ID="   ", GATEWAY_ID="legacy-id").island_id == "legacy-id"
+
+
+def test_empty_canonical_does_not_shadow_legacy_display_name_or_seed_peers():
+    assert _settings_with(
+        ISLAND_DISPLAY_NAME="", GATEWAY_DISPLAY_NAME="Imagineering"
+    ).island_display_name == "Imagineering"
+    assert len(
+        _settings_with(ISLAND_SEED_PEERS="", GATEWAY_SEED_PEERS=_SEED).island_seed_peers
+    ) == 1
+
+
+def test_adoption_respects_each_fields_own_whitespace_policy():
+    """The resolver must not IMPOSE a policy; it inherits each field's.
+
+    The two fields deliberately differ, and adoption has to preserve that:
+      * island_id is stripped downstream by _harden_for_production, because it is
+        matched by exact string (it namespaces LiveKit rooms across islands), and a
+        padded id silently never matches — the moderator-id bug class in costume.
+      * island_display_name is NOT stripped: it is a label, and
+        test_string_fields_keep_their_whitespace forbids a config layer from
+        rewriting string fields.
+    So the resolver uses .strip() to decide EMPTINESS only, and assigns raw bytes;
+    what happens after is each field's own business.
+    """
+    assert _settings_with(GATEWAY_ID="  padded  ").island_id == "padded"
+    assert (
+        _settings_with(GATEWAY_DISPLAY_NAME="  Padded  ").island_display_name
+        == "  Padded  "
+    )
+
+
+def test_neither_name_set_gives_the_plain_defaults():
+    """The NULL arm — without it the tests above could pass on a stuck value."""
+    s = _settings_with(
+        ISLAND_ID="", GATEWAY_ID="", ISLAND_DISPLAY_NAME="", GATEWAY_DISPLAY_NAME="",
+        ISLAND_SEED_PEERS="", GATEWAY_SEED_PEERS="",
+    )
+    assert s.island_id == ""
+    assert s.island_display_name == "Aiko"
+    assert s.island_seed_peers == []
+
+
+def test_canonical_names_work_alone_on_a_cut_over_box():
+    s = _settings_with(ISLAND_ID="fresh", ISLAND_SEED_PEERS=_SEED)
+    assert s.island_id == "fresh"
+    assert len(s.island_seed_peers) == 1
+
+
+def test_both_legacy_and_canonical_names_are_forwarded_by_compose():
+    """The resolver is useless if the legacy var never reaches the container."""
+    env = _chat_island_environment()
+    for var in (
+        "ISLAND_ID", "GATEWAY_ID",
+        "ISLAND_DISPLAY_NAME", "GATEWAY_DISPLAY_NAME",
+        "ISLAND_SEED_PEERS", "GATEWAY_SEED_PEERS",
+    ):
+        assert var in env, f"{var} is not forwarded into the chat-island container"

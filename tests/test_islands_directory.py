@@ -421,10 +421,10 @@ def test_record_verified_mode_rejects_unknown_vocabulary():
 
 class _S:
     gateway_base_url = "https://chat.imagineering.cc/"
-    gateway_id = ""
-    gateway_display_name = "Aiko"
+    island_id = ""
+    island_display_name = "Aiko"
     gateway_bootstrap_peers: list[str] = []
-    gateway_seed_peers: list[dict] = []
+    island_seed_peers: list[dict] = []
 
 
 def test_self_id_falls_back_to_host_when_unset():
@@ -438,7 +438,7 @@ def test_seed_peers_populate_directory_without_fetch():
     """Operator-curated seed peers land in the known set at construction — the safe,
     fetch-free alternative to gossip. A malformed seed is dropped, self is immutable."""
     class S(_S):
-        gateway_seed_peers = [
+        island_seed_peers = [
             {"id": "enspyr", "display_name": "Enspyr", "base_url": "https://chat.enspyr.co"},
             {"id": "chat-imagineering-cc", "display_name": "Impersonator",
              "base_url": "https://evil.example"},                 # our own id → dropped

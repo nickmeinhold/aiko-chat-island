@@ -227,7 +227,7 @@ async def lifespan(app: FastAPI):
                      gi, len(settings.gateway_bootstrap_peers))
         else:
             log.info("gateway directory gossip disabled; serving self + %d seed peer(s)",
-                     len(settings.gateway_seed_peers))
+                     len(settings.island_seed_peers))
         try:
             yield
         finally:

@@ -107,7 +107,7 @@ def test_the_harness_actually_runs_the_real_script(island) -> None:
 def test_a_fresh_island_is_solo_and_quiet(island) -> None:
     island.run()
     v = _values(island)
-    assert v["GATEWAY_SEED_PEERS"] == "[]"
+    assert v["ISLAND_SEED_PEERS"] == "[]"
     assert v["PASSKEY_ENABLED"] == "false"
     assert v["JWT_SECRET"] == FIXED_SECRET
     assert "ENVIRONMENT" not in v, "absence of ENVIRONMENT is what arms the fail-closed JWT guard"
@@ -124,11 +124,11 @@ def test_a_rerun_without_flags_preserves_both_operator_choices(island) -> None:
     fix, both silently reverted: the federation link emptied and the sign-in method
     withdrawn, on an island whose health check stayed green."""
     island.run("--seed-peers", PEERS, "--enable-passkeys")
-    assert _values(island)["GATEWAY_SEED_PEERS"] == PEERS
+    assert _values(island)["ISLAND_SEED_PEERS"] == PEERS
 
     island.run()          # <- no flags at all, the documented re-run
     v = _values(island)
-    assert v["GATEWAY_SEED_PEERS"] == PEERS, "the federation link was silently emptied"
+    assert v["ISLAND_SEED_PEERS"] == PEERS, "the federation link was silently emptied"
     assert v["PASSKEY_ENABLED"] == "true", "passkey sign-in was silently withdrawn"
 
 
@@ -136,7 +136,7 @@ def test_the_rerun_test_can_actually_fail(island) -> None:
     """MUST-FAIL ARM. Pins that the convention default differs from the recorded value, so
     the assertions above discriminate rather than comparing a default to itself."""
     island.run()
-    assert _values(island)["GATEWAY_SEED_PEERS"] == "[]" != PEERS
+    assert _values(island)["ISLAND_SEED_PEERS"] == "[]" != PEERS
 
 
 def test_an_explicit_flag_still_changes_a_recorded_choice(island) -> None:
@@ -144,7 +144,7 @@ def test_an_explicit_flag_still_changes_a_recorded_choice(island) -> None:
     island.run("--seed-peers", PEERS, "--enable-passkeys")
     island.run("--seed-peers", "[]", "--no-passkeys")
     v = _values(island)
-    assert v["GATEWAY_SEED_PEERS"] == "[]"
+    assert v["ISLAND_SEED_PEERS"] == "[]"
     assert v["PASSKEY_ENABLED"] == "false"
 
 
@@ -203,7 +203,7 @@ def test_a_peer_name_containing_a_hash_survives_into_the_gateways_parser(island)
     fine. The defect is in what the heredoc WRITES — which is only visible from here, and
     only by asking python-dotenv rather than the shell."""
     island.run("--seed-peers", PEERS_HASH)
-    got = _values(island)["GATEWAY_SEED_PEERS"]
+    got = _values(island)["ISLAND_SEED_PEERS"]
     assert got == PEERS_HASH, (
         "the gateway will read a truncated peer list.\n"
         f"  wrote:      {PEERS_HASH}\n"
@@ -216,7 +216,7 @@ def test_the_hash_test_can_actually_fail(island) -> None:
     assertion above is exercising the documented truncation and not passing by accident."""
     assert " #" in PEERS_HASH
     island.run("--seed-peers", PEERS)
-    assert _values(island)["GATEWAY_SEED_PEERS"] == PEERS, "the no-hash control must pass"
+    assert _values(island)["ISLAND_SEED_PEERS"] == PEERS, "the no-hash control must pass"
 
 
 def test_a_display_name_containing_a_hash_survives_too(island) -> None:
@@ -225,7 +225,7 @@ def test_a_display_name_containing_a_hash_survives_too(island) -> None:
     "Island". Found by asking whether the hash hole was a class rather than fixing the one
     value that was reported."""
     island.run("--name", "Island #1")
-    assert _values(island)["GATEWAY_DISPLAY_NAME"] == "Island #1"
+    assert _values(island)["ISLAND_DISPLAY_NAME"] == "Island #1"
 
 
 def test_quoted_values_round_trip_across_a_rerun(island) -> None:
@@ -233,14 +233,14 @@ def test_quoted_values_round_trip_across_a_rerun(island) -> None:
     value that is written quoted and read back must survive rather than accumulate or lose
     quotes. Two re-runs, because a single one cannot show accumulation.
 
-    Only GATEWAY_SEED_PEERS is asserted across re-runs. GATEWAY_DISPLAY_NAME is quoted the
+    Only ISLAND_SEED_PEERS is asserted across re-runs. ISLAND_DISPLAY_NAME is quoted the
     same way but is NOT read back — `--name` is required on every invocation, so it is
     re-supplied rather than preserved, and it cannot accumulate. Its quoting is covered by
     the hash test above."""
     island.run("--name", "Island #1", "--seed-peers", PEERS_HASH)
     island.run()
     island.run()
-    assert _values(island)["GATEWAY_SEED_PEERS"] == PEERS_HASH, (
+    assert _values(island)["ISLAND_SEED_PEERS"] == PEERS_HASH, (
         "quotes accumulated or were lost across re-runs"
     )
 
@@ -263,4 +263,45 @@ def test_the_quoting_tests_can_actually_fail(island) -> None:
     assert dotenv_values(str(island.root / "raw.env"))["K"] == "Island", (
         "python-dotenv stopped truncating at ' #' — the quote-on-write guard may now be "
         "unnecessary; re-verify before removing it"
+    )
+
+
+# --- the cutover window: a box whose .env still holds the LEGACY names ----------
+
+def test_a_rerun_reads_back_a_legacy_gateway_seed_peers(island) -> None:
+    """A not-yet-cut-over box must keep its federation link across a standup re-run.
+
+    Both live islands' .env files were written before the ISLAND_* rename, so their
+    recorded seed list is under GATEWAY_SEED_PEERS. resolve-gateway-env.sh reads the
+    canonical name first; if it did NOT also read the legacy one, an unflagged re-run
+    would resolve the seed list to [] and the two islands would stop knowing about
+    each other — no error, green health check. That is #3734 exactly, re-opened by a
+    rename instead of by a missing read-back.
+
+    Delete this test with the legacy rung, once every box is cut over.
+    """
+    island.run()  # produce a real .env, then rewrite it into the pre-rename shape
+    text = island.env_file.read_text().replace("ISLAND_SEED_PEERS=", "GATEWAY_SEED_PEERS=")
+    assert "GATEWAY_SEED_PEERS=" in text, "fixture setup failed to create the legacy shape"
+    island.env_file.write_text(
+        text.replace("GATEWAY_SEED_PEERS='[]'", f"GATEWAY_SEED_PEERS='{PEERS}'")
+    )
+
+    island.run()  # the documented unflagged re-run
+    assert _values(island)["ISLAND_SEED_PEERS"] == PEERS, (
+        "a legacy GATEWAY_SEED_PEERS was not read back — the federation link would be "
+        "silently emptied on the next standup re-run of a live island"
+    )
+
+
+def test_the_legacy_readback_test_can_actually_fail(island) -> None:
+    """Must-fail arm: with NEITHER name carrying the peers, the re-run must give []."""
+    island.run()
+    island.env_file.write_text(
+        island.env_file.read_text().replace("ISLAND_SEED_PEERS=", "UNRELATED_KEY=")
+    )
+    island.run()
+    assert _values(island)["ISLAND_SEED_PEERS"] == "[]", (
+        "the control is void: this arm must show the empty result the test above "
+        "distinguishes itself from"
     )

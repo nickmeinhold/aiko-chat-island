@@ -103,8 +103,16 @@ services:
       # an imagineering deploy with no overrides is unchanged. Island 2 (enspyr)
       # sets GATEWAY_BASE_URL/_ID/_DISPLAY_NAME + PASSKEY_RP_ID to its own domain.
       GATEWAY_BASE_URL: ${GATEWAY_BASE_URL:-https://chat.imagineering.cc}
+      # ISLAND_* is canonical; GATEWAY_* is the legacy name a not-yet-cut-over box
+      # still has in its .env. BOTH are forwarded during the window, and config.py's
+      # _adopt_legacy_gateway_identity picks the canonical one only when it is
+      # non-blank — because compose forwards an unset var as "", which would
+      # otherwise shadow a live box's real identity. Drop the GATEWAY_* three once
+      # every box is cut over (docs/island-vs-gateway.md).
+      ISLAND_ID: ${ISLAND_ID:-}
       GATEWAY_ID: ${GATEWAY_ID:-}
-      GATEWAY_DISPLAY_NAME: ${GATEWAY_DISPLAY_NAME:-Aiko}
+      ISLAND_DISPLAY_NAME: ${ISLAND_DISPLAY_NAME:-}
+      GATEWAY_DISPLAY_NAME: ${GATEWAY_DISPLAY_NAME:-}
       # --- LiveKit (video/audio). Operator-settable; forwarded so a host .env value
       # is NOT inert in the container (the PASSKEY_EXTRA_ORIGINS/ISLAND_SIGNING_SEED
       # incident class — cage-match #122 Carnot+Tesla+Wu 3-way HIGH). API_SECRET is a
@@ -149,6 +157,7 @@ services:
       # with NO network fetch (authentic by construction). THIS is how islands list
       # each other today: JSON array of {"id","display_name","base_url"}. Island 1
       # seeds enspyr; island 2 seeds imagineering. Safe with gossip off.
+      ISLAND_SEED_PEERS: ${ISLAND_SEED_PEERS:-[]}
       GATEWAY_SEED_PEERS: ${GATEWAY_SEED_PEERS:-[]}
       # Gossip FETCH gate — fail-closed. The anti-entropy loop pulls peer base URLs
       # (SSRF surface, #1578), so it stays OFF until that hardening lands AND 3+

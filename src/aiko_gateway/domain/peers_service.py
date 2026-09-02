@@ -319,7 +319,7 @@ async def gossip_once(directory: IslandDirectory, client, *, timeout: float = 5.
 
 def _host_of(base_url: str) -> str:
     """Derive a fallback gateway id from a base URL's host (so a deploy that sets
-    gateway_base_url but not gateway_id still self-identifies). Lowercased, dots →
+    gateway_base_url but not island_id still self-identifies). Lowercased, dots →
     dashes, to satisfy _ID_RE."""
     m = re.match(r"^https://([a-zA-Z0-9.-]+)", base_url.strip())
     if not m:
@@ -329,7 +329,7 @@ def _host_of(base_url: str) -> str:
 
 def build_directory_from_settings(settings) -> IslandDirectory:
     """Construct the process-wide IslandDirectory from config. Self id falls back to
-    the base-url host when gateway_id is unset.
+    the base-url host when island_id is unset.
 
     NAMED DEFERRAL (#1760): the self-identity config keys are still `gateway_*`
     (`GATEWAY_BASE_URL` / `GATEWAY_ID` / `GATEWAY_DISPLAY_NAME` / `GATEWAY_SEED_PEERS`),
@@ -338,14 +338,14 @@ def build_directory_from_settings(settings) -> IslandDirectory:
     so the rename waits for a coordinated deploy (with a `gateway_*` alias meanwhile),
     NOT this wire PR. Deliberate, not an oversight (Kelvin cage-match)."""
     base = _normalize_base_url(settings.gateway_base_url)
-    gid = (settings.gateway_id or _host_of(base)).strip().lower()
+    gid = (settings.island_id or _host_of(base)).strip().lower()
     self_peer = coerce_island(
-        {"id": gid, "displayName": settings.gateway_display_name, "baseURL": base})
+        {"id": gid, "displayName": settings.island_display_name, "baseURL": base})
     if self_peer is None:
         log.warning("could not build a valid self peer (id=%r base=%r); the "
                     "directory will advertise no self entry", gid, base)
     return IslandDirectory(self_peer, settings.gateway_bootstrap_peers,
-                         seed_peers=settings.gateway_seed_peers)
+                         seed_peers=settings.island_seed_peers)
 
 
 # Process-wide singleton — built once from settings, shared by the REST route and
