@@ -462,7 +462,11 @@ class Settings(BaseSettings):
     # legacy-adoption arms. Two real fields put the precedence in OUR hands.
     # DELETE both these fields and the resolver once every box is cut over.
     gateway_id: str = ""
-    gateway_display_name: str = ""
+    # Default "Aiko", NOT "" — it must equal the compose default (enforced by
+    # test_compose_defaults_match_config_defaults) AND the compose default must stay
+    # "Aiko" for rollback safety (a pinned older image reads this field directly).
+    # Behaviour-neutral: the resolver yields "Aiko" from either, measured.
+    gateway_display_name: str = "Aiko"
     gateway_seed_peers: list[dict] = []
     # Bootstrap contacts: peer gateway base URLs to GOSSIP with (fetched at startup).
     # Only used when gossip is enabled. A known-node seed (P2P bootstrap), NOT a
