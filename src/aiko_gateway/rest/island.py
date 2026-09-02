@@ -51,7 +51,7 @@ async def get_island(response: Response) -> dict:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="island self-identity is not configured "
-                   "(no valid GATEWAY_BASE_URL / GATEWAY_ID)")
+                   "(no valid GATEWAY_BASE_URL / ISLAND_ID)")
     # A signed trust document: never let a CDN/proxy freeze a stale mode/base_url
     # across a redeploy (mode is immutable per boot, so a restart is the only way it
     # changes — a cached copy could then advertise the OLD posture). no-store keeps

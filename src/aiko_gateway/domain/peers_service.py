@@ -332,7 +332,9 @@ def build_directory_from_settings(settings) -> IslandDirectory:
     the base-url host when island_id is unset.
 
     NAMED DEFERRAL (#1760): the self-identity config keys are still `gateway_*`
-    (`GATEWAY_BASE_URL` / `GATEWAY_ID` / `GATEWAY_DISPLAY_NAME` / `GATEWAY_SEED_PEERS`),
+    (`GATEWAY_BASE_URL` — the gateway EDGE, deliberately still gateway-named — plus
+    `ISLAND_ID` / `ISLAND_DISPLAY_NAME` / `ISLAND_SEED_PEERS`, which name the ISLAND;
+    their legacy `GATEWAY_*` spellings are still read during the cutover),
     not `island_*`, even though they populate an Island. Renaming them is
     deploy-coupled — the env names are set in the compose files on both island boxes —
     so the rename waits for a coordinated deploy (with a `gateway_*` alias meanwhile),

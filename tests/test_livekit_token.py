@@ -242,7 +242,7 @@ async def test_read_only_member_gets_subscribe_only_token(
     assert claims["video"]["canPublishData"] is False
 
 
-async def test_gateway_id_namespaces_room_and_identity(
+async def test_island_id_namespaces_room_and_identity(
     client, session, livekit_configured, monkeypatch
 ):
     # cage-match #122 rd2 (Tesla+Wu F2): the prefixed branch was never exercised. With

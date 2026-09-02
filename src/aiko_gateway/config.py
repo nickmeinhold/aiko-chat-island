@@ -425,6 +425,24 @@ class Settings(BaseSettings):
     # gossip unnecessary: each island lists the others directly, no SSRF-prone fetch.
     # JSON array of {"id","display_name","base_url"}. Preferred over gossip until
     # transitive discovery (3+ islands) actually justifies the fetch path.
+    # KNOWN LIMITATION, bounded to the cutover window and deliberately NOT fixed
+    # with a None sentinel (Carnot, cage-match round 1 — finding accepted, fix
+    # rejected with reason). An explicit canonical `ISLAND_SEED_PEERS=[]` ("solo
+    # island") cannot override a populated legacy `GATEWAY_SEED_PEERS`: both arrive
+    # as a falsy value, so the resolver adopts the legacy list.
+    #
+    # It cannot be fixed here, because the information is destroyed BEFORE Python
+    # sees it: compose forwards the var unconditionally, so "operator set []" and
+    # "operator said nothing" are identical bytes at the container boundary. The
+    # obvious repair — a None default plus an empty compose default `${VAR:-}` — is
+    # BARRED by test_no_empty_compose_default_on_a_type_an_older_image_cannot_parse:
+    # an empty default on a non-string field crash-loops a PINNED OLDER IMAGE that
+    # lacks the blank-coercion, which this repo's rollback path can pull (proven
+    # against :0.6.0). Trading a proven crash-loop for a narrow window is a bad deal.
+    #
+    # The operator workaround is the documented cutover itself: REPLACE the legacy
+    # line rather than adding the canonical one beside it. The limitation disappears
+    # with the legacy field.
     island_seed_peers: list[dict] = []
 
     # --- LEGACY identity vars, read ONLY by _adopt_legacy_gateway_identity ---
@@ -698,7 +716,8 @@ class Settings(BaseSettings):
                         "REMOTE/shared SFU (in ANY environment): the SFU is shared across "
                         "islands on ONE API key, so rooms/identities MUST be namespaced by "
                         "island_id or they collide across islands (the empty default is the "
-                        "fail-open case). Refusing to boot — set GATEWAY_ID."
+                        "fail-open case). Refusing to boot — set ISLAND_ID "
+                        "(or the legacy GATEWAY_ID, still read during the cutover)."
                     )
         # APNs, like LiveKit, is OPTIONAL — but HALF-configured is the dangerous
         # state, not the absent one. Absent credentials are honest: is_configured()
