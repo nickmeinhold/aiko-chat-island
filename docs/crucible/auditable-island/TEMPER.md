@@ -4,6 +4,47 @@
 bundle was handed over — including `CRUCIBLE.md`'s enthusiasm — so a laundered
 assumption could be caught at its source.*
 
+
+> ## 📌 POSTSCRIPT 2026-09-02 morning — read before acting on this verdict
+>
+> Nick pushed back on the write-up (*"I don't believe this isn't possible"*) and was
+> right. Two follow-up research passes (`RESEARCH-anchoring.md`,
+> `RESEARCH-federated-kt.md`) refute a premise this verdict leaned on. **Separate what
+> was struck from what was assumed:**
+>
+> **STILL DEAD — the strike stands, untouched by the new research:**
+> - The signed ack + prober. A voluntary proof is theatre against an operator who is the
+>   adversary. Nothing found since changes this.
+> - Echoing the row's `client_msg_id` (#3805). Still leaks a field `accounts_service.py:157`
+>   tombstones as PII, still defeated by an operator who copies it across rows.
+> - The slogan *"nothing left to be reputable about"*. Still an overclaim.
+>
+> **OVERTURNED — the reasoning below is wrong on these points:**
+> - *"At N=2 split-view detection is theatre, so per-island KT is not viable."* **Density
+>   was never the requirement — a shared reference point the island does not control was.**
+>   Witness cosigning (C2SP `tlog-witness`, Sigsum) rents one: a witness stores O(1), never
+>   sees log contents, learns only activity rate, and **k=1 buys the entire property**.
+>   Witnesses need not be islands.
+> - *"Design 06 D3 is gated on five unbuilt things."* Inherited and mostly wrong. #3774 is
+>   an app-side invariant marked *"Blocked on nothing"*; the gossip transport only gates the
+>   cross-island row; the real gap is one named in the code itself — `revoke_key` hard-deletes,
+>   so `signing_keys` is *"a live-key ledger, not an append-only audit log."*
+> - *"This shape may be novel."* It is `draft-ietf-keytrans-architecture-05` §5.3. Standard
+>   architecture, zero production deployments.
+>
+> **NEW, and it should govern any rebuild:** the distinguishing variable across every system
+> examined is **not cryptography — it is whether a machine checks the proof unattended.**
+> Keybase ran a correct blockchain-anchored log for a decade; `keybase/blockchain` was
+> archived in 2016 with 7 stars and the client never read the chain. Only a paid audit ever
+> looked. And its NCC-Group High finding is the cautionary tale for us specifically: ordinary
+> server bugs wrote invalid links into an immutable record, the append-only property made
+> them unremovable, and the blacklist workaround became the vulnerability.
+>
+> **Per the scout-memory rule, this is the stated reason the invalidation no longer binds the
+> territory** — it still binds the *mechanism this bundle invented*. A rebuild starts from
+> "what verifies this unattended", not from "what goes in the leaf".
+
+
 ## Verdict: **CANDIDATE INVALIDATED** — 2 of 4 families DISSOLVE
 
 | Reviewer | Family | Verdict |
