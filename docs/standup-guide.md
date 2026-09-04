@@ -163,6 +163,12 @@ curl -s https://chat.example.org/.well-known/assetlinks.json | jq   # non-empty 
 # not true and this exact invocation silently emptied the recorded seed peers.
 # To stop advertising passkeys later, pass --no-passkeys — omitting --enable-passkeys
 # is not "off", it means "leave it as recorded".
+#
+# A re-run REFUSES if .env holds keys standup does not itself write (a signing seed, APNs
+# credentials, MODERATOR_USER_IDS, ISLAND_VERSION…). The rewrite is a whole-file replace,
+# so those keys would be destroyed — several of them unrecoverably. The refusal names
+# every key at risk and leaves .env untouched; add them to the heredoc, or delete them
+# deliberately, then re-run. See claude-tasks#3921.
 
 # 3. confirm it's advertised:
 curl -s https://chat.example.org/v1/auth/providers | jq   # includes {"slug":"passkey"}
@@ -225,6 +231,10 @@ docker volume create aiko_data
 cat > .env <<EOF
 JWT_SECRET=$(openssl rand -hex 32)
 GATEWAY_BASE_URL=https://chat.example.org
+# This island's identity in the directory, and what namespaces its LiveKit rooms
+# across islands. Omit it and the id is DERIVED from the base-url host, which works
+# until a second island shows up or video is turned on — set it explicitly.
+ISLAND_ID=example
 ISLAND_DISPLAY_NAME=Example Island
 PASSKEY_RP_ID=chat.example.org
 ISLAND_SEED_PEERS=[]

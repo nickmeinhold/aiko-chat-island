@@ -313,3 +313,63 @@ def test_the_standup_refusal_arm_can_actually_pass(island) -> None:
     island.run("--seed-peers", PEERS)
     island.run()
     assert _values(island)["ISLAND_SEED_PEERS"] == PEERS
+
+
+# --- the whole-file rewrite must not destroy what it does not write (#3921) ---
+#
+# Measured against the two live islands: a documented unflagged re-run would have taken
+# 15 keys off imagineering and 11 off enspyr, including ISLAND_SIGNING_SEED and
+# APNS_PRIVATE_KEY (which exist nowhere else) and ISLAND_VERSION (whose loss silently
+# unpins the next deploy). Each test below runs a CLEAN re-run first, so a guard that
+# simply refused everything would fail its own first assertion.
+
+def test_a_rerun_refuses_to_destroy_a_key_it_does_not_write(island) -> None:
+    island.run()
+    island.run()  # the null arm, inline: an unadorned re-run must still SUCCEED
+
+    before = island.env_file.read_text() + "ISLAND_SIGNING_SEED=not-recoverable-anywhere\n"
+    island.env_file.write_text(before)
+
+    result = island.run(expect_ok=False)
+    assert result.returncode != 0, (
+        "standup rewrote a .env holding a key it does not write — the signing seed is gone "
+        "and exists nowhere else"
+    )
+    assert "ISLAND_SIGNING_SEED" in (result.stdout + result.stderr), (
+        "the refusal must NAME the keys at risk; 'refusing to rewrite' alone tells an "
+        "operator nothing about what they nearly lost"
+    )
+    assert island.env_file.read_text() == before, (
+        "the aborted run mutated .env — the guard destroyed what it exists to protect"
+    )
+
+
+def test_the_key_loss_guard_uses_the_reader_grammar_not_a_naive_match(island) -> None:
+    """An `export`-prefixed key must be protected too.
+
+    This is not a hypothetical shape: an `export JWT_SECRET=` once read as absent and
+    standup MINTED A NEW SECRET, logging out every user (see deploy/lib/dotenv-read.sh's
+    header). A guard using `^[A-Z_]+=` would report that key as safe to destroy — so the
+    lister shares the reader's grammar rather than approximating it."""
+    island.run()
+    before = island.env_file.read_text() + "export APNS_PRIVATE_KEY=-----BEGIN-FAKE-----\n"
+    island.env_file.write_text(before)
+
+    result = island.run(expect_ok=False)
+    assert result.returncode != 0, "an export-prefixed key was not seen and would be destroyed"
+    assert "APNS_PRIVATE_KEY" in (result.stdout + result.stderr)
+    assert island.env_file.read_text() == before
+
+
+def test_the_guard_reports_every_dropped_key_not_just_the_first(island) -> None:
+    """An operator acts on the whole list or not at all. Reporting one key at a time turns
+    one refusal into N sequential rediscoveries of the same bug."""
+    island.run()
+    island.env_file.write_text(
+        island.env_file.read_text()
+        + "ISLAND_ID=enspyr\nISLAND_VERSION=0.9.3\nMODERATOR_USER_IDS=[\"op-1\"]\n"
+    )
+    out = island.run(expect_ok=False)
+    combined = out.stdout + out.stderr
+    for key in ("ISLAND_ID", "ISLAND_VERSION", "MODERATOR_USER_IDS"):
+        assert key in combined, f"{key} was dropped from the report — the list must be total"

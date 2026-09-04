@@ -491,6 +491,45 @@ PASSKEY_ENABLED=$ENABLE_PASSKEYS
 $LIVEKIT_ENV_BLOCK
 EOF
 chmod 600 "$ENV_TMP"
+
+# REFUSE TO DROP A KEY WE DID NOT WRITE (#3921).
+#
+# This heredoc is a WHOLE-FILE REPLACE, so every key it does not itself emit is destroyed
+# by the `mv` below. Measured against the two live islands when this was written: a
+# documented unflagged re-run would have taken 15 keys off one box and 11 off the other,
+# including ISLAND_SIGNING_SEED and APNS_PRIVATE_KEY — secrets that exist nowhere else and
+# cannot be re-derived — and would have reverted ISLAND_VERSION to the compose default
+# `edge`, so the next `up -d` pulls main instead of the pinned tag. A config-preservation
+# bug that ends in an unpinned deploy.
+#
+# #3734 fixed two instances of this by adding read-back, one key at a time as each was
+# discovered. That approach re-arms the moment anyone adds a key to a box, which is
+# exactly what happened. So the check is not a list of keys we own — a list is a second
+# artifact that drifts from this heredoc silently, which is the same defect one level up.
+# It COMPARES THE FILE WE ARE ABOUT TO WRITE AGAINST THE FILE WE ARE ABOUT TO DESTROY,
+# using one grammar (dotenv_keys, the reader's own key expression) for both sides. A key
+# that would survive cannot be missed, and a key added to either side is covered the day
+# it appears with no edit here.
+#
+# No override flag, deliberately: an operator who genuinely wants a key gone can remove it
+# from .env themselves, which is explicit and leaves a trace. A `--force` would be
+# habituated on the first false alarm and is then indistinguishable from not having the
+# check — and what it would be waving through is unrecoverable secret loss.
+#
+# $ENV_FILE is guaranteed READABLE here: standup dies on an unreadable .env at the
+# JWT-secret block above, precisely so absence cannot be forged by permissions. Without
+# that upstream check this comparison would read a locked file as "no keys to preserve"
+# and destroy everything in it — the non-match-is-absence trap dotenv-read.sh's header
+# describes.
+_dropped="$(comm -23 <(dotenv_keys "$ENV_FILE") <(dotenv_keys "$ENV_TMP") | tr '\n' ' ')"
+if [ -n "${_dropped// /}" ]; then
+  rm -f "$ENV_TMP"
+  die "refusing to rewrite $ENV_FILE: it holds keys this standup does not write, and the rewrite is a whole-file replace that would DESTROY them:
+    ${_dropped}
+  Some of these cannot be recovered (a signing seed, an APNs key and a client secret exist only on this box), and ISLAND_VERSION reverting to the compose default silently unpins the next deploy. Your .env has NOT been touched.
+  If you meant to keep them, they must be added to the heredoc in deploy/standup.sh (or read back like ISLAND_SEED_PEERS / PASSKEY_ENABLED). If you really meant to lose them, delete them from $ENV_FILE yourself and re-run. See claude-tasks#3921."
+fi
+
 mv "$ENV_TMP" "$ENV_FILE"
 ok "wrote $ENV_FILE (mode 600, via atomic rename)"
 

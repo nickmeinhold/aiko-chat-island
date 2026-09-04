@@ -58,3 +58,26 @@ dotenv_read() {
   done
   printf '%s' "$v"
 }
+
+# dotenv_keys <file> — echoes every KEY the file assigns, one per line, deduplicated.
+#
+# SAME GRAMMAR AS dotenv_read, and that is the entire point of putting it here. The
+# caller that needs this (standup.sh, comparing what it is about to WRITE against what
+# it is about to DESTROY) must agree exactly with the reader about what counts as an
+# assignment — a key the lister misses is a key the comparison reports as safe. An
+# `export FOO=` line is the specific shape that would slip through a naive `^[A-Z_]+=`,
+# and it is the shape that already caused one silent JWT re-mint (see the header).
+#
+# The key expression is the reader's, with the key position opened up to a capture; the
+# two are edited together or not at all.
+#
+# Absence and unreadability are again indistinguishable here, deliberately, for the same
+# reason dotenv_read leaves that judgement to the caller: a brand-new island has no .env
+# and legitimately lists no keys. standup.sh checks readability separately before it
+# treats an empty listing as "nothing to preserve".
+dotenv_keys() {
+  [ -f "$1" ] || return 0
+  grep -E "^[[:space:]]*(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*[[:space:]]*=" "$1" 2>/dev/null \
+    | sed -E "s/^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=.*/\2/" \
+    | sort -u
+}
