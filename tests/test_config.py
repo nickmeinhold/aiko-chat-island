@@ -1654,9 +1654,67 @@ def test_a_blank_display_name_is_never_advertised_as_the_island_label():
         assert _settings_with(ISLAND_DISPLAY_NAME=blank).island_display_name == "Aiko"
 
 
+def test_the_blank_fallback_covers_programmatic_construction_too():
+    """A DEFAULT and a VALIDATOR are not behaviourally identical over all inputs, so the
+    deleted validator's replacement has to be checked on the surface the env path does not
+    cover. It is: _normalise_env_strings is mode="before" on the MODEL, not a settings
+    source, so it deletes a blank key for direct construction as well as for env. Measured
+    here rather than assumed, and pinned so a future move of that rule into a source layer
+    (where it would see env only) cannot silently reopen the blank-label case."""
+    from aiko_gateway.config import Settings
+
+    for blank in ("", "   ", "\t"):
+        s = Settings(_env_file=None, environment="dev", island_display_name=blank)
+        assert s.island_display_name == "Aiko", (
+            f"programmatic island_display_name={blank!r} gave {s.island_display_name!r} — "
+            "the field default does not cover this surface"
+        )
+
+
 def test_canonical_names_work_alone_on_a_cut_over_box():
     s = _settings_with(ISLAND_ID="fresh", ISLAND_SEED_PEERS=_SEED)
     assert s.island_id == "fresh"
+    assert len(s.island_seed_peers) == 1
+
+
+def test_leftover_legacy_identity_keys_are_inert():
+    """THE LOAD-BEARING INVARIANT OF THE COMPOSE-LAG WINDOW, and it is about POPULATED
+    keys, not empty ones.
+
+    deploy/update.sh pulls the image and does NOT sync docker-compose.yml (#2301), so
+    after this deletion both live boxes run an image with no GATEWAY_* identity fields
+    against a compose that still forwards three of them. The live-box probe proved the
+    EMPTY case (their .env carries no legacy key, so the forwards render blank). This
+    pins the case a probe of two cut-over boxes structurally cannot reach: a POPULATED
+    legacy key must not become this island's identity.
+
+    It holds today by construction — the fields are gone and model_config sets
+    extra="ignore" — which is exactly why it needs pinning rather than trusting. A later
+    AliasChoices, or a field that happens to be named gateway_id, would resurrect the
+    resolution silently and no other test in this file would notice."""
+    ghost = '[{"id":"ghost","display_name":"Ghost","base_url":"https://ghost.example"}]'
+    s = _settings_with(
+        GATEWAY_ID="ghost-island",
+        GATEWAY_DISPLAY_NAME="Ghost Island",
+        GATEWAY_SEED_PEERS=ghost,
+    )
+    assert s.island_id == "", "a leftover GATEWAY_ID became this island's identity"
+    assert s.island_display_name == "Aiko", "a leftover GATEWAY_DISPLAY_NAME became the label"
+    assert s.island_seed_peers == [], "a leftover GATEWAY_SEED_PEERS became the peer list"
+
+
+def test_the_inertness_test_can_actually_fail():
+    """NULL ARM. Pins that the CANONICAL names in the same shape DO take effect — without
+    it, a Settings that ignored all three inputs for some unrelated reason (a broken
+    fixture, a crashed env source) would satisfy the test above for the wrong reason."""
+    ghost = '[{"id":"ghost","display_name":"Ghost","base_url":"https://ghost.example"}]'
+    s = _settings_with(
+        ISLAND_ID="ghost-island",
+        ISLAND_DISPLAY_NAME="Ghost Island",
+        ISLAND_SEED_PEERS=ghost,
+    )
+    assert s.island_id == "ghost-island"
+    assert s.island_display_name == "Ghost Island"
     assert len(s.island_seed_peers) == 1
 
 
