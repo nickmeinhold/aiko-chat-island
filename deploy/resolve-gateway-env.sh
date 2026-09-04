@@ -56,7 +56,15 @@ _read_kv() { dotenv_read "$1" "$2"; }
 
 # RESOLUTION ORDER, identical for both: flag, then the value this island RECORDED,
 # then convention. The middle rung is the one that was missing.
+# The recorded rung reads BOTH names, canonical first. ISLAND_SEED_PEERS is the
+# name a cut-over box has; GATEWAY_SEED_PEERS is what a box that has not been cut
+# over still holds. Reading only one of them would re-open the exact hole this
+# file was written to close: an unread seed list resolves to [], peers_service
+# serves self, and the islands stop knowing about each other with no error and a
+# green health check. Drop the legacy rung once every box is cut over
+# (docs/island-vs-gateway.md).
 seed_peers="$seed_flag"
+[ -n "$seed_peers" ] || seed_peers="$(_read_kv "$gw_env" ISLAND_SEED_PEERS)"
 [ -n "$seed_peers" ] || seed_peers="$(_read_kv "$gw_env" GATEWAY_SEED_PEERS)"
 [ -n "$seed_peers" ] || seed_peers="[]"
 

@@ -44,10 +44,10 @@ def livekit_configured(monkeypatch):
     is needed; monkeypatch restores the originals afterward."""
     monkeypatch.setattr(settings, "livekit_api_key", _LK_KEY)
     monkeypatch.setattr(settings, "livekit_api_secret", _LK_SECRET)
-    # Pin gateway_id="" so domain tests asserting un-namespaced sub/room don't break if
+    # Pin island_id="" so domain tests asserting un-namespaced sub/room don't break if
     # the harness ever seeds GATEWAY_ID (cage-match #122 rd6 Wu #6). Namespaced-branch
     # tests set it explicitly.
-    monkeypatch.setattr(settings, "gateway_id", "")
+    monkeypatch.setattr(settings, "island_id", "")
     return settings
 
 
@@ -242,13 +242,13 @@ async def test_read_only_member_gets_subscribe_only_token(
     assert claims["video"]["canPublishData"] is False
 
 
-async def test_gateway_id_namespaces_room_and_identity(
+async def test_island_id_namespaces_room_and_identity(
     client, session, livekit_configured, monkeypatch
 ):
     # cage-match #122 rd2 (Tesla+Wu F2): the prefixed branch was never exercised. With
-    # gateway_id set, BOTH room and participant identity carry the island prefix so
+    # island_id set, BOTH room and participant identity carry the island prefix so
     # they can't collide across islands sharing one SFU/API key.
-    monkeypatch.setattr(settings, "gateway_id", "island-a")
+    monkeypatch.setattr(settings, "island_id", "island-a")
     alice = await _user(session, "alice")
     peer = await _user(session, "peer")
     ch = await _private_channel(session)

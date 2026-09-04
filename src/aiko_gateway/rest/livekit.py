@@ -138,7 +138,7 @@ async def create_video_token(
     # room from the RESOLVED row (channel.id), never the raw path param.
     can_publish = await acl.is_posting_member(session, user.id, channel)
     # Pass the BARE ids — the door (mint_room_token) namespaces room AND identity by
-    # gateway_id on the shared SFU, so isolation is enforced in one place, not per
+    # island_id on the shared SFU, so isolation is enforced in one place, not per
     # caller (cage-match #122 rd4 Wu #1). The response echoes the SAME namespaced room
     # via room_for_channel (one source of truth, no route/door drift).
     try:

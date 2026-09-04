@@ -473,13 +473,18 @@ cat > "$ENV_TMP" <<EOF
 JWT_SECRET=$JWT_SECRET
 
 # --- island identity (this compose is the island template) ---
+# ISLAND_* is canonical: these name the ISLAND (who it is), not the gateway edge.
+# GATEWAY_BASE_URL keeps its name deliberately — a base_url IS the gateway edge
+# (docs/island-vs-gateway.md). A fresh standup writes canonical names only; the
+# legacy GATEWAY_DISPLAY_NAME / GATEWAY_SEED_PEERS are still READ from an existing
+# .env by config.py and resolve-gateway-env.sh, for boxes not yet cut over.
 GATEWAY_BASE_URL=$BASE_URL
-GATEWAY_DISPLAY_NAME='$DISPLAY_NAME'
+ISLAND_DISPLAY_NAME='$DISPLAY_NAME'
 PASSKEY_RP_ID=$DOMAIN
 
 # Federation: operator-curated peers this island advertises in its directory.
 # JSON array of {"id","display_name","base_url"}. Empty [] = solo island.
-GATEWAY_SEED_PEERS='$SEED_PEERS'
+ISLAND_SEED_PEERS='$SEED_PEERS'
 
 # Passkeys: advertise passkey sign-in via /v1/auth/providers. Leave false until
 # this island serves valid /.well-known assetlinks.json + AASA for its domain

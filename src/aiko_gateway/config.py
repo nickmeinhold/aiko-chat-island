@@ -406,14 +406,18 @@ class Settings(BaseSettings):
     # --- island/gateway directory via peer gossip (#1546) ---
     # The DECENTRALIZED discovery layer: each gateway advertises a known-peer set
     # and converges by anti-entropy gossip — NO central registry. See
-    # domain/peers_service.py + rest/islands.py. The app's server picker calls
+    # domain/peers_service.py + rest/islands.py. The app's island picker calls
     # GET /v1/islands (deprecated alias /v1/gateways) to swap its hardcoded preset list.
     #
     # This gateway's stable id in the directory. Empty → derived from the
     # gateway_base_url host (so a single-gateway deploy still self-identifies).
-    gateway_id: str = ""
-    # Human label the picker shows for THIS gateway.
-    gateway_display_name: str = "Aiko"
+    # This island's stable id in the directory. Empty -> derived from the
+    # gateway_base_url host (so a single-island deploy still self-identifies).
+    island_id: str = ""
+    # Human label the picker shows for THIS island. Blank -> "Aiko" (applied by
+    # _adopt_legacy_gateway_identity below, so blank can mean "not set by the
+    # operator" and the legacy var can still win).
+    island_display_name: str = ""
     # Operator-curated static peers: FULL entries merged into the directory at
     # startup with NO network fetch. Authentic BY CONSTRUCTION (the operator put
     # them here) — this IS the "operator allowlist" the peers_service trust banner
@@ -421,6 +425,48 @@ class Settings(BaseSettings):
     # gossip unnecessary: each island lists the others directly, no SSRF-prone fetch.
     # JSON array of {"id","display_name","base_url"}. Preferred over gossip until
     # transitive discovery (3+ islands) actually justifies the fetch path.
+    # KNOWN LIMITATION, bounded to the cutover window and deliberately NOT fixed
+    # with a None sentinel (Carnot, cage-match round 1 — finding accepted, fix
+    # rejected with reason). An explicit canonical `ISLAND_SEED_PEERS=[]` ("solo
+    # island") cannot override a populated legacy `GATEWAY_SEED_PEERS`: both arrive
+    # as a falsy value, so the resolver adopts the legacy list.
+    #
+    # It cannot be fixed here, because the information is destroyed BEFORE Python
+    # sees it: compose forwards the var unconditionally, so "operator set []" and
+    # "operator said nothing" are identical bytes at the container boundary. The
+    # obvious repair — a None default plus an empty compose default `${VAR:-}` — is
+    # BARRED by test_no_empty_compose_default_on_a_type_an_older_image_cannot_parse:
+    # an empty default on a non-string field crash-loops a PINNED OLDER IMAGE that
+    # lacks the blank-coercion, which this repo's rollback path can pull (proven
+    # against :0.6.0). Trading a proven crash-loop for a narrow window is a bad deal.
+    #
+    # A presence-preserving settings source (Carnot's round-2 remedy) does not help
+    # either, and this is MEASURED rather than argued: compose forwards
+    # `${ISLAND_SEED_PEERS:-[]}`, so BOTH "operator said nothing" and "operator set
+    # []" reach the container as the same PRESENT key holding the same "[]". Presence
+    # is constant TRUE, so preserving it separates nothing.
+    #
+    # The operator workaround is the documented cutover itself: REPLACE the legacy
+    # line rather than adding the canonical one beside it. The limitation disappears
+    # with the legacy field — it is bounded by that deletion, not open-ended.
+    island_seed_peers: list[dict] = []
+
+    # --- LEGACY identity vars, read ONLY by _adopt_legacy_gateway_identity ---
+    # These three named the ISLAND (its identity and its peer islands), not the
+    # gateway edge, so they moved to `island_*` (docs/island-vs-gateway.md). They
+    # survive as real fields, NOT as pydantic validation aliases, and that is the
+    # whole point: compose forwards an unset var as the EMPTY STRING, and an
+    # AliasChoices("ISLAND_ID", "GATEWAY_ID") treats "" as PRESENT — so a box whose
+    # .env still says GATEWAY_ID would have resolved island_id to "" and lost its
+    # identity silently. Measured, not reasoned: see tests/test_config.py's
+    # legacy-adoption arms. Two real fields put the precedence in OUR hands.
+    # DELETE both these fields and the resolver once every box is cut over.
+    gateway_id: str = ""
+    # Default "Aiko", NOT "" — it must equal the compose default (enforced by
+    # test_compose_defaults_match_config_defaults) AND the compose default must stay
+    # "Aiko" for rollback safety (a pinned older image reads this field directly).
+    # Behaviour-neutral: the resolver yields "Aiko" from either, measured.
+    gateway_display_name: str = "Aiko"
     gateway_seed_peers: list[dict] = []
     # Bootstrap contacts: peer gateway base URLs to GOSSIP with (fetched at startup).
     # Only used when gossip is enabled. A known-node seed (P2P bootstrap), NOT a
@@ -575,6 +621,42 @@ class Settings(BaseSettings):
         return self.environment.strip().lower() not in _NON_PROD_ENVIRONMENTS
 
     @model_validator(mode="after")
+    def _adopt_legacy_gateway_identity(self) -> "Settings":
+        """Let a box still on GATEWAY_* keep its identity, canonical name winning.
+
+        Runs BEFORE _harden_for_production by definition order, because that guard
+        reads island_id and refuses to boot without one against a remote SFU — a
+        resolver running after it would fail a box that is correctly configured
+        under the old names.
+
+        WHY NOT pydantic's AliasChoices, which is the obvious tool: compose forwards
+        an unset variable as the EMPTY STRING, and AliasChoices takes the first key
+        PRESENT in the environment. `ISLAND_ID: ${ISLAND_ID:-}` is therefore always
+        present, always wins, and always empty — so both live islands would have
+        booted with no identity the first time a container ran with both names
+        forwarded. Returning None from the absence-aware source does not rescue it
+        either: None means "this source has no value", not "try the next alias".
+        Both measured before this was written.
+
+        Blank-after-strip counts as unset, so a var forwarded as "" or "  " falls
+        through to the legacy name instead of shadowing it. `.strip()` decides
+        EMPTINESS only — the value assigned is the operator's raw bytes, because
+        test_string_fields_keep_their_whitespace forbids a config layer from
+        rewriting a string field (a PEM and a client secret are string fields).
+        """
+        if not self.island_id.strip() and self.gateway_id.strip():
+            self.island_id = self.gateway_id
+        if not self.island_display_name.strip():
+            self.island_display_name = (
+                self.gateway_display_name
+                if self.gateway_display_name.strip()
+                else "Aiko"
+            )
+        if not self.island_seed_peers and self.gateway_seed_peers:
+            self.island_seed_peers = self.gateway_seed_peers
+        return self
+
+    @model_validator(mode="after")
     def _harden_for_production(self) -> "Settings":
         # Normalize the moderator seat list at the Settings boundary (EVERY env): strip
         # each id and drop empties, so the STORED value equals what require_moderator /
@@ -595,17 +677,17 @@ class Settings(BaseSettings):
         # silently sign a different byte string than the operator set.
         self.livekit_api_key = self.livekit_api_key.strip()
         self.livekit_api_secret = self.livekit_api_secret.strip()
-        # Strip gateway_id too (cage-match #122 rd3 Tesla+Wu): it namespaces LiveKit
+        # Strip island_id too (cage-match #122 rd3 Tesla+Wu): it namespaces LiveKit
         # rooms/identities, so a padded "  island-a  " would mint under a non-canonical
-        # prefix AND slip past the `if not self.gateway_id` prod gate below. Normalize
+        # prefix AND slip past the `if not self.island_id` prod gate below. Normalize
         # once here so the stored value is what actually prefixes the room string — the
         # same asymmetric-strip fix already applied to moderator_user_ids and the creds.
-        self.gateway_id = self.gateway_id.strip()
+        self.island_id = self.island_id.strip()
         # LiveKit is OPTIONAL, but WHEN configured it mints bearer capabilities to a
         # SHARED SFU (one API key across islands). The forgery + cross-island-collision
         # risk is a function of pointing at a REMOTE/shared SFU, NOT of ENVIRONMENT
         # (cage-match #122 rd5 Wu F1 — gating on is_production let a non-prod box with
-        # the real shared creds + no gateway_id merge its users into prod's rooms). So
+        # the real shared creds + no island_id merge its users into prod's rooms). So
         # these guards fire whenever LiveKit is configured against a non-loopback SFU,
         # in EVERY environment; a loopback dev SFU (ws://localhost) is exempt.
         if self.livekit_api_key or self.livekit_api_secret:
@@ -638,13 +720,14 @@ class Settings(BaseSettings):
                         f"< {_MIN_PROD_SECRET_LEN}) for a remote SFU. A weak-but-non-empty "
                         "secret makes every minted room token forgeable. Refusing to boot."
                     )
-                if not self.gateway_id:
+                if not self.island_id:
                     raise ValueError(
-                        "gateway_id is required when LiveKit is configured against a "
+                        "island_id is required when LiveKit is configured against a "
                         "REMOTE/shared SFU (in ANY environment): the SFU is shared across "
                         "islands on ONE API key, so rooms/identities MUST be namespaced by "
-                        "gateway_id or they collide across islands (the empty default is the "
-                        "fail-open case). Refusing to boot — set GATEWAY_ID."
+                        "island_id or they collide across islands (the empty default is the "
+                        "fail-open case). Refusing to boot — set ISLAND_ID "
+                        "(or the legacy GATEWAY_ID, still read during the cutover)."
                     )
         # APNs, like LiveKit, is OPTIONAL — but HALF-configured is the dangerous
         # state, not the absent one. Absent credentials are honest: is_configured()

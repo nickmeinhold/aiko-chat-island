@@ -31,7 +31,7 @@ explicit, visible kwarg.
 
 Named residuals (cage-match #122, honest scope, NOT closed here):
   * **Shared-key = one compromise domain (Tesla).** The imagineering SFU is shared
-    across islands on ONE HS256 API secret. ``gateway_id`` namespacing prevents
+    across islands on ONE HS256 API secret. ``island_id`` namespacing prevents
     *accidental* room/identity collision, but it is NOT a cryptographic tenant
     boundary: whoever holds one island's secret can forge tokens for any island's
     rooms on that SFU. Per-island LiveKit API keys would make it a real boundary;
@@ -52,13 +52,13 @@ from ..config import settings
 
 
 def _namespaced(value: str) -> str:
-    """Prefix a room name / participant identity with the island's ``gateway_id`` on
+    """Prefix a room name / participant identity with the island's ``island_id`` on
     the SHARED SFU. Applied INSIDE the door (cage-match #122 rd4 Wu #1) so isolation is
     enforced by construction — a future in-process caller (the robot loop) cannot mint
-    an un-namespaced token by forgetting to prefix. ``gateway_id`` is stripped at the
+    an un-namespaced token by forgetting to prefix. ``island_id`` is stripped at the
     Settings boundary and REQUIRED in prod when LiveKit is configured, so the
     empty-prefix branch is dev/single-island only."""
-    gid = settings.gateway_id
+    gid = settings.island_id
     return f"{gid}:{value}" if gid else value
 
 
@@ -128,7 +128,7 @@ def mint_room_token(
 
     NAMESPACING IS DOOR-ENFORCED (cage-match #122 rd4 Wu #1): ``identity`` and ``room``
     are passed as the BARE ids (user_id / channel_id); the door prefixes both with
-    ``gateway_id`` via ``_namespaced`` so no caller can mint an un-namespaced token on
+    ``island_id`` via ``_namespaced`` so no caller can mint an un-namespaced token on
     the shared SFU. A ``jti`` is stamped for audit/future-revocation correlation.
 
     RESIDUALS this token does NOT close (honest scope): (a) it is a bearer valid for
