@@ -3,12 +3,12 @@
 PR#151 derived the invariant "an operator CHOICE must be recorded and read back; a
 measured FACT should be re-derived" and closed it inside standup.sh's MEDIA wiring.
 The class pass was scoped to one code path. Testing that claim found
-GATEWAY_SEED_PEERS with the identical hole in the identical file, and a systematic
+ISLAND_SEED_PEERS with the identical hole in the identical file, and a systematic
 sweep of the .env heredoc found a SECOND instance, PASSKEY_ENABLED.
 
 BOTH FAILURES ARE SILENT, which is why they need a suite that can go red:
 
-  * GATEWAY_SEED_PEERS is the federation link. Each live island's seed list is
+  * ISLAND_SEED_PEERS is the federation link. Each live island's seed list is
     literally the other island. Reset to [], peers_service serves self and stops —
     no fetch, no error, no log line. The islands quietly stop knowing each other.
   * PASSKEY_ENABLED is the PRIMARY sign-in ingress since social was dropped (#1923).
@@ -56,7 +56,7 @@ def test_fresh_island_is_solo(tmp_path) -> None:
 
 
 def test_seed_peers_flag_wins_over_the_record(tmp_path) -> None:
-    out = _parsed(_run(tmp_path, gw={"GATEWAY_SEED_PEERS": PEERS_A}, seed_flag=PEERS_B))
+    out = _parsed(_run(tmp_path, gw={"ISLAND_SEED_PEERS": PEERS_A}, seed_flag=PEERS_B))
     assert out["SEED_PEERS"] == PEERS_B
 
 
@@ -69,7 +69,7 @@ def test_recorded_seed_peers_beat_convention_without_the_flag(tmp_path) -> None:
     Worse than the hostname bug it rhymes with: a wrong hostname produces a CONNECT
     failure, whereas an emptied peer list produces a perfectly healthy island that
     has simply forgotten the network it belongs to."""
-    out = _parsed(_run(tmp_path, gw={"GATEWAY_SEED_PEERS": PEERS_A}))
+    out = _parsed(_run(tmp_path, gw={"ISLAND_SEED_PEERS": PEERS_A}))
     assert out["SEED_PEERS"] == PEERS_A, "convention overwrote the recorded federation link"
 
 
@@ -85,7 +85,7 @@ def test_the_seed_peers_regression_test_can_actually_fail(tmp_path) -> None:
 def test_explicit_empty_seed_peers_flag_beats_a_recorded_list(tmp_path) -> None:
     """Going solo is a real choice and must be expressible. An explicit --seed-peers
     '[]' is an operator statement, not an absence, so it wins over the record."""
-    out = _parsed(_run(tmp_path, gw={"GATEWAY_SEED_PEERS": PEERS_A}, seed_flag="[]"))
+    out = _parsed(_run(tmp_path, gw={"ISLAND_SEED_PEERS": PEERS_A}, seed_flag="[]"))
     assert out["SEED_PEERS"] == "[]"
 
 
@@ -144,7 +144,7 @@ def test_the_last_assignment_wins_matching_python_dotenv(tmp_path) -> None:
     the parser the gateway actually uses, or the resolved value and the running value
     diverge — the disagreement being invisible."""
     env = tmp_path / "gateway.env"
-    env.write_text(f"GATEWAY_SEED_PEERS={PEERS_A}\nGATEWAY_SEED_PEERS={PEERS_B}\n")
+    env.write_text(f"ISLAND_SEED_PEERS={PEERS_A}\nISLAND_SEED_PEERS={PEERS_B}\n")
     result = subprocess.run([str(SCRIPT), str(env), "", ""], capture_output=True, text=True)
     assert _parsed(result)["SEED_PEERS"] == PEERS_B
 
@@ -154,7 +154,7 @@ def test_a_json_value_containing_equals_survives_intact(tmp_path) -> None:
     one (a base_url query string). Truncating at the first '=' would produce
     malformed JSON that peers_service rejects — silently, back to serving self."""
     tricky = '[{"id":"x","display_name":"X","base_url":"https://x.example.org/?a=b"}]'
-    out = _parsed(_run(tmp_path, gw={"GATEWAY_SEED_PEERS": tricky}))
+    out = _parsed(_run(tmp_path, gw={"ISLAND_SEED_PEERS": tricky}))
     assert out["SEED_PEERS"] == tricky
 
 
@@ -222,7 +222,7 @@ def test_quotes_are_stripped_from_seed_peers_too(tmp_path) -> None:
     """The strip is in the shared reader, so it must hold for BOTH keys — otherwise a
     quoted peer list would round-trip its quotes into .env and back out again, growing
     a pair each run."""
-    out = _parsed(_run(tmp_path, gw={"GATEWAY_SEED_PEERS": f'"{PEERS_A}"'}))
+    out = _parsed(_run(tmp_path, gw={"ISLAND_SEED_PEERS": f'"{PEERS_A}"'}))
     assert out["SEED_PEERS"] == PEERS_A
 
 
@@ -242,7 +242,7 @@ def test_an_unbalanced_quote_is_left_alone(tmp_path) -> None:
 def test_a_seed_list_with_an_unbalanced_quote_is_refused(tmp_path) -> None:
     """The companion case on the other key: not an array shape, so it refuses rather
     than laundering a corrupt value into .env."""
-    result = _run(tmp_path, gw={"GATEWAY_SEED_PEERS": '"unbalanced'})
+    result = _run(tmp_path, gw={"ISLAND_SEED_PEERS": '"unbalanced'})
     assert result.returncode == 1
     assert "not bracket-delimited" in result.stderr
 
@@ -251,10 +251,10 @@ def test_an_export_prefixed_recorded_value_is_honoured(tmp_path) -> None:
     """CARNOT'S ROUND-3 FINDING, and the most severe of the three rounds because it is
     SILENT. `export KEY=v` is valid dotenv and python-dotenv honours it. Matching only
     `^KEY=` read nothing from such a file, fell through to convention, and wrote
-    PASSKEY_ENABLED=false AND GATEWAY_SEED_PEERS=[] — #3734 itself, reachable through a
+    PASSKEY_ENABLED=false AND ISLAND_SEED_PEERS=[] — #3734 itself, reachable through a
     supported .env syntax, on the very code paths this PR exists to protect."""
     env = tmp_path / "gateway.env"
-    env.write_text(f"export PASSKEY_ENABLED=true\nexport GATEWAY_SEED_PEERS={PEERS_A}\n")
+    env.write_text(f"export PASSKEY_ENABLED=true\nexport ISLAND_SEED_PEERS={PEERS_A}\n")
     out = _parsed(subprocess.run([str(SCRIPT), str(env), "", ""], capture_output=True, text=True))
     assert out["PASSKEY_ENABLED"] == "true", "an export-prefixed passkey setting was silently downgraded"
     assert out["SEED_PEERS"] == PEERS_A, "an export-prefixed peer list was silently emptied"
@@ -264,7 +264,7 @@ def test_the_export_test_can_actually_fail(tmp_path) -> None:
     """MUST-FAIL ARM. Without the `export ` prefix support the same file resolves to the
     convention values, so the assertion above discriminates between the two."""
     env = tmp_path / "plain.env"
-    env.write_text(f"PASSKEY_ENABLED=true\nGATEWAY_SEED_PEERS={PEERS_A}\n")
+    env.write_text(f"PASSKEY_ENABLED=true\nISLAND_SEED_PEERS={PEERS_A}\n")
     plain = _parsed(subprocess.run([str(SCRIPT), str(env), "", ""], capture_output=True, text=True))
     assert plain["PASSKEY_ENABLED"] == "true"
     assert plain["PASSKEY_ENABLED"] != "false"
@@ -272,12 +272,12 @@ def test_the_export_test_can_actually_fail(tmp_path) -> None:
 
 def test_a_truncated_seed_list_is_refused_by_the_bracket_check(tmp_path) -> None:
     """CARNOT'S ROUND-3 RECOVERY CASE. An island stood up before this fix, using the
-    guide's multiline --seed-peers, has a literal `GATEWAY_SEED_PEERS=[` in .env with the
+    guide's multiline --seed-peers, has a literal `ISLAND_SEED_PEERS=[` in .env with the
     array body orphaned on following lines (unparseable by python-dotenv too). Reading
     that back and writing it out again would launder a broken value into a
     deliberate-looking one while peers_service kept serving self. Refuse instead, and say
     how to repair it."""
-    result = _run(tmp_path, gw={"GATEWAY_SEED_PEERS": "["})
+    result = _run(tmp_path, gw={"ISLAND_SEED_PEERS": "["})
     assert result.returncode == 1
     assert "not bracket-delimited" in result.stderr
     assert "--seed-peers" in result.stderr, "the refusal must say how to repair it"
@@ -286,8 +286,8 @@ def test_a_truncated_seed_list_is_refused_by_the_bracket_check(tmp_path) -> None
 def test_the_refusal_does_not_reject_valid_arrays(tmp_path) -> None:
     """MUST-FAIL ARM for the refusal — a guard that rejects everything is not a guard.
     Both the empty array and a populated one must pass."""
-    assert _parsed(_run(tmp_path, gw={"GATEWAY_SEED_PEERS": "[]"}))["SEED_PEERS"] == "[]"
-    assert _parsed(_run(tmp_path, gw={"GATEWAY_SEED_PEERS": PEERS_A}))["SEED_PEERS"] == PEERS_A
+    assert _parsed(_run(tmp_path, gw={"ISLAND_SEED_PEERS": "[]"}))["SEED_PEERS"] == "[]"
+    assert _parsed(_run(tmp_path, gw={"ISLAND_SEED_PEERS": PEERS_A}))["SEED_PEERS"] == PEERS_A
     assert _parsed(_run(tmp_path))["SEED_PEERS"] == "[]"
 
 
@@ -403,9 +403,9 @@ def test_the_class_guard_detects_a_wrong_value_not_only_a_refusal(tmp_path) -> N
     passing because nothing ever reaches it."""
     from dotenv import dotenv_values
     env = tmp_path / "escapes.env"
-    env.write_text('GATEWAY_SEED_PEERS="[{\\"id\\":\\"e\\"}]"\n')
+    env.write_text('ISLAND_SEED_PEERS="[{\\"id\\":\\"e\\"}]"\n')
 
-    want = dotenv_values(str(env))["GATEWAY_SEED_PEERS"]
+    want = dotenv_values(str(env))["ISLAND_SEED_PEERS"]
     result = subprocess.run([str(SCRIPT), str(env), "", ""], capture_output=True, text=True)
     assert result.returncode == 0, "this shape must EXIT 0 — a refusal would not test the branch"
     got = dict(l.split("=", 1) for l in result.stdout.strip().splitlines())["SEED_PEERS"]
@@ -432,7 +432,7 @@ def test_the_bracket_check_is_bracket_shaped_and_says_so(tmp_path) -> None:
 
     This test PINS THE DECLARED SCOPE, so that if someone later reads the guard as
     validating JSON, the suite says otherwise in writing."""
-    out = _parsed(_run(tmp_path, gw={"GATEWAY_SEED_PEERS": "[not-json]"}))
+    out = _parsed(_run(tmp_path, gw={"ISLAND_SEED_PEERS": "[not-json]"}))
     assert out["SEED_PEERS"] == "[not-json]", (
         "the guard now validates JSON bodies — good, but update the message, the header "
         "comment and this test, which all declare it as bracket-shape only"
@@ -446,7 +446,7 @@ def test_the_resolver_works_when_invoked_through_a_symlink(tmp_path) -> None:
     lib/ beside the link and died. Loud, not silent, but new fragility we added."""
     link = tmp_path / "linked-resolver.sh"
     link.symlink_to(SCRIPT)
-    env = _write(tmp_path / "gateway.env", {"PASSKEY_ENABLED": "true", "GATEWAY_SEED_PEERS": PEERS_A})
+    env = _write(tmp_path / "gateway.env", {"PASSKEY_ENABLED": "true", "ISLAND_SEED_PEERS": PEERS_A})
     result = subprocess.run([str(link), str(env), "", ""], capture_output=True, text=True)
     assert result.returncode == 0, f"symlink invocation failed: {result.stderr}"
     out = dict(l.split("=", 1) for l in result.stdout.strip().splitlines())

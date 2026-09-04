@@ -160,7 +160,7 @@ curl -s https://chat.example.org/.well-known/assetlinks.json | jq   # non-empty 
 # Note this re-run does NOT repeat --seed-peers, and does not need to: a re-run
 # preserves the federation peers and the passkey setting this island already
 # recorded in .env, and a flag is only needed to CHANGE one. Before #3734 that was
-# not true and this exact invocation silently emptied GATEWAY_SEED_PEERS.
+# not true and this exact invocation silently emptied the recorded seed peers.
 # To stop advertising passkeys later, pass --no-passkeys — omitting --enable-passkeys
 # is not "off", it means "leave it as recorded".
 
@@ -225,9 +225,9 @@ docker volume create aiko_data
 cat > .env <<EOF
 JWT_SECRET=$(openssl rand -hex 32)
 GATEWAY_BASE_URL=https://chat.example.org
-GATEWAY_DISPLAY_NAME=Example Island
+ISLAND_DISPLAY_NAME=Example Island
 PASSKEY_RP_ID=chat.example.org
-GATEWAY_SEED_PEERS=[]
+ISLAND_SEED_PEERS=[]
 PASSKEY_ENABLED=false
 EOF
 chmod 600 .env

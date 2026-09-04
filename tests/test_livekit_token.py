@@ -45,7 +45,7 @@ def livekit_configured(monkeypatch):
     monkeypatch.setattr(settings, "livekit_api_key", _LK_KEY)
     monkeypatch.setattr(settings, "livekit_api_secret", _LK_SECRET)
     # Pin island_id="" so domain tests asserting un-namespaced sub/room don't break if
-    # the harness ever seeds GATEWAY_ID (cage-match #122 rd6 Wu #6). Namespaced-branch
+    # the harness ever seeds ISLAND_ID (cage-match #122 rd6 Wu #6). Namespaced-branch
     # tests set it explicitly.
     monkeypatch.setattr(settings, "island_id", "")
     return settings

@@ -116,9 +116,7 @@ drift between the people applying it. Name the job, not the field.
 `peers_service.py` now models a node as `Island` (was `GatewayPeer`) in an
 `IslandDirectory` (was `PeerDirectory`); `coerce_island` (was `coerce_peer`). The
 entry *is a peer island* (its `id`/`display_name`); `base_url` is that island's
-gateway edge. Wire untouched by the rename (keys unchanged). **Deferred, deploy-coupled:**
-the self-identity config env vars are still `GATEWAY_*` (`gateway_base_url`,
-`gateway_display_name`, `GATEWAY_SEED_PEERS`).
+gateway edge. Wire untouched by the rename (keys unchanged).
 
 **DONE 2026-09-02.** Three env vars named the island, not the gateway edge, and moved:
 
@@ -136,17 +134,18 @@ and `GATEWAY_GOSSIP_ENABLED` / `_INTERVAL_SECONDS` (they configure the gateway's
 polling behaviour, not who the island is).
 
 **It was never actually deploy-coupled**, which is why it sat deferred for two months
-for no reason. Both names are real `Settings` fields; `_adopt_legacy_gateway_identity`
-takes the canonical one only when it is non-blank, so a box on the old `.env` keeps
-working untouched.
+for no reason. The rename shipped behind a compatibility layer that read both spellings,
+and that layer was **deleted on 2026-09-05 (#3836)** once both live boxes were verified
+running the canonical names. Only `ISLAND_*` is read now.
 
-**The obvious implementation is wrong, and silently.** `AliasChoices("ISLAND_ID",
-"GATEWAY_ID")` fails here: compose forwards an unset var as the EMPTY STRING, and
-AliasChoices takes the first key PRESENT — so `ISLAND_ID: ${ISLAND_ID:-}` always wins
-and is always empty, and both live islands would have booted with no identity.
-Measured before the resolver was written. `resolve-gateway-env.sh` reads both names
-for the same reason: reading only the canonical one would empty the federation link
-on the next standup re-run, which is #3734 re-opened by a rename.
+**The obvious implementation was wrong, and silently — the reason is durable even
+though the layer is gone.** `AliasChoices("ISLAND_ID", "GATEWAY_ID")` could not do this
+job: compose forwards an unset var as the EMPTY STRING, and AliasChoices takes the first
+key PRESENT — so `ISLAND_ID: ${ISLAND_ID:-}` always wins and is always empty, and both
+live islands would have booted with no identity. Measured before the resolver was
+written. That is why every identity var in `config.py` is a real field with a real
+default and a blank-is-absent rule, rather than an alias: at the container boundary
+"the operator said nothing" and "the operator set blank" are the same bytes.
 
 **Cutover order:** deploy the image FIRST (it understands both), then flip each box's
 `.env`, then delete the legacy fields, their resolver, the compose forwards, the

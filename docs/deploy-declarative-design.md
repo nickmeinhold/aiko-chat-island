@@ -57,7 +57,7 @@ DOMAIN=chat.enspyr.co
 PASSKEY_RP_ID=chat.enspyr.co
 ISLAND_VERSION=0.2.4
 SOCIAL_SIGNIN_ENABLED=false
-# GATEWAY_ID / GATEWAY_DISPLAY_NAME / GATEWAY_SEED_PEERS …
+# ISLAND_ID / ISLAND_DISPLAY_NAME / ISLAND_SEED_PEERS …
 ```
 
 ### `deploy/deploy-to.sh <island>` — NEW, runs on the laptop (control plane)

@@ -128,7 +128,7 @@ Never deploy `.env.example` or anything derived from it.
 | Social sign-in | `SOCIAL_SIGNIN_ENABLED`, `APPLE_CLIENT_IDS`, `GOOGLE_CLIENT_IDS`, `SOCIAL_NONCE_REQUIRED` | Apple/Google ID-token verify + replay-nonce (#13) |
 | OAuth broker | `GITHUB_CLIENT_ID/_SECRET`, `APP_OAUTH_CALLBACK_URL` | server-side code exchange + app-bound handoff (#21/#34) |
 | Passkeys | `PASSKEY_ENABLED`, `PASSKEY_RP_ID`, `PASSKEY_IOS_APP_ID`, `PASSKEY_ANDROID_PACKAGE` | WebAuthn (#1471); domain-bound, advertised via `/v1/auth/providers` |
-| Directory | `GATEWAY_BASE_URL/_ID/_DISPLAY_NAME`, `GATEWAY_SEED_PEERS`, `GATEWAY_GOSSIP_ENABLED` | island discovery; gossip fail-closed off (seed-peers suffice for 2 islands) |
+| Directory | `GATEWAY_BASE_URL`, `ISLAND_ID/_DISPLAY_NAME/_SEED_PEERS`, `GATEWAY_GOSSIP_ENABLED` | island discovery; gossip fail-closed off (seed-peers suffice for 2 islands) |
 | Guards | `RATE_LIMIT_ENABLED`, `AUTH_RATE_LIMIT`, `MAX_REQUEST_BYTES` | per-IP fixed-window + 64 KiB body cap on public ceremonies (#28) |
 
 ## API surface
