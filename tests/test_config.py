@@ -1348,7 +1348,7 @@ def test_string_fields_keep_their_whitespace():
 
     from aiko_gateway.config import Settings
 
-    with mock.patch.dict(os.environ, {"GATEWAY_DISPLAY_NAME": "  Padded  "}, clear=False):
+    with mock.patch.dict(os.environ, {"ISLAND_DISPLAY_NAME": "  Padded  "}, clear=False):
         assert Settings(_env_file=None).island_display_name == "  Padded  ", (
             "a string field must not be silently stripped"
         )
@@ -1452,7 +1452,7 @@ def test_the_whole_rendered_compose_environment_boots():
     rendered["PASSKEY_ENABLED"] = "true"          # a sign-in ingress must exist
     rendered["MODERATOR_USER_IDS"] = '["operator-1"]'  # moderator mode needs a moderator
     rendered["CSAM_RUNBOOK_ACKNOWLEDGED"] = "true"     # A5 operator acknowledgement
-    rendered["GATEWAY_ID"] = "probe.example.org"       # per-island identity
+    rendered["ISLAND_ID"] = "probe.example.org"        # per-island identity
     # `_env_file=None` is load-bearing, not tidiness (cage-match PR#141 round 7,
     # Tesla). Settings is configured `env_file=".env"` and this repo HAS a root .env,
     # so `clear=True` on os.environ does NOT isolate the test — pydantic-settings reads
@@ -1589,7 +1589,7 @@ def test_a_custom_env_file_override_is_honoured(tmp_path):
     from aiko_gateway.config import Settings
 
     env = tmp_path / "custom.env"
-    env.write_text("GATEWAY_DISPLAY_NAME=from-the-custom-file\n")
+    env.write_text("ISLAND_DISPLAY_NAME=from-the-custom-file\n")
     s = Settings(_env_file=str(env))
     assert s.island_display_name == "from-the-custom-file", (
         f"the custom _env_file was not read; got {s.island_display_name!r} — the "
@@ -1597,21 +1597,14 @@ def test_a_custom_env_file_override_is_honoured(tmp_path):
     )
 
 
-# --- legacy GATEWAY_* identity adoption (docs/island-vs-gateway.md) --------------
+# --- island identity resolution (docs/island-vs-gateway.md) ---------------------
 #
-# GATEWAY_ID / GATEWAY_DISPLAY_NAME / GATEWAY_SEED_PEERS named the ISLAND, not the
-# gateway edge, so they became ISLAND_*. Both names are forwarded by compose during
-# the cutover window and resolved by Settings._adopt_legacy_gateway_identity.
-#
-# THESE ARE REGRESSION TESTS FOR A MEASURED NEAR-MISS, not speculative coverage.
-# The obvious implementation — pydantic's AliasChoices("ISLAND_ID", "GATEWAY_ID") —
-# is WRONG here, and silently: compose forwards an unset var as the EMPTY STRING,
-# AliasChoices takes the first key PRESENT, so `ISLAND_ID: ${ISLAND_ID:-}` always
-# wins and is always empty. Both live islands, whose .env still says GATEWAY_ID,
-# would have booted with no identity — which fails the LiveKit remote-SFU boot guard
-# and drops directory self-identity to a host-derived id. The absence-aware source
-# does not rescue it either: returning None means "this source has no value", not
-# "try the next alias". Hence two real fields and an explicit resolver.
+# WHY BLANK-COERCION EXISTS AT ALL, and it is measured rather than reasoned: compose
+# forwards an UNSET variable as the EMPTY STRING, so "the operator said nothing" and
+# "the operator set it to blank" are identical bytes at the container boundary. Any
+# scheme that keys on PRESENCE — pydantic's AliasChoices, an absence-aware settings
+# source returning None — cannot separate them. Hence a real field plus an explicit
+# blank-is-unset rule, which is the shape every identity var in this file follows.
 
 def _settings_with(**env):
     import os
@@ -1626,62 +1619,56 @@ def _settings_with(**env):
 _SEED = '[{"id":"x","display_name":"X","base_url":"https://x.example"}]'
 
 
-def test_legacy_gateway_id_is_adopted_when_canonical_is_unset():
-    assert _settings_with(GATEWAY_ID="legacy-id").island_id == "legacy-id"
+def test_each_identity_field_keeps_its_own_whitespace_policy():
+    """The config layer must not IMPOSE one policy across the identity fields.
 
-
-def test_canonical_island_id_wins_over_legacy():
-    assert _settings_with(ISLAND_ID="new", GATEWAY_ID="legacy-id").island_id == "new"
-
-
-def test_empty_canonical_does_not_shadow_a_live_legacy_identity():
-    """THE regression: compose forwards an unset ISLAND_ID as "".
-
-    If this goes red, every box still on a GATEWAY_* .env loses its identity on the
-    next deploy — silently, because an empty id is a valid-looking value.
-    """
-    assert _settings_with(ISLAND_ID="", GATEWAY_ID="legacy-id").island_id == "legacy-id"
-    assert _settings_with(ISLAND_ID="   ", GATEWAY_ID="legacy-id").island_id == "legacy-id"
-
-
-def test_empty_canonical_does_not_shadow_legacy_display_name_or_seed_peers():
-    assert _settings_with(
-        ISLAND_DISPLAY_NAME="", GATEWAY_DISPLAY_NAME="Imagineering"
-    ).island_display_name == "Imagineering"
-    assert len(
-        _settings_with(ISLAND_SEED_PEERS="", GATEWAY_SEED_PEERS=_SEED).island_seed_peers
-    ) == 1
-
-
-def test_adoption_respects_each_fields_own_whitespace_policy():
-    """The resolver must not IMPOSE a policy; it inherits each field's.
-
-    The two fields deliberately differ, and adoption has to preserve that:
+    The two deliberately differ:
       * island_id is stripped downstream by _harden_for_production, because it is
         matched by exact string (it namespaces LiveKit rooms across islands), and a
         padded id silently never matches — the moderator-id bug class in costume.
       * island_display_name is NOT stripped: it is a label, and
         test_string_fields_keep_their_whitespace forbids a config layer from
-        rewriting string fields.
-    So the resolver uses .strip() to decide EMPTINESS only, and assigns raw bytes;
-    what happens after is each field's own business.
+        rewriting string fields. Only a BLANK one is replaced, with the default.
     """
-    assert _settings_with(GATEWAY_ID="  padded  ").island_id == "padded"
+    assert _settings_with(ISLAND_ID="  padded  ").island_id == "padded"
     assert (
-        _settings_with(GATEWAY_DISPLAY_NAME="  Padded  ").island_display_name
+        _settings_with(ISLAND_DISPLAY_NAME="  Padded  ").island_display_name
         == "  Padded  "
     )
 
 
-def test_neither_name_set_gives_the_plain_defaults():
-    """The NULL arm — without it the tests above could pass on a stuck value."""
-    s = _settings_with(
-        ISLAND_ID="", GATEWAY_ID="", ISLAND_DISPLAY_NAME="", GATEWAY_DISPLAY_NAME="",
-        ISLAND_SEED_PEERS="", GATEWAY_SEED_PEERS="",
-    )
+def test_nothing_set_gives_the_plain_defaults():
+    """The NULL arm — without it the tests around it could pass on a stuck value."""
+    s = _settings_with(ISLAND_ID="", ISLAND_DISPLAY_NAME="", ISLAND_SEED_PEERS="")
     assert s.island_id == ""
     assert s.island_display_name == "Aiko"
     assert s.island_seed_peers == []
+
+
+def test_a_blank_display_name_is_never_advertised_as_the_island_label():
+    """peers_service puts island_display_name into the directory entry verbatim, so a
+    whitespace-only value would advertise an island with no name in the app's picker.
+    Blank must behave exactly as unset (the invariant
+    test_blank_env_value_behaves_as_unset asserts corpus-wide)."""
+    for blank in ("", " ", "   ", "\t"):
+        assert _settings_with(ISLAND_DISPLAY_NAME=blank).island_display_name == "Aiko"
+
+
+def test_the_blank_fallback_covers_programmatic_construction_too():
+    """A DEFAULT and a VALIDATOR are not behaviourally identical over all inputs, so the
+    deleted validator's replacement has to be checked on the surface the env path does not
+    cover. It is: _normalise_env_strings is mode="before" on the MODEL, not a settings
+    source, so it deletes a blank key for direct construction as well as for env. Measured
+    here rather than assumed, and pinned so a future move of that rule into a source layer
+    (where it would see env only) cannot silently reopen the blank-label case."""
+    from aiko_gateway.config import Settings
+
+    for blank in ("", "   ", "\t"):
+        s = Settings(_env_file=None, environment="dev", island_display_name=blank)
+        assert s.island_display_name == "Aiko", (
+            f"programmatic island_display_name={blank!r} gave {s.island_display_name!r} — "
+            "the field default does not cover this surface"
+        )
 
 
 def test_canonical_names_work_alone_on_a_cut_over_box():
@@ -1690,12 +1677,50 @@ def test_canonical_names_work_alone_on_a_cut_over_box():
     assert len(s.island_seed_peers) == 1
 
 
-def test_both_legacy_and_canonical_names_are_forwarded_by_compose():
-    """The resolver is useless if the legacy var never reaches the container."""
+def test_leftover_legacy_identity_keys_are_inert():
+    """THE LOAD-BEARING INVARIANT OF THE COMPOSE-LAG WINDOW, and it is about POPULATED
+    keys, not empty ones.
+
+    deploy/update.sh pulls the image and does NOT sync docker-compose.yml (#2301), so
+    after this deletion both live boxes run an image with no GATEWAY_* identity fields
+    against a compose that still forwards three of them. The live-box probe proved the
+    EMPTY case (their .env carries no legacy key, so the forwards render blank). This
+    pins the case a probe of two cut-over boxes structurally cannot reach: a POPULATED
+    legacy key must not become this island's identity.
+
+    It holds today by construction — the fields are gone and model_config sets
+    extra="ignore" — which is exactly why it needs pinning rather than trusting. A later
+    AliasChoices, or a field that happens to be named gateway_id, would resurrect the
+    resolution silently and no other test in this file would notice."""
+    ghost = '[{"id":"ghost","display_name":"Ghost","base_url":"https://ghost.example"}]'
+    s = _settings_with(
+        GATEWAY_ID="ghost-island",
+        GATEWAY_DISPLAY_NAME="Ghost Island",
+        GATEWAY_SEED_PEERS=ghost,
+    )
+    assert s.island_id == "", "a leftover GATEWAY_ID became this island's identity"
+    assert s.island_display_name == "Aiko", "a leftover GATEWAY_DISPLAY_NAME became the label"
+    assert s.island_seed_peers == [], "a leftover GATEWAY_SEED_PEERS became the peer list"
+
+
+def test_the_inertness_test_can_actually_fail():
+    """NULL ARM. Pins that the CANONICAL names in the same shape DO take effect — without
+    it, a Settings that ignored all three inputs for some unrelated reason (a broken
+    fixture, a crashed env source) would satisfy the test above for the wrong reason."""
+    ghost = '[{"id":"ghost","display_name":"Ghost","base_url":"https://ghost.example"}]'
+    s = _settings_with(
+        ISLAND_ID="ghost-island",
+        ISLAND_DISPLAY_NAME="Ghost Island",
+        ISLAND_SEED_PEERS=ghost,
+    )
+    assert s.island_id == "ghost-island"
+    assert s.island_display_name == "Ghost Island"
+    assert len(s.island_seed_peers) == 1
+
+
+def test_the_identity_vars_are_forwarded_by_compose():
+    """A Settings field is useless if the var never reaches the container — the
+    PASSKEY_EXTRA_ORIGINS/ISLAND_SIGNING_SEED inert-var class (#141)."""
     env = _chat_island_environment()
-    for var in (
-        "ISLAND_ID", "GATEWAY_ID",
-        "ISLAND_DISPLAY_NAME", "GATEWAY_DISPLAY_NAME",
-        "ISLAND_SEED_PEERS", "GATEWAY_SEED_PEERS",
-    ):
+    for var in ("ISLAND_ID", "ISLAND_DISPLAY_NAME", "ISLAND_SEED_PEERS"):
         assert var in env, f"{var} is not forwarded into the chat-island container"

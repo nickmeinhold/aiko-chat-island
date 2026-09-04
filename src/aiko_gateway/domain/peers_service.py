@@ -332,16 +332,10 @@ def build_directory_from_settings(settings) -> IslandDirectory:
     the base-url host when island_id is unset.
 
     THE #1760 DEFERRAL IS DISCHARGED. The three self-identity keys that name the
-    ISLAND now do so: `ISLAND_ID`, `ISLAND_DISPLAY_NAME`, `ISLAND_SEED_PEERS`. Their
-    legacy `GATEWAY_*` spellings remain readable through the cutover window (two real
-    Settings fields plus `_adopt_legacy_gateway_identity`), so a box whose .env has
-    not been flipped keeps its identity.
+    ISLAND now do so: `ISLAND_ID`, `ISLAND_DISPLAY_NAME`, `ISLAND_SEED_PEERS`.
 
     `GATEWAY_BASE_URL` keeps its name deliberately and is NOT part of that rename: a
-    base_url names the gateway EDGE, not the island (docs/island-vs-gateway.md).
-
-    The old text here said the rename "waits for a coordinated deploy". It never
-    needed one — resolving both names in-process is what removed the coupling."""
+    base_url names the gateway EDGE, not the island (docs/island-vs-gateway.md)."""
     base = _normalize_base_url(settings.gateway_base_url)
     gid = (settings.island_id or _host_of(base)).strip().lower()
     self_peer = coerce_island(

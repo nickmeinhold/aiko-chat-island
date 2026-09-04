@@ -408,8 +408,8 @@ fi
 # below rewrites $ENV_FILE, since the record it reads is that same file (#3734).
 # FAIL CLOSED. `done < <(cmd)` swallows cmd's exit status even under
 # `set -euo pipefail` — the loop simply reads nothing, both variables stay empty,
-# and the heredoc below then writes `GATEWAY_SEED_PEERS=` … which compose reads
-# through `${GATEWAY_SEED_PEERS:-[]}` as `[]`. That is #3734 itself, reintroduced
+# and the heredoc below then writes `ISLAND_SEED_PEERS=` … which compose reads
+# through `${ISLAND_SEED_PEERS:-[]}` as `[]`. That is #3734 itself, reintroduced
 # through the ERROR PATH of the code that exists to prevent it. So: capture to a
 # file, CHECK the status, and die rather than write unresolved choices.
 RESOLVED_ENV="$(mktemp "${TMPDIR:-/tmp}/aiko-resolved.XXXXXX")"
@@ -475,9 +475,7 @@ JWT_SECRET=$JWT_SECRET
 # --- island identity (this compose is the island template) ---
 # ISLAND_* is canonical: these name the ISLAND (who it is), not the gateway edge.
 # GATEWAY_BASE_URL keeps its name deliberately — a base_url IS the gateway edge
-# (docs/island-vs-gateway.md). A fresh standup writes canonical names only; the
-# legacy GATEWAY_DISPLAY_NAME / GATEWAY_SEED_PEERS are still READ from an existing
-# .env by config.py and resolve-gateway-env.sh, for boxes not yet cut over.
+# (docs/island-vs-gateway.md).
 GATEWAY_BASE_URL=$BASE_URL
 ISLAND_DISPLAY_NAME='$DISPLAY_NAME'
 PASSKEY_RP_ID=$DOMAIN

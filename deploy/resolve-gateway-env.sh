@@ -5,13 +5,13 @@
 # WHY THIS FILE EXISTS. PR#151 found a class in standup.sh's media wiring and closed
 # it there: "an operator CHOICE must be recorded and read back; a measured FACT should
 # be re-derived." The class pass was then scoped to one code path. Testing that claim
-# (#3734) found GATEWAY_SEED_PEERS with the same hole in the same file, and a
+# (#3734) found the seed-peers list with the same hole in the same file, and a
 # systematic sweep of the .env heredoc found a second, PASSKEY_ENABLED. This is the
 # sibling of resolve-media-env.sh for the non-media half.
 #
 # WHAT MAKES THESE TWO WORSE THAN THE HOSTNAME BUG. Both fail SILENTLY and look
 # healthy:
-#   * GATEWAY_SEED_PEERS is the federation link. Each live island's seed list is the
+#   * ISLAND_SEED_PEERS is the federation link. Each live island's seed list is the
 #     other island. Reset to [], peers_service just serves self — no fetch, no error,
 #     no log line. The islands simply stop knowing about each other.
 #   * PASSKEY_ENABLED is the PRIMARY sign-in ingress since social was dropped
@@ -20,7 +20,7 @@
 #
 # NOT IN THE CLASS, checked rather than assumed:
 #   * JWT_SECRET       — already read back and reused (standup.sh, "not rotated").
-#   * GATEWAY_BASE_URL / GATEWAY_DISPLAY_NAME — fail CLOSED: required, prompted, or
+#   * GATEWAY_BASE_URL / ISLAND_DISPLAY_NAME — fail CLOSED: required, prompted, or
 #     `die`. A re-run cannot silently blank them.
 #   * LIVEKIT_DOMAIN / LIVEKIT_TURN_DOMAIN    — resolve-media-env.sh owns these.
 #   * LIVEKIT_NODE_IP  — a measured FACT about the host. Deliberately re-derived every
@@ -54,18 +54,29 @@ done
 . "$(cd -P "$(dirname "$_src")" && pwd)/lib/dotenv-read.sh"
 _read_kv() { dotenv_read "$1" "$2"; }
 
-# RESOLUTION ORDER, identical for both: flag, then the value this island RECORDED,
-# then convention. The middle rung is the one that was missing.
-# The recorded rung reads BOTH names, canonical first. ISLAND_SEED_PEERS is the
-# name a cut-over box has; GATEWAY_SEED_PEERS is what a box that has not been cut
-# over still holds. Reading only one of them would re-open the exact hole this
-# file was written to close: an unread seed list resolves to [], peers_service
-# serves self, and the islands stop knowing about each other with no error and a
-# green health check. Drop the legacy rung once every box is cut over
-# (docs/island-vs-gateway.md).
+# RESOLUTION ORDER: flag, then the value this island RECORDED, then convention.
+# The middle rung is the one that was missing — an unread seed list resolves to [],
+# peers_service serves self, and the islands stop knowing about each other with no
+# error and a green health check.
 seed_peers="$seed_flag"
 [ -n "$seed_peers" ] || seed_peers="$(_read_kv "$gw_env" ISLAND_SEED_PEERS)"
-[ -n "$seed_peers" ] || seed_peers="$(_read_kv "$gw_env" GATEWAY_SEED_PEERS)"
+
+# REFUSE, rather than fall through, when the ONLY recorded seed list is under the
+# pre-2026-09 spelling. Deleting the legacy rung (#3836) is correct — but deleting a
+# silent RECOVERY must not leave a silent LOSS in its place. Without this stop, an
+# un-cut-over box's documented unflagged re-run resolves to the "[]" convention below,
+# standup.sh writes that back as ISLAND_SEED_PEERS, and the federation link is emptied
+# with no error and a green health check: #3734 exactly, re-opened by the cleanup that
+# followed the rename. The bracket-shape guard further down cannot catch it — "[]" is
+# bracket-delimited and perfectly valid.
+#
+# Not a fallback: the legacy VALUE is never read or written. The operator is told what
+# to rename, and an explicit --seed-peers flag still wins outright (it is checked
+# first, and an operator who passes it has stated their intent).
+if [ -z "$seed_peers" ] && [ -n "$(_read_kv "$gw_env" GATEWAY_SEED_PEERS)" ]; then
+  echo "resolve-gateway-env: this .env records its seed peers under the retired GATEWAY_SEED_PEERS name and has no ISLAND_SEED_PEERS. Continuing would resolve the federation list to [] and silently unpeer this island on the next standup write. Rename the key to ISLAND_SEED_PEERS in $gw_env (the value is unchanged), or pass --seed-peers with the intended array." >&2
+  exit 1
+fi
 [ -n "$seed_peers" ] || seed_peers="[]"
 
 # Same order, but the flag is TRI-STATE. --enable-passkeys and --no-passkeys are both
@@ -78,7 +89,7 @@ passkey_enabled="$passkeys_flag"
 
 # SINGLE-LINE GUARANTEE, enforced HERE rather than trusted of every caller. Output
 # is a newline-delimited KEY=VALUE stream, so a value containing a newline would be
-# read back as a truncated first line — `GATEWAY_SEED_PEERS=[` silently replacing the
+# read back as a truncated first line — `ISLAND_SEED_PEERS=[` silently replacing the
 # federation list, which is the very failure this script exists to prevent. The guide
 # documents a MULTILINE --seed-peers array (docs/standup-guide.md), so this is the
 # documented path, not a hostile edge. Newlines are insignificant whitespace outside a
@@ -97,7 +108,7 @@ esac
 # check only looks at the first and last character — so `[not-json]` passes.
 #
 # That gap is DELIBERATE and stays. This guard exists for ONE historic corruption: An island stood up before this fix with
-# the guide's multiline invocation has `GATEWAY_SEED_PEERS=[` in its .env (the body
+# the guide's multiline invocation has a bare `ISLAND_SEED_PEERS=[` in its .env (the body
 # lines were orphaned and unparseable by python-dotenv too). Reading that back and
 # writing it out again would launder a broken value into a deliberate-looking one, and
 # peers_service would keep serving self. Validating the JSON *body* means a JSON parser in
@@ -106,7 +117,7 @@ esac
 # rather than JSON. Prose matching code is the fix here, not more code.
 case "$seed_peers" in
   "["*"]") ;;
-  *) echo "resolve-gateway-env: GATEWAY_SEED_PEERS is not bracket-delimited (must start '[' and end ']'), got '$seed_peers'. A pre-2026-09 standup with a multiline --seed-peers left a truncated value; pass --seed-peers with the intended array to repair it." >&2; exit 1 ;;
+  *) echo "resolve-gateway-env: ISLAND_SEED_PEERS is not bracket-delimited (must start '[' and end ']'), got '$seed_peers'. A pre-2026-09 standup with a multiline --seed-peers left a truncated value; pass --seed-peers with the intended array to repair it." >&2; exit 1 ;;
 esac
 
 printf 'SEED_PEERS=%s\n' "$seed_peers"

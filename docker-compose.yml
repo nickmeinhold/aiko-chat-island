@@ -101,28 +101,19 @@ services:
       # --- ISLAND IDENTITY (the compose is the island template). Each island sets
       # these in its host .env; the defaults are island 1 (chat.imagineering.cc) so
       # an imagineering deploy with no overrides is unchanged. Island 2 (enspyr)
-      # sets GATEWAY_BASE_URL/_ID/_DISPLAY_NAME + PASSKEY_RP_ID to its own domain.
+      # sets GATEWAY_BASE_URL + ISLAND_ID/_DISPLAY_NAME + PASSKEY_RP_ID to its own
+      # domain. GATEWAY_BASE_URL keeps its name because a base_url IS the gateway
+      # edge, not the island (docs/island-vs-gateway.md).
       GATEWAY_BASE_URL: ${GATEWAY_BASE_URL:-https://chat.imagineering.cc}
-      # ISLAND_* is canonical; GATEWAY_* is the legacy name a not-yet-cut-over box
-      # still has in its .env. BOTH are forwarded during the window, and config.py's
-      # _adopt_legacy_gateway_identity picks the canonical one only when it is
-      # non-blank — because compose forwards an unset var as "", which would
-      # otherwise shadow a live box's real identity. Drop the GATEWAY_* three once
-      # every box is cut over (docs/island-vs-gateway.md).
       ISLAND_ID: ${ISLAND_ID:-}
-      GATEWAY_ID: ${GATEWAY_ID:-}
-      ISLAND_DISPLAY_NAME: ${ISLAND_DISPLAY_NAME:-}
-      # The LEGACY var keeps its original `Aiko` default deliberately (Carnot,
-      # cage-match round 3). Blanking it is behaviour-neutral for THIS image — the
-      # resolver yields "Aiko" either way, measured — but it is NOT neutral on
-      # ROLLBACK: a pinned older image reads gateway_display_name directly, so an
-      # empty default would give every island a blank name in the app's picker.
-      # Same reversibility test the SEED_PEERS default below is held to.
-      GATEWAY_DISPLAY_NAME: ${GATEWAY_DISPLAY_NAME:-Aiko}
+      # `Aiko`, not empty: peers_service puts this into the directory entry the
+      # app's picker renders, so an empty default names every island nothing.
+      # Must equal config's default (test_compose_defaults_match_config_defaults).
+      ISLAND_DISPLAY_NAME: ${ISLAND_DISPLAY_NAME:-Aiko}
       # --- LiveKit (video/audio). Operator-settable; forwarded so a host .env value
       # is NOT inert in the container (the PASSKEY_EXTRA_ORIGINS/ISLAND_SIGNING_SEED
       # incident class — cage-match #122 Carnot+Tesla+Wu 3-way HIGH). API_SECRET is a
-      # REAL secret; when set in prod, config.py demands >=32 chars + GATEWAY_ID + wss.
+      # REAL secret; when set in prod, config.py demands >=32 chars + ISLAND_ID + wss.
       # Absent => video is disabled (endpoint 503), NOT a boot failure.
       LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-}
       LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-}
@@ -167,7 +158,6 @@ services:
       # pinned OLDER image that lacks the blank-coercion (proven against :0.6.0), and
       # this repo's rollback path pulls pinned images.
       ISLAND_SEED_PEERS: ${ISLAND_SEED_PEERS:-[]}
-      GATEWAY_SEED_PEERS: ${GATEWAY_SEED_PEERS:-[]}
       # Gossip FETCH gate — fail-closed. The anti-entropy loop pulls peer base URLs
       # (SSRF surface, #1578), so it stays OFF until that hardening lands AND 3+
       # islands make transitive discovery worth it. Off → directory still serves

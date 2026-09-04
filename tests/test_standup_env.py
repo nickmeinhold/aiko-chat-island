@@ -266,42 +266,50 @@ def test_the_quoting_tests_can_actually_fail(island) -> None:
     )
 
 
-# --- the cutover window: a box whose .env still holds the LEGACY names ----------
+# --- the retired spelling, through the REAL script ---------------------------
+#
+# The resolver's own suite proves the refusal; these prove what standup DOES with it.
+# A stop that fires after the .env has already been rewritten would destroy the very
+# federation list it exists to protect, so "refuses" is only half the property —
+# "refuses WITHOUT touching the file" is the half that makes it safe.
 
-def test_a_rerun_reads_back_a_legacy_gateway_seed_peers(island) -> None:
-    """A not-yet-cut-over box must keep its federation link across a standup re-run.
-
-    Both live islands' .env files were written before the ISLAND_* rename, so their
-    recorded seed list is under GATEWAY_SEED_PEERS. resolve-gateway-env.sh reads the
-    canonical name first; if it did NOT also read the legacy one, an unflagged re-run
-    would resolve the seed list to [] and the two islands would stop knowing about
-    each other — no error, green health check. That is #3734 exactly, re-opened by a
-    rename instead of by a missing read-back.
-
-    Delete this test with the legacy rung, once every box is cut over.
-    """
-    island.run()  # produce a real .env, then rewrite it into the pre-rename shape
-    text = island.env_file.read_text().replace("ISLAND_SEED_PEERS=", "GATEWAY_SEED_PEERS=")
-    assert "GATEWAY_SEED_PEERS=" in text, "fixture setup failed to create the legacy shape"
+def test_a_legacy_only_seed_list_makes_standup_refuse(island) -> None:
+    island.run("--seed-peers", PEERS)          # a real, populated .env
     island.env_file.write_text(
-        text.replace("GATEWAY_SEED_PEERS='[]'", f"GATEWAY_SEED_PEERS='{PEERS}'")
+        island.env_file.read_text().replace("ISLAND_SEED_PEERS=", "GATEWAY_SEED_PEERS=")
+    )
+    result = island.run(expect_ok=False)       # the documented unflagged re-run
+    assert result.returncode != 0, (
+        "standup completed against a legacy-only seed list — it would have written the "
+        "[] convention back and unpeered this island"
+    )
+    assert "ISLAND_SEED_PEERS" in (result.stdout + result.stderr), (
+        "the resolver's actionable message must survive out through standup; an operator "
+        "who cannot see WHICH key to rename cannot act on the refusal"
     )
 
-    island.run()  # the documented unflagged re-run
-    assert _values(island)["ISLAND_SEED_PEERS"] == PEERS, (
-        "a legacy GATEWAY_SEED_PEERS was not read back — the federation link would be "
-        "silently emptied on the next standup re-run of a live island"
-    )
 
-
-def test_the_legacy_readback_test_can_actually_fail(island) -> None:
-    """Must-fail arm: with NEITHER name carrying the peers, the re-run must give []."""
-    island.run()
+def test_the_refusal_does_not_overwrite_the_existing_env(island) -> None:
+    """The half that makes the stop safe rather than merely loud. standup resolves BEFORE
+    it rewrites (deploy/standup.sh: resolver, then the mktemp+mv heredoc), so an aborted
+    run must leave the operator's file byte-identical — their seed list is still there to
+    be renamed by hand."""
+    island.run("--seed-peers", PEERS)
     island.env_file.write_text(
-        island.env_file.read_text().replace("ISLAND_SEED_PEERS=", "UNRELATED_KEY=")
+        island.env_file.read_text().replace("ISLAND_SEED_PEERS=", "GATEWAY_SEED_PEERS=")
     )
+    before = island.env_file.read_bytes()
+    island.run(expect_ok=False)
+    assert island.env_file.read_bytes() == before, (
+        "the aborted run mutated .env — the refusal destroyed the seed list it exists to save"
+    )
+    assert PEERS.encode() in before, "fixture void: the preserved file must contain the peers"
+
+
+def test_the_standup_refusal_arm_can_actually_pass(island) -> None:
+    """NULL ARM. The same re-run against a CANONICAL .env must SUCCEED and preserve the
+    list — without this, a standup.sh that refused every re-run would satisfy both tests
+    above."""
+    island.run("--seed-peers", PEERS)
     island.run()
-    assert _values(island)["ISLAND_SEED_PEERS"] == "[]", (
-        "the control is void: this arm must show the empty result the test above "
-        "distinguishes itself from"
-    )
+    assert _values(island)["ISLAND_SEED_PEERS"] == PEERS
