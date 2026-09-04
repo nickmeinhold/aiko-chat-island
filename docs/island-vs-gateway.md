@@ -85,7 +85,31 @@ safe. Implemented 2026-07-08.)*
 | Surface | Term | Examples |
 |---|---|---|
 | Node identity / federation / choice | **island** | island picker, discovery directory, presets, the peer-entry *identity* (`id`, `display_name`) |
-| Protocol edge / connection / transport | **gateway** | the `/v1/*` REST + WS API, `base_url`, the `aiko_gateway` package, `GatewayRestApi`/`gateway_transport` (app) |
+| Protocol edge / connection / transport | **gateway** | the `/v1/*` REST + WS API, the `aiko_gateway` package, `GatewayRestApi`/`gateway_transport` (app) |
+| A base URL used as **self-description** — "what is my own address" | **gateway** | island's `GATEWAY_BASE_URL` (derives the OAuth `redirect_uri`, validates `PASSKEY_RP_ID`, and is what this node advertises about itself in the directory) |
+| A base URL used as **selection** — "which island am I pointing at" | **island** | app's `ISLAND_BASE_URL` dart-define (seeds the initial pick; the user re-points it in-app) |
+
+### `base_url` is TWO concepts that share a value — this table used to collapse them
+
+Until 2026-09-04 the gateway row simply listed ``base_url``, and that single row manufactured
+a cross-repo disagreement that was not real. The app renamed its dart-define
+``GATEWAY_BASE_URL`` → ``ISLAND_BASE_URL`` (app PR#178) while the island kept
+``GATEWAY_BASE_URL`` (island PR#156, applying the old row) — and both were CORRECT, because
+they name different jobs that happen to hold the same string:
+
+- **Self-description** is gateway-shaped. The island publishes an address ABOUT ITSELF and
+  derives its own redirect from it. That is the protocol edge describing where it answers.
+- **Selection** is island-shaped. Choosing that URL in the app IS choosing which sovereign
+  deployment you belong to — "the unit of federation and choice", which is this document's
+  own definition of an island.
+
+**Neither repo moves code. Nothing on the wire changes under any reading** — the directory
+payload's per-entry ``base_url`` field is untouched, and remains that island's gateway edge.
+
+**The general lesson, since this doc caused it twice** (the two-bin taxonomy that omitted
+`server`, and now this): a row that lists a VALUE rather than a JOB will eventually be applied
+to two different jobs that share that value, and the resulting disagreement will look like
+drift between the people applying it. Name the job, not the field.
 
 ## Island-repo internal naming (DONE)
 
