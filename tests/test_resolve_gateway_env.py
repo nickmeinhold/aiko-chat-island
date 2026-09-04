@@ -462,3 +462,38 @@ def test_the_symlink_test_can_actually_fail(tmp_path) -> None:
     assert link.is_symlink()
     assert link.parent != SCRIPT.parent, "the link must NOT sit beside the real lib/"
     assert not (tmp_path / "lib" / "dotenv-read.sh").exists()
+
+
+# --- the retired spelling: refuse loudly, never fall through to [] ------------
+#
+# #3836 deleted the legacy GATEWAY_SEED_PEERS rung, which is correct — but removing a
+# silent RECOVERY must not install a silent LOSS. These three arms pin that the stop
+# fires on exactly the dangerous shape and on nothing else.
+
+def test_a_legacy_only_seed_list_is_refused_instead_of_silently_emptied(tmp_path) -> None:
+    """The shape that would re-open #3734: an un-cut-over .env whose only recorded seed
+    list is under the retired name. Falling through to the [] convention would make
+    standup.sh write that back and unpeer the island with a green health check."""
+    result = _run(tmp_path, gw={"GATEWAY_SEED_PEERS": PEERS_A})
+    assert result.returncode != 0, (
+        "a legacy-only seed list resolved silently instead of stopping — the federation "
+        "link would be emptied on the next standup write"
+    )
+    assert "ISLAND_SEED_PEERS" in result.stderr, (
+        "the refusal must name the key to rename; an operator cannot act on 'refused'"
+    )
+    assert "SEED_PEERS=[]" not in result.stdout, "it must not emit a resolved value at all"
+
+
+def test_an_explicit_flag_still_wins_over_a_legacy_only_record(tmp_path) -> None:
+    """The stop must not trap an operator who has already stated their intent. The flag is
+    checked first, so a legacy-only .env plus --seed-peers resolves normally."""
+    out = _parsed(_run(tmp_path, gw={"GATEWAY_SEED_PEERS": PEERS_A}, seed_flag=PEERS_B))
+    assert out["SEED_PEERS"] == PEERS_B
+
+
+def test_the_refusal_arm_can_actually_pass(tmp_path) -> None:
+    """NULL ARM. Without it, a guard that refused unconditionally would satisfy the test
+    above. A .env with NEITHER spelling is a genuinely solo island and must resolve to []."""
+    out = _parsed(_run(tmp_path, gw={"PASSKEY_ENABLED": "true"}))
+    assert out["SEED_PEERS"] == "[]"

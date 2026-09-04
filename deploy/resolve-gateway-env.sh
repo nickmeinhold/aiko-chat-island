@@ -60,6 +60,23 @@ _read_kv() { dotenv_read "$1" "$2"; }
 # error and a green health check.
 seed_peers="$seed_flag"
 [ -n "$seed_peers" ] || seed_peers="$(_read_kv "$gw_env" ISLAND_SEED_PEERS)"
+
+# REFUSE, rather than fall through, when the ONLY recorded seed list is under the
+# pre-2026-09 spelling. Deleting the legacy rung (#3836) is correct — but deleting a
+# silent RECOVERY must not leave a silent LOSS in its place. Without this stop, an
+# un-cut-over box's documented unflagged re-run resolves to the "[]" convention below,
+# standup.sh writes that back as ISLAND_SEED_PEERS, and the federation link is emptied
+# with no error and a green health check: #3734 exactly, re-opened by the cleanup that
+# followed the rename. The bracket-shape guard further down cannot catch it — "[]" is
+# bracket-delimited and perfectly valid.
+#
+# Not a fallback: the legacy VALUE is never read or written. The operator is told what
+# to rename, and an explicit --seed-peers flag still wins outright (it is checked
+# first, and an operator who passes it has stated their intent).
+if [ -z "$seed_peers" ] && [ -n "$(_read_kv "$gw_env" GATEWAY_SEED_PEERS)" ]; then
+  echo "resolve-gateway-env: this .env records its seed peers under the retired GATEWAY_SEED_PEERS name and has no ISLAND_SEED_PEERS. Continuing would resolve the federation list to [] and silently unpeer this island on the next standup write. Rename the key to ISLAND_SEED_PEERS in $gw_env (the value is unchanged), or pass --seed-peers with the intended array." >&2
+  exit 1
+fi
 [ -n "$seed_peers" ] || seed_peers="[]"
 
 # Same order, but the flag is TRI-STATE. --enable-passkeys and --no-passkeys are both

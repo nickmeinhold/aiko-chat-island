@@ -147,9 +147,11 @@ written. That is why every identity var in `config.py` is a real field with a re
 default and a blank-is-absent rule, rather than an alias: at the container boundary
 "the operator said nothing" and "the operator set blank" are the same bytes.
 
-**Cutover order:** deploy the image FIRST (it understands both), then flip each box's
-`.env`, then delete the legacy fields, their resolver, the compose forwards, the
-legacy rung in `resolve-gateway-env.sh`, and the two legacy tests.
+**Cutover order, as it was actually run** (historical — every step is done, and the
+recipe no longer has anything to act on): the image shipped first, understanding both
+spellings; then each box's `.env` was flipped to `ISLAND_*` and verified live; then the
+legacy fields, their resolver, the compose forwards, the legacy rung in
+`resolve-gateway-env.sh` and the two legacy tests were deleted (#3836, 2026-09-05).
 
 ## App-side (coordinated, after this lock)
 
