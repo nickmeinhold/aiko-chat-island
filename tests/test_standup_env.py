@@ -578,3 +578,44 @@ def test_the_failing_listing_test_can_actually_pass(island) -> None:
         "the refusal did not name the key, so the test above could be passing on a "
         "generic failure rather than on the guard"
     )
+
+
+def test_a_failure_between_creating_and_writing_the_sfu_env_strands_nothing(island) -> None:
+    """The EXIT trap can only remove a path it can NAME. An earlier revision created the
+    staged SFU file with `mktemp` and recorded it in the trap-visible variable several
+    lines later, after the heredoc and the chmod — so a failure in between left a mode-600
+    file holding LIVEKIT_API_SECRET beside the real one, invisible to the trap (Carnot,
+    cage-match #159 round 2). The window is closed by assigning the tracked name AT the
+    mktemp; this proves it by failing inside the window."""
+    lk_env = _media_island(island)
+    script = island.root / "deploy" / "standup.sh"
+    script.write_text(script.read_text().replace(
+        'LK_ENV_TARGET="$lk_env"\n  cat > "$LK_ENV_STAGED"',
+        'LK_ENV_TARGET="$lk_env"\n  false\n  cat > "$LK_ENV_STAGED"', 1))
+
+    island.run("--with-media", "--livekit-domain", "livekit.example.org", expect_ok=False)
+
+    strays = [p.name for p in lk_env.parent.glob(".env.??????")]
+    assert not strays, (
+        f"a failure between creating and writing the staged SFU env stranded a "
+        f"secret-bearing temp file the trap could not see: {strays}"
+    )
+
+
+def test_the_stranded_file_test_can_actually_fail(island) -> None:
+    """NULL ARM. Injecting the same failure BEFORE the tracked assignment must strand a
+    file — otherwise the test above could pass because the injection never fired, or
+    because --with-media never reached the mktemp at all."""
+    lk_env = _media_island(island)
+    script = island.root / "deploy" / "standup.sh"
+    script.write_text(script.read_text().replace(
+        'LK_ENV_STAGED="$(mktemp "${lk_env}.XXXXXX")"',
+        'LK_ENV_STAGED_UNTRACKED="$(mktemp "${lk_env}.XXXXXX")"\n  false', 1))
+
+    island.run("--with-media", "--livekit-domain", "livekit.example.org", expect_ok=False)
+
+    strays = [p.name for p in lk_env.parent.glob(".env.??????")]
+    assert strays, (
+        "the injection did not strand anything, so the test above proves nothing about "
+        "the trap — it may simply never have reached the staging code"
+    )
