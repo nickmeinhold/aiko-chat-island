@@ -167,8 +167,13 @@ curl -s https://chat.example.org/.well-known/assetlinks.json | jq   # non-empty 
 # A re-run REFUSES if .env holds keys standup does not itself write (a signing seed, APNs
 # credentials, MODERATOR_USER_IDS, ISLAND_VERSION…). The rewrite is a whole-file replace,
 # so those keys would be destroyed — several of them unrecoverably. The refusal names
-# every key at risk and leaves .env untouched; add them to the heredoc, or delete them
-# deliberately, then re-run. See claude-tasks#3921.
+# every key at risk and leaves .env untouched.
+#
+# The only bypass is --drop-env-keys K1,K2, which must name EVERY key the refusal listed:
+# an un-named key still refuses, and naming a key that is not at risk also refuses. It is
+# a bypass you can only satisfy by reading this run's output, which is deliberate — a
+# blanket --force would be typed once and thereafter be indistinguishable from having no
+# check. See claude-tasks#3921.
 
 # 3. confirm it's advertised:
 curl -s https://chat.example.org/v1/auth/providers | jq   # includes {"slug":"passkey"}

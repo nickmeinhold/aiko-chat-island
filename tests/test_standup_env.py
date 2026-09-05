@@ -619,3 +619,56 @@ def test_the_stranded_file_test_can_actually_fail(island) -> None:
         "the injection did not strand anything, so the test above proves nothing about "
         "the trap — it may simply never have reached the staging code"
     )
+
+
+# --- the ONLY bypass names its keys (cage-match #159 round 3, Carnot) ---------
+#
+# The refusal CAN be wrong: dotenv_keys is line-oriented, so a multiline quoted value
+# contributes phantom keys. A refusal that can be wrong with no bypass is a permanently
+# dead documented path — over-approximation is safe for data LOSS and unsafe for
+# AVAILABILITY. The bypass therefore exists, but must NAME every key, so it cannot be
+# typed as a reflex and cannot be satisfied from a stale list.
+
+def test_naming_every_at_risk_key_discharges_the_refusal(island) -> None:
+    island.run()
+    island.env_file.write_text(island.env_file.read_text() + "APNS_TEAM_ID=T1\nGITHUB_CLIENT_ID=g1\n")
+
+    island.run("--drop-env-keys", "APNS_TEAM_ID,GITHUB_CLIENT_ID")   # must SUCCEED
+
+    v = _values(island)
+    assert "APNS_TEAM_ID" not in v and "GITHUB_CLIENT_ID" not in v, (
+        "the keys were acknowledged for removal but survived — the flag did not do what "
+        "the operator consented to"
+    )
+
+
+def test_naming_only_some_at_risk_keys_still_refuses(island) -> None:
+    """THE ARM THAT MAKES IT AN ACKNOWLEDGEMENT AND NOT A FORCE. If a partial list passed,
+    the flag would be `--force` wearing a longer name."""
+    island.run()
+    before = island.env_file.read_text() + "APNS_TEAM_ID=T1\nGITHUB_CLIENT_ID=g1\n"
+    island.env_file.write_text(before)
+
+    out = island.run("--drop-env-keys", "APNS_TEAM_ID", expect_ok=False)
+    assert out.returncode != 0, "an un-named at-risk key was destroyed under a partial list"
+    assert "GITHUB_CLIENT_ID" in (out.stdout + out.stderr), "the remaining key was not named"
+    assert island.env_file.read_text() == before
+
+
+def test_naming_a_key_that_is_not_at_risk_refuses(island) -> None:
+    """Strict in the OTHER direction too. A stale or mistyped name means the list the
+    operator is working from is not this run's, and consent given against the wrong list is
+    not consent — it must not silently discharge nothing while reading as approval."""
+    island.run()
+    before = island.env_file.read_text()
+    out = island.run("--drop-env-keys", "SOME_KEY_THAT_IS_NOT_THERE", expect_ok=False)
+    assert out.returncode != 0
+    assert "SOME_KEY_THAT_IS_NOT_THERE" in (out.stdout + out.stderr)
+    assert island.env_file.read_text() == before
+
+
+def test_the_bypass_is_not_needed_on_a_clean_rerun(island) -> None:
+    """NULL ARM. A re-run with nothing at risk must succeed with no flag at all — without
+    this, a standup that refused every re-run would satisfy the arms above."""
+    island.run()
+    island.run()

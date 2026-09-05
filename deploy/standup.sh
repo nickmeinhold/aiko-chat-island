@@ -77,6 +77,7 @@ cd "$REPO_ROOT"
 # value (deploy/resolve-gateway-env.sh); "[]" / "false" are real choices that win.
 # Collapsing those two is #3734 — a re-run silently dropped the federation link.
 DOMAIN=""; DISPLAY_NAME=""; SEED_PEERS=""; ENABLE_PASSKEYS=""; DO_TLS="true"; INTERACTIVE="true"; FROM_SOURCE="false"
+DROP_ENV_KEYS=""
 # Media is OFF by default, unlike TLS. An island without HTTPS is broken; an island
 # without an SFU is a supported configuration the code already models
 # (livekit_tokens.is_configured() -> 503 "capability disabled"). Defaulting it ON
@@ -102,6 +103,18 @@ while [ $# -gt 0 ]; do
     --with-media)     DO_MEDIA="true"; shift ;;
     --turn-domain)    TURN_DOMAIN="${2:?--turn-domain needs a value}"; shift 2 ;;
     --livekit-domain) LIVEKIT_DOMAIN="${2:?--livekit-domain needs a value}"; shift 2 ;;
+    # The key-loss guard's ONLY bypass, and it is deliberately not a --force. It must
+    # NAME every key it is discharging, so it cannot be habituated: the list differs per
+    # box, it goes in the operator's shell history, and it is unusable as a reflex. A
+    # blanket flag would be typed once on a false alarm and thereafter be indistinguishable
+    # from having no guard — while what it waves through is unrecoverable secret loss.
+    #
+    # It exists because the refusal CAN be wrong. dotenv_keys is line-oriented with no
+    # quote state, so a multiline quoted value contributes phantom keys, and a refusal
+    # that can be wrong with no bypass is a permanently dead documented path (Carnot,
+    # cage-match #159 round 3: over-approximation is safe for data LOSS, and not safe for
+    # AVAILABILITY when refusal has no escape — two different axes).
+    --drop-env-keys)  DROP_ENV_KEYS="${2:?--drop-env-keys needs a comma-separated key list}"; shift 2 ;;
     --from-source)    FROM_SOURCE="true"; shift ;;
     --yes)            INTERACTIVE="false"; shift ;;
     -h|--help)        sed -n '2,/^set -euo/p' "$0" | sed 's/^# \{0,1\}//;/^set -euo/d'; exit 0 ;;
@@ -135,7 +148,7 @@ need() { command -v "$1" >/dev/null 2>&1 || die "missing required tool: $1"; }
 # would otherwise strand a readable secret under an unexpected name beside the real file.
 # One trap covers every exit; after a successful rename the staged paths no longer exist,
 # so it is a no-op on the happy path. Set BEFORE the first mktemp, not beside it.
-trap 'rm -f "${ENV_TMP:-}" "${LK_ENV_STAGED:-}" "${KEYS_HAVE:-}" "${KEYS_WANT:-}" 2>/dev/null || true' EXIT
+trap 'rm -f "${ENV_TMP:-}" "${LK_ENV_STAGED:-}" "${KEYS_HAVE:-}" "${KEYS_WANT:-}" "${KEYS_DROPPED:-}" "${KEYS_ACKED:-}" 2>/dev/null || true' EXIT
 
 # comm and sort are load-bearing for the key-loss guard below, and their absence has
 # OPPOSITE polarity: a missing `comm` kills the assignment (fails closed by accident), a
@@ -576,8 +589,28 @@ KEYS_HAVE="$(mktemp "${TMPDIR:-/tmp}/aiko-keys-have.XXXXXX")"
 KEYS_WANT="$(mktemp "${TMPDIR:-/tmp}/aiko-keys-want.XXXXXX")"
 dotenv_keys "$ENV_FILE" > "$KEYS_HAVE" || die "could not list the keys in $ENV_FILE, so the rewrite cannot be proved safe. Refusing to continue — your .env has NOT been touched."
 dotenv_keys "$ENV_TMP"  > "$KEYS_WANT" || die "could not list the keys of the .env this run would write, so the rewrite cannot be proved safe. Refusing to continue — your .env has NOT been touched."
-_dropped="$(comm -23 "$KEYS_HAVE" "$KEYS_WANT" | tr '\n' ' ')" \
+KEYS_DROPPED="$(mktemp "${TMPDIR:-/tmp}/aiko-keys-dropped.XXXXXX")"
+comm -23 "$KEYS_HAVE" "$KEYS_WANT" > "$KEYS_DROPPED" \
   || die "could not compare the current .env against the one this run would write, so the rewrite cannot be proved safe. Refusing to continue — your .env has NOT been touched."
+
+# --drop-env-keys discharges the refusal for the keys it NAMES, and is strict in BOTH
+# directions. Un-named keys still refuse (so it is not a force in disguise), and naming a
+# key that is NOT at risk also refuses — that means the operator is working from a stale
+# list or a typo, and a typo must never silently discharge nothing while reading as
+# consent. The effect is that the flag can only be satisfied by looking at THIS run's
+# output, which is the whole point of naming over forcing.
+KEYS_ACKED="$(mktemp "${TMPDIR:-/tmp}/aiko-keys-acked.XXXXXX")"
+printf '%s' "$DROP_ENV_KEYS" | tr ',' '\n' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' \
+  | grep -v '^$' | sort -u > "$KEYS_ACKED" || true
+_spurious="$(comm -13 "$KEYS_DROPPED" "$KEYS_ACKED" | tr '\n' ' ')"
+if [ -n "${_spurious// /}" ]; then
+  die "--drop-env-keys names keys that are NOT at risk in this run:
+    ${_spurious}
+  Nothing was changed. Re-run without the flag to see the real list — a stale or mistyped
+  name means the list you are working from is not this run's, and consent given against
+  the wrong list is not consent."
+fi
+_dropped="$(comm -23 "$KEYS_DROPPED" "$KEYS_ACKED" | tr '\n' ' ')"
 if [ -n "${_dropped// /}" ]; then
   die "refusing to rewrite $ENV_FILE. This rewrite is a whole-file replace, and these keys
   are not ones standup writes, so they would be DESTROYED:
@@ -597,9 +630,15 @@ if [ -n "${_dropped// /}" ]; then
       ISLAND_SEED_PEERS and PASSKEY_ENABLED already are. That is a code change, so it is
       the wrong thing to attempt mid-incident.
 
-  Do NOT simply delete a listed name to get past this. If any of the names above look like
-  fragments of a value rather than settings you recognise, they are continuation lines of a
-  multi-line value and deleting them edits the value itself.
+  Do NOT delete a listed name from $ENV_FILE to get past this. If a name above looks like a
+  fragment of a value rather than a setting you recognise, it IS one — a continuation line
+  of a multi-line value, which this line-oriented check cannot see into — and deleting it
+  edits the value body. Use step 4 instead, which changes nothing in your file.
+
+   4. If you have decided these keys should go, or if a name above is a fragment of a
+      multi-line value rather than a setting, discharge them EXPLICITLY by naming them:
+        --drop-env-keys ${_dropped// /,}
+      Naming is required precisely so this cannot become a reflex.
 
   The real fix is preserve-on-rewrite rather than refuse — see claude-tasks#3921."
 fi
