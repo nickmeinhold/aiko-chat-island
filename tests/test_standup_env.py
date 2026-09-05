@@ -313,3 +313,515 @@ def test_the_standup_refusal_arm_can_actually_pass(island) -> None:
     island.run("--seed-peers", PEERS)
     island.run()
     assert _values(island)["ISLAND_SEED_PEERS"] == PEERS
+
+
+# The literal prose the refusal always prints, regardless of which keys were found. Any
+# key named in here is unusable as a fixture for the totality assertion below.
+_REFUSAL_PROSE = (
+    (Path(__file__).resolve().parents[1] / "deploy" / "standup.sh").read_text()
+)
+
+
+# --- the whole-file rewrite must not destroy what it does not write (#3921) ---
+#
+# Measured against the two live islands: a documented unflagged re-run would have taken
+# 15 keys off imagineering and 11 off enspyr, including ISLAND_SIGNING_SEED and
+# APNS_PRIVATE_KEY (which exist nowhere else) and ISLAND_VERSION (whose loss silently
+# unpins the next deploy). Each test below runs a CLEAN re-run first, so a guard that
+# simply refused everything would fail its own first assertion.
+
+def test_a_rerun_refuses_to_destroy_a_key_it_does_not_write(island) -> None:
+    island.run()
+    island.run()  # the null arm, inline: an unadorned re-run must still SUCCEED
+
+    before = island.env_file.read_text() + "ISLAND_SIGNING_SEED=not-recoverable-anywhere\n"
+    island.env_file.write_text(before)
+
+    result = island.run(expect_ok=False)
+    assert result.returncode != 0, (
+        "standup rewrote a .env holding a key it does not write — the signing seed is gone "
+        "and exists nowhere else"
+    )
+    assert "ISLAND_SIGNING_SEED" in (result.stdout + result.stderr), (
+        "the refusal must NAME the keys at risk; 'refusing to rewrite' alone tells an "
+        "operator nothing about what they nearly lost"
+    )
+    assert island.env_file.read_text() == before, (
+        "the aborted run mutated .env — the guard destroyed what it exists to protect"
+    )
+
+
+def test_the_key_loss_guard_uses_the_reader_grammar_not_a_naive_match(island) -> None:
+    """An `export`-prefixed key must be protected too.
+
+    This is not a hypothetical shape: an `export JWT_SECRET=` once read as absent and
+    standup MINTED A NEW SECRET, logging out every user (see deploy/lib/dotenv-read.sh's
+    header). A guard using `^[A-Z_]+=` would report that key as safe to destroy — so the
+    lister shares the reader's grammar rather than approximating it."""
+    island.run()
+    before = island.env_file.read_text() + "export APNS_PRIVATE_KEY=-----BEGIN-FAKE-----\n"
+    island.env_file.write_text(before)
+
+    result = island.run(expect_ok=False)
+    assert result.returncode != 0, "an export-prefixed key was not seen and would be destroyed"
+    assert "APNS_PRIVATE_KEY" in (result.stdout + result.stderr)
+    assert island.env_file.read_text() == before
+
+
+def test_the_guard_reports_every_dropped_key_not_just_the_first(island) -> None:
+    """An operator acts on the whole list or not at all. Reporting one key at a time turns
+    one refusal into N sequential rediscoveries of the same bug."""
+    island.run()
+    # Keys standup genuinely does not write, and NONE of which appear in the refusal's
+    # fixed prose. Two earlier fixtures were void: ISLAND_ID is read back now (so it tests
+    # the read-back, not the report), and ISLAND_VERSION is NAMED IN THE BOILERPLATE
+    # ("ISLAND_VERSION reverting to the compose default…"), so asserting it as a substring
+    # passed whether or not the guard ever listed it — a check paid for by the message it
+    # was checking (Tesla, cage-match #159).
+    before = island.env_file.read_text() + (
+        "APNS_TEAM_ID=T1\nGITHUB_CLIENT_ID=gh-1\nMODERATOR_USER_IDS=[\"op-1\"]\n"
+    )
+    island.env_file.write_text(before)
+    for boilerplate_key in ("APNS_TEAM_ID", "GITHUB_CLIENT_ID", "MODERATOR_USER_IDS"):
+        assert boilerplate_key not in _REFUSAL_PROSE, (
+            f"{boilerplate_key} appears in the refusal's fixed text, so asserting it below "
+            "would prove nothing about the reported list"
+        )
+
+    out = island.run(expect_ok=False)
+    assert out.returncode != 0, "the guard did not fire at all"
+    combined = out.stdout + out.stderr
+    for key in ("APNS_TEAM_ID", "GITHUB_CLIENT_ID", "MODERATOR_USER_IDS"):
+        assert key in combined, f"{key} was dropped from the report — the list must be total"
+    assert island.env_file.read_text() == before, "the refused run mutated .env"
+
+
+# --- ISLAND_ID survives a re-run (cage-match #159, Carnot) --------------------
+#
+# The guide tells a manual operator to set ISLAND_ID; standup never emitted one; the
+# key-loss guard refuses any .env holding a key standup does not write. Those three
+# together turned the documented manual path into one that could never be re-run — a
+# doc change and a guard interacting, neither wrong alone.
+
+def test_a_guide_written_island_id_survives_a_rerun(island) -> None:
+    island.run()
+    island.env_file.write_text(island.env_file.read_text() + "ISLAND_ID=example\n")
+
+    island.run()   # must SUCCEED: the guard has nothing to complain about any more
+    assert _values(island)["ISLAND_ID"] == "example", (
+        "the operator's explicit island identity was dropped by a re-run — the id "
+        "silently reverts to being derived from the base-url host, which re-namespaces "
+        "this island's LiveKit rooms"
+    )
+
+
+def test_the_island_id_readback_test_can_actually_fail(island) -> None:
+    """MUST-FAIL ARM. A fresh island sets no ISLAND_ID, so the key must be ABSENT rather
+    than present-and-empty — otherwise the assertion above could pass against a line
+    standup emits unconditionally, proving nothing about read-back."""
+    island.run()
+    assert "ISLAND_ID" not in _values(island), (
+        "standup emitted an ISLAND_ID for an island that never set one — read-back "
+        "became a default, which is #3835's call to make, not this guard's"
+    )
+
+
+# --- an abort must leave NO deploy state changed (cage-match #159, Carnot) ----
+#
+# The key-loss guard sits near the END of standup, and the --with-media path used to
+# install deploy/livekit/.env near the START. So "refused" meant "refused, but the media
+# half already landed" — a partial mutation wearing a clean abort's clothes. The SFU env
+# is now STAGED and renamed into place only after the last gate, under an EXIT trap.
+
+def _media_island(island):
+    """Give curl a public IP so --with-media can run. The default stub returns nothing,
+    which standup correctly treats as fatal (a blank node_ip advertises an unreachable
+    ICE candidate and every call fails at CONNECT, silently)."""
+    stub = island.root.parent / "bin" / "curl"
+    stub.write_text('#!/usr/bin/env bash\ncase "$*" in *ipify*) echo 203.0.113.9 ;; esac\nexit 0\n')
+    stub.chmod(0o755)
+    return island.root / "deploy" / "livekit" / ".env"
+
+
+def test_a_refused_rerun_does_not_install_the_sfu_env(island) -> None:
+    lk_env = _media_island(island)
+    island.run("--with-media", "--livekit-domain", "livekit.example.org")
+    assert lk_env.exists(), "fixture void: --with-media must have produced an SFU env"
+    # INODE, not content. The SFU env is deterministic given the same inputs, so a re-run
+    # rewrites it BYTE-IDENTICALLY — a content comparison passes whether or not the file
+    # was replaced, making it a check whose outcome is independent of the thing it checks.
+    # Caught by running this test against the pre-fix ordering, where it stayed green.
+    # `mv` installs a new inode, so the inode is what actually witnesses the install.
+    lk_before_ino = lk_env.stat().st_ino
+
+    island.env_file.write_text(island.env_file.read_text() + "APNS_PRIVATE_KEY=only-here\n")
+    result = island.run("--with-media", "--livekit-domain", "livekit.example.org",
+                        expect_ok=False)
+
+    assert result.returncode != 0, "the guard did not fire"
+    assert lk_env.stat().st_ino == lk_before_ino, (
+        "the refused run still installed a new SFU env — an abort changed deploy state, "
+        "so 'refused' does not mean 'nothing happened'"
+    )
+
+
+def test_a_refused_rerun_strands_no_temp_file_holding_the_sfu_secret(island) -> None:
+    """Staging moves the SFU file's install to the end of the run, which opens a window
+    where an abort could leave a mode-600 mktemp file holding LIVEKIT_API_SECRET beside
+    the real one. The EXIT trap has to close it on EVERY exit, not just the guard's."""
+    lk_env = _media_island(island)
+    island.run("--with-media", "--livekit-domain", "livekit.example.org")
+    island.env_file.write_text(island.env_file.read_text() + "APNS_PRIVATE_KEY=only-here\n")
+    island.run("--with-media", "--livekit-domain", "livekit.example.org", expect_ok=False)
+
+    # mktemp's suffix is exactly six chars, so this cannot collide with the tracked
+    # .env.example the fixture copies in — a wider glob matched it and failed for the
+    # wrong reason.
+    strays = [p.name for p in lk_env.parent.glob(".env.??????")] + \
+             [p.name for p in island.env_file.parent.glob(".env.??????")]
+    assert not strays, f"a staged secret-bearing temp file survived the abort: {strays}"
+
+
+# --- the guard's own failure modes (cage-match #159, Tesla) -------------------
+
+def test_a_key_the_reader_could_read_is_not_invisible_to_the_lister(island) -> None:
+    """The lister must OVER-approximate, because the two directions are not symmetric: a
+    name it misses is destroyed silently, a name it invents only causes a readable refusal.
+    dotenv_read interpolates whatever key its caller asks for and has no charset at all, so
+    a lister with a narrow `[A-Z_]+` charset would report `FOO.BAR` as safe to delete."""
+    island.run()
+    before = island.env_file.read_text() + "APNS.TEAM-ID=T1\n"
+    island.env_file.write_text(before)
+    out = island.run(expect_ok=False)
+    assert out.returncode != 0, "a dotted/hyphenated key was invisible and would be destroyed"
+    assert "APNS.TEAM-ID" in (out.stdout + out.stderr)
+    assert island.env_file.read_text() == before
+
+
+def test_a_commented_out_assignment_is_not_reported_as_a_key(island) -> None:
+    """The null arm of the widening. Over-approximation is the safe direction, but it stops
+    at comments — otherwise a `#OLD_KEY=x` left in a .env would brick every re-run, and a
+    guard that refuses on a comment gets disabled by the first operator who meets it."""
+    island.run()
+    island.env_file.write_text(island.env_file.read_text() + "#RETIRED_KEY=old\n# X=1\n")
+    island.run()   # must SUCCEED
+
+
+def test_the_key_listing_propagates_a_read_error_instead_of_reporting_no_keys(island) -> None:
+    """`grep | sed | sort` returns the STATUS OF SORT, so a grep that died of an I/O error
+    reads as 'this file assigns nothing' — which the comparison then treats as 'nothing to
+    preserve'. That is the non-match-is-absence shape deploy/lib/dotenv-read.sh exists to
+    kill, committed by the function enforcing it. grep: 0 matched, 1 no-match (legitimate),
+    >=2 real error."""
+    lib = island.root / "deploy" / "lib" / "dotenv-read.sh"
+    unreadable = island.root / "locked.env"
+    unreadable.write_text("SECRET=x\n")
+    unreadable.chmod(0o000)
+    try:
+        r = subprocess.run(
+            ["bash", "-c", f'source "{lib}"; dotenv_keys "{unreadable}"'],
+            capture_output=True, text=True)
+        assert r.returncode != 0, (
+            "an unreadable file listed as zero keys with a SUCCESS status — the caller "
+            "would read that as 'nothing to preserve' and destroy everything in it"
+        )
+    finally:
+        unreadable.chmod(0o600)
+
+
+def test_an_empty_but_valid_env_lists_no_keys_and_succeeds(island) -> None:
+    """NULL ARM for the test above: 'no assignments' must stay a SUCCESS, or a brand-new
+    island — which legitimately has no .env — could never stand up."""
+    lib = island.root / "deploy" / "lib" / "dotenv-read.sh"
+    empty = island.root / "empty.env"
+    empty.write_text("# just a comment\n")
+    r = subprocess.run(["bash", "-c", f'source "{lib}"; dotenv_keys "{empty}"'],
+                       capture_output=True, text=True)
+    assert r.returncode == 0 and r.stdout.strip() == ""
+
+
+def test_a_failing_key_listing_aborts_instead_of_rewriting(island) -> None:
+    """THE FAIL-OPEN THIS GUARD ALMOST SHIPPED WITH.
+
+    The first draft compared `<(dotenv_keys A)` against `<(dotenv_keys B)`. Process
+    substitution DISCARDS the child's exit status even under `set -euo pipefail`, so a
+    lister that died produced an empty fifo, `comm` compared nothing against nothing, the
+    dropped set was empty, and the rewrite proceeded — a comparison that never happened,
+    wearing the clothes of "nothing to preserve". This script already documents that exact
+    swallow eighty lines above, for the resolver.
+
+    The fixture's deploy/ is a COPY, so the lister can be broken here without touching the
+    real one."""
+    island.run()
+    before = island.env_file.read_text() + "ISLAND_SIGNING_SEED=not-recoverable\n"
+    island.env_file.write_text(before)
+
+    lib = island.root / "deploy" / "lib" / "dotenv-read.sh"
+    lib.write_text(lib.read_text() + '\ndotenv_keys() { return 3; }\n')
+
+    result = island.run(expect_ok=False)
+    assert result.returncode != 0, (
+        "the key listing FAILED and standup rewrote .env anyway — the guard did not run, "
+        "and its silence was read as 'nothing to preserve'"
+    )
+    assert island.env_file.read_text() == before, "the signing seed was destroyed"
+
+
+def test_the_failing_listing_test_can_actually_pass(island) -> None:
+    """NULL ARM. With the lister intact and the same extra key present, the run must fail
+    for the RIGHT reason — naming the key — rather than for the broken-lister reason. Two
+    different aborts are not the same abort."""
+    island.run()
+    island.env_file.write_text(island.env_file.read_text() + "ISLAND_SIGNING_SEED=x\n")
+    out = island.run(expect_ok=False)
+    assert "ISLAND_SIGNING_SEED" in (out.stdout + out.stderr), (
+        "the refusal did not name the key, so the test above could be passing on a "
+        "generic failure rather than on the guard"
+    )
+
+
+def test_a_failure_between_creating_and_writing_the_sfu_env_strands_nothing(island) -> None:
+    """The EXIT trap can only remove a path it can NAME. An earlier revision created the
+    staged SFU file with `mktemp` and recorded it in the trap-visible variable several
+    lines later, after the heredoc and the chmod — so a failure in between left a mode-600
+    file holding LIVEKIT_API_SECRET beside the real one, invisible to the trap (Carnot,
+    cage-match #159 round 2). The window is closed by assigning the tracked name AT the
+    mktemp; this proves it by failing inside the window."""
+    lk_env = _media_island(island)
+    script = island.root / "deploy" / "standup.sh"
+    script.write_text(script.read_text().replace(
+        'LK_ENV_TARGET="$lk_env"\n  cat > "$LK_ENV_STAGED"',
+        'LK_ENV_TARGET="$lk_env"\n  false\n  cat > "$LK_ENV_STAGED"', 1))
+
+    island.run("--with-media", "--livekit-domain", "livekit.example.org", expect_ok=False)
+
+    strays = [p.name for p in lk_env.parent.glob(".env.??????")]
+    assert not strays, (
+        f"a failure between creating and writing the staged SFU env stranded a "
+        f"secret-bearing temp file the trap could not see: {strays}"
+    )
+
+
+def test_the_stranded_file_test_can_actually_fail(island) -> None:
+    """NULL ARM. Injecting the same failure BEFORE the tracked assignment must strand a
+    file — otherwise the test above could pass because the injection never fired, or
+    because --with-media never reached the mktemp at all."""
+    lk_env = _media_island(island)
+    script = island.root / "deploy" / "standup.sh"
+    script.write_text(script.read_text().replace(
+        'LK_ENV_STAGED="$(mktemp "${lk_env}.XXXXXX")"',
+        'LK_ENV_STAGED_UNTRACKED="$(mktemp "${lk_env}.XXXXXX")"\n  false', 1))
+
+    island.run("--with-media", "--livekit-domain", "livekit.example.org", expect_ok=False)
+
+    strays = [p.name for p in lk_env.parent.glob(".env.??????")]
+    assert strays, (
+        "the injection did not strand anything, so the test above proves nothing about "
+        "the trap — it may simply never have reached the staging code"
+    )
+
+
+# --- the ONLY bypass names its keys (cage-match #159 round 3, Carnot) ---------
+#
+# The refusal CAN be wrong: dotenv_keys is line-oriented, so a multiline quoted value
+# contributes phantom keys. A refusal that can be wrong with no bypass is a permanently
+# dead documented path — over-approximation is safe for data LOSS and unsafe for
+# AVAILABILITY. The bypass therefore exists, but must NAME every key, so it cannot be
+# typed as a reflex and cannot be satisfied from a stale list.
+
+def test_naming_every_at_risk_key_discharges_the_refusal(island) -> None:
+    island.run()
+    island.env_file.write_text(island.env_file.read_text() + "APNS_TEAM_ID=T1\nGITHUB_CLIENT_ID=g1\n")
+
+    island.run("--drop-env-keys", "APNS_TEAM_ID,GITHUB_CLIENT_ID")   # must SUCCEED
+
+    v = _values(island)
+    assert "APNS_TEAM_ID" not in v and "GITHUB_CLIENT_ID" not in v, (
+        "the keys were acknowledged for removal but survived — the flag did not do what "
+        "the operator consented to"
+    )
+
+
+def test_naming_only_some_at_risk_keys_still_refuses(island) -> None:
+    """THE ARM THAT MAKES IT AN ACKNOWLEDGEMENT AND NOT A FORCE. If a partial list passed,
+    the flag would be `--force` wearing a longer name."""
+    island.run()
+    before = island.env_file.read_text() + "APNS_TEAM_ID=T1\nGITHUB_CLIENT_ID=g1\n"
+    island.env_file.write_text(before)
+
+    out = island.run("--drop-env-keys", "APNS_TEAM_ID", expect_ok=False)
+    assert out.returncode != 0, "an un-named at-risk key was destroyed under a partial list"
+    assert "GITHUB_CLIENT_ID" in (out.stdout + out.stderr), "the remaining key was not named"
+    assert island.env_file.read_text() == before
+
+
+def test_naming_a_key_that_is_not_at_risk_refuses(island) -> None:
+    """Strict in the OTHER direction too. A stale or mistyped name means the list the
+    operator is working from is not this run's, and consent given against the wrong list is
+    not consent — it must not silently discharge nothing while reading as approval."""
+    island.run()
+    before = island.env_file.read_text()
+    out = island.run("--drop-env-keys", "SOME_KEY_THAT_IS_NOT_THERE", expect_ok=False)
+    assert out.returncode != 0
+    assert "SOME_KEY_THAT_IS_NOT_THERE" in (out.stdout + out.stderr)
+    assert island.env_file.read_text() == before
+
+
+def test_the_bypass_is_not_needed_on_a_clean_rerun(island) -> None:
+    """NULL ARM. A re-run with nothing at risk must succeed with no flag at all — without
+    this, a standup that refused every re-run would satisfy the arms above."""
+    island.run()
+    island.run()
+
+
+def test_a_nul_byte_does_not_blind_the_key_listing(island) -> None:
+    """A NUL ANYWHERE IN .env USED TO DEFEAT THE LISTING ITSELF.
+
+    Without `grep -a`, one NUL makes grep declare "Binary file … matches" and emit no
+    matching lines — so this returns a single nonsense entry, or on a grep that instead
+    exits 1, THE EMPTY SET WITH A SUCCESS STATUS. A caller comparing that against the file
+    it is about to write computes "nothing would be dropped" and rewrites over a live
+    signing seed. Not exotic: a value pasted out of a UTF-16 editor carries them. This is
+    non-match-is-absence at the one input that is not an ASCII line — the ghost
+    deploy/lib/dotenv-read.sh exists to bury (Tesla, cage-match #159 round 2).
+
+    Tested at the LIBRARY, because that is where `grep -a` is the only variable. Driving
+    it through standup proves less than it appears to: resolve-media-env.sh aborts on the
+    same file first, so the run dies for an unrelated reason and the key-loss guard is
+    never reached — incidental protection, not this guard working.
+    """
+    lib = island.root / "deploy" / "lib" / "dotenv-read.sh"
+    env = island.root / "nul.env"
+    # BOTH ORDERINGS. An earlier version of this test only put the seed BEFORE the NUL, so
+    # it could not have gone red for a reader that TRUNCATES at the first NUL rather than
+    # skipping the file — a check whose success was independent of one of the two failure
+    # shapes (Tesla, cage-match #159 confirming pass). The truncation shape does not in
+    # fact occur here (bash's $() strips NULs rather than truncating, measured on 3.2),
+    # but the arm costs nothing and the criticism was right about the test.
+    for name, body in (
+        ("seed-before-nul", b"ISLAND_SIGNING_SEED=x\nJUNK=\x00\nAPNS_TEAM_ID=T1\n"),
+        ("seed-after-nul",  b"JUNK=\x00\nISLAND_SIGNING_SEED=x\nAPNS_TEAM_ID=T1\n"),
+    ):
+        env.write_bytes(body)
+        r = subprocess.run(["bash", "-c", f'source "{lib}"; dotenv_keys "{env}"'],
+                           capture_output=True, text=True)
+        keys = set(r.stdout.split())
+        assert r.returncode == 0, f"{name}: the listing failed outright: {r.stderr}"
+        assert {"ISLAND_SIGNING_SEED", "APNS_TEAM_ID"} <= keys, (
+            f"{name}: a NUL byte blinded the listing — got {keys or 'nothing'}. A caller "
+            "would read that as 'nothing to preserve' and destroy the seed."
+        )
+
+
+def test_a_nul_bearing_env_is_never_silently_rewritten(island) -> None:
+    """The invariant that actually matters, asserted without caring WHICH guard fires.
+    Something must stop a run against a file the tooling cannot fully read, and the file
+    must survive. Today the media resolver aborts first; if that ever changes, the
+    key-loss guard is now able to see the file itself."""
+    island.run()
+    before = island.env_file.read_bytes() + b"ISLAND_SIGNING_SEED=not-recoverable\nJUNK=\x00\n"
+    island.env_file.write_bytes(before)
+
+    result = island.run(expect_ok=False)
+    assert result.returncode != 0, "a NUL-bearing .env was rewritten"
+    assert island.env_file.read_bytes() == before, "the signing seed was destroyed"
+
+
+def test_the_nul_test_can_actually_pass(island) -> None:
+    """NULL ARM for the library test: the SAME file without the NUL must list the same
+    keys, so the assertion above discriminates on the NUL rather than on the fixture."""
+    lib = island.root / "deploy" / "lib" / "dotenv-read.sh"
+    env = island.root / "clean.env"
+    env.write_bytes(b"ISLAND_SIGNING_SEED=not-recoverable\nJUNK=x\nAPNS_TEAM_ID=T1\n")
+    r = subprocess.run(["bash", "-c", f'source "{lib}"; dotenv_keys "{env}"'],
+                       capture_output=True, text=True)
+    assert {"ISLAND_SIGNING_SEED", "APNS_TEAM_ID"} <= set(r.stdout.split())
+
+
+def test_a_nul_does_not_corrupt_the_value_reader(island) -> None:
+    """WORSE THAN A MISSED KEY. Without `grep -a`, one NUL makes grep answer "Binary file X
+    matches", which flows through tail/sed unchanged and is RETURNED AS THE VALUE. For
+    JWT_SECRET that is a re-mint when the sentence is short (standup's >= 32 check rejects
+    it and every live session dies — the incident in dotenv-read.sh's own header) or, on a
+    longer path, a JWT secret that IS that sentence. The lister got `-a` first; the reader
+    is the half that mints secrets (Tesla, cage-match #159 confirming pass)."""
+    lib = island.root / "deploy" / "lib" / "dotenv-read.sh"
+    env = island.root / "jwt.env"
+    secret = "the-real-one-that-must-not-change-0000"
+    env.write_bytes(f"JWT_SECRET={secret}\n".encode() + b"JUNK=\x00\n")
+
+    r = subprocess.run(["bash", "-c", f'source "{lib}"; dotenv_read "{env}" JWT_SECRET'],
+                       capture_output=True, text=True)
+    assert r.stdout == secret, (
+        f"the reader returned {r.stdout!r} instead of the secret — a NUL anywhere in .env "
+        "either re-mints JWT_SECRET (logging out every user) or installs grep's own "
+        "diagnostic sentence as the signing key"
+    )
+
+
+# The shape of a real live island's .env, by SEVERITY TIER rather than by copying a
+# box's current key list — a census pinned to today's boxes goes stale the first time
+# someone adds a key, and a test that must be edited to stay true stops being read.
+# Every name here is one both live islands actually carry.
+_LIVE_SHAPED_KEYS = {
+    # unrecoverable: exists nowhere but the box
+    "ISLAND_SIGNING_SEED", "APNS_PRIVATE_KEY", "GITHUB_CLIENT_SECRET",
+    # loud: the island refuses to boot without them
+    "MODERATOR_USER_IDS", "CSAM_RUNBOOK_ACKNOWLEDGED",
+    # silent and dangerous: reverts to the compose default and unpins the next deploy
+    "ISLAND_VERSION", "ENVIRONMENT",
+    # ordinary operator config
+    "APNS_KEY_ID", "APNS_TEAM_ID", "APNS_TOPIC", "APNS_USE_SANDBOX",
+    "APPLE_CLIENT_IDS", "GOOGLE_CLIENT_IDS", "SOCIAL_SIGNIN_ENABLED",
+}
+
+
+def _reported_at_risk(result) -> set[str]:
+    """The keys the refusal actually LISTED, parsed out of its own report line.
+
+    Searching the whole of stdout+stderr for a key name cannot tell "reported" from
+    "mentioned": four of these names appear in standup.sh's own prose, so a substring
+    assertion would be satisfied by boilerplate — which is exactly how an earlier version
+    of this file's totality test went void. Parsing the list removes the ambiguity instead
+    of working around it, and it lets the assertion compare SETS rather than probe for
+    membership one name at a time."""
+    text = result.stdout + result.stderr
+    marker = "DESTROYED:"
+    assert marker in text, f"the refusal did not print its report line:\n{text[-800:]}"
+    return set(text.split(marker, 1)[1].split("\n")[1].split())
+
+
+def test_every_key_of_a_live_shaped_env_is_reported_at_risk(island) -> None:
+    """TOTALITY, against the shape a production .env actually has.
+
+    The other refusal tests use one or three names. A guard that reported MOST of the
+    at-risk keys and quietly dropped one would pass all of them — and the dropped one
+    might be the signing seed. The PR body cited a run against both boxes' real key sets;
+    that was a measurement, not a committed check, so the suite could not have noticed the
+    heredoc growing a tenth key and a live name falling off the WANT side (Tesla,
+    cage-match #159 confirming pass)."""
+    island.run()
+    text = island.env_file.read_text()
+    already = {l.split("=", 1)[0] for l in text.splitlines() if "=" in l and not l.startswith("#")}
+    extra = sorted(_LIVE_SHAPED_KEYS - already)
+    assert len(extra) >= 12, "fixture void: standup already writes most of these"
+    island.env_file.write_text(text + "".join(f"{k}=synthetic\n" for k in extra))
+
+    reported = _reported_at_risk(island.run(expect_ok=False))
+    assert reported == set(extra), (
+        f"the reported list is not the at-risk set. Omitted (would be destroyed "
+        f"silently): {sorted(set(extra) - reported)}. Invented: {sorted(reported - set(extra))}"
+    )
+
+
+def test_the_totality_test_reads_the_list_and_not_the_prose(island) -> None:
+    """NULL ARM. Parsing must yield NOTHING for keys that are merely mentioned. Four of the
+    names above appear in standup.sh's own text, so this pins that the parser reads the
+    report line rather than the surrounding explanation."""
+    island.run()
+    island.env_file.write_text(island.env_file.read_text() + "APNS_TEAM_ID=T1\n")
+    reported = _reported_at_risk(island.run(expect_ok=False))
+    assert reported == {"APNS_TEAM_ID"}, (
+        f"parsed {sorted(reported)} from a run with exactly one key at risk — the parser "
+        "is picking up prose, so the totality assertion would be satisfied by boilerplate"
+    )
