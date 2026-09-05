@@ -263,6 +263,46 @@ curl -s https://chat.example.org/health      # via Caddy + Let's Encrypt
 
 ---
 
+## Staying current
+
+Your island is sovereign. Nobody can push it an update, there is no operator registry,
+and it will never update itself — which is the point, and also means **a security fix
+reaches you only if you go and get it.**
+
+Two ways to hear about one, and they are complementary:
+
+1. **Watch the releases page** — <https://github.com/nickmeinhold/aiko-chat-island/releases>,
+   press **Watch → Custom → Releases**. GitHub emails you. This works even when your
+   island is down, and it is the one to set up first.
+2. **The island tells you.** It checks the release list and logs a line when a newer
+   release exists. Read it with `docker compose logs chat-island | grep -i "newer island release"`.
+
+`ISLAND_UPDATE_NUDGE` in your `.env` chooses how much you hear about:
+
+| value | you are told about |
+|---|---|
+| `off` | nothing — the island makes no outbound release check at all |
+| `major` | **breaking** releases only *(default)* |
+| `minor` | breaking + feature releases |
+| `all` | every release, including patches |
+
+The check costs one request a day to GitHub, which means GitHub learns your box runs an
+island on roughly that schedule. It already learns as much when you pull an image, and
+your island's domain is public in DNS — but a daily call is a heartbeat where a pull is
+an event, so `off` is a real supported choice and not a debug flag.
+
+**Taking an update** is always yours to do, and is always the same two steps:
+
+```sh
+# in your island directory
+sed -i.bak 's/^ISLAND_VERSION=.*/ISLAND_VERSION=X.Y.Z/' .env   # the version WITHOUT the leading v
+./deploy/update.sh --yes
+```
+
+`update.sh` backs up the database before it does anything, pulls the pinned image,
+recreates the stack, and verifies `/health` — refusing to report success if the island
+does not come back.
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |
