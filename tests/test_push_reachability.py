@@ -155,10 +155,34 @@ async def test_health_reports_live_reachability_not_a_boot_snapshot(
 
 
 async def test_health_keeps_its_existing_shape(health_client, unconfigured):
-    """Additive only — monitoring depends on these keys."""
+    """Additive only for the keys a consumer actually reads.
+
+    The previous version of this docstring said "monitoring depends on these
+    keys" and pinned `channels` on that basis. Measured: the only two consumers
+    are the compose healthcheck (HTTP status alone) and `deploy/update.sh`,
+    which parses `git_sha` and `ref` and nothing else. No monitoring read
+    `channels`; the claim was prose, not a dependency.
+    """
     body = (await health_client.get("/health")).json()
     assert body["status"] == "ok"
-    assert "aiko_connected" in body and "channels" in body
+    assert "aiko_connected" in body
+    assert "git_sha" in body["build"] and "ref" in body["build"]
+
+
+async def test_health_does_not_publish_channel_names(health_client, unconfigured):
+    """/health is unauthenticated, so anything in it is public.
+
+    Channel names are what people talk about, and the island's standing position
+    is that it declines to know or tell (claude-tasks#3769). This endpoint
+    echoed `settings.aiko_channels` — config intent, never live state — which
+    bought a debugging convenience nothing consumed at the price of publishing
+    the names to anyone. Nick, 2026-09-05: "there's no need".
+
+    This arm exists so the field cannot return by accident.
+    """
+    body = (await health_client.get("/health")).json()
+    assert "channels" not in body, (
+        "/health must not publish channel names — it is unauthenticated")
 
 
 # --------------------------------------------- /health must not become fragile

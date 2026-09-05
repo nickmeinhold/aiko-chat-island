@@ -362,7 +362,6 @@ async def health(session: DbSession) -> dict:
     return {
         "status": "ok",
         "aiko_connected": bool(state.bus and state.bus.connected),
-        "channels": settings.aiko_channels,
         "push": await _reachability(session),
         # UNSIGNED build provenance — what code is in this container. Read through
         # the module (not a name bound at import) so it stays patchable, and COPIED
