@@ -758,6 +758,15 @@ Next steps:
                         && echo "bundled SFU is up on $TURN_DOMAIN. Open UDP 3478, 7882-7892 and 50000-60000, and put TLS in front of 5349." \
                         || echo "no SFU — /v1/channels/*/video-token returns 503 (a supported state). Re-run with --with-media, or set LIVEKIT_URL/LIVEKIT_API_KEY/LIVEKIT_API_SECRET to use an existing one." )
 
+  • Staying current: nobody can push this island an update — it is yours, and it will
+                   never update itself. New releases are announced at
+                   https://github.com/nickmeinhold/aiko-chat-island/releases
+                   (press Watch -> Custom -> Releases to be emailed). This island also
+                   logs a line when a newer BREAKING release exists; set
+                   ISLAND_UPDATE_NUDGE to minor or all to hear about more, or off to
+                   stop it checking. To take an update: bump ISLAND_VERSION in .env
+                   and run deploy/update.sh.
+
 Re-running this script is safe: it won't rotate your JWT secret, wipe data, or
   reset the choices already recorded in .env (federation peers, passkey sign-in).
   Pass a flag only to CHANGE one — omitting --seed-peers or --enable-passkeys now
