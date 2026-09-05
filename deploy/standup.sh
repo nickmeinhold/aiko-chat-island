@@ -129,7 +129,20 @@ BASE_URL="https://$DOMAIN"
 # --- preflight: required tools ---------------------------------------------
 log "Preflight — checking required tools"
 need() { command -v "$1" >/dev/null 2>&1 || die "missing required tool: $1"; }
-need docker; need openssl; need curl
+# EVERY mode-600 temp file this script mints holds a secret — the gateway .env carries a
+# fresh JWT_SECRET, the staged SFU env carries LIVEKIT_API_SECRET. Both are installed by
+# rename at the very end, so every abort in between (a `die`, a set -e failure, Ctrl-C)
+# would otherwise strand a readable secret under an unexpected name beside the real file.
+# One trap covers every exit; after a successful rename the staged paths no longer exist,
+# so it is a no-op on the happy path. Set BEFORE the first mktemp, not beside it.
+trap 'rm -f "${ENV_TMP:-}" "${LK_ENV_STAGED:-}" "${KEYS_HAVE:-}" "${KEYS_WANT:-}" 2>/dev/null || true' EXIT
+
+# comm and sort are load-bearing for the key-loss guard below, and their absence has
+# OPPOSITE polarity: a missing `comm` kills the assignment (fails closed by accident), a
+# missing `sort` inside dotenv_keys empties both sides so nothing is ever reported dropped
+# (fails OPEN by the same accident). Declare them with the rest rather than discovering
+# the difference on a live box.
+need docker; need openssl; need curl; need comm; need sort
 docker compose version >/dev/null 2>&1 || die "docker compose v2 not available (need the 'docker compose' plugin)"
 docker info >/dev/null 2>&1 || die "cannot talk to the Docker daemon (is it running? are you in the docker group?)"
 ok "docker, git, openssl, curl, docker compose present"
@@ -342,8 +355,12 @@ LIVEKIT_API_KEY_ID=$lk_key
 LIVEKIT_API_SECRET=$lk_secret
 EOF_LK
   chmod 600 "$lk_env_tmp"
-  mv "$lk_env_tmp" "$lk_env"
-  ok "wrote $lk_env (mode 600, via atomic rename)"
+  # STAGED, NOT INSTALLED. The gateway .env key-loss guard below can still abort this
+  # run, and an abort must leave NO deploy state changed — installing the SFU env here
+  # would make "refused" mean "refused, but the media half already landed" (Carnot,
+  # cage-match #159). Both files are renamed into place together, after the last gate.
+  LK_ENV_STAGED="$lk_env_tmp"
+  LK_ENV_TARGET="$lk_env"
 
   LIVEKIT_ENV_BLOCK="
 # --- media (bundled SFU, --with-media). MUST match deploy/livekit/.env. ---
@@ -388,6 +405,21 @@ fi
 
 log "Step 2/$TOTAL — writing .env (island identity + secrets)"
 ENV_FILE="$REPO_ROOT/.env"
+
+# Preserve an explicit ISLAND_ID across re-runs. standup has never emitted one — the id
+# falls back to being derived from the base-url host — but the manual-standup recipe in
+# docs/standup-guide.md tells an operator to set it, and it is the value that namespaces
+# this island's LiveKit rooms across islands. Without this read-back the key-loss guard
+# below would refuse every re-run on any box that followed the guide, turning a documented
+# path into a dead one (Carnot, cage-match #159 — my own doc change and my own guard,
+# interacting).
+#
+# Read-back only, NOT a new default: a box that has never set one still gets no line, so
+# nothing changes for an island standing up fresh. Giving island_id a real value by
+# default is #3835's decision, not this guard's to make.
+ISLAND_ID_LINE=""
+_existing_island_id="$(dotenv_read "$ENV_FILE" ISLAND_ID)"
+[ -n "$_existing_island_id" ] && ISLAND_ID_LINE="ISLAND_ID='$_existing_island_id'"
 
 # Preserve an existing JWT secret across re-runs — rotating it invalidates every
 # live session. Only mint a new one on the very first run.
@@ -457,7 +489,7 @@ fi
 #
 # The one shape single quotes cannot carry is a literal apostrophe, so it is REFUSED
 # loudly with the escape named, rather than silently mangled.
-for _v in "$DISPLAY_NAME" "$SEED_PEERS"; do
+for _v in "$DISPLAY_NAME" "$SEED_PEERS" "$_existing_island_id"; do
   case "$_v" in
     *"'"*) die "a single quote (') cannot be represented in this island's .env. Rename, or use the JSON escape \\u0027 inside --seed-peers. Offending value: $_v" ;;
   esac
@@ -477,6 +509,7 @@ JWT_SECRET=$JWT_SECRET
 # GATEWAY_BASE_URL keeps its name deliberately — a base_url IS the gateway edge
 # (docs/island-vs-gateway.md).
 GATEWAY_BASE_URL=$BASE_URL
+$ISLAND_ID_LINE
 ISLAND_DISPLAY_NAME='$DISPLAY_NAME'
 PASSKEY_RP_ID=$DOMAIN
 
@@ -521,17 +554,56 @@ chmod 600 "$ENV_TMP"
 # that upstream check this comparison would read a locked file as "no keys to preserve"
 # and destroy everything in it — the non-match-is-absence trap dotenv-read.sh's header
 # describes.
-_dropped="$(comm -23 <(dotenv_keys "$ENV_FILE") <(dotenv_keys "$ENV_TMP") | tr '\n' ' ')"
+# CAPTURE AND CHECK, never process substitution. `<( )` discards the child's exit status
+# even under `set -euo pipefail`: a lister that dies yields an EMPTY fifo, `comm` compares
+# nothing against nothing, `_dropped` is empty, the guard does not fire, and the rewrite
+# proceeds — a comparison that did not happen wearing the clothes of "nothing to preserve".
+# The fail direction of the two new binaries is not even consistent: a missing `comm`
+# kills the assignment (closed, by accident) while a missing `sort` inside the lister
+# empties both sides (OPEN, by the same accident). A guard whose dependencies have
+# opposite polarity is not fail-closed.
+#
+# This script already names this exact swallow eighty lines up, for the resolver: "`done <
+# <(cmd)` swallows cmd's exit status … the loop simply reads nothing". That is #3734
+# through the error path. Reintroducing it here — on the path that exists to protect an
+# unrecoverable signing seed — would be the third instance of one class in one file
+# (Tesla, cage-match #159). So: capture to files, check the status, and die on either.
+KEYS_HAVE="$(mktemp "${TMPDIR:-/tmp}/aiko-keys-have.XXXXXX")"
+KEYS_WANT="$(mktemp "${TMPDIR:-/tmp}/aiko-keys-want.XXXXXX")"
+dotenv_keys "$ENV_FILE" > "$KEYS_HAVE" || die "could not list the keys in $ENV_FILE, so the rewrite cannot be proved safe. Refusing to continue — your .env has NOT been touched."
+dotenv_keys "$ENV_TMP"  > "$KEYS_WANT" || die "could not list the keys of the .env this run would write, so the rewrite cannot be proved safe. Refusing to continue — your .env has NOT been touched."
+_dropped="$(comm -23 "$KEYS_HAVE" "$KEYS_WANT" | tr '\n' ' ')" \
+  || die "could not compare the current .env against the one this run would write, so the rewrite cannot be proved safe. Refusing to continue — your .env has NOT been touched."
 if [ -n "${_dropped// /}" ]; then
-  rm -f "$ENV_TMP"
-  die "refusing to rewrite $ENV_FILE: it holds keys this standup does not write, and the rewrite is a whole-file replace that would DESTROY them:
+  die "refusing to rewrite $ENV_FILE. This rewrite is a whole-file replace, and these keys
+  are not ones standup writes, so they would be DESTROYED:
     ${_dropped}
-  Some of these cannot be recovered (a signing seed, an APNs key and a client secret exist only on this box), and ISLAND_VERSION reverting to the compose default silently unpins the next deploy. Your .env has NOT been touched.
-  If you meant to keep them, they must be added to the heredoc in deploy/standup.sh (or read back like ISLAND_SEED_PEERS / PASSKEY_ENABLED). If you really meant to lose them, delete them from $ENV_FILE yourself and re-run. See claude-tasks#3921."
+  Your .env has NOT been touched, and nothing else on this box was changed.
+
+  WHAT TO DO, easiest first:
+   1. You probably do not need standup at all. The settings a re-run exists to change —
+      the seed-peer list and the passkey switch — are read back automatically, so if that
+      is what you came for, pass the flag and you will land here again for no gain.
+   2. Back the file up before doing anything else:  cp $ENV_FILE $ENV_FILE.bak
+      Several of the keys above exist ONLY on this box (a signing seed, an APNs key, a
+      client secret). There is no copy to restore them from.
+   3. To have standup MANAGE one of these, it needs writing or reading back the way
+      ISLAND_SEED_PEERS and PASSKEY_ENABLED already are. That is a code change, so it is
+      the wrong thing to attempt mid-incident.
+
+  Do NOT simply delete a listed name to get past this. If any of the names above look like
+  fragments of a value rather than settings you recognise, they are continuation lines of a
+  multi-line value and deleting them edits the value itself.
+
+  The real fix is preserve-on-rewrite rather than refuse — see claude-tasks#3921."
 fi
 
 mv "$ENV_TMP" "$ENV_FILE"
 ok "wrote $ENV_FILE (mode 600, via atomic rename)"
+if [ -n "${LK_ENV_STAGED:-}" ]; then
+  mv "$LK_ENV_STAGED" "$LK_ENV_TARGET"
+  ok "wrote $LK_ENV_TARGET (mode 600, via atomic rename)"
+fi
 
 # --- step 3: bring the island up (4 containers, 1 image + stock mosquitto) ---
 if [ "$FROM_SOURCE" = "true" ]; then

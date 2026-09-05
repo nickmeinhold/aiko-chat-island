@@ -61,23 +61,48 @@ dotenv_read() {
 
 # dotenv_keys <file> — echoes every KEY the file assigns, one per line, deduplicated.
 #
-# SAME GRAMMAR AS dotenv_read, and that is the entire point of putting it here. The
-# caller that needs this (standup.sh, comparing what it is about to WRITE against what
-# it is about to DESTROY) must agree exactly with the reader about what counts as an
-# assignment — a key the lister misses is a key the comparison reports as safe. An
-# `export FOO=` line is the specific shape that would slip through a naive `^[A-Z_]+=`,
-# and it is the shape that already caused one silent JWT re-mint (see the header).
+# ITS JOB IS TO OVER-APPROXIMATE, and that is the opposite of dotenv_read's job. The
+# caller (standup.sh, comparing what it is about to WRITE against what it is about to
+# DESTROY) has asymmetric costs: a key this misses is a key the comparison reports as
+# SAFE TO DESTROY — silently, unrecoverably for a signing seed — while a spurious extra
+# name only produces a refusal the operator can read and act on. So the key pattern here
+# is deliberately WIDER than any real dotenv grammar: anything that is not whitespace and
+# not `=`, which admits `FOO.BAR`, `FOO-BAR`, and every shape python-dotenv accepts.
 #
-# The key expression is the reader's, with the key position opened up to a capture; the
-# two are edited together or not at all.
+# NOT "the same expression as the reader", which an earlier revision of this comment
+# claimed (Tesla, cage-match #159 — the prose over-claimed the code). dotenv_read
+# INTERPOLATES the caller's key with no charset at all, so it will happily read a name
+# this lister would never have to guess. There are two expressions with two purposes and
+# opposite error costs; they are edited together, and the reader's is the narrow one only
+# because its caller already knows the name it wants.
 #
-# Absence and unreadability are again indistinguishable here, deliberately, for the same
-# reason dotenv_read leaves that judgement to the caller: a brand-new island has no .env
-# and legitimately lists no keys. standup.sh checks readability separately before it
-# treats an empty listing as "nothing to preserve".
+# A leading `#` is excluded so a commented-out `#FOO=bar` is not reported as a key — that
+# is parity with python-dotenv rather than laxity, and it is the one place the widening
+# stops.
+#
+# KNOWN LIMIT, stated rather than papered over: this is line-oriented and has no quote
+# state, so a MULTILINE quoted value (python-dotenv accepts them; nothing this repo writes
+# produces one) would contribute its continuation lines as phantom keys wherever they look
+# like an assignment. That direction is safe — a phantom causes a refusal, never a
+# deletion — but the refusal's advice must not tell an operator to delete a phantom, since
+# that means editing the value body. Quote-aware parsing belongs with the merge design,
+# not here.
+#
+# Absence and unreadability are indistinguishable here, deliberately, for the same reason
+# dotenv_read leaves that judgement to the caller: a brand-new island has no .env and
+# legitimately lists no keys. standup.sh dies on an unreadable .env before it reaches this,
+# and checks this function's own exit status rather than reading silence as absence.
 dotenv_keys() {
   [ -f "$1" ] || return 0
-  grep -E "^[[:space:]]*(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*[[:space:]]*=" "$1" 2>/dev/null \
-    | sed -E "s/^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=.*/\2/" \
-    | sort -u
+  local _k='^[[:space:]]*(export[[:space:]]+)?([^=[:space:]#][^=[:space:]]*)[[:space:]]*='
+  local _raw _rc
+  # grep is run ALONE so its status survives. Down a pipeline the final `sort` returns 0
+  # no matter how grep died, so an I/O error would read as "this file assigns nothing" —
+  # the non-match-is-absence shape this whole file exists to kill, committed by the
+  # function that enforces it. grep's contract: 0 = matched, 1 = no match (a legitimately
+  # key-less file), >= 2 = a real error, which is the only one that must propagate.
+  _raw="$(grep -E "$_k" "$1")"; _rc=$?
+  [ "$_rc" -le 1 ] || return "$_rc"
+  [ -n "$_raw" ] || return 0
+  printf '%s\n' "$_raw" | sed -E "s/$_k.*/\2/" | sort -u
 }
