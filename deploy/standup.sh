@@ -563,10 +563,13 @@ chmod 600 "$ENV_TMP"
 # earlier version of this comment claimed they shared one expression, which was never
 # true (Tesla, cage-match #159).
 #
-# No override flag, deliberately: an operator who genuinely wants a key gone can remove it
-# from .env themselves, which is explicit and leaves a trace. A `--force` would be
-# habituated on the first false alarm and is then indistinguishable from not having the
-# check — and what it would be waving through is unrecoverable secret loss.
+# The only bypass NAMES its keys (--drop-env-keys, see the flag's own comment). It is not
+# a `--force`, which would be habituated on the first false alarm and thereafter be
+# indistinguishable from having no check, while what it waves through is unrecoverable
+# secret loss. An earlier version of THIS comment said "no override flag, deliberately"
+# and survived the commit that added the flag — the third instance in this change of prose
+# describing a previous version of its own code, and the only one that was operator-facing
+# (Tesla, cage-match #159 confirming pass).
 #
 # $ENV_FILE is guaranteed READABLE here: standup dies on an unreadable .env at the
 # JWT-secret block above, precisely so absence cannot be forged by permissions. Without
@@ -641,10 +644,16 @@ if [ -n "${_dropped// /}" ]; then
   of a multi-line value, which this line-oriented check cannot see into — and deleting it
   edits the value body. Use step 4 instead, which changes nothing in your file.
 
-   4. If you have decided these keys should go, or if a name above is a fragment of a
-      multi-line value rather than a setting, discharge them EXPLICITLY by naming them:
+   4. If you recognise EVERY name above as a setting you have decided to lose, discharge
+      them explicitly by naming them:
         --drop-env-keys ${_dropped_csv}
       Naming is required precisely so this cannot become a reflex.
+
+      DO NOT use step 4 if any name above is not a setting you recognise. Such a name is a
+      continuation line of a multi-line value, and its parent key is in this same list —
+      so naming the whole list consents to destroying the very secret the fragments came
+      from. There is no safe way past this case yet; that is what preserve-on-rewrite
+      (claude-tasks#3921) is for. Copy the file aside and leave standup alone.
 
   The real fix is preserve-on-rewrite rather than refuse — see claude-tasks#3921."
 fi

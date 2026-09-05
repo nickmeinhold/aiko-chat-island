@@ -50,7 +50,14 @@
 # treating absence as "first run" (see the existing_secret block there).
 dotenv_read() {
   local v q _re="^[[:space:]]*(export[[:space:]]+)?$2[[:space:]]*=[[:space:]]*"
-  v=$([ -f "$1" ] && grep -E "$_re" "$1" 2>/dev/null | tail -n1 | sed -E "s/$_re//; s/[[:space:]]*\r?$//" || true)
+  # -a for the same reason dotenv_keys carries it, and the consequence here is worse than
+  # a missed key. Without it a single NUL anywhere in the file makes grep answer "Binary
+  # file X matches", which flows through tail/sed unchanged and is RETURNED AS THE VALUE.
+  # For JWT_SECRET that is either a re-mint (the string is short, standup's >= 32 check
+  # rejects it, every live session dies — the incident in this file's own header) or, on a
+  # longer path, a JWT secret that IS the sentence "Binary file … matches". Measured, not
+  # reasoned (Tesla, cage-match #159 confirming pass).
+  v=$([ -f "$1" ] && LC_ALL=C grep -aE "$_re" "$1" 2>/dev/null | tail -n1 | sed -E "s/$_re//; s/[[:space:]]*\r?$//" || true)
   for q in '"' "'"; do
     if [ ${#v} -ge 2 ] && [ "${v#"$q"}" != "$v" ] && [ "${v%"$q"}" != "$v" ]; then
       v="${v#"$q"}"; v="${v%"$q"}"; break

@@ -692,16 +692,25 @@ def test_a_nul_byte_does_not_blind_the_key_listing(island) -> None:
     """
     lib = island.root / "deploy" / "lib" / "dotenv-read.sh"
     env = island.root / "nul.env"
-    env.write_bytes(b"ISLAND_SIGNING_SEED=not-recoverable\nJUNK=\x00\nAPNS_TEAM_ID=T1\n")
-
-    r = subprocess.run(["bash", "-c", f'source "{lib}"; dotenv_keys "{env}"'],
-                       capture_output=True, text=True)
-    keys = set(r.stdout.split())
-    assert r.returncode == 0, f"the listing failed outright: {r.stderr}"
-    assert {"ISLAND_SIGNING_SEED", "APNS_TEAM_ID"} <= keys, (
-        f"a NUL byte blinded the listing — got {keys or 'nothing'}. A caller would read "
-        "that as 'this file assigns nothing to preserve' and destroy the seed."
-    )
+    # BOTH ORDERINGS. An earlier version of this test only put the seed BEFORE the NUL, so
+    # it could not have gone red for a reader that TRUNCATES at the first NUL rather than
+    # skipping the file — a check whose success was independent of one of the two failure
+    # shapes (Tesla, cage-match #159 confirming pass). The truncation shape does not in
+    # fact occur here (bash's $() strips NULs rather than truncating, measured on 3.2),
+    # but the arm costs nothing and the criticism was right about the test.
+    for name, body in (
+        ("seed-before-nul", b"ISLAND_SIGNING_SEED=x\nJUNK=\x00\nAPNS_TEAM_ID=T1\n"),
+        ("seed-after-nul",  b"JUNK=\x00\nISLAND_SIGNING_SEED=x\nAPNS_TEAM_ID=T1\n"),
+    ):
+        env.write_bytes(body)
+        r = subprocess.run(["bash", "-c", f'source "{lib}"; dotenv_keys "{env}"'],
+                           capture_output=True, text=True)
+        keys = set(r.stdout.split())
+        assert r.returncode == 0, f"{name}: the listing failed outright: {r.stderr}"
+        assert {"ISLAND_SIGNING_SEED", "APNS_TEAM_ID"} <= keys, (
+            f"{name}: a NUL byte blinded the listing — got {keys or 'nothing'}. A caller "
+            "would read that as 'nothing to preserve' and destroy the seed."
+        )
 
 
 def test_a_nul_bearing_env_is_never_silently_rewritten(island) -> None:
@@ -727,3 +736,92 @@ def test_the_nul_test_can_actually_pass(island) -> None:
     r = subprocess.run(["bash", "-c", f'source "{lib}"; dotenv_keys "{env}"'],
                        capture_output=True, text=True)
     assert {"ISLAND_SIGNING_SEED", "APNS_TEAM_ID"} <= set(r.stdout.split())
+
+
+def test_a_nul_does_not_corrupt_the_value_reader(island) -> None:
+    """WORSE THAN A MISSED KEY. Without `grep -a`, one NUL makes grep answer "Binary file X
+    matches", which flows through tail/sed unchanged and is RETURNED AS THE VALUE. For
+    JWT_SECRET that is a re-mint when the sentence is short (standup's >= 32 check rejects
+    it and every live session dies — the incident in dotenv-read.sh's own header) or, on a
+    longer path, a JWT secret that IS that sentence. The lister got `-a` first; the reader
+    is the half that mints secrets (Tesla, cage-match #159 confirming pass)."""
+    lib = island.root / "deploy" / "lib" / "dotenv-read.sh"
+    env = island.root / "jwt.env"
+    secret = "the-real-one-that-must-not-change-0000"
+    env.write_bytes(f"JWT_SECRET={secret}\n".encode() + b"JUNK=\x00\n")
+
+    r = subprocess.run(["bash", "-c", f'source "{lib}"; dotenv_read "{env}" JWT_SECRET'],
+                       capture_output=True, text=True)
+    assert r.stdout == secret, (
+        f"the reader returned {r.stdout!r} instead of the secret — a NUL anywhere in .env "
+        "either re-mints JWT_SECRET (logging out every user) or installs grep's own "
+        "diagnostic sentence as the signing key"
+    )
+
+
+# The shape of a real live island's .env, by SEVERITY TIER rather than by copying a
+# box's current key list — a census pinned to today's boxes goes stale the first time
+# someone adds a key, and a test that must be edited to stay true stops being read.
+# Every name here is one both live islands actually carry.
+_LIVE_SHAPED_KEYS = {
+    # unrecoverable: exists nowhere but the box
+    "ISLAND_SIGNING_SEED", "APNS_PRIVATE_KEY", "GITHUB_CLIENT_SECRET",
+    # loud: the island refuses to boot without them
+    "MODERATOR_USER_IDS", "CSAM_RUNBOOK_ACKNOWLEDGED",
+    # silent and dangerous: reverts to the compose default and unpins the next deploy
+    "ISLAND_VERSION", "ENVIRONMENT",
+    # ordinary operator config
+    "APNS_KEY_ID", "APNS_TEAM_ID", "APNS_TOPIC", "APNS_USE_SANDBOX",
+    "APPLE_CLIENT_IDS", "GOOGLE_CLIENT_IDS", "SOCIAL_SIGNIN_ENABLED",
+}
+
+
+def _reported_at_risk(result) -> set[str]:
+    """The keys the refusal actually LISTED, parsed out of its own report line.
+
+    Searching the whole of stdout+stderr for a key name cannot tell "reported" from
+    "mentioned": four of these names appear in standup.sh's own prose, so a substring
+    assertion would be satisfied by boilerplate — which is exactly how an earlier version
+    of this file's totality test went void. Parsing the list removes the ambiguity instead
+    of working around it, and it lets the assertion compare SETS rather than probe for
+    membership one name at a time."""
+    text = result.stdout + result.stderr
+    marker = "DESTROYED:"
+    assert marker in text, f"the refusal did not print its report line:\n{text[-800:]}"
+    return set(text.split(marker, 1)[1].split("\n")[1].split())
+
+
+def test_every_key_of_a_live_shaped_env_is_reported_at_risk(island) -> None:
+    """TOTALITY, against the shape a production .env actually has.
+
+    The other refusal tests use one or three names. A guard that reported MOST of the
+    at-risk keys and quietly dropped one would pass all of them — and the dropped one
+    might be the signing seed. The PR body cited a run against both boxes' real key sets;
+    that was a measurement, not a committed check, so the suite could not have noticed the
+    heredoc growing a tenth key and a live name falling off the WANT side (Tesla,
+    cage-match #159 confirming pass)."""
+    island.run()
+    text = island.env_file.read_text()
+    already = {l.split("=", 1)[0] for l in text.splitlines() if "=" in l and not l.startswith("#")}
+    extra = sorted(_LIVE_SHAPED_KEYS - already)
+    assert len(extra) >= 12, "fixture void: standup already writes most of these"
+    island.env_file.write_text(text + "".join(f"{k}=synthetic\n" for k in extra))
+
+    reported = _reported_at_risk(island.run(expect_ok=False))
+    assert reported == set(extra), (
+        f"the reported list is not the at-risk set. Omitted (would be destroyed "
+        f"silently): {sorted(set(extra) - reported)}. Invented: {sorted(reported - set(extra))}"
+    )
+
+
+def test_the_totality_test_reads_the_list_and_not_the_prose(island) -> None:
+    """NULL ARM. Parsing must yield NOTHING for keys that are merely mentioned. Four of the
+    names above appear in standup.sh's own text, so this pins that the parser reads the
+    report line rather than the surrounding explanation."""
+    island.run()
+    island.env_file.write_text(island.env_file.read_text() + "APNS_TEAM_ID=T1\n")
+    reported = _reported_at_risk(island.run(expect_ok=False))
+    assert reported == {"APNS_TEAM_ID"}, (
+        f"parsed {sorted(reported)} from a run with exactly one key at risk — the parser "
+        "is picking up prose, so the totality assertion would be satisfied by boilerplate"
+    )
