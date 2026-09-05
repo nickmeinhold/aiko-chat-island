@@ -613,6 +613,10 @@ if [ -n "${_spurious// /}" ]; then
   the wrong list is not consent."
 fi
 _dropped="$(LC_ALL=C comm -23 "$KEYS_DROPPED" "$KEYS_ACKED" | tr '\n' ' ')"
+# Comma-joined with no trailing separator, because the refusal prints this as a command
+# for the operator to COPY while something has gone wrong. `A,B,` works (the empty field
+# is filtered) but invites a hand-edit at exactly the wrong moment.
+_dropped_csv="$(printf '%s' "$_dropped" | sed -E 's/^ +//; s/ +$//; s/ +/,/g')"
 if [ -n "${_dropped// /}" ]; then
   die "refusing to rewrite $ENV_FILE. This rewrite is a whole-file replace, and these keys
   are not ones standup writes, so they would be DESTROYED:
@@ -639,7 +643,7 @@ if [ -n "${_dropped// /}" ]; then
 
    4. If you have decided these keys should go, or if a name above is a fragment of a
       multi-line value rather than a setting, discharge them EXPLICITLY by naming them:
-        --drop-env-keys ${_dropped// /,}
+        --drop-env-keys ${_dropped_csv}
       Naming is required precisely so this cannot become a reflex.
 
   The real fix is preserve-on-rewrite rather than refuse — see claude-tasks#3921."
