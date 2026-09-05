@@ -202,7 +202,8 @@ sole-copy prod DB".
 # UPDATE to the latest published image — backup -> pull -> recreate -> verify:
 ./deploy/update.sh                              # the safe path (fail-closed on backup)
 
-# change display name / add peers / flip a flag — safe, keeps data + secret:
+# change display name / add peers / flip a flag. Keeps data + secret, and REFUSES rather
+# than proceeding if .env holds keys standup does not write (see the note above):
 ./deploy/standup.sh --domain chat.example.org --name "New Name" --seed-peers '[…]'
 
 # pin a specific version instead of tracking `edge` (main):

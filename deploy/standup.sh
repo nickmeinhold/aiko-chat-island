@@ -557,9 +557,11 @@ chmod 600 "$ENV_TMP"
 # exactly what happened. So the check is not a list of keys we own — a list is a second
 # artifact that drifts from this heredoc silently, which is the same defect one level up.
 # It COMPARES THE FILE WE ARE ABOUT TO WRITE AGAINST THE FILE WE ARE ABOUT TO DESTROY,
-# using one grammar (dotenv_keys, the reader's own key expression) for both sides. A key
-# that would survive cannot be missed, and a key added to either side is covered the day
-# it appears with no edit here.
+# with dotenv_keys listing BOTH sides, so a key added to either is covered the day it
+# appears with no edit here. dotenv_keys is deliberately WIDER than dotenv_read rather
+# than identical to it — the two have opposite error costs and that file says why; an
+# earlier version of this comment claimed they shared one expression, which was never
+# true (Tesla, cage-match #159).
 #
 # No override flag, deliberately: an operator who genuinely wants a key gone can remove it
 # from .env themselves, which is explicit and leaves a trace. A `--force` would be
@@ -590,7 +592,7 @@ KEYS_WANT="$(mktemp "${TMPDIR:-/tmp}/aiko-keys-want.XXXXXX")"
 dotenv_keys "$ENV_FILE" > "$KEYS_HAVE" || die "could not list the keys in $ENV_FILE, so the rewrite cannot be proved safe. Refusing to continue — your .env has NOT been touched."
 dotenv_keys "$ENV_TMP"  > "$KEYS_WANT" || die "could not list the keys of the .env this run would write, so the rewrite cannot be proved safe. Refusing to continue — your .env has NOT been touched."
 KEYS_DROPPED="$(mktemp "${TMPDIR:-/tmp}/aiko-keys-dropped.XXXXXX")"
-comm -23 "$KEYS_HAVE" "$KEYS_WANT" > "$KEYS_DROPPED" \
+LC_ALL=C comm -23 "$KEYS_HAVE" "$KEYS_WANT" > "$KEYS_DROPPED" \
   || die "could not compare the current .env against the one this run would write, so the rewrite cannot be proved safe. Refusing to continue — your .env has NOT been touched."
 
 # --drop-env-keys discharges the refusal for the keys it NAMES, and is strict in BOTH
@@ -601,8 +603,8 @@ comm -23 "$KEYS_HAVE" "$KEYS_WANT" > "$KEYS_DROPPED" \
 # output, which is the whole point of naming over forcing.
 KEYS_ACKED="$(mktemp "${TMPDIR:-/tmp}/aiko-keys-acked.XXXXXX")"
 printf '%s' "$DROP_ENV_KEYS" | tr ',' '\n' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' \
-  | grep -v '^$' | sort -u > "$KEYS_ACKED" || true
-_spurious="$(comm -13 "$KEYS_DROPPED" "$KEYS_ACKED" | tr '\n' ' ')"
+  | grep -v '^$' | LC_ALL=C sort -u > "$KEYS_ACKED" || true
+_spurious="$(LC_ALL=C comm -13 "$KEYS_DROPPED" "$KEYS_ACKED" | tr '\n' ' ')"
 if [ -n "${_spurious// /}" ]; then
   die "--drop-env-keys names keys that are NOT at risk in this run:
     ${_spurious}
@@ -610,7 +612,7 @@ if [ -n "${_spurious// /}" ]; then
   name means the list you are working from is not this run's, and consent given against
   the wrong list is not consent."
 fi
-_dropped="$(comm -23 "$KEYS_DROPPED" "$KEYS_ACKED" | tr '\n' ' ')"
+_dropped="$(LC_ALL=C comm -23 "$KEYS_DROPPED" "$KEYS_ACKED" | tr '\n' ' ')"
 if [ -n "${_dropped// /}" ]; then
   die "refusing to rewrite $ENV_FILE. This rewrite is a whole-file replace, and these keys
   are not ones standup writes, so they would be DESTROYED:

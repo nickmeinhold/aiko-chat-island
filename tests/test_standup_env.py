@@ -672,3 +672,58 @@ def test_the_bypass_is_not_needed_on_a_clean_rerun(island) -> None:
     this, a standup that refused every re-run would satisfy the arms above."""
     island.run()
     island.run()
+
+
+def test_a_nul_byte_does_not_blind_the_key_listing(island) -> None:
+    """A NUL ANYWHERE IN .env USED TO DEFEAT THE LISTING ITSELF.
+
+    Without `grep -a`, one NUL makes grep declare "Binary file … matches" and emit no
+    matching lines — so this returns a single nonsense entry, or on a grep that instead
+    exits 1, THE EMPTY SET WITH A SUCCESS STATUS. A caller comparing that against the file
+    it is about to write computes "nothing would be dropped" and rewrites over a live
+    signing seed. Not exotic: a value pasted out of a UTF-16 editor carries them. This is
+    non-match-is-absence at the one input that is not an ASCII line — the ghost
+    deploy/lib/dotenv-read.sh exists to bury (Tesla, cage-match #159 round 2).
+
+    Tested at the LIBRARY, because that is where `grep -a` is the only variable. Driving
+    it through standup proves less than it appears to: resolve-media-env.sh aborts on the
+    same file first, so the run dies for an unrelated reason and the key-loss guard is
+    never reached — incidental protection, not this guard working.
+    """
+    lib = island.root / "deploy" / "lib" / "dotenv-read.sh"
+    env = island.root / "nul.env"
+    env.write_bytes(b"ISLAND_SIGNING_SEED=not-recoverable\nJUNK=\x00\nAPNS_TEAM_ID=T1\n")
+
+    r = subprocess.run(["bash", "-c", f'source "{lib}"; dotenv_keys "{env}"'],
+                       capture_output=True, text=True)
+    keys = set(r.stdout.split())
+    assert r.returncode == 0, f"the listing failed outright: {r.stderr}"
+    assert {"ISLAND_SIGNING_SEED", "APNS_TEAM_ID"} <= keys, (
+        f"a NUL byte blinded the listing — got {keys or 'nothing'}. A caller would read "
+        "that as 'this file assigns nothing to preserve' and destroy the seed."
+    )
+
+
+def test_a_nul_bearing_env_is_never_silently_rewritten(island) -> None:
+    """The invariant that actually matters, asserted without caring WHICH guard fires.
+    Something must stop a run against a file the tooling cannot fully read, and the file
+    must survive. Today the media resolver aborts first; if that ever changes, the
+    key-loss guard is now able to see the file itself."""
+    island.run()
+    before = island.env_file.read_bytes() + b"ISLAND_SIGNING_SEED=not-recoverable\nJUNK=\x00\n"
+    island.env_file.write_bytes(before)
+
+    result = island.run(expect_ok=False)
+    assert result.returncode != 0, "a NUL-bearing .env was rewritten"
+    assert island.env_file.read_bytes() == before, "the signing seed was destroyed"
+
+
+def test_the_nul_test_can_actually_pass(island) -> None:
+    """NULL ARM for the library test: the SAME file without the NUL must list the same
+    keys, so the assertion above discriminates on the NUL rather than on the fixture."""
+    lib = island.root / "deploy" / "lib" / "dotenv-read.sh"
+    env = island.root / "clean.env"
+    env.write_bytes(b"ISLAND_SIGNING_SEED=not-recoverable\nJUNK=x\nAPNS_TEAM_ID=T1\n")
+    r = subprocess.run(["bash", "-c", f'source "{lib}"; dotenv_keys "{env}"'],
+                       capture_output=True, text=True)
+    assert {"ISLAND_SIGNING_SEED", "APNS_TEAM_ID"} <= set(r.stdout.split())
