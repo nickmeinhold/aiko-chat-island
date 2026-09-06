@@ -315,7 +315,7 @@ run — no human holds the key — and the signature is recorded in
 
 ```sh
 gh attestation verify \
-  oci://ghcr.io/nickmeinhold/aiko-chat-island:0.9.5 \
+  oci://ghcr.io/nickmeinhold/aiko-chat-island:<the tag you pulled> \
   --repo nickmeinhold/aiko-chat-island
 ```
 
@@ -338,8 +338,10 @@ not come from this repo's workflow cannot produce a valid attestation, and one t
 is recorded in a log neither we nor GitHub can quietly rewrite. That is the same bar
 Certificate Transparency clears for TLS certificates, and it is the honest one.
 
-Images published before v0.9.5 have no attestation and will fail this check. That is
-correct — the evidence starts where the evidence starts.
+Images published before attestation was added have none, and will fail this check with
+`HTTP 404: Not Found`. That is correct rather than broken — the evidence starts where
+the evidence starts. If you need to know whether a given tag is attested, run the
+command against it; a 404 is the answer.
 
 ---
 
