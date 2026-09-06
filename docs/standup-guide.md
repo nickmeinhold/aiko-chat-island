@@ -328,7 +328,7 @@ GitHub's API, so verification keeps working even if this project's GitHub accoun
 not:
 
 ```sh
-gh attestation verify oci://your-registry.example/aiko-chat-island:0.9.5 \
+gh attestation verify oci://your-registry.example/aiko-chat-island:<the tag you pulled> \
   --repo nickmeinhold/aiko-chat-island --bundle-from-oci
 ```
 
