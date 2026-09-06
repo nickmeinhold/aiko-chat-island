@@ -200,3 +200,72 @@ jobs:
           gh attestation verify \
             "oci://${IMAGE}@${{ steps.index.outputs.digest }}" \
             --repo "${{ github.repository }}"
+
+  # --- publish the GitHub Release the update nudge reads -----------------------
+  #
+  # MEASURED 2026-09-06, and it was a live dark capability: this repo had ZERO GitHub
+  # Releases, so `/releases/latest` returned 404. `domain/update_nudge.py` reads exactly
+  # that endpoint and fails OPEN at debug level, so the nudge shipped enabled by default
+  # and would have stayed silent forever — indistinguishable, to an operator, from "you
+  # are up to date". The image existed; the thing that tells anyone the image exists did
+  # not. docs/standup-guide.md also tells operators to watch the releases page.
+  #
+  # So the Release is not release ceremony, it is the nudge's DATA SOURCE, and a data
+  # source created by remembering to type `gh release create` is a hand-managed artifact
+  # with no declared desired state. This job declares it.
+  publish-release:
+    needs: merge
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # create the Release object
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # annotated tag objects are not fetched at depth 1
+
+      # The annotated tag message IS the release notes. One source, written at tag time
+      # by the person who knows why the release exists — not regenerated from commit
+      # subjects, which would drift from what the tagger meant.
+      # Written to a FILE and passed as --notes-file, never interpolated into a command
+      # line. A tag message is prose: it contains backticks, quotes and $ signs, and
+      # `--notes "${{ ... }}"` would hand them to a shell. (Learned the same hour, the
+      # hard way, by letting a backtick in a `git tag -m` string execute.)
+      - name: Extract notes from the annotated tag
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          type=$(git cat-file -t "$tag")
+          [ "$type" = tag ] || {
+            echo "::error::$tag is a $type, not an annotated tag — it carries no notes" >&2
+            exit 1
+          }
+          git tag -l --format='%(contents)' "$tag" > /tmp/release-notes.md
+          [ -s /tmp/release-notes.md ] || {
+            echo "::error::annotated tag $tag has an empty message" >&2
+            exit 1
+          }
+          echo "--- notes to be published ---"; cat /tmp/release-notes.md
+
+      - name: Create the Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${{ github.repository }}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-file /tmp/release-notes.md \
+            --verify-tag
+
+      # MUST-FAIL ARM. Without this the job proves only that `gh release create` exited
+      # 0; this asserts the endpoint the nudge actually reads now answers with THIS tag.
+      # It is the difference between publishing a release and being discoverable.
+      - name: Verify /releases/latest now names this tag
+        run: |
+          latest=$(curl -sf \
+            "https://api.github.com/repos/${{ github.repository }}/releases/latest" \
+            | jq -r .tag_name)
+          echo "releases/latest = $latest (expected ${GITHUB_REF_NAME})"
+          [ "$latest" = "${GITHUB_REF_NAME}" ] || {
+            echo "::error::the update nudge would not see this release" >&2
+            exit 1
+          }
