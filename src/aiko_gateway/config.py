@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic_settings.sources import DotEnvSettingsSource, EnvSettingsSource
+from .domain.update_nudge import UpdateNudge
 
 # Leaf import (stdlib-only enum) — safe at module top, no config<->domain cycle. The
 # SINGLE source of truth for the mode vocabulary, shared with the signing codec so the
@@ -42,7 +43,7 @@ def _whitespace_is_never_meaningful(annotation) -> bool:
             a is type(None) or _whitespace_is_never_meaningful(a) for a in args
         )
     if isinstance(annotation, type):
-        # Enum FIRST: a str-Enum (class IslandMode(str, Enum)) is a str subclass, so
+        # Enum FIRST: a StrEnum (IslandMode, UpdateNudge) is a str subclass, so
         # testing str first would classify it as "do not touch" and `ISLAND_MODE=
         # "moderator "` would fail its member lookup. No enum member carries
         # whitespace, so stripping is always safe there.
@@ -442,6 +443,30 @@ class Settings(BaseSettings):
     # How often the background gossip loop pulls each known peer's island directory and
     # merges. Takes effect only when gateway_gossip_enabled is true.
     gateway_gossip_interval_seconds: int = 300
+
+    # --- operator update nudge (#2457's notification half, without its authority) ---
+    # An island is sovereign: nobody can push it an update, and there is deliberately
+    # no operator registry, no telemetry, no phone-home. The consequence is that a
+    # security fix reaches a third-party operator ONLY if they choose to pull, with no
+    # mechanism by which they could otherwise learn one exists. This closes that gap
+    # by TELLING the operator and doing nothing else — it never pulls, restarts or
+    # writes. See domain/update_nudge.py for the full reasoning.
+    #
+    # DEFAULT IS ON AT `major`, and that is a judgement call worth seeing: an opt-in
+    # notice selects for exactly the operators who least need it (anyone who would
+    # enable it is already watching releases), while `major` is the lowest-frequency,
+    # highest-signal level — a breaking release is the one an operator must act on.
+    # The cost is one outbound request per interval, so the release host learns this
+    # box runs an island on a rough schedule. GitHub already learns as much from image
+    # pulls and the island's domain is public in DNS, but a periodic call is a
+    # heartbeat where a pull is an event. That difference is why `off` is a real level
+    # and not a hidden debug flag.
+    island_update_nudge: UpdateNudge = UpdateNudge.MAJOR
+    # How often to look, when the nudge is not `off`. Daily: a release is not urgent
+    # enough to poll harder, and a slower heartbeat is a smaller disclosure. The check
+    # also runs once at boot, so a long interval never means a long silence after an
+    # operator restarts.
+    island_update_check_interval_seconds: int = 86400
 
     # --- island identity + moderation mode (crucible-09 Phase A) ---
     # The island's elected moderation posture, signed into its self-manifest

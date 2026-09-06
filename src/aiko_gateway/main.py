@@ -175,6 +175,35 @@ async def _gossip_loop(interval: int) -> None:
             await asyncio.sleep(interval)
 
 
+async def _update_nudge_loop(interval: int, level) -> None:
+    """Tell the OPERATOR when a newer island release exists (#2457's notification
+    half). It never pulls, restarts or writes — the operator stays the only actor.
+
+    Runs once immediately so a restart surfaces a pending release straight away, then
+    every `interval`. Best-effort in the strongest sense: `check_once` is contracted
+    never to raise, and this still wraps it, because a nudge that can break a boot is
+    worse than no nudge at all (fail-open — weak-signal capture, not a mutation).
+    """
+    import httpx
+
+    from .domain.update_nudge import check_once
+
+    # Through the MODULE, not a name bound at import — the same reason /health reads
+    # it that way, so a test can patch BUILD_INFO and this sees the patch.
+    ref = build_info.BUILD_INFO.get("ref")
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        while True:
+            try:
+                line = await check_once(client, ref, level)
+                if line:
+                    log.warning("%s", line)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.debug("update nudge iteration failed", exc_info=True)
+            await asyncio.sleep(interval)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     state.loop = asyncio.get_running_loop()
@@ -188,6 +217,7 @@ async def lifespan(app: FastAPI):
     # or an exception during cleanup — otherwise the fd (and the lock) would leak in
     # a non-exiting host (a test harness / embedded server). Kelvin+Carnot, PR#111.
     gossip_task: "asyncio.Task | None" = None
+    nudge_task: "asyncio.Task | None" = None
     try:
         # Alembic (run by the container entrypoint before uvicorn) owns schema
         # creation/evolution; here we only VERIFY the live schema is migrated +
@@ -228,6 +258,17 @@ async def lifespan(app: FastAPI):
         else:
             log.info("gateway directory gossip disabled; serving self + %d seed peer(s)",
                      len(settings.island_seed_peers))
+        # Operator update nudge: say something when a newer release exists, and do
+        # nothing else. Default `major` — see config for why this is ON by default.
+        from .domain.update_nudge import UpdateNudge as _Nudge
+        ui = settings.island_update_check_interval_seconds
+        if settings.island_update_nudge is not _Nudge.OFF and ui > 0:
+            nudge_task = asyncio.create_task(
+                _update_nudge_loop(ui, settings.island_update_nudge))
+            log.info("operator update nudge ENABLED (level=%s, every %ds)",
+                     settings.island_update_nudge.value, ui)
+        else:
+            log.info("operator update nudge off — this island will not check for releases")
         try:
             yield
         finally:
@@ -241,6 +282,10 @@ async def lifespan(app: FastAPI):
                 gossip_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await gossip_task
+            if nudge_task is not None:
+                nudge_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await nudge_task
             # Push shutdown, IN THIS ORDER (#3267; cage-match #139 Maxwell+Carnot).
             # DRAIN the in-flight wake tasks FIRST, THEN close the pooled APNs
             # HTTP/2 connection — closing the shared client while a wake is

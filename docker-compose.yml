@@ -150,6 +150,16 @@ services:
       # Signing key version carried in the manifest for the rotation lifecycle
       # (#1865). Bumped when the seed is rotated. Defaults to config's 1.
       ISLAND_KEY_VERSION: ${ISLAND_KEY_VERSION:-1}
+      # --- operator update nudge (notification only; it never pulls) ---
+      # An island is sovereign and nobody can push it an update, so a security fix
+      # reaches a third-party operator only if they learn one exists. This tells the
+      # operator in the container log and does nothing else. `off` disables the single
+      # outbound request per interval; `major` (the default) reports breaking releases
+      # only, `minor` adds feature releases, `all` adds patches. See
+      # src/aiko_gateway/domain/update_nudge.py for the disclosure this does and does
+      # not make.
+      ISLAND_UPDATE_NUDGE: ${ISLAND_UPDATE_NUDGE:-major}
+      ISLAND_UPDATE_CHECK_INTERVAL_SECONDS: ${ISLAND_UPDATE_CHECK_INTERVAL_SECONDS:-86400}
       # Directory SEED peers (#1548) — operator-curated FULL peer entries, merged
       # with NO network fetch (authentic by construction). THIS is how islands list
       # each other today: JSON array of {"id","display_name","base_url"}. Island 1
