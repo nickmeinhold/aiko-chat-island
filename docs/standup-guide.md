@@ -303,6 +303,48 @@ sed -i.bak 's/^ISLAND_VERSION=.*/ISLAND_VERSION=X.Y.Z/' .env   # the version WIT
 recreates the stack, and verifies `/health` — refusing to report success if the island
 does not come back.
 
+## Verifying what you pulled
+
+You are trusting bytes from a registry. You do not have to trust them on our word.
+
+Every image this project publishes carries a **build-provenance attestation**: a signed,
+publicly-logged statement that these exact bytes came out of this repository's release
+workflow, at a named commit. It is signed by an identity minted for that single workflow
+run — no human holds the key — and the signature is recorded in
+[Rekor](https://docs.sigstore.dev/logs/overview), a public append-only transparency log.
+
+```sh
+gh attestation verify \
+  oci://ghcr.io/nickmeinhold/aiko-chat-island:<the tag you pulled> \
+  --repo nickmeinhold/aiko-chat-island
+```
+
+Exit 0 means verified. It prints nothing when it succeeds and is not attached to a
+terminal, so **check the exit status, not the output** — `echo $?`.
+
+If you mirror our image into your own registry, the evidence comes with it. Add
+`--bundle-from-oci` and the attestation is read from the registry rather than from
+GitHub's API, so verification keeps working even if this project's GitHub account does
+not:
+
+```sh
+gh attestation verify oci://your-registry.example/aiko-chat-island:<the tag you pulled> \
+  --repo nickmeinhold/aiko-chat-island --bundle-from-oci
+```
+
+**What this does and does not give you.** It does not prevent a bad image from being
+published — nothing can. It makes one permanently *distinguishable*: an image that did
+not come from this repo's workflow cannot produce a valid attestation, and one that did
+is recorded in a log neither we nor GitHub can quietly rewrite. That is the same bar
+Certificate Transparency clears for TLS certificates, and it is the honest one.
+
+Images published before attestation was added have none, and will fail this check with
+`HTTP 404: Not Found`. That is correct rather than broken — the evidence starts where
+the evidence starts. If you need to know whether a given tag is attested, run the
+command against it; a 404 is the answer.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |
