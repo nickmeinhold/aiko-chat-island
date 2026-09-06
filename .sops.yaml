@@ -32,11 +32,40 @@
 #                      INERT there — the file exists while the capability does not. Do
 #                      not read its presence as proof the key survived a migration.
 #
-#   recovery         — never used in normal operation. Generated 2026-09-06 and
-#                      deliberately NOT written to this machine. Private half lives
-#                      in Bitwarden AND on paper: one key, two retrieval paths that
-#                      fail for unrelated reasons (a forgotten master password does
-#                      not burn the paper; a house fire does not lock the vault).
+# HONEST SCOPE, narrowed after the PR#166 cage-match (Tesla). age is 1-OF-2, not a
+# split key: EITHER recipient alone decrypts everything. So this is redundancy against
+# LOSS, and it is NOT a threshold scheme — there is no "two people must agree" property
+# here, and the paper copy is a second STORAGE LOCATION for the same principal, not a
+# third recipient. Anyone holding the recovery key holds both islands, every historical
+# commit, forever.
+#
+# THE RECOVERY KEY'S ACTUAL EXPOSURE, measured 2026-09-06 rather than assumed in either
+# direction. It was generated on the operator laptop and written to temp files there
+# while being exercised against production ciphertext — an untested recovery key is the
+# usual way recovery fails, so that proof was worth having, but it means the key cannot
+# be described as "never on a machine". What that does and does not amount to, checked:
+# `$TMPDIR` is [Excluded] from Time Machine, and the newest APFS local snapshot predates
+# the key by three weeks, so no backup or snapshot copy of those temp files exists. The
+# residual is unlinked blocks on an APFS volume with FileVault On — recoverable only from
+# an already-unlocked machine, which by then also holds the Secure Enclave key, so it
+# widens nothing. The copy that DOES persist is in the session transcript under
+# ~/.claude/projects/, which is [Included] in Time Machine; that is a known and accepted
+# posture, recorded here so the threat model is stated rather than implied.
+#
+# Say it this way, not more strongly and not less: "generated and exercised on the
+# operator laptop 2026-09-06, then stored offline; no snapshot or backup copy of the
+# working files, residual limited to unallocated blocks behind FileVault." A vaguer
+# admission ("it has touched this machine") reads as worse than it is and invites a
+# re-mint that would buy nothing; a claim of purity would be false.
+#
+#   recovery         — never used in normal operation. Generated on this laptop
+#                      2026-09-06, used ONCE here to prove it decrypts production
+#                      config, then stored offline: Bitwarden AND paper. One key, two
+#                      retrieval paths that fail for unrelated reasons (a forgotten
+#                      master password does not burn the paper; a house fire does not
+#                      lock the vault). It is NOT written to the age keystore and is
+#                      not used in normal operation — see the measured exposure note
+#                      above for exactly what "generated here" does and does not mean.
 #
 # IF A YUBIKEY IS EVER ADDED: do not make it Bitwarden's second factor if it is also
 # the SOPS primary. One token guarding both the encryption and the route to the
@@ -46,11 +75,20 @@
 # each file re-encrypts to the current recipient list.
 
 creation_rules:
-  - path_regex: deploy/secrets/.*\.enc\.env$
+  # `.env.sops`, NOT `.enc.env`. SOPS infers input type from the EXTENSION, so a
+  # file ending in `.env` is parsed as dotenv — and these are binary-encrypted,
+  # because a real-newline PEM is not legal dotenv. The consequence was not
+  # cosmetic: `sops updatekeys` — the documented rotation path, and the way a
+  # YubiKey would later be added — FAILED with `invalid dotenv input line: {`.
+  # A filename that claims a format its content does not have is a lie the
+  # tooling believes. Renaming makes the name honest, so no command depends on
+  # anyone remembering `--input-type binary`. (Found by testing the documented
+  # procedure rather than the code; two adversarial reviewers read right past it.)
+  - path_regex: deploy/secrets/.*\.env\.sops$
     key_groups:
       - age:
           # operator-laptop — Apple Secure Enclave, Touch ID or passcode.
           # Identity handle: ~/.config/sops/age/se-identity.txt (a HANDLE, not the key)
           - age1se1qgw7n5ehtekw2h7lflepxgmc2xw5rvf5uam60w7dpe3zyse4yqvvuwwkagu
-          # recovery (offline; Bitwarden + paper, never on a machine)
+          # recovery (Bitwarden + paper; generated+verified here 2026-09-06, then offline)
           - age1vh4qyncy3cwv5pgtjlmqefsj2p487cgkatl47vn4e3m6yku2faeqjnq90e

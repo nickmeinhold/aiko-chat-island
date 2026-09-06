@@ -26,3 +26,27 @@ jobs:
       - run: pip install -e ".[dev]"
 
       - run: pytest
+
+  # Key-free verification of the committed encrypted island config. Runs on every push
+  # because the artifacts sit in a PUBLIC repo permanently: a dropped recipient or an
+  # added one is invisible in a binary diff, and a plaintext slip cannot be un-pushed.
+  # Every arm is mutation-proven (see deploy/secrets/README.md); it needs no secrets, no
+  # key, and no network.
+  secrets-integrity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install sops (for the rotation-path check)
+        run: |
+          # Checksum-pinned. An unverified curl makes the VERIFIER itself
+          # supply-chain mutable — a thermometer the heat bath can rewrite
+          # (Carnot, cage-match round 2). CI holds no decryption key, so the
+          # secret blast radius is nil, but a tampered sops could report a
+          # green gate over a broken artifact.
+          SOPS_SHA=775f1384d55decfad228e7196a3f683791914f92a473f78fc47700531c29dfef
+          curl -sSfL -o /tmp/sops https://github.com/getsops/sops/releases/download/v3.11.0/sops-v3.11.0.linux.amd64
+          echo "$SOPS_SHA  /tmp/sops" | sha256sum -c -
+          sudo install -m 0755 /tmp/sops /usr/local/bin/sops
+          sops --version
+      - name: Verify committed secrets
+        run: ./deploy/verify-secrets.sh

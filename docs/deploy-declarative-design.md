@@ -1,4 +1,23 @@
 # Declarative island deploy — design (#47 / #1577)
+> ## ⚠️ SUPERSEDED — THIS DOCUMENT DESCRIBES v1, WHICH WAS DELETED
+>
+> **Do not build from this file.** Temper finding #7 (unanimous) removed the entire
+> template/render/envsubst layer described below, in favour of the *subtractive middle*:
+> **store the complete encrypted `.env` per island — "the artifact in git IS the artifact
+> on the box."** Rollout step 1 shipped to v2 in PR#166.
+>
+> What is actually true now:
+> - `deploy/secrets/<island>.env.sops` holds the **complete** `.env`, SOPS **binary** type.
+>   Not `.enc.env` (SOPS parses that extension as dotenv and `updatekeys` fails), and not
+>   secrets-only.
+> - There is **no** `.env.template`, no `envsubst`, no render step, and no missing-var map.
+> - `./deploy/verify-secrets.sh` is the key-free verification gate.
+>
+> Kept for the reasoning and the rejected alternatives, which are still worth reading.
+> A rewritten v2 design is owed — until it exists, treat every mechanism below as
+> historical. (Flagged in the PR#166 cage-match by two families: a stale design beside a
+> live artifact is how a deleted layer gets rebuilt with production credentials in it.)
+
 
 Status: **design** (2026-07-28). Grounded on measured drift + SOPS reality, not intent.
 Supersedes the hand-`scp`/`sed`/`--yes` deploy that zeroed enspyr's live compose (the
@@ -37,12 +56,12 @@ Three repo-authoritative inputs per island + two scripts.
 ```
 deploy/
   islands/<island>.conf     # per-island NON-SECRET manifest (shell-sourced)
-  secrets/<island>.enc.env  # SOPS-encrypted secrets (JWT_SECRET, GITHUB_CLIENT_SECRET…)
+  secrets/<island>.env.sops  # SOPS-encrypted secrets (JWT_SECRET, GITHUB_CLIENT_SECRET…)
   .env.template             # the shape: ${VARS} referencing manifest + secrets
   update.sh                 # box-side executor (EXISTS, unchanged)
   mosquitto.conf, caddy/    # already repo-authoritative
 docker-compose.yml          # already in sync
-.sops.yaml                  # age recipients (creation rule for secrets/*.enc.env)
+.sops.yaml                  # age recipients (creation rule for secrets/*.env.sops)
 ```
 
 `islands/<island>.conf` declares everything that legitimately differs per island —
@@ -63,7 +82,7 @@ SOCIAL_SIGNIN_ENABLED=false
 ### `deploy/deploy-to.sh <island>` — NEW, runs on the laptop (control plane)
 
 1. `source deploy/islands/<island>.conf` (non-secret config).
-2. `sops -d deploy/secrets/<island>.enc.env` → secrets into shell env (laptop has the key).
+2. `sops -d deploy/secrets/<island>.env.sops` → secrets into shell env (laptop has the key).
 3. Render `deploy/.env.template` → a temp `.env` locally (`envsubst` / explicit map).
 4. **Whole-file `scp`** compose + rendered `.env` + `update.sh` + `mosquitto.conf` to
    `${REMOTE_USER}@${SSH_ALIAS}:${REMOTE_PATH}` — via a staging temp then atomic `mv`,
@@ -87,7 +106,7 @@ SOCIAL_SIGNIN_ENABLED=false
 ## Rollout (current → declarative, low-risk because config is UNCHANGED)
 
 1. **Lift current reality into the repo**: read each box's live `.env` (already inventoried),
-   derive `islands/<island>.conf` (non-secret) + extract secrets into `secrets/<island>.enc.env`
+   derive `islands/<island>.conf` (non-secret) + extract secrets into `secrets/<island>.env.sops`
    (SOPS-encrypt with the laptop age key). The boxes are the current source of truth for the
    *values*; we're capturing them, not changing them.
 2. **Prove the render reproduces reality**: render each island's `.env` and `diff` it against
@@ -99,7 +118,7 @@ SOCIAL_SIGNIN_ENABLED=false
 
 ## Open sub-decisions (defaults proposed)
 
-- **Secrets layout**: per-island `secrets/<island>.enc.env` (JWT differs per island; imagineering
+- **Secrets layout**: per-island `secrets/<island>.env.sops` (JWT differs per island; imagineering
   has social secrets enspyr lacks). *Default: per-island.*
 - **Manifest format**: shell `.conf` sourced directly (no parser dep on a slim toolchain). *Default: shell.*
 - **Render tool**: `envsubst` (gettext) vs an explicit bash var map. *Default: explicit map (no new dep, fail-closed on a missing var).*
