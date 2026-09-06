@@ -97,6 +97,16 @@ jobs:
   merge:
     needs: build
     runs-on: ubuntu-latest
+    # Narrowed here rather than at workflow level: only this job mints an OIDC
+    # identity, and `build` must not be able to. Job-level `permissions` REPLACES
+    # the workflow-level block, so contents/packages are restated, not inherited.
+    permissions:
+      contents: read
+      packages: write
+      id-token: write      # the whole security mechanism: a short-lived identity
+                           # issued to THIS workflow run, which signs the provenance.
+                           # The key never exists anywhere a human can reach it.
+      attestations: write  # file the resulting bundle against this repo
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -140,3 +150,53 @@ jobs:
 
       - name: Inspect published image
         run: docker buildx imagetools inspect "${IMAGE}:${DOCKER_METADATA_OUTPUT_VERSION}"
+
+      # --- supply-chain provenance (#3973 layer 1) ---
+      #
+      # The island's whole posture is that it DECLINES TO KNOW: no operator registry,
+      # no telemetry, no record of who talks to whom. Attestation is the same posture
+      # pointed the other way — it asks nothing of operators and lets a stranger prove
+      # something true about the bytes we publish. Visibility, not prevention: this
+      # cannot stop a bad image being pushed, it makes a bad image permanently
+      # distinguishable from one this workflow built.
+      #
+      # The subject is the INDEX digest, not the per-arch digests. `:X.Y.Z` resolves to
+      # the manifest list, so that is what an operator's `docker compose pull` gets and
+      # what `gh attestation verify` will look for. Attesting the per-arch digests
+      # instead would be true, verifiable, and about an artifact nobody resolves to.
+      - name: Resolve the published index digest
+        id: index
+        run: |
+          digest=$(docker buildx imagetools inspect \
+                     "${IMAGE}:${DOCKER_METADATA_OUTPUT_VERSION}" \
+                     --format '{{.Manifest.Digest}}')
+          # imagetools prints diagnostics on failure and still exits 0 in some paths,
+          # so shape-check rather than trusting the exit code.
+          case "$digest" in
+            sha256:*) ;;
+            *) echo "not a digest: '$digest'" >&2; exit 1 ;;
+          esac
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.index.outputs.digest }}
+          # Also store the bundle as an OCI referrer, so the attestation travels with
+          # the image. An operator who mirrors our image into their own registry — the
+          # sovereign case this project exists for — keeps the evidence with the bytes
+          # instead of depending on our GitHub account still being there.
+          push-to-registry: true
+
+      # The must-fail arm. Without this the workflow only proves the attest STEP ran,
+      # which is exactly the "known, not failing" shape this layer exists to escape.
+      # If the bundle is missing, unverifiable, or names a different subject, the
+      # release goes red here rather than at some operator's `verify` months later.
+      - name: Verify the attestation we just published
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh attestation verify \
+            "oci://${IMAGE}@${{ steps.index.outputs.digest }}" \
+            --repo "${{ github.repository }}"
