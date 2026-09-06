@@ -39,11 +39,24 @@
 # third recipient. Anyone holding the recovery key holds both islands, every historical
 # commit, forever.
 #
-# And the recovery key HAS been on this networked machine: it was generated here, and
-# used here to prove it can decrypt production config. That proof was worth having — an
-# untested recovery key is the usual way recovery fails — but it consumed the property
-# it demonstrated. Do not describe this key as "never on a machine"; describe it as
-# "generated and verified on the operator laptop 2026-09-06, then stored offline".
+# THE RECOVERY KEY'S ACTUAL EXPOSURE, measured 2026-09-06 rather than assumed in either
+# direction. It was generated on the operator laptop and written to temp files there
+# while being exercised against production ciphertext — an untested recovery key is the
+# usual way recovery fails, so that proof was worth having, but it means the key cannot
+# be described as "never on a machine". What that does and does not amount to, checked:
+# `$TMPDIR` is [Excluded] from Time Machine, and the newest APFS local snapshot predates
+# the key by three weeks, so no backup or snapshot copy of those temp files exists. The
+# residual is unlinked blocks on an APFS volume with FileVault On — recoverable only from
+# an already-unlocked machine, which by then also holds the Secure Enclave key, so it
+# widens nothing. The copy that DOES persist is in the session transcript under
+# ~/.claude/projects/, which is [Included] in Time Machine; that is a known and accepted
+# posture, recorded here so the threat model is stated rather than implied.
+#
+# Say it this way, not more strongly and not less: "generated and exercised on the
+# operator laptop 2026-09-06, then stored offline; no snapshot or backup copy of the
+# working files, residual limited to unallocated blocks behind FileVault." A vaguer
+# admission ("it has touched this machine") reads as worse than it is and invites a
+# re-mint that would buy nothing; a claim of purity would be false.
 #
 #   recovery         — never used in normal operation. Generated on this laptop
 #                      2026-09-06, used ONCE here to prove it decrypts production
@@ -51,9 +64,8 @@
 #                      retrieval paths that fail for unrelated reasons (a forgotten
 #                      master password does not burn the paper; a house fire does not
 #                      lock the vault). It is NOT written to the age keystore and is
-#                      not used in normal operation — but see the honest-scope note
-#                      above: it has touched this machine, and the docs must not claim
-#                      otherwise.
+#                      not used in normal operation — see the measured exposure note
+#                      above for exactly what "generated here" does and does not mean.
 #
 # IF A YUBIKEY IS EVER ADDED: do not make it Bitwarden's second factor if it is also
 # the SOPS primary. One token guarding both the encryption and the route to the
