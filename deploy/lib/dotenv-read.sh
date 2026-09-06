@@ -133,5 +133,29 @@ dotenv_keys() {
   _raw="$(LC_ALL=C grep -aE "$_k" "$1")"; _rc=$?
   [ "$_rc" -le 1 ] || return "$_rc"
   [ -n "$_raw" ] || return 0
-  printf '%s\n' "$_raw" | tr -d '\000' | LC_ALL=C sed -E "s/$_k.*/\2/" | LC_ALL=C sort -u
+  # NO TOOL IS EVER MID-PIPE. A pipeline reports only its LAST command's status unless
+  # `set -o pipefail` is in force, so in `... | tr | sed | sort` a missing `tr` or `sed`
+  # still exits on `sort` — status 0, with an EMPTY key list. The caller reads that as
+  # "this file assigns nothing", computes that nothing would be dropped, and replaces
+  # .env, destroying every key it could not see, ISLAND_SIGNING_SEED included.
+  #
+  # `pipefail` prevents that, and every current caller happens to set it — which is the
+  # defect, not the fix. A sourced library that states a data-loss guarantee cannot rest
+  # it on a shell option set in a different file, which it neither sets nor asserts and
+  # cannot see. Staging each tool as the terminal command of its own substitution makes
+  # the guarantee the function's own: every status is checked where it is produced, and
+  # the property is verifiable by reading this block rather than by auditing callers.
+  #
+  # `tr -d '\000'` is BELT-AND-BRACES AT THIS POSITION, not the NUL defence. Command
+  # substitution strips NUL bytes, so `_raw` above cannot contain one by the time this
+  # runs (measured). The defence that actually fires is `grep -a`, described further up,
+  # without which grep prints "Binary file ... matches" and emits no lines at all. Kept
+  # because it is harmless and would matter if `_raw` were ever populated another way;
+  # named honestly rather than left wearing a purpose it does not serve here. Deleting
+  # it is tracked separately — it is a behaviour change on a seed-destroying path and
+  # does not belong in a commit about pipeline status.
+  local _stripped _names
+  _stripped="$(printf '%s\n' "$_raw" | tr -d '\000')" || return $?
+  _names="$(printf '%s\n' "$_stripped" | LC_ALL=C sed -E "s/$_k.*/\2/")" || return $?
+  printf '%s\n' "$_names" | LC_ALL=C sort -u
 }

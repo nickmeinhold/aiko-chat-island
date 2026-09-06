@@ -150,15 +150,21 @@ need() { command -v "$1" >/dev/null 2>&1 || die "missing required tool: $1"; }
 # so it is a no-op on the happy path. Set BEFORE the first mktemp, not beside it.
 trap 'rm -f "${ENV_TMP:-}" "${LK_ENV_STAGED:-}" "${KEYS_HAVE:-}" "${KEYS_WANT:-}" "${KEYS_DROPPED:-}" "${KEYS_ACKED:-}" 2>/dev/null || true' EXIT
 
-# comm and sort are load-bearing for the key-loss guard below, and their absence has
-# OPPOSITE polarity: a missing `comm` kills the assignment (fails closed by accident), a
-# missing `sort` inside dotenv_keys empties both sides so nothing is ever reported dropped
-# (fails OPEN by the same accident). Declare them with the rest rather than discovering
-# the difference on a live box.
-need docker; need openssl; need curl; need comm; need sort
+# Declared so a missing tool is a clear refusal at startup rather than a puzzling failure
+# mid-run. This list is NOT what makes the key-loss guard safe — dotenv_keys owns that
+# itself, by never leaving a tool mid-pipe (see deploy/lib/dotenv-read.sh).
+#
+# An earlier note here asserted the opposite, and asserted it about the wrong tools: that
+# a missing `sort` "fails OPEN by accident". Measured false. `sort` is the TERMINAL
+# command of its pipeline, so its 127 is the pipeline's status with or without pipefail —
+# it cannot fail open. The two that could were `sed` and `tr`, sitting mid-pipe, and
+# neither was ever in this list. The claim was written from the reasoning and the
+# reasoning was never run; it is the fourth instance in this file's neighbourhood of prose
+# describing a version of the code that does not exist.
+need docker; need openssl; need curl; need comm; need sort; need sed; need tr; need grep
 docker compose version >/dev/null 2>&1 || die "docker compose v2 not available (need the 'docker compose' plugin)"
 docker info >/dev/null 2>&1 || die "cannot talk to the Docker daemon (is it running? are you in the docker group?)"
-ok "docker, git, openssl, curl, docker compose present"
+ok "docker, docker compose, openssl, curl, comm, sort, sed, tr, grep present"
 
 # --- preflight: TLS preconditions (only when we run the bundled Caddy) -------
 # Both checks below matter ONLY under the bundled Caddy; --no-tls means the
