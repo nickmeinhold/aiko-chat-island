@@ -145,6 +145,15 @@ dotenv_keys() {
   # cannot see. Staging each tool as the terminal command of its own substitution makes
   # the guarantee the function's own: every status is checked where it is produced, and
   # the property is verifiable by reading this block rather than by auditing callers.
+  #
+  # `tr -d '\000'` is BELT-AND-BRACES AT THIS POSITION, not the NUL defence. Command
+  # substitution strips NUL bytes, so `_raw` above cannot contain one by the time this
+  # runs (measured). The defence that actually fires is `grep -a`, described further up,
+  # without which grep prints "Binary file ... matches" and emits no lines at all. Kept
+  # because it is harmless and would matter if `_raw` were ever populated another way;
+  # named honestly rather than left wearing a purpose it does not serve here. Deleting
+  # it is tracked separately — it is a behaviour change on a seed-destroying path and
+  # does not belong in a commit about pipeline status.
   local _stripped _names
   _stripped="$(printf '%s\n' "$_raw" | tr -d '\000')" || return $?
   _names="$(printf '%s\n' "$_stripped" | LC_ALL=C sed -E "s/$_k.*/\2/")" || return $?
