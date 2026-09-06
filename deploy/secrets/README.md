@@ -128,6 +128,26 @@ The ordering is the point. Steps 1-5 are what actually reduce harm; step 6 only 
 the bleeding for future commits and feels like the fix while changing nothing about what
 is already public.
 
+### The password manager is breached
+
+**This is a leak, and the paper copy does not help.** Bitwarden holds the recovery key;
+paper holds the *same* key. Two storage locations uncorrelate **loss**, not **compromise** —
+a vault breach plus `git clone` is both islands, with no Touch ID and no Mac. Follow the
+leak procedure above in full: rotate every secret, then re-key.
+
+Related and easy to get wrong at 3am: **a stolen Mac with a known passcode is a leak; a
+dead Mac is not.** Those two headings rhyme and the wrong one is easy to follow. If the
+device is gone and the passcode may be known, treat it as a leak.
+
+### The primitive ages
+
+This ciphertext is immortal and X25519/AES-GCM will not be. `sops updatekeys` re-wraps
+HEAD; it cannot reach forks, clones, mirrors or archives. **A future cryptanalytic break
+is a LEAK, not a re-encrypt** — and the only response that exists is rotating the payloads.
+If that day comes, the procedure is the leak procedure, applied to everything ever
+committed here. That is the standing cost of the public ruling, named rather than assumed
+away.
+
 ### Both keys lost
 
 The committed config is unrecoverable ciphertext. The islands keep running, and the boxes

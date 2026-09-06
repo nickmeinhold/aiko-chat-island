@@ -56,12 +56,12 @@ Three repo-authoritative inputs per island + two scripts.
 ```
 deploy/
   islands/<island>.conf     # per-island NON-SECRET manifest (shell-sourced)
-  secrets/<island>.enc.env  # SOPS-encrypted secrets (JWT_SECRET, GITHUB_CLIENT_SECRET…)
+  secrets/<island>.env.sops  # SOPS-encrypted secrets (JWT_SECRET, GITHUB_CLIENT_SECRET…)
   .env.template             # the shape: ${VARS} referencing manifest + secrets
   update.sh                 # box-side executor (EXISTS, unchanged)
   mosquitto.conf, caddy/    # already repo-authoritative
 docker-compose.yml          # already in sync
-.sops.yaml                  # age recipients (creation rule for secrets/*.enc.env)
+.sops.yaml                  # age recipients (creation rule for secrets/*.env.sops)
 ```
 
 `islands/<island>.conf` declares everything that legitimately differs per island —
@@ -82,7 +82,7 @@ SOCIAL_SIGNIN_ENABLED=false
 ### `deploy/deploy-to.sh <island>` — NEW, runs on the laptop (control plane)
 
 1. `source deploy/islands/<island>.conf` (non-secret config).
-2. `sops -d deploy/secrets/<island>.enc.env` → secrets into shell env (laptop has the key).
+2. `sops -d deploy/secrets/<island>.env.sops` → secrets into shell env (laptop has the key).
 3. Render `deploy/.env.template` → a temp `.env` locally (`envsubst` / explicit map).
 4. **Whole-file `scp`** compose + rendered `.env` + `update.sh` + `mosquitto.conf` to
    `${REMOTE_USER}@${SSH_ALIAS}:${REMOTE_PATH}` — via a staging temp then atomic `mv`,
@@ -106,7 +106,7 @@ SOCIAL_SIGNIN_ENABLED=false
 ## Rollout (current → declarative, low-risk because config is UNCHANGED)
 
 1. **Lift current reality into the repo**: read each box's live `.env` (already inventoried),
-   derive `islands/<island>.conf` (non-secret) + extract secrets into `secrets/<island>.enc.env`
+   derive `islands/<island>.conf` (non-secret) + extract secrets into `secrets/<island>.env.sops`
    (SOPS-encrypt with the laptop age key). The boxes are the current source of truth for the
    *values*; we're capturing them, not changing them.
 2. **Prove the render reproduces reality**: render each island's `.env` and `diff` it against
@@ -118,7 +118,7 @@ SOCIAL_SIGNIN_ENABLED=false
 
 ## Open sub-decisions (defaults proposed)
 
-- **Secrets layout**: per-island `secrets/<island>.enc.env` (JWT differs per island; imagineering
+- **Secrets layout**: per-island `secrets/<island>.env.sops` (JWT differs per island; imagineering
   has social secrets enspyr lacks). *Default: per-island.*
 - **Manifest format**: shell `.conf` sourced directly (no parser dep on a slim toolchain). *Default: shell.*
 - **Render tool**: `envsubst` (gettext) vs an explicit bash var map. *Default: explicit map (no new dep, fail-closed on a missing var).*
@@ -203,7 +203,7 @@ so the artifact in git IS the artifact on the box — no render, no proof needed
 
 ## Repo-authoritative inputs (v2)
 
-- `deploy/secrets/<island>.enc.env` — SOPS-encrypted **COMPLETE** `.env` (the exact bytes
+- `deploy/secrets/<island>.env.sops` — SOPS-encrypted **COMPLETE** `.env` (the exact bytes
   to ship). No template, no `envsubst`, no missing-var map.
 - `deploy/islands/<island>.conf` — tiny NON-SECRET connect manifest (`SSH_ALIAS`,
   `REMOTE_USER`, `REMOTE_PATH`, `ISLAND_ID`), parsed as **DATA** (strict `KEY=VALUE`
@@ -213,7 +213,7 @@ so the artifact in git IS the artifact on the box — no render, no proof needed
 ## `deploy-to.sh <island>` (v2)
 
 1. Parse manifest as data (allowlisted keys; validate `REMOTE_PATH`, `SSH_ALIAS`, `ISLAND_ID`).
-2. `set +x`; `sops -d secrets/<island>.enc.env --output "$TMP"` → decrypt to a `mktemp`
+2. `set +x`; `sops -d secrets/<island>.env.sops --output "$TMP"` → decrypt to a `mktemp`
    file with `umask 077`. **Never** load secrets into shell env or argv. `trap 'shred -u $TMP'`
    on all exits (SIGKILL residue = named accepted risk).
 3. **Tenant preflight** (before any write): ssh box, confirm `REMOTE_PATH/current` is THIS

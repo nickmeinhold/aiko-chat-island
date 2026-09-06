@@ -46,6 +46,34 @@ EOF_RECIPIENTS
 echo "Policy requires ${#WANT[@]} recipients:"
 for r in "${WANT[@]}"; do note "${r:0:16}…"; done
 
+# CONTINUITY AGAINST main's POLICY — and read the honest scope before trusting it.
+# The checks below read recipients from THIS checkout's .sops.yaml, so a PR that swaps
+# both blobs AND rewrites the policy to match is self-consistent and goes green: the tree
+# authenticates against itself (Tesla, cage-match round 3). This compares against main's
+# recipient set instead.
+#
+# WHAT IT CANNOT DO, stated so nobody reads more into it: the recipient field is a plain
+# STRING. Without a key, nothing here proves the DEK is really wrapped to those keys — a
+# determined forger can write main's recipients into a fake envelope. This catches the
+# careless and accidental case, not an attacker. Real assurance needs a decrypt, which CI
+# has no key for by design.
+if git rev-parse --verify -q origin/main >/dev/null 2>&1 && git show origin/main:"$POLICY" >/dev/null 2>&1; then
+  MAIN_R=$(git show origin/main:"$POLICY" | sed -n 's/^[[:space:]]*-[[:space:]]*\(age1[a-z0-9]\{20,\}\)[[:space:]]*$/\1/p' | sort)
+  HERE_R=$(printf '%s\n' "${WANT[@]}" | sort)
+  if [ -n "$MAIN_R" ] && [ "$MAIN_R" != "$HERE_R" ]; then
+    if [ "${ALLOW_RECIPIENT_CHANGE:-}" = "1" ]; then
+      note "recipient set DIFFERS from origin/main — permitted by ALLOW_RECIPIENT_CHANGE=1"
+    else
+      bad "recipient set differs from origin/main's $POLICY. Rotation is rare and must be deliberate: re-run with ALLOW_RECIPIENT_CHANGE=1 and say why in the PR body. (This is a continuity check, not authentication — see the note above.)"
+      diff <(printf '%s\n' "$MAIN_R") <(printf '%s\n' "$HERE_R") | sed 's/^/      /'
+    fi
+  else
+    note "recipient set matches origin/main"
+  fi
+else
+  note "origin/main not available — skipping the continuity check (local run)"
+fi
+
 shopt -s nullglob
 
 # ALLOWLIST THE DIRECTORY BEFORE GLOBBING FOR TARGETS.
@@ -66,11 +94,25 @@ for entry in "$SECRETS_DIR"/* "$SECRETS_DIR"/.[!.]*; do
   esac
 done
 
+MANIFEST="$SECRETS_DIR/MANIFEST.txt"
+
 FILES=("$SECRETS_DIR"/*.env.sops)
 if [ "${#FILES[@]}" -eq 0 ]; then
-  # Legitimately empty before the first island is lifted — but say so loudly, and
-  # carry any allowlist failure above into the exit status rather than returning 0.
-  echo "No *.env.sops found in $SECRETS_DIR — nothing to verify (valid only before the first island is lifted)."
+  # SILENCE-READS-AS-SUCCESS, SIBLING CASE. An earlier revision exited 0 here with the
+  # lullaby "valid only before the first island is lifted" — so a PR DELETING every
+  # secrets file kept CI green and removed the only recovery copy the public repo exists
+  # to hold. The rename case was mutation-tested and the class declared closed; deletion
+  # of ALL matches was never tested. Confessing one instance is not naming the class.
+  #
+  # The manifest is the witness: if it names islands, those files MUST exist. Only a
+  # genuinely un-lifted repo (no manifest sections) may pass with nothing to verify.
+  if [ -f "$MANIFEST" ] && grep -qE '^\[[a-z0-9_-]+\]$' "$MANIFEST"; then
+    for sec in $(grep -oE '^\[[a-z0-9_-]+\]$' "$MANIFEST" | tr -d '[]'); do
+      bad "$MANIFEST names island [$sec] but $SECRETS_DIR/$sec.env.sops IS GONE — every encrypted island artifact has been removed"
+    done
+    exit 1
+  fi
+  echo "No *.env.sops found in $SECRETS_DIR and no island sections in MANIFEST — nothing to verify (a genuinely un-lifted repo)."
   exit "$FAIL"
 fi
 
@@ -171,7 +213,6 @@ fi
 #    surface back. CI cannot decrypt, so here we can only check the manifest exists and
 #    has a section per island — the BINDING check is --deep below. Say that plainly
 #    rather than letting a shallow pass read as a verified manifest.
-MANIFEST="$SECRETS_DIR/MANIFEST.txt"
 if [ ! -f "$MANIFEST" ]; then
   bad "$MANIFEST missing — the only reviewable record of which keys exist"
 else
