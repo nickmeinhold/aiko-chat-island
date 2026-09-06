@@ -8,10 +8,29 @@
 # already holds three age identities in a single keys.txt, so naming a second one
 # from that file would satisfy the letter of the requirement and none of its purpose.
 #
-#   operator-laptop  — daily use. Private half in ~/.config/sops/age/keys.txt.
-#                      To be REPLACED by a YubiKey (age1yubikey1…) once hardware
-#                      arrives, so routine decryption needs a physical touch and the
-#                      key material cannot be exfiltrated from a compromised laptop.
+#   operator-laptop  — daily use. An APPLE SECURE ENCLAVE key (age1se1…), Touch ID or
+#                      passcode to use. The private half physically cannot leave the
+#                      Mac's Secure Enclave: it is not exportable, not backed up, and
+#                      not carried by Migration Assistant. That non-exfiltratable
+#                      property is the whole reason a YubiKey was on the table, and the
+#                      Secure Enclave already provides it for nothing.
+#
+#                      MEASURED 2026-09-06 before adopting it, because getsops/sops#1803
+#                      reports `invalid type 'age1se'`: that issue is STALE. sops PR#1641
+#                      added age-plugin-se support in v3.10.0, and on the 3.11.0 here an
+#                      age1se recipient encrypts and decrypts correctly.
+#
+#                      THE COST, NAMED: this key is bound to THIS Mac. A new laptop means
+#                      a new key and `sops updatekeys`, and it cannot be used from the
+#                      island boxes or any other machine. That is acceptable only because
+#                      decryption is control-side BY DESIGN (the boxes never hold a key).
+#                      The day deploying from a second machine matters, a YubiKey
+#                      (age1yubikey1…) is the portable version of the same property.
+#
+#                      THE TRAP, because the failure is silent: the on-disk identity file
+#                      is only a HANDLE. It syncs to a new Mac perfectly happily and is
+#                      INERT there — the file exists while the capability does not. Do
+#                      not read its presence as proof the key survived a migration.
 #
 #   recovery         — never used in normal operation. Generated 2026-09-06 and
 #                      deliberately NOT written to this machine. Private half lives
@@ -19,9 +38,9 @@
 #                      fail for unrelated reasons (a forgotten master password does
 #                      not burn the paper; a house fire does not lock the vault).
 #
-# WHEN THE YUBIKEY LANDS: do not put it on Bitwarden's 2FA if it is also the SOPS
-# primary. One token guarding both the encryption and the route to the recovery key
-# means a single loss closes both doors.
+# IF A YUBIKEY IS EVER ADDED: do not make it Bitwarden's second factor if it is also
+# the SOPS primary. One token guarding both the encryption and the route to the
+# recovery key means a single loss closes both doors.
 #
 # Adding or rotating a recipient is not a one-shot decision: `sops updatekeys` on
 # each file re-encrypts to the current recipient list.
@@ -30,7 +49,8 @@ creation_rules:
   - path_regex: deploy/secrets/.*\.enc\.env$
     key_groups:
       - age:
-          # operator-laptop (software, 2026-06-08) — replace with the YubiKey
-          - age1aw47p94meh9d2x6ur0ud8v4wvucun6vst767emqj8gtnuxxcpqmqh49c0c
+          # operator-laptop — Apple Secure Enclave, Touch ID or passcode.
+          # Identity handle: ~/.config/sops/age/se-identity.txt (a HANDLE, not the key)
+          - age1se1qgw7n5ehtekw2h7lflepxgmc2xw5rvf5uam60w7dpe3zyse4yqvvuwwkagu
           # recovery (offline; Bitwarden + paper, never on a machine)
           - age1vh4qyncy3cwv5pgtjlmqefsj2p487cgkatl47vn4e3m6yku2faeqjnq90e
