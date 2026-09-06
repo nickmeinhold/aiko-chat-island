@@ -110,7 +110,19 @@ PYCHK
   #     wrap (a work laptop, a CI runner, a stranger who already holds a key), it
   #     grants full plaintext, and in a binary blob it is invisible to every diff.
   #     Pin the set EXACTLY: present-and-only.
-  FOUND=$(grep -oE 'age1[a-z0-9]{20,}' "$f" | sort -u)
+  # Parse sops.age[].recipient from the SCHEMA, not a regex over the whole file. The
+  # regex found no false positives today (measured: 0 matches inside the ENC payload),
+  # but it could match an age1-shaped substring in base64 — a leaky calorimeter reading
+  # the container instead of the contents, when the structured field is right there and
+  # already parsed once above. Latent, not live; fixed anyway, because recipient-set
+  # exactness is THE cleartext invariant CI can check. Carnot, cage-match round 3.
+  FOUND=$(python3 -c "
+import json,sys
+d=json.load(open(sys.argv[1]))
+for a in d.get('sops',{}).get('age',[]):
+    r=a.get('recipient')
+    if r: print(r)
+" "$f" | sort -u)
   for got in $FOUND; do
     ok=0
     for r in "${WANT[@]}"; do [ "$got" = "$r" ] && ok=1; done

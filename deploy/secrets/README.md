@@ -165,3 +165,22 @@ APNS key, say) will be **clobbered** by the first delivery of this snapshot unle
 lifted back into the repo first. Until step 2 lands: after any hand-edit on a box,
 re-lift that island. `./deploy/verify-secrets.sh` cannot detect this — it verifies the
 artifact's integrity, not its agreement with production.
+
+## Required before merging ANY change to a `*.env.sops`
+
+The binary encoding means a diff shows that `data` changed and nothing else — not which
+key, not which value. `MANIFEST.txt` restores the key-name inventory; it does **not**
+restore *which existing key's value* moved. Nothing mechanical can, so this is a rule:
+
+**A PR touching a `*.env.sops` must include, in its body:**
+
+1. the output of `./deploy/verify-secrets.sh --deep` (proves the manifest still matches), and
+2. a plain-language summary of what changed — *which* keys, and why.
+
+A reviewer who cannot decrypt is otherwise being asked to approve a bag. If the summary
+and the manifest disagree, the summary is wrong.
+
+The standing alternative, if this ever becomes onerous: split `APNS_PRIVATE_KEY` into its
+own binary artifact and keep the rest as dotenv-SOPS with visible key names. That was
+priced during review and deferred, not rejected — it trades one always-opaque file for
+two files with a sharper boundary.
