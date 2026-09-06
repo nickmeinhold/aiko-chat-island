@@ -38,7 +38,14 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install sops (for the rotation-path check)
         run: |
+          # Checksum-pinned. An unverified curl makes the VERIFIER itself
+          # supply-chain mutable — a thermometer the heat bath can rewrite
+          # (Carnot, cage-match round 2). CI holds no decryption key, so the
+          # secret blast radius is nil, but a tampered sops could report a
+          # green gate over a broken artifact.
+          SOPS_SHA=775f1384d55decfad228e7196a3f683791914f92a473f78fc47700531c29dfef
           curl -sSfL -o /tmp/sops https://github.com/getsops/sops/releases/download/v3.11.0/sops-v3.11.0.linux.amd64
+          echo "$SOPS_SHA  /tmp/sops" | sha256sum -c -
           sudo install -m 0755 /tmp/sops /usr/local/bin/sops
           sops --version
       - name: Verify committed secrets

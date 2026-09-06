@@ -23,21 +23,24 @@ need() { command -v "$1" >/dev/null 2>&1 || { echo "missing required tool: $1" >
 # that dies mid-pipeline exits on the LAST command's status, which is success with
 # empty output — the exact fail-open that cost this repo a near-miss on
 # ISLAND_SIGNING_SEED (PR#163). Fail loudly at the top instead.
-need grep; need sed; need sort; need python3
+need grep; need sed; need sort; need python3   # stdlib json only — NOT PyYAML (see below)
 
 # --- the recipients this repo REQUIRES, read from committed policy, not hardcoded.
 # NOT `mapfile` — that is bash 4+, and macOS ships bash 3.2, which is the shell
 # that actually runs deploys here. A bash-4-ism would pass CI (ubuntu) and fail on
 # the operator's laptop: green where it does not matter, red where it does.
+# NO PyYAML. An earlier draft parsed .sops.yaml with `python3 -c "import yaml"`; CI
+# installs only sops, so the gate depended on PyYAML happening to be on the runner
+# image (it is, today — undeclared ambient state is not a dependency, it is a
+# coincidence with a good track record). It failed CLOSED, but a gate whose failure
+# mode is "the runner image changed" is instrumentation you cannot trust. The
+# recipient list is a flat `- age1...` sequence; read it with the tools already
+# required. Carnot's catch, cage-match round 2.
 WANT=()
 while IFS= read -r _r; do
   [ -n "$_r" ] && WANT+=("$_r")
 done <<EOF_RECIPIENTS
-$(python3 -c "
-import yaml
-d=yaml.safe_load(open('$POLICY'))
-for r in d['creation_rules'][0]['key_groups'][0]['age']: print(r)
-")
+$(sed -n 's/^[[:space:]]*-[[:space:]]*\(age1[a-z0-9]\{20,\}\)[[:space:]]*$/\1/p' "$POLICY")
 EOF_RECIPIENTS
 [ "${#WANT[@]}" -ge 2 ] || bad "$POLICY declares ${#WANT[@]} recipient(s); at least 2 with uncorrelated failure modes are required (#3976)"
 echo "Policy requires ${#WANT[@]} recipients:"
@@ -57,9 +60,9 @@ shopt -s nullglob
 for entry in "$SECRETS_DIR"/* "$SECRETS_DIR"/.[!.]*; do
   [ -e "$entry" ] || continue
   case "$(basename "$entry")" in
-    README.md|.gitignore) ;;
+    README.md|.gitignore|MANIFEST.txt) ;;
     *.env.sops) ;;
-    *) bad "unexpected artifact in $SECRETS_DIR: $(basename "$entry") — only README.md, .gitignore and *.env.sops belong here. A misnamed secret would otherwise fall outside the glob below and be silently skipped." ;;
+    *) bad "unexpected artifact in $SECRETS_DIR: $(basename "$entry") — only README.md, MANIFEST.txt, .gitignore and *.env.sops belong here. A misnamed secret would otherwise fall outside the glob below and be silently skipped." ;;
   esac
 done
 
@@ -74,8 +77,23 @@ fi
 for f in "${FILES[@]}"; do
   echo; echo "== $f"
 
-  # 1. It must actually be a SOPS envelope, not a stray file with the right name.
-  grep -q '"sops"' "$f" || grep -q 'lastmodified' "$f" || bad "no SOPS metadata — is this actually encrypted?"
+  # 1. STRUCTURAL envelope check, one parse. An earlier draft accepted a file merely
+  #    CONTAINING the string `lastmodified` — a loose grep standing in for a shape
+  #    assertion (Carnot round 2). Assert the fields that must exist for this to be a
+  #    decryptable SOPS document at all.
+  python3 - "$f" <<'PYCHK' || FAIL=1
+import json,sys
+try: d=json.load(open(sys.argv[1]))
+except Exception as e:
+    print(f"  FAIL: not parseable JSON — not a SOPS envelope ({e.__class__.__name__})"); sys.exit(1)
+m=d.get("sops") or {}
+missing=[k for k in ("age","mac","lastmodified","version") if k not in m] + ([] if "data" in d else ["data"])
+if missing:
+    print(f"  FAIL: SOPS envelope missing required field(s): {', '.join(missing)}"); sys.exit(1)
+if not isinstance(m["age"], list) or not m["age"]:
+    print("  FAIL: sops.age is empty — no recipient can decrypt this file"); sys.exit(1)
+print(f"  valid SOPS envelope (v{m['version']}, {len(m['age'])} age recipient stanzas)")
+PYCHK
 
   # 2. EVERY policy recipient must be present. This is the arm that goes red if a
   #    botched `sops updatekeys` silently drops the offline recovery key — which
@@ -136,12 +154,42 @@ else
   note "sops not installed — skipping the rotation-path check (metadata checks above still ran)"
 fi
 
-# 6. --deep: prove a real decrypt. Needs a key, so it is opt-in and never runs in CI.
+# 6. MANIFEST coverage (key-free). The binary encoding means a diff cannot show WHICH
+#    key changed, so MANIFEST.txt carries the key NAMES in cleartext to buy that review
+#    surface back. CI cannot decrypt, so here we can only check the manifest exists and
+#    has a section per island — the BINDING check is --deep below. Say that plainly
+#    rather than letting a shallow pass read as a verified manifest.
+MANIFEST="$SECRETS_DIR/MANIFEST.txt"
+if [ ! -f "$MANIFEST" ]; then
+  bad "$MANIFEST missing — the only reviewable record of which keys exist"
+else
+  for f in "${FILES[@]}"; do
+    isl=$(basename "$f" .env.sops)
+    grep -q "^\[$isl\]$" "$MANIFEST" || bad "$MANIFEST has no [$isl] section — a secrets file with no manifest entry is unreviewable"
+  done
+  for sec in $(grep -oE '^\[[a-z0-9_-]+\]$' "$MANIFEST" | tr -d '[]'); do
+    [ -f "$SECRETS_DIR/$sec.env.sops" ] || bad "$MANIFEST names [$sec] but $SECRETS_DIR/$sec.env.sops does not exist"
+  done
+  grep -qE '=' "$MANIFEST" && bad "$MANIFEST contains '=' — it must hold key NAMES only, never values"
+  note "manifest covers every island (names only; binding check is --deep)"
+fi
+
+# 7. --deep: prove a real decrypt AND that the manifest tells the truth. Needs a key,
+#    so it is opt-in and never runs in CI.
 if [ "${1:-}" = "--deep" ]; then
   command -v sops >/dev/null 2>&1 || { echo "sops required for --deep" >&2; exit 2; }
   for f in "${FILES[@]}"; do
-    n=$(sops -d "$f" | grep -cE '^[[:space:]]*(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*=' || true)
-    [ "$n" -gt 0 ] && note "$f decrypts to $n assignments" || bad "$f decrypted to ZERO assignments"
+    isl=$(basename "$f" .env.sops)
+    ACTUAL=$(sops -d "$f" | grep -oE '^[[:space:]]*(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*=' \
+             | sed -E 's/^[[:space:]]*(export[[:space:]]+)?//; s/=$//' | sort)
+    [ -n "$ACTUAL" ] || { bad "$f decrypted to ZERO assignments"; continue; }
+    CLAIMED=$(sed -n "/^\[$isl\]$/,/^$/p" "$MANIFEST" | grep -E '^[A-Za-z_][A-Za-z0-9_]*$' | sort)
+    if [ "$ACTUAL" = "$CLAIMED" ]; then
+      note "$isl: $(printf '%s\n' "$ACTUAL" | grep -c .) keys, manifest matches exactly"
+    else
+      bad "$isl: MANIFEST DOES NOT MATCH the decrypted file — the reviewable record is lying"
+      diff <(printf '%s\n' "$CLAIMED") <(printf '%s\n' "$ACTUAL") | sed 's/^/      /' | head -12
+    fi
   done
 fi
 

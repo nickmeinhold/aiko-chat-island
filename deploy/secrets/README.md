@@ -45,7 +45,7 @@ Known divergences captured as-is, not fixed:
   (#157). `ENVIRONMENT` is worth a look against #3365.
 
 
-## Why `.env.sops` and not `.env.sops`
+## Why `.env.sops` and not `.enc.env`
 
 SOPS picks its parser from the **file extension**. A name ending in `.env` is parsed
 as dotenv — and these are binary blobs, so `sops updatekeys` failed outright with
@@ -70,7 +70,21 @@ reading it. The name now matches the content, so no command needs a remembered
   "nothing to verify" and exit 0. A checker that goes quiet when its targets vanish
   reports success for the state it exists to detect.
 
-`--deep` additionally proves a real decrypt; it needs a key, so it never runs in CI.
+`--deep` additionally proves a real decrypt **and that `MANIFEST.txt` tells the truth**.
+It needs a key, so it never runs in CI — **run it before merging any change to a
+`*.env.sops`.** A shallow pass confirms the manifest exists and covers every island; only
+the deep pass confirms it matches reality.
+
+### `MANIFEST.txt` — the review surface binary encoding took away
+
+Key **names** in cleartext, never values. A binary blob makes a diff show *that* a file
+changed, not *which* key — a permanent loss on a public, immortal artifact. The manifest
+buys it back: adding, removing or renaming a key changes this file visibly.
+
+It leaks nothing new. Every name in it is already public in `docker-compose.yml`, which
+has always been committed. (That resolves a tension the reviewers raised across two
+rounds — "key counts are reconnaissance" versus "commit a manifest" — on the first
+objection's own terms.)
 
 Every arm is mutation-proven — each was made to fail on purpose before being trusted.
 
