@@ -1,4 +1,23 @@
 # Declarative island deploy — design (#47 / #1577)
+> ## ⚠️ SUPERSEDED — THIS DOCUMENT DESCRIBES v1, WHICH WAS DELETED
+>
+> **Do not build from this file.** Temper finding #7 (unanimous) removed the entire
+> template/render/envsubst layer described below, in favour of the *subtractive middle*:
+> **store the complete encrypted `.env` per island — "the artifact in git IS the artifact
+> on the box."** Rollout step 1 shipped to v2 in PR#166.
+>
+> What is actually true now:
+> - `deploy/secrets/<island>.env.sops` holds the **complete** `.env`, SOPS **binary** type.
+>   Not `.enc.env` (SOPS parses that extension as dotenv and `updatekeys` fails), and not
+>   secrets-only.
+> - There is **no** `.env.template`, no `envsubst`, no render step, and no missing-var map.
+> - `./deploy/verify-secrets.sh` is the key-free verification gate.
+>
+> Kept for the reasoning and the rejected alternatives, which are still worth reading.
+> A rewritten v2 design is owed — until it exists, treat every mechanism below as
+> historical. (Flagged in the PR#166 cage-match by two families: a stale design beside a
+> live artifact is how a deleted layer gets rebuilt with production credentials in it.)
+
 
 Status: **design** (2026-07-28). Grounded on measured drift + SOPS reality, not intent.
 Supersedes the hand-`scp`/`sed`/`--yes` deploy that zeroed enspyr's live compose (the
