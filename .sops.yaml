@@ -1,0 +1,36 @@
+# SOPS recipients for this repo's encrypted secrets.
+#
+# Public keys only — nothing here is secret, and that is the point: anyone can see
+# WHO can decrypt, nobody can decrypt without a private half.
+#
+# TWO RECIPIENTS, WITH DELIBERATELY UNCORRELATED FAILURE MODES. A second recipient
+# whose private half sits next to the first one is not redundancy — this laptop
+# already holds three age identities in a single keys.txt, so naming a second one
+# from that file would satisfy the letter of the requirement and none of its purpose.
+#
+#   operator-laptop  — daily use. Private half in ~/.config/sops/age/keys.txt.
+#                      To be REPLACED by a YubiKey (age1yubikey1…) once hardware
+#                      arrives, so routine decryption needs a physical touch and the
+#                      key material cannot be exfiltrated from a compromised laptop.
+#
+#   recovery         — never used in normal operation. Generated 2026-09-06 and
+#                      deliberately NOT written to this machine. Private half lives
+#                      in Bitwarden AND on paper: one key, two retrieval paths that
+#                      fail for unrelated reasons (a forgotten master password does
+#                      not burn the paper; a house fire does not lock the vault).
+#
+# WHEN THE YUBIKEY LANDS: do not put it on Bitwarden's 2FA if it is also the SOPS
+# primary. One token guarding both the encryption and the route to the recovery key
+# means a single loss closes both doors.
+#
+# Adding or rotating a recipient is not a one-shot decision: `sops updatekeys` on
+# each file re-encrypts to the current recipient list.
+
+creation_rules:
+  - path_regex: deploy/secrets/.*\.enc\.env$
+    key_groups:
+      - age:
+          # operator-laptop (software, 2026-06-08) — replace with the YubiKey
+          - age1aw47p94meh9d2x6ur0ud8v4wvucun6vst767emqj8gtnuxxcpqmqh49c0c
+          # recovery (offline; Bitwarden + paper, never on a machine)
+          - age1vh4qyncy3cwv5pgtjlmqefsj2p487cgkatl47vn4e3m6yku2faeqjnq90e
