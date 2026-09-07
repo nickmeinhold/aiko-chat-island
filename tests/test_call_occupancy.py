@@ -147,7 +147,7 @@ async def test_empty_room_is_not_live_and_has_no_since(monkeypatch, livekit_conf
     occ = await livekit_rooms.occupancy(room="chan-abc")
     assert occ.live is False
     assert occ.participants == 0
-    assert occ.since_ms is None
+    assert occ.since is None
 
 
 async def test_occupied_room_reports_count_and_earliest_join(monkeypatch, livekit_configured):
@@ -160,7 +160,7 @@ async def test_occupied_room_reports_count_and_earliest_join(monkeypatch, liveki
     assert occ.participants == 2
     # EARLIEST current join, not the later one: "since" answers when this occupancy
     # began, so a callee can tell "still the call I was rung for" from a newer one.
-    assert occ.since_ms == 1788700000 * 1000
+    assert occ.since == "2026-09-06T13:06:40Z"   # rendered INSIDE the 503 boundary
 
 
 async def test_absent_or_zero_joined_at_never_backdates_since(monkeypatch, livekit_configured):
@@ -169,13 +169,24 @@ async def test_absent_or_zero_joined_at_never_backdates_since(monkeypatch, livek
     # would defeat the app's "is this the same call" comparison rather than just being
     # untidy.
     _fake_sfu(monkeypatch, _responds({"participants": [
-        {"identity": "a"},
-        {"identity": "b", "joinedAt": 0},
+        {"identity": "a"},                       # absent  -> protobuf "no value"
+        {"identity": "b", "joinedAt": 0},        # zero    -> protobuf "no value"
         {"identity": "c", "joinedAt": "1788700500"},
     ]}))
     occ = await livekit_rooms.occupancy(room="chan-abc")
     assert occ.participants == 3          # all three ARE present
-    assert occ.since_ms == 1788700500 * 1000
+    assert occ.since == "2026-09-06T13:15:00Z"
+
+
+async def test_every_participant_unstamped_is_live_with_no_since(
+    monkeypatch, livekit_configured
+):
+    """Unstamped is ORDINARY, not broken: the room is occupied and we simply cannot say
+    since when. This is the arm that keeps the r3 strictness from over-reaching — if
+    absent/zero were treated as malformed, a legitimately unstamped room would 503."""
+    _fake_sfu(monkeypatch, _responds({"participants": [{"identity": "a"}, {"identity": "b"}]}))
+    occ = await livekit_rooms.occupancy(room="chan-abc")
+    assert occ.live is True and occ.participants == 2 and occ.since is None
 
 
 async def test_request_carries_the_namespaced_room_and_a_bearer(
@@ -440,7 +451,7 @@ async def test_the_empty_ARRAY_is_still_a_real_empty_room(
     distinction the fix rests on — empty array is data, absent key is ignorance."""
     _fake_sfu(monkeypatch, _responds({"participants": []}))
     occ = await livekit_rooms.occupancy(room="chan-abc")
-    assert occ.live is False and occ.participants == 0 and occ.since_ms is None
+    assert occ.live is False and occ.participants == 0 and occ.since is None
 
 
 async def test_malformed_payload_reaches_the_route_as_503_not_500(
@@ -470,3 +481,51 @@ async def test_aclose_releases_the_pooled_client(monkeypatch, livekit_configured
     assert livekit_rooms._client_singleton is not None      # pooled after first use
     await livekit_rooms.aclose()
     assert livekit_rooms._client_singleton is None          # and released on shutdown
+
+
+# ---- the CLASS round 3 closed: no SFU-derived value is computed after the boundary ----
+# Round 1's instance was SHAPE (a malformed body raised AttributeError -> 500). Round 3's
+# was RANGE: the route called datetime.fromtimestamp on the SFU's joinedAt OUTSIDE the try
+# that maps SFU failure to 503, so an absurd stamp raised OverflowError and escaped as a
+# gateway 500. Same class both times -- SFU data being computed past the boundary meant to
+# contain it. Rendering now happens in the domain, so there is nothing left outside to break.
+
+@pytest.mark.parametrize("arm,stamp", [
+    ("past platform time_t", "999999999999999999999"),
+    ("negative",             "-1788700000"),
+    ("unparseable",          "1e400"),
+    ("not a number at all",  "yesterday"),
+])
+async def test_unrenderable_joined_at_is_503_not_a_gateway_500(
+    monkeypatch, livekit_configured, arm, stamp
+):
+    _fake_sfu(monkeypatch, _responds({"participants": [{"joinedAt": stamp}]}))
+    with pytest.raises(livekit_rooms.LiveKitUnreachable):
+        await livekit_rooms.occupancy(room="chan-abc")
+
+
+async def test_unrenderable_joined_at_reaches_the_route_as_503(
+    client, session, monkeypatch, livekit_configured
+):
+    """The route-level proof. Before the fix this was an uncaught OverflowError -> 500,
+    which is a different status, a different client path, and an alarm that reads as a
+    gateway bug rather than an SFU one."""
+    alice, peer = await _user(session, "alice"), await _user(session, "peer")
+    ch = await _dm(session)
+    await _join(session, ch, alice)
+    await _join(session, ch, peer)
+    _fake_sfu(monkeypatch, _responds({"participants": [
+        {"identity": peer.id, "joinedAt": "999999999999999999999"}]}))
+
+    resp = await client.get(f"/v1/channels/{ch.id}/call", headers=_headers(alice))
+    assert resp.status_code == 503
+    assert "live" not in resp.json()
+
+
+async def test_a_sane_stamp_still_renders(monkeypatch, livekit_configured):
+    """NULL CONTROL for the three arms above. A range check that rejects everything
+    would pass them all while breaking the feature — this pins that ordinary
+    timestamps are still accepted and rendered."""
+    _fake_sfu(monkeypatch, _responds({"participants": [{"joinedAt": "1788700000"}]}))
+    occ = await livekit_rooms.occupancy(room="chan-abc")
+    assert occ.since == "2026-09-06T13:06:40Z"

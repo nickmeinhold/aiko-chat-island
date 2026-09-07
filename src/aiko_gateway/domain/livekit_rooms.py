@@ -29,6 +29,7 @@ Measured against the live imagineering SFU, 2026-09-07:
 """
 from __future__ import annotations
 
+import datetime as dt
 import logging
 from dataclasses import dataclass
 from urllib.parse import urlparse, urlunparse
@@ -58,10 +59,22 @@ class LiveKitUnreachable(RuntimeError):
 
 @dataclass(frozen=True)
 class Occupancy:
-    """Present-tense truth about one room. ``since_ms`` is None when nobody is in it."""
+    """Present-tense truth about one room. ``since`` is None when nobody is in it.
+
+    ``since`` is the FINISHED wire string, not a number the caller must still convert.
+    That is the fix for a CLASS, not a preference (cage-match #167 r3, Carnot): the
+    route used to receive epoch milliseconds and call ``datetime.fromtimestamp`` itself,
+    OUTSIDE the try that maps SFU failure to 503 — so a payload like
+    ``{"joinedAt": "999999999999999999999"}`` raised OverflowError at the route and
+    escaped as a 500, violating the same "malformed SFU means cannot-determine, never a
+    gateway error" invariant that round 1's shape bug violated. Two instances, one
+    class: SFU-derived values were being computed after the boundary that is supposed to
+    contain them. Rendering here means there is no SFU-derived arithmetic left outside
+    it to get wrong.
+    """
     live: bool
     participants: int
-    since_ms: int | None
+    since: str | None
 
 
 def _api_base() -> str:
@@ -109,6 +122,32 @@ async def aclose() -> None:
     if _client_singleton is not None:
         await _client_singleton.aclose()
         _client_singleton = None
+
+
+def _iso_or_unreachable(epoch_seconds: int) -> str:
+    """Render a Unix timestamp as ISO-8601 UTC, or declare the payload unreadable.
+
+    NO MAGIC RANGE CONSTANT. The question is not "is this number smaller than some
+    bound I picked" — it is "can this actually be rendered as a time?", and the honest
+    way to answer that is to render it and see. A bound chosen by hand would be a
+    constant whose meaning drifts with the platform it was chosen on; ``fromtimestamp``
+    already knows its own limits (it raises OverflowError past platform ``time_t``).
+
+    A stamp we cannot render is treated exactly like a wrong-typed field: the SFU said
+    something we do not understand, so the answer is "cannot determine" (503), never a
+    gateway 500 and never a fabricated time.
+
+    The ``Z`` suffix is the app tab's specified contract for this field
+    (claude-tasks#3159 shows ``"since": "2026-08-15T13:22:04.113Z"``). Python has no
+    stdlib call that emits it — ``isoformat(z=True)`` is a TypeError and ``%Z`` yields
+    the zone NAME ("UTC") — so the replace is the idiom, not a workaround.
+    """
+    try:
+        moment = dt.datetime.fromtimestamp(epoch_seconds, dt.timezone.utc)
+    except (OverflowError, OSError, ValueError) as exc:
+        raise LiveKitUnreachable(
+            f"SFU reported an unrenderable joinedAt ({epoch_seconds})") from exc
+    return moment.isoformat().replace("+00:00", "Z")
 
 
 def _participants_from(body: object) -> list[dict]:
@@ -211,22 +250,33 @@ async def occupancy(*, room: str) -> Occupancy:
     # joinedAt is Unix SECONDS in LiveKit's protobuf-JSON, and absent/0 for a participant
     # the SFU has not stamped. Drop unusable stamps rather than letting a 0 masquerade as
     # 1970 — an absent stamp must not make `since_ms` older than the call.
+    # TWO CATEGORIES, and the line between them is protobuf's, not ours (cage-match
+    # #167 r3). ABSENT or ZERO is protobuf-JSON's way of saying "no value" — an
+    # unstamped participant is ordinary and is simply skipped, so a room full of
+    # unstamped peers reports live=True with since=None rather than failing. Anything
+    # ELSE that is present must be readable: a negative, unparseable, or unrenderable
+    # stamp is the SFU asserting a time we cannot read, which is the same "payload we
+    # do not understand" as a wrong-typed field and gets the same 503.
+    #
+    # An earlier version dropped negative and unparseable stamps while raising on
+    # out-of-range ones — three equally malformed values, treated three ways, for no
+    # reason a reader could state. Consistency here is the actual fix; the OverflowError
+    # Carnot found was one arbitrary branch of it.
     joined = []
     for p in participants:
         raw = p.get("joinedAt")
-        # Bind the value ONCE. An earlier version guarded with .get() and then indexed
-        # with [], so a participant carrying no stamp at all raised KeyError instead of
-        # being skipped — the guard and the value were reading different expressions.
-        if raw is None:
-            continue
+        if raw is None or raw == 0 or raw == "0":
+            continue                      # protobuf "no value" — unstamped, not broken
         try:
             stamp = int(raw)
-        except (TypeError, ValueError):
-            continue
-        if stamp > 0:
-            joined.append(stamp)
+        except (TypeError, ValueError) as exc:
+            raise LiveKitUnreachable(
+                f"SFU sent an unreadable joinedAt ({raw!r})") from exc
+        if stamp <= 0:
+            raise LiveKitUnreachable(f"SFU sent a non-positive joinedAt ({stamp})")
+        joined.append(stamp)
     return Occupancy(
         live=bool(participants),
         participants=len(participants),
-        since_ms=min(joined) * 1000 if joined else None,
+        since=_iso_or_unreachable(min(joined)) if joined else None,
     )
