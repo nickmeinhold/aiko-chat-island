@@ -37,7 +37,6 @@ credential that must not be cached by any intermediary (Wu).
 """
 from __future__ import annotations
 
-import datetime as dt
 import logging
 
 from fastapi import APIRouter, HTTPException, Response, status
@@ -257,10 +256,10 @@ async def get_call_occupancy(
     # A ring polls this: a cached answer is a stale answer, and a stale answer is exactly
     # the bug. Never let an intermediary hold it.
     response.headers["Cache-Control"] = "no-store"
-    since = (
-        dt.datetime.fromtimestamp(occ.since_ms / 1000, dt.timezone.utc)
-          .isoformat().replace("+00:00", "Z")
-        if occ.since_ms is not None else None
-    )
+    # `occ.since` is already the finished wire string. NOTHING SFU-derived is computed
+    # here: the route used to convert epoch millis itself, outside the try above, so an
+    # out-of-range joinedAt raised OverflowError and escaped as a 500 (cage-match #167
+    # r3, Carnot). Rendering moved inside the 503 boundary, which is where every other
+    # judgement about the SFU's payload already lives.
     return CallOccupancyResponse(
-        live=occ.live, participants=occ.participants, since=since)
+        live=occ.live, participants=occ.participants, since=occ.since)
