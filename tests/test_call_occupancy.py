@@ -63,6 +63,13 @@ def _fake_sfu(monkeypatch, handler):
 
     Patches ``httpx.AsyncClient`` in the MODULE's namespace rather than adding a
     production injection seam — the code under test stays exactly what ships.
+
+    The module pools ONE client (see its ``_client``/``aclose``, mirroring
+    ``domain/apns.py``), so the singleton is also reset here: without it the first
+    test to run would build the pooled client and every later test would silently
+    reuse THAT one, making its own handler dead code and its assertions vacuous —
+    a whole file of tests grading one stale mock. ``monkeypatch.setattr`` restores
+    the previous value afterwards, so the reset is symmetric.
     """
     real = httpx.AsyncClient
 
@@ -70,6 +77,7 @@ def _fake_sfu(monkeypatch, handler):
         kwargs["transport"] = httpx.MockTransport(handler)
         return real(*args, **kwargs)
 
+    monkeypatch.setattr(livekit_rooms, "_client_singleton", None)
     monkeypatch.setattr(livekit_rooms.httpx, "AsyncClient", _factory)
 
 
@@ -390,3 +398,75 @@ async def test_gates_agree_three_party_dm_fails_closed(
         await _join(session, ch, u)
     occ, tok = await _both(client, a, ch.id)
     assert occ == tok == 403
+
+
+# ---- the vendor boundary: shapes we do not understand are UNKNOWN, not EMPTY ----
+# Found by Carnot in the cage-match on PR #167, confirmed executably before the fix.
+# The first parser read `resp.json().get("participants") or []`, which turned a
+# missing/null field into an empty room and therefore into `live: false` on a
+# ringing handset — the module's own stated principle, violated by its own parser.
+
+@pytest.mark.parametrize("arm,body", [
+    ("participants key MISSING",   {}),
+    ("participants is null",       {"participants": None}),
+    ("participants is an object",  {"participants": {"a": {"joinedAt": "1"}}}),
+    ("participants is a string",   {"participants": "alice"}),
+    ("participants holds strings", {"participants": ["alice"]}),
+    ("participants holds ints",    {"participants": [42]}),
+    ("body is a list",             ["nope"]),
+    ("body is a string",           "nope"),
+])
+async def test_unrecognised_payload_is_unknown_not_empty(
+    monkeypatch, livekit_configured, arm, body
+):
+    """Every one of these previously returned live=False (or raised AttributeError
+    and escaped as a 500). All must now be the same 'cannot determine' as a network
+    failure: there is ONE meaning for 'the answer did not arrive', regardless of
+    which way it failed to."""
+    _fake_sfu(monkeypatch, _responds(body))
+    with pytest.raises(livekit_rooms.LiveKitUnreachable):
+        await livekit_rooms.occupancy(room="chan-abc")
+
+
+async def test_the_empty_ARRAY_is_still_a_real_empty_room(
+    monkeypatch, livekit_configured
+):
+    """THE NULL CONTROL for the test above, and it is load-bearing rather than
+    decorative. Requiring the `participants` key is only safe because LiveKit emits
+    it even when empty — protobuf-JSON often OMITS empty repeated fields, and if it
+    did here, the strictness above would 503 every empty room and break the feature
+    outright. Verified at the byte level against both live islands 2026-09-07:
+    an empty room returns literally {"participants":[]}. This test pins the
+    distinction the fix rests on — empty array is data, absent key is ignorance."""
+    _fake_sfu(monkeypatch, _responds({"participants": []}))
+    occ = await livekit_rooms.occupancy(room="chan-abc")
+    assert occ.live is False and occ.participants == 0 and occ.since_ms is None
+
+
+async def test_malformed_payload_reaches_the_route_as_503_not_500(
+    client, session, monkeypatch, livekit_configured
+):
+    """The route promises 503 for 'cannot tell'. A malformed-but-valid-JSON body used
+    to raise AttributeError past the route's `except` and surface as a 500 — a
+    different code, a different client code path, and an alarm that reads as a
+    gateway bug rather than an SFU one."""
+    alice, peer = await _user(session, "alice"), await _user(session, "peer")
+    ch = await _dm(session)
+    await _join(session, ch, alice)
+    await _join(session, ch, peer)
+    _fake_sfu(monkeypatch, _responds({"participants": ["alice"]}))
+
+    resp = await client.get(f"/v1/channels/{ch.id}/call", headers=_headers(alice))
+    assert resp.status_code == 503
+    assert "live" not in resp.json()
+
+
+async def test_aclose_releases_the_pooled_client(monkeypatch, livekit_configured):
+    """The pooled client is closed by the app lifespan. If aclose() failed to drop the
+    reference, a second lifespan (a test harness, an embedded server) would hand out a
+    CLOSED client forever."""
+    _fake_sfu(monkeypatch, _responds({"participants": []}))
+    await livekit_rooms.occupancy(room="chan-abc")
+    assert livekit_rooms._client_singleton is not None      # pooled after first use
+    await livekit_rooms.aclose()
+    assert livekit_rooms._client_singleton is None          # and released on shutdown

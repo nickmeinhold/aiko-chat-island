@@ -296,9 +296,12 @@ async def lifespan(app: FastAPI):
             # it. All three are no-ops on an island with push unconfigured.
             # Imported here rather than at module scope to keep the import graph of
             # `main` unchanged for the clean-checkout route-table tests.
-            from .domain import apns, push_service
+            from .domain import apns, livekit_rooms, push_service
             await push_service.aclose()
             await apns.aclose()
+            # The occupancy endpoint's pooled SFU client (#3159). No-op on an island
+            # with video unconfigured, and on one where no call was ever polled.
+            await livekit_rooms.aclose()
     finally:
         # Outermost: runs whether startup raised before yield or cleanup raised.
         release_single_worker_lock()
