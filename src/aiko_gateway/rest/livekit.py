@@ -77,6 +77,67 @@ class VideoTokenResponse(BaseModel):
     can_publish: bool  # echoes the grant the caller actually received (read-only → False)
 
 
+async def _gated_dm_channel(session, user_id: str, channel_id: str):
+    """THE ONE DOOR both video endpoints pass through. Returns the resolved channel.
+
+    WHY THIS IS A FUNCTION AND NOT A CONVENTION (cage-match #167 r2, Carnot). The two
+    endpoints answer questions about the same object, so a gate present on one and
+    absent on the other turns the weaker into an oracle for what the stronger hides: a
+    user blocked from minting a join token could still poll occupancy and learn exactly
+    when the person who blocked them is on a call. The first version of this PR kept the
+    two gate sequences in sync by hand and PROVED the agreement with property tests
+    (``test_gates_agree_*``). That guards the window; it does not remove the coupling —
+    a third endpoint, or a new safety check added to one caller, re-opens it and the
+    tests only notice the cases they enumerate. This repo's own rule is to seal the
+    shared door rather than each caller, so the gate lives here once and the property
+    tests now verify the door is actually shared rather than that two copies still
+    match.
+
+    The order is load-bearing and unchanged from the reviewed original:
+
+      1. **Existence-hiding.** ``acl.readable_channel`` collapses "no such channel" and
+         "private channel you are not in" into the SAME ``None`` -> identical 404.
+      2. **DM-only** (cage-match #122 rd7). A group/public room cannot enforce pairwise
+         BLOCKS at a room-level token: participants are unbounded and LiveKit
+         subscription is all-or-nothing, so a blocked user could watch the blocker's
+         live camera. Fail closed to DMs until selective per-track subscription lands
+         (#2731). Private is checked too as defence in depth: migration 0020's
+         ``ck_channels_dm_private`` makes a public DM unrepresentable, so this branch is
+         unreachable through the DB today, but a future writer path would make it
+         reachable again.
+      3. **2-party cardinality from GROUND TRUTH** (cage-match #122 rd9). Resolved from
+         RAW ``Membership`` rows, never ``list_members`` — that is the visibility-shaped
+         @-mention roster, and if it ever hides blocked or soft-deleted peers a
+         list-based check would see only self and fail OPEN on the exact safety surface
+         DM-only exists to protect.
+      4. **Block in EITHER direction** -> existence-hiding 404, so the block primitive
+         traverses the video paths exactly as it traverses message fanout.
+    """
+    channel = await acl.readable_channel(session, user_id, channel_id)
+    if channel is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "channel not found")
+
+    if channel.kind != "dm" or not channel.is_private:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "video is only available in direct messages")
+
+    peer_ids = (await session.execute(
+        select(Membership.user_id).where(
+            Membership.channel_id == channel.id,
+            Membership.user_id != user_id,
+        )
+    )).scalars().all()
+    if len(peer_ids) != 1:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "video is only available in direct messages")
+    if await moderation_service.is_blocked_between(session, user_id, peer_ids[0]):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "channel not found")
+
+    return channel
+
+
 @router.post(
     "/channels/{channel_id}/video-token",
     response_model=VideoTokenResponse,
@@ -96,59 +157,7 @@ async def create_video_token(
             status.HTTP_503_SERVICE_UNAVAILABLE, "video is not enabled on this island"
         )
 
-    # Membership/existence gate — a non-member of a private channel (or a missing
-    # channel) is the same existence-hiding 404 as everywhere else.
-    channel = await acl.readable_channel(session, user.id, channel_id)
-    if channel is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "channel not found")
-
-    # DM-ONLY in increment 1 (cage-match #122 rd7 Carnot). Group/public rooms cannot
-    # enforce pairwise BLOCKS at a room-level token: participants are unbounded (public
-    # readers with no membership row) and LiveKit subscription is all-or-nothing, so a
-    # blocked user could watch the blocker's live camera — silently widening block
-    # semantics on a SAFETY boundary. Fail closed to DMs (2-party, where blocks ARE
-    # enforceable) until selective per-track subscription lands (#2731). The channel is
-    # already readable here, so revealing "video is DM-only" leaks nothing.
-    # DM must ALSO be private (cage-match #122 rd8 Carnot) — DEFENCE IN DEPTH, and
-    # stated honestly. This comment used to say kind='dm' was "not fully DB-constrained
-    # to is_private". That was true when written and stopped being true at migration
-    # 0020, which added `ck_channels_dm_private` (kind != 'dm' OR is_private): the
-    # malformed public DM row it warned about is now unrepresentable, and this branch
-    # is unreachable through the DB. The check STAYS — it costs one comparison, and a
-    # future writer path or a relaxed constraint would make it reachable again — but a
-    # reader was learning a false fact about the schema, which is how the next person
-    # mis-models the system (claude-tasks#3350; `push_service._recipients` carries the
-    # corrected wording this mirrors).
-    if channel.kind != "dm" or not channel.is_private:
-        raise HTTPException(
-            status.HTTP_403_FORBIDDEN,
-            "video is only available in direct messages")
-
-    # BLOCK LAYER (cage-match #122 rd6 Wu #1 / rd8 Tesla): readability is NECESSARY, not
-    # SUFFICIENT — the block primitive must traverse the video path exactly as it does
-    # message fanout (concept invariant-must-traverse-all-layers). Resolve the DM peer(s)
-    # from RAW Membership rows — NOT list_members, which is the visibility-shaped @-mention
-    # roster: if it ever hides blocked/soft-deleted peers, a list-based check would see
-    # only self and fail OPEN on the exact safety surface DM-only exists to protect
-    # (rd8 Tesla F1 — a safety gate must read ground truth, not a social proxy). A block
-    # in EITHER direction denies the join (existence-hiding 404).
-    peer_ids = (await session.execute(
-        select(Membership.user_id).where(
-            Membership.channel_id == channel.id,
-            Membership.user_id != user.id,
-        )
-    )).scalars().all()
-    # Assert 2-PARTY cardinality from ground truth (cage-match #122 rd9 Carnot):
-    # DM-only's block safety rests on the room being exactly {caller, one peer}. A
-    # malformed / migration-created private kind='dm' with 3+ members would reintroduce
-    # the multi-party pairwise-block gap DM-only closes; a singleton is an empty-room
-    # capability outside the model. Fail closed unless there is exactly one peer.
-    if len(peer_ids) != 1:
-        raise HTTPException(
-            status.HTTP_403_FORBIDDEN,
-            "video is only available in direct messages")
-    if await moderation_service.is_blocked_between(session, user.id, peer_ids[0]):
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "channel not found")
+    channel = await _gated_dm_channel(session, user.id, channel_id)
 
     # READ ≠ PUBLISH: publish (live camera/mic) requires an EXPLICIT posting
     # membership (acl.is_posting_member) on BOTH public and private channels — a
@@ -225,30 +234,7 @@ async def get_call_occupancy(
             status.HTTP_503_SERVICE_UNAVAILABLE, "video is not enabled on this island"
         )
 
-    channel = await acl.readable_channel(session, user.id, channel_id)
-    if channel is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "channel not found")
-
-    if channel.kind != "dm" or not channel.is_private:
-        raise HTTPException(
-            status.HTTP_403_FORBIDDEN,
-            "video is only available in direct messages")
-
-    # Block layer + 2-party cardinality, from RAW Membership rows for the same reason
-    # video-token does it: list_members is the visibility-shaped roster and would fail
-    # OPEN on the exact safety surface DM-only exists to protect.
-    peer_ids = (await session.execute(
-        select(Membership.user_id).where(
-            Membership.channel_id == channel.id,
-            Membership.user_id != user.id,
-        )
-    )).scalars().all()
-    if len(peer_ids) != 1:
-        raise HTTPException(
-            status.HTTP_403_FORBIDDEN,
-            "video is only available in direct messages")
-    if await moderation_service.is_blocked_between(session, user.id, peer_ids[0]):
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "channel not found")
+    channel = await _gated_dm_channel(session, user.id, channel_id)
 
     try:
         occ = await livekit_rooms.occupancy(room=channel.id)
@@ -258,9 +244,15 @@ async def get_call_occupancy(
         # this endpoint exists to prevent, inverted. 503 says "I cannot tell", which the app
         # already has a code path for (it mirrors video-token's capability-disabled 503), and
         # a ring that cannot be told to stop still stops at its own duration ceiling.
+        # no-store on the ERROR path too (cage-match #167 r2, Carnot). The success
+        # path already refuses caching; a 503 left to default behaviour could be held
+        # by an intermediary and replayed to a handset that is polling once a second,
+        # which turns a momentary SFU blip into a persistent "cannot tell". The whole
+        # endpoint is a present-tense read: NO response from it is ever cacheable.
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
-            "call state is temporarily unavailable")
+            "call state is temporarily unavailable",
+            headers={"Cache-Control": "no-store"})
 
     # A ring polls this: a cached answer is a stale answer, and a stale answer is exactly
     # the bug. Never let an intermediary hold it.
