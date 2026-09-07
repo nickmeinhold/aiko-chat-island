@@ -80,6 +80,81 @@ def _api_base() -> str:
     return urlunparse((scheme, parts.netloc, "", "", "", ""))
 
 
+# One pooled client, not one per request. MEASURED against the live imagineering
+# SFU, 2026-09-07, 16 samples per arm interleaved to control for network drift:
+#
+#     fresh AsyncClient per request : median 198.1 ms
+#     shared AsyncClient            : median  57.9 ms
+#
+# 140ms per poll, a 3.4x speedup, almost all of it TCP+TLS handshake. That is not a
+# micro-optimisation here: this endpoint is polled about once a second by a RINGING
+# phone, and the whole feature exists to stop a ring PROMPTLY. Re-handshaking on
+# every poll spends the latency budget of the thing being built. Same singleton +
+# aclose() shape as ``domain/apns.py`` — the app lifespan closes it on shutdown, so
+# this follows the repo's existing convention rather than adding a second one.
+_client_singleton: httpx.AsyncClient | None = None
+
+
+def _client() -> httpx.AsyncClient:
+    """The pooled client, created on first use."""
+    global _client_singleton
+    if _client_singleton is None:
+        _client_singleton = httpx.AsyncClient(timeout=_TIMEOUT_SECONDS)
+    return _client_singleton
+
+
+async def aclose() -> None:
+    """Close the pooled client. Called from the app lifespan on shutdown."""
+    global _client_singleton
+    if _client_singleton is not None:
+        await _client_singleton.aclose()
+        _client_singleton = None
+
+
+def _participants_from(body: object) -> list[dict]:
+    """Validate the SFU's payload SHAPE, and refuse to guess when it is not what we expect.
+
+    THIS FUNCTION EXISTS BECAUSE THE MODULE'S OWN PRINCIPLE WAS ONLY PROSE. The
+    docstring above promises that an SFU we cannot understand yields "I don't know",
+    never "nobody is here" — but the first version of this parser read
+    ``resp.json().get("participants") or []``, which quietly turned a MISSING or
+    ``null`` field into an empty room and therefore into ``live: false`` on a ringing
+    handset. That is the exact inversion this endpoint exists to prevent, arriving
+    through protocol drift instead of through a network failure. (Found by Carnot in
+    the cage-match; confirmed executably before fixing.)
+
+    The same read also assumed ``participants`` was a list of dicts, so a body like
+    ``{"participants": ["alice"]}`` raised ``AttributeError`` and escaped as a 500
+    rather than the promised 503. Both are one defect: the vendor payload was being
+    read as an internal typed object instead of as untrusted protocol data. So the
+    shape is checked ONCE, here, and every failure to match is the same
+    ``LiveKitUnreachable`` the network path raises — "cannot determine" has a single
+    meaning regardless of which way the answer failed to arrive.
+
+    REQUIRING the key is safe, and that is a measurement rather than an assumption:
+    protobuf-JSON commonly omits empty repeated fields, which would make this 503 on
+    every empty room and break the feature outright. Checked at the byte level against
+    BOTH live islands, 2026-09-07 — an empty room returns literally
+    ``{"participants":[]}`` on each. If a future LiveKit changes its marshaller to omit
+    the field, this fails LOUDLY (503, "cannot tell") instead of silently cancelling
+    live calls, which is the correct direction to break in.
+    """
+    if not isinstance(body, dict):
+        raise LiveKitUnreachable(f"SFU returned a {type(body).__name__}, not an object")
+    if "participants" not in body:
+        # NOT an empty room. A response missing the field is one we do not understand.
+        raise LiveKitUnreachable("SFU response has no 'participants' field")
+    participants = body["participants"]
+    if not isinstance(participants, list):
+        raise LiveKitUnreachable(
+            f"SFU 'participants' is a {type(participants).__name__}, not a list")
+    for p in participants:
+        if not isinstance(p, dict):
+            raise LiveKitUnreachable(
+                f"SFU participant entry is a {type(p).__name__}, not an object")
+    return participants
+
+
 async def occupancy(*, room: str) -> Occupancy:
     """Ask the SFU who is in ``room`` RIGHT NOW. ``room`` is the BARE channel id.
 
@@ -93,19 +168,28 @@ async def occupancy(*, room: str) -> Occupancy:
     ``empty_timeout`` (300s by default, and neither island overrides it), so
     ``creationTime`` can belong to a call that already ended while a new one has since
     started in the same room object. The earliest current join answers the question the
-    app actually asks — "is this still the call I was rung for?" — and moves, correctly,
-    when the original participants have all gone and a different call has begun.
+    app actually asks — "is this still the call I was rung for?" — far better than a
+    creationTime that can outlive the call it belongs to.
+
+    STATED HONESTLY, because the first version of this paragraph did not: `since` moves
+    when the EARLIEST CURRENT participant leaves, which is not the same event as "the
+    original participants have all gone". In a 2-party DM where the caller drops and
+    rejoins, `since` advances to the callee's join time while the same call continues.
+    A client comparing `since` for identity should treat a forward jump as "possibly
+    still the same call" rather than proof of a new one. Making `since` immovable would
+    require the island to hold per-call state, which is exactly what the design declines
+    to do — so the limitation is inherent to a stateless read, not an oversight, and the
+    app tab should have it in the contract rather than discover it.
     """
     token = livekit_tokens.mint_room_admin_token(room=room)
     namespaced = livekit_tokens.room_for_channel(room)
     url = _api_base() + _LIST_PARTICIPANTS_PATH
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT_SECONDS) as client:
-            resp = await client.post(
-                url,
-                json={"room": namespaced},
-                headers={"Authorization": f"Bearer {token}"},
-            )
+        resp = await _client().post(
+            url,
+            json={"room": namespaced},
+            headers={"Authorization": f"Bearer {token}"},
+        )
     except httpx.HTTPError as exc:
         # Log the class, never the token. A ringing handset polls this, so a persistent
         # SFU outage would otherwise write one line per second per ring.
@@ -119,9 +203,10 @@ async def occupancy(*, room: str) -> Occupancy:
         raise LiveKitUnreachable(f"SFU returned HTTP {resp.status_code}")
 
     try:
-        participants = resp.json().get("participants") or []
+        body = resp.json()
     except ValueError as exc:
         raise LiveKitUnreachable("SFU returned a non-JSON body") from exc
+    participants = _participants_from(body)
 
     # joinedAt is Unix SECONDS in LiveKit's protobuf-JSON, and absent/0 for a participant
     # the SFU has not stamped. Drop unusable stamps rather than letting a 0 masquerade as

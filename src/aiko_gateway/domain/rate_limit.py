@@ -1,4 +1,11 @@
-"""Per-client rate limiting for the public auth endpoints (#28).
+"""Per-client rate limiting (#28) — originally for the public auth endpoints, and
+since #3159 for one AUTHENTICATED read as well.
+
+SCOPE NOTE, because the threat model below is about unauthenticated ceremonies and no
+longer describes every consumer: the call-occupancy endpoint uses this limiter as a
+blast-radius cap on a POLLED read (it is authenticated, so credential-stuffing is not
+the concern) and passes an explicit wider ``limit``. The mechanism is unchanged; what
+follows is the ORIGINAL motivating threat model, not an exhaustive list of callers.
 
 The gateway is a SINGLE uvicorn worker over file-backed SQLite, so an in-process
 fixed-window counter is sufficient and needs no Redis. The asyncio event loop is
@@ -114,7 +121,10 @@ limiter = RateLimiter()
 def rate_limit(bucket: str, *, limit: int | None = None, window: int | None = None):
     """Build a FastAPI dependency that rate-limits the route by client IP.
 
-    Usage: ``@router.post(..., dependencies=[Depends(rate_limit("passkey"))])``.
+    Usage: ``@router.post(..., dependencies=[rate_limit("passkey")])`` — this function
+    ALREADY returns a ``Depends``, so wrapping the result in another ``Depends`` (as an
+    earlier version of this line showed) is a double-wrap. Every real call site in the
+    repo has always been correct; only the example was wrong.
     Routes sharing a ``bucket`` share one per-IP budget (e.g. all four passkey
     ceremony endpoints share "passkey", so an attacker can't get 4x the budget by
     rotating endpoints). Disabled wholesale by ``settings.rate_limit_enabled``.
