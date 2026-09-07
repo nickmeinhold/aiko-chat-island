@@ -3,6 +3,12 @@
 ``POST /v1/channels/{channel_id}/video-token`` mints a LiveKit JOIN token for the
 authenticated caller, scoped to the channel-as-room. Increment 1 is **DM-ONLY**.
 
+``GET /v1/channels/{channel_id}/call`` answers whether a call is happening in that
+channel RIGHT NOW (#3159) — the present-tense half a signed invitation cannot supply.
+It runs the SAME gate sequence, in the same order, for a reason worth stating once:
+two endpoints about one object whose gates diverge turn the weaker into an oracle for
+what the stronger hides. Change one, change both.
+
 Trust-boundary properties, from the codebase's established patterns:
 
   * **ACL gate before mint (existence-hiding).** ``acl.readable_channel`` collapses
@@ -31,6 +37,7 @@ credential that must not be cached by any intermediary (Wu).
 """
 from __future__ import annotations
 
+import datetime as dt
 import logging
 
 from fastapi import APIRouter, HTTPException, Response, status
@@ -38,7 +45,7 @@ from pydantic import BaseModel
 from sqlalchemy import select
 
 from ..config import settings
-from ..domain import acl, livekit_tokens, moderation_service
+from ..domain import acl, livekit_rooms, livekit_tokens, moderation_service
 from ..domain.models import Membership
 from ..domain.rate_limit import rate_limit
 from .deps import CurrentUser, DbSession
@@ -46,6 +53,19 @@ from .deps import CurrentUser, DbSession
 log = logging.getLogger("aiko_gateway.video")
 
 router = APIRouter(prefix="/v1", tags=["video"])
+
+
+class CallOccupancyResponse(BaseModel):
+    """Present-tense truth about a channel's call (#3159).
+
+    COUNT ONLY, deliberately: the ring needs "is this call still happening", not "who is
+    in it". Returning identities would make this a presence probe for any channel member
+    — a strictly larger disclosure than the ring requires, on an endpoint the app polls
+    once a second. The app tab specified it this way and the island agrees.
+    """
+    live: bool
+    participants: int
+    since: str | None = None  # ISO-8601 UTC; null when the room is empty
 
 
 class VideoTokenResponse(BaseModel):
@@ -167,3 +187,88 @@ async def create_video_token(
         token=token, url=settings.livekit_url,
         room=livekit_tokens.room_for_channel(channel.id), can_publish=can_publish,
     )
+
+
+# The ring polls this for the length of a ring. The app tab's spec is ~1/s bounded by a
+# 30s ring = up to 30 requests per ring per party, and caller and callee are frequently
+# behind ONE NAT (same house, same office), so a shared-IP ring costs up to ~60. The auth
+# default of 20/60s would 429 a legitimate call partway through ringing — which the app
+# would most likely surface as the call dying for no reason. 150/60s carries two parties
+# at 1/s with headroom for a retry and a second concurrent ring, while still bounding an
+# abusive client to a read that costs one indexed DB lookup plus one ~175ms SFU call.
+_OCCUPANCY_LIMIT_PER_WINDOW = 150
+
+
+@router.get(
+    "/channels/{channel_id}/call",
+    response_model=CallOccupancyResponse,
+    dependencies=[rate_limit("call_occupancy", limit=_OCCUPANCY_LIMIT_PER_WINDOW)],
+)
+async def get_call_occupancy(
+    channel_id: str, user: CurrentUser, session: DbSession, response: Response
+) -> CallOccupancyResponse:
+    """Is a call happening in this channel RIGHT NOW? (#3159)
+
+    A signed call invitation is a permanent claim about the PAST; call liveness is a fact
+    about the PRESENT, and nothing in the message layer reconciles them. Without this, a
+    caller who hangs up three seconds in leaves the callee ringing, answering, and landing
+    alone in an empty room. This is the present-tense half.
+
+    THE GATE ORDER IS video-token's, DELIBERATELY AND IDENTICALLY. Both endpoints answer
+    questions about the same object, so if their gates ever diverge the weaker one becomes
+    the way to learn what the stronger one hides — a caller blocked from minting a token
+    could still watch a DM's occupancy and infer when two people are talking. Any change
+    to one gate is a change to both.
+    """
+    if not livekit_tokens.is_configured():
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "video is not enabled on this island"
+        )
+
+    channel = await acl.readable_channel(session, user.id, channel_id)
+    if channel is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "channel not found")
+
+    if channel.kind != "dm" or not channel.is_private:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "video is only available in direct messages")
+
+    # Block layer + 2-party cardinality, from RAW Membership rows for the same reason
+    # video-token does it: list_members is the visibility-shaped roster and would fail
+    # OPEN on the exact safety surface DM-only exists to protect.
+    peer_ids = (await session.execute(
+        select(Membership.user_id).where(
+            Membership.channel_id == channel.id,
+            Membership.user_id != user.id,
+        )
+    )).scalars().all()
+    if len(peer_ids) != 1:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "video is only available in direct messages")
+    if await moderation_service.is_blocked_between(session, user.id, peer_ids[0]):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "channel not found")
+
+    try:
+        occ = await livekit_rooms.occupancy(room=channel.id)
+    except (livekit_rooms.LiveKitUnreachable, livekit_tokens.LiveKitNotConfigured):
+        # UNKNOWN IS NOT EMPTY. Reporting live=false here would tell a ringing handset the
+        # call had ended, cancelling a call that is in fact happening — the precise failure
+        # this endpoint exists to prevent, inverted. 503 says "I cannot tell", which the app
+        # already has a code path for (it mirrors video-token's capability-disabled 503), and
+        # a ring that cannot be told to stop still stops at its own duration ceiling.
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "call state is temporarily unavailable")
+
+    # A ring polls this: a cached answer is a stale answer, and a stale answer is exactly
+    # the bug. Never let an intermediary hold it.
+    response.headers["Cache-Control"] = "no-store"
+    since = (
+        dt.datetime.fromtimestamp(occ.since_ms / 1000, dt.timezone.utc)
+          .isoformat().replace("+00:00", "Z")
+        if occ.since_ms is not None else None
+    )
+    return CallOccupancyResponse(
+        live=occ.live, participants=occ.participants, since=since)
