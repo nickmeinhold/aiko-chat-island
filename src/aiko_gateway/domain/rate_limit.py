@@ -111,13 +111,21 @@ class RateLimiter:
 limiter = RateLimiter()
 
 
-def rate_limit(bucket: str):
+def rate_limit(bucket: str, *, limit: int | None = None, window: int | None = None):
     """Build a FastAPI dependency that rate-limits the route by client IP.
 
     Usage: ``@router.post(..., dependencies=[Depends(rate_limit("passkey"))])``.
     Routes sharing a ``bucket`` share one per-IP budget (e.g. all four passkey
     ceremony endpoints share "passkey", so an attacker can't get 4x the budget by
     rotating endpoints). Disabled wholesale by ``settings.rate_limit_enabled``.
+
+    ``limit``/``window`` override the auth defaults for a bucket whose traffic shape is
+    not an auth ceremony. Added for the call-occupancy read (#3159): the ring polls it
+    about once a second for the length of a ring, and BOTH parties to a call can sit
+    behind one NAT, so the 20-per-60s auth budget would 429 a legitimate ring partway
+    through. An override is stated at the call site with its arithmetic, so a reader can
+    see WHY a route has a wider budget instead of finding a magic number in settings.
+    Omitting both preserves the historical behaviour exactly.
     """
     async def _dependency(request: Request) -> None:
         if not settings.rate_limit_enabled:
@@ -125,8 +133,8 @@ def rate_limit(bucket: str):
         allowed, retry_after = limiter.hit(
             bucket,
             client_ip(request),
-            settings.auth_rate_limit,
-            settings.auth_rate_limit_window_seconds,
+            settings.auth_rate_limit if limit is None else limit,
+            settings.auth_rate_limit_window_seconds if window is None else window,
         )
         if not allowed:
             raise HTTPException(
