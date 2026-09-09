@@ -105,3 +105,99 @@ that the user taps. CallKit is not in the picture at all yet.
   misnaming) stand — they are about the design's internal consistency, not its transport.
 - Nick's 2026-09-09 ruling that the island owns the ring ceiling stands.
 - Flaws 1, 2, 3, 6, 7 of TEMPER.md are untouched by these measurements.
+
+---
+
+# FIRST CONTACT — the VoIP spike, 2026-09-09 (app tab)
+
+Run by the app tab on `spike/voip-must-report`. **iPhone 14 Pro (iPhone15,2), iOS 26.6.1 build
+23G83**, development-signed, sandbox APNs, topic `cc.imagineering.aikoChatApp.voipspike.voip`,
+pushes sent from a local script holding the `.p8` — no island in the loop.
+
+## M7. PROVEN — CallKit rings from a VoIP push with no Dart alive
+
+```
+[VOIP-SPIKE] push #1 report OK 849CF575-D357-4A23-8A74-D8A4F71A1122
+```
+
+Corroborated two ways: the log, and Nick watching the handset ring. The debug build logged
+*"Cannot create a FlutterEngine instance in debug mode"* and **rang anyway**, because the whole
+path is Swift in `didFinishLaunching` and needs no isolate.
+
+Full chain demonstrated end to end for the first time in this system's history: PushKit
+registration → VoIP token → sandbox APNs → `reportNewIncomingCall` → visible ring on a real
+handset. **This is the cold-start property design 16 v2 §1 rests on, demonstrated rather than
+argued.** M6's "not one VoIP push has ever been sent" was true until 2026-09-09; this was it.
+
+**Cite this one. It is solid.**
+
+## M8. VOID — the must-report question has NO ANSWER, and the reason is the finding
+
+Not "inconclusive". **Void.** The negative control never fired:
+
+```
+[VOIP-SPIKE] push #1..#4 mode=silent   →  "reporting NOTHING"     Runner[1234:129433]
+```
+
+Four consecutive VoIP pushes where the handler reported **nothing whatsoever** — the flagrant,
+undisputed violation — and iOS did not terminate, did not warn, did not degrade delivery. **One
+PID across all four** (a termination would restart the counter in a new process, since VoIP push
+relaunches).
+
+**So the enforcement mechanism was not engaged in that configuration**, which makes both arms
+uninformative: the earlier `endonly` arm read "unpunished" for the same reason the must-fail arm
+did. A clean-looking log would have supported "YES, ends can ride VoIP" and it would have been
+worthless.
+
+Most likely cause, flagged by the app tab *before* the run: launching via
+`devicectl process launch --console` holds a **usage assertion** and leaves the app
+`running-active-Visible`. **Must-report governs waking a SUSPENDED app; a foregrounded app was
+never in the state the rule polices.** Unseparated secondary candidates: development signing, and
+a violation count below any threshold.
+
+**A valid run needs the app suspended, no console attach, no usage assertion, logs read after the
+fact via `log collect`.** Harness redesign, not another push.
+
+**Consequence for TEMPER.md flaw 5: unchanged and still gating.** The predicate fix stays
+un-hardened. The tree's top node is still open.
+
+## M9. Tesla's momentary-ring claim has STILL never met a handset
+
+The `endonly` arm reports `endedAt` for a UUID iOS has never seen. It never reports a call and
+then retracts it. The race Tesla describes — retract-before-completion racing "unknown UUID"
+against a full-screen flash after it — needs `reportNewIncomingCall` followed immediately by an
+end **on the same UUID**, and that arm does not exist. **Temper flaw 1's central factual claim
+remains unmeasured.** It is a separate arm and it is worth building.
+
+## M10. A new instrument, and it makes flaw 9 observable
+
+`CSDVoIPApplicationKillCounts` in `com.apple.TelephonyUtilities` is the **per-app VoIP kill
+ledger**. `callservicesd` consulted it once per push and logged *"found no value for key"* each
+time — absent meaning zero recorded kills.
+
+This matters beyond tonight: **flaw 9's mechanism (a report-and-end ratio costing VoIP delivery
+fleet-wide) stops being inferred and becomes directly readable.** Any future design that spends
+momentary rings can be *measured* rather than argued about.
+
+## M11. Containment held — verified independently, not accepted
+
+- **Both live islands still read `APNS_TOPIC=cc.imagineering.aikoChatApp`** (checked over ssh
+  from this repo, both boxes, after the run). No island was touched; every push came from a
+  local script.
+- `git show main:...project.pbxproj` → 3× `cc.imagineering.aikoChatApp` + 3× `.RunnerTests`.
+  The `.voipspike` change is confined to uncommitted working-tree edits on
+  `spike/voip-must-report`.
+
+**Owed, and this class has bitten this project before:** the harness that produced M7 exists
+**only as uncommitted working-tree state on one machine**, on a branch with no remote. `#3198`
+records the same failure once already — *"its signer previously existed only in a scratchpad and
+had evaporated."* The first VoIP push this system ever sent deserves a committed instrument.
+
+## Method note worth keeping
+
+Three times in one evening a **control** caught something neither reasoning nor adversarial
+review would have: verifying the `_forget` claim instead of conceding it; the 4/4 strike on the
+trilemma; and a negative control voiding a result that would otherwise have been reported as an
+answer. The instrument also nearly won twice — a fabricated `%@`-redaction mechanism was refuted
+by the device printing `[VOIP-SPIKE] {public}@` back, because `NSLog` is printf-style and does
+not take os_log annotations.
