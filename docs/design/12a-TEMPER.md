@@ -77,7 +77,19 @@ If every failed proof must first report a CallKit call using a cached name, the 
 Round 1 of ≤3. Before round 2:
 
 1. **Hand flaws 1, 2, 6 and 8 to the app tab** — they strike v2's §0/§1c/§1d, not just this document.
-2. **Run the one-handset `endedAt` experiment** (flaw 5's gate) and the Recents degrees-of-freedom probe (flaw 11). Both are cheap, both currently gate written design, and neither is decidable by argument.
+2. **Run the one-handset `endedAt` experiment** (flaw 5's gate) and the Recents degrees-of-freedom probe (flaw 11). Neither is decidable by argument.
+   - **Flaw 11 is ANSWERED** (2026-09-09, read from the iOS 26.5 SDK): `includesCallsInRecents`
+     exists **only** on `CXProviderConfiguration` — `CXCallUpdate` has no recents field, so it
+     is not per-call via the update path. **But `CXProvider.configuration` is `readwrite`**
+     (`CXProvider.h:114`), so the configuration can be swapped at runtime. The option space is
+     **not** foreclosed at the API level; whether iOS honours a swap between report and end is
+     the narrower device question already open as claude-tasks#3775.
+   - **Flaw 5's gate genuinely needs a handset** — `simctl push` states outright that VoIP
+     pushes are unsupported on the Simulator. It is **not** blocked on Nick: his iPhone is
+     paired and available to this Mac. It is blocked on there being no CallKit/PushKit code in
+     the app repo at all, so the experiment needs a ~50-line throwaway Swift harness first.
+     A build task, not a permission task; the only Nick-shaped part is consent to deploy a
+     probe to his personal device.
 3. **Surface flaw 2 to Nick**: arm (B) may not implement his 2026-09-01 ruling. That is his to rule on, not ours to fold.
 4. Then recast §Headline, Finding 1 and Finding 3, and re-strike.
 
