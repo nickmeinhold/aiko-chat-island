@@ -9,8 +9,10 @@ missed silently and permanently, which is the whole of claude-tasks#3253.
 WHY A SINGLE DOOR. Everything security-relevant about waking a device is a
 decision about WHO may cause it, and those decisions are worthless if a second
 send path can skip them. So the route, any in-process caller and the tests all
-enter through `schedule_wake`; `apns.py` underneath is pure transport and holds
-no policy at all.
+enter through `schedule_wake`; `apns.py` and `fcm.py` underneath are pure
+transports and hold no policy at all. There are two transports and still ONE
+door: they are siblings below the boundary, never a second entrance, and neither
+knows the other exists.
 
 THE GATES, IN THE ORDER THEY ACTUALLY RUN. This list is kept exhaustive on
 purpose: it listed FIVE while the code ran EIGHT, which is the same
@@ -20,7 +22,11 @@ list is the most tempting place for it, because nothing reads a list.
 
   0. **Downstream of an accepted message.** Structural, not a check written here
      — it is why the block and idempotency rules traverse for free. See below.
-  1. **Configured.** No credentials → this island never pushes. Silent and total.
+  1. **Configured — ANY transport.** No credentials for ANY transport → this
+     island never pushes. Silent and total. Deliberately not "APNs configured":
+     an island with FCM credentials and no APNs credentials is a legitimate,
+     bootable deployment, and gating the door on one transport made every gate
+     below unreachable for it.
   2. **The pinned sentinel, in a channel the CALLER calls a DM** (`should_wake`).
      Cheap, and deliberately not trusted on its own — gate 3 re-reads it.
   3. **The channel row really is a private DM**, read from the DB, because a
@@ -32,8 +38,43 @@ list is the most tempting place for it, because nothing reads a list.
      `create_outbound` and here consults it.
   6. **Not a blocked pair** — the caller's fanout set UNIONED with this service's
      own read, so neither is trusted alone.
-  7. **The peer has an APNs-sendable device.** No device, no budget spent.
+  7. **The peer has a device this island can actually send to.** No sendable
+     device, no budget spent. "Sendable" is a join over (platform x token_kind x
+     what this wake needs) — see `plan_deliveries`.
   8. **Within the per-recipient wake budget.** Waking is louder than sending.
+     ONE budget for the person, not one per transport.
+
+THE LOUDNESS CONTRACT. Every skip and refusal names a `reason=`, and the LEVEL is
+part of the contract rather than a matter of taste — this module has twice
+rediscovered that silence reads as success, and once that a warning firing on
+healthy boxes is the same silence in a high-vis vest.
+
+  wake skipped device=%s reason=transport_not_configured   INFO
+  wake skipped device=%s reason=unroutable_row             ERROR
+  wake skipped user=%s reason=no_sendable_devices          DEBUG
+  apns sent device=%s env=%s kind=%s verdict=%s            INFO
+  fcm sent device=%s verdict=%s                            INFO
+  wake delivered_to=0 user=%s devices=%d                   ERROR
+  reap skipped device=%s reason=dead_without_reap_order    WARNING
+  reap skipped device=%s reason=row_changed_since_send     WARNING
+
+`transport_not_configured` IS INFO, NOT ERROR, and the reasoning is about what
+the operator will actually see: both live boxes are APNs-configured and hold FCM
+rows TODAY, so ERROR-per-row-per-wake would mean an ERROR on every ring for every
+Android user until credentials land — manufacturing the very warning-nobody-reads
+that `warn_if_unreachable` exists to avoid. The POPULATION signal belongs to the
+boot warning and to `reachability`, which fire once.
+
+`delivered_to=0` IS THE ALARM NOTHING ELSE HAS. A recipient was selected, sends
+were attempted, and not one came back DELIVERED. Before it, a total failure to
+ring produced only per-device lines and no statement anywhere that the ring
+failed.
+
+NEVER LOG A TOKEN — always the row's ULID. `apns._LONG_HEX` redacts hex runs and
+can never cover a base64url FCM token; it does not need to, because FCM v1 carries
+the token in the request BODY (httpx's request log cannot contain it) rather than
+in the URL path the way APNs does. Stated so nobody "fixes" the gap by widening a
+regex that guards nothing on that path.
 
 GATE 0, STATED PROPERLY, BECAUSE IT IS WHY THE BLOCK RULES TRAVERSE FOR FREE.
 A wake can only ever be scheduled AFTER `messages_service.create_outbound`
@@ -80,18 +121,22 @@ duplicate notification is a blemish; a missed call is the bug.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import datetime as dt
+import enum
 import logging
-from typing import Literal
+from collections.abc import Callable, Sequence
+from typing import Literal, assert_never
 
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import settings
 from ..db import SessionLocal
-from . import apns, moderation_service
+from . import apns, fcm, moderation_service
 from .models import (Channel, ChannelKind, DeviceToken, Membership, Platform,
-                     ApnsEnvironment, User)
+                     ApnsEnvironment, TokenKind, User)
+from .push_result import ReapOrder, Verdict, WakePayload
 from .rate_limit import limiter
 
 log = logging.getLogger("aiko_gateway.push")
@@ -111,6 +156,53 @@ log = logging.getLogger("aiko_gateway.push")
 # is U+00B7 MIDDLE DOT and the emoji is U+1F4DE — a look-alike substitution here
 # would silently stop every ring, and would do so with no error anywhere.
 CALL_INVITE_BODY = "aiko:call/1 · 📞 started a call"
+
+# WHICH TRANSPORTS THIS ISLAND CAN ACTUALLY SEND ON — a CONFIG-PROBE registry, and
+# nothing else.
+#
+# It exists because gate 1 used to be `apns.is_configured()` and guarded
+# `schedule_wake` ITSELF. On an island with FCM credentials and no APNs
+# credentials — which `config.py`'s all-or-none guard makes a legitimate,
+# bootable, supported deployment — that returned False and no task was created at
+# all, so gates 2-8 never ran and no Android handset was ever woken however
+# correct the FCM transport was. The failure was invisible to the suite too,
+# because the `configured` fixture always set all four APNs settings.
+#
+# THE REGISTRY LIVES HERE, IN THE POLICY LAYER, so neither transport learns the
+# other exists. And it is a CONFIG PROBE ONLY: it must NEVER be iterated to SEND.
+# Iterating a registry to dispatch would be a second door wearing a dict — sending
+# goes through the single `match` on the Delivery union in `_wake_user` and
+# nowhere else.
+_CONFIG_PROBES: dict[Platform, Callable[[], bool]] = {
+    Platform.APNS: apns.is_configured,
+    Platform.FCM: fcm.is_configured,
+}
+
+# TOTALITY AT IMPORT, not at first ring. A `Platform` member added without a probe
+# would otherwise be silently treated as unconfigured — every device on that
+# transport skipped forever, with a reason that reads like the operator's fault.
+# Boot is where an operator is watching; a wake is not.
+if set(_CONFIG_PROBES) != set(Platform):
+    raise RuntimeError(
+        "no push config probe for platform(s): "
+        f"{sorted(p.value for p in set(Platform) - set(_CONFIG_PROBES))}")
+
+
+def _configured_platforms() -> frozenset[Platform]:
+    """The transports this island holds credentials for, read fresh each time —
+    settings are monkeypatched by tests and could in principle be reloaded."""
+    return frozenset(p for p, probe in _CONFIG_PROBES.items() if probe())
+
+
+def any_transport_configured() -> bool:
+    """Gate 1. True if this island can push on ANY transport.
+
+    Each transport still gates itself individually below the door (`plan_deliveries`
+    skips a row whose platform is unconfigured, and each `send` raises if called
+    unconfigured), so this is the cheap short-circuit rather than the enforcement.
+    """
+    return bool(_configured_platforms())
+
 
 # In-flight wake tasks, held so the event loop cannot garbage-collect them.
 # `asyncio.create_task` returns the ONLY strong reference to a task; drop it and
@@ -146,8 +238,32 @@ def is_call_invite(body: str) -> bool:
     return body == CALL_INVITE_BODY
 
 
-def should_wake(channel_kind: ChannelKindStr, body: str) -> bool:
-    """The shared domain predicate for "does this message wake a handset?".
+class WakeKind(enum.Enum):
+    """WHAT KIND OF WAKE this is — the thing `should_wake` decides, carried as a
+    value instead of re-derived four hundred lines away.
+
+    A plain `Enum`, not a `StrEnum`: in this codebase a StrEnum means "persisted,
+    and drives a DB CHECK via `_in_check`". This is never persisted and never
+    crosses the wire.
+
+    WHY THIS IS NOT CEREMONY. "Every push this module can emit is a call invite"
+    is true today only because `is_call_invite` — an EXACT equality against the
+    pinned sentinel — gates both entry points, far from the header that decides
+    `apns-push-type`. Threading the kind makes it a DATA-FLOW fact: the router
+    emits a VoIP delivery only from a `WakeKind` it was handed, and the only
+    supply is that gate. When design 12 Decision 5's cancel wake lands (named
+    there as "the island's real blocker"), adding `WakeKind.CALL_END` makes the
+    router's match non-exhaustive — which is exactly the moment somebody must
+    DECIDE whether a cancel rings, rather than a non-call silently inheriting a
+    VoIP push whose penalty is invisible to `SendResult` forever.
+    """
+
+    CALL_INVITE = "call_invite"
+
+
+def should_wake(channel_kind: ChannelKindStr, body: str) -> WakeKind | None:
+    """The shared domain predicate for "does this message wake a handset, and as
+    what?". `None` means it does not.
 
     Lives here, next to the sender, rather than being re-derived at each call
     site — the same discipline as `messages_service.should_federate`, and for the
@@ -158,40 +274,140 @@ def should_wake(channel_kind: ChannelKindStr, body: str) -> bool:
     `channels.kind`, so a magic string here would be entropy injected at exactly
     the policy gate — and a rename of the enum member would leave this predicate
     silently matching nothing, i.e. push quietly switching itself off.
+
+    CALLERS MUST TEST `is None`, NEVER `not wake`. The single member is truthy
+    today, so truthiness works by coincidence; a future member with a falsy value
+    would turn the gate off with no error anywhere.
     """
-    return channel_kind == ChannelKind.DM.value and is_call_invite(body)
+    if channel_kind == ChannelKind.DM.value and is_call_invite(body):
+        return WakeKind.CALL_INVITE
+    return None
 
 
-def _payload(channel_id: str) -> dict:
-    """The wake payload — DELIBERATELY OPAQUE, and the opacity is the feature.
+@dataclasses.dataclass(frozen=True, slots=True)
+class ApnsDelivery:
+    """One push to send to Apple, as PLAIN VALUES snapshotted from a row.
 
-    APNs is an intermediary we cannot remove, and it can read everything we send
-    it. A payload saying "Alice is calling you" would tell Apple who calls whom,
-    on a product whose entire thesis is that such facts stay with the operator.
-    So the push carries a wake and a destination, never an identity: Apple learns
-    that a device was woken and when — timing and frequency — but not by whom.
-
-    The cost, stated honestly rather than hidden: the notification the user sees
-    on the lock screen cannot name the caller either, because the app has not yet
-    spoken to the island when iOS renders it. Naming the caller would require
-    either putting the name in this payload (the thing we are refusing) or a
-    Notification Service Extension that fetches it on-device before display
-    (real, but out of scope here). Until then a wake reads "Incoming call".
-
-    `channel_id` is the one identifier included. It is what makes the tap land in
-    the right conversation, and it is stable — so Apple can correlate repeated
-    wakes for the same conversation over time. That is a genuine residual, judged
-    worth the deep link; it is not a claim that the payload leaks nothing.
+    `(row_id, token, updated_at)` is the reaper's observation triple, captured
+    before any await: after planning, the send loop holds no ORM instance at all,
+    which is the same discipline `wake_for_message`'s docstring already commits to
+    (a detached instance raises on first attribute access).
     """
-    return {
-        "aps": {
-            "alert": {"title": "Incoming call", "body": "Tap to join"},
-            "sound": "default",
-        },
-        # Short key: the payload has a 4KB ceiling and this is the only custom
-        # field, so there is no reason to spend bytes on a long name.
-        "c": channel_id,
-    }
+
+    row_id: str
+    token: str
+    updated_at: dt.datetime
+    apns_environment: ApnsEnvironment
+    token_kind: TokenKind
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class FcmDelivery:
+    """One push to send to Google. NO environment and NO token kind: FCM has one
+    registry and one endpoint per project, and carrying a field the transport
+    cannot honour would read as a routing decision nothing downstream makes."""
+
+    row_id: str
+    token: str
+    updated_at: dt.datetime
+
+
+Delivery = ApnsDelivery | FcmDelivery
+
+
+def plan_deliveries(
+    rows: Sequence[DeviceToken], *, wake: WakeKind,
+    configured: frozenset[Platform],
+) -> tuple[list[Delivery], list[tuple[str, str]]]:
+    """Decide what to send where. PURE, TOTAL, and it MUST NEVER RAISE.
+
+    No session, no settings read, no I/O, no await — `configured` is passed in
+    precisely so the whole routing table stays table-testable against
+    `itertools.product(Platform, TokenKind, WakeKind)`. That sweep is the real
+    merge gate here: CI runs `pytest` and `secrets-integrity` and nothing else, so
+    the `assert_never` calls below buy editor-time errors and nothing in CI.
+
+    NEVER RAISING IS A HARD REQUIREMENT, not tidiness. `_wake_user` is called from
+    a loop inside `wake_for_message`'s single broad `try`, so an exception here
+    abandons every remaining RECIPIENT — not one device.
+
+    Returns `(deliveries, skips)`, where each skip is `(row_id, reason)` and the
+    caller logs it at the level the loudness contract specifies. Nothing is
+    dropped without a reason: an earlier design partitioned on RAW STRINGS, so a
+    corrupted kind fell out of every bucket and vanished with no line at all —
+    the one silent cell in a design named for having none.
+
+    ARM (B): EVERY SELECTED ROW GETS A PUSH. Both an alert row and a voip row for
+    one handset is the NORMAL state (design 12 Decision 2), and rows carry NO
+    device identity — the two tokens are unrelated strings and Decision 2a
+    explicitly refuses to infer pairing. So "one push per handset" is NOT
+    COMPUTABLE, which makes this a REPRESENTATION gap rather than a tuning
+    choice, and no selection rule can be correct. The two arms cost:
+
+      (A) voip-preferred — an alert-only SECOND Apple device (an iPad, an older
+          phone) never rings while any voip row exists: a MISSED CALL.
+      (B) send to every selected row — a dual-registered iPhone gets a CallKit
+          ring AND a redundant banner: a BLEMISH.
+
+    (B), for the reason this module already gives in its own words: a duplicate
+    notification is a blemish; a missed call is the bug. It is also the only arm
+    with no silent non-delivery, and it makes the deploy trivially safe — every
+    row on both live islands is `token_kind='alert'` by server_default today and
+    the alert ring is proven on real handsets, so it must keep ringing. Closing
+    the residual properly needs a device/install identifier on the registration
+    wire and per-group selection; that is filed, not built here.
+    """
+    deliveries: list[Delivery] = []
+    skips: list[tuple[str, str]] = []
+    for row in rows:
+        try:
+            # THE ORM EDGE — every closed-set column becomes its enum HERE, in one
+            # place, inside one guard. The columns are `Mapped[str]` like every
+            # other closed set in this codebase (claude-tasks#3400 tracks the
+            # convention corpus-wide), and this is the boundary where the string
+            # becomes the set again. A corrupted row is skipped with a named
+            # reason instead of raising into a fanout.
+            platform = Platform(row.platform)
+            kind = TokenKind(row.token_kind)
+            if platform not in configured:
+                # OPERATOR-FIXABLE, and loud enough to be findable without being
+                # the alarm. The property it preserves: an Android device that
+                # registered successfully and is never woken must not become
+                # indistinguishable from a delivery bug. The reason names
+                # something the operator can actually act on.
+                skips.append((row.id, "transport_not_configured"))
+                continue
+            match platform:
+                case Platform.FCM:
+                    # REGARDLESS OF `token_kind`. FCM has one registry (design 12
+                    # Decision 2.4) and ring-ness is a property of the MESSAGE
+                    # (data-only at HIGH priority), not of the token. A naive
+                    # "prefer voip" rule applied across both platforms would
+                    # deselect every Android row — the zero-ring failure.
+                    deliveries.append(
+                        FcmDelivery(row.id, row.token, row.updated_at))
+                case Platform.APNS:
+                    match (kind, wake):
+                        case (TokenKind.VOIP, WakeKind.CALL_INVITE):
+                            pass
+                        case (TokenKind.ALERT, WakeKind.CALL_INVITE):
+                            pass
+                        case _:
+                            # NOT `assert_never`: tuple narrowing is unreliable
+                            # and there is no type checker in CI, so the
+                            # fall-through has to be a real runtime arm. It is
+                            # caught by this function's own handler, which is what
+                            # keeps the never-raise contract.
+                            raise ValueError(
+                                f"unrouted apns wake kind={kind} wake={wake}")
+                    deliveries.append(ApnsDelivery(
+                        row.id, row.token, row.updated_at,
+                        ApnsEnvironment(row.apns_environment), kind))
+                case _:
+                    assert_never(platform)
+        except ValueError:
+            skips.append((row.id, "unroutable_row"))
+    return deliveries, skips
 
 
 async def _recipients(session: AsyncSession, *, channel_id: str, sender_id: str,
@@ -315,10 +531,10 @@ async def _recipients(session: AsyncSession, *, channel_id: str, sender_id: str,
 async def reachability(session: AsyncSession) -> dict:
     """Can this island actually reach the devices it is storing? (#3397)
 
-    Gate 1 of the send path declines EVERY wake when APNs is unconfigured, and
-    that decline is silent and total — correctly, because an operator who never
-    set up push should not get a crash. But an island holding registered tokens
-    with no credentials is DEAF while every other signal reads healthy:
+    Gate 1 of the send path declines EVERY wake when no transport is configured,
+    and that decline is silent and total — correctly, because an operator who
+    never set up push should not get a crash. But an island holding registered
+    tokens it cannot send to is DEAF while every other signal reads healthy:
     registration returns 201, the message persists, /health says ok, and the
     recipient never hears anything. A push has no user-visible success, so there
     is nothing for anyone to notice the absence of.
@@ -326,24 +542,58 @@ async def reachability(session: AsyncSession) -> dict:
     The COUNT is what makes this actionable. "Push is off" is a shrug; "push is
     off and 2 devices are registered to it" is a bug with an owner.
 
-    NO PER-ENVIRONMENT BREAKDOWN, deliberately. An APNs auth key (.p8) is
-    environment-AGNOSTIC — the same key authenticates against both hosts (proven
-    2026-08-23: identical key, BadDeviceToken from both, i.e. auth accepted at
-    each). So `configured` is reachability for every token this island holds,
-    sandbox and production alike, and a per-environment field would be machinery
-    describing a state that cannot occur.
+    PER-PLATFORM, BECAUSE THE OLD REPORT LIED IN BOTH DIRECTIONS. It counted
+    EVERY row with no platform predicate while `configured` was an APNs-only
+    fact, so an APNs island reported its Android rows REACHABLE (the #3397
+    failure in a new direction) and an FCM-only island would report every row
+    unreachable — firing the boot warning on every boot of a healthy box, which
+    is the warning-nobody-reads this surface exists to avoid becoming.
+
+    NO PER-ENVIRONMENT BREAKDOWN, deliberately, and that argument does NOT extend
+    to platforms. An APNs auth key (.p8) is environment-AGNOSTIC — the same key
+    authenticates against both hosts (proven 2026-08-23: identical key,
+    BadDeviceToken from both, i.e. auth accepted at each) — so a per-environment
+    field would describe a state that cannot occur. Two transports with two
+    independent credential sets is a different question with a real answer.
+
+    THE THREE ORIGINAL KEYS KEEP THEIR NAMES so `/health`'s contract and its tests
+    are untouched. `unreachable_by_platform` is additive and is read only by
+    `warn_if_unreachable`.
     """
-    configured = apns.is_configured()
-    registered = (await session.execute(
-        select(func.count()).select_from(DeviceToken))).scalar_one()
+    configured = _configured_platforms()
+    counts = (await session.execute(
+        select(DeviceToken.platform, func.count())
+        .group_by(DeviceToken.platform))).all()
+    unreachable_by_platform: dict[str, int] = {}
+    for platform_value, count in counts:
+        try:
+            reachable = Platform(platform_value) in configured
+        except ValueError:
+            # FAIL CLOSED. A platform string outside the enum can only come from a
+            # corrupted row or a member added without a config probe; either way
+            # nothing can send to it, and calling it reachable would hide the one
+            # device class that is guaranteed unreachable.
+            reachable = False
+        if not reachable:
+            unreachable_by_platform[platform_value] = count
     return {
-        "configured": configured,
-        "registered_devices": registered,
-        # Every stored token, or none — see the .p8 note above. Kept as its own
-        # field rather than left for the reader to derive: this is the number an
-        # operator acts on, and a signal you have to compute is one you skip.
-        "unreachable_devices": 0 if configured else registered,
+        "configured": bool(configured),
+        "registered_devices": sum(count for _, count in counts),
+        # Kept as its own field rather than left for the reader to derive: this is
+        # the number an operator acts on, and a signal you have to compute is one
+        # you skip.
+        "unreachable_devices": sum(unreachable_by_platform.values()),
+        "unreachable_by_platform": unreachable_by_platform,
     }
+
+
+# What an operator must set to make each transport reachable. Keyed by the STORED
+# platform string rather than the enum, so a corrupted row still gets a sentence.
+_UNREACHABLE_REMEDY = {
+    Platform.APNS.value: ("Set APNS_KEY_ID / APNS_TEAM_ID / APNS_TOPIC / "
+                          "APNS_PRIVATE_KEY"),
+    Platform.FCM.value: "Set FCM_SERVICE_ACCOUNT_JSON",
+}
 
 
 async def warn_if_unreachable(session: AsyncSession) -> None:
@@ -353,54 +603,71 @@ async def warn_if_unreachable(session: AsyncSession) -> None:
     would have printed the moment the process came up and ended a four-hour
     investigation before it started.
 
+    ONE WARNING PER UNCONFIGURED-BUT-POPULATED PLATFORM, each silent when its own
+    arm is healthy. An island serving Android with no Apple credentials is not
+    broken and must not be told it is.
+
     SILENT ON THE HEALTHY CASES, and that is the load-bearing half. Push simply
     not being configured is a legitimate, intended state for most islands; an
     unconfigured island with zero tokens has nothing wrong with it. A warning
     that fires on healthy boxes is one every operator learns to scroll past,
     which is the original silence wearing a high-vis vest.
+
+    EVERY MESSAGE NAMES #2301, and that clause is the only mitigation available
+    for the one deploy gap nothing mechanical closes: `deploy/update.sh` pulls the
+    IMAGE and never syncs the box's `docker-compose.yml`, so a variable the
+    operator has set in `.env` can be inert in the container with every other
+    signal reading healthy. It turns a four-hour investigation into a grep.
     """
     report = await reachability(session)
-    if report["unreachable_devices"]:
+    for platform_value, count in sorted(report["unreachable_by_platform"].items()):
+        remedy = _UNREACHABLE_REMEDY.get(
+            platform_value,
+            f"No transport exists for platform={platform_value!r} — this is a "
+            "corrupted row or a code/data mismatch")
         log.warning(
-            "%d device token(s) registered but APNs is NOT configured on this "
-            "island — those devices are UNREACHABLE and every wake will be "
-            "silently declined. Set APNS_KEY_ID / APNS_TEAM_ID / APNS_TOPIC / "
-            "APNS_PRIVATE_KEY, or unregister them.",
-            report["unreachable_devices"])
+            "%d device token(s) registered on platform=%s but that transport is "
+            "NOT configured on this island — those devices are UNREACHABLE and "
+            "every wake for them will be silently declined. %s, or unregister "
+            "them — and check this box's docker-compose.yml actually forwards it "
+            "(#2301: update.sh pulls the image, it does NOT sync compose).",
+            count, platform_value, remedy)
 
 
-async def _wake_user(session: AsyncSession, user_id: str, payload: dict,
-                     collapse_id: str) -> None:
-    """Push to every device this user has registered, reaping the dead ones."""
+async def _wake_user(session: AsyncSession, user_id: str, *, wake: WakeKind,
+                     payload: WakePayload, collapse_id: str) -> None:
+    """Push to every device this user has registered that this island can reach,
+    reaping the ones a transport positively declares dead."""
     # A ROW IS NOT A SENDABLE ROW (cage-match #139 round 2, Carnot). Round 1 moved
     # the budget charge below a fetch of ALL this user's device rows and claimed
     # the budget was then only spent when there was "something to spend it on" —
-    # but a recipient holding only an Android/FCM token would still burn wake
-    # slots on every call, so an iPhone registered later in the same minute could
-    # find its first real wake already throttled. Prose and behaviour had drifted
-    # apart inside one function, the same defect class as the reaper's extra arm.
+    # but a recipient holding only an unsendable token would still burn wake slots
+    # on every call, so a phone registered later in the same minute could find its
+    # first real wake already throttled.
     #
-    # Partitioned in PYTHON rather than filtered in the query, deliberately.
-    # Filtering in SQL fixes the budget but silently discards the reason the
-    # unsupported rows were ever visited: an Android device that registered
-    # successfully and is never woken would become indistinguishable from a
-    # delivery bug. Both properties are wanted, so keep both — one query, an
-    # early return that the budget never sees, and the skip still says why.
+    # Partitioned in PYTHON rather than filtered in the query, deliberately, and
+    # the reason survived the arrival of a second transport: filtering in SQL
+    # fixes the budget but silently discards the reason the unsendable rows were
+    # ever visited — a device that registered successfully and is never woken
+    # would become indistinguishable from a delivery bug. One query, a planner
+    # that names every skip, an early return the budget never sees.
     rows = (await session.execute(
         select(DeviceToken).where(DeviceToken.user_id == user_id)
     )).scalars().all()
-    tokens = [r for r in rows if r.platform == Platform.APNS.value]
-    for r in rows:
-        if r.platform != Platform.APNS.value:
-            # FCM (Android) is a separate transport behind this same door and is
-            # NOT built. Loud, not silent.
-            log.info("wake skipped user=%s platform=%s reason=transport_not_built",
-                     user_id, r.platform)
-    if not tokens:
-        # Not an error: a user with no APNs-sendable device cannot be woken by
-        # this island today. Debug because it is the normal state for every
-        # account that has not yet run a build with push wired in.
-        log.debug("wake skipped user=%s reason=no_apns_devices", user_id)
+    deliveries, skips = plan_deliveries(
+        rows, wake=wake, configured=_configured_platforms())
+    for row_id, reason in skips:
+        if reason == "unroutable_row":
+            # ERROR: a row the island cannot classify at all is a data or code
+            # defect, not an operator setting.
+            log.error("wake skipped device=%s reason=unroutable_row", row_id)
+        else:
+            log.info("wake skipped device=%s reason=%s", row_id, reason)
+    if not deliveries:
+        # Not an error: a user with no device this island can send to cannot be
+        # woken. Debug because it is the normal state for every account that has
+        # not yet run a build with push wired in.
+        log.debug("wake skipped user=%s reason=no_sendable_devices", user_id)
         return
 
     # BUDGET IS SPENT HERE, after we know there is something to spend it on
@@ -414,135 +681,161 @@ async def _wake_user(session: AsyncSession, user_id: str, payload: dict,
     # the budget protects the person being interrupted rather than throttling per
     # sender, which a second sender would simply route around.
     #
+    # ONE BUCKET FOR EVERY TRANSPORT, charged ONCE per fanout. A per-transport
+    # bucket would hand a peer holding both an iPhone and an Android twice the
+    # ring budget, which contradicts the doctrine in the paragraph above — the
+    # budget is about the person, not the wire. The bucket name is transport-
+    # neutral on purpose, so a reader adding a transport has nowhere natural to
+    # put a second counter. `settings.apns_wake_per_recipient_per_minute` keeps
+    # its name for the reason written at its definition.
+    #
     # SCOPE (Carnot): this counter is PER-PROCESS. The gateway is single-worker
     # by construction (worker_guard), so per-process is the whole population
     # today — but `GATEWAY_ALLOW_MULTIWORKER=true` or any horizontal scaling
     # multiplies this budget by the worker count. Waking a handset is louder than
     # delivering a message, so that limitation is worth stating rather than
     # inheriting silently: a shared-storage counter is the fix if this ever scales.
-    allowed, _ = limiter.hit("apns_wake", user_id,
+    allowed, _ = limiter.hit("push_wake", user_id,
                              settings.apns_wake_per_recipient_per_minute, 60.0)
     if not allowed:
         log.warning("wake throttled user=%s", user_id)
         return
 
-    # (row_id, token, updated_at) AS OBSERVED AT SEND TIME — not just the id.
-    # See the conditional DELETE below for why all three are carried.
-    dead: list[tuple[str, str, object, int | None]] = []
-    for row in tokens:
-        observed = (row.id, row.token, row.updated_at)
+    # (row_id, token, updated_at) AS OBSERVED AT SEND TIME, plus the transport's
+    # reaping decision. See the conditional DELETE below for why all three are
+    # carried.
+    dead: list[tuple[str, str, object, ReapOrder | None]] = []
+    delivered = 0
+    for delivery in deliveries:
         try:
-            # THE ORM EDGE (cage-match, Carnot MEDIUM). The column is
-            # `Mapped[str]` like every other closed-set column in this codebase
-            # (claude-tasks#3400 tracks that convention corpus-wide, so this one
-            # field does not get to deviate) — but the boundary out of the ORM is
-            # exactly where the string becomes the closed set again. A corrupted
-            # row raises HERE, inside the per-device try below, so it is logged,
-            # skipped and never reaped: identical blast radius to the old runtime
-            # check, one layer earlier and with the type system holding it.
-            result = await apns.send(
-                row.token, payload,
-                apns_environment=ApnsEnvironment(row.apns_environment),
-                collapse_id=collapse_id)
+            # THE ONLY DISPATCH IN THE MODULE. One match on the Delivery union —
+            # never an iteration over a transport registry, which would be a
+            # second door wearing a dict.
+            match delivery:
+                case ApnsDelivery():
+                    result = await apns.send(
+                        delivery.token, payload,
+                        apns_environment=delivery.apns_environment,
+                        token_kind=delivery.token_kind,
+                        collapse_id=collapse_id)
+                    # THE SEMANTIC RECORD OF A SEND, keyed by ROW ID rather than by
+                    # token (claude-tasks#3586). httpx knows only the URL, so the
+                    # best it can do is a redacted token prefix; the row id is a
+                    # non-secret ULID that correlates EXACTLY with the table and
+                    # leaks nothing. Logged for EVERY outcome, not just failures:
+                    # before this line a successful send wrote nothing of our own,
+                    # so "did the push go out?" was answerable only by the ABSENCE
+                    # of a failure line — the silence-reads-as-success trap this
+                    # repo has a standing rule against.
+                    log.info("apns sent device=%s env=%s kind=%s verdict=%s",
+                             delivery.row_id, delivery.apns_environment.value,
+                             delivery.token_kind.value, result.verdict.value)
+                case FcmDelivery():
+                    result = await fcm.send(delivery.token, payload,
+                                            collapse_key=collapse_id)
+                    log.info("fcm sent device=%s verdict=%s",
+                             delivery.row_id, result.verdict.value)
+                case _:
+                    assert_never(delivery)
         except Exception:
-            # PER-DEVICE BOUNDARY (cage-match #139 round 6, Carnot). `apns.send`
-            # swallows httpx errors itself, but it can still raise from provider-
-            # token signing, client construction, or any future transport defect —
-            # and the only other catch is OUTSIDE this whole loop, so one bad row
-            # or environment edge would abandon every remaining device AND every
-            # remaining recipient. Entropy localizes only where you build the
-            # boundary. Treated as transient: log, skip, keep going, never reap.
+            # PER-DEVICE BOUNDARY (cage-match #139 round 6, Carnot). Each transport
+            # swallows its own protocol errors, but either can still raise from
+            # credential handling, client construction, or a future defect — and
+            # the only other catch is OUTSIDE this whole loop, so one bad row would
+            # abandon every remaining device AND every remaining recipient. It is
+            # now also a CROSS-TRANSPORT boundary: Apple being down must not cost
+            # the Android half of a fanout, or the reverse. Entropy localizes only
+            # where you build the boundary. Treated as transient: log, skip, keep
+            # going, never reap.
             log.exception("wake failed for one device user=%s", user_id)
             continue
-        # THE SEMANTIC RECORD OF A SEND, keyed by ROW ID rather than by token
-        # (claude-tasks#3586). httpx already logs the request, but it knows only the
-        # URL, so the best it can do is a redacted token prefix; the row id is a
-        # non-secret ULID that correlates EXACTLY with the table and leaks nothing.
-        # A prefix is a redaction — this is simply the right key.
-        #
-        # Logged for every outcome, not just failures: before this line a SUCCESSFUL
-        # send wrote nothing of our own, so "did the push go out?" was answerable only
-        # by the ABSENCE of a failure line, which is the silence-reads-as-success trap
-        # this repo has a standing rule against. It is per-device by construction
-        # because the fanout is; if that ever gets chatty, collapse to one summary
-        # line per wake rather than dropping back to logging nothing.
-        log.info("apns sent device=%s env=%s verdict=%s",
-                 row.id, row.apns_environment, result.verdict.value)
-        if result.verdict is apns.Verdict.DEAD_TOKEN:
-            dead.append((*observed, result.invalid_since_ms))
+        if result.verdict is Verdict.DELIVERED:
+            delivered += 1
+        if result.verdict is Verdict.DEAD_TOKEN:
+            dead.append((delivery.row_id, delivery.token, delivery.updated_at,
+                         result.reap))
 
-    for row_id, token, updated_at, invalid_since_ms in dead:
+    if not delivered:
+        # THE ALARM NOTHING ELSE IN THIS SYSTEM HAS. Every gate passed, a recipient
+        # was selected, sends were attempted, and not one came back DELIVERED. The
+        # per-device lines say what each transport answered; this says the ring
+        # failed, which is the sentence an operator is actually looking for.
+        log.error("wake delivered_to=0 user=%s devices=%d",
+                  user_id, len(deliveries))
+
+    for row_id, token, updated_at, order in dead:
         # COMPARE-AND-DELETE, because there is a real TOCTOU window here and this
         # is the only irreversible operation in the module (cage-match #139 round
         # 3, Carnot).
         #
-        # `apns.send` is an AWAITED network call. Between issuing it and acting on
-        # its verdict, the device can re-register: `register_device` upserts keyed
-        # on the globally-unique token, so the SAME row id can be refreshed, or
-        # reassigned to a different account when a handset changes hands
-        # (logout A → login B). Deleting by id alone acts on a verdict about the
-        # row as it WAS, destroying a registration made while we were waiting —
+        # A transport's `send` is an AWAITED network call. Between issuing it and
+        # acting on its verdict, the device can re-register: `register_device`
+        # upserts keyed on the globally-unique token, so the SAME row id can be
+        # refreshed, or reassigned to a different account when a handset changes
+        # hands (logout A -> login B). Deleting by id alone acts on a verdict about
+        # the row as it WAS, destroying a registration made while we were waiting —
         # and a destroyed device row cannot be re-derived from anything the island
         # holds. The user must reopen the app to be reachable again, which is
         # exactly what push exists to avoid needing.
         #
         # So the delete is CONDITIONAL on the row still being the one we sent to:
         # same token, and untouched since (`updated_at` is refreshed by
-        # register_device's upsert via `onupdate`). If anything re-registered in
-        # the window, the WHERE matches nothing and the row survives — a stale
-        # token lingering costs one wasted request per send, which is the correct
-        # side to err on for a reaper.
+        # register_device's upsert, explicitly). If anything re-registered in the
+        # window, the WHERE matches nothing and the row survives — a stale token
+        # lingering costs one wasted request per send, which is the correct side
+        # to err on for a reaper.
         #
         # This is the codebase's established SQLite-safe pattern: an atomic
         # conditional DELETE rather than a read-then-write (`FOR UPDATE` is inert
         # on SQLite — see the concurrency notes in memberships_service).
+        #
+        # THE REAPER HOLDS NO TRANSPORT NAME AND NO PLATFORM BRANCH, and that is
+        # the generalisation: it was made to serve two transports by REMOVING
+        # knowledge, not by adding a branch. What evidence proves a death is a fact
+        # about each provider's protocol and now lives with it (`apns._reap_order`,
+        # `fcm._reap_order_for`); what remains here is the question this layer can
+        # answer for everybody — is this still the row we sent to?
+        if order is None:
+            # NO ORDER, NO REAP (cage-match #139 round 6, Carnot, generalised). The
+            # transport observed a death it cannot prove is current — for APNs, a
+            # 410 with no `timestamp`, the only evidence separating "this token is
+            # dead" from "this token WAS dead before the user reinstalled and got
+            # the same token back". Failing safe for a reaper means NOT deleting,
+            # at a cost of one wasted request per send against a stale row: the
+            # same trade already accepted for BadDeviceToken.
+            #
+            # WARNING because it is unexpected: if it ever becomes common the
+            # reaper is effectively off, and that should be visible rather than
+            # inferred.
+            log.warning("reap skipped user=%s device=%s "
+                        "reason=dead_without_reap_order", user_id, row_id)
+            continue
         conditions = [
             DeviceToken.id == row_id,
             DeviceToken.token == token,
             DeviceToken.updated_at == updated_at,
         ]
-        if invalid_since_ms is None:
-            # NO TIMESTAMP, NO REAP (cage-match #139 round 6, Carnot). Apple
-            # documents `timestamp` on a 410, and it is the ONLY evidence that
-            # distinguishes "this token is dead" from "this token WAS dead before
-            # the user reinstalled and got the same token back". Without it the
-            # equality guards cover only the network-await window, which leaves
-            # real ambiguity on the one irreversible operation in the module.
-            #
-            # This module's stated posture is that failing safe for a reaper means
-            # NOT deleting, and the cost of honouring it here is one wasted request
-            # per send against a stale row — the same trade already accepted for
-            # BadDeviceToken. Applying the doctrine consistently rather than only
-            # where it was convenient. Logged at warning because a 410 without a
-            # timestamp is unexpected: if it ever becomes common the reaper is
-            # effectively off, and that should be visible rather than inferred.
-            log.warning("reap skipped user=%s reason=410_without_timestamp", user_id)
-            continue
-        else:
+        if order.not_reregistered_since is not None:
             # APPLE'S OWN RULE, not just our race guard (cage-match #139 round 4,
-            # Carnot). A 410 body carries the moment APNs confirmed the token
-            # invalid, and Apple says to resume pushing if the app registered that
-            # token AGAIN since. The equality checks above only cover the network
-            # await; this covers a row that was ALREADY refreshed before the send,
-            # whose 410 is simply stale. Keep the row when our registration is
-            # newer than Apple's invalidation.
-            invalid_since = dt.datetime.fromtimestamp(
-                invalid_since_ms / 1000, tz=dt.UTC)
-            conditions.append(DeviceToken.updated_at <= invalid_since)
-        # Reached ONLY with a timestamp in hand: the None arm above `continue`s.
-        # (This comment previously said the equality guards decided on their own
-        # when no timestamp arrived — true before round 6, stale the moment the
-        # fail-safe arm landed. Left corrected rather than deleted because the
-        # drift is the point: it is the third time in this review that prose and
-        # behaviour separated inside one function.)
+            # Carnot). The equality checks above only cover the network await;
+            # this covers a row that was ALREADY refreshed before the send, whose
+            # death notice is simply stale. Keep the row when our registration is
+            # newer than the provider's invalidation. FCM supplies no such date —
+            # see `fcm._reap_order_for` for what carries the reversibility there,
+            # and for the falsifier if that reasoning is wrong.
+            conditions.append(
+                DeviceToken.updated_at <= order.not_reregistered_since)
         outcome = await session.execute(delete(DeviceToken).where(*conditions))
         if outcome.rowcount:
-            log.info("reaped dead device row user=%s", user_id)
+            log.info("reaped dead device row user=%s device=%s", user_id, row_id)
         else:
-            # Not an error — the row changed under us, which is precisely the
-            # case this guard exists to protect. Logged so a reaper that never
-            # reaps is diagnosable rather than mysterious.
-            log.info("reap skipped user=%s reason=row_changed_since_send", user_id)
+            # Not an error — the row changed under us, which is precisely the case
+            # this guard exists to protect. WARNING rather than INFO because it is
+            # also the TRIPWIRE for the FCM reaper's one unverified assumption
+            # (that a refreshed FCM token is always a NEW string): if that is
+            # wrong, it shows up here as volume.
+            log.warning("reap skipped user=%s device=%s "
+                        "reason=row_changed_since_send", user_id, row_id)
     if dead:
         await session.commit()
 
@@ -560,9 +853,19 @@ async def wake_for_message(*, channel_id: str, channel_kind: ChannelKindStr, sen
     triggered it. The message is the durable, authoritative thing; the push is a
     hint that one arrived.
     """
-    if not apns.is_configured():
+    if not any_transport_configured():
         return
-    if not should_wake(channel_kind, body):
+    # RE-DERIVED HERE, NOT PASSED IN. `schedule_wake` computes the same value for
+    # its cheap short-circuit, but handing it down as an argument would make the
+    # WakeKind a caller-supplied fact — and a caller could then hand this function
+    # CALL_INVITE alongside a body that is not one, which is exactly the
+    # caller-supplied-lock defect rounds 4, 5 and 6 of cage-match #139 swept out of
+    # this module three times (the block set, the ORM attributes, the channel
+    # kind). The gate is the ONLY supply of a WakeKind; recomputing it is free.
+    #
+    # `is None`, never `not wake`: see `should_wake`.
+    wake = should_wake(channel_kind, body)
+    if wake is None:
         return
 
     try:
@@ -570,11 +873,12 @@ async def wake_for_message(*, channel_id: str, channel_kind: ChannelKindStr, sen
             recipients = await _recipients(
                 session, channel_id=channel_id, sender_id=sender_id,
                 exclude_user_ids=exclude_user_ids)
-            payload = _payload(channel_id)
+            payload = WakePayload(channel_id=channel_id)
             for user_id in recipients:
                 # The per-recipient budget is charged inside _wake_user, once the
                 # recipient is known to have a device worth waking.
-                await _wake_user(session, user_id, payload, collapse_id=channel_id)
+                await _wake_user(session, user_id, wake=wake, payload=payload,
+                                 collapse_id=channel_id)
     except Exception:
         # Deliberately broad. This runs detached in a background task, where an
         # escaping exception is logged by asyncio at GC time (or lost) rather than
@@ -592,8 +896,10 @@ def schedule_wake(*, channel_id: str, channel_kind: ChannelKindStr, sender_id: s
     callee's notification transport. So the wake runs after the message is
     already durable and already fanned out, on its own task and its own session.
 
-    Cheap short-circuit before scheduling anything: on an island with no APNs
-    credentials (every island today) this is a predicate call and no task at all.
+    Cheap short-circuit before scheduling anything: on an island with no push
+    credentials at all this is a predicate call and no task at all. ANY transport,
+    not APNs specifically — gating this on one transport meant an FCM-configured,
+    APNs-less island created no task and was silently, totally deaf.
 
     NEVER RAISES — and the guard is the point (cage-match #139, Maxwell+Carnot).
     `wake_for_message` protects the send path from a push that FAILS, but this
@@ -610,7 +916,7 @@ def schedule_wake(*, channel_id: str, channel_kind: ChannelKindStr, sender_id: s
     optional capability, but such a caller should pass a loop rather than rely
     on it.)
     """
-    if not apns.is_configured() or not should_wake(channel_kind, body):
+    if not any_transport_configured() or should_wake(channel_kind, body) is None:
         return
     coro = wake_for_message(
         channel_id=channel_id, channel_kind=channel_kind, sender_id=sender_id,
@@ -634,15 +940,17 @@ def schedule_wake(*, channel_id: str, channel_kind: ChannelKindStr, sender_id: s
 
 
 async def aclose(timeout: float = 5.0) -> None:
-    """Drain in-flight wakes, then let the transport close. Call BEFORE
-    ``apns.aclose()``.
+    """Drain in-flight wakes, then let the transports close. Call BEFORE
+    ``apns.aclose()`` and ``fcm.aclose()`` — drain first, then close EVERY
+    transport.
 
     A FIX-INTERACTION DEFECT, found by two reviewers independently (cage-match
-    #139, Maxwell + Carnot). `_in_flight` and `apns.aclose()` are each correct in
-    isolation and collided: `_in_flight` exists so the GC cannot eat a live wake,
-    and `apns.aclose()` exists so the pooled HTTP/2 connection is not leaked — but
-    closing the shared client while a task is mid-`send()` tears the connection out
-    from under it. The task then dies inside `wake_for_message`'s broad `except`
+    #139, Maxwell + Carnot). `_in_flight` and a transport's `aclose()` are each
+    correct in isolation and collided: `_in_flight` exists so the GC cannot eat a
+    live wake, and `aclose()` exists so the pooled connection is not leaked — but
+    closing a shared client while a task is mid-`send()` tears the connection out
+    from under it. Adding a second transport does not change the ordering, it
+    only means there are now two clients that must not close early. The task then dies inside `wake_for_message`'s broad `except`
     and logs "wake failed", which is a misleading epitaph for an orderly-shutdown
     bug: it reads as Apple's fault forever.
 

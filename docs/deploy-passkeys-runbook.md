@@ -290,3 +290,79 @@ ssh imagineering "docker exec aiko-chat-island-1 \
   command.downgrade(c,'0007')\""
 # worst case: restore the step-1 backup (see the restore drill, #17).
 ```
+
+---
+
+## FCM (Android push wake) — the operator half
+
+Added with the `token_kind` + VoIP + FCM change. **NO `deploy/preflight-fcm.sh`
+exists, and the absence is a decision rather than an omission.**
+`preflight-apns.sh` exists because a PARTIAL four-variable set crash-loops the
+box; FCM is ONE variable, so no partial state exists for a line-oriented check to
+catch. The remaining boot-refusal case is a MALFORMED blob — a large single-line
+JSON, which is exactly the shape `preflight-apns.sh:45-49` names as its own
+declared residual skew, with its own escape hatch: run the check inside the
+container using the island's OWN parser rather than growing a third one.
+
+### The zero-skew pre-deploy check (run BEFORE `deploy/update.sh`)
+
+```bash
+# On the box, in ~/apps/aiko-chat-gateway. Uses the island's own dotenv + pydantic,
+# so it CANNOT disagree with the boot guard. Capture stderr — an exit code is not
+# proof of effect.
+docker compose run --rm chat-island \
+  python -c 'from aiko_gateway.config import settings; \
+             print("FCM configured:", bool(settings.fcm_service_account_json))' \
+  2>&1 | tee /tmp/fcm-preflight.log
+```
+
+A malformed credential makes this command FAIL with the named cause (unparseable
+JSON / not a service account / missing field / non-RSA key) instead of the
+container crash-looping after the version bump. A blank or absent value prints
+`False` and is a perfectly healthy island — Android push is simply off.
+
+### Adding the credential to a box
+
+1. **Flatten it to ONE line**: `jq -c . < service-account.json`. The boot guard
+   REFUSES a value containing a real newline, because two line-oriented readers of
+   this same `.env` are broken on multi-line values —
+   `deploy/lib/dotenv-read.sh:97-103` emits phantom keys for continuation lines,
+   and `preflight-apns.sh` declares multi-line unhandled.
+2. Add `FCM_SERVICE_ACCOUNT_JSON='<one line>'` to the box's `.env`, **single
+   quotes** so the JSON's own double quotes survive python-dotenv's
+   one-quote-pair rule. Do NOT hand-expand the `private_key`'s literal `\n` into
+   real newlines — that breaks the JSON *and* the dotenv parse.
+3. **Copy the repo's `docker-compose.yml` to the box.** `deploy/update.sh` pulls
+   the IMAGE and does NOT sync the compose file (#2301, ADR ISL-0003), so a green
+   CI on the new `FCM_SERVICE_ACCOUNT_JSON` forward is fully compatible with the
+   operator's `.env` value being INERT in production. This is the load-bearing
+   manual step and nothing mechanical closes it.
+4. **Re-lift the hand edit into `deploy/secrets/<island>.env.sops` and add the key
+   NAME to `deploy/secrets/MANIFEST.txt`**, then run
+   `./deploy/verify-secrets.sh --deep` (needs a key; never runs in CI — it is the
+   ONLY thing binding the manifest to the decrypted reality) and paste its output
+   plus a plain-language summary into the PR. Skipping this leaves the split brain
+   `deploy/secrets/README.md:177-187` warns about, and the next snapshot delivery
+   clobbers the box.
+5. Thereafter `deploy/standup.sh` will REFUSE every re-run until
+   `FCM_SERVICE_ACCOUNT_JSON` is named in `--drop-env-keys`. That is correct
+   behaviour for an unrecoverable secret — a Firebase service-account private key
+   is downloadable exactly once. Do not "fix" it.
+
+### Verifying at the RUNNING CONTAINER (not the repo, not the host `.env`)
+
+```bash
+# The host .env proves only that the operator typed it. This proves compose
+# forwarded it.
+docker compose exec chat-island sh -c 'env | grep -c FCM_SERVICE_ACCOUNT_JSON'
+# expect: 1
+docker compose exec chat-island alembic current   # expect: 0025
+docker compose logs chat-island | grep -i "UNREACHABLE"   # expect: silent
+```
+
+A healthy island is **silent** at boot. An island holding Android rows with no FCM
+credential logs one WARNING naming `FCM_SERVICE_ACCOUNT_JSON` and `#2301`.
+
+**Terminal observable, which no green above substitutes for:** a real Android
+handset rings from a genuine call invite. An FCM `200` means ACCEPTED, never
+delivered.

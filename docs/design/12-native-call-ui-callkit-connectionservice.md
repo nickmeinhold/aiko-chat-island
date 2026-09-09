@@ -176,6 +176,43 @@ other. The app tab carries the client half.
 
 ## Decision 3 — one credential, two topics; the preflight moves in the same change
 
+> **OPEN — surfaced by the implementation, NOT resolved. Nick's call.**
+> The build (branch `feat/ring-transports`) **derives** the VoIP topic as
+> `settings.apns_topic + ".voip"` inside `apns._topic_for`, which contradicts
+> "Config gains one field" below. It is recorded here rather than folded in,
+> because a recorded design outranks an implementer's inference and this is a
+> conflict to decide, not to tie-break.
+>
+> **Measured cost of the arm below, which is why it did not ship as written.**
+> `config.py`'s guard is `if any(_apns.values()) and not all(_apns.values()):
+> raise ... Refusing to boot`, and both live islands carry exactly the four
+> `APNS_*` keys (re-verified over ssh on both boxes, 12a-MEASURED M11). A fifth
+> member makes `any()` true and `all()` false on **both boxes at once** — with
+> `restart: always`, a crash-loop triggered by a version bump on a box nobody
+> edited. That is precisely the incident class `deploy/preflight-apns.sh` exists
+> for, re-created by the change that extends it.
+>
+> **Three arms:**
+> 1. **Derive** (what ships today). `<bundle>.voip` is Apple's own definition, so
+>    this is a protocol fact rather than a guess; two independently-editable topic
+>    fields is exactly the drift `apns_topic`'s "state it, don't infer it" comment
+>    warns about, with the same silent-400 symptom. Breaks no box. One function
+>    body to reverse.
+> 2. **`apns_voip_topic` in the all-or-none group**, as written below. Honours the
+>    stated-not-inferred instinct; requires setting the fifth key on both boxes
+>    *before* the deploy that adds it, or they crash-loop.
+> 3. **`apns_voip_topic` as an OPTIONAL OVERRIDE, explicitly NOT in the group** —
+>    empty means derive. Honours "config gains one field", breaks no box, and
+>    costs a compose forward, a MANIFEST entry and six invariant-7b test surfaces
+>    for an escape hatch no island needs today.
+>
+> If arm 2 or 3 is chosen, `deploy/preflight-apns.sh:51`'s hardcoded four-name
+> list and `tests/test_deploy_preflight.py`'s partial arm gain the fifth member in
+> the same commit — but ONLY under arm 2, since arm 3's field is not part of an
+> all-or-none set and adding it to the preflight would abort deploys on healthy
+> boxes.
+
+
 VoIP needs `apns-topic: <bundle-id>.voip` and `apns-push-type: voip`. Because the island
 authenticates with a **`.p8` token (JWT)** rather than a certificate, **the same signing key
 covers VoIP** — no second credential set to provision, rotate or leak. Config gains one
@@ -388,6 +425,26 @@ belong to. This list is §1-§8 only.)*
 
 **Still open:**
 
+- **Decision 3's `apns_voip_topic` field vs deriving the suffix** — three arms and
+  the measured crash-loop cost are recorded at Decision 3 above. The build ships
+  the derive arm as the reversible default; the switch is one function body
+  (`apns._topic_for`).
+- **The relationship between the three clocks, and the app's `admitRing` gate.**
+  The island now carries a `_VOIP_LEASE_SECONDS = 30` ring lease (Nick, 2026-09-09,
+  #3744 — the mechanism of record for the island-owned ceiling), equal to the app's
+  `kCallRingDuration`. The app's `admitRing` freshness gate is **10s**, narrower
+  than the lease: a stored VoIP push delivered at t=15s is admitted by APNs, MUST
+  be reported to CallKit (Decision 4 — no on-device window to reconsider), and
+  would then be refused by that gate. That is a report-and-end, the exact ratio
+  Apple polices. The island half is one named constant; the app half is a decision
+  the app tab owns, and the ruling explicitly left the three-clock relationship
+  open. **Agree it with `aiko_chat_app` before this merges.**
+- **claude-tasks#3723 sequencing.** The app tab's design 16 §5 argues the
+  sovereign-key-signed DELETE should land BEFORE `token_kind`, because a signed
+  unregister covers both kinds by construction. `token_kind` shipped first here;
+  the island half of Decision 2a (never infer that discharging one kind discharged
+  the other) is honoured and commented at `devices_service.unregister_device`, but
+  the sequencing question itself is the app tab's to answer.
 - **The Play `USE_FULL_SCREEN_INTENT` declaration** — Nick submits (#3615). Listed here only
   because it is unsubmitted; nothing waits on the outcome, since prompt-and-degrade is build
   work either way.

@@ -152,6 +152,20 @@ def test_fresh_db_upgrades_to_head(tmp_path, monkeypatch) -> None:
     assert re.search(r'apns_environment\s+VARCHAR\(16\)\s+.*?NOT NULL',
                      device_sql, re.IGNORECASE), (
         f"apns_environment is not NOT NULL in the migrated DDL:\n{device_sql}")
+    # device_tokens.token_kind closed set (migration 0025). Same CHECK-blind
+    # reasoning: compare_metadata cannot see a CHECK on SQLite, so a migration
+    # that shipped the column without its constraint would pass the parity gate
+    # and admit a third kind at write time — which `plan_deliveries` would then
+    # skip as `unroutable_row`, i.e. a handset that silently stops ringing.
+    assert "ck_device_tokens_token_kind" in device_sql
+    assert "'alert'" in device_sql and "'voip'" in device_sql
+    # COLUMN-SCOPED for the same reason as apns_environment above: the
+    # corpus-scoped form is satisfied by every other non-null column and cannot go
+    # red. NOT NULL is its own arm because `NULL IN ('alert','voip')` is UNKNOWN,
+    # which a CHECK constraint PASSES.
+    assert re.search(r'token_kind\s+VARCHAR\(8\)\s+.*?NOT NULL',
+                     device_sql, re.IGNORECASE), (
+        f"token_kind is not NOT NULL in the migrated DDL:\n{device_sql}")
 
 
 def test_adopt_pre_alembic_db_stamps_baseline(tmp_path, monkeypatch) -> None:
@@ -453,3 +467,66 @@ def test_0024_rename_preserves_the_value_a_live_row_already_carries(
             "the downgrade lost the row's environment on the way back")
     finally:
         engine.dispose()
+
+
+def test_rows_written_at_0024_read_alert_at_0025(tmp_path, monkeypatch) -> None:
+    """`server_default='alert'` IS THE BACKFILL, and this is the proof.
+
+    0023 needed a settings-aware UPDATE because its safe DDL default and its
+    honest per-island value DIFFERED. Here they are the same constant — the wire
+    contract says an absent `token_kind` means alert, and an existing row is
+    exactly a row whose client never declared one — so no data migration exists
+    and none is owed.
+
+    The island setting is flipped between the revisions on purpose, mirroring the
+    0024 test: 0025 must not read config at all, so nothing about the box may
+    change the answer. Without the flip this would pass for a migration that
+    re-derived the value from settings.
+    """
+    _, sync_url = _point_app_at(tmp_path, monkeypatch)
+    monkeypatch.setattr(settings, "apns_use_sandbox", True, raising=False)
+
+    command.upgrade(migrate._alembic_config(), "0024")  # stop one short
+    engine = create_engine(sync_url)
+    try:
+        with engine.begin() as conn:
+            conn.exec_driver_sql(
+                "INSERT INTO users "
+                "(id, username, aiko_username, display_name, created_at, kind) "
+                "VALUES ('01USERAAAAAAAAAAAAAAAAAAAA', 'u', 'u', 'U', "
+                "'2026-09-09T00:00:00+00:00', 'human')")
+            conn.exec_driver_sql(
+                "INSERT INTO device_tokens "
+                "(id, user_id, platform, token, apns_environment, created_at, "
+                " updated_at) VALUES "
+                "('01TOKENAAAAAAAAAAAAAAAAAAA', '01USERAAAAAAAAAAAAAAAAAAAA', "
+                "'apns', 'live-token', 'production', '2026-09-09T00:00:00+00:00', "
+                "'2026-09-09T00:00:00+00:00')")
+
+        monkeypatch.setattr(settings, "apns_use_sandbox", False, raising=False)
+        command.upgrade(migrate._alembic_config(), "0025")
+
+        with engine.connect() as conn:
+            kind, env = conn.exec_driver_sql(
+                "SELECT token_kind, apns_environment FROM device_tokens "
+                "WHERE id='01TOKENAAAAAAAAAAAAAAAAAAA'").one()
+
+        # The rebuild must not lose the neighbour column either — 0024's lesson
+        # was that a SQLite table rebuild is exactly where a value gets silently
+        # re-defaulted, and 0025 rebuilds the same table again.
+        assert kind == "alert", (
+            "a row that predates token_kind did not read as alert — the "
+            "server_default is not doing the backfill it was chosen for")
+        assert env == "production"
+
+        command.downgrade(migrate._alembic_config(), "0024")
+        with engine.connect() as conn:
+            cols = {r[1] for r in conn.exec_driver_sql(
+                "PRAGMA table_info(device_tokens)").fetchall()}
+            survived = conn.exec_driver_sql(
+                "SELECT apns_environment FROM device_tokens").scalar()
+    finally:
+        engine.dispose()
+    assert "token_kind" not in cols
+    assert survived == "production", (
+        "the downgrade rebuild lost a live row's environment")
