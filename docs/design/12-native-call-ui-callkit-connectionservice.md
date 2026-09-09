@@ -123,6 +123,16 @@ ban misreads it. What is true is narrower and load-bearing:
 
 ## Decision 1c — CallKit weakens one of the DISSOLVE's own pillars (flagged, not acted on)
 
+> **SUPERSEDED — Nick, 2026-09-09. The ISLAND owns the ring ceiling, not the app tab.**
+> The assignment recorded below ("The app tab owns re-establishing it and has taken it") is
+> **reversed**: a CallKit ring does not self-expire, the app is suspendable the instant the
+> report completes, and the commitment had no home on the app side. See
+> [`12a-answer-to-the-callkit-temper-findings.md`](12a-answer-to-the-callkit-temper-findings.md)
+> finding 1 for the reasoning and the ring-lease mechanism that keeps Decision 1 intact.
+> **Note also that this section contradicts Decision 4 seventy lines below** — Decision 4 had
+> already moved send-time correctness to the island. That contradiction is what the reversal
+> resolves. Text kept unedited as the record.
+
 Maxwell's DISSOLVE pillar was *there was no server-only fact anyway*: "the shipped app
 carries `kCallRingDuration = 30s`; a crashed caller rings for at most 30 seconds with no
 island involvement."

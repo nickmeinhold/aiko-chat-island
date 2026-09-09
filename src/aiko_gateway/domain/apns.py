@@ -396,6 +396,15 @@ async def send(device_token: str, payload: dict, *,
         # UserNotifications alert — and it fits "a call is a gathering" better than
         # a ring does: a gathering has a door that stays open and needs no 30-second
         # synchronous window. See claude-tasks#3267.
+        #
+        # SUPERSEDED, NOT WRONG (claude-tasks#3609, Nick 2026-08-29: "I want to get
+        # the app actually ringing, like phone calls ring"). The Apple constraint
+        # above is still true; what changed is that we now want the thing it costs.
+        # This literal is the ONLY push type the island can send — there is no VoIP
+        # path here at all — so any reader of designs 12/12a/16v2, which all assume
+        # PushKit, is reading about a transport this file has never used. Kept
+        # rather than deleted because the gathering argument is the fallback if
+        # CallKit is abandoned.
         "apns-push-type": "alert",
         # 10 = deliver immediately. The alternative (5) permits Apple to hold the
         # push to save power, which for a perishable ring is the wrong trade.
