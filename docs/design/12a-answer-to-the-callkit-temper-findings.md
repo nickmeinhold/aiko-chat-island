@@ -3,8 +3,12 @@
 **Answers:** claude-tasks#3744 (four findings the island half owns), filed by the app tab
 2026-09-01 from its 4/4 `/design-temper` on app design 16.
 **Amends:** design 12 (`12-native-call-ui-callkit-connectionservice.md`) — Decisions 1c, 4, 5.
-**Status:** the island's position, written to be struck. Not a decision of record until it is
-tempered and, where marked, until Nick rules.
+**Status:** the island's position, under `/design-temper` as of 2026-09-09. Not a decision of
+record until it is struck, **except** finding 1's ceiling inversion, which Nick ruled on
+2026-09-09 and which is marked in place.
+
+**Nick's rulings folded here:** finding 1 (the island takes the ring ceiling) — DECIDED.
+Finding 4 (Recents) — still open, question restated on the correct premise and awaiting him.
 
 ---
 
@@ -178,6 +182,16 @@ about logging, not a property of the system. Anything stronger is an overclaim.
 ---
 
 ## Finding 1 — Decision 1c may be assigning the app tab something it cannot hold
+
+> **DECIDED — Nick, 2026-09-09: "yep". The island takes the ceiling.**
+> Design 12 Decision 1c's assignment to the app tab is **reversed and dead**; do not build
+> against it. The mechanism of record is the **ring lease expiry** below — the island expires
+> its own push, it does not infer an end, so Decision 1's boundary survives. The wake carrying
+> it must be distinguishable at the client from a signed client end.
+> The three-clock question below is **not** settled by this ruling and stays open.
+>
+> The reasoning that led here is kept unedited, including the part arguing it should not be
+> decided by two tabs agreeing — that is why it was put to Nick rather than resolved here.
 
 **Both tabs agree the island should take the ceiling. That is not enough to move it, and it
 is not recorded as settled here.**
