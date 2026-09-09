@@ -19,6 +19,8 @@ Built from the domain services only (never `main`), keeping the suite's
 "never import aiko_services" isolation invariant.
 """
 from __future__ import annotations
+import time
+from sqlalchemy import delete as sa_delete
 
 import asyncio
 import contextlib
@@ -1200,3 +1202,100 @@ async def test_the_send_carries_the_ROW_environment_not_the_island(
     assert by_token == {"b" * 64: "sandbox", "p" * 64: "production"}, (
         "the fanout applied one environment to every device instead of reading "
         "each row's own")
+
+
+# ---------------------------------------------------------------------------
+# CROSS-TRANSPORT TIME ISOLATION — the half of the boundary that was only a
+# comment. `_wake_user` has always claimed "Apple being down must not cost the
+# Android half of a fanout, or the reverse." While the fanout was a serial `for`
+# loop that was FALSE, and the test above could not see it: it inserts the FCM
+# row SECOND, so Apple is reached first by rowid accident, and it asserts only
+# THAT the send happened, never WHEN.
+#
+# The coupling was TIME, not exceptions. Both clients carry a 10s httpx timeout
+# and an FCM OAuth transport failure is deliberately not negative-cached, so a
+# blackholed Google cost the iPhone up to ~10s per Android row — inside the 30s
+# ring lease and outside the app's admission window.
+#
+# BOTH arms insert the SLOW transport's row FIRST, so a regression to serial
+# dispatch fails instead of passing by ordering.
+# ---------------------------------------------------------------------------
+
+
+async def _reinsert_apns_row_last(session, user_id: str, token: str) -> None:
+    """Force the APNs row to be the LAST row for this user.
+
+    The fanout query carries no ORDER BY, so rowid order applies. A test that
+    wants Apple reached second has to say so structurally rather than hope.
+    """
+    await session.execute(
+        sa_delete(DeviceToken).where(DeviceToken.user_id == user_id,
+                                     DeviceToken.platform == "apns"))
+    session.add(DeviceToken(user_id=user_id, platform="apns", token=token))
+    await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_a_stalled_fcm_send_does_not_delay_the_apns_ring(
+    session, dm, configured, fcm_configured, monkeypatch
+):
+    """RED-PROVEN against the serial loop: Apple was reached at 1.01s."""
+    alice, bob = dm
+    session.add(DeviceToken(user_id=bob.id, platform="fcm", token="f" * 100))
+    await session.commit()
+    await _reinsert_apns_row_last(session, bob.id, "b" * 64)
+
+    reached: dict[str, float] = {}
+    t0 = time.monotonic()
+
+    async def _stalled_fcm(*a, **kw):
+        await asyncio.sleep(1.0)
+        raise RuntimeError("google is blackholed")
+
+    async def _timed_apns(*a, **kw):
+        reached["at"] = time.monotonic() - t0
+        return SendResult(verdict=Verdict.DELIVERED)
+
+    monkeypatch.setattr(fcm, "send", _stalled_fcm)
+    monkeypatch.setattr(apns, "send", _timed_apns)
+    await _wake(sender_id=alice.id)
+
+    assert "at" in reached, "the APNs send never happened at all"
+    assert reached["at"] < 0.2, (
+        f"the APNs ring waited {reached['at']:.2f}s on the stalled FCM send — "
+        "the fanout has regressed to serial dispatch. A ring that arrives after "
+        "the ring is over is a missed call, not a degraded one."
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_stalled_apns_send_does_not_delay_the_fcm_wake(
+    session, dm, configured, fcm_configured, fake_fcm, monkeypatch
+):
+    """THE MIRROR. A boundary tested in one direction only is half a boundary —
+    the same sentence the exception-direction test above was written under."""
+    alice, bob = dm
+    # bob's APNs row already exists and is FIRST; the FCM row goes in after it,
+    # so the stalled transport is reached first without any reordering.
+    session.add(DeviceToken(user_id=bob.id, platform="fcm", token="f" * 100))
+    await session.commit()
+
+    reached: dict[str, float] = {}
+    t0 = time.monotonic()
+
+    async def _stalled_apns(*a, **kw):
+        await asyncio.sleep(1.0)
+        raise RuntimeError("apple is blackholed")
+
+    async def _timed_fcm(*a, **kw):
+        reached["at"] = time.monotonic() - t0
+        return SendResult(verdict=Verdict.DELIVERED)
+
+    monkeypatch.setattr(apns, "send", _stalled_apns)
+    monkeypatch.setattr(fcm, "send", _timed_fcm)
+    await _wake(sender_id=alice.id)
+
+    assert "at" in reached, "the FCM send never happened at all"
+    assert reached["at"] < 0.2, (
+        f"the FCM wake waited {reached['at']:.2f}s on the stalled APNs send"
+    )

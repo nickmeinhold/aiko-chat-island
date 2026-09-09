@@ -99,6 +99,39 @@ the device today. This is a real defect in the "waking is louder than sending"
 argument, not a cosmetic one, and closing it needs mute to become island-side
 state that this gate can read. Filed rather than silently accepted.
 
+    THAT GAP CHANGED SEVERITY CLASS WHEN VoIP LANDED, AND MUST NOT CARRY ITS OLD
+    SEVERITY FORWARD. Under the alert world the cost was a banner the recipient
+    resents — one annoyed person. Under CallKit the same un-suppressed wake is a
+    push the client MUST report to CallKit and then end, because there is no
+    on-device window in which to decline (design 12 Decision 4). The island's
+    stated VoIP discipline — "emits VoIP ONLY for a genuine call invite", enforced
+    by `should_wake`'s exact-sentinel match — asks *is this a real invite*, never
+    *may this sender ring this person*. Those are different questions and only the
+    second bounds a report-and-end ratio.
+
+    The island cannot answer the second one and BY RULING must not: ring consent is
+    per-conversation and device-local (`ring_allowlist_store.dart`; Nick 2026-09-01),
+    the island learns nothing, and `grep -rn friend src/` returns zero. Any
+    authenticated user may open a DM with any user id and send the sentinel.
+
+    THE COST, STATED AT ITS MEASURED STRENGTH AND NO HIGHER. Apple's
+    `PKPushRegistryDelegate` documentation: failing to report terminates the app,
+    and repeatedly failing "MAY cause the system to stop delivering any more VoIP
+    push notifications to your app". That is PER-DEVICE DENIAL, not a fleet-wide
+    revocation of a privilege — an earlier draft of this comment and of design 12a
+    said the stronger thing and it was wrong (corrected 2026-09-10). It is also
+    worse to operate with than the dramatic version: per-device denial accumulates
+    silently on the handsets taking the MOST calls, so calling quietly stops working
+    for the heaviest users with nothing surfacing anywhere.
+    `CSDVoIPApplicationKillCounts` in the device-local `com.apple.TelephonyUtilities`
+    domain is the ledger that makes it observable rather than inferred.
+
+    NOT CLOSED HERE, AND NOT OURS TO CLOSE ALONE. Either the app accepts and bounds
+    a non-zero report-and-end ratio and someone owns measuring it, or ring capability
+    needs an island-visible signal — which collides head-on with both the
+    no-broker-door ruling and the sender-anonymity ruling. That is a fork for Nick
+    and the app tab, not a patch to this routing code.
+
 A CONNECTED SOCKET DOES NOT SUPPRESS THE PUSH — a decision, not an oversight
 (cage-match #139 round 2, Carnot). A recipient who is live on the WebSocket gets
 BOTH the in-app ring and a push banner, and the obvious optimisation is to skip
@@ -136,7 +169,7 @@ from ..db import SessionLocal
 from . import apns, fcm, moderation_service
 from .models import (Channel, ChannelKind, DeviceToken, Membership, Platform,
                      ApnsEnvironment, TokenKind, User)
-from .push_result import ReapOrder, Verdict, WakePayload
+from .push_result import ReapOrder, SendResult, Verdict, WakePayload
 from .rate_limit import limiter
 
 log = logging.getLogger("aiko_gateway.push")
@@ -706,7 +739,30 @@ async def _wake_user(session: AsyncSession, user_id: str, *, wake: WakeKind,
     # carried.
     dead: list[tuple[str, str, object, ReapOrder | None]] = []
     delivered = 0
-    for delivery in deliveries:
+
+    async def _send_one(delivery: Delivery) -> SendResult | None:
+        """ONE device's send, with the per-device boundary INSIDE it.
+
+        The boundary was already an exception boundary (cage-match #139 round 6,
+        Carnot) and its comment already claimed to be a cross-transport one:
+        "Apple being down must not cost the Android half of a fanout, or the
+        reverse." That claim was FALSE while this ran as a serial `for` loop, and
+        the falsehood was invisible to the tests that existed — the only
+        cross-transport test inserted its APNs row first, so Apple was reached
+        first by rowid accident and the assertion never looked at WHEN.
+
+        The real coupling was TIME, not exceptions. Both clients carry a 10s
+        httpx timeout and an FCM OAuth transport failure is deliberately not
+        negative-cached, so a blackholed Google cost the iPhone in the SAME
+        fanout up to ~10s per Android row — inside the 30s ring lease and
+        outside the app's admission window. A ring that arrives after the ring
+        is over is not a degraded ring, it is a missed call.
+
+        So the sends now run CONCURRENTLY and the boundary is per-coroutine.
+        Nothing here needs ordering: the session is untouched until the reap
+        loop below, and the budget was charged before any send. `gather`
+        preserves input order, so the `dead` list is still deterministic.
+        """
         try:
             # THE ONLY DISPATCH IN THE MODULE. One match on the Delivery union —
             # never an iteration over a transport registry, which would be a
@@ -738,16 +794,22 @@ async def _wake_user(session: AsyncSession, user_id: str, *, wake: WakeKind,
                 case _:
                     assert_never(delivery)
         except Exception:
-            # PER-DEVICE BOUNDARY (cage-match #139 round 6, Carnot). Each transport
-            # swallows its own protocol errors, but either can still raise from
-            # credential handling, client construction, or a future defect — and
-            # the only other catch is OUTSIDE this whole loop, so one bad row would
-            # abandon every remaining device AND every remaining recipient. It is
-            # now also a CROSS-TRANSPORT boundary: Apple being down must not cost
-            # the Android half of a fanout, or the reverse. Entropy localizes only
-            # where you build the boundary. Treated as transient: log, skip, keep
-            # going, never reap.
+            # Each transport swallows its own protocol errors, but either can
+            # still raise from credential handling, client construction, or a
+            # future defect. Serially that abandoned every remaining device AND
+            # every remaining recipient; concurrently it would poison the gather.
+            # Treated as transient: log, skip, never reap.
             log.exception("wake failed for one device user=%s", user_id)
+            return None
+        return result
+
+    # `return_exceptions` is deliberately NOT set: `_send_one` already catches
+    # everything and returns None, so an exception escaping to here would be a
+    # defect in that guard and should be loud rather than silently collected.
+    results = await asyncio.gather(*(_send_one(d) for d in deliveries))
+
+    for delivery, result in zip(deliveries, results, strict=True):
+        if result is None:
             continue
         if result.verdict is Verdict.DELIVERED:
             delivered += 1

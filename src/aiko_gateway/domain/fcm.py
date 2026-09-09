@@ -185,8 +185,23 @@ def _sign_assertion(credential: dict) -> str:
         },
         credential["private_key"],
         algorithm="RS256",
-        headers={"kid": credential.get("private_key_id")},
+        # `kid` IS OPTIONAL HERE, AND MUST BE OMITTED RATHER THAN PASSED AS None.
+        # Google identifies the signing key from `iss` (the service-account email);
+        # `private_key_id` is a convenience, not part of the JWT-bearer contract. But
+        # PyJWT hard-rejects a non-string kid ("Key ID header parameter must be a
+        # string"), so passing `.get()` straight through turns a credential the boot
+        # ladder BLESSES — it requires only project_id, client_email, private_key —
+        # into an exception on every single send. Android goes totally deaf while
+        # /health stays green, which is the exact failure the ladder exists to
+        # prevent, one field over.
+        headers=_assertion_headers(credential),
     )
+
+
+def _assertion_headers(credential: dict) -> dict | None:
+    """`{"kid": ...}` only when there is a real string to put in it."""
+    kid = credential.get("private_key_id")
+    return {"kid": kid} if isinstance(kid, str) and kid else None
 
 
 async def _access_token() -> str | None:
@@ -212,12 +227,33 @@ async def _access_token() -> str | None:
         # misconfiguration becoming one token-endpoint POST per device per ring.
         return None
 
-    credential = _credential()
+    # THE SIGNING IS INSIDE THE GUARD, not above it. This function's docstring
+    # promises it "returns None rather than raising", and until this change that
+    # promise covered only the network POST — `_credential()` parsing and
+    # `_sign_assertion()` sat outside every handler, so a credential defect became
+    # a traceback per device per ring, forever, with the negative cache unreachable
+    # because it lives on the return path. A stated contract that the code does not
+    # keep is worse than no contract: `push_service` is written against this one.
+    try:
+        credential = _credential()
+        assertion = _sign_assertion(credential)
+    except Exception as ex:
+        # Negative-cached, UNLIKE a transport failure: a credential that cannot be
+        # parsed or signed with will not fix itself, and retrying it once per device
+        # per ring is the shape this backoff exists to stop.
+        _oauth_backoff_until = now + _OAUTH_FAILURE_BACKOFF_SECONDS
+        log.error(
+            "fcm credential is unusable (%s) — every Android ring will be dropped "
+            "until FCM_SERVICE_ACCOUNT_JSON is fixed. The boot ladder accepts a "
+            "blob this signing step cannot use, so a green /health does not mean "
+            "Android can be reached.", type(ex).__name__)
+        return None
+
     try:
         response = await _client().post(
             credential.get("token_uri") or _TOKEN_URI_FALLBACK,
             data={"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-                  "assertion": _sign_assertion(credential)},
+                  "assertion": assertion},
         )
     except httpx.HTTPError as ex:
         # NOT negative-cached: a transport failure says nothing about the
@@ -283,7 +319,39 @@ def build_message(device_token: str, payload: WakePayload, *,
     """The FCM v1 envelope for a wake. Module-level and pure, so the invariants
     below are testable with no network.
 
-    DATA-ONLY, WITH NO `notification` BLOCK ANYWHERE — A CORRECTNESS PROPERTY, NOT
+    THIS SHAPE IS CORRECT FOR THE RING, AND TODAY'S CLIENT CONSUMES NEITHER HALF
+    OF IT. Read this before provisioning a credential.
+
+    Measured 2026-09-10 against `../aiko_chat_app`: the app's ONLY Android push
+    consumer is `FcmNotificationTapSource`
+    (`lib/features/notifications/data/notification_tap_source.dart:68-96`), whose
+    whole contract is `getInitialMessage()` + `onMessageOpenedApp` — a USER TAP on
+    a system-tray entry. Both streams fire only for a message that PRODUCED a tray
+    entry, which a data-only message never does. `grep -rn onBackgroundMessage lib`
+    returns nothing, so no Dart runs either, and the manifest carries no
+    `POST_NOTIFICATIONS`, `FOREGROUND_SERVICE`, `USE_FULL_SCREEN_INTENT` or custom
+    `FirebaseMessagingService`. The app tab says so itself: design 16
+    §"Android is unscoped here".
+
+    So with a credential provisioned, FCM answers 200, `push_service` logs
+    `verdict=delivered`, the `delivered_to=0` alarm stays quiet — and the handset
+    does nothing. The island's own alarms are STRUCTURALLY BLIND to it, which makes
+    this worse than today's loud `transport_not_built` skip.
+
+    HARD GATE, therefore: **do not provision `FCM_SERVICE_ACCOUNT_JSON` on any box
+    until the app's Android receive half exists.** No island carries one today and
+    that is the safe state, not an oversight.
+
+    WHICH SHAPE SHIPS IS A JOINT DECISION, NOT TIE-BROKEN HERE. (a) data-only, as
+    built — ring-capable, and the only shape that can drive a full-screen intent,
+    which is what Nick's 2026-09-09 "ring like a telephone" ruling requires; it
+    needs a background handler plus foreground-service/full-screen-intent plumbing
+    that does not exist. (b) a `notification` block — exactly what
+    `FcmNotificationTapSource` was built to consume, an interim tap-to-join path,
+    and structurally incapable of ringing. The ruling points at (a); the working
+    client is (b); the gap between them is app work, not island work.
+
+        DATA-ONLY, WITH NO `notification` BLOCK ANYWHERE — A CORRECTNESS PROPERTY, NOT
     A STYLE CHOICE. A message carrying `notification` is a DISPLAY message: when
     the app is backgrounded or killed the system tray renders it and the app gets
     NO CODE EXECUTION, so `onMessageReceived` never runs and the app cannot start

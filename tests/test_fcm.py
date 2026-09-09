@@ -397,3 +397,85 @@ def test_is_configured_is_a_single_field(monkeypatch):
     monkeypatch.setattr(settings, "fcm_service_account_json", CREDENTIAL,
                         raising=False)
     assert fcm.is_configured() is True
+
+
+# ---------------------------------------------------------------------------
+# THE CREDENTIAL THE BOOT LADDER BLESSES AND THE SIGNER CANNOT USE.
+#
+# config.py's ladder requires only ("project_id", "client_email", "private_key").
+# A real service-account blob normally also carries "private_key_id", and the
+# signer passed it straight into PyJWT's `kid` header — where a None is a hard
+# rejection, not a shrug. So a credential that BOOTS FINE made every send raise:
+# Android totally deaf, /health green, one traceback per device per ring, and the
+# negative cache unreachable because it lives on the return path.
+#
+# `kid` is optional on a JWT-bearer assertion (Google identifies the key from
+# `iss`), so the fix is to omit it rather than to widen the ladder.
+# ---------------------------------------------------------------------------
+
+
+def _credential_without_kid() -> str:
+    """Exactly what the boot ladder accepts, and nothing more."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    pem = rsa.generate_private_key(public_exponent=65537, key_size=2048).private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode()
+    return json.dumps({
+        "project_id": "test-project",
+        "client_email": "svc@test-project.iam.gserviceaccount.com",
+        "private_key": pem,
+    })
+
+
+def test_a_credential_with_no_private_key_id_still_signs():
+    """THE MUST-FAIL ARM. Against the pre-fix signer this raises
+    `InvalidTokenError: Key ID header parameter must be a string`."""
+    cred = json.loads(_credential_without_kid())
+    token = fcm._sign_assertion(cred)
+    assert isinstance(token, str) and token.count(".") == 2
+    import jwt as _jwt
+    assert "kid" not in _jwt.get_unverified_header(token), (
+        "an absent private_key_id must OMIT the kid header, never send a null one"
+    )
+
+
+def test_a_real_private_key_id_is_still_carried():
+    """The positive control. Without it the test above would pass just as well if
+    the signer dropped `kid` unconditionally — which would be a different bug."""
+    cred = json.loads(_credential_without_kid())
+    cred["private_key_id"] = "abc123"
+    import jwt as _jwt
+    assert _jwt.get_unverified_header(fcm._sign_assertion(cred))["kid"] == "abc123"
+
+
+@pytest.mark.asyncio
+async def test_an_unusable_credential_returns_transient_and_never_raises(monkeypatch):
+    """The stated raise contract, enforced. `fcm.send`'s docstring promises it
+    never raises for an auth failure; before this change `_credential()` and
+    `_sign_assertion()` sat OUTSIDE every handler, so the promise held only for
+    the network POST."""
+    monkeypatch.setattr(settings, "fcm_service_account_json",
+                        '{"project_id":"p","client_email":"e","private_key":"not-a-pem"}',
+                        raising=False)
+    fcm.reset_for_tests()
+    result = await fcm.send("f" * 100, {"c": "chan"})
+    assert result.verdict is Verdict.TRANSIENT
+    assert result.reap is None, "an unusable credential must never reap a token"
+
+
+@pytest.mark.asyncio
+async def test_an_unusable_credential_is_negative_cached(monkeypatch):
+    """Unlike a transport blip, a credential defect will not fix itself — so it is
+    backed off rather than retried once per device per ring."""
+    monkeypatch.setattr(settings, "fcm_service_account_json",
+                        '{"project_id":"p","client_email":"e","private_key":"not-a-pem"}',
+                        raising=False)
+    fcm.reset_for_tests()
+    await fcm.send("f" * 100, {"c": "chan"})
+    assert fcm._oauth_backoff_until is not None, (
+        "the negative cache must be reachable from the credential path, not only "
+        "from the HTTP-status path"
+    )
