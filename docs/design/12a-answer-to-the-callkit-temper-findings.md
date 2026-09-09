@@ -29,6 +29,42 @@ individually well-argued. Any two are compatible. All three are not.
 This is the actual joint question. It is upstream of the poll-versus-push argument that has
 been standing in for it (island #4023), and upstream of whether PR #167 merges.
 
+### RESOLVED — the trilemma dissolves, because outcome 3 is not binary
+
+The app tab supplied the solvent within the hour, and it is the better answer. **Claim 3 is
+only contradictory if ring/no-ring is a binary.** It is not. There are three outcomes:
+
+| outcome | who determines it |
+|---|---|
+| **silent** — no push leaves the island | island only |
+| **momentary ring** — VoIP sent, Swift verifies, fails, ends immediately | device only |
+| **sustained ring** — VoIP sent, Swift verifies, passes | device only |
+
+Device-local consent fully determines *momentary vs sustained*. **That is the on-device
+window design 12 Decision 4 says does not exist** — bounded to the report-then-end interval,
+but real. Only *silent vs momentary* needs a decision where the fact is not.
+
+So claims 1 + 2 + 3-as-stated are contradictory; **1 + 2 + 3′ are consistent**, where 3′ is
+the narrower true claim: **only the island can produce silence.** Design 16 v2 §0 already
+contains the distinction — it downgrades the property to *"no **sustained** ring before
+proof"* — without noting that it answers a trilemma nobody had framed.
+
+**Which changes the question.** It is not "which two do we keep." It is **what is a momentary
+ring worth, and to whom?** Two costs, different owners:
+
+- **To the user** — a quarter-second buzz through silent mode and DND from someone they
+  refused. Bounded, but it is precisely the harassment surface, and it is *observable by the
+  attacker*.
+- **To us** — flaw 9. A poor report-and-end ratio costs VoIP delivery **fleet-wide**. That is
+  the real ceiling, and it is why the verify set has to be *right* rather than merely fast.
+
+Design 12 Decision 4's sentence — *"there is no on-device window in which to reconsider"* —
+is therefore **too strong as written** and should be narrowed to "no window in which to
+*silence*". Both documents' errors here are the same error: treating an interval as a point.
+
+The arms below are kept because the costing still stands, but they are now arms on the
+**narrowed** question, not the trilemma.
+
 ### The three arms
 
 **(A) Publish the consent fact.** `should_wake` gains a consent input, the fork becomes
@@ -53,12 +89,52 @@ blind-signed wake token at consent time; an invite carries it; the island verifi
 signature and learns only *"this invite carries a valid ring capability"* — never who
 consented to whom, never who is calling.
 
-**I recommend (C), and it is not a new idea I am importing** — it is the direction already
-ruled in. Nick, 2026-08-25: the island should learn neither who is friends with whom **nor
-who is calling**; blind wake tokens are how a ring is spent without a session. (C) is that
-mechanism doing a second job it was already shaped for.
+**I recommended (C) here. That recommendation is withdrawn, and the way I reached it is worth
+recording, because it is the exact failure this document catches other people making.**
 
-**Two guardrails on (C), because this claim has inflated once already.** Its ruled scope is
+I wrote that (C) *"is not a new idea I am importing — it is the direction already ruled in."*
+Nick's 2026-08-25 ruling is about **anonymity**: the island should not learn who is calling.
+It is **not** an endorsement of capabilities as the **ring gate**. Those are different axes,
+and claude-tasks#3745 says so in terms: *"This decision makes the ring SAFE without making it
+ANONYMOUS — the app tab had bundled those and they are orthogonal."* I un-bundled nothing; I
+re-bundled them, and upgraded a ruling on one axis into authority over another. The app tab
+caught it, having had the same move caught on it by Nick forty minutes earlier.
+
+**And that same #3745 comment cuts harder against (C) than either of us argued:**
+
+> **restricting the caller set SHRINKS the anonymity set.** Friends/consent makes the island's
+> picture of who-rang-whom *more* precise, not less. Friends decides who *may* ring; blind
+> tokens would decide whether the operator *learns who did*.
+
+So consent and anonymity do not merely fail to imply one another — on this path they pull
+in **opposite** directions. A mechanism serving both was never going to be free.
+
+**Three objections to (C), hardest first:**
+
+**(a) Revocation asymmetry — disqualifying in this shape.** Device-local consent revokes *at
+the enforcement point*, instantly, by the person being woken. A minted capability sits **in
+the caller's hands** and cannot be revoked, only expired. For a mechanism whose entire purpose
+is that the sleeper controls who may wake them, that inverts who holds the off switch.
+Verified, not hypothetical: **claude-tasks#3521 is open and confirmed pre-existing on `main`**
+— revoking consent mid-ring makes the hangup unadmittable, because `admitCallEnd` re-reads
+current consent and a refused end *deliberately keeps ringing*. Capabilities make that class
+strictly worse. The staleness worry and this are one defect from two ends: short expiry is the
+only fix, short expiry needs frequent re-minting, and re-minting needs a live channel — the
+one thing a locked handset does not have.
+
+**(b) The ratchet above.**
+
+**(c) Distribution.** A capability must reach the caller over some channel, and that channel
+is a new trust surface with its own story. Device-local consent needs no distribution at all,
+which is its main virtue rather than an incidental one.
+
+**Corrected position: (B) is the spine — arms 1 + 2 + 3′ above — with the momentary ring
+priced honestly. (C) is held as the named escape if flaw 9 measurement says the
+report-and-end ratio is untenable**, because it buys the one cell nothing else does: silence
+for a refused caller. Neither document should harden around it yet.
+
+**Two guardrails carried on (C) for whenever it is picked up, because this claim has inflated
+once already** — twice now, counting the axis-upgrade above. Its ruled scope is
 sender-side: *"the island cannot link a ring to an account in its own data."* It does **not**
 buy recipient anonymity — the island must hold the device token to send the wake, so it knows
 who is being woken, and that survives at N=33 because the binding constraint is APNs, not
@@ -199,10 +275,27 @@ Under the corrected predicate an invite is VoIP, an end is not, and the app tab'
 *"ends on a channel that does not carry the `reportNewIncomingCall` duty"* is satisfied by an
 island-side change with no new transport invented.
 
-**The open half is the one the app tab flagged and I am not closing tonight:** an alert push
-does not wake a locked ringing phone reliably, which is the inverted failure Decision 5
-exists to prevent. So the corrected predicate is necessary and may not be sufficient. That
-needs measurement, not reasoning — see the owed work below.
+**DO NOT harden Decision 4 around this yet.** The app tab's correction, which I accept: the
+predicate fix is the **second** node of a tree whose first node is unmeasured, and half the
+time it will be moot.
+
+```
+Does reportCall(with:endedAt:) ALONE satisfy iOS's must-report rule?
+├─ YES → ends ride VoIP. Guaranteed wake, no second ring.
+│        The predicate fix is UNNECESSARY; Decision 5's transport stands as written.
+└─ NO  → ends must go alert. The predicate fix is NECESSARY, and
+         "does an alert wake a locked, RINGING handset in time?"
+         becomes load-bearing and needs its own measurement.
+```
+
+**The top node needs one handset, no island, and no gateway change** — send a local VoIP
+push, report only `endedAt`, observe whether iOS complains or degrades delivery. That is the
+discriminator and it is cheap. The island's two-handset alert-wake protocol tests the NO
+branch specifically, so it should run *after*, not instead.
+
+Both tabs arrived at this experiment independently (it is design 16 v2 §9 step 2), which is
+worth less than it feels — we share a premise set, and that is exactly the condition under
+which independent agreement is not evidence.
 
 ### The UUID contract — the island's half, pinned
 
@@ -329,9 +422,11 @@ sentinel can. If the endpoint is ever struck it should be struck on its own meri
 
 ## Owed, and not answered here
 
-- **Measure it, do not reason about it.** Does an alert push wake a locked, ringing handset
-  in time to stop a CallKit ring? Finding 3's corrected predicate depends on it and no amount
-  of design settles it. We have two real handsets and a live island.
+- **Measure it, do not reason about it — in this order, because the first may moot the
+  second.** (1) Does `reportCall(with:endedAt:)` alone satisfy iOS's must-report rule? One
+  handset, no island, app tab drives. (2) Only if (1) is NO: does an alert push wake a locked,
+  *ringing* handset in time? Two handsets and a live island, island drives. Both documents are
+  currently reasoning about an Apple behaviour neither tab has observed.
 - **#3745 stays a separate thread — do not fold it into this answer.** I had it filed as
   "two incompatible ring designs, neither citing the other"; the app tab corrected the
   characterisation and I take it. Its core is the **sender-anonymity contradiction**: designs
@@ -341,10 +436,16 @@ sentinel can. If the endpoint is ever struck it should be struck on its own meri
   Sharpened further on that thread: design 12's answer to the liveness finding is *"cancellation
   is a signed client message"* — its fix for one problem is **more** attributability, which
   runs *against* the anonymity ruling rather than merely being silent on it.
-- **Design 16 v2 (#3781) is not written; the app tab starts it tonight.** Nothing here cites
-  it and nothing should predict it. It will cite this document and this document will cite it
-  once it lands — that mutual citation is the actual fix for the two-designs problem, and it
-  is separate from #3745's content.
+- **Design 16 v2 has LANDED** — `aiko_chat_app` PR #196, `docs/design/16-callkit-ring-v2.md`,
+  RECAST OF RECORD. It is cited here rather than predicted:
+  - **§0** states the bounded property (*"no **sustained** ring before proof"*) and the flaw-9
+    consequence. This document's headline section defers to it.
+  - **§1c** holds the key-set-freshness crack and three candidate answers, recommending
+    write-through on consent with multi-device as the stated residual. The island owes nothing
+    for it; recorded here so it is not re-derived.
+  - **§2** surfaces the Decision 1c inversion as SURFACED, NOT DECIDED — matching this
+    document's position exactly, which is agreement between two tabs and therefore not a
+    decision. It is Nick's.
 - **Arm (C)'s actual cost** — blind-signed wake tokens are the ruled direction but have never
   been costed as an implementation. Before anyone treats (C) as chosen, that number exists
   and nobody has it.
@@ -363,6 +464,15 @@ previous reading imported from a spark.
 
 Findings 1-4 are the app tab's, answered. Finding 5 and the three-way contradiction are the
 island's, raised here for the first time.
+
+**Revised a second time after the app tab's reply**, which dissolved this document's headline
+trilemma (outcome 3 is not binary; only the island can produce *silence*), disqualified the
+blind-capability arm on revocation asymmetry against the verified claude-tasks#3521, caught
+the ratchet in my own recommendation, and showed the predicate fix to be the second node of a
+tree whose first node is one cheap unmeasured experiment. Its claims were verified here before
+acceptance — #3521 read in full, and the safe-versus-anonymous quote located on #3745 rather
+than #3781 where it was cited, which turned up the sharper argument against my own position
+(*"restricting the caller set SHRINKS the anonymity set"*).
 
 **Reviewed live by the app tab session before publication**, which corrected four things in
 the draft: the relayed "video is done" premise and the PR #167 disposition built on it;
