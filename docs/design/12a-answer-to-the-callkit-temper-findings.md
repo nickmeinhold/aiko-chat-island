@@ -133,6 +133,40 @@ priced honestly. (C) is held as the named escape if flaw 9 measurement says the
 report-and-end ratio is untenable**, because it buys the one cell nothing else does: silence
 for a refused caller. Neither document should harden around it yet.
 
+### Pushing back on objection (a), since it was invited — it narrows rather than falls
+
+The app tab asked to be pushed on revocation, as the load-bearing objection. Honest answer:
+**it is partly answerable, the answer costs something specific, and the part it does not
+answer is the part #3521 actually names.**
+
+*Partly answerable.* Revocation of a bearer capability is a solved shape: the island holds a
+set of revoked capability identifiers and refuses them at the send door. The callee publishes
+"this id is dead" without revealing whose it was or who held it, so the island still learns
+neither side of the tie. The off switch returns to the sleeper.
+
+*What it costs.* If a capability carries a stable id so it can be revoked, the island can
+**link rings that reuse it** — it learns "the same relationship rang N times", which is not
+who, but is more than nothing. One-time tokens remove the linkage and remove revocability with
+it, because you cannot revoke a token that has not been minted. So the arm is really
+**unlinkable / revocable / offline-mintable — pick two**, and a locked handset with no live
+channel is what forces the third. That is a sharper statement of the same tension the app tab
+identified, not a refutation of it.
+
+*What it does not answer at all.* **Mid-ring revocation — #3521's actual case — survives every
+construction above.** A revocation list is consulted at send time; a ring already reported to
+CallKit is already in flight, and no island-side state can retract it. Device-local consent
+revokes at the enforcement point, which is the only place that helps once the phone is
+already ringing.
+
+**So the objection is sustained, on a narrower and better-stated reason:** not "capabilities
+cannot be revoked" (they can, at a linkability price), but **"no island-side mechanism can
+revoke a ring that is already ringing, and that is the case the open bug is about."**
+
+Confidence, marked: the revocation-list construction is standard and I am confident it exists;
+I am **not** confident about its unlinkability properties under the specific blind-signature
+scheme this would use, and that is a question for someone who does this for a living rather
+than for either tab. Nothing above should be built on without that check.
+
 **Two guardrails carried on (C) for whenever it is picked up, because this claim has inflated
 once already** — twice now, counting the axis-upgrade above. Its ruled scope is
 sender-side: *"the island cannot link a ring to an account in its own data."* It does **not**
@@ -436,8 +470,9 @@ sentinel can. If the endpoint is ever struck it should be struck on its own meri
   Sharpened further on that thread: design 12's answer to the liveness finding is *"cancellation
   is a signed client message"* — its fix for one problem is **more** attributability, which
   runs *against* the anonymity ruling rather than merely being silent on it.
-- **Design 16 v2 has LANDED** — `aiko_chat_app` PR #196, `docs/design/16-callkit-ring-v2.md`,
-  RECAST OF RECORD. It is cited here rather than predicted:
+- **Design 16 v2 has LANDED** — `aiko_chat_app` PR #196, `docs/design/16-callkit-ring-v2.md`
+  at **`8ee5ded`** (pinned deliberately, not the branch head), RECAST OF RECORD. It is cited
+  here rather than predicted:
   - **§0** states the bounded property (*"no **sustained** ring before proof"*) and the flaw-9
     consequence. This document's headline section defers to it.
   - **§1c** holds the key-set-freshness crack and three candidate answers, recommending
