@@ -1,5 +1,30 @@
 # 12a-MEASURED — what the island actually does, measured 2026-09-09
 
+> **CORRECTION 2026-09-10 — "fleet-wide revocation" is WRONG, and it was mine.**
+> Apple's `PKPushRegistryDelegate` documentation, fetched verbatim after Nick asked one word
+> — *"penalises? Or denies?"*:
+> *"On iOS 13.0 and later, if you fail to report a call to CallKit, the system will terminate
+> your app. Repeatedly failing to report calls **may** cause the system to stop delivering any
+> more VoIP push notifications to your app."*
+> Three errors in what this document carried: it **DENIES delivery, it does not revoke a
+> privilege** (nothing is taken away — the OS stops handing pushes over); it is **PER-DEVICE,
+> not fleet-wide** (*"the system"* is the OS on that handset, corroborated by
+> `CSDVoIPApplicationKillCounts` living in the device-local `com.apple.TelephonyUtilities`
+> domain — evidence we held for hours without connecting); and *"may cause"* means it is **not
+> deterministic**, so "unrecoverable" was unearned too.
+> **The conclusions in this document do not change, and one gets STRONGER.** A single failure
+> terminating the app IS deterministic. And per-device denial is *harder* to detect than a
+> fleet-wide event: it accumulates silently on the handsets taking the most calls, so calling
+> quietly stops working for your heaviest users with nothing surfacing anywhere.
+> **Provenance, which is the real finding.** The phrase entered as Tesla's temper wording and
+> was restated four times across two repos, each restatement reading as established fact. Four
+> adversarial families did not catch it **because it was never written as a claim** — it arrived
+> as background colour inside an argument about something else. The raw strike files in
+> `temper-strikes-12a/` are deliberately NOT edited: a temper records what was said at a moment,
+> and this error was in the restating.
+
+
+
 Written because three design documents (island 12, island 12a, app 16 v2) reason in detail
 about PushKit and CallKit, and nobody had checked what the island sends. Every claim here is
 a grep or a read against `src/` at `c36cfbb`, with the instrument positive-controlled.
@@ -89,7 +114,7 @@ return if CallKit is abandoned.
 
 **Not one VoIP push has ever been sent by this system.** The app tab's `.voipspike` build will
 be the first. Every claim in designs 12, 12a and 16 v2 about must-report, the momentary ring,
-report-and-end ratios and flaw 9's fleet-wide reputation burn is reasoning about a transport
+report-and-end ratios and flaw 9's per-device delivery denial is reasoning about a transport
 with **zero operational history here** — Apple's documentation, correctly read, and nothing else.
 
 That is not an argument against the design. It is an argument for why the one-handset
@@ -175,8 +200,7 @@ remains unmeasured.** It is a separate arm and it is worth building.
 ledger**. `callservicesd` consulted it once per push and logged *"found no value for key"* each
 time — absent meaning zero recorded kills.
 
-This matters beyond tonight: **flaw 9's mechanism (a report-and-end ratio costing VoIP delivery
-fleet-wide) stops being inferred and becomes directly readable.** Any future design that spends
+This matters beyond tonight: **flaw 9's mechanism (a report-and-end ratio causing per-device VoIP delivery denial) stops being inferred and becomes directly readable.** Any future design that spends
 momentary rings can be *measured* rather than argued about.
 
 ## M11. Containment held — verified independently, not accepted

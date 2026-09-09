@@ -16,8 +16,33 @@
 
 ## Fatal flaws (deduped, most-severe first)
 
+> **CORRECTION 2026-09-10 — "fleet-wide revocation" is WRONG, and it was mine.**
+> Apple's `PKPushRegistryDelegate` documentation, fetched verbatim after Nick asked one word
+> — *"penalises? Or denies?"*:
+> *"On iOS 13.0 and later, if you fail to report a call to CallKit, the system will terminate
+> your app. Repeatedly failing to report calls **may** cause the system to stop delivering any
+> more VoIP push notifications to your app."*
+> Three errors in what this document carried: it **DENIES delivery, it does not revoke a
+> privilege** (nothing is taken away — the OS stops handing pushes over); it is **PER-DEVICE,
+> not fleet-wide** (*"the system"* is the OS on that handset, corroborated by
+> `CSDVoIPApplicationKillCounts` living in the device-local `com.apple.TelephonyUtilities`
+> domain — evidence we held for hours without connecting); and *"may cause"* means it is **not
+> deterministic**, so "unrecoverable" was unearned too.
+> **The conclusions in this document do not change, and one gets STRONGER.** A single failure
+> terminating the app IS deterministic. And per-device denial is *harder* to detect than a
+> fleet-wide event: it accumulates silently on the handsets taking the most calls, so calling
+> quietly stops working for your heaviest users with nothing surfacing anywhere.
+> **Provenance, which is the real finding.** The phrase entered as Tesla's temper wording and
+> was restated four times across two repos, each restatement reading as established fact. Four
+> adversarial families did not catch it **because it was never written as a claim** — it arrived
+> as background colour inside an argument about something else. The raw strike files in
+> `temper-strikes-12a/` are deliberately NOT edited: a temper records what was said at a moment,
+> and this error was in the restating.
+
+
+
 **1. The "momentary ring" is not a designed topology — raised by Tesla, with Kelvin and Carnot converging on its consequences. THIS IS THE SHARED PREMISE THE STRIKE WAS COMMISSIONED TO FIND.**
-`reportNewIncomingCall` is an async RPC to SpringBoard. Swift can *decide* sustain-vs-retract before reporting; it cannot *enact* silence, and `reportCall(endedAt:)` races "unknown UUID" before completion against a full-screen flash after it. Report-and-immediate-end is the iOS 13 abuse pattern the must-report rule was written to kill — flaw 9 is not a ratio to tune, it is fleet-wide revocation of the right to ring anyone. Neither tab could see this because both needed a third cell to keep device-local consent and VoIP in the same design.
+`reportNewIncomingCall` is an async RPC to SpringBoard. Swift can *decide* sustain-vs-retract before reporting; it cannot *enact* silence, and `reportCall(endedAt:)` races "unknown UUID" before completion against a full-screen flash after it. Report-and-immediate-end is the iOS 13 abuse pattern the must-report rule was written to kill — flaw 9 is not a ratio to tune, it is per-device DENIAL of VoIP delivery, accumulating silently on your heaviest users (see the correction above). Neither tab could see this because both needed a third cell to keep device-local consent and VoIP in the same design.
 **DISPOSITION: fold.** Strike the three-outcome table as a *designed topology*. The true statement is narrower: the device may decide sustain-vs-retract before report; it cannot silence; retract is an async race and a flaw-9 input, not a product cell.
 
 **2. Arm (B) does not implement Nick's 2026-09-01 ruling, while wearing its name — raised by Tesla.**

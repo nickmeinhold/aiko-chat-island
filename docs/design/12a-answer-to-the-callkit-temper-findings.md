@@ -14,6 +14,31 @@ Finding 4 (Recents) — still open, question restated on the correct premise and
 
 ## The headline: a three-way contradiction, stated by neither tab
 
+> **CORRECTION 2026-09-10 — "fleet-wide revocation" is WRONG, and it was mine.**
+> Apple's `PKPushRegistryDelegate` documentation, fetched verbatim after Nick asked one word
+> — *"penalises? Or denies?"*:
+> *"On iOS 13.0 and later, if you fail to report a call to CallKit, the system will terminate
+> your app. Repeatedly failing to report calls **may** cause the system to stop delivering any
+> more VoIP push notifications to your app."*
+> Three errors in what this document carried: it **DENIES delivery, it does not revoke a
+> privilege** (nothing is taken away — the OS stops handing pushes over); it is **PER-DEVICE,
+> not fleet-wide** (*"the system"* is the OS on that handset, corroborated by
+> `CSDVoIPApplicationKillCounts` living in the device-local `com.apple.TelephonyUtilities`
+> domain — evidence we held for hours without connecting); and *"may cause"* means it is **not
+> deterministic**, so "unrecoverable" was unearned too.
+> **The conclusions in this document do not change, and one gets STRONGER.** A single failure
+> terminating the app IS deterministic. And per-device denial is *harder* to detect than a
+> fleet-wide event: it accumulates silently on the handsets taking the most calls, so calling
+> quietly stops working for your heaviest users with nothing surfacing anywhere.
+> **Provenance, which is the real finding.** The phrase entered as Tesla's temper wording and
+> was restated four times across two repos, each restatement reading as established fact. Four
+> adversarial families did not catch it **because it was never written as a claim** — it arrived
+> as background colour inside an argument about something else. The raw strike files in
+> `temper-strikes-12a/` are deliberately NOT edited: a temper records what was said at a moment,
+> and this error was in the restating.
+
+
+
 The four findings are real and I accept three of them outright. But reading them against our
 own design 12 surfaces something bigger that sits underneath all four, and that neither
 document contains:
@@ -59,7 +84,7 @@ ring worth, and to whom?** Two costs, different owners:
 - **To the user** — a quarter-second buzz through silent mode and DND from someone they
   refused. Bounded, but it is precisely the harassment surface, and it is *observable by the
   attacker*.
-- **To us** — flaw 9. A poor report-and-end ratio costs VoIP delivery **fleet-wide**. That is
+- **To us** — flaw 9. A poor report-and-end ratio may cause iOS to stop delivering VoIP pushes **to that handset** (see the correction above). That is
   the real ceiling, and it is why the verify set has to be *right* rather than merely fast.
 
 Design 12 Decision 4's sentence — *"there is no on-device window in which to reconsider"* —
@@ -285,7 +310,7 @@ payload stays `c`-only, and the deleted identity-resolution endpoint stays delet
   *verify → report → immediately end on failure*, never *verify-or-silence*. A forged push
   still produces a momentary ring. Stating the stronger version would be an overclaim, and
   the residual lands in flaw 9, where a poor report-and-end ratio costs VoIP delivery
-  fleet-wide.
+  to that handset.
 
 The second of those is the same sub-second flash that arm (B) and finding 4 both pay for —
 now visible in a third place, which is the clearest argument yet that they are one cost and
