@@ -44,6 +44,12 @@ def configured(monkeypatch):
     monkeypatch.setattr(settings, "apns_key_id", "ABCDE12345", raising=False)
     monkeypatch.setattr(settings, "apns_team_id", "TEAMID1234", raising=False)
     monkeypatch.setattr(settings, "apns_topic", "cc.example.app", raising=False)
+    # DELIBERATELY NOT `apns_topic + ".voip"`. The VoIP topic is STATED, not derived
+    # (design 12 Decision 3; Nick, 2026-09-10), and a fixture carrying the derivable
+    # value would let a re-derived implementation pass every test in this file —
+    # the check would be independent of the thing it checks.
+    monkeypatch.setattr(settings, "apns_voip_topic", "cc.example.app.stated.voip",
+                        raising=False)
     monkeypatch.setattr(settings, "apns_private_key", "-----BEGIN PRIVATE KEY-----",
                         raising=False)
     # Signing needs a real P-256 key and is not what this file measures.
@@ -127,9 +133,14 @@ async def test_a_voip_send_uses_the_dot_voip_topic_and_push_type_voip(
     configured, captured
 ):
     """Apple defines the VoIP topic AS `<bundle-id>.voip` — a suffixed namespace
-    on one app record, not a second app, key or team. A wrong suffix is a 400
+    on one app record, not a second app, key or team. A wrong topic is a 400
     DeviceTokenNotForTopic, which is REJECTED, which never reaps: one WARNING
     line and a phone that does not ring.
+
+    THE VALUE IS READ FROM CONFIG, NEVER COMPUTED. The fixture's voip topic is
+    deliberately not `apns_topic + ".voip"`, so this assertion FAILS against a
+    derived implementation. That is what makes it a test of the ruling rather
+    than a restatement of Apple's naming convention.
 
     The 30s expiration is the RING LEASE (Nick, 2026-09-09, #3744): the island
     expires its own push, which is a fact about our delivery rather than a claim
@@ -140,7 +151,11 @@ async def test_a_voip_send_uses_the_dot_voip_topic_and_push_type_voip(
     after = int(time.time())
 
     request = captured[0]
-    assert request.headers["apns-topic"] == "cc.example.app.voip"
+    assert request.headers["apns-topic"] == "cc.example.app.stated.voip"
+    assert request.headers["apns-topic"] != "cc.example.app" + ".voip", (
+        "the VoIP topic must come from settings.apns_voip_topic, not from "
+        "suffixing settings.apns_topic — see apns._topic_for"
+    )
     assert request.headers["apns-push-type"] == "voip"
     assert request.headers["apns-priority"] == "10"
     assert before + 30 <= int(request.headers["apns-expiration"]) <= after + 30

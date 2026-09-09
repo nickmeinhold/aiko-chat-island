@@ -241,6 +241,16 @@ class Settings(BaseSettings):
     # a device token is only valid for the topic it was issued under, so a wrong
     # topic is a silent 400 for every send, and it must be stated, not inferred.
     apns_topic: str = ""
+    # The VoIP topic — the SAME bundle id with a `.voip` suffix, which is Apple's
+    # definition rather than our choice. STATED, NOT DERIVED, by design 12 Decision
+    # 3 and Nick's ruling of 2026-09-10: the same argument the line above makes for
+    # `apns_topic` applies here unchanged. A device's VoIP token is minted under
+    # THIS topic and is valid for no other, so a wrong value is the same silent 400
+    # for every ring, and an operator who can read the value is an operator who can
+    # fix it. It joins the all-or-none group below, which is what makes a missing
+    # value abort a deploy at preflight instead of surfacing as a phone that never
+    # rings. See `apns._topic_for`.
+    apns_voip_topic: str = ""
     # SECRET — the .p8 signing key, PEM contents (host .env / SOPS), not a path.
     # Contents rather than a path deliberately: the container would otherwise need a
     # bind-mount whose absence fails at first-send (a runtime surprise) instead of at
@@ -727,6 +737,15 @@ class Settings(BaseSettings):
             # cryptography accepts either, but leading whitespace breaks the
             # "-----BEGIN" header match. lstrip only.
             "apns_private_key": self.apns_private_key.lstrip(),
+            # THE FIFTH MEMBER (design 12 Decision 3; Nick, 2026-09-10). Adding it
+            # is only safe because `deploy/preflight-apns.sh` gained the same key in
+            # the SAME change: an existing box carries four of these five, so
+            # without the preflight this line turns the next version bump into a
+            # boot refusal under `restart: always`. The preflight catches it before
+            # the backup and before anything is pulled, so the operator gets a
+            # message while the island is still running. Never add a member here
+            # without adding it there.
+            "apns_voip_topic": self.apns_voip_topic.strip(),
         }
         for name, value in _apns.items():
             setattr(self, name, value)

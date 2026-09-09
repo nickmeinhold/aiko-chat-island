@@ -1849,3 +1849,66 @@ def test_the_fcm_ladder_does_not_fire_on_a_blank_island():
         "`${FCM_SERVICE_ACCOUNT_JSON:-}` and an unset host var lands in the "
         "container as the empty string, so blank has to mean off rather than "
         "malformed")
+
+
+# --- The fifth APNs member (design 12 Decision 3; Nick, 2026-09-10) -----------
+# The guard half of the pairing tested in tests/test_deploy_preflight.py. Both
+# halves are needed: the preflight keeps a deploy from starting, this keeps a
+# mis-set box from lying about being configured.
+
+
+def _four_apns_keys() -> dict:
+    """Exactly what both live islands carried before 2026-09-10."""
+    return {
+        "APNS_KEY_ID": "ABC123DEFG",
+        "APNS_TEAM_ID": "TEAM123456",
+        "APNS_TOPIC": "cc.example.testapp",
+        "APNS_PRIVATE_KEY": _real_p8_pem(),
+    }
+
+
+def _real_p8_pem() -> str:
+    """A genuinely parseable EC key. `config.py` checks PRESENCE IS NOT PARSEABILITY
+    (cage-match #139), so a placeholder PEM fails the wrong guard and would make the
+    all-five arm below prove nothing about the member count."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    return ec.generate_private_key(ec.SECP256R1()).private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode()
+
+
+def test_todays_live_box_shape_refuses_to_boot(monkeypatch) -> None:
+    """THE DANGER, PINNED. Four keys and no VoIP topic is now a PARTIAL set, so the
+    island refuses to boot — which is why `deploy/preflight-apns.sh` had to gain the
+    same key in the same commit. This test is not asserting desirable behaviour; it
+    is asserting the cost that makes the preflight load-bearing."""
+    from aiko_gateway.config import Settings
+    for k, v in _four_apns_keys().items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.delenv("APNS_VOIP_TOPIC", raising=False)
+    with pytest.raises(ValueError, match="apns_voip_topic"):
+        Settings()
+
+
+def test_all_five_boots(monkeypatch) -> None:
+    """The positive control: the one operator action clears it and nothing else
+    changes. Without this arm the test above would pass on a Settings() that raised
+    for any reason at all."""
+    from aiko_gateway.config import Settings
+    for k, v in _four_apns_keys().items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setenv("APNS_VOIP_TOPIC", "cc.example.testapp.voip")
+    s = Settings()
+    assert s.apns_voip_topic == "cc.example.testapp.voip"
+
+
+def test_no_apns_keys_at_all_still_boots(monkeypatch) -> None:
+    """The all-or-NONE half. Adding a fifth member must not make a blank island —
+    the standup default, and the common case — start failing."""
+    from aiko_gateway.config import Settings
+    for k in (*_four_apns_keys(), "APNS_VOIP_TOPIC"):
+        monkeypatch.delenv(k, raising=False)
+    Settings()

@@ -257,6 +257,7 @@ services:
       APNS_KEY_ID: ${APNS_KEY_ID:-}
       APNS_TEAM_ID: ${APNS_TEAM_ID:-}
       APNS_TOPIC: ${APNS_TOPIC:-}
+      APNS_VOIP_TOPIC: ${APNS_VOIP_TOPIC:-}
       APNS_PRIVATE_KEY: ${APNS_PRIVATE_KEY:-}
       # Sandbox vs production APNs host — an OPERATOR switch the code may not guess.
       # A development-build device token is valid ONLY against the sandbox host.

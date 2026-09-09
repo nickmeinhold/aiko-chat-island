@@ -146,11 +146,8 @@ _TOKEN_REFRESH_SECONDS = 50 * 60
 # `.location-query`), selected per request by the header. Not a second app, not a
 # second App ID, not a second credential.
 #
-# SURFACED, NOT SETTLED: design 12 Decision 3 records "config gains one field" and
-# an all-or-none guard gaining a fifth member. Deriving contradicts that sentence,
-# and the reason it is derived anyway is measured rather than preferred — see
-# `_topic_for`. Nick has not ruled; the switch is that one function body.
-_VOIP_TOPIC_SUFFIX = ".voip"
+# RULED 2026-09-10 (Nick): the VoIP topic is a STATED setting, not a derived
+# one — see `_topic_for` and `config.apns_voip_topic`.
 
 # How long APNs may keep trying to deliver an ALERT wake. A call is PERISHABLE in a
 # way an ordinary notification is not: a ring that surfaces ten minutes late is
@@ -294,40 +291,29 @@ def _host(apns_environment: ApnsEnvironment) -> str:
 
 
 def _topic_for(token_kind: TokenKind) -> str:
-    """The APNs topic for ONE token's kind. THE WHOLE OF THE BLOCKER-2 QUESTION
-    LIVES IN THIS FUNCTION BODY, so it can be switched without touching anything
-    else.
+    """The APNs topic for ONE token's kind — both STATED, neither inferred.
 
-    DERIVED, and the local rule it appears to violate actually argues FOR
-    derivation. `config.py` says of `apns_topic`: "NOT derived from any other
-    setting: a device token is only valid for the topic it was issued under, so a
-    wrong topic is a silent 400 for every send, and it must be stated, not
-    inferred." That warning is about drift between a topic and the tokens minted
-    under it — and two independently-editable topic fields is exactly how that
-    drift happens, with the same silent-400 symptom. `<bundle>.voip` is Apple's
-    definition, not our guess.
+    STATED, per design 12 Decision 3 and Nick's ruling of 2026-09-10. An earlier
+    revision derived the VoIP topic as `apns_topic + ".voip"`, on the argument that
+    the suffix is Apple's definition rather than our guess. That is true and it was
+    not the deciding fact: `config.py` already says of `apns_topic` that a device
+    token "is only valid for the topic it was issued under, so a wrong topic is a
+    silent 400 for every send, and it must be stated, not inferred" — and that
+    sentence applies to a VoIP token unchanged. A value an operator can read is a
+    value an operator can fix; a derived one is only visible in this file.
 
-    THE RECORDED DESIGN SAYS OTHERWISE, AND THAT IS SURFACED RATHER THAN
-    TIE-BROKEN. Design 12 Decision 3 records "Config gains one field" plus "the
-    half-configured guard ... gains a fifth member" and the matching
-    `deploy/preflight-apns.sh` change. A recorded design outranks an
-    implementer's inference, so the conflict belongs on the record — see the open
-    question added to design 12.
-
-    WHY THIS ARM SHIPS PENDING THAT RULING: the recorded arm is measurably
-    dangerous as written. `config.py`'s guard is `if any(_apns.values()) and not
-    all(_apns.values()): raise ... Refusing to boot`, and both live islands carry
-    exactly the four APNS_* keys. A fifth member makes `any()` true and `all()`
-    false on both boxes at once — with `restart: always`, a crash-loop triggered
-    by a version bump on a box nobody edited, which is precisely the incident
-    class `preflight-apns.sh` was built for, re-created by the change that
-    extends it. Deriving breaks no box and is one function body to reverse.
+    The cost of stating it was real and is paid rather than dodged: the field joins
+    the all-or-none guard in `config.py`, so an existing box carrying four of five
+    keys would refuse to boot. `deploy/preflight-apns.sh` gained the same key in the
+    same change, which turns that into a deploy that aborts before touching the
+    running stack. The guard and its preflight are one mechanism in two files and
+    must always move together.
     """
     match token_kind:
         case TokenKind.ALERT:
             return settings.apns_topic
         case TokenKind.VOIP:
-            return settings.apns_topic + _VOIP_TOPIC_SUFFIX
+            return settings.apns_voip_topic
         case _:
             assert_never(token_kind)
 
