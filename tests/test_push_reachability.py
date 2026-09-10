@@ -52,12 +52,6 @@ async def _user_with_devices(session, n: int):
     return user
 
 
-FCM_CREDENTIAL = (
-    '{"type":"service_account","project_id":"aiko-island-test",'
-    '"private_key_id":"0123456789abcdef",'
-    '"private_key":"-----BEGIN PRIVATE KEY-----\\nx\\n-----END PRIVATE KEY-----\\n",'
-    '"client_email":"island@aiko-island-test.iam.gserviceaccount.com"}'
-)
 
 
 async def _user_with_apns(session, n: int, *, username: str = "ada"):
@@ -93,18 +87,6 @@ def configured(monkeypatch):
                  ("apns_voip_topic", "cc.example.app.voip"),
                  ("apns_private_key", "-----BEGIN PRIVATE KEY-----")):
         monkeypatch.setattr(settings, k, v, raising=False)
-    monkeypatch.setattr(settings, "fcm_service_account_json", "", raising=False)
-
-
-@pytest.fixture
-def fcm_only(monkeypatch):
-    """FCM configured, APNs not — a legitimate, bootable deployment (config.py's
-    all-or-none guard makes APNs-absent a supported state)."""
-    for k in ("apns_key_id", "apns_team_id", "apns_topic", "apns_private_key",
-              "apns_voip_topic"):
-        monkeypatch.setattr(settings, k, "", raising=False)
-    monkeypatch.setattr(settings, "fcm_service_account_json", FCM_CREDENTIAL,
-                        raising=False)
 
 
 @pytest.fixture
@@ -112,7 +94,6 @@ def unconfigured(monkeypatch):
     for k in ("apns_key_id", "apns_team_id", "apns_topic", "apns_private_key",
               "apns_voip_topic"):
         monkeypatch.setattr(settings, k, "", raising=False)
-    monkeypatch.setattr(settings, "fcm_service_account_json", "", raising=False)
 
 
 # ------------------------------------------------------------------ the report
@@ -166,16 +147,6 @@ async def test_an_apns_island_counts_its_android_rows_as_unreachable(
     assert report["unreachable_by_platform"] == {"fcm": 2}
 
 
-async def test_an_fcm_only_island_reaches_its_android_rows(session, fcm_only):
-    """THE MIRROR, and the arm that stops "unreachable" collapsing back into
-    "APNs is off". An FCM-only island reaching its Android handsets is a healthy
-    island."""
-    await _user_with_android(session, 2)
-    report = await push_service.reachability(session)
-    assert report == {"configured": True, "registered_devices": 2,
-                      "unreachable_devices": 0, "unreachable_by_platform": {}}
-
-
 # NO TEST FOR THE UNKNOWN-PLATFORM ARM, and the absence is deliberate.
 # `reachability` fails CLOSED on a stored platform outside the enum (an unknown
 # string counts as unreachable rather than reachable), but that state is
@@ -216,47 +187,6 @@ async def test_startup_is_silent_when_there_is_nothing_to_say(
     with caplog.at_level("WARNING"):
         await push_service.warn_if_unreachable(session)
     assert not [r for r in caplog.records if r.levelname == "WARNING"], caplog.text
-
-
-async def test_an_fcm_only_island_with_android_rows_is_silent_at_boot(
-    session, fcm_only, caplog
-):
-    """THE NULL ARM THAT MUST NOT REGRESS. A per-platform report computed the
-    naive way — "configured" meaning APNs — would fire this warning on every boot
-    of a perfectly healthy Android-serving island."""
-    await _user_with_android(session, 3)
-    with caplog.at_level("WARNING"):
-        await push_service.warn_if_unreachable(session)
-    assert not [r for r in caplog.records if r.levelname == "WARNING"], caplog.text
-
-
-async def test_an_apns_island_with_android_rows_warns_and_names_fcm(
-    session, configured, caplog
-):
-    """The message has to name the variable the operator must set AND the place
-    it silently fails to arrive: `deploy/update.sh` pulls the image and never
-    syncs the box's `docker-compose.yml` (#2301), so a value set in `.env` can be
-    inert in production with nothing anywhere saying so. That clause turns a
-    four-hour investigation into a grep, and it is the only mitigation available
-    for the one deploy gap nothing mechanical closes."""
-    await _user_with_android(session, 2)
-    with caplog.at_level("WARNING"):
-        await push_service.warn_if_unreachable(session)
-    text = caplog.text
-    assert "FCM_SERVICE_ACCOUNT_JSON" in text, text
-    assert "APNS_KEY_ID" not in text, (
-        "the APNs arm fired on an island whose APNs transport is healthy")
-    # #2301 IS NO LONGER ASSERTED HERE, AND THAT IS THE FIX (Tesla, cage-match
-    # PR#172 r5). The compose-forwarding advice is only true for a transport the
-    # operator can actually provision. FCM is currently a BOOT REFUSAL, so telling
-    # them to make compose forward it is telling them to crash-loop a live island —
-    # and this assertion is what REQUIRED that sentence to be present in the FCM
-    # warning, so the test was pinning the contradiction in place. The clause now
-    # lives in the APNs remedy and is asserted there
-    # (test_the_apns_remedy_still_carries_the_compose_warning), where it is true.
-    assert "#2301" not in text, (
-        "the FCM warning tells the operator to make compose forward a credential "
-        f"the island refuses to boot with. Text: {text}")
 
 
 # -------------------------------------------------------------------- /health
@@ -381,72 +311,6 @@ async def test_health_does_not_publish_a_device_population(
 _DEV_JWT_SECRET = "x" * 64
 
 
-def _fcm_credential_for_collision() -> str:
-    import json
-    from cryptography.hazmat.primitives import serialization
-    from cryptography.hazmat.primitives.asymmetric import rsa
-    pem = rsa.generate_private_key(public_exponent=65537, key_size=2048).private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption()).decode()
-    return json.dumps({"project_id": "p",
-                       "client_email": "e@p.iam.gserviceaccount.com",
-                       "private_key": pem})
-
-
-@pytest.mark.asyncio
-async def test_the_fcm_remedy_does_not_instruct_what_the_boot_guard_refuses(
-    session, configured, caplog
-):
-    """THE COLLISION TEST (Tesla, cage-match PR#172 r4).
-
-    Two facts were each pinned in isolation and never brought together:
-
-      1. `warn_if_unreachable` must NAME FCM when an APNs island holds Android rows
-         (test_an_apns_island_with_android_rows_warns_and_names_fcm)
-      2. a well-formed FCM credential must REFUSE to boot
-         (test_a_well_formed_fcm_credential_is_REFUSED_until_android_can_receive)
-
-    Both green, and together they described a remedy that says "Set
-    FCM_SERVICE_ACCOUNT_JSON" against a guard that refuses exactly that. Both live
-    islands already hold Android rows, so that instruction prints on every boot; an
-    operator obeying it writes the var, pulls, and crash-loops under
-    `restart: always` with the island already down. There is no FCM preflight to
-    catch it on the way in — the compose comment says so.
-
-    A full green could not see it because no test read the two facts in the same
-    breath. This one does: it asserts the remedy and the guard agree, so they cannot
-    drift apart again without something going red.
-    """
-    # READS THE RENDERED WARNING, NOT THE DICT (Tesla, cage-match PR#172 r5).
-    # The first version of this test read `_UNREACHABLE_REMEDY[FCM]` in isolation
-    # — and the contradiction it was built to catch had moved into the TEMPLATE
-    # around that string, which told every platform to "check compose actually
-    # forwards it". So the collision test had the very isolation-blindness it
-    # exists to prevent, and passed while the rendered sentence still instructed
-    # an operator to brick a live island. Assert what the operator READS.
-    await _user_with_android(session, 2)
-    with caplog.at_level("WARNING"):
-        await push_service.warn_if_unreachable(session)
-    remedy = caplog.text
-
-    # The guard must really refuse — proving this test is colliding two LIVE facts,
-    # not asserting prose against a rule that has quietly been lifted.
-    with pytest.raises(ValidationError):
-        Settings(_env_file=None, environment="dev", jwt_secret=_DEV_JWT_SECRET,
-                 fcm_service_account_json=_fcm_credential_for_collision())
-
-    assert "Set FCM_SERVICE_ACCOUNT_JSON" not in remedy, (
-        "the boot warning instructs the operator to set a credential the boot "
-        f"guard refuses — following it bricks a live island. Remedy: {remedy!r}")
-    assert "not available" in remedy.lower() or "do not set" in remedy.lower(), (
-        f"the warning must tell the operator the transport is unavailable rather "
-        f"than how to enable it. Rendered: {remedy!r}")
-    assert "#2301" not in remedy, (
-        "the rendered FCM warning still tells the operator to make compose forward "
-        f"a credential the island refuses to boot with. Rendered: {remedy!r}")
-
-
 @pytest.mark.asyncio
 async def test_the_apns_remedy_still_carries_the_compose_warning(session, caplog,
                                                                  monkeypatch):
@@ -472,3 +336,34 @@ async def test_the_apns_remedy_still_carries_the_compose_warning(session, caplog
     assert "#2301" in text, (
         "the compose-forwarding mitigation vanished from the arm where it applies "
         f"— it was moved out of the template and must land here. Text: {text}")
+
+
+@pytest.mark.asyncio
+async def test_an_island_with_android_rows_says_NOT_BUILT_not_how_to_configure(
+    session, configured, caplog
+):
+    """The warning must name Android as UNREACHABLE and offer no action.
+
+    Replaces `test_an_apns_island_with_android_rows_warns_and_names_fcm`, which
+    required the warning to name `FCM_SERVICE_ACCOUNT_JSON` — an instruction that
+    two later rounds proved could not be given safely. Design 14's temper removed
+    the send path entirely, so there is now nothing to set and the honest warning
+    states a capability fact.
+
+    BOTH ARMS, because this surface has drifted three times in this PR alone:
+      - it must NAME the unreachable devices (silence would make an Android
+        registration indistinguishable from a delivery bug), and
+      - it must NOT hand the operator a variable to set, because none exists and a
+        remedy nobody can act on is what produced the contradiction rounds.
+    """
+    await _user_with_android(session, 2)
+    with caplog.at_level("WARNING"):
+        await push_service.warn_if_unreachable(session)
+    text = caplog.text
+    assert "platform=fcm" in text, f"the Android rows were not named: {text}"
+    assert "NOT BUILT" in text, f"the warning must state the capability fact: {text}"
+    assert "FCM_SERVICE_ACCOUNT_JSON" not in text, (
+        "the warning offers a credential to set; there is no send path, so that "
+        f"instruction cannot be acted on. Text: {text}")
+    assert "APNS_KEY_ID" not in text, (
+        "the APNs arm fired on an island whose APNs transport is healthy")

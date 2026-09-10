@@ -32,7 +32,7 @@ import pytest
 import pytest_asyncio
 
 from aiko_gateway.config import settings
-from aiko_gateway.domain import apns, fcm, push_service, users_service
+from aiko_gateway.domain import apns, push_service, users_service
 import sqlalchemy as sa
 
 from aiko_gateway.domain.models import (
@@ -43,7 +43,7 @@ from aiko_gateway.domain.push_result import ReapOrder, SendResult, Verdict
 CHANNEL = "01JDMCHANNELDM000000000000"
 
 # A synthetic FCM service-account blob. No key material: every FCM test here
-# replaces `fcm.send` wholesale, so nothing ever signs anything.
+# replaces `apns.send` wholesale, so nothing ever signs anything.
 FCM_CREDENTIAL = (
     '{"type":"service_account","project_id":"aiko-island-test",'
     '"private_key_id":"0123456789abcdef",'
@@ -105,40 +105,6 @@ class FakeApns:
         return apns.SendResult(self.verdict, reap)
 
 
-class FakeFcm:
-    """The Android sibling of `FakeApns`, at the same layer and with the same
-    rule: it returns the REAL module's result type, so a divergence between the
-    two transports' contracts fails the suite rather than hiding in a union.
-
-    Its signature is deliberately NARROWER than FakeApns's — no `token_kind`, no
-    environment. FCM has one registry and one endpoint per project, and a
-    parameter the transport cannot honour is worse than its absence.
-    """
-
-    def __init__(self, verdict=None):
-        from aiko_gateway.domain.push_result import Verdict
-        self.verdict = verdict if verdict is not None else Verdict.DELIVERED
-        self.reap: ReapOrder | None = None
-        self.sent: list[tuple[str, object, str | None]] = []
-
-    async def __call__(self, device_token, payload, *, collapse_key=None):
-        from aiko_gateway.domain.push_result import SendResult, Verdict
-        self.sent.append((device_token, payload, collapse_key))
-        # DERIVES from the production rule, like FakeApns (Tesla, cage-match PR#172
-        # r5). The APNs fake was forbidden to mirror `apns._reap_order` in r2
-        # because a duplicated rule cannot fail differently from the original — and
-        # this fake, one transport over, went on synthesising `ReapOrder(None)` by
-        # hand. The class was closed at the instance it was pointed at.
-        #
-        # What that cost: if `fcm._reap_order_for` ever WITHHOLDS the order — the
-        # fail-safe, and the live open question in claude-tasks#4199 — these policy
-        # tests would keep reaping and stay green. If it ever issued an order for a
-        # WIDER set of verdicts, they would never notice either. The tests would be
-        # describing a transport that no longer exists.
-        reap = self.reap if self.reap is not None else fcm._reap_order_for(self.verdict)
-        return SendResult(self.verdict, reap)
-
-
 @pytest.fixture
 def configured(monkeypatch):
     """An island WITH working APNs credentials."""
@@ -156,22 +122,9 @@ def configured(monkeypatch):
     # path it was written for.
     monkeypatch.setattr(settings, "apns_voip_topic", "cc.example.app.voip",
                         raising=False)
-    monkeypatch.setattr(settings, "fcm_service_account_json", "", raising=False)
     apns.reset_for_tests()
     yield
     apns.reset_for_tests()
-
-
-@pytest.fixture
-def fcm_configured(monkeypatch):
-    """An island WITH working FCM credentials. Composable with `configured` or
-    used alone — an FCM-only island is a legitimate, bootable deployment, which
-    is the whole of the gate-1 regression below."""
-    monkeypatch.setattr(settings, "fcm_service_account_json", FCM_CREDENTIAL,
-                        raising=False)
-    fcm.reset_for_tests()
-    yield
-    fcm.reset_for_tests()
 
 
 @pytest.fixture
@@ -185,13 +138,6 @@ def apns_unconfigured(monkeypatch):
 def fake_apns(monkeypatch):
     fake = FakeApns()
     monkeypatch.setattr(apns, "send", fake)
-    return fake
-
-
-@pytest.fixture
-def fake_fcm(monkeypatch):
-    fake = FakeFcm()
-    monkeypatch.setattr(fcm, "send", fake)
     return fake
 
 
@@ -371,7 +317,7 @@ async def test_payload_never_names_the_caller(session, dm, configured, fake_apns
     # field, so there is nowhere for a future "improvement" to put a caller's
     # name — it would have to change the type, which is the difference between a
     # commitment and a comment. The per-transport envelopes are rendered BELOW the
-    # boundary (`apns._render`, `fcm.build_message`) from exactly this.
+    # boundary (`apns._render`) from exactly this.
     assert [f.name for f in dataclasses.fields(payload)] == ["channel_id"]
 
 
@@ -742,78 +688,10 @@ async def test_a_dead_token_without_a_reap_order_is_not_deleted(
     )
 
 
-@pytest.mark.asyncio
-async def test_an_fcm_dead_token_is_reaped_on_the_compare_and_delete_alone(
-    session, dm, configured, fcm_configured, fake_fcm
-):
-    """FCM REAPS ON `UNREGISTERED` ONLY, WITH NO DATE ARM — and the reversibility
-    rests entirely on the observation triple.
-
-    `(id, token, updated_at-observed-at-send-time)` is itself a compare-and-swap:
-    `register_device` sets `updated_at` explicitly on every reassign, so a device
-    re-registering between our send and our reap fails the equality and survives.
-    Its mirror arm is `test_an_fcm_row_re_registered_during_the_send_is_not_reaped`.
-    """
-    from aiko_gateway.domain.push_result import Verdict
-
-    alice, bob = dm
-    await session.execute(DeviceToken.__table__.delete())
-    session.add(DeviceToken(user_id=bob.id, platform="fcm", token="f" * 100))
-    await session.commit()
-    fake_fcm.verdict = Verdict.DEAD_TOKEN
-
-    await _wake(sender_id=alice.id)
-    remaining = (await session.execute(
-        DeviceToken.__table__.select().where(DeviceToken.user_id == bob.id)
-    )).all()
-    assert remaining == []
-
-
-@pytest.mark.asyncio
-async def test_an_fcm_row_re_registered_during_the_send_is_not_reaped(
-    session, dm, configured, fcm_configured, monkeypatch, caplog
-):
-    """THE ARM THAT CARRIES THE WHOLE FCM REAPER, because there is no date arm to
-    fall back on. The fake mutates the row MID-SEND — the window itself, not a
-    simulation of it.
-
-    Verify by mutation: removing the `updated_at` equality from the conditional
-    DELETE turns this red, which is what makes it the proof rather than a
-    reassurance.
-    """
-    from aiko_gateway.domain.push_result import ReapOrder, SendResult, Verdict
-
-    alice, bob = dm
-    await session.execute(DeviceToken.__table__.delete())
-    session.add(DeviceToken(user_id=bob.id, platform="fcm", token="f" * 100))
-    await session.commit()
-
-    async def _send_then_reregister(device_token, payload, *, collapse_key=None):
-        await session.execute(
-            DeviceToken.__table__.update()
-            .where(DeviceToken.token == device_token)
-            .values(updated_at=dt.datetime.now(dt.UTC)))
-        await session.commit()
-        return SendResult(Verdict.DEAD_TOKEN, ReapOrder(None))
-
-    monkeypatch.setattr(fcm, "send", _send_then_reregister)
-    with caplog.at_level(logging.WARNING, logger="aiko_gateway.push"):
-        await _wake(sender_id=alice.id)
-
-    survivors = (await session.execute(
-        DeviceToken.__table__.select().where(DeviceToken.user_id == bob.id)
-    )).all()
-    assert len(survivors) == 1, (
-        "an Android device that re-registered during the send was reaped")
-    assert any("row_changed_since_send" in r.message for r in caplog.records), (
-        "the row survived, but the tripwire that would reveal a wrong assumption "
-        "about FCM token re-issue never fired")
-
-
 def test_verdict_mapping_is_narrow():
     """The mapping itself, at the unit level — the reaping rule stated once.
 
-    Its FCM sibling lives in `test_fcm.py` (`test_unregistered_is_the_only_
+    (The FCM sibling went with the transport — design 14 temper. `test_unregistered_is_the_only_
     reaping_verdict` and its 404-without-a-detail must-fail arm), because each
     transport's mapping is a fact about that protocol and belongs beside it. Both
     halves are the same protective pair as the 410/400 one below: deleting either
@@ -865,101 +743,6 @@ async def test_a_blocked_peer_is_excluded(session, dm, configured, fake_apns):
     alice, bob = dm
     await _wake(sender_id=alice.id, exclude={bob.id})
     assert fake_apns.sent == []
-
-
-@pytest.mark.asyncio
-async def test_an_android_row_goes_to_fcm_and_never_to_apple(
-    session, dm, configured, fcm_configured, fake_apns, fake_fcm
-):
-    """RE-AUTHORED from `test_android_row_is_skipped_not_sent_to_apple`.
-
-    The skip half INVERTS — FCM is built now, so an Android row must be sent, not
-    logged and dropped. The never-handed-to-Apple half is the SECURITY property
-    and survives verbatim: an FCM token against APNs is a guaranteed rejection
-    and (before the narrow reaping rule) was a candidate for deletion.
-    """
-    alice, bob = dm
-    session.add(DeviceToken(user_id=bob.id, platform="fcm", token="f" * 100))
-    await session.commit()
-    await _wake(sender_id=alice.id)
-    assert [t for t, _, _ in fake_apns.sent] == ["b" * 64]
-    assert [t for t, _, _ in fake_fcm.sent] == ["f" * 100]
-
-
-@pytest.mark.asyncio
-async def test_an_fcm_only_island_still_wakes_its_android_devices(
-    session, dm, apns_unconfigured, fcm_configured, fake_apns, fake_fcm
-):
-    """THE GATE-1 REGRESSION TEST, and the highest-leverage assertion in the change.
-
-    `apns.is_configured()` used to guard `schedule_wake` ITSELF, so on an island
-    with FCM credentials and no APNs credentials the function returned before any
-    task was created — gates 2-8 never ran and no Android handset was ever woken,
-    however correct the FCM transport was. `config.py`'s all-or-none guard makes
-    an APNs-less island a legitimate, bootable, supported deployment.
-
-    NOTHING IN THE SUITE COULD HAVE CAUGHT IT: the `configured` fixture always
-    set all four APNs settings, so the FCM-only island was a state no test could
-    reach.
-    """
-    alice, bob = dm
-    await session.execute(DeviceToken.__table__.delete())
-    session.add(DeviceToken(user_id=bob.id, platform="fcm", token="f" * 100))
-    await session.commit()
-
-    await _wake(sender_id=alice.id)
-    assert [t for t, _, _ in fake_fcm.sent] == ["f" * 100]
-    assert fake_apns.sent == [], "an APNs-less island tried to reach Apple"
-
-
-@pytest.mark.asyncio
-async def test_an_island_with_no_transport_at_all_sends_nothing(
-    session, dm, apns_unconfigured, fake_apns, fake_fcm, monkeypatch
-):
-    """THE CONTROL FOR THE TEST ABOVE. "Any transport configured" must not
-    degrade into "always configured" — an island with neither credential set is
-    the normal state for most deployments and must still be silent and total."""
-    monkeypatch.setattr(settings, "fcm_service_account_json", "", raising=False)
-    alice, bob = dm
-    session.add(DeviceToken(user_id=bob.id, platform="fcm", token="f" * 100))
-    await session.commit()
-    await _wake(sender_id=alice.id)
-    assert fake_apns.sent == [] and fake_fcm.sent == []
-
-
-@pytest.mark.asyncio
-async def test_an_apns_failure_does_not_suppress_the_fcm_send(
-    session, dm, configured, fcm_configured, fake_fcm, monkeypatch
-):
-    """The per-device boundary, now ACROSS transports. One raising transport must
-    not abandon the other — entropy localizes only where you build the boundary."""
-    alice, bob = dm
-    session.add(DeviceToken(user_id=bob.id, platform="fcm", token="f" * 100))
-    await session.commit()
-
-    async def _explode(*a, **kw):
-        raise RuntimeError("apple is down")
-
-    monkeypatch.setattr(apns, "send", _explode)
-    await _wake(sender_id=alice.id)
-    assert [t for t, _, _ in fake_fcm.sent] == ["f" * 100]
-
-
-@pytest.mark.asyncio
-async def test_an_fcm_failure_does_not_suppress_the_apns_send(
-    session, dm, configured, fcm_configured, fake_apns, monkeypatch
-):
-    """THE MIRROR. A boundary tested in one direction only is half a boundary."""
-    alice, bob = dm
-    session.add(DeviceToken(user_id=bob.id, platform="fcm", token="f" * 100))
-    await session.commit()
-
-    async def _explode(*a, **kw):
-        raise RuntimeError("google is down")
-
-    monkeypatch.setattr(fcm, "send", _explode)
-    await _wake(sender_id=alice.id)
-    assert [t for t, _, _ in fake_apns.sent] == ["b" * 64]
 
 
 @pytest.mark.asyncio
@@ -1053,70 +836,6 @@ async def test_wake_budget_is_per_recipient(session, dm, configured, fake_apns,
     for _ in range(5):
         await _wake(sender_id=alice.id)
     assert len(fake_apns.sent) == 3
-
-
-@pytest.mark.asyncio
-async def test_a_recipient_whose_only_transport_is_unconfigured_burns_no_budget(
-    session, dm, configured, fake_apns, fake_fcm, monkeypatch
-):
-    """RE-AUTHORED from `test_an_fcm_only_recipient_does_not_burn_the_apns_budget`,
-    which is guaranteed red the moment FCM sends — its MECHANISM inverted, its
-    PROPERTY did not, and the property was a cage-match finding.
-
-    A ROW IS NOT A SENDABLE ROW (cage-match #139 round 2, Carnot). Round 1
-    charged the budget once the recipient was known to have *a device*, so a
-    recipient holding only an unsendable token burned a wake slot on every call —
-    and an iPhone registered later in the same minute could find its first real
-    wake already throttled.
-
-    The LIVE instance of "a row that is not sendable" is now a row whose
-    transport is UNCONFIGURED on this island, which is the honest successor: it
-    is the state both live boxes are in for their Android rows today.
-
-    The arm that makes this meaningful is the second half: after N+1 unsendable
-    calls, a freshly registered iPhone must STILL be wakeable.
-    """
-    alice, bob = dm
-    monkeypatch.setattr(settings, "apns_wake_per_recipient_per_minute", 2,
-                        raising=False)
-    monkeypatch.setattr(settings, "fcm_service_account_json", "", raising=False)
-    await session.execute(DeviceToken.__table__.delete())
-    session.add(DeviceToken(user_id=bob.id, platform="fcm", token="f" * 100))
-    await session.commit()
-
-    for _ in range(5):            # would exhaust a 2/min budget if charged
-        await _wake(sender_id=alice.id)
-    assert fake_apns.sent == [] and fake_fcm.sent == []
-
-    session.add(DeviceToken(user_id=bob.id, platform="apns", token="b" * 64))
-    await session.commit()
-    await _wake(sender_id=alice.id)
-    assert len(fake_apns.sent) == 1, "the new iPhone was throttled by unsendable rows"
-
-
-@pytest.mark.asyncio
-async def test_an_fcm_only_recipient_on_a_configured_island_burns_exactly_one_slot(
-    session, dm, configured, fcm_configured, fake_apns, fake_fcm, monkeypatch
-):
-    """THE INVERSE ARM THE RE-AUTHORING OWES. FCM sends now, so it now CHARGES —
-    once per fanout, out of the SAME per-person budget.
-
-    One budget, one key, one charge. A second `"fcm_wake"` bucket would hand a
-    peer holding both an iPhone and an Android twice the ring budget, which
-    contradicts this module's own doctrine that the budget protects the person
-    being interrupted rather than the transport.
-    """
-    alice, bob = dm
-    monkeypatch.setattr(settings, "apns_wake_per_recipient_per_minute", 2,
-                        raising=False)
-    await session.execute(DeviceToken.__table__.delete())
-    session.add(DeviceToken(user_id=bob.id, platform="fcm", token="f" * 100))
-    await session.commit()
-
-    for _ in range(5):
-        await _wake(sender_id=alice.id)
-    assert len(fake_fcm.sent) == 2, "the FCM fanout ignored the per-person budget"
-    assert fake_apns.sent == []
 
 
 @pytest.mark.asyncio
@@ -1275,89 +994,6 @@ async def _reinsert_apns_row_last(session, user_id: str, token: str) -> None:
                                      DeviceToken.platform == "apns"))
     session.add(DeviceToken(user_id=user_id, platform="apns", token=token))
     await session.commit()
-
-
-@pytest.mark.asyncio
-async def test_a_stalled_fcm_send_does_not_delay_the_apns_ring(
-    session, dm, configured, fcm_configured, monkeypatch
-):
-    """RED-PROVEN against the serial loop: Apple was reached at 1.01s."""
-    alice, bob = dm
-    session.add(DeviceToken(user_id=bob.id, platform="fcm", token="f" * 100))
-    await session.commit()
-    await _reinsert_apns_row_last(session, bob.id, "b" * 64)
-
-    reached: dict[str, float] = {}
-    t0 = time.monotonic()
-
-    async def _stalled_fcm(*a, **kw):
-        await asyncio.sleep(1.0)
-        raise RuntimeError("google is blackholed")
-
-    async def _timed_apns(*a, **kw):
-        # CONSTRUCT FIRST, RECORD SECOND — the ordering is the guard (Tesla,
-        # cage-match PR#172 r2). This read the other way round, and `SendResult` /
-        # `Verdict` were imported only INSIDE a fake class further up the file, so
-        # every run raised `NameError` on the return. `_send_one`'s broad
-        # `except Exception` swallowed it as "wake failed for one device" — and
-        # because the stopwatch had ALREADY been written on the previous line, both
-        # assertions below passed. For two full rounds this test, whose entire
-        # subject is that Apple gets rung, never once observed Apple being rung.
-        #
-        # Nothing about the assertions needed changing: recording the measurement
-        # AFTER the fallible work is what makes `"at" in reached` mean "the send
-        # actually completed" instead of "we got as far as looking at the clock".
-        # A stopwatch that stops before the explosion is not proof of a ring.
-        result = SendResult(verdict=Verdict.DELIVERED)
-        reached["at"] = time.monotonic() - t0
-        return result
-
-    monkeypatch.setattr(fcm, "send", _stalled_fcm)
-    monkeypatch.setattr(apns, "send", _timed_apns)
-    await _wake(sender_id=alice.id)
-
-    assert "at" in reached, (
-        "the APNs send never completed at all. Because the fake now records the "
-        "clock AFTER constructing its result, this assertion fails on a swallowed "
-        "transport exception instead of sailing past one")
-    assert reached["at"] < 0.2, (
-        f"the APNs ring waited {reached['at']:.2f}s on the stalled FCM send — "
-        "the fanout has regressed to serial dispatch. A ring that arrives after "
-        "the ring is over is a missed call, not a degraded one."
-    )
-
-
-@pytest.mark.asyncio
-async def test_a_stalled_apns_send_does_not_delay_the_fcm_wake(
-    session, dm, configured, fcm_configured, fake_fcm, monkeypatch
-):
-    """THE MIRROR. A boundary tested in one direction only is half a boundary —
-    the same sentence the exception-direction test above was written under."""
-    alice, bob = dm
-    # bob's APNs row already exists and is FIRST; the FCM row goes in after it,
-    # so the stalled transport is reached first without any reordering.
-    session.add(DeviceToken(user_id=bob.id, platform="fcm", token="f" * 100))
-    await session.commit()
-
-    reached: dict[str, float] = {}
-    t0 = time.monotonic()
-
-    async def _stalled_apns(*a, **kw):
-        await asyncio.sleep(1.0)
-        raise RuntimeError("apple is blackholed")
-
-    async def _timed_fcm(*a, **kw):
-        reached["at"] = time.monotonic() - t0
-        return SendResult(verdict=Verdict.DELIVERED)
-
-    monkeypatch.setattr(apns, "send", _stalled_apns)
-    monkeypatch.setattr(fcm, "send", _timed_fcm)
-    await _wake(sender_id=alice.id)
-
-    assert "at" in reached, "the FCM send never happened at all"
-    assert reached["at"] < 0.2, (
-        f"the FCM wake waited {reached['at']:.2f}s on the stalled APNs send"
-    )
 
 
 @pytest.mark.asyncio

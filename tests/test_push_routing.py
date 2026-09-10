@@ -25,9 +25,13 @@ from aiko_gateway.domain.models import (
     ApnsEnvironment, DeviceToken, Platform, TokenKind,
 )
 from aiko_gateway.domain.push_service import (
-    ApnsDelivery, FcmDelivery, WakeKind, plan_deliveries,
+    ApnsDelivery, WakeKind, plan_deliveries,
 )
 
+# NAME KEPT, MEANING NARROWED: `Platform` still has two members (both islands
+# hold Android rows) but only APNs has a send path, so 'both configured' now
+# means 'every transport that CAN be configured'. The FCM member is skipped as
+# NOT BUILT before the configured check ever runs — design 14 temper.
 BOTH = frozenset(Platform)
 NOW = dt.datetime(2026, 9, 9, 12, 0, tzinfo=dt.UTC)
 
@@ -49,7 +53,7 @@ def _row(row_id: str, platform: str, token_kind: str = TokenKind.ALERT.value,
 # future cancel and turn the router's deliberate skip into a red test.
 @pytest.mark.parametrize(
     "platform,kind,wake",
-    list(itertools.product(Platform, TokenKind, [WakeKind.CALL_INVITE])))
+    list(itertools.product([Platform.APNS], TokenKind, [WakeKind.CALL_INVITE])))
 def test_every_platform_token_kind_combination_is_routed_for_call_invite(
         platform, kind, wake):
     """TOTALITY OVER THE ENUMS, so a member added without teaching the router
@@ -101,7 +105,7 @@ def test_a_new_wake_kind_must_be_routed_explicitly():
     class _FutureWake(enum.Enum):
         CALL_END = "call_end"
 
-    for platform in Platform:
+    for platform in [Platform.APNS]:   # the only platform with a send path
         rows = [_row("01ROW", platform.value, TokenKind.ALERT.value)]
         deliveries, skips = plan_deliveries(
             rows, wake=_FutureWake.CALL_END, configured=BOTH)
@@ -111,18 +115,6 @@ def test_a_new_wake_kind_must_be_routed_explicitly():
         assert len(skips) == 1 and skips[0][0] == "01ROW", (
             f"{platform} dropped an unrecognised wake kind without naming it; a "
             f"silent skip is how the decision gets missed. Got: {skips}")
-
-
-@pytest.mark.parametrize("kind", list(TokenKind))
-def test_an_fcm_row_routes_to_fcm_whatever_kind_it_carries(kind):
-    """FCM has ONE registry (design 12 Decision 2.4) and ring-ness is a property
-    of the MESSAGE (data-only + HIGH priority), not of the token. A naive "prefer
-    voip" rule applied globally would deselect every Android row — the zero-ring
-    failure."""
-    deliveries, skips = plan_deliveries(
-        [_row("01ROW", Platform.FCM.value, kind.value)],
-        wake=WakeKind.CALL_INVITE, configured=BOTH)
-    assert skips == [] and isinstance(deliveries[0], FcmDelivery)
 
 
 # ------------------------------------------------------------------ the fanout
@@ -158,7 +150,9 @@ def test_a_row_whose_transport_is_unconfigured_is_skipped_not_sent():
     deliveries, skips = plan_deliveries(
         rows, wake=WakeKind.CALL_INVITE, configured=frozenset({Platform.APNS}))
     assert [d.row_id for d in deliveries] == ["01APNS"]
-    assert skips == [("01FCM", "transport_not_configured")]
+    assert skips == [("01FCM", "transport_not_built")], (
+        "an Android row must name NOT BUILT — `transport_not_configured` implies\n"
+        "an operator setting that would fix it, and none exists (design 14 temper)")
 
 
 def test_nothing_is_planned_when_no_transport_is_configured():
@@ -169,7 +163,7 @@ def test_nothing_is_planned_when_no_transport_is_configured():
                                         configured=frozenset())
     assert deliveries == []
     assert sorted(skips) == [("01APNS", "transport_not_configured"),
-                             ("01FCM", "transport_not_configured")]
+                             ("01FCM", "transport_not_built")]
 
 
 @pytest.mark.parametrize("bad", [
@@ -189,7 +183,7 @@ def test_a_corrupt_row_skips_only_that_row_and_does_not_raise(bad):
     kwargs.update(bad)
     rows = [_row("01GOOD1", Platform.APNS.value),
             _row("01BAD", **kwargs),
-            _row("01GOOD2", Platform.FCM.value)]
+            _row("01GOOD2", Platform.APNS.value)]
     deliveries, skips = plan_deliveries(rows, wake=WakeKind.CALL_INVITE,
                                         configured=BOTH)
     assert sorted(d.row_id for d in deliveries) == ["01GOOD1", "01GOOD2"]
@@ -214,3 +208,25 @@ def test_the_probe_registry_is_never_the_send_path():
     import inspect
     source = inspect.getsource(push_service._wake_user)
     assert "_CONFIG_PROBES" not in source
+
+
+@pytest.mark.parametrize("kind", list(TokenKind))
+def test_an_android_row_is_skipped_as_NOT_BUILT_whatever_kind_it_carries(kind):
+    """Android rows exist on both live islands and there is no send path for them.
+
+    The reason must be `transport_not_built`, NOT `transport_not_configured`: the
+    latter names an operator setting that would fix it, and none exists — design
+    14's temper dissolved shipping an FCM send path ahead of the client's receive
+    half, so there is no credential to set. A remedy an operator cannot act on is
+    how two rounds of contradictory guidance happened.
+
+    THE ARM THAT DISCRIMINATES: `configured=BOTH` — the not-built skip must fire
+    even when the island is maximally configured, because it is a fact about what
+    is BUILT, not about what is set.
+    """
+    deliveries, skips = plan_deliveries(
+        [_row("01ROW", Platform.FCM.value, kind.value)],
+        wake=WakeKind.CALL_INVITE, configured=BOTH)
+    assert deliveries == [], "an Android row produced a delivery with no send path"
+    assert skips == [("01ROW", "transport_not_built")], (
+        f"an Android row must be named NOT BUILT, got {skips}")

@@ -9,7 +9,7 @@ missed silently and permanently, which is the whole of claude-tasks#3253.
 WHY A SINGLE DOOR. Everything security-relevant about waking a device is a
 decision about WHO may cause it, and those decisions are worthless if a second
 send path can skip them. So the route, any in-process caller and the tests all
-enter through `schedule_wake`; `apns.py` and `fcm.py` underneath are pure
+enter through `schedule_wake`; `apns.py` underneath is a pure
 transports and hold no policy at all. There are two transports and still ONE
 door: they are siblings below the boundary, never a second entrance, and neither
 knows the other exists.
@@ -53,7 +53,6 @@ healthy boxes is the same silence in a high-vis vest.
   wake skipped device=%s reason=unroutable_row             ERROR
   wake skipped user=%s reason=no_sendable_devices          DEBUG
   apns sent device=%s env=%s kind=%s verdict=%s            INFO
-  fcm sent device=%s verdict=%s                            INFO
   wake delivered_to=0 user=%s devices=%d                   ERROR
   reap skipped device=%s reason=dead_without_reap_order    WARNING
   reap skipped device=%s reason=row_changed_since_send     WARNING
@@ -166,7 +165,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import settings
 from ..db import SessionLocal
-from . import apns, fcm, moderation_service
+from . import apns, moderation_service
 from .models import (Channel, ChannelKind, DeviceToken, Membership, Platform,
                      ApnsEnvironment, TokenKind, User)
 from .push_result import ReapOrder, SendResult, Verdict, WakePayload
@@ -206,9 +205,23 @@ CALL_INVITE_BODY = "aiko:call/1 · 📞 started a call"
 # Iterating a registry to dispatch would be a second door wearing a dict — sending
 # goes through the single `match` on the Delivery union in `_wake_user` and
 # nowhere else.
+def _fcm_not_built() -> bool:
+    """Android is NOT BUILT — never configured, by construction, not by config.
+
+    The totality guard below demands an answer for every `Platform` member, and
+    this is the honest one. It is a FUNCTION rather than a bare `False` so the
+    reason has somewhere to live: design 14's temper dissolved shipping an FCM
+    send path ahead of the client's receive half, so there is no credential an
+    operator could set that would make this True. When Android ships end-to-end,
+    this is replaced by a real `fcm.is_configured` — and the closed-set guard is
+    what will make sure every other address gets updated in the same change.
+    """
+    return False
+
+
 _CONFIG_PROBES: dict[Platform, Callable[[], bool]] = {
     Platform.APNS: apns.is_configured,
-    Platform.FCM: fcm.is_configured,
+    Platform.FCM: _fcm_not_built,
 }
 
 # TOTALITY AT IMPORT, not at first ring. A `Platform` member added without a probe
@@ -334,18 +347,14 @@ class ApnsDelivery:
     token_kind: TokenKind
 
 
-@dataclasses.dataclass(frozen=True, slots=True)
-class FcmDelivery:
-    """One push to send to Google. NO environment and NO token kind: FCM has one
-    registry and one endpoint per project, and carrying a field the transport
-    cannot honour would read as a routing decision nothing downstream makes."""
-
-    row_id: str
-    token: str
-    updated_at: dt.datetime
 
 
-Delivery = ApnsDelivery | FcmDelivery
+# ONE MEMBER TODAY. Kept as an alias rather than collapsed to ApnsDelivery:
+# `Platform` is still a closed set with a live FCM member (both islands hold
+# Android rows), so the router's exhaustiveness is a real property, not a
+# formality — and design 14's temper was explicit that a second transport
+# must EARN the shared shape rather than have it predicted for it.
+Delivery = ApnsDelivery
 
 
 def plan_deliveries(
@@ -402,6 +411,13 @@ def plan_deliveries(
             # reason instead of raising into a fanout.
             platform = Platform(row.platform)
             kind = TokenKind(row.token_kind)
+            # NOT-BUILT IS CHECKED FIRST, and the order is the point: a transport
+            # this island cannot speak at all must not be reported as
+            # `transport_not_configured`, which names something the operator could
+            # fix. There is nothing to fix — Android has no send path here yet.
+            if platform is Platform.FCM:
+                skips.append((row.id, "transport_not_built"))
+                continue
             if platform not in configured:
                 # OPERATOR-FIXABLE, and loud enough to be findable without being
                 # the alarm. The property it preserves: an Android device that
@@ -411,34 +427,6 @@ def plan_deliveries(
                 skips.append((row.id, "transport_not_configured"))
                 continue
             match platform:
-                case Platform.FCM:
-                    # REGARDLESS OF `token_kind`. FCM has one registry (design 12
-                    # Decision 2.4) and ring-ness is a property of the MESSAGE
-                    # (data-only at HIGH priority), not of the token. A naive
-                    # "prefer voip" rule applied across both platforms would
-                    # deselect every Android row — the zero-ring failure.
-                    #
-                    # BUT NOT REGARDLESS OF `wake` (Tesla, cage-match PR#172 r2).
-                    # This arm appended for ANY WakeKind while the APNs arm below
-                    # matches on it with a real fall-through. `WakeKind` was forged
-                    # precisely so that adding a member — a CALL_END cancel is the
-                    # named candidate — cannot silently inherit ring behaviour. That
-                    # protection existed on ONE platform: the day the enum grows,
-                    # iOS would skip pending a decision while Android sent a HIGH
-                    # data ring for a cancel, and `test_every_platform_token_kind_
-                    # wake_combination_is_routed` sweeps the full product and
-                    # REQUIRES a delivery for every member, so the instrument built
-                    # to force the decision would bless the asymmetry instead.
-                    #
-                    # Behaviour today is unchanged — CALL_INVITE is the only member.
-                    # What changes is what happens to the NEXT one: both platforms
-                    # now stop and ask.
-                    match wake:
-                        case WakeKind.CALL_INVITE:
-                            deliveries.append(
-                                FcmDelivery(row.id, row.token, row.updated_at))
-                        case _:
-                            skips.append((row.id, "wake_kind_not_routed_for_fcm"))
                 case Platform.APNS:
                     match (kind, wake):
                         case (TokenKind.VOIP, WakeKind.CALL_INVITE):
@@ -655,21 +643,15 @@ _UNREACHABLE_REMEDY = {
                           "box's docker-compose.yml actually forwards them "
                           "(#2301: update.sh pulls the image, it does NOT sync "
                           "compose)"),
-    # DO NOT SAY "Set FCM_SERVICE_ACCOUNT_JSON" (Tesla, cage-match PR#172 r4).
-    # config.py REFUSES TO BOOT on a present credential until the Android receive
-    # half exists. Both live islands already hold Android device rows, so this line
-    # prints on every boot today — and an operator who obeyed it would write the
-    # var, pull, and crash-loop under `restart: always` with the island already
-    # down. There is no FCM preflight to catch it on the way in.
-    #
-    # This is the APNs four-of-five remedy defect committed a second time, one
-    # transport over, in the same change that fixed the first: an operator-facing
-    # sentence that builds exactly the state the guard refuses. The suite pinned
-    # both halves in isolation — the warning must name FCM, a present blob must
-    # refuse to boot — and never collided them, so a full green could not see it.
-    Platform.FCM.value: ("Android push is not available on this island yet: the "
-                         "client has no receive half, so the credential is "
-                         "refused at boot. Do NOT set FCM_SERVICE_ACCOUNT_JSON"),
+    # NOT BUILT, so there is NOTHING an operator can set (design 14 temper). The
+    # earlier wording told them to set a credential, then a later round told them
+    # NOT to set it while a boot guard refused it — two rounds of findings were
+    # that contradiction leaking across surfaces. With no FCM send path there is no
+    # credential, no guard and no contradiction: the remedy states a fact about the
+    # island's capabilities rather than an action the operator cannot usefully take.
+    Platform.FCM.value: ("Android push is NOT BUILT on this island — there is no "
+                         "credential to set. These devices are unreachable until "
+                         "the Android transport ships with its client receive half"),
 }
 
 
@@ -843,11 +825,6 @@ async def _wake_user(session: AsyncSession, user_id: str, *, wake: WakeKind,
                     log.info("apns sent device=%s env=%s kind=%s verdict=%s",
                              delivery.row_id, delivery.apns_environment.value,
                              delivery.token_kind.value, result.verdict.value)
-                case FcmDelivery():
-                    result = await fcm.send(delivery.token, payload,
-                                            collapse_key=collapse_id)
-                    log.info("fcm sent device=%s verdict=%s",
-                             delivery.row_id, result.verdict.value)
                 case _:
                     assert_never(delivery)
         except Exception:
@@ -938,7 +915,7 @@ async def _wake_user(session: AsyncSession, user_id: str, *, wake: WakeKind,
         # the generalisation: it was made to serve two transports by REMOVING
         # knowledge, not by adding a branch. What evidence proves a death is a fact
         # about each provider's protocol and now lives with it (`apns._reap_order`,
-        # `fcm._reap_order_for`); what remains here is the question this layer can
+        # dated authority); what remains here is the question this layer can
         # answer for everybody — is this still the row we sent to?
         if order is None:
             # NO ORDER, NO REAP (cage-match #139 round 6, Carnot, generalised). The
@@ -965,8 +942,8 @@ async def _wake_user(session: AsyncSession, user_id: str, *, wake: WakeKind,
             # Carnot). The equality checks above only cover the network await;
             # this covers a row that was ALREADY refreshed before the send, whose
             # death notice is simply stale. Keep the row when our registration is
-            # newer than the provider's invalidation. FCM supplies no such date —
-            # see `fcm._reap_order_for` for what carries the reversibility there,
+            # newer than the provider's invalidation. A transport supplying no such
+            # date would have to carry its reversibility elsewhere,
             # and for the falsifier if that reasoning is wrong.
             conditions.append(
                 DeviceToken.updated_at <= order.not_reregistered_since)
@@ -1086,8 +1063,7 @@ def schedule_wake(*, channel_id: str, channel_kind: ChannelKindStr, sender_id: s
 
 async def aclose(timeout: float = 5.0) -> None:
     """Drain in-flight wakes, then let the transports close. Call BEFORE
-    ``apns.aclose()`` and ``fcm.aclose()`` — drain first, then close EVERY
-    transport.
+    ``apns.aclose()`` — drain first, then close the transport.
 
     A FIX-INTERACTION DEFECT, found by two reviewers independently (cage-match
     #139, Maxwell + Carnot). `_in_flight` and a transport's `aclose()` are each

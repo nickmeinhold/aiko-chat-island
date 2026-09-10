@@ -762,15 +762,15 @@ def test_a_nul_does_not_corrupt_the_value_reader(island) -> None:
 # The shape of a real live island's .env, by SEVERITY TIER rather than by copying a
 # box's current key list — a census pinned to today's boxes goes stale the first time
 # someone adds a key, and a test that must be edited to stay true stops being read.
-# Every name here is one both live islands carry, EXCEPT FCM_SERVICE_ACCOUNT_JSON,
-# which is here ahead of the boxes on purpose: a Firebase service-account private key
-# is downloadable exactly ONCE, so the first island to gain Android must not be the
-# run that discovers whether the guard lists it. Naming a key the boxes do not yet
-# hold only widens the fixture, which makes the totality assertion strictly stronger.
+# Every name here is one both live islands carry. FCM_SERVICE_ACCOUNT_JSON was listed
+# here ahead of the boxes; it went with the transport when design 14's temper dissolved
+# shipping an FCM send path ahead of the client's receive half. It comes back in the
+# change that ships Android end-to-end — a Firebase service-account private key is
+# downloadable exactly ONCE, so that change must not be the run that discovers whether
+# this guard lists it.
 _LIVE_SHAPED_KEYS = {
     # unrecoverable: exists nowhere but the box
     "ISLAND_SIGNING_SEED", "APNS_PRIVATE_KEY", "GITHUB_CLIENT_SECRET",
-    "FCM_SERVICE_ACCOUNT_JSON",
     # loud: the island refuses to boot without them
     # APNS_VOIP_TOPIC is listed as LOUD because it joined config.py's APNs
     # all-or-none group: a box that loses only this key still holds four APNs

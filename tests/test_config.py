@@ -1726,7 +1726,6 @@ def test_the_identity_vars_are_forwarded_by_compose():
         assert var in env, f"{var} is not forwarded into the chat-island container"
 
 
-# --- FCM credential boot ladder (the Android transport) -------------------------
 #
 # WITHOUT THIS LADDER a malformed blob boots clean and then fails inside
 # push_service's broad `except` as "wake failed for one device" FOREVER — a deaf
@@ -1759,121 +1758,6 @@ def _credential(**overrides) -> str:
     }
     blob.update(overrides)
     return _json.dumps(blob)
-
-
-def test_an_absent_fcm_credential_boots_fine():
-    """THE ARM THAT PROTECTS EVERY ISLAND THAT WILL NEVER SET FCM — which is most
-    of them, and all of them today. A guard with only its failing arm cannot be
-    shown to have a passing one."""
-    s = Settings(_env_file=None, environment="dev", jwt_secret=_DEV_JWT_SECRET)
-    assert s.fcm_service_account_json == ""
-
-
-def test_a_well_formed_fcm_credential_is_REFUSED_until_android_can_receive():
-    """A credential the ladder ACCEPTS must still be refused at boot (Carnot,
-    cage-match PR#172 r2).
-
-    This test asserted the opposite until round 2 — that a well-formed credential
-    boots — and that was the honest reading of the code at the time. The gate
-    against provisioning lived only in `fcm.build_message`'s docstring, and prose
-    does not gate: hours after that docstring was written, this repo's own operator
-    provisioned the credential on both islands and called it a fix. The failure it
-    guards is SILENT (FCM 200, `verdict=delivered`, quiet alarm, dead handset), so
-    nothing downstream would have reported the mistake either.
-
-    WHY THIS DISCRIMINATES: it uses a credential the FCM ladder fully accepts, so
-    the refusal cannot be coming from a shape complaint. Deleting the guard makes
-    this test go green again — which is exactly what lifting it should look like
-    when the Android receive half lands.
-
-    The message is asserted, not just the raise: a generic ValueError from any other
-    validator in this file would satisfy `pytest.raises` alone and tell us nothing
-    about WHICH rule fired.
-    """
-    with pytest.raises(ValidationError) as excinfo:
-        Settings(_env_file=None, environment="dev", jwt_secret=_DEV_JWT_SECRET,
-                 fcm_service_account_json=_credential())
-    message = str(excinfo.value)
-    assert "no receive half" in message, (
-        f"the refusal must name the REASON — an island operator reading it needs to "
-        f"know this is a missing client capability, not a malformed key. Got: {message}")
-    assert "verdict=delivered" in message, (
-        "the refusal must name the silent-false-success failure mode, because that "
-        "is the whole argument for refusing a credential that is otherwise valid")
-
-
-def test_a_multi_line_fcm_credential_refuses_to_boot():
-    """SINGLE LINE, and it is not fussiness. TWO line-oriented readers of the same
-    .env already declare themselves broken on multi-line values — `dotenv_keys`
-    emits phantom keys for continuation lines, and `preflight-apns.sh` names
-    multi-line as unhandled and closes off growing a third parser. JSON has no
-    mandatory newlines, so requiring one line REMOVES the coupling instead of
-    guarding the window."""
-    with pytest.raises(ValidationError) as ei:
-        Settings(_env_file=None, environment="dev", jwt_secret=_DEV_JWT_SECRET,
-                 fcm_service_account_json=_json.dumps(
-                     _json.loads(_credential()), indent=2))
-    assert "jq -c" in str(ei.value), (
-        "the refusal did not name the one-line fix an operator can run")
-
-
-def test_an_unparseable_fcm_credential_refuses_to_boot():
-    """PRESENCE IS NOT PARSEABILITY, one transport over. A truncated paste boots
-    clean without this and then fails forever inside a swallowed background send."""
-    with pytest.raises(ValidationError) as ei:
-        Settings(_env_file=None, environment="dev", jwt_secret=_DEV_JWT_SECRET,
-                 fcm_service_account_json='{"type": "service_account", "proj')
-    assert "fcm_service_account_json" in str(ei.value)
-    assert "truncated paste" in str(ei.value), (
-        "the refusal did not name a cause an operator can act on")
-
-
-def test_a_wrong_shaped_fcm_credential_refuses_to_boot():
-    """A Firebase WEB config or `google-services.json` looks identical on disk —
-    the same hazard as an App Store Connect key pasted for a `.p8`."""
-    with pytest.raises(ValidationError) as ei:
-        Settings(_env_file=None, environment="dev", jwt_secret=_DEV_JWT_SECRET,
-                 fcm_service_account_json='{"apiKey":"x","projectId":"y"}')
-    assert "service_account" in str(ei.value)
-
-
-def test_an_fcm_credential_missing_a_required_field_refuses_to_boot():
-    for field in ("project_id", "client_email", "private_key"):
-        with pytest.raises(ValidationError) as ei:
-            Settings(_env_file=None, environment="dev", jwt_secret=_DEV_JWT_SECRET,
-                     fcm_service_account_json=_credential(**{field: ""}))
-        assert field in str(ei.value), f"the refusal did not name {field}"
-
-
-def test_an_ec_key_in_an_fcm_credential_refuses_to_boot():
-    """PARSEABLE IS NOT USABLE. FCM assertions are RS256; an EC key parses, is a
-    real private key, satisfies every presence check and can never sign one —
-    pushing the failure straight back into the swallowed background send path
-    this whole validator exists to keep it out of."""
-    from cryptography.hazmat.primitives import serialization
-    from cryptography.hazmat.primitives.asymmetric import ec
-    key = ec.generate_private_key(ec.SECP256R1())
-    pem = key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption()).decode()
-    with pytest.raises(ValidationError) as ei:
-        Settings(_env_file=None, environment="dev", jwt_secret=_DEV_JWT_SECRET,
-                 fcm_service_account_json=_credential(private_key=pem))
-    assert "RS256" in str(ei.value)
-
-
-def test_the_fcm_ladder_does_not_fire_on_a_blank_island():
-    """The cross-field arm. `test_the_whole_rendered_compose_environment_boots` is
-    the only test in this repo that can see a guard firing on the stock all-blank
-    island; this states the same property directly so the failure names itself."""
-    s = Settings(_env_file=None, environment="dev", jwt_secret=_DEV_JWT_SECRET,
-                 fcm_service_account_json="   ")
-    assert s.fcm_service_account_json == "", (
-        "a whitespace-only credential must read as ABSENT — the compose forward is "
-        "`${FCM_SERVICE_ACCOUNT_JSON:-}` and an unset host var lands in the "
-        "container as the empty string, so blank has to mean off rather than "
-        "malformed")
 
 
 # --- The fifth APNs member (design 12 Decision 3; Nick, 2026-09-10) -----------

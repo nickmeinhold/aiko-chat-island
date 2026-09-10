@@ -263,16 +263,6 @@ services:
       # A development-build device token is valid ONLY against the sandbox host.
       APNS_USE_SANDBOX: ${APNS_USE_SANDBOX:-false}
       APNS_WAKE_PER_RECIPIENT_PER_MINUTE: ${APNS_WAKE_PER_RECIPIENT_PER_MINUTE:-6}
-      # FCM push wake (Android). ONE variable, so there is no half-configured
-      # state and no preflight to write — but config.py DOES refuse to boot on a
-      # malformed blob, so it must be SINGLE-LINE JSON (jq -c .). Absent/blank =>
-      # Android push OFF, not a boot failure.
-      #
-      # LEAVE IT BLANK. A PRESENT credential is currently a BOOT REFUSAL, not a
-      # working Android transport: the client has no receive half, so every send
-      # would 200 and ring nothing while the island logged verdict=delivered.
-      # Setting this on a live box crash-loops it under `restart: always`.
-      FCM_SERVICE_ACCOUNT_JSON: ${FCM_SERVICE_ACCOUNT_JSON:-}
       # Auth/abuse policy — operator-tunable blast-radius caps (#28).
       RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-true}
       AUTH_RATE_LIMIT: ${AUTH_RATE_LIMIT:-20}

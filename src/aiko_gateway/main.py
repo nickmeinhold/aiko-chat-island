@@ -287,7 +287,7 @@ async def lifespan(app: FastAPI):
                 with contextlib.suppress(asyncio.CancelledError):
                     await nudge_task
             # Push shutdown, IN THIS ORDER (#3267; cage-match #139 Maxwell+Carnot).
-            # DRAIN the in-flight wake tasks FIRST, THEN close EVERY transport's
+            # DRAIN the in-flight wake tasks FIRST, THEN close the transport's
             # pooled connection — closing a shared client while a wake is mid-send
             # tears the connection out from under it, and the resulting error is
             # swallowed by wake_for_message's broad except as a misleading "wake
@@ -296,10 +296,9 @@ async def lifespan(app: FastAPI):
             # it. All three are no-ops on an island with push unconfigured.
             # Imported here rather than at module scope to keep the import graph of
             # `main` unchanged for the clean-checkout route-table tests.
-            from .domain import apns, fcm, push_service
+            from .domain import apns, push_service
             await push_service.aclose()
             await apns.aclose()
-            await fcm.aclose()
     finally:
         # Outermost: runs whether startup raised before yield or cleanup raised.
         release_single_worker_lock()
