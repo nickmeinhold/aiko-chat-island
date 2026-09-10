@@ -12,6 +12,7 @@ import aiko_services" isolation invariant — same pattern as test_membership_ac
 from __future__ import annotations
 
 import pytest
+from sqlalchemy import select
 import pytest_asyncio
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
@@ -188,6 +189,17 @@ async def test_a_voip_registration_round_trips_through_the_router(client, sessio
         json={"platform": "apns", "token": "j" * 64, "token_kind": "voip"})
     assert resp.status_code == 201
     assert resp.json()["token_kind"] == "voip"
+    # AND THE ROW, not just the echo (Carnot, cage-match PR#170 r4). This asserted
+    # the 201 body alone, so a service that echoes `req.token_kind` faithfully and
+    # STORES 'alert' passed — while durable misclassification of a VoIP token is
+    # this PR's central failure mode. The storage assertion exists in
+    # test_token_kind.py, but this test names the ROUTER round trip and has to
+    # discriminate the router-to-service leg itself.
+    row = (await session.execute(
+        select(DeviceToken).where(DeviceToken.token == "j" * 64))).scalar_one()
+    assert row.token_kind == "voip", (
+        "the router echoed voip but the row stored "
+        f"{row.token_kind!r} — the echo is not evidence of storage")
 
 async def test_the_registration_response_names_the_token_kind(client, session):
     """The 201 body grew a third field. It echoes the RESOLVED kind for the same

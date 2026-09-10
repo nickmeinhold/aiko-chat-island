@@ -498,55 +498,74 @@ def test_the_0025_check_still_matches_what_the_enum_renders_today():
     )
 
 
-def test_the_0025_column_is_wide_enough_for_every_member():
-    """The shadow closed set (Tesla, same round). VARCHAR width is a second,
-    quieter constraint beside the CHECK — unenforced on SQLite, enforced on
-    Postgres, so it is invisible where we run and bites where we might."""
+def test_the_0025_column_is_wide_enough_for_every_member(tmp_path, monkeypatch) -> None:
+    """THE SHADOW CLOSED SET — and this test could not catch the bug it exists for
+    (Tesla, cage-match PR#170 r4).
+
+    VARCHAR width is a second, quieter constraint beside the CHECK: unenforced on
+    SQLite, enforced on Postgres, so it is invisible where we run and bites where we
+    might. `_KIND_WIDTH = 16` exists because `String(8)` was the original value and
+    would have swallowed a future `background` (10) or `liveactivity` (12).
+
+    The first version asserted `model_width == _KIND_WIDTH` and both `>= longest` —
+    where `longest` is `max(len(m.value) for m in TokenKind)` = len('alert') = 5. So
+    a regression of BOTH declarations back to `String(8)` passed: 8 == 8, and 8 >= 5.
+    The guard was blind to precisely the defect that motivated it.
+
+    Two corrections, both from Tesla:
+      * the floor is the set we might ADOPT, not the set we hold. These values are
+        Apple's own `apns-push-type` spellings, so the floor is the longest of those,
+        not the longest of the two members we happen to use today.
+      * strike the EMITTED DDL, not the constant that claims to have produced it.
+        `upgrade()` can pass `sa.String(8)` while `_KIND_WIDTH` stays 16 and no
+        assertion above would flicker.
+    """
     import importlib.util
+    import re as _re
+    import sqlite3
     from pathlib import Path
-    from aiko_gateway.domain.models import TokenKind
+    from alembic import command
+    from aiko_gateway import migrate
+    from aiko_gateway.domain.models import DeviceToken, TokenKind
+
+    # The widest apns-push-type spelling Apple currently defines. The floor is a
+    # fact about the VOCABULARY, not about our current membership — which is the
+    # whole reason 8 was wrong while every value we stored still fitted in it.
+    WIDEST_PUSH_TYPE = len("liveactivity")  # 12
 
     rev = Path(__file__).resolve().parents[1] / "alembic" / "versions" / "0025_device_token_kind.py"
     spec = importlib.util.spec_from_file_location("rev_0025b", rev)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
 
-    from aiko_gateway.domain.models import DeviceToken
-
-    longest = max(len(m.value) for m in TokenKind)
-
-    # THE ARM THIS TEST WAS MISSING (Carnot + Tesla, cage-match PR#170 r2). It
-    # asserted only the MIGRATION's width, so `models.py` regressing to String(8)
-    # left it green — a check whose outcome was independent of one of the two
-    # things its own name claims to cover. Three closed-set clocks exist here
-    # (enum, CHECK, VARCHAR width) and only two pairs were ever compared.
     model_width = DeviceToken.__table__.c.token_kind.type.length
     assert model_width == mod._KIND_WIDTH, (
         f"the ORM column is String({model_width}) and revision 0025 writes "
         f"String({mod._KIND_WIDTH}). SQLite does not enforce VARCHAR width so both "
-        "look fine where we run; Postgres does. Two declarations of one width is "
-        "the same duplicated-truth defect the CHECK parity test exists for.")
-    assert model_width >= longest, (
-        f"the ORM column String({model_width}) cannot hold the longest TokenKind "
-        f"value ({longest} chars).")
+        "look fine where we run; Postgres does.")
+    assert model_width >= WIDEST_PUSH_TYPE, (
+        f"String({model_width}) cannot hold the longest apns-push-type spelling "
+        f"({WIDEST_PUSH_TYPE} chars, 'liveactivity'). A floor of "
+        f"max(len(m.value) for m in TokenKind) = "
+        f"{max(len(m.value) for m in TokenKind)} would admit String(8) — the exact "
+        "regression this test exists to lock.")
 
-    assert mod._KIND_WIDTH >= longest, (
-        f"_KIND_WIDTH={mod._KIND_WIDTH} cannot hold the longest TokenKind value "
-        f"({longest} chars). On Postgres this truncates or errors; on SQLite it is "
-        "silently ignored, which is why it would ship unnoticed."
-    )
+    # THE EMITTED DDL, not the constant. Read VARCHAR(n) back out of the migrated
+    # schema so a revision that passes a different width to sa.String() is caught.
+    _async_url, sync_url = _point_app_at(tmp_path, monkeypatch)
+    command.upgrade(migrate._alembic_config(), "head")
+    con = sqlite3.connect(sync_url.replace("sqlite:///", ""))
+    ddl = con.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='device_tokens'"
+    ).fetchone()[0]
+    con.close()
 
+    emitted = _re.search(r"token_kind\s+VARCHAR\((\d+)\)", ddl, _re.I)
+    assert emitted, f"could not read token_kind's emitted width from: {ddl!r}"
+    assert int(emitted.group(1)) == mod._KIND_WIDTH, (
+        f"the migrated DDL declares VARCHAR({emitted.group(1)}) while _KIND_WIDTH is "
+        f"{mod._KIND_WIDTH} — the constant does not describe what upgrade() emitted.")
 
-# ---------------------------------------------------------------------------
-# RECOVERED BY THE SPLIT AUDIT (cage-match PR#170 round 2, Tesla).
-#
-# This test was written on the combined branch and MY SPLIT DROPPED IT: I carried
-# the source files and one test file across and never diffed the test SURFACE.
-# 0025 REBUILDS device_tokens via batch_alter_table, on a live table holding real
-# APNs tokens, and revision 0024 exists precisely because a rebuild can silently
-# re-default a column. Without this, `server_default='alert'` is a CLAIM about a
-# backfill that nothing had ever driven.
-# ---------------------------------------------------------------------------
 
 def test_rows_written_at_0024_read_alert_at_0025(tmp_path, monkeypatch) -> None:
     """`server_default='alert'` IS THE BACKFILL, and this is the proof.
@@ -640,7 +659,7 @@ def test_the_migrated_ddl_actually_carries_the_check(tmp_path, monkeypatch) -> N
     import sqlite3
     from alembic import command
     from aiko_gateway import migrate
-    from aiko_gateway.domain.models import TokenKind
+    from aiko_gateway.domain.models import TokenKind, _in_check
 
     _async_url, sync_url = _point_app_at(tmp_path, monkeypatch)
     command.upgrade(migrate._alembic_config(), "head")
@@ -660,37 +679,93 @@ def test_the_migrated_ddl_actually_carries_the_check(tmp_path, monkeypatch) -> N
     # because 'alert' was found in the default rather than in the constraint. The
     # member the backfill actually writes is precisely the one the loop could not
     # see.
+    # BALANCED extraction. A naive `\(([^)]*)\)` stops at the first close paren,
+    # which is the one inside `IN ('alert', 'voip')` — so the captured clause was
+    # missing its tail and could never equal what _in_check renders. A parser that
+    # silently truncates its input is the same class as a fixture that cannot
+    # discriminate: the comparison runs, and it is comparing the wrong thing.
     import re as _re
-    m = _re.search(r"CONSTRAINT\s+ck_device_tokens_token_kind\s+CHECK\s*\((.*?)\)\)",
-                   ddl, _re.S | _re.I) or _re.search(
-                   r"ck_device_tokens_token_kind[^(]*\(([^)]*)\)", ddl, _re.S | _re.I)
-    assert m, f"could not extract the token_kind CHECK clause from: {ddl!r}"
+
+    def _check_clause(ddl_text: str, name: str) -> str | None:
+        anchor = _re.search(rf"{name}\s+CHECK\s*\(", ddl_text, _re.I)
+        if not anchor:
+            return None
+        i = anchor.end()          # first char inside the CHECK's open paren
+        depth = 1
+        for j in range(i, len(ddl_text)):
+            if ddl_text[j] == "(":
+                depth += 1
+            elif ddl_text[j] == ")":
+                depth -= 1
+                if depth == 0:
+                    return ddl_text[i:j]
+        return None
+
+    clause_text = _check_clause(ddl, "ck_device_tokens_token_kind")
+    assert clause_text, f"could not extract the token_kind CHECK clause from: {ddl!r}"
+    m = _re.match(r"(.*)", clause_text, _re.S)
     clause = m.group(1)
-    for member in TokenKind:
-        assert f"'{member.value}'" in clause, (
-            f"the migrated CHECK clause does not admit {member.value!r}; the clause "
-            f"is {clause!r}")
+
+    # THE TARGET EXPRESSION, not just the literals (Carnot, PR#170 r4). Scanning the
+    # clause for each member is satisfied by `platform IN ('alert','voip')` or even
+    # `'alert' IN ('alert','voip')` — every literal is present and the constraint
+    # constrains the wrong thing, or nothing. Compare against what _in_check renders
+    # so the column being constrained is part of the assertion.
+    def _norm2(x: str) -> str:
+        return "".join(str(x).lower().split()).replace('"', "'")
+
+    assert _norm2(clause) == _norm2(_in_check("token_kind", TokenKind)), (
+        f"the migrated CHECK clause is {clause!r}, which is not what _in_check "
+        f"renders ({_in_check('token_kind', TokenKind)!r}). Matching member literals "
+        "is not enough — a constraint on the wrong column contains them all.")
 
     # THE WORK OUTPUT, not the nameplate (Carnot, cage-match PR#170 r3). Everything
     # above is still a READ of generated text: a CHECK attached to a DIFFERENT
     # column, or a dead literal, satisfies all of it. The only measurement that
     # binds the constraint to THIS column is making the database refuse a bad value.
+    # THE FIXTURE MUST FAIL FOR THE RIGHT REASON (Carnot, cage-match PR#170 r4).
+    # The first version inserted user_id='u1' with no matching users row.
+    # device_tokens.user_id is an FK onto users.id, and SQLite's foreign_keys pragma
+    # is OFF by default — so TODAY the CHECK is what rejects it, but the assertion
+    # could not tell CHECK enforcement from FK enforcement. Turn FKs on (now, or by
+    # someone later) and this silently becomes a foreign-key test that passes with
+    # the CHECK absent or attached to the wrong column. Same non-discriminating
+    # class this test was written to close, one layer down.
     con = sqlite3.connect(sync_url.replace("sqlite:///", ""))
+    con.execute("PRAGMA foreign_keys=ON")   # remove the ambiguity rather than rely on the default
+    con.execute("INSERT INTO users (id, username, display_name, aiko_username, "
+                "created_at) VALUES "
+                "('u1','u1','U One','u1','2026-01-01 00:00:00')")
+    con.commit()
+
+    # POSITIVE CONTROL FIRST: the same user and a VALID kind must succeed. Without
+    # it, the refusal below proves only "this INSERT always fails".
+    con.execute("INSERT INTO device_tokens (id, user_id, platform, token, "
+                "token_kind, apns_environment, created_at, updated_at) VALUES "
+                "('ok','u1','apns','good','alert','production',"
+                "'2026-01-01 00:00:00','2026-01-01 00:00:00')")
+    con.commit()
+
     try:
         con.execute("INSERT INTO device_tokens (id, user_id, platform, token, "
                     "token_kind, apns_environment, created_at, updated_at) VALUES "
                     "('t1','u1','apns','x','shout','production',"
                     "'2026-01-01 00:00:00','2026-01-01 00:00:00')")
         con.commit()
-        raised = False
-    except sqlite3.IntegrityError:
-        raised = True
+        err = None
+    except sqlite3.IntegrityError as ex:
+        err = str(ex)
     finally:
         con.close()
-    assert raised, (
+
+    assert err is not None, (
         "the migrated DB accepted token_kind='shout' — the CHECK is present in the "
         "DDL text but is not enforcing on this column. A constraint that reads "
         "correctly and rejects nothing is the exact shape this test exists to catch.")
+    assert "CHECK" in err.upper(), (
+        f"the insert was rejected, but not by a CHECK — {err!r}. The row's user "
+        "exists and the only invalid field is token_kind, so anything other than a "
+        "CHECK failure means this test is measuring a different constraint.")
 
 
 def test_downgrading_0025_refuses_while_a_voip_row_exists(tmp_path, monkeypatch) -> None:

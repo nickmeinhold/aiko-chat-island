@@ -71,7 +71,11 @@ depends_on: Union[str, Sequence[str], None] = None
 # fails loudly here and gets its own revision rather than silently diverging.
 _KIND_CHECK = "token_kind IN ('alert', 'voip')"
 
-# WIDTH DERIVED FROM THE SET, not picked (Tesla, cage-match PR#170). `String(8)` fit
+# WIDTH: INTENTIONAL HEADROOM, SHARED WITH THE ORM — not computed (Carnot, r4
+# corrected an earlier comment here that claimed it was 'derived from the set'.
+# 16 is picked; what the tests enforce is that it EQUALS the ORM's width and is
+# >= the longest member. Saying 'derived' of a hand-chosen constant misleads the
+# next migration author into thinking it will track the enum by itself.) `String(8)` fit
 # 'alert' (5) and 'voip' (4) and was a SHADOW CLOSED SET beside the CHECK: the values
 # are Apple's own `apns-push-type` spellings, and `background` is 10 characters,
 # `liveactivity` 12. SQLite does not enforce VARCHAR width, Postgres does — so the
