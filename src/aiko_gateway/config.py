@@ -302,6 +302,12 @@ class Settings(BaseSettings):
     # LiveKit — absent credentials mean the island runs normally and simply never
     # sends to Android.
     #
+    # AND TODAY A PRESENT CREDENTIAL DOES NOT "simply never send" — IT REFUSES TO
+    # BOOT (Tesla, cage-match PR#172 r4). See the receive-half guard in
+    # `_harden_for_production`. Stated here because this comment is where a reader
+    # forms their model of the switch, and leaving it describing the pre-guard
+    # world is how the operator-facing remedy string came to contradict the code.
+    #
     # SINGLE LINE, enforced by the guard in _harden_for_production. Two line-oriented
     # readers of this same .env already declare themselves broken on multi-line
     # values, and JSON has no mandatory newlines — so requiring one line removes the

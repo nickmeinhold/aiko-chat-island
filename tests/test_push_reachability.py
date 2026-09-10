@@ -35,9 +35,11 @@ import pytest_asyncio
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
-from aiko_gateway.config import settings
+from pydantic import ValidationError
+
+from aiko_gateway.config import Settings, settings
 from aiko_gateway.domain import push_service, users_service
-from aiko_gateway.domain.models import DeviceToken
+from aiko_gateway.domain.models import DeviceToken, Platform
 
 
 async def _user_with_devices(session, n: int):
@@ -352,3 +354,56 @@ async def test_health_does_not_publish_a_device_population(
     assert "registered_devices" not in body
     assert "unreachable_devices" not in body
     assert '"3"' not in body and ": 3" not in body
+
+
+_DEV_JWT_SECRET = "x" * 64
+
+
+def _fcm_credential_for_collision() -> str:
+    import json
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    pem = rsa.generate_private_key(public_exponent=65537, key_size=2048).private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption()).decode()
+    return json.dumps({"project_id": "p",
+                       "client_email": "e@p.iam.gserviceaccount.com",
+                       "private_key": pem})
+
+
+def test_the_fcm_remedy_does_not_instruct_what_the_boot_guard_refuses():
+    """THE COLLISION TEST (Tesla, cage-match PR#172 r4).
+
+    Two facts were each pinned in isolation and never brought together:
+
+      1. `warn_if_unreachable` must NAME FCM when an APNs island holds Android rows
+         (test_an_apns_island_with_android_rows_warns_and_names_fcm)
+      2. a well-formed FCM credential must REFUSE to boot
+         (test_a_well_formed_fcm_credential_is_REFUSED_until_android_can_receive)
+
+    Both green, and together they described a remedy that says "Set
+    FCM_SERVICE_ACCOUNT_JSON" against a guard that refuses exactly that. Both live
+    islands already hold Android rows, so that instruction prints on every boot; an
+    operator obeying it writes the var, pulls, and crash-loops under
+    `restart: always` with the island already down. There is no FCM preflight to
+    catch it on the way in — the compose comment says so.
+
+    A full green could not see it because no test read the two facts in the same
+    breath. This one does: it asserts the remedy and the guard agree, so they cannot
+    drift apart again without something going red.
+    """
+    remedy = push_service._UNREACHABLE_REMEDY[Platform.FCM.value]
+
+    # The guard must really refuse — proving this test is colliding two LIVE facts,
+    # not asserting prose against a rule that has quietly been lifted.
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, environment="dev", jwt_secret=_DEV_JWT_SECRET,
+                 fcm_service_account_json=_fcm_credential_for_collision())
+
+    assert "Set FCM_SERVICE_ACCOUNT_JSON" not in remedy, (
+        "the boot warning instructs the operator to set a credential the boot "
+        f"guard refuses — following it bricks a live island. Remedy: {remedy!r}")
+    assert "not available" in remedy.lower() or "do not set" in remedy.lower(), (
+        f"the remedy must tell the operator the transport is unavailable rather "
+        f"than how to enable it. Remedy: {remedy!r}")

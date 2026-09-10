@@ -532,6 +532,38 @@ async def send(device_token: str, payload: WakePayload, *,
     except ValueError:
         error_code = ""
     verdict = _verdict(response.status_code, error_code)
+
+    # A REFUSED BEARER IS NOT A REUSABLE ONE (Tesla r2, Carnot r4 — two families
+    # independently, which is what makes it not optional).
+    #
+    # `_access_token` negative-caches failures of the OAuth EXCHANGE, but nothing
+    # invalidated a token that the exchange handed us happily and the MESSAGE
+    # endpoint then refused. A revoked key, a disabled service account or a
+    # permission change produces 401/403 on every send while the cached bearer sits
+    # valid-by-the-clock for up to its full lifetime — so every Android send in the
+    # fanout, and every ring after it, fails identically until the cache ages out,
+    # with no retry that could ever succeed. `delivered_to=0` screams the whole
+    # time and names nothing an operator can act on.
+    #
+    # Dropping the cache entry is the smallest correct move: the NEXT send re-mints,
+    # which either succeeds (the refusal was transient or the key was rotated back)
+    # or fails at the exchange, where the existing 60s backoff takes over and does
+    # the rate-limiting properly. We deliberately do NOT add a second backoff here
+    # — one door for that decision, and it already exists one layer down.
+    #
+    # 403 is included because Google returns it for credential-shaped refusals
+    # (SERVICE_DISABLED, PERMISSION_DENIED), not only for per-message policy. The
+    # cost of being wrong is one extra token mint; the cost of the other direction
+    # is an island deaf to Android for the better part of an hour.
+    if response.status_code in (401, 403):
+        global _cached_access_token
+        if _cached_access_token is not None:
+            log.warning(
+                "fcm dropped the cached access token after status=%s — it was "
+                "accepted by the OAuth exchange and refused by the message "
+                "endpoint, so it cannot be reused", response.status_code)
+            _cached_access_token = None
+
     # NEVER the device token: it rides in the request body, so nothing else in
     # this path can leak it and this line must not be the exception. ERROR for
     # REJECTED because that is the quietest failure mode here and the one where a

@@ -652,7 +652,21 @@ _UNREACHABLE_REMEDY = {
     # and the places a HUMAN reads are the ones where disagreeing costs most.
     Platform.APNS.value: ("Set APNS_KEY_ID / APNS_TEAM_ID / APNS_TOPIC / "
                           "APNS_VOIP_TOPIC / APNS_PRIVATE_KEY"),
-    Platform.FCM.value: "Set FCM_SERVICE_ACCOUNT_JSON",
+    # DO NOT SAY "Set FCM_SERVICE_ACCOUNT_JSON" (Tesla, cage-match PR#172 r4).
+    # config.py REFUSES TO BOOT on a present credential until the Android receive
+    # half exists. Both live islands already hold Android device rows, so this line
+    # prints on every boot today — and an operator who obeyed it would write the
+    # var, pull, and crash-loop under `restart: always` with the island already
+    # down. There is no FCM preflight to catch it on the way in.
+    #
+    # This is the APNs four-of-five remedy defect committed a second time, one
+    # transport over, in the same change that fixed the first: an operator-facing
+    # sentence that builds exactly the state the guard refuses. The suite pinned
+    # both halves in isolation — the warning must name FCM, a present blob must
+    # refuse to boot — and never collided them, so a full green could not see it.
+    Platform.FCM.value: ("Android push is not available on this island yet: the "
+                         "client has no receive half, so the credential is "
+                         "refused at boot. Do NOT set FCM_SERVICE_ACCOUNT_JSON"),
 }
 
 

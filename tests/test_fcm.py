@@ -522,3 +522,51 @@ def test_the_signed_assertion_actually_carries_the_narrow_scope():
     assert assertion["iss"] == cred["client_email"], (
         "iss must be the service-account email — Google identifies the signing key "
         "from it, which is why omitting `kid` is safe")
+
+
+async def test_a_message_endpoint_401_drops_the_cached_bearer(configured, monkeypatch):
+    """A bearer the SEND endpoint refuses must not stay cached (Tesla r2,
+    Carnot r4).
+
+    THE DEFECT: `_access_token` negative-caches failures of the OAuth EXCHANGE, but
+    a token the exchange issued happily and the MESSAGE endpoint then refused stayed
+    valid-by-the-clock for its full lifetime. A revoked key or disabled service
+    account therefore made every Android send in the fanout — and every ring after
+    it — fail identically for up to ~55 minutes, with no retry that could ever
+    succeed and no operator-actionable line anywhere.
+
+    WHY THIS DISCRIMINATES: it asserts on `_cached_access_token` DIRECTLY, before
+    and after. Asserting only the verdict would pass unchanged with the fix
+    reverted, because the verdict is REJECTED either way — the row is spared
+    correctly in both worlds. The cache is the only place the difference exists.
+    """
+    seen: list[httpx.Request] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if "oauth2.googleapis.com" in str(request.url):
+            return httpx.Response(200, json={"access_token": "ya29.stub",
+                                             "expires_in": 3599})
+        return httpx.Response(401, json={"error": {"status": "UNAUTHENTICATED"}})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(_handler))
+    monkeypatch.setattr(fcm, "_client_singleton", client, raising=False)
+    monkeypatch.setattr(fcm, "_sign_assertion", lambda cred: "stub-assertion")
+    try:
+        result = await fcm.send(TOKEN, WakePayload(channel_id=CHANNEL))
+        assert result.verdict is Verdict.REJECTED
+        assert result.reap is None, "an auth refusal must never reap a device row"
+        assert fcm._cached_access_token is None, (
+            "the bearer the message endpoint refused is still cached — every "
+            "subsequent send will replay the same doomed credential until it "
+            "expires on the clock")
+
+        # And the NEXT send re-mints rather than replaying: two OAuth exchanges.
+        await fcm.send(TOKEN, WakePayload(channel_id=CHANNEL))
+        oauth_calls = [r for r in seen if "oauth2" in str(r.url)]
+        assert len(oauth_calls) == 2, (
+            f"expected a fresh token mint on the second send, saw "
+            f"{len(oauth_calls)} OAuth exchange(s) — dropping the cache is only "
+            "useful if the next attempt actually re-mints")
+    finally:
+        await client.aclose()
