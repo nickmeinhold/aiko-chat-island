@@ -28,6 +28,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
 from aiko_gateway.domain import devices_service, security, users_service
+from sqlalchemy import select
 from aiko_gateway.domain.models import DeviceToken, TokenKind
 from aiko_gateway.rest import devices as device_routes
 from aiko_gateway.rest.deps import get_session
@@ -79,6 +80,14 @@ async def test_out_of_set_token_kind_is_422_at_the_boundary(client, session):
         "/v1/devices", headers=_headers(alice),
         json={"platform": "apns", "token": ALERT_TOKEN, "token_kind": "shout"})
     assert resp.status_code == 422
+    # AND NO ROW (Tesla, cage-match PR#170 r3). The sibling
+    # test_register_rejects_unknown_platform_with_422 in tests/test_devices.py
+    # already asserts this; the kind test forgot. 422-after-insert is the complete
+    # silence: a row exists, no honest error reaches the client, and the later VoIP
+    # path finds a token whose kind nothing validated.
+    assert await devices_service.tokens_for_user(session, alice.id) == [], (
+        "a rejected registration must leave no row — a 422 returned AFTER the "
+        "insert is indistinguishable from a clean rejection at the boundary")
 
 
 # ---------------------------------------------------------- layer 2: the CHECK
@@ -252,7 +261,7 @@ async def test_both_kinds_for_one_handset_coexist_as_two_rows(client, session):
     assert sorted(r.token_kind for r in rows) == ["alert", "voip"]
 
 
-async def test_an_fcm_row_may_carry_any_kind_and_nothing_reads_it(client, session):
+async def test_an_fcm_row_stores_whatever_kind_it_declared(client, session):
     """INERT FOR FCM, in the same shape as `apns_environment`'s inert-for-FCM
     paragraph. NO conditional CHECK and NO cross-field 422: that machinery was
     explicitly refused once already, it prevents nothing (the FCM branch never
@@ -263,3 +272,18 @@ async def test_an_fcm_row_may_carry_any_kind_and_nothing_reads_it(client, sessio
         "/v1/devices", headers=_headers(grace),
         json={"platform": "fcm", "token": "f" * 100, "token_kind": "voip"})
     assert resp.status_code == 201
+
+    # ASSERT THE NAMED TARGET, not merely that the request was accepted (Carnot,
+    # cage-match PR#170 r3). This asserted only the 201, so it stayed green whether
+    # the route stored 'voip' or silently coerced to 'alert' — its outcome depended
+    # on neither half of "may carry any kind" nor "nothing reads it". The first half
+    # is now checked here; the second half is a claim about a send path that does
+    # NOT EXIST on this branch, so it is stated as scope rather than tested, and the
+    # test name no longer promises coverage this piece cannot provide.
+    assert resp.json()["token_kind"] == "voip", (
+        "an fcm row must store the kind it declared — the FCM transport does not "
+        "read it, but coercing it here would be a silent rewrite of client-supplied "
+        "data and would make the echo lie")
+    row = (await session.execute(
+        select(DeviceToken).where(DeviceToken.token == "f" * 100))).scalar_one()
+    assert row.token_kind == "voip", "the stored row must match the echo"

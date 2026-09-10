@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import re
 
+import pytest
 from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.runtime.migration import MigrationContext
@@ -578,7 +579,7 @@ def test_rows_written_at_0024_read_alert_at_0025(tmp_path, monkeypatch) -> None:
                 "(id, user_id, platform, token, apns_environment, created_at, "
                 " updated_at) VALUES "
                 "('01TOKENAAAAAAAAAAAAAAAAAAA', '01USERAAAAAAAAAAAAAAAAAAAA', "
-                "'apns', 'live-token', 'production', '2026-09-09T00:00:00+00:00', "
+                "'apns', 'live-token', 'sandbox', '2026-09-09T00:00:00+00:00', "
                 "'2026-09-09T00:00:00+00:00')")
 
         monkeypatch.setattr(settings, "apns_use_sandbox", False, raising=False)
@@ -595,7 +596,22 @@ def test_rows_written_at_0024_read_alert_at_0025(tmp_path, monkeypatch) -> None:
         assert kind == "alert", (
             "a row that predates token_kind did not read as alert — the "
             "server_default is not doing the backfill it was chosen for")
-        assert env == "production"
+        # THE DISCRIMINATING FIXTURE (Tesla, cage-match PR#170 r3). This stored
+        # 'production' — the column's OWN server_default — and asserted 'production'
+        # back, with the island flipped to production as well. So a rebuild that
+        # silently re-defaulted the column passed. A rebuild that re-derived it from
+        # settings passed. EVERY failure mode of the neighbour agreed with the
+        # assertion, which is the whole reason 0024 exists as a lesson.
+        #
+        # 0024's test had power because it stored 'sandbox' against a 'production'
+        # default on a flipped box. This copy kept the choreography and inverted the
+        # fixture. imagineering holds a real token that 0023 stamped 'sandbox' and
+        # 0025 rebuilds that table: a silent re-default there is every push 400ing
+        # BadDeviceToken, never reaped, no ring.
+        assert env == "sandbox", (
+            "0025's rebuild re-defaulted apns_environment — a live sandbox-stamped "
+            "token would now be routed to the production APNs host, 400 "
+            "BadDeviceToken on every push, never reaped, no ring")
 
         command.downgrade(migrate._alembic_config(), "0024")
         with engine.connect() as conn:
@@ -606,7 +622,7 @@ def test_rows_written_at_0024_read_alert_at_0025(tmp_path, monkeypatch) -> None:
     finally:
         engine.dispose()
     assert "token_kind" not in cols
-    assert survived == "production", (
+    assert survived == "sandbox", (
         "the downgrade rebuild lost a live row's environment")
 
 
@@ -638,7 +654,92 @@ def test_the_migrated_ddl_actually_carries_the_check(tmp_path, monkeypatch) -> N
     assert "ck_device_tokens_token_kind" in ddl, (
         "the migrated device_tokens table carries no token_kind CHECK — the "
         "constraint the parity test compares literals about never reached the DB")
+    # EXTRACT THE CLAUSE, do not scan the church (Tesla, cage-match PR#170 r3).
+    # This looped over the whole CREATE TABLE, which already contains
+    # DEFAULT 'alert' — so a CHECK emitted as `IN ('voip')` alone kept this green,
+    # because 'alert' was found in the default rather than in the constraint. The
+    # member the backfill actually writes is precisely the one the loop could not
+    # see.
+    import re as _re
+    m = _re.search(r"CONSTRAINT\s+ck_device_tokens_token_kind\s+CHECK\s*\((.*?)\)\)",
+                   ddl, _re.S | _re.I) or _re.search(
+                   r"ck_device_tokens_token_kind[^(]*\(([^)]*)\)", ddl, _re.S | _re.I)
+    assert m, f"could not extract the token_kind CHECK clause from: {ddl!r}"
+    clause = m.group(1)
     for member in TokenKind:
-        assert f"'{member.value}'" in ddl, (
-            f"the migrated CHECK does not admit {member.value!r}; the DDL is "
-            f"{ddl!r}")
+        assert f"'{member.value}'" in clause, (
+            f"the migrated CHECK clause does not admit {member.value!r}; the clause "
+            f"is {clause!r}")
+
+    # THE WORK OUTPUT, not the nameplate (Carnot, cage-match PR#170 r3). Everything
+    # above is still a READ of generated text: a CHECK attached to a DIFFERENT
+    # column, or a dead literal, satisfies all of it. The only measurement that
+    # binds the constraint to THIS column is making the database refuse a bad value.
+    con = sqlite3.connect(sync_url.replace("sqlite:///", ""))
+    try:
+        con.execute("INSERT INTO device_tokens (id, user_id, platform, token, "
+                    "token_kind, apns_environment, created_at, updated_at) VALUES "
+                    "('t1','u1','apns','x','shout','production',"
+                    "'2026-01-01 00:00:00','2026-01-01 00:00:00')")
+        con.commit()
+        raised = False
+    except sqlite3.IntegrityError:
+        raised = True
+    finally:
+        con.close()
+    assert raised, (
+        "the migrated DB accepted token_kind='shout' — the CHECK is present in the "
+        "DDL text but is not enforcing on this column. A constraint that reads "
+        "correctly and rejects nothing is the exact shape this test exists to catch.")
+
+
+def test_downgrading_0025_refuses_while_a_voip_row_exists(tmp_path, monkeypatch) -> None:
+    """LOSSY IN THE ONE DIRECTION THAT MATTERS (Carnot, cage-match PR#170 r3).
+
+    `token_kind` is the ONLY durable distinction between a UIKit alert token and a
+    PushKit VoIP token — both are 64-hex strings. Dropping the column after any VoIP
+    row exists leaves them indistinguishable under the old absent-means-alert
+    contract, so they silently become alert tokens and every push to them 400s with
+    no reap and no ring: the exact failure this revision exists to prevent, produced
+    by its own rollback.
+    """
+    import sqlite3
+    from alembic import command
+    from aiko_gateway import migrate
+
+    _async_url, sync_url = _point_app_at(tmp_path, monkeypatch)
+    command.upgrade(migrate._alembic_config(), "head")
+    path = sync_url.replace("sqlite:///", "")
+
+    # An alert-only DB downgrades cleanly — the expected case, and the control
+    # WITHOUT WHICH the refusal below would prove only "downgrade always fails".
+    con = sqlite3.connect(path)
+    con.execute("INSERT INTO device_tokens (id, user_id, platform, token, "
+                "token_kind, apns_environment, created_at, updated_at) VALUES "
+                "('a1','u1','apns','aaa','alert','production',"
+                "'2026-01-01 00:00:00','2026-01-01 00:00:00')")
+    con.commit(); con.close()
+    command.downgrade(migrate._alembic_config(), "0024")
+    command.upgrade(migrate._alembic_config(), "head")
+
+    # Now one VoIP row: the downgrade must refuse and SAY WHAT IT WOULD DESTROY.
+    con = sqlite3.connect(path)
+    con.execute("INSERT INTO device_tokens (id, user_id, platform, token, "
+                "token_kind, apns_environment, created_at, updated_at) VALUES "
+                "('v1','u1','apns','vvv','voip','production',"
+                "'2026-01-01 00:00:00','2026-01-01 00:00:00')")
+    con.commit(); con.close()
+
+    with pytest.raises(Exception) as ei:
+        command.downgrade(migrate._alembic_config(), "0024")
+    assert "refusing to downgrade 0025" in str(ei.value), (
+        f"expected the guard's refusal, got {ei.value!r}")
+
+    # And the column survived the refusal — a guard that aborts halfway is worse
+    # than no guard, because it destroys data AND reports failure.
+    con = sqlite3.connect(path)
+    cols = [r[1] for r in con.execute("PRAGMA table_info(device_tokens)")]
+    kinds = [r[0] for r in con.execute("SELECT token_kind FROM device_tokens ORDER BY id")]
+    con.close()
+    assert "token_kind" in cols, "the refused downgrade dropped the column anyway"
+    assert kinds == ["alert", "voip"], f"rows were altered by a refused downgrade: {kinds}"

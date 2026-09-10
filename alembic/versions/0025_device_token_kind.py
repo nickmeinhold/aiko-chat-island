@@ -91,6 +91,35 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    """FAIL CLOSED IF A VoIP ROW EXISTS (Carnot, cage-match PR#170 r3).
+
+    This dropped the column unconditionally. Once any island has accepted a single
+    `voip` registration, that is LOSSY IN THE ONE DIRECTION THAT MATTERS: the column
+    is the only durable distinction between a UIKit alert token and a PushKit VoIP
+    token, and both are just 64-hex strings. After the drop the old schema holds
+    both, indistinguishable, under a contract that says absent-means-alert — so the
+    rows silently become alert tokens, and the next VoIP-era deploy re-reads them as
+    such. A 400 DeviceTokenNotForTopic, never reaped, no ring. The same failure this
+    whole revision exists to prevent, produced by its own rollback.
+
+    Refusing is the honest option. An operator rolling back before any VoIP token
+    exists (the expected case, since no client mints one yet) is unaffected; one
+    rolling back after is told exactly what they would destroy and can choose to
+    delete those rows deliberately. A migration that silently loses data an operator
+    would not have chosen to lose is not reversible, whatever the DDL says.
+    """
+    bind = op.get_bind()
+    voip_rows = bind.execute(sa.text(
+        "SELECT COUNT(*) FROM device_tokens WHERE token_kind != :alert"
+    ), {"alert": "alert"}).scalar_one()
+    if voip_rows:
+        raise RuntimeError(
+            f"refusing to downgrade 0025: {voip_rows} device_tokens row(s) carry a "
+            "non-alert token_kind, and dropping the column would make them "
+            "indistinguishable from alert tokens under the old absent-means-alert "
+            "contract — every push to them would then 400 with no reap and no ring. "
+            "Delete or re-register those rows deliberately first, then re-run."
+        )
     with op.batch_alter_table("device_tokens", schema=None) as batch_op:
         batch_op.drop_constraint("ck_device_tokens_token_kind", type_="check")
         batch_op.drop_column("token_kind")
