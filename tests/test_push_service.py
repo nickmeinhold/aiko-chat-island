@@ -1066,14 +1066,27 @@ async def test_a_first_contact_call_invite_does_not_wake(
     need the recipient to have already acted against someone they may never have
     heard of.
 
-    THE ARM: bob's message is DELETED, so the channel is first contact. The wake
-    must not happen. Without this test the gate working and the gate not running
-    are the same silence — the class that has bitten this project repeatedly — and
-    `test_a_call_invite_wakes_once_the_recipient_has_spoken` below is the control
-    that stops this passing for the wrong reason.
+    THE ARM MODELS THE WORLD PRODUCTION ACTUALLY PRODUCES (Tesla, cage-match
+    PR#173 r1), which the first version did not. It deleted EVERY message and woke
+    against an EMPTY channel — a state `ws.py` can never create, because a wake is
+    scheduled only after `create_outbound` has already written the caller's own
+    sentinel row. So real first contact has exactly ONE message in the channel: the
+    stranger's invite.
+
+    Why that mattered rather than being pedantry: a WEAKER predicate — "the channel
+    has any row", or "anyone has spoken here, caller included" — passes the empty
+    version (nothing to see, silence) and RINGS in production (Alice's invite row is
+    right there). The test would have been green while the gate leaked. So the
+    caller's message is seeded and bob stays mute, which is the shape of the attack.
+
+    Deleting the whole gate is a different probe and does not cover this: it catches
+    "no gate", not "a gate that reads the wrong row."
     """
     alice, bob = dm
     await session.execute(Message.__table__.delete())
+    session.add(Message(id="01ALICEINVITE00000000000", channel_id=CHANNEL,
+                        sender_user_id=alice.id, sender_kind="user",
+                        body=push_service.CALL_INVITE_BODY))
     await session.commit()
 
     with caplog.at_level(logging.INFO, logger="aiko_gateway.push"):
@@ -1128,3 +1141,58 @@ async def test_an_ordinary_message_does_not_wake_at_all_gate_or_no_gate(
         "an ordinary message woke a handset. If that is now intended, the conduct "
         "gate (claude-tasks#4216) must be extended to cover it — a stranger's "
         "MESSAGE waking a locked phone is the same class of harm as their call")
+
+
+@pytest.mark.asyncio
+async def test_a_soft_deleted_message_still_counts_as_conduct(
+    session, dm, configured, fake_apns
+):
+    """The docstring claims soft-delete is not withdrawal. PIN IT (Carnot, r1).
+
+    Carnot's concern was exact: that claim depends on the soft-delete
+    implementation preserving `sender_user_id`, and if deletion ever anonymises the
+    sender the claim silently stops being true — a guarantee living in prose, which
+    is the failure mode this repo keeps finding. So it becomes a test.
+
+    Checked while writing this: `Message.deleted_at` is a separate column and the
+    moderation/soft-delete path does not touch `sender_user_id`. ACCOUNT deletion
+    DOES null it (`accounts_service.py:185`), and that is fine — a deleted account
+    has no devices to ring, so conduct vanishing with it fails CLOSED.
+
+    Mutation-proven: making soft-delete also null `sender_user_id` — the exact
+    drift Carnot said the prose would not survive — reddens this test.
+    """
+    alice, bob = dm
+    await session.execute(
+        Message.__table__.update().values(deleted_at=dt.datetime.now(dt.UTC)))
+    await session.commit()
+
+    await _wake(sender_id=alice.id)
+    assert [t for t, _, _ in fake_apns.sent] == ["b" * 64], (
+        "deleting your own message retracted your conduct. That would invent a "
+        "revocation channel this design deliberately does not have — and an "
+        "all-or-nothing, invisible one at that. Withdrawal is what the friends "
+        "edge is for (claude-tasks#2792)")
+
+
+@pytest.mark.asyncio
+async def test_the_predicate_filters_a_mixed_recipient_list(session, dm):
+    """Mixed recipients: one has spoken, one has not (Carnot, r1).
+
+    UNREACHABLE ON TODAY'S WAKE PATH, and saying so is the point rather than
+    skipping the test. `should_wake` fires only for `ChannelKind.DM`, and
+    `_recipients` asserts a DM has exactly one peer — so the live recipient list is
+    always length 1 and a mixed list cannot occur.
+
+    The FUNCTION still takes a list, so it is tested as a function. The day a
+    non-DM wake kind exists, this is the arm that already says what the predicate
+    must do — rather than that behaviour being discovered by whoever adds it.
+    """
+    _alice, bob = dm
+    silent = await users_service.create_user(
+        session, username="carol", display_name="Carol", password="pw")
+    kept = await push_service._spoken_here(
+        session, channel_id=CHANNEL, user_ids=[bob.id, silent.id])
+    assert kept == [bob.id], (
+        f"the predicate must keep only the recipient who has posted here; "
+        f"got {kept}")
