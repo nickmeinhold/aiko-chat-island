@@ -533,36 +533,50 @@ async def send(device_token: str, payload: WakePayload, *,
         error_code = ""
     verdict = _verdict(response.status_code, error_code)
 
-    # A REFUSED BEARER IS NOT A REUSABLE ONE (Tesla r2, Carnot r4 — two families
-    # independently, which is what makes it not optional).
+    # A REFUSED BEARER IS NOT A REUSABLE ONE — BUT KEY IT ON THE ERROR CODE, NOT
+    # THE HTTP STATUS (Tesla, cage-match PR#172 r6, correcting my own r4 fix).
     #
-    # `_access_token` negative-caches failures of the OAuth EXCHANGE, but nothing
-    # invalidated a token that the exchange handed us happily and the MESSAGE
-    # endpoint then refused. A revoked key, a disabled service account or a
-    # permission change produces 401/403 on every send while the cached bearer sits
-    # valid-by-the-clock for up to its full lifetime — so every Android send in the
-    # fanout, and every ring after it, fails identically until the cache ages out,
-    # with no retry that could ever succeed. `delivered_to=0` screams the whole
-    # time and names nothing an operator can act on.
+    # r4 dropped the cached bearer on any 401/403. `_verdict`'s own docstring, six
+    # inches up, already says why that is wrong: `SENDER_ID_MISMATCH` is a 403 and
+    # is a LIVE token minted against a DIFFERENT project — a twin of
+    # BadDeviceToken, a DEVICE fact, never a credential death. So one foreign
+    # Android row in a fanout dropped the island-wide bearer for every other send.
+    # The information needed to avoid that was already in this file.
     #
-    # Dropping the cache entry is the smallest correct move: the NEXT send re-mints,
-    # which either succeeds (the refusal was transient or the key was rotated back)
-    # or fails at the exchange, where the existing 60s backoff takes over and does
-    # the rate-limiting properly. We deliberately do NOT add a second backoff here
-    # — one door for that decision, and it already exists one layer down.
+    # AND THE BACKOFF CLAIM WAS FALSE. r4's comment said a failed re-mint would hit
+    # `_OAUTH_FAILURE_BACKOFF_SECONDS`. For the credential-shaped 403s it was
+    # written for, it does not: Google still ISSUES an access token for a project
+    # whose API is disabled, so the exchange SUCCEEDS, the message endpoint 403s
+    # again, the cache drops again — one token mint per device per ring, forever,
+    # with no backoff. Two sentences in one comment that could not both be true.
     #
-    # 403 is included because Google returns it for credential-shaped refusals
-    # (SERVICE_DISABLED, PERMISSION_DENIED), not only for per-message policy. The
-    # cost of being wrong is one extra token mint; the cost of the other direction
-    # is an island deaf to Android for the better part of an hour.
-    if response.status_code in (401, 403):
-        global _cached_access_token
+    # So: drop the bearer only for credential-shaped refusals, and arm the SAME
+    # backoff door directly rather than hoping the exchange will fail into it.
+    # THE DISCRIMINATOR IS THE PRESENCE OF AN `FcmError` DETAIL, not a list of
+    # status names. `_fcm_error_code` returns a code only when the response carries
+    # a `google.firebase.fcm.v1.FcmError` detail, and that detail is FCM telling us
+    # something about THIS MESSAGE OR DEVICE — `SENDER_ID_MISMATCH` (a live token
+    # from another project), `UNREGISTERED`, `INVALID_ARGUMENT`. A refusal of OUR
+    # BEARER has no FcmError detail at all: it is a bare 401 UNAUTHENTICATED or
+    # 403 PERMISSION_DENIED, exactly as `_verdict`'s docstring already says.
+    #
+    # Keying on a set of status STRINGS would also have been wrong in the other
+    # direction: a genuine 401 carries `error.status = "UNAUTHENTICATED"` and NO
+    # FcmError, so an `error_code in {...}` test never fires — the branch would
+    # have been dead on the one case it exists for. (Caught by this file's own
+    # tests the moment the r4 fixture stopped satisfying a status-only rule.)
+    if response.status_code in (401, 403) and not error_code:
+        global _cached_access_token, _oauth_backoff_until
         if _cached_access_token is not None:
             log.warning(
-                "fcm dropped the cached access token after status=%s — it was "
-                "accepted by the OAuth exchange and refused by the message "
-                "endpoint, so it cannot be reused", response.status_code)
-            _cached_access_token = None
+                "fcm dropped the cached access token: status=%s with no FcmError "
+                "detail is a refusal of the CREDENTIAL, not of this device, so the "
+                "bearer cannot be reused", response.status_code)
+        _cached_access_token = None
+        # Arm the backoff HERE. The exchange will happily succeed against a
+        # disabled project, so leaving this to `_access_token` means no backoff at
+        # all for exactly the case this branch exists to handle.
+        _oauth_backoff_until = time.monotonic() + _OAUTH_FAILURE_BACKOFF_SECONDS
 
     # NEVER the device token: it rides in the request body, so nothing else in
     # this path can leak it and this line must not be the exception. ERROR for

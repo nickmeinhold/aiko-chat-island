@@ -1937,3 +1937,44 @@ def test_no_apns_keys_at_all_still_boots(monkeypatch) -> None:
     for k in (*_four_apns_keys(), "APNS_VOIP_TOPIC"):
         monkeypatch.delenv(k, raising=False)
     Settings()
+
+
+def test_an_apns_topic_pair_that_is_identical_refuses_to_boot(monkeypatch) -> None:
+    """PRESENCE IS NOT USABILITY, for a PAIR (Tesla, cage-match PR#172 r6).
+
+    THE ARM THAT DISCRIMINATES: every other five-credential test uses
+    `cc.example.testapp` / `cc.example.testapp.voip`, so equality could never redden
+    one of them. This sets them EQUAL and changes nothing else, so it fails if and
+    only if the collision check exists.
+
+    Why equality is fatal rather than untidy: Apple issues alert tokens under the
+    bundle id and VoIP tokens under a separate topic, so an identical pair is a
+    guaranteed `DeviceTokenNotForTopic` on every VoIP send. The failure is SILENT —
+    a handset registered for both kinds still gets its alert banner, `delivered_to=0`
+    never fires, and only voip-only devices go deaf. The way an operator reaches
+    this state is copying APNS_TOPIC into the new slot, which is the single most
+    likely thing to do when a fifth credential appears.
+    """
+    from aiko_gateway.config import Settings
+    for k, v in _four_apns_keys().items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setenv("APNS_VOIP_TOPIC", _four_apns_keys()["APNS_TOPIC"])
+    with pytest.raises(ValueError) as ei:
+        Settings()
+    message = str(ei.value)
+    assert "must differ" in message, message
+    assert "DeviceTokenNotForTopic" in message, (
+        "the refusal must name Apple's actual error, so an operator who has "
+        f"already seen it in a log can connect the two. Got: {message}")
+
+
+def test_a_distinct_apns_topic_pair_still_boots(monkeypatch) -> None:
+    """THE CONTROL. A collision check that also rejected a VALID pair would take
+    push offline on both live islands, whose real values differ only by the `.voip`
+    suffix. Without this arm the test above passes just as well against a guard that
+    refuses every configuration."""
+    from aiko_gateway.config import Settings
+    for k, v in _four_apns_keys().items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setenv("APNS_VOIP_TOPIC", "cc.example.testapp.voip")
+    assert Settings().apns_voip_topic == "cc.example.testapp.voip"

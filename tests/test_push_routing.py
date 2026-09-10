@@ -44,16 +44,30 @@ def _row(row_id: str, platform: str, token_kind: str = TokenKind.ALERT.value,
 
 # ------------------------------------------------------------------ the sweep
 
+# `[WakeKind.CALL_INVITE]`, NOT `WakeKind` — the docstring below explains why, and
+# the two must not drift: a sweep over the whole enum would demand delivery for a
+# future cancel and turn the router's deliberate skip into a red test.
 @pytest.mark.parametrize(
     "platform,kind,wake",
-    list(itertools.product(Platform, TokenKind, WakeKind)))
-def test_every_platform_token_kind_wake_combination_is_routed(platform, kind, wake):
+    list(itertools.product(Platform, TokenKind, [WakeKind.CALL_INVITE])))
+def test_every_platform_token_kind_combination_is_routed_for_call_invite(
+        platform, kind, wake):
     """TOTALITY OVER THE ENUMS, so a member added without teaching the router
     about it fails HERE rather than at a handset that does not ring.
 
-    Every combination whose platform is configured must yield exactly one
-    delivery and zero skips: there is no combination of stored row and admitted
-    wake that this island is allowed to silently drop.
+    SCOPED TO `CALL_INVITE`, DELIBERATELY (Carnot, cage-match PR#172 r6). This
+    swept `product(Platform, TokenKind, WakeKind)` and REQUIRED a delivery for
+    every member — which inverts its own purpose the moment `WakeKind` grows. The
+    router is built so a future `CALL_END` cancel cannot silently inherit ring
+    behaviour: both arms now match on `wake` and fall through to a named skip. A
+    test demanding "exactly one delivery, zero skips" for EVERY WakeKind would fail
+    that deliberate skip and read as a regression, so the instrument built to force
+    a decision would instead have argued for shipping the silent inheritance.
+
+    So this asserts the CURRENT matrix — every platform/kind pair, for the one wake
+    kind that exists — and `test_a_new_wake_kind_must_be_routed_explicitly` below
+    carries the future-proofing, by failing on an UNHANDLED kind rather than
+    requiring delivery for all of them. Two different questions, two tests.
     """
     rows = [_row("01ROW", platform.value, kind.value)]
     deliveries, skips = plan_deliveries(rows, wake=wake, configured=BOTH)
@@ -67,6 +81,36 @@ def test_every_platform_token_kind_wake_combination_is_routed(platform, kind, wa
             "an APNs delivery lost the row's kind — the header fork reads it")
     else:
         assert isinstance(delivered, FcmDelivery)
+
+
+def test_a_new_wake_kind_must_be_routed_explicitly():
+    """THE FUTURE-PROOFING, asked the right way round (Carnot, cage-match PR#172 r6).
+
+    The question is NOT "does every WakeKind get delivered?" — that would bless a
+    cancel arriving as a ring. It is "does an UNKNOWN WakeKind get silently
+    delivered?", and the answer must be no, on BOTH transports.
+
+    Round 2 found the router had this protection on the APNs arm only, so a future
+    `CALL_END` would have been skipped on iOS pending a decision while Android sent
+    a HIGH-priority data ring for a cancel. This drives a synthetic member through
+    both arms and requires a NAMED SKIP, which is what forces the next author to
+    make a decision rather than inherit one.
+    """
+    import enum
+
+    class _FutureWake(enum.Enum):
+        CALL_END = "call_end"
+
+    for platform in Platform:
+        rows = [_row("01ROW", platform.value, TokenKind.ALERT.value)]
+        deliveries, skips = plan_deliveries(
+            rows, wake=_FutureWake.CALL_END, configured=BOTH)
+        assert deliveries == [], (
+            f"{platform} DELIVERED an unrecognised wake kind — a future cancel "
+            "would ring the handset it was meant to stop")
+        assert len(skips) == 1 and skips[0][0] == "01ROW", (
+            f"{platform} dropped an unrecognised wake kind without naming it; a "
+            f"silent skip is how the decision gets missed. Got: {skips}")
 
 
 @pytest.mark.parametrize("kind", list(TokenKind))

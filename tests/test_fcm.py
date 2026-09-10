@@ -561,12 +561,69 @@ async def test_a_message_endpoint_401_drops_the_cached_bearer(configured, monkey
             "subsequent send will replay the same doomed credential until it "
             "expires on the clock")
 
-        # And the NEXT send re-mints rather than replaying: two OAuth exchanges.
+        # AND THE BACKOFF IS ARMED, which is the half r4 got wrong (Tesla r6).
+        # r4 asserted the next send RE-MINTS. That is precisely the incident: for a
+        # credential-shaped refusal Google will happily issue another token — the
+        # project's API is disabled, not the account — so the message endpoint 403s
+        # again, the cache drops again, and the island posts one token mint PER
+        # DEVICE PER RING with no backoff at all. r4's comment claimed the existing
+        # `_OAUTH_FAILURE_BACKOFF_SECONDS` door would catch that; it could not,
+        # because the exchange never fails. So the door is now armed here directly.
+        assert fcm._oauth_backoff_until is not None, (
+            "dropping the bearer without arming the backoff turns one bad "
+            "credential into a token-mint storm, one per device per ring")
         await fcm.send(TOKEN, WakePayload(channel_id=CHANNEL))
         oauth_calls = [r for r in seen if "oauth2" in str(r.url)]
-        assert len(oauth_calls) == 2, (
-            f"expected a fresh token mint on the second send, saw "
-            f"{len(oauth_calls)} OAuth exchange(s) — dropping the cache is only "
-            "useful if the next attempt actually re-mints")
+        assert len(oauth_calls) == 1, (
+            f"the second send re-minted ({len(oauth_calls)} exchanges) — the "
+            "backoff must suppress it, or a disabled project produces a mint per "
+            "device per ring forever")
+    finally:
+        await client.aclose()
+
+
+async def test_a_device_level_403_does_NOT_drop_the_island_wide_bearer(configured,
+                                                                      monkeypatch):
+    """`SENDER_ID_MISMATCH` is a DEVICE fact, not a credential death (Tesla r6).
+
+    THE DEFECT THIS PINS: r4 keyed the bearer drop on the HTTP STATUS, so a single
+    foreign Android row — a live token minted against a different Firebase project,
+    which arrives as 403 — dropped the island-wide bearer for every OTHER device in
+    the same fanout. One stale row could de-authenticate the whole ring.
+
+    The discriminator is the presence of an `FcmError` detail: FCM attaches one when
+    it is telling us about THIS message or device, and omits it when it is refusing
+    our credential. `_verdict`'s own docstring already said so; r4 did not use it.
+
+    THE ARM THAT DISCRIMINATES: the bearer must still be cached afterwards. Asserting
+    only the verdict would pass either way — REJECTED is correct in both worlds.
+    """
+    seen: list[httpx.Request] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if "oauth2.googleapis.com" in str(request.url):
+            return httpx.Response(200, json={"access_token": "ya29.stub",
+                                             "expires_in": 3599})
+        return httpx.Response(403, json={"error": {
+            "status": "PERMISSION_DENIED",
+            "details": [{
+                "@type": "type.googleapis.com/google.firebase.fcm.v1.FcmError",
+                "errorCode": "SENDER_ID_MISMATCH"}]}})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(_handler))
+    monkeypatch.setattr(fcm, "_client_singleton", client, raising=False)
+    monkeypatch.setattr(fcm, "_sign_assertion", lambda cred: "stub-assertion")
+    try:
+        result = await fcm.send(TOKEN, WakePayload(channel_id=CHANNEL))
+        assert result.verdict is Verdict.REJECTED
+        assert result.reap is None, (
+            "SENDER_ID_MISMATCH is a live token in another project — reaping it "
+            "would delete a working registration")
+        assert fcm._cached_access_token is not None, (
+            "a device-level 403 dropped the island-wide bearer: one foreign row "
+            "would de-authenticate every other send in the fanout")
+        assert fcm._oauth_backoff_until is None, (
+            "a device-level refusal must not arm the credential backoff")
     finally:
         await client.aclose()

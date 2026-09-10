@@ -763,6 +763,38 @@ class Settings(BaseSettings):
                 "push at Apple's door, which is indistinguishable on the handset "
                 "from push being switched off. Refusing to boot."
             )
+        # PRESENCE IS NOT USABILITY, and for a PAIR that means they must DIFFER
+        # (Tesla, cage-match PR#172 r6). `apns_topic` and `apns_voip_topic` were
+        # each checked for presence and never against each other. They cannot both
+        # be right when equal: Apple issues alert tokens under the bare bundle id
+        # and VoIP tokens under a separate `.voip` topic, so equality is a CERTAIN
+        # wrong-topic for one kind — usually VoIP, because the way an operator
+        # reaches this state is copying APNS_TOPIC into the new slot.
+        #
+        # WHY IT WOULD HAVE BEEN INVISIBLE, which is the reason it is a boot
+        # refusal and not a warning: every VoIP send returns 400
+        # DeviceTokenNotForTopic -> REJECTED -> never reaped -> one ERROR line. A
+        # handset registered for BOTH kinds still gets its alert banner, so
+        # `delivered_to=0` never fires and the island looks healthy. Only the
+        # voip-only population — which this change's own comments call normal and
+        # PERMANENT, because a PushKit token needs no notification permission —
+        # goes silently, permanently deaf.
+        #
+        # The ladder above already refuses a P-256 key that parses and cannot sign,
+        # and FCM makes a disagreeing project id unrepresentable by deriving it.
+        # This is the same "parseable is not usable" rung for a two-field invariant
+        # that was left as two independent strings.
+        if (self.apns_topic and self.apns_voip_topic
+                and self.apns_topic == self.apns_voip_topic):
+            raise ValueError(
+                f"APNS_TOPIC and APNS_VOIP_TOPIC are both {self.apns_topic!r}. "
+                "They must differ: Apple issues alert tokens under the bundle id "
+                "and VoIP tokens under a separate topic (conventionally the bundle "
+                "id plus '.voip'), so an identical pair guarantees every VoIP push "
+                "is rejected with DeviceTokenNotForTopic. That failure is SILENT — "
+                "dual-registered handsets still get the alert, so no alarm fires "
+                "and only voip-only devices go deaf. Refusing to boot."
+            )
         if all(_apns.values()):
             # PRESENCE IS NOT PARSEABILITY (cage-match #139, Maxwell). The guard
             # above earns its keep by failing "where an operator is watching,
