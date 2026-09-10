@@ -157,6 +157,7 @@ async def test_registration_without_token_kind_stores_alert(client, session):
     resp = await client.post("/v1/devices", headers=_headers(alice),
                              json={"platform": "apns", "token": ALERT_TOKEN})
     assert resp.status_code == 201
+    assert resp.status_code == 201, resp.text
     row = await session.get(DeviceToken, resp.json()["id"])
     assert row.token_kind == TokenKind.ALERT.value
 
@@ -169,6 +170,7 @@ async def test_a_declared_voip_registration_is_stored(client, session):
         "/v1/devices", headers=_headers(bob),
         json={"platform": "apns", "token": VOIP_TOKEN, "token_kind": "voip"})
     assert resp.status_code == 201
+    assert resp.status_code == 201, resp.text
     row = await session.get(DeviceToken, resp.json()["id"])
     assert row.token_kind == TokenKind.VOIP.value
 
@@ -202,11 +204,17 @@ async def test_a_declared_kind_wins_on_reregistration(client, session):
     """DECLARATION WINS — the control for omission-preserves. A guard that never
     updated the stored kind would satisfy the test above perfectly."""
     dave = await _user(session, "dave")
-    await client.post("/v1/devices", headers=_headers(dave),
+    # PIN THE SETUP TOO (Tesla, cage-match PR#170 r5). If this first POST fails, the
+    # second one is an INSERT, and the test then blesses "voip can be stored" —
+    # which is not the reassign rule it exists to lock. That is how this class
+    # sneaks back in through a control rather than through an assertion.
+    setup = await client.post("/v1/devices", headers=_headers(dave),
                       json={"platform": "apns", "token": ALERT_TOKEN})
+    assert setup.status_code == 201, setup.text
     resp = await client.post(
         "/v1/devices", headers=_headers(dave),
         json={"platform": "apns", "token": ALERT_TOKEN, "token_kind": "voip"})
+    assert resp.status_code == 201, resp.text
     row = await session.get(DeviceToken, resp.json()["id"])
     assert row.token_kind == TokenKind.VOIP.value
 
@@ -243,6 +251,7 @@ async def test_the_201_echoes_the_resolved_token_kind(client, session):
     # The default arm, kept: absent means alert is the wire contract.
     alert = await client.post("/v1/devices", headers=_headers(erin),
                               json={"platform": "apns", "token": ALERT_TOKEN})
+    assert alert.status_code == 201, alert.text
     assert alert.json()["token_kind"] == "alert"
 
 

@@ -212,3 +212,48 @@ async def test_the_registration_response_names_the_token_kind(client, session):
                              json={"platform": "apns", "token": "k" * 64})
     assert resp.status_code == 201
     assert resp.json()["token_kind"] == "alert"
+
+
+# ---------------------------------------------------------------------------
+# THE DOCUMENT, NOT JUST THE BODY (Tesla, cage-match PR#170 r5).
+#
+# `RegisterDeviceResp` exists BECAUSE an untyped `-> dict` made the OpenAPI half of
+# the desync detector undetectable: the 201 was `{"additionalProperties": true}` and
+# `RegisterDeviceReq` was the only schema in the document carrying `token_kind`. The
+# app tab stated it will verify against `openapi.json` before wiring its first VoIP
+# registration.
+#
+# Nothing in this suite read that document. Revert the return annotation to `dict`,
+# keep the same keys in the body, and every runtime test above stays green — so the
+# round-1 fix for "this contract is not assertable" was itself not asserted. That is
+# the same class this PR has now found ten times, at the highest level it can occur:
+# the guard is unguarded.
+# ---------------------------------------------------------------------------
+
+
+def test_the_openapi_document_types_the_registration_echo() -> None:
+    """Locks the CONTRACT the app tab verifies against, not the runtime body."""
+    from aiko_gateway.main import app
+
+    schemas = app.openapi()["components"]["schemas"]
+
+    assert "RegisterDeviceResp" in schemas, (
+        "the 201 response is untyped — openapi.json cannot tell a client that the "
+        "island resolves and RETURNS a token_kind, only that it accepts one. That "
+        "is exactly the half the app tab said it would check.")
+
+    props = schemas["RegisterDeviceResp"]["properties"]
+    assert "token_kind" in props, (
+        f"RegisterDeviceResp does not carry token_kind: {sorted(props)}")
+
+    # EVERY closed set typed, not just the new one — a contract that says
+    # `platform: Platform` inbound and `platform: string` outbound has to be read
+    # twice, and this repo's rule is that a closed set is never a String.
+    for field, schema_name in (("platform", "Platform"),
+                               ("apns_environment", "ApnsEnvironment"),
+                               ("token_kind", "TokenKind")):
+        ref = props[field].get("$ref") or "".join(
+            a.get("$ref", "") for a in props[field].get("anyOf", []))
+        assert schema_name in ref, (
+            f"RegisterDeviceResp.{field} is not typed as {schema_name} in the "
+            f"document — it resolved to {props[field]!r}")

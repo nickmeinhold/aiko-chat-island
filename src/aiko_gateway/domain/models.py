@@ -801,9 +801,13 @@ class DeviceToken(Base):
     apns_environment: Mapped[str] = mapped_column(
         String(16), nullable=False, server_default=ApnsEnvironment.PRODUCTION.value)
     # What this token is FOR (design 12 Decision 2) — see TokenKind for the axis.
-    # `String(16)` matches this table's other closed-set columns, and is DERIVED
-    # from the longest member rather than picked — see _KIND_WIDTH in revision
-    # 0025 and its parity test. (It read `String(8)` until cage-match PR#170 r2:
+    # `String(16)` matches this table's other closed-set columns and is INTENTIONAL
+    # HEADROOM, not computed — it must equal `_KIND_WIDTH` in revision 0025, and the
+    # tests enforce that equality plus a floor of the longest apns-push-type
+    # spelling. (An earlier version of this comment said "derived from the longest
+    # member", contradicting the migration's own note; two incompatible accounts of
+    # one constant is the drift this column's whole width story is about. Carnot,
+    # cage-match PR#170 r5.) It read `String(8)` until PR#170 r2:
     # the values are Apple's `apns-push-type` spellings and `background` is 10,
     # so the width was a second, quieter closed set beside the CHECK — invisible
     # on SQLite, enforced on Postgres.) Mapped[str] rather than Mapped[Enum] is

@@ -457,47 +457,22 @@ def test_0024_rename_preserves_the_value_a_live_row_already_carries(
 
 
 # ---------------------------------------------------------------------------
-# MIGRATION-vs-ENUM PARITY (Carnot, cage-match PR#170 — a confirmed finding).
+# THE MIGRATION-vs-ENUM PARITY TEST WAS DELETED HERE (Carnot, cage-match PR#170 r5),
+# and the deletion is the fix rather than a retreat from one.
 #
-# `models.py` renders device_tokens' CHECK from the enum via
-# `_in_check("token_kind", TokenKind)`; revision 0025 carried a HAND-WRITTEN
-# literal saying the same thing. Two sources of truth for one closed set, in a
-# change whose own docstring argues the enum is the single source — and nothing
-# compared them. Add a third TokenKind member and the model's CHECK updates
-# itself while the migration's literal does not, so an island bootstrapped from
-# migrations ends up with a DIFFERENT constraint from the one the model declares.
+# It asserted that revision 0025's frozen `_KIND_CHECK` literal must equal what
+# `_in_check` renders from the LIVE TokenKind enum. That pins a HISTORICAL ARTIFACT
+# to CURRENT CODE, which is the wrong invariant for a migration chain: the day a
+# future revision correctly adds a member and rebuilds the CHECK in 0026, this test
+# goes red and STAYS red, and the only ways out are editing history or deleting the
+# test. It cannot distinguish real head-schema drift from a correct later migration.
 #
-# The fix is NOT to import the live enum into the revision: a migration is a
-# historical artifact and must keep producing the DDL it always produced. This
-# test is the honest form of the guarantee — it fails loudly the day the enum
-# grows, which is the day a new revision is owed.
+# The invariant actually worth holding is "the migrated HEAD's DDL matches the
+# model", and `test_the_migrated_ddl_actually_carries_the_check` below already
+# asserts exactly that — against the emitted DDL and a behavioural reject, not
+# against a literal. So the parity test was both wrong and redundant with a test
+# that is right. Subtracting it is the smaller system.
 # ---------------------------------------------------------------------------
-
-
-def test_the_0025_check_still_matches_what_the_enum_renders_today():
-    """RED-PROVEN by adding a member to TokenKind: this goes red, the model's
-    CHECK silently absorbs it, and the migration's does not."""
-    import importlib.util
-    from pathlib import Path
-    from aiko_gateway.domain.models import TokenKind, _in_check
-
-    rev = Path(__file__).resolve().parents[1] / "alembic" / "versions" / "0025_device_token_kind.py"
-    spec = importlib.util.spec_from_file_location("rev_0025", rev)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-
-    def _norm(sql: str) -> str:
-        return "".join(str(sql).lower().split()).replace('"', "'")
-
-    assert _norm(mod._KIND_CHECK) == _norm(_in_check("token_kind", TokenKind)), (
-        f"revision 0025's CHECK ({mod._KIND_CHECK!r}) has drifted from what "
-        f"_in_check renders from TokenKind ({_in_check('token_kind', TokenKind)!r}). "
-        "The enum grew without a new migration: a fresh island would get a "
-        "different constraint from the one models.py declares. Write the new "
-        "revision rather than editing 0025 — it is history, not current state."
-    )
-
-
 def test_the_0025_column_is_wide_enough_for_every_member(tmp_path, monkeypatch) -> None:
     """THE SHADOW CLOSED SET — and this test could not catch the bug it exists for
     (Tesla, cage-match PR#170 r4).
@@ -768,6 +743,22 @@ def test_the_migrated_ddl_actually_carries_the_check(tmp_path, monkeypatch) -> N
         "CHECK failure means this test is measuring a different constraint.")
 
 
+    # AND THE NEIGHBOURS SURVIVED THE REBUILD (Tesla, cage-match PR#170 r5).
+    # This asked only about the constraint 0025 ADDS. Revision 0024 exists because a
+    # batch_alter_table rebuild silently altered a neighbour, and 0025 rebuilds the
+    # SAME table again — but `compare_metadata` is CHECK-blind on SQLite by this
+    # file's own admission, so a batch copy that keeps token_kind and DROPS the
+    # sibling CHECKs would not flicker anywhere. The values would still copy, so
+    # even the sandbox-neighbour test stays green; the closed set on
+    # apns_environment would quietly become prose.
+    for neighbour in ("ck_device_tokens_platform",
+                      "ck_device_tokens_apns_environment"):
+        assert neighbour in ddl, (
+            f"{neighbour} is absent from the migrated device_tokens DDL — 0025's "
+            "rebuild dropped a constraint it did not own. The column's values "
+            "survive the copy, so nothing else in this suite can see it.")
+
+
 def test_downgrading_0025_refuses_while_a_voip_row_exists(tmp_path, monkeypatch) -> None:
     """LOSSY IN THE ONE DIRECTION THAT MATTERS (Carnot, cage-match PR#170 r3).
 
@@ -788,7 +779,17 @@ def test_downgrading_0025_refuses_while_a_voip_row_exists(tmp_path, monkeypatch)
 
     # An alert-only DB downgrades cleanly — the expected case, and the control
     # WITHOUT WHICH the refusal below would prove only "downgrade always fails".
+    # A VALID PARENT ROW AND FKs ON (Carnot, PR#170 r5). Round 4 fixed exactly this
+    # ambiguity in the DDL test and left its sibling here — device_tokens.user_id is
+    # an FK onto users.id, so with SQLite's default foreign_keys=OFF this fixture
+    # measured SQLite's indulgence as much as the downgrade guard, and would fail
+    # for the wrong reason the moment FKs are enabled. The only discriminant must be
+    # token_kind != 'alert'.
     con = sqlite3.connect(path)
+    con.execute("PRAGMA foreign_keys=ON")
+    con.execute("INSERT INTO users (id, username, display_name, aiko_username, "
+                "created_at) VALUES "
+                "('u1','u1','U One','u1','2026-01-01 00:00:00')")
     con.execute("INSERT INTO device_tokens (id, user_id, platform, token, "
                 "token_kind, apns_environment, created_at, updated_at) VALUES "
                 "('a1','u1','apns','aaa','alert','production',"
@@ -799,6 +800,7 @@ def test_downgrading_0025_refuses_while_a_voip_row_exists(tmp_path, monkeypatch)
 
     # Now one VoIP row: the downgrade must refuse and SAY WHAT IT WOULD DESTROY.
     con = sqlite3.connect(path)
+    con.execute("PRAGMA foreign_keys=ON")
     con.execute("INSERT INTO device_tokens (id, user_id, platform, token, "
                 "token_kind, apns_environment, created_at, updated_at) VALUES "
                 "('v1','u1','apns','vvv','voip','production',"
