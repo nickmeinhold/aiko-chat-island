@@ -110,6 +110,19 @@ async def register_device(
     permit an island whose absent-means-voip."""
     declared = apns_environment.value if apns_environment is not None else None
     resolved = declared if declared is not None else default_apns_environment()
+    # FAIL LOUDLY AND AT THE BOUNDARY on a non-enum (Carnot, cage-match PR#170).
+    # This read `token_kind.value if token_kind is not None`, so an in-process
+    # caller passing a bare `"voip"` got an AttributeError from deep inside the
+    # service — while the docstring above implies the DB CHECK arbitrates. The route
+    # is pydantic-validated so no HTTP path reaches this, but "no caller does that
+    # today" is exactly the guarantee a second caller removes, and this module has
+    # in-process callers by design. A closed type is not a String; refusing one here
+    # is the same argument TokenKind itself makes, applied to the door.
+    if token_kind is not None and not isinstance(token_kind, TokenKind):
+        raise TypeError(
+            f"token_kind must be a TokenKind, got {type(token_kind).__name__} "
+            f"({token_kind!r}). The closed set has one definition; a bare string "
+            "here would reach the DB as an unvalidated value.")
     declared_kind = token_kind.value if token_kind is not None else None
     resolved_kind = (declared_kind if declared_kind is not None
                      else TokenKind.ALERT.value)

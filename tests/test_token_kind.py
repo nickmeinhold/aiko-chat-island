@@ -212,9 +212,29 @@ async def test_the_201_echoes_the_resolved_token_kind(client, session):
     went to a token that is not a VoIP token. The echo is the only way the client
     learns it sent `voip` and got back `alert`."""
     erin = await _user(session, "erin")
-    resp = await client.post("/v1/devices", headers=_headers(erin),
-                             json={"platform": "apns", "token": ALERT_TOKEN})
-    assert resp.json()["token_kind"] == "alert"
+
+    # THE LOAD-BEARING ARM, and it was missing (Tesla, cage-match PR#170). This
+    # test asserted only the DEFAULT path — sent nothing, got 'alert' — which is
+    # the one case the desync detector is NOT for. The 3am signature is "sent
+    # voip, got alert" or "sent voip, got nothing", and neither was exercised
+    # anywhere: the declared-voip test reads the ROW, not the 201 body. The
+    # docstring above described a test that did not exist.
+    voip = await client.post("/v1/devices", headers=_headers(erin),
+                             json={"platform": "apns", "token": VOIP_TOKEN,
+                                   "token_kind": "voip"})
+    assert voip.status_code == 201
+    body = voip.json()
+    assert "token_kind" in body, (
+        "the 201 MUST carry token_kind — its absence is precisely the signature "
+        "of an island that predates this field, and the client fail-closes on it")
+    assert body["token_kind"] == "voip", (
+        f"sent voip, echoed {body['token_kind']!r} — this is the desync the echo "
+        "exists to surface, and the app tab fail-closes its VoIP registration on it")
+
+    # The default arm, kept: absent means alert is the wire contract.
+    alert = await client.post("/v1/devices", headers=_headers(erin),
+                              json={"platform": "apns", "token": ALERT_TOKEN})
+    assert alert.json()["token_kind"] == "alert"
 
 
 async def test_both_kinds_for_one_handset_coexist_as_two_rows(client, session):

@@ -453,3 +453,66 @@ def test_0024_rename_preserves_the_value_a_live_row_already_carries(
             "the downgrade lost the row's environment on the way back")
     finally:
         engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# MIGRATION-vs-ENUM PARITY (Carnot, cage-match PR#170 — a confirmed finding).
+#
+# `models.py` renders device_tokens' CHECK from the enum via
+# `_in_check("token_kind", TokenKind)`; revision 0025 carried a HAND-WRITTEN
+# literal saying the same thing. Two sources of truth for one closed set, in a
+# change whose own docstring argues the enum is the single source — and nothing
+# compared them. Add a third TokenKind member and the model's CHECK updates
+# itself while the migration's literal does not, so an island bootstrapped from
+# migrations ends up with a DIFFERENT constraint from the one the model declares.
+#
+# The fix is NOT to import the live enum into the revision: a migration is a
+# historical artifact and must keep producing the DDL it always produced. This
+# test is the honest form of the guarantee — it fails loudly the day the enum
+# grows, which is the day a new revision is owed.
+# ---------------------------------------------------------------------------
+
+
+def test_the_0025_check_still_matches_what_the_enum_renders_today():
+    """RED-PROVEN by adding a member to TokenKind: this goes red, the model's
+    CHECK silently absorbs it, and the migration's does not."""
+    import importlib.util
+    from pathlib import Path
+    from aiko_gateway.domain.models import TokenKind, _in_check
+
+    rev = Path(__file__).resolve().parents[1] / "alembic" / "versions" / "0025_device_token_kind.py"
+    spec = importlib.util.spec_from_file_location("rev_0025", rev)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    def _norm(sql: str) -> str:
+        return "".join(str(sql).lower().split()).replace('"', "'")
+
+    assert _norm(mod._KIND_CHECK) == _norm(_in_check("token_kind", TokenKind)), (
+        f"revision 0025's CHECK ({mod._KIND_CHECK!r}) has drifted from what "
+        f"_in_check renders from TokenKind ({_in_check('token_kind', TokenKind)!r}). "
+        "The enum grew without a new migration: a fresh island would get a "
+        "different constraint from the one models.py declares. Write the new "
+        "revision rather than editing 0025 — it is history, not current state."
+    )
+
+
+def test_the_0025_column_is_wide_enough_for_every_member():
+    """The shadow closed set (Tesla, same round). VARCHAR width is a second,
+    quieter constraint beside the CHECK — unenforced on SQLite, enforced on
+    Postgres, so it is invisible where we run and bites where we might."""
+    import importlib.util
+    from pathlib import Path
+    from aiko_gateway.domain.models import TokenKind
+
+    rev = Path(__file__).resolve().parents[1] / "alembic" / "versions" / "0025_device_token_kind.py"
+    spec = importlib.util.spec_from_file_location("rev_0025b", rev)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    longest = max(len(m.value) for m in TokenKind)
+    assert mod._KIND_WIDTH >= longest, (
+        f"_KIND_WIDTH={mod._KIND_WIDTH} cannot hold the longest TokenKind value "
+        f"({longest} chars). On Postgres this truncates or errors; on SQLite it is "
+        "silently ignored, which is why it would ship unnoticed."
+    )

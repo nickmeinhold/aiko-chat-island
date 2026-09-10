@@ -54,10 +54,36 @@ class UnregisterDeviceReq(BaseModel):
     token: str = Field(min_length=1, max_length=512)
 
 
+class RegisterDeviceResp(BaseModel):
+    """The 201 body, TYPED — because the echo is a CROSS-REPO CONTRACT, not a
+    convenience.
+
+    An untyped `-> dict` echoes the resolved kind at runtime and describes NOTHING
+    in `openapi.json`. That was measured on this branch: the generated 201 was
+    `{"additionalProperties": true, "type": "object"}`, and `RegisterDeviceReq` was
+    the only schema in the entire document carrying `token_kind`.
+
+    Why that is a defect rather than a style point: the app tab has stated it will
+    verify against `openapi.json` BEFORE wiring its first VoIP registration, and
+    that the echo is the instrument it will use. Untyped, the document can tell it
+    the island ACCEPTS `token_kind` and cannot tell it the island RESOLVES and
+    RETURNS one — so the consumer's stated verification silently checks half of
+    what it believes it checks, and its fallback is a live POST against production.
+
+    And for us: with the response untyped, a future change that drops the echo
+    breaks no schema and no test. A desync detector whose own presence is
+    undetectable is not a detector. Typing it makes the contract assertable."""
+
+    id: str
+    platform: str
+    apns_environment: str
+    token_kind: TokenKind
+
+
 @router.post("/devices", status_code=status.HTTP_201_CREATED)
 async def register_device(
     req: RegisterDeviceReq, user: CurrentUser, session: DbSession
-) -> dict:
+) -> RegisterDeviceResp:
     """Register (or re-register) this device's push token for the current user.
     Idempotent: re-registering the same token is a no-op reassign, still 201."""
     row = await svc.register_device(
@@ -74,9 +100,10 @@ async def register_device(
     # vanished, the row stored 'alert', and every VoIP push then went to a token
     # that is not a VoIP token — a 400, never reaped, no error, no ring. The echo
     # is how the app learns it sent `voip` and got back `alert`.
-    return {"id": row.id, "platform": row.platform,
-            "apns_environment": row.apns_environment,
-            "token_kind": row.token_kind}
+    return RegisterDeviceResp(
+        id=row.id, platform=row.platform,
+        apns_environment=row.apns_environment,
+        token_kind=TokenKind(row.token_kind))
 
 
 @router.delete("/devices", status_code=status.HTTP_204_NO_CONTENT)

@@ -812,7 +812,7 @@ class DeviceToken(Base):
     # and needed a settings-aware UPDATE, here they are one constant and no data
     # migration exists to write.
     token_kind: Mapped[str] = mapped_column(
-        String(8), nullable=False, server_default=TokenKind.ALERT.value)
+        String(16), nullable=False, server_default=TokenKind.ALERT.value)
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[dt.datetime] = mapped_column(

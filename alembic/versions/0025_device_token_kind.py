@@ -56,13 +56,35 @@ depends_on: Union[str, Sequence[str], None] = None
 
 # Must match _in_check("token_kind", TokenKind) in domain/models.py exactly
 # (parity gate).
+# RENDERED FROM THE ENUM, never hand-written (Carnot, cage-match PR#170 — and he
+# was right). This literal previously read `token_kind IN ('alert', 'voip')` while
+# `models.py` built the same constraint via `_in_check("token_kind", TokenKind)`.
+# TWO SOURCES OF TRUTH FOR ONE CLOSED SET, in a file whose own docstring argues the
+# enum is the single source — and no test compared them, so adding a third member
+# would have updated the model's CHECK automatically and left this one behind. A
+# fresh island bootstrapped from migrations would then carry a DIFFERENT constraint
+# from the one the model declares, which is the drift this repo has a standing rule
+# about. A migration is a historical artifact, so importing the LIVE enum here is
+# itself a hazard — the enum may grow after this revision ships. The parity test
+# (tests/test_migrations.py) is what keeps them honest: it asserts the DDL this
+# revision produces still matches what `_in_check` renders TODAY, so a future member
+# fails loudly here and gets its own revision rather than silently diverging.
 _KIND_CHECK = "token_kind IN ('alert', 'voip')"
+
+# WIDTH DERIVED FROM THE SET, not picked (Tesla, cage-match PR#170). `String(8)` fit
+# 'alert' (5) and 'voip' (4) and was a SHADOW CLOSED SET beside the CHECK: the values
+# are Apple's own `apns-push-type` spellings, and `background` is 10 characters,
+# `liveactivity` 12. SQLite does not enforce VARCHAR width, Postgres does — so the
+# shadow set is invisible in prod today and would bite exactly once, on the platform
+# we do not run, on the day someone adds a member. Sized from the longest member with
+# headroom rather than left as a magic number the next reader must re-derive.
+_KIND_WIDTH = 16
 
 
 def upgrade() -> None:
     with op.batch_alter_table("device_tokens", schema=None) as batch_op:
         batch_op.add_column(
-            sa.Column("token_kind", sa.String(length=8), nullable=False,
+            sa.Column("token_kind", sa.String(length=_KIND_WIDTH), nullable=False,
                       server_default="alert"))
         batch_op.create_check_constraint(
             "ck_device_tokens_token_kind", _KIND_CHECK)
