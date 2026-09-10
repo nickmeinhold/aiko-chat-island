@@ -222,7 +222,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # annotated tag objects are not fetched at depth 1
+          fetch-depth: 0
+
+      # MEASURED 2026-09-10 (run 34460720722): this job's FIRST ever real exercise
+      # failed here. `git cat-file -t v0.10.0` returned `commit` on the runner while
+      # the same tag on GitHub is `.object.type = tag` — the tag object exists, the
+      # working copy's ref had been flattened to the commit it peels to.
+      #
+      # `fetch-depth: 0` was already set and did not prevent it, so the widely-repeated
+      # "depth 1 misses the tag object" is NOT the cause here. Rather than bet the fix
+      # on a mechanism nobody has proven, this fetches the tag ref explicitly and by
+      # force: the job then holds the object because it asked for it, not because
+      # actions/checkout happened to leave one behind. `--no-tags` keeps this to the ONE
+      # tag being released instead of dragging in every tag in the repo.
+      - name: Fetch the tag OBJECT, not just the ref
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          git fetch --no-tags --force origin "refs/tags/${tag}:refs/tags/${tag}"
 
       # The annotated tag message IS the release notes. One source, written at tag time
       # by the person who knows why the release exists — not regenerated from commit
@@ -259,11 +275,17 @@ jobs:
       # MUST-FAIL ARM. Without this the job proves only that `gh release create` exited
       # 0; this asserts the endpoint the nudge actually reads now answers with THIS tag.
       # It is the difference between publishing a release and being discoverable.
+      # Authenticated on purpose. An anonymous call here is rate-limited PER IP, and
+      # runners share them: a 403 makes `curl -sf` exit non-zero and print nothing, so
+      # `latest` goes empty and this arm fails looking exactly like a missing release.
+      # Reproduced from a dev box the same day this job was fixed. It fails closed,
+      # which is right, but it must fail for the reason it claims.
       - name: Verify /releases/latest now names this tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          latest=$(curl -sf \
-            "https://api.github.com/repos/${{ github.repository }}/releases/latest" \
-            | jq -r .tag_name)
+          latest=$(gh api "repos/${{ github.repository }}/releases/latest" \
+            --jq .tag_name)
           echo "releases/latest = $latest (expected ${GITHUB_REF_NAME})"
           [ "$latest" = "${GITHUB_REF_NAME}" ] || {
             echo "::error::the update nudge would not see this release" >&2
