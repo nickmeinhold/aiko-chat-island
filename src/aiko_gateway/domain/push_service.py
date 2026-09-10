@@ -38,10 +38,14 @@ list is the most tempting place for it, because nothing reads a list.
      `create_outbound` and here consults it.
   6. **Not a blocked pair** — the caller's fanout set UNIONED with this service's
      own read, so neither is trusted alone.
-  7. **The peer has a device this island can actually send to.** No sendable
+  7. **The recipient has SPOKEN in this channel** (claude-tasks#4216). A wake
+     reaches only someone who has posted here before — conduct, not consent, and
+     not withdrawable; see `_spoken_here`. Runs on EVERY wake kind, not just call
+     invites, so a new member cannot inherit an un-gated ring.
+  8. **The peer has a device this island can actually send to.** No sendable
      device, no budget spent. "Sendable" is a join over (platform x token_kind x
      what this wake needs) — see `plan_deliveries`.
-  8. **Within the per-recipient wake budget.** Waking is louder than sending.
+  9. **Within the per-recipient wake budget.** Waking is louder than sending.
      ONE budget for the person, not one per transport.
 
 THE LOUDNESS CONTRACT. Every skip and refusal names a `reason=`, and the LEVEL is
@@ -52,6 +56,7 @@ healthy boxes is the same silence in a high-vis vest.
   wake skipped device=%s reason=transport_not_configured   INFO
   wake skipped device=%s reason=unroutable_row             ERROR
   wake skipped user=%s reason=no_sendable_devices          DEBUG
+  call wake skipped user=%s channel=%s reason=no_prior_conduct  INFO
   apns sent device=%s env=%s kind=%s verdict=%s            INFO
   wake delivered_to=0 user=%s devices=%d                   ERROR
   reap skipped device=%s reason=dead_without_reap_order    WARNING
@@ -107,6 +112,21 @@ state that this gate can read. Filed rather than silently accepted.
     by `should_wake`'s exact-sentinel match — asks *is this a real invite*, never
     *may this sender ring this person*. Those are different questions and only the
     second bounds a report-and-end ratio.
+
+    SUPERSEDED 2026-09-11 — READ THIS BEFORE ACTING ON THE PARAGRAPH BELOW. Nick
+    rejected the interim ("no, do it now") and the island now DOES apply a gate:
+    a wake reaches only a recipient who has POSTED in the channel (`_spoken_here`,
+    gate 7, claude-tasks#4216). "Any authenticated user may open a DM with any user
+    id and send the sentinel" is no longer true of RINGING.
+
+    The ruling it cites is intact and is NOT contradicted by that gate: ring
+    CONSENT remains per-conversation and device-local, the island still learns no
+    friend graph, and `grep -rn friend src/` still returns zero. The gate reads only
+    the island's own message rows — who posted where — and asserts nothing about who
+    knows whom. Left standing rather than deleted, because a later hand reading the
+    original text alone would conclude the gate violates a ruling and remove it.
+
+    The original, for the record:
 
     The island cannot answer the second one and BY RULING must not: ring consent is
     per-conversation and device-local (`ring_allowlist_store.dart`; Nick 2026-09-01),
@@ -166,8 +186,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..config import settings
 from ..db import SessionLocal
 from . import apns, moderation_service
-from .models import (Channel, ChannelKind, DeviceToken, Membership, Platform,
-                     ApnsEnvironment, TokenKind, User)
+from .models import (Channel, ChannelKind, DeviceToken, Membership, Message,
+                     Platform, ApnsEnvironment, TokenKind, User)
 from .push_result import ReapOrder, SendResult, Verdict, WakePayload
 from .rate_limit import limiter
 
@@ -962,6 +982,60 @@ async def _wake_user(session: AsyncSession, user_id: str, *, wake: WakeKind,
         await session.commit()
 
 
+async def _spoken_here(session: AsyncSession, *, channel_id: str,
+                       user_ids: list[str]) -> list[str]:
+    """Of these recipients, the ones who have POSTED in this channel before.
+
+    Gate 7. A wake reaches only someone who has already spoken here
+    (claude-tasks#4216) — before it, any authenticated user could open a DM with
+    any user id and ring a locked phone; blocks and bans are opt-OUT and require
+    the recipient to have already acted against a stranger.
+
+    CONDUCT, NOT CONSENT, and the word is load-bearing: this observes that you
+    spoke to someone, not that you agreed they may ring you. **There is no
+    un-reply** — one message, ever, and that party can ring you forever. A
+    `friends` edge is declared and WITHDRAWABLE; this is neither. So it PRECEDES
+    that primitive (#2792) and calling it consent anywhere would retire a debt
+    still owed.
+
+    IT ASKS ABOUT THE RECIPIENT, NOT THE CALLER. In a two-party DM the recipient
+    having spoken here IS their engagement with the only other party. Asking about
+    the caller instead would let a stranger ring anyone who had ever used the
+    channel. Consequence worth knowing: Nick messages Dreamfinder, so Dreamfinder
+    may ring Nick — an agent need never have posted.
+
+    IT GATES THE WAKE, NEVER THE INVITE. A connected recipient still receives the
+    invite frame; what stops is the cold-start ring, which is the harm.
+
+    IT SURVIVES E2EE AND `should_wake` DOES NOT — this reads who posted where,
+    never content, which the island still knows once MLS lands (#1962).
+
+    SOFT-DELETE IS NOT WITHDRAWAL: deleting your own message does not retract
+    having engaged, and treating it as withdrawal would invent an all-or-nothing
+    invisible revocation channel. Pinned by test, not by this sentence.
+
+    NOTHING IS RECORDED — a refused ring is a log line and no row (Nick,
+    2026-09-01). That also rules out telling a caller they were refused, or
+    rate-limiting their retries.
+    """
+    if not user_ids:
+        return []
+    rows = (await session.execute(
+        select(Message.sender_user_id)
+        .where(Message.channel_id == channel_id,
+               Message.sender_user_id.in_(user_ids))
+        .distinct()
+    )).scalars().all()
+    spoken = {r for r in rows if r is not None}
+    for user_id in user_ids:
+        if user_id not in spoken:
+            # INFO, not WARNING: this is the gate working, not a fault. It names
+            # the user and the reason and stops there — see the no-record note.
+            log.info("call wake skipped user=%s channel=%s reason=no_prior_conduct",
+                     user_id, channel_id)
+    return [u for u in user_ids if u in spoken]
+
+
 async def wake_for_message(*, channel_id: str, channel_kind: ChannelKindStr, sender_id: str,
                            body: str, exclude_user_ids: set[str]) -> None:
     """Wake the other DM member's devices for an accepted call invitation.
@@ -995,6 +1069,21 @@ async def wake_for_message(*, channel_id: str, channel_kind: ChannelKindStr, sen
             recipients = await _recipients(
                 session, channel_id=channel_id, sender_id=sender_id,
                 exclude_user_ids=exclude_user_ids)
+            # EVERY WAKE, NOT ONE KIND (Tesla, cage-match PR#173 r1). This read
+            # `if wake is WakeKind.CALL_INVITE:` — a tautology today, because
+            # `should_wake` returns that member or None and nothing else, and a
+            # SILENT BYPASS tomorrow. `WakeKind.CALL_END` is already named in this
+            # file as the next member; a `should_wake` arm returning it would skip
+            # the gate with no `assert_never`, no exhaustiveness, and no reddened
+            # test. The router was given exhaustive matching and the trust boundary
+            # was given an `if` — the weaker construct on the more dangerous path.
+            #
+            # Gating unconditionally is behaviourally IDENTICAL today and cannot be
+            # bypassed by adding a member. A future wake kind that must reach a
+            # silent recipient has to remove this line deliberately, which is a
+            # decision someone makes rather than one they inherit.
+            recipients = await _spoken_here(
+                session, channel_id=channel_id, user_ids=recipients)
             payload = WakePayload(channel_id=channel_id)
             for user_id in recipients:
                 # The per-recipient budget is charged inside _wake_user, once the
