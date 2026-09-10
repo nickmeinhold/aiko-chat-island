@@ -166,6 +166,60 @@ class ApnsEnvironment(enum.StrEnum):
     PRODUCTION = "production"
 
 
+class TokenKind(enum.StrEnum):
+    """Closed set of push-token DELIVERY SEMANTICS — what a token is FOR (design
+    12 Decision 2). Same single-source-of-truth pattern as Platform: drives the
+    DB CHECK on device_tokens.token_kind via _in_check.
+
+    THE AXIS, because getting it wrong is the whole risk. `platform` says which
+    transport FAMILY a token belongs to (Apple vs Google); `token_kind` says
+    which delivery semantics it carries (a banner vs a ring). An `apns_voip`
+    PLATFORM value would be the WRONG axis — Android could never hold it, and the
+    two questions would collapse into one field that answers neither.
+
+    TWO REGISTRIES, TWO STRINGS, TWO ROWS. An alert token comes from UIKit
+    (`registerForRemoteNotifications`) and is valid only against the bare bundle
+    topic; a VoIP token comes from PushKit (`PKPushRegistry`) and only against
+    `<bundle>.voip`. They rotate independently and neither is derivable from the
+    other, so one handset holding both is TWO rows — which is why UNIQUE(token)
+    needs no change to accommodate this.
+
+    PARTIAL IS THE DEFAULT, and one arm is permanent. A PushKit VoIP token needs
+    no user permission at all, while a handset that declined notifications cannot
+    be RUNG by an alert push. (Precisely: an app can obtain an alert device token
+    without notification authorization — authorization gates DISPLAY — so the
+    claim is about being rung, not about holding.) So "holds voip and never
+    alert" is a normal, permanent population rather than a half-registered edge
+    case, and nothing in this model may imply both-required.
+
+    THE VALUES ARE APPLE'S OWN `apns-push-type` SPELLINGS, sent verbatim as a
+    header. Renaming a member silently changes the wire — an unknown push type is
+    a 400, which is REJECTED, which never reaps: one WARNING line and a phone
+    that does not ring.
+
+    THE NAME IS UNPREFIXED ON PURPOSE, and the contrast with `apns_environment`
+    one class up is the argument. That one is prefixed because the split is an
+    APNs-only fact — the `.p8` is environment-agnostic and no other transport has
+    such a division. A delivery semantic is something a second transport could
+    plausibly grow, so the unprefixed name is the forward-compatible one. Two
+    independent records already say `token_kind` (design 12 Decision 2; the app
+    tab's design 16 §5), so this is a reason written down rather than a choice
+    being made.
+
+    INERT FOR FCM. The column is NOT NULL for every platform because a CHECK
+    alone cannot close a set against NULL, but Firebase has one registry and no
+    VoIP equivalent — an 'fcm' row simply carries whichever kind it registered
+    under and the FCM send path never reads it. Ring-ness on Android is a
+    property of the MESSAGE (data-only at HIGH priority), not of the token. A
+    conditional constraint would be machinery bought to express "this field means
+    nothing over here"; the sentence does the job, exactly as it does for
+    apns_environment above.
+    """
+
+    ALERT = "alert"
+    VOIP = "voip"
+
+
 class PasskeyOperation(enum.StrEnum):
     """Closed set of WebAuthn ceremony types (#1471). Same single-source-of-truth
     pattern as Role/JoinPolicy/Platform: drives the DB CHECK on
@@ -727,6 +781,8 @@ class DeviceToken(Base):
                         name="ck_device_tokens_platform"),
         CheckConstraint(_in_check("apns_environment", ApnsEnvironment),
                         name="ck_device_tokens_apns_environment"),
+        CheckConstraint(_in_check("token_kind", TokenKind),
+                        name="ck_device_tokens_token_kind"),
     )
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=new_ulid)
     user_id: Mapped[str] = mapped_column(
@@ -744,6 +800,28 @@ class DeviceToken(Base):
     # irreversible.
     apns_environment: Mapped[str] = mapped_column(
         String(16), nullable=False, server_default=ApnsEnvironment.PRODUCTION.value)
+    # What this token is FOR (design 12 Decision 2) — see TokenKind for the axis.
+    # `String(16)` matches this table's other closed-set columns and is INTENTIONAL
+    # HEADROOM, not computed — it must equal `_KIND_WIDTH` in revision 0025, and the
+    # tests enforce that equality plus a floor of the longest apns-push-type
+    # spelling. (An earlier version of this comment said "derived from the longest
+    # member", contradicting the migration's own note; two incompatible accounts of
+    # one constant is the drift this column's whole width story is about. Carnot,
+    # cage-match PR#170 r5.) It read `String(8)` until PR#170 r2:
+    # the values are Apple's `apns-push-type` spellings and `background` is 10,
+    # so the width was a second, quieter closed set beside the CHECK — invisible
+    # on SQLite, enforced on Postgres.) Mapped[str] rather than Mapped[Enum] is
+    # the house convention every closed-set column follows (claude-tasks#3400):
+    # the DB CHECK is the enforcement and the enum re-enters at the ORM edge.
+    #
+    # THE server_default IS THE BACKFILL. "Absent means alert" is the wire
+    # contract, an existing row is exactly a row whose client never declared one,
+    # and a direct SQL INSERT that omits the column gets the same safe value — so
+    # unlike 0023, whose safe DDL default and honest per-island value DIFFERED
+    # and needed a settings-aware UPDATE, here they are one constant and no data
+    # migration exists to write.
+    token_kind: Mapped[str] = mapped_column(
+        String(16), nullable=False, server_default=TokenKind.ALERT.value)
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[dt.datetime] = mapped_column(

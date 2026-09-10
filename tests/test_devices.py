@@ -12,6 +12,7 @@ import aiko_services" isolation invariant — same pattern as test_membership_ac
 from __future__ import annotations
 
 import pytest
+from sqlalchemy import select
 import pytest_asyncio
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
@@ -173,3 +174,102 @@ async def test_account_deletion_purges_device_tokens(session):
     await accounts_service.delete_user_account(session, alice.id)
     assert await devices_service.tokens_for_user(session, alice.id) == []
     assert await users_service.get_by_id(session, alice.id) is None
+
+
+# --- Recovered by the split audit (cage-match PR#170 round 2) ---------------
+# Router-level token_kind coverage, written on the combined branch and dropped
+# when this piece was split out.
+
+async def test_a_voip_registration_round_trips_through_the_router(client, session):
+    """The router's own arm of the token-kind wire (the service-level and
+    DB-level arms live in `test_token_kind.py`)."""
+    bob = await _user(session, "kindbob")
+    resp = await client.post(
+        "/v1/devices", headers=_headers(bob),
+        json={"platform": "apns", "token": "j" * 64, "token_kind": "voip"})
+    assert resp.status_code == 201
+    assert resp.json()["token_kind"] == "voip"
+    # AND THE ROW, not just the echo (Carnot, cage-match PR#170 r4). This asserted
+    # the 201 body alone, so a service that echoes `req.token_kind` faithfully and
+    # STORES 'alert' passed — while durable misclassification of a VoIP token is
+    # this PR's central failure mode. The storage assertion exists in
+    # test_token_kind.py, but this test names the ROUTER round trip and has to
+    # discriminate the router-to-service leg itself.
+    row = (await session.execute(
+        select(DeviceToken).where(DeviceToken.token == "j" * 64))).scalar_one()
+    assert row.token_kind == "voip", (
+        "the router echoed voip but the row stored "
+        f"{row.token_kind!r} — the echo is not evidence of storage")
+
+async def test_the_registration_response_names_the_token_kind(client, session):
+    """The 201 body grew a third field. It echoes the RESOLVED kind for the same
+    stated reason `apns_environment` is echoed: a client that sent nothing learns
+    what the island picked, which is the only way it can notice a mismatch with
+    the build it actually is — and, measured, the only way an app shipping
+    `token_kind` against an un-deployed island learns the field was discarded."""
+    alice = await _user(session, "kindalice")
+    resp = await client.post("/v1/devices", headers=_headers(alice),
+                             json={"platform": "apns", "token": "k" * 64})
+    assert resp.status_code == 201
+    assert resp.json()["token_kind"] == "alert"
+
+
+# ---------------------------------------------------------------------------
+# THE DOCUMENT, NOT JUST THE BODY (Tesla, cage-match PR#170 r5).
+#
+# `RegisterDeviceResp` exists BECAUSE an untyped `-> dict` made the OpenAPI half of
+# the desync detector undetectable: the 201 was `{"additionalProperties": true}` and
+# `RegisterDeviceReq` was the only schema in the document carrying `token_kind`. The
+# app tab stated it will verify against `openapi.json` before wiring its first VoIP
+# registration.
+#
+# Nothing in this suite read that document. Revert the return annotation to `dict`,
+# keep the same keys in the body, and every runtime test above stays green — so the
+# round-1 fix for "this contract is not assertable" was itself not asserted. That is
+# the same class this PR has now found ten times, at the highest level it can occur:
+# the guard is unguarded.
+# ---------------------------------------------------------------------------
+
+
+def test_the_openapi_document_types_the_registration_echo() -> None:
+    """Locks the CONTRACT the app tab verifies against, not the runtime body."""
+    from aiko_gateway.main import app
+
+    doc = app.openapi()
+    schemas = doc["components"]["schemas"]
+
+    # THE ENDPOINT'S 201 MUST POINT AT IT — not merely "the component exists"
+    # (Maxwell, self-strike PR#170 r6). A component only appears in
+    # components.schemas because something references it, so the weaker assertion
+    # happens to work today for exactly one reason: this is the only route using
+    # RegisterDeviceResp. The day a second route references it, the model could be
+    # detached from THIS endpoint and the weaker check would stay green. The
+    # contract the app tab reads is the 201 of POST /v1/devices, so that is what
+    # gets asserted.
+    ref_201 = (doc["paths"]["/v1/devices"]["post"]["responses"]["201"]
+               ["content"]["application/json"]["schema"].get("$ref", ""))
+    assert ref_201.endswith("/RegisterDeviceResp"), (
+        f"POST /v1/devices' 201 does not reference RegisterDeviceResp — it is "
+        f"{ref_201 or 'untyped'}. openapi.json therefore cannot tell a client that "
+        "the island resolves and RETURNS a token_kind, only that it accepts one.")
+
+    assert "RegisterDeviceResp" in schemas, (
+        "the 201 response is untyped — openapi.json cannot tell a client that the "
+        "island resolves and RETURNS a token_kind, only that it accepts one. That "
+        "is exactly the half the app tab said it would check.")
+
+    props = schemas["RegisterDeviceResp"]["properties"]
+    assert "token_kind" in props, (
+        f"RegisterDeviceResp does not carry token_kind: {sorted(props)}")
+
+    # EVERY closed set typed, not just the new one — a contract that says
+    # `platform: Platform` inbound and `platform: string` outbound has to be read
+    # twice, and this repo's rule is that a closed set is never a String.
+    for field, schema_name in (("platform", "Platform"),
+                               ("apns_environment", "ApnsEnvironment"),
+                               ("token_kind", "TokenKind")):
+        ref = props[field].get("$ref") or "".join(
+            a.get("$ref", "") for a in props[field].get("anyOf", []))
+        assert schema_name in ref, (
+            f"RegisterDeviceResp.{field} is not typed as {schema_name} in the "
+            f"document — it resolved to {props[field]!r}")
