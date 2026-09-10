@@ -38,7 +38,7 @@ import sqlalchemy as sa
 from aiko_gateway.domain.models import (
     ApnsEnvironment, Channel, ChannelKind, DeviceToken, Membership, TokenKind,
 )
-from aiko_gateway.domain.push_result import ReapOrder
+from aiko_gateway.domain.push_result import ReapOrder, SendResult, Verdict
 
 CHANNEL = "01JDMCHANNELDM000000000000"
 
@@ -85,18 +85,23 @@ class FakeApns:
         # contract has drifted from the real API tests a system that does not
         # exist — this one drifted once already, when send() grew SendResult, and
         # the suite caught it immediately because every test goes through here.
-        # MIRRORS `apns._reap_order` EXACTLY, including its refusal: a DEAD_TOKEN
-        # with no timestamp issues NO ORDER AT ALL, because for Apple the
-        # timestamp is the only evidence separating "dead" from "was dead before
-        # the reinstall". A fake that issued a dateless order here would be
-        # modelling FCM's rule while wearing Apple's name, and the no-reap-order
-        # test would pass against a transport that reaps on weaker evidence than
-        # Apple's protocol supports.
-        reap = None
-        if (self.verdict is apns.Verdict.DEAD_TOKEN
-                and self.invalid_since_ms is not None):
-            reap = ReapOrder(dt.datetime.fromtimestamp(
-                self.invalid_since_ms / 1000, tz=dt.UTC))
+        # CALLS the real rule rather than MIRRORING it (Tesla, cage-match PR#172
+        # r2). This block used to re-implement `apns._reap_order` line for line, and
+        # said so in a comment that read as a virtue — "MIRRORS apns._reap_order
+        # EXACTLY". A mirror is not an independent instrument: the fake and the
+        # function shared a representation, so they could not fail differently.
+        # If `_reap_order` ever started returning `ReapOrder()` — the DESTRUCTIVE
+        # default, a dateless order authorising an unbounded delete — for a
+        # timestamp-less 410, this fake would keep returning None and every
+        # reap-refusal test in the suite would stay green while the island emptied
+        # the device table. The one behaviour these tests exist to protect is the
+        # one a duplicated rule cannot check.
+        #
+        # Deriving from the production function makes that change PROPAGATE into
+        # the tests instead of being hidden by them. The fake still owns the INPUT
+        # (`invalid_since_ms` — Apple's units, converted by the real code, which is
+        # where the rule lives); it no longer owns the DECISION.
+        reap = apns._reap_order(self.verdict, self.invalid_since_ms)
         return apns.SendResult(self.verdict, reap)
 
 
@@ -1014,8 +1019,7 @@ async def test_a_wake_that_delivered_to_nobody_is_logged_at_error(
     per-device warnings and no statement anywhere that the ring failed."""
     alice, bob = dm
     fake_apns.verdict = apns.Verdict.REJECTED
-    with caplog.at_level(logging.ERROR, logger="aiko_gateway.push"):
-        await _wake(sender_id=alice.id)
+    await _wake(sender_id=alice.id)
     assert any("delivered_to=0" in r.message and r.levelname == "ERROR"
                for r in caplog.records), caplog.text
 
@@ -1285,14 +1289,31 @@ async def test_a_stalled_fcm_send_does_not_delay_the_apns_ring(
         raise RuntimeError("google is blackholed")
 
     async def _timed_apns(*a, **kw):
+        # CONSTRUCT FIRST, RECORD SECOND — the ordering is the guard (Tesla,
+        # cage-match PR#172 r2). This read the other way round, and `SendResult` /
+        # `Verdict` were imported only INSIDE a fake class further up the file, so
+        # every run raised `NameError` on the return. `_send_one`'s broad
+        # `except Exception` swallowed it as "wake failed for one device" — and
+        # because the stopwatch had ALREADY been written on the previous line, both
+        # assertions below passed. For two full rounds this test, whose entire
+        # subject is that Apple gets rung, never once observed Apple being rung.
+        #
+        # Nothing about the assertions needed changing: recording the measurement
+        # AFTER the fallible work is what makes `"at" in reached` mean "the send
+        # actually completed" instead of "we got as far as looking at the clock".
+        # A stopwatch that stops before the explosion is not proof of a ring.
+        result = SendResult(verdict=Verdict.DELIVERED)
         reached["at"] = time.monotonic() - t0
-        return SendResult(verdict=Verdict.DELIVERED)
+        return result
 
     monkeypatch.setattr(fcm, "send", _stalled_fcm)
     monkeypatch.setattr(apns, "send", _timed_apns)
     await _wake(sender_id=alice.id)
 
-    assert "at" in reached, "the APNs send never happened at all"
+    assert "at" in reached, (
+        "the APNs send never completed at all. Because the fake now records the "
+        "clock AFTER constructing its result, this assertion fails on a swallowed "
+        "transport exception instead of sailing past one")
     assert reached["at"] < 0.2, (
         f"the APNs ring waited {reached['at']:.2f}s on the stalled FCM send — "
         "the fanout has regressed to serial dispatch. A ring that arrives after "

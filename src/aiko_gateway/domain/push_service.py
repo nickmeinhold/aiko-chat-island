@@ -417,8 +417,28 @@ def plan_deliveries(
                     # (data-only at HIGH priority), not of the token. A naive
                     # "prefer voip" rule applied across both platforms would
                     # deselect every Android row — the zero-ring failure.
-                    deliveries.append(
-                        FcmDelivery(row.id, row.token, row.updated_at))
+                    #
+                    # BUT NOT REGARDLESS OF `wake` (Tesla, cage-match PR#172 r2).
+                    # This arm appended for ANY WakeKind while the APNs arm below
+                    # matches on it with a real fall-through. `WakeKind` was forged
+                    # precisely so that adding a member — a CALL_END cancel is the
+                    # named candidate — cannot silently inherit ring behaviour. That
+                    # protection existed on ONE platform: the day the enum grows,
+                    # iOS would skip pending a decision while Android sent a HIGH
+                    # data ring for a cancel, and `test_every_platform_token_kind_
+                    # wake_combination_is_routed` sweeps the full product and
+                    # REQUIRES a delivery for every member, so the instrument built
+                    # to force the decision would bless the asymmetry instead.
+                    #
+                    # Behaviour today is unchanged — CALL_INVITE is the only member.
+                    # What changes is what happens to the NEXT one: both platforms
+                    # now stop and ask.
+                    match wake:
+                        case WakeKind.CALL_INVITE:
+                            deliveries.append(
+                                FcmDelivery(row.id, row.token, row.updated_at))
+                        case _:
+                            skips.append((row.id, "wake_kind_not_routed_for_fcm"))
                 case Platform.APNS:
                     match (kind, wake):
                         case (TokenKind.VOIP, WakeKind.CALL_INVITE):
