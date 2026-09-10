@@ -1769,12 +1769,37 @@ def test_an_absent_fcm_credential_boots_fine():
     assert s.fcm_service_account_json == ""
 
 
-def test_a_well_formed_fcm_credential_boots():
-    """The positive control for every rung below: if this ever stops booting, the
-    four refusals become vacuous."""
-    s = Settings(_env_file=None, environment="dev", jwt_secret=_DEV_JWT_SECRET,
+def test_a_well_formed_fcm_credential_is_REFUSED_until_android_can_receive():
+    """A credential the ladder ACCEPTS must still be refused at boot (Carnot,
+    cage-match PR#172 r2).
+
+    This test asserted the opposite until round 2 — that a well-formed credential
+    boots — and that was the honest reading of the code at the time. The gate
+    against provisioning lived only in `fcm.build_message`'s docstring, and prose
+    does not gate: hours after that docstring was written, this repo's own operator
+    provisioned the credential on both islands and called it a fix. The failure it
+    guards is SILENT (FCM 200, `verdict=delivered`, quiet alarm, dead handset), so
+    nothing downstream would have reported the mistake either.
+
+    WHY THIS DISCRIMINATES: it uses a credential the FCM ladder fully accepts, so
+    the refusal cannot be coming from a shape complaint. Deleting the guard makes
+    this test go green again — which is exactly what lifting it should look like
+    when the Android receive half lands.
+
+    The message is asserted, not just the raise: a generic ValueError from any other
+    validator in this file would satisfy `pytest.raises` alone and tell us nothing
+    about WHICH rule fired.
+    """
+    with pytest.raises(ValidationError) as excinfo:
+        Settings(_env_file=None, environment="dev", jwt_secret=_DEV_JWT_SECRET,
                  fcm_service_account_json=_credential())
-    assert "aiko-island-test" in s.fcm_service_account_json
+    message = str(excinfo.value)
+    assert "no receive half" in message, (
+        f"the refusal must name the REASON — an island operator reading it needs to "
+        f"know this is a missing client capability, not a malformed key. Got: {message}")
+    assert "verdict=delivered" in message, (
+        "the refusal must name the silent-false-success failure mode, because that "
+        "is the whole argument for refusing a credential that is otherwise valid")
 
 
 def test_a_multi_line_fcm_credential_refuses_to_boot():

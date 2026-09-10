@@ -899,6 +899,44 @@ class Settings(BaseSettings):
                     "to boot."
                 )
 
+        # THE ANDROID RECEIVE HALF DOES NOT EXIST, SO THE CREDENTIAL IS REFUSED —
+        # a boot error, not a docstring (Carnot, cage-match PR#172 r2).
+        #
+        # `fcm.build_message` documents, with measurements against ../aiko_chat_app,
+        # that today's client consumes NEITHER half of a data-only wake: its only
+        # Android push consumer is a tray-TAP handler, and a data-only message
+        # produces no tray entry. So with a credential present FCM answers 200,
+        # push_service logs `verdict=delivered`, the `delivered_to=0` alarm stays
+        # QUIET, and the handset does nothing. That is strictly worse than the loud
+        # `transport_not_built` skip it replaces: a false success where there was an
+        # honest failure, and the island's own alarms are structurally blind to it.
+        #
+        # WHY THIS IS A GUARD AND NOT A COMMENT. It WAS a comment — `fcm.py` carries
+        # a HARD GATE in capitals saying do not provision. Hours after it was
+        # written, this repo's own operator provisioned the credential on both
+        # islands anyway and described it as fixing a dark capability. Prose does not
+        # gate; it only records an intention for whoever already agrees. The failure
+        # it guards against is SILENT, so nothing downstream would have reported the
+        # mistake either.
+        #
+        # Same shape as the `island_mode == E2EE` refusal directly below, and for the
+        # same reason: a capability whose consumer does not exist yet must be
+        # UNREPRESENTABLE, not merely discouraged. Lifting this is one deletion, and
+        # it belongs in the change that lands the Android receive half — where a
+        # reviewer will be looking at exactly this question.
+        if self.fcm_service_account_json:
+            raise ValueError(
+                "FCM_SERVICE_ACCOUNT_JSON is set, but this island refuses to boot "
+                "with it: the Android client has no receive half yet (no background "
+                "message handler, no notification permission, no full-screen "
+                "intent), so every FCM send would return 200 and ring nothing while "
+                "the island logged `verdict=delivered`. A silent false success is "
+                "worse than the loud `transport_not_built` skip you get without a "
+                "credential. Unset it. This guard is lifted by the change that "
+                "ships the Android receive half — see claude-tasks#4199 for the "
+                "reaper question that must also be answered first."
+            )
+
         # A2 (crucible-09 Phase A): `e2ee` is schema-reserved for Phase B and
         # HARD-REJECTED in EVERY environment until MLS lands. Advertising an
         # unimplemented E2EE mode would be the exact mislabel this feature prevents
