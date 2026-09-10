@@ -510,9 +510,135 @@ def test_the_0025_column_is_wide_enough_for_every_member():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
 
+    from aiko_gateway.domain.models import DeviceToken
+
     longest = max(len(m.value) for m in TokenKind)
+
+    # THE ARM THIS TEST WAS MISSING (Carnot + Tesla, cage-match PR#170 r2). It
+    # asserted only the MIGRATION's width, so `models.py` regressing to String(8)
+    # left it green — a check whose outcome was independent of one of the two
+    # things its own name claims to cover. Three closed-set clocks exist here
+    # (enum, CHECK, VARCHAR width) and only two pairs were ever compared.
+    model_width = DeviceToken.__table__.c.token_kind.type.length
+    assert model_width == mod._KIND_WIDTH, (
+        f"the ORM column is String({model_width}) and revision 0025 writes "
+        f"String({mod._KIND_WIDTH}). SQLite does not enforce VARCHAR width so both "
+        "look fine where we run; Postgres does. Two declarations of one width is "
+        "the same duplicated-truth defect the CHECK parity test exists for.")
+    assert model_width >= longest, (
+        f"the ORM column String({model_width}) cannot hold the longest TokenKind "
+        f"value ({longest} chars).")
+
     assert mod._KIND_WIDTH >= longest, (
         f"_KIND_WIDTH={mod._KIND_WIDTH} cannot hold the longest TokenKind value "
         f"({longest} chars). On Postgres this truncates or errors; on SQLite it is "
         "silently ignored, which is why it would ship unnoticed."
     )
+
+
+# ---------------------------------------------------------------------------
+# RECOVERED BY THE SPLIT AUDIT (cage-match PR#170 round 2, Tesla).
+#
+# This test was written on the combined branch and MY SPLIT DROPPED IT: I carried
+# the source files and one test file across and never diffed the test SURFACE.
+# 0025 REBUILDS device_tokens via batch_alter_table, on a live table holding real
+# APNs tokens, and revision 0024 exists precisely because a rebuild can silently
+# re-default a column. Without this, `server_default='alert'` is a CLAIM about a
+# backfill that nothing had ever driven.
+# ---------------------------------------------------------------------------
+
+def test_rows_written_at_0024_read_alert_at_0025(tmp_path, monkeypatch) -> None:
+    """`server_default='alert'` IS THE BACKFILL, and this is the proof.
+
+    0023 needed a settings-aware UPDATE because its safe DDL default and its
+    honest per-island value DIFFERED. Here they are the same constant — the wire
+    contract says an absent `token_kind` means alert, and an existing row is
+    exactly a row whose client never declared one — so no data migration exists
+    and none is owed.
+
+    The island setting is flipped between the revisions on purpose, mirroring the
+    0024 test: 0025 must not read config at all, so nothing about the box may
+    change the answer. Without the flip this would pass for a migration that
+    re-derived the value from settings.
+    """
+    _, sync_url = _point_app_at(tmp_path, monkeypatch)
+    monkeypatch.setattr(settings, "apns_use_sandbox", True, raising=False)
+
+    command.upgrade(migrate._alembic_config(), "0024")  # stop one short
+    engine = create_engine(sync_url)
+    try:
+        with engine.begin() as conn:
+            conn.exec_driver_sql(
+                "INSERT INTO users "
+                "(id, username, aiko_username, display_name, created_at, kind) "
+                "VALUES ('01USERAAAAAAAAAAAAAAAAAAAA', 'u', 'u', 'U', "
+                "'2026-09-09T00:00:00+00:00', 'human')")
+            conn.exec_driver_sql(
+                "INSERT INTO device_tokens "
+                "(id, user_id, platform, token, apns_environment, created_at, "
+                " updated_at) VALUES "
+                "('01TOKENAAAAAAAAAAAAAAAAAAA', '01USERAAAAAAAAAAAAAAAAAAAA', "
+                "'apns', 'live-token', 'production', '2026-09-09T00:00:00+00:00', "
+                "'2026-09-09T00:00:00+00:00')")
+
+        monkeypatch.setattr(settings, "apns_use_sandbox", False, raising=False)
+        command.upgrade(migrate._alembic_config(), "0025")
+
+        with engine.connect() as conn:
+            kind, env = conn.exec_driver_sql(
+                "SELECT token_kind, apns_environment FROM device_tokens "
+                "WHERE id='01TOKENAAAAAAAAAAAAAAAAAAA'").one()
+
+        # The rebuild must not lose the neighbour column either — 0024's lesson
+        # was that a SQLite table rebuild is exactly where a value gets silently
+        # re-defaulted, and 0025 rebuilds the same table again.
+        assert kind == "alert", (
+            "a row that predates token_kind did not read as alert — the "
+            "server_default is not doing the backfill it was chosen for")
+        assert env == "production"
+
+        command.downgrade(migrate._alembic_config(), "0024")
+        with engine.connect() as conn:
+            cols = {r[1] for r in conn.exec_driver_sql(
+                "PRAGMA table_info(device_tokens)").fetchall()}
+            survived = conn.exec_driver_sql(
+                "SELECT apns_environment FROM device_tokens").scalar()
+    finally:
+        engine.dispose()
+    assert "token_kind" not in cols
+    assert survived == "production", (
+        "the downgrade rebuild lost a live row's environment")
+
+
+def test_the_migrated_ddl_actually_carries_the_check(tmp_path, monkeypatch) -> None:
+    """THE TUNING FORK HELD TO THE BELL, NOT THE SCORE (Tesla, PR#170 r2).
+
+    The parity test above compares two SOURCE literals. It would stay green if
+    `upgrade()` never applied the constraint at all — the 0025 docstring claims the
+    check is asserted "structurally in the migrated DDL", and until this test that
+    sentence was false. Revision 0024 DID inspect `sqlite_master`; this one did not
+    inherit the habit.
+
+    So: drive the real migration and read the constraint out of the database.
+    """
+    import sqlite3
+    from alembic import command
+    from aiko_gateway import migrate
+    from aiko_gateway.domain.models import TokenKind
+
+    _async_url, sync_url = _point_app_at(tmp_path, monkeypatch)
+    command.upgrade(migrate._alembic_config(), "head")
+
+    con = sqlite3.connect(sync_url.replace("sqlite:///", ""))
+    ddl = con.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='device_tokens'"
+    ).fetchone()[0]
+    con.close()
+
+    assert "ck_device_tokens_token_kind" in ddl, (
+        "the migrated device_tokens table carries no token_kind CHECK — the "
+        "constraint the parity test compares literals about never reached the DB")
+    for member in TokenKind:
+        assert f"'{member.value}'" in ddl, (
+            f"the migrated CHECK does not admit {member.value!r}; the DDL is "
+            f"{ddl!r}")

@@ -74,9 +74,18 @@ class RegisterDeviceResp(BaseModel):
     breaks no schema and no test. A desync detector whose own presence is
     undetectable is not a detector. Typing it makes the contract assertable."""
 
+    # EVERY closed set typed, not just the new one (Maxwell, cage-match PR#170 r2).
+    # The first version of this model typed `token_kind` and left `platform` and
+    # `apns_environment` as bare strings — one screen below a request model that
+    # types both as enums and says why: "so an out-of-set value is a 422 at the
+    # boundary, not a silent store the DB CHECK would later reject with a 500."
+    # The response half then described those same closed sets as free strings in
+    # openapi.json, so a generated client saw `platform: string` on the way out and
+    # `platform: Platform` on the way in. A contract asymmetric about its own
+    # vocabulary is a contract that has to be read twice.
     id: str
-    platform: str
-    apns_environment: str
+    platform: Platform
+    apns_environment: ApnsEnvironment
     token_kind: TokenKind
 
 
@@ -100,9 +109,17 @@ async def register_device(
     # vanished, the row stored 'alert', and every VoIP push then went to a token
     # that is not a VoIP token — a 400, never reaped, no error, no ring. The echo
     # is how the app learns it sent `voip` and got back `alert`.
+    # FAIL CLOSED on an out-of-set stored value, deliberately (Maxwell r2). These
+    # constructors raise ValueError -> 500 if a row somehow holds a value outside
+    # the enum, where the old untyped dict would have echoed it through. That is
+    # only reachable by downgrading from a future revision that added a member, and
+    # a 500 on REGISTRATION is the honest outcome: the alternative is handing a
+    # client a value its own enum cannot parse and letting it decide, which is how
+    # a desync detector becomes a desync source. Written down as a choice rather
+    # than left as an accident of the constructor.
     return RegisterDeviceResp(
-        id=row.id, platform=row.platform,
-        apns_environment=row.apns_environment,
+        id=row.id, platform=Platform(row.platform),
+        apns_environment=ApnsEnvironment(row.apns_environment),
         token_kind=TokenKind(row.token_kind))
 
 

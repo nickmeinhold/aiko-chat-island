@@ -173,3 +173,30 @@ async def test_account_deletion_purges_device_tokens(session):
     await accounts_service.delete_user_account(session, alice.id)
     assert await devices_service.tokens_for_user(session, alice.id) == []
     assert await users_service.get_by_id(session, alice.id) is None
+
+
+# --- Recovered by the split audit (cage-match PR#170 round 2) ---------------
+# Router-level token_kind coverage, written on the combined branch and dropped
+# when this piece was split out.
+
+async def test_a_voip_registration_round_trips_through_the_router(client, session):
+    """The router's own arm of the token-kind wire (the service-level and
+    DB-level arms live in `test_token_kind.py`)."""
+    bob = await _user(session, "kindbob")
+    resp = await client.post(
+        "/v1/devices", headers=_headers(bob),
+        json={"platform": "apns", "token": "j" * 64, "token_kind": "voip"})
+    assert resp.status_code == 201
+    assert resp.json()["token_kind"] == "voip"
+
+async def test_the_registration_response_names_the_token_kind(client, session):
+    """The 201 body grew a third field. It echoes the RESOLVED kind for the same
+    stated reason `apns_environment` is echoed: a client that sent nothing learns
+    what the island picked, which is the only way it can notice a mismatch with
+    the build it actually is — and, measured, the only way an app shipping
+    `token_kind` against an un-deployed island learns the field was discarded."""
+    alice = await _user(session, "kindalice")
+    resp = await client.post("/v1/devices", headers=_headers(alice),
+                             json={"platform": "apns", "token": "k" * 64})
+    assert resp.status_code == 201
+    assert resp.json()["token_kind"] == "alert"
