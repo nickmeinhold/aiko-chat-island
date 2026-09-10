@@ -217,14 +217,24 @@ async def test_an_empty_environment_is_rejected_not_defaulted(session):
     to have proven a database boundary, so the test was green for a reason it did
     not name. The PROPERTY under test is unchanged and still holds — an empty
     string is never coerced to the island default — but it is enforced one layer
-    earlier than the prose said. Pinned to AttributeError so the test goes red if
-    the edge ever starts swallowing bare strings and defaulting them.
+    earlier than the prose said. Pinned to the exception type so the test goes red
+    if the edge ever starts swallowing bare strings and defaulting them.
+
+    UPDATED 2026-09-10 (cage-match PR#170 r6), AND THE RED WAS THIS TEST WORKING.
+    `register_device` now REFUSES a non-enum `apns_environment` explicitly, so the
+    failure moved from an accidental `AttributeError` off `.value` to a deliberate
+    `TypeError` naming the parameter. The previous pin was written precisely to go
+    red when this edge changed, and it did — on the same day the edge was changed
+    for the better. The property is unchanged and now enforced ON PURPOSE rather
+    than as a side effect of attribute access, which is what the earlier correction
+    said was missing. Pinned to TypeError, and to the parameter name, so a future
+    guard that fails for some other reason still cannot pass silently.
 
     (The genuine DB-CHECK boundary is covered separately, by
     test_db_check_rejects_an_out_of_set_environment, which writes raw SQL and
     asserts the constraint name in the error.)"""
     ivan = await _user(session, "ivan")
-    with pytest.raises(AttributeError):
+    with pytest.raises(TypeError, match="apns_environment"):
         await devices_service.register_device(
             session, user_id=ivan.id, platform="apns", token="i" * 64,
             apns_environment="")  # type: ignore[arg-type]

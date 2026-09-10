@@ -235,7 +235,23 @@ def test_the_openapi_document_types_the_registration_echo() -> None:
     """Locks the CONTRACT the app tab verifies against, not the runtime body."""
     from aiko_gateway.main import app
 
-    schemas = app.openapi()["components"]["schemas"]
+    doc = app.openapi()
+    schemas = doc["components"]["schemas"]
+
+    # THE ENDPOINT'S 201 MUST POINT AT IT — not merely "the component exists"
+    # (Maxwell, self-strike PR#170 r6). A component only appears in
+    # components.schemas because something references it, so the weaker assertion
+    # happens to work today for exactly one reason: this is the only route using
+    # RegisterDeviceResp. The day a second route references it, the model could be
+    # detached from THIS endpoint and the weaker check would stay green. The
+    # contract the app tab reads is the 201 of POST /v1/devices, so that is what
+    # gets asserted.
+    ref_201 = (doc["paths"]["/v1/devices"]["post"]["responses"]["201"]
+               ["content"]["application/json"]["schema"].get("$ref", ""))
+    assert ref_201.endswith("/RegisterDeviceResp"), (
+        f"POST /v1/devices' 201 does not reference RegisterDeviceResp — it is "
+        f"{ref_201 or 'untyped'}. openapi.json therefore cannot tell a client that "
+        "the island resolves and RETURNS a token_kind, only that it accepts one.")
 
     assert "RegisterDeviceResp" in schemas, (
         "the 201 response is untyped — openapi.json cannot tell a client that the "

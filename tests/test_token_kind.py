@@ -29,7 +29,7 @@ from sqlalchemy.exc import IntegrityError
 
 from aiko_gateway.domain import devices_service, security, users_service
 from sqlalchemy import select
-from aiko_gateway.domain.models import DeviceToken, TokenKind
+from aiko_gateway.domain.models import ApnsEnvironment, DeviceToken, TokenKind
 from aiko_gateway.rest import devices as device_routes
 from aiko_gateway.rest.deps import get_session
 
@@ -296,3 +296,34 @@ async def test_an_fcm_row_stores_whatever_kind_it_declared(client, session):
     row = (await session.execute(
         select(DeviceToken).where(DeviceToken.token == "f" * 100))).scalar_one()
     assert row.token_kind == "voip", "the stored row must match the echo"
+
+
+# --- BOTH enum parameters fail the same way (Carnot, cage-match PR#170 r6) -----
+# The token_kind guard landed in r4 and its sibling in the same function kept the
+# old accidental AttributeError. Enforcing a stated rule asymmetrically means a
+# reader cannot tell which parameters are guarded without reading all of them.
+
+
+@pytest.mark.parametrize("kwargs, name", [
+    ({"token_kind": "voip"}, "token_kind"),
+    ({"apns_environment": "sandbox"}, "apns_environment"),
+])
+async def test_a_bare_string_is_refused_at_the_service_boundary(
+    session, kwargs, name
+):
+    """RED-proven by removing either guard: the other arm stays green, which is
+    exactly how the asymmetry survived a round."""
+    user = await _user(session, f"guard-{name}")
+    with pytest.raises(TypeError, match=name):
+        await devices_service.register_device(
+            session, user_id=user.id, platform="apns", token="g" * 64, **kwargs)
+
+
+async def test_both_enum_parameters_are_accepted_as_enums(session):
+    """The positive control — without it the arms above would pass for a function
+    that rejected every call."""
+    user = await _user(session, "guard-ok")
+    row = await devices_service.register_device(
+        session, user_id=user.id, platform="apns", token="h" * 64,
+        token_kind=TokenKind.VOIP, apns_environment=ApnsEnvironment.SANDBOX)
+    assert row.token_kind == "voip" and row.apns_environment == "sandbox"

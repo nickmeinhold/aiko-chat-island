@@ -108,6 +108,19 @@ async def register_device(
     function because its default is a per-island fact; ``token_kind``'s default is
     a CONSTANT that is part of the wire contract, and a per-island setting would
     permit an island whose absent-means-voip."""
+    # BOTH enum parameters fail the SAME way (Carnot, cage-match PR#170 r6). The
+    # token_kind guard below was added in r4 and this sibling was left with the old
+    # accidental AttributeError from deep inside the service — one instance fixed,
+    # its twin in the same function untouched. The docstring argues both are
+    # enum-typed closed sets, so enforcing that asymmetrically means a reader
+    # cannot tell which parameters are actually guarded without reading both.
+    if apns_environment is not None and not isinstance(apns_environment,
+                                                       ApnsEnvironment):
+        raise TypeError(
+            f"apns_environment must be an ApnsEnvironment, got "
+            f"{type(apns_environment).__name__} ({apns_environment!r}). Same rule "
+            "as token_kind below: a closed set has one definition, and a bare "
+            "string here would reach the DB as an unvalidated value.")
     declared = apns_environment.value if apns_environment is not None else None
     resolved = declared if declared is not None else default_apns_environment()
     # FAIL LOUDLY AND AT THE BOUNDARY on a non-enum (Carnot, cage-match PR#170).
