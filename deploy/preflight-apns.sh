@@ -48,7 +48,14 @@ env_file="${1:?usage: preflight-apns.sh <path-to-.env>}"
 # needs one, exec the check inside the running container and use the island's OWN
 # dotenv rather than growing a third parser here.
 set_keys=(); missing_keys=()
-for k in APNS_KEY_ID APNS_TEAM_ID APNS_TOPIC APNS_PRIVATE_KEY; do
+# APNS_VOIP_TOPIC joined this list in the SAME change that added it to config.py's
+# all-or-none guard (design 12 Decision 3; Nick, 2026-09-10). That pairing is the
+# whole safety property: an existing box carries the other four, so the guard alone
+# would turn the next version bump into a boot refusal under `restart: always`. This
+# check runs before the backup and before anything is pulled, so the operator reads
+# a message with the island still up. The two files are one mechanism; never extend
+# the guard without extending this loop.
+for k in APNS_KEY_ID APNS_TEAM_ID APNS_TOPIC APNS_PRIVATE_KEY APNS_VOIP_TOPIC; do
   # Present AND non-blank. config.py restores absence for a whitespace-only value
   # (claude-tasks#3358), so a key with a blank value is "unset" to the island and must
   # not count as partially-configured here either — otherwise this preflight would

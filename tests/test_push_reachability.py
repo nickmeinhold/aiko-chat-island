@@ -18,6 +18,15 @@ there is no such state: an APNs auth key (`.p8`) is environment-AGNOSTIC — the
 key authenticates against both hosts, proven 2026-08-23 — so a configured island can
 reach a sandbox token and a production token alike. Reporting "reachable for
 sandbox" separately would be a mechanism for a condition that cannot occur.
+
+WHAT IS NOW HERE, AND WHY THE ARGUMENT ABOVE DOES NOT COVER IT. Per-PLATFORM
+reachability is a genuinely different question from per-ENVIRONMENT, and the
+`.p8`-is-environment-agnostic reasoning says nothing about it. With two
+transports the old report lied in BOTH directions: an APNs-configured island
+counted its Android rows as REACHABLE (the #3397 failure in a new direction), and
+an FCM-only island would report every row unreachable AND fire the boot warning
+on every healthy boot — the warning-nobody-reads that
+`test_startup_is_silent_when_there_is_nothing_to_say` exists to prevent.
 """
 from __future__ import annotations
 
@@ -41,18 +50,49 @@ async def _user_with_devices(session, n: int):
     return user
 
 
+FCM_CREDENTIAL = (
+    '{"type":"service_account","project_id":"aiko-island-test",'
+    '"private_key_id":"0123456789abcdef",'
+    '"private_key":"-----BEGIN PRIVATE KEY-----\\nx\\n-----END PRIVATE KEY-----\\n",'
+    '"client_email":"island@aiko-island-test.iam.gserviceaccount.com"}'
+)
+
+
+async def _user_with_android(session, n: int, *, username: str = "bob"):
+    user = await users_service.create_user(
+        session, username=username, display_name=username.title(), password="pw")
+    for i in range(n):
+        session.add(DeviceToken(user_id=user.id, platform="fcm",
+                                token=f"fcm-{username}-{i}" + "z" * 80))
+    await session.commit()
+    return user
+
+
 @pytest.fixture
 def configured(monkeypatch):
+    """APNs configured, FCM not — the shape of both live islands today."""
     for k, v in (("apns_key_id", "ABCDE12345"), ("apns_team_id", "TEAMID1234"),
                  ("apns_topic", "cc.example.app"),
                  ("apns_private_key", "-----BEGIN PRIVATE KEY-----")):
         monkeypatch.setattr(settings, k, v, raising=False)
+    monkeypatch.setattr(settings, "fcm_service_account_json", "", raising=False)
+
+
+@pytest.fixture
+def fcm_only(monkeypatch):
+    """FCM configured, APNs not — a legitimate, bootable deployment (config.py's
+    all-or-none guard makes APNs-absent a supported state)."""
+    for k in ("apns_key_id", "apns_team_id", "apns_topic", "apns_private_key"):
+        monkeypatch.setattr(settings, k, "", raising=False)
+    monkeypatch.setattr(settings, "fcm_service_account_json", FCM_CREDENTIAL,
+                        raising=False)
 
 
 @pytest.fixture
 def unconfigured(monkeypatch):
     for k in ("apns_key_id", "apns_team_id", "apns_topic", "apns_private_key"):
         monkeypatch.setattr(settings, k, "", raising=False)
+    monkeypatch.setattr(settings, "fcm_service_account_json", "", raising=False)
 
 
 # ------------------------------------------------------------------ the report
@@ -65,7 +105,8 @@ async def test_unconfigured_island_holding_tokens_reports_them_unreachable(
     await _user_with_devices(session, 2)
     report = await push_service.reachability(session)
     assert report == {"configured": False, "registered_devices": 2,
-                      "unreachable_devices": 2}
+                      "unreachable_devices": 2,
+                      "unreachable_by_platform": {"apns": 2}}
 
 
 async def test_unconfigured_island_with_no_tokens_is_not_a_problem(
@@ -76,18 +117,57 @@ async def test_unconfigured_island_with_no_tokens_is_not_a_problem(
     every operator learns to ignore, which is worse than no signal."""
     report = await push_service.reachability(session)
     assert report == {"configured": False, "registered_devices": 0,
-                      "unreachable_devices": 0}
+                      "unreachable_devices": 0, "unreachable_by_platform": {}}
 
 
 async def test_configured_island_reaches_every_token_it_holds(session, configured):
-    """Configured means reachable for EVERY token, sandbox and production alike:
-    the .p8 authenticates against both hosts. There is no partial-reachability
-    state to report, and inventing one would be a mechanism for an impossible
-    condition."""
+    """Configured means reachable for EVERY token of that transport, sandbox and
+    production alike: the .p8 authenticates against both hosts. There is no
+    partial-ENVIRONMENT reachability state to report, and inventing one would be a
+    mechanism for an impossible condition."""
     await _user_with_devices(session, 3)
     report = await push_service.reachability(session)
     assert report == {"configured": True, "registered_devices": 3,
-                      "unreachable_devices": 0}
+                      "unreachable_devices": 0, "unreachable_by_platform": {}}
+
+
+async def test_an_apns_island_counts_its_android_rows_as_unreachable(
+    session, configured
+):
+    """THE #3397 FAILURE IN A NEW DIRECTION. Before this the count had NO
+    platform predicate, so an APNs-configured island holding Android rows
+    reported them REACHABLE — a deaf handset with every signal reading healthy,
+    which is precisely the four-hour investigation this surface exists to end."""
+    await _user_with_devices(session, 1)
+    await _user_with_android(session, 2)
+    report = await push_service.reachability(session)
+    assert report["registered_devices"] == 3
+    assert report["unreachable_devices"] == 2
+    assert report["unreachable_by_platform"] == {"fcm": 2}
+
+
+async def test_an_fcm_only_island_reaches_its_android_rows(session, fcm_only):
+    """THE MIRROR, and the arm that stops "unreachable" collapsing back into
+    "APNs is off". An FCM-only island reaching its Android handsets is a healthy
+    island."""
+    await _user_with_android(session, 2)
+    report = await push_service.reachability(session)
+    assert report == {"configured": True, "registered_devices": 2,
+                      "unreachable_devices": 0, "unreachable_by_platform": {}}
+
+
+# NO TEST FOR THE UNKNOWN-PLATFORM ARM, and the absence is deliberate.
+# `reachability` fails CLOSED on a stored platform outside the enum (an unknown
+# string counts as unreachable rather than reachable), but that state is
+# UNREPRESENTABLE through the database: `ck_device_tokens_platform` is rendered
+# FROM the enum by `_in_check`, so an INSERT or UPDATE carrying 'martian' is
+# refused — verified, not assumed. The branch is reachable only if the enum
+# SHRINKS in a later release while old rows persist.
+#
+# Kept in the code because it costs one `try` and guessing "reachable" for a
+# device nothing can send to is the one direction this surface exists to prevent;
+# given no test because a test that cannot create the failure cannot clear it —
+# the same reasoning `push_service` applies to its `is_private` arm.
 
 
 # ------------------------------------------------------- the startup log line
@@ -116,6 +196,37 @@ async def test_startup_is_silent_when_there_is_nothing_to_say(
     with caplog.at_level("WARNING"):
         await push_service.warn_if_unreachable(session)
     assert not [r for r in caplog.records if r.levelname == "WARNING"], caplog.text
+
+
+async def test_an_fcm_only_island_with_android_rows_is_silent_at_boot(
+    session, fcm_only, caplog
+):
+    """THE NULL ARM THAT MUST NOT REGRESS. A per-platform report computed the
+    naive way — "configured" meaning APNs — would fire this warning on every boot
+    of a perfectly healthy Android-serving island."""
+    await _user_with_android(session, 3)
+    with caplog.at_level("WARNING"):
+        await push_service.warn_if_unreachable(session)
+    assert not [r for r in caplog.records if r.levelname == "WARNING"], caplog.text
+
+
+async def test_an_apns_island_with_android_rows_warns_and_names_fcm(
+    session, configured, caplog
+):
+    """The message has to name the variable the operator must set AND the place
+    it silently fails to arrive: `deploy/update.sh` pulls the image and never
+    syncs the box's `docker-compose.yml` (#2301), so a value set in `.env` can be
+    inert in production with nothing anywhere saying so. That clause turns a
+    four-hour investigation into a grep, and it is the only mitigation available
+    for the one deploy gap nothing mechanical closes."""
+    await _user_with_android(session, 2)
+    with caplog.at_level("WARNING"):
+        await push_service.warn_if_unreachable(session)
+    text = caplog.text
+    assert "FCM_SERVICE_ACCOUNT_JSON" in text, text
+    assert "#2301" in text, text
+    assert "APNS_KEY_ID" not in text, (
+        "the APNs arm fired on an island whose APNs transport is healthy")
 
 
 # -------------------------------------------------------------------- /health

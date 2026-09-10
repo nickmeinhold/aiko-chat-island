@@ -1724,3 +1724,191 @@ def test_the_identity_vars_are_forwarded_by_compose():
     env = _chat_island_environment()
     for var in ("ISLAND_ID", "ISLAND_DISPLAY_NAME", "ISLAND_SEED_PEERS"):
         assert var in env, f"{var} is not forwarded into the chat-island container"
+
+
+# --- FCM credential boot ladder (the Android transport) -------------------------
+#
+# WITHOUT THIS LADDER a malformed blob boots clean and then fails inside
+# push_service's broad `except` as "wake failed for one device" FOREVER — a deaf
+# island with a green /health, which is the invisible failure the APNs validator
+# exists to prevent, one transport over. The rungs mirror config.py's APNs ladder
+# exactly: present -> parseable -> right shape -> usable.
+
+import json as _json
+
+def _rsa_pem() -> str:
+    """A genuinely usable RSA key, generated rather than pasted. The last rung
+    actually LOADS the key, so a decorative string cannot satisfy it."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    return key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption()).decode()
+
+
+def _credential(**overrides) -> str:
+    blob = {
+        "type": "service_account",
+        "project_id": "aiko-island-test",
+        "private_key_id": "0123456789abcdef",
+        "private_key": _rsa_pem(),
+        "client_email": "island@aiko-island-test.iam.gserviceaccount.com",
+        "token_uri": "https://oauth2.googleapis.com/token",
+    }
+    blob.update(overrides)
+    return _json.dumps(blob)
+
+
+def test_an_absent_fcm_credential_boots_fine():
+    """THE ARM THAT PROTECTS EVERY ISLAND THAT WILL NEVER SET FCM — which is most
+    of them, and all of them today. A guard with only its failing arm cannot be
+    shown to have a passing one."""
+    s = Settings(_env_file=None, environment="dev", jwt_secret=_DEV_JWT_SECRET)
+    assert s.fcm_service_account_json == ""
+
+
+def test_a_well_formed_fcm_credential_boots():
+    """The positive control for every rung below: if this ever stops booting, the
+    four refusals become vacuous."""
+    s = Settings(_env_file=None, environment="dev", jwt_secret=_DEV_JWT_SECRET,
+                 fcm_service_account_json=_credential())
+    assert "aiko-island-test" in s.fcm_service_account_json
+
+
+def test_a_multi_line_fcm_credential_refuses_to_boot():
+    """SINGLE LINE, and it is not fussiness. TWO line-oriented readers of the same
+    .env already declare themselves broken on multi-line values — `dotenv_keys`
+    emits phantom keys for continuation lines, and `preflight-apns.sh` names
+    multi-line as unhandled and closes off growing a third parser. JSON has no
+    mandatory newlines, so requiring one line REMOVES the coupling instead of
+    guarding the window."""
+    with pytest.raises(ValidationError) as ei:
+        Settings(_env_file=None, environment="dev", jwt_secret=_DEV_JWT_SECRET,
+                 fcm_service_account_json=_json.dumps(
+                     _json.loads(_credential()), indent=2))
+    assert "jq -c" in str(ei.value), (
+        "the refusal did not name the one-line fix an operator can run")
+
+
+def test_an_unparseable_fcm_credential_refuses_to_boot():
+    """PRESENCE IS NOT PARSEABILITY, one transport over. A truncated paste boots
+    clean without this and then fails forever inside a swallowed background send."""
+    with pytest.raises(ValidationError) as ei:
+        Settings(_env_file=None, environment="dev", jwt_secret=_DEV_JWT_SECRET,
+                 fcm_service_account_json='{"type": "service_account", "proj')
+    assert "fcm_service_account_json" in str(ei.value)
+    assert "truncated paste" in str(ei.value), (
+        "the refusal did not name a cause an operator can act on")
+
+
+def test_a_wrong_shaped_fcm_credential_refuses_to_boot():
+    """A Firebase WEB config or `google-services.json` looks identical on disk —
+    the same hazard as an App Store Connect key pasted for a `.p8`."""
+    with pytest.raises(ValidationError) as ei:
+        Settings(_env_file=None, environment="dev", jwt_secret=_DEV_JWT_SECRET,
+                 fcm_service_account_json='{"apiKey":"x","projectId":"y"}')
+    assert "service_account" in str(ei.value)
+
+
+def test_an_fcm_credential_missing_a_required_field_refuses_to_boot():
+    for field in ("project_id", "client_email", "private_key"):
+        with pytest.raises(ValidationError) as ei:
+            Settings(_env_file=None, environment="dev", jwt_secret=_DEV_JWT_SECRET,
+                     fcm_service_account_json=_credential(**{field: ""}))
+        assert field in str(ei.value), f"the refusal did not name {field}"
+
+
+def test_an_ec_key_in_an_fcm_credential_refuses_to_boot():
+    """PARSEABLE IS NOT USABLE. FCM assertions are RS256; an EC key parses, is a
+    real private key, satisfies every presence check and can never sign one —
+    pushing the failure straight back into the swallowed background send path
+    this whole validator exists to keep it out of."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    key = ec.generate_private_key(ec.SECP256R1())
+    pem = key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption()).decode()
+    with pytest.raises(ValidationError) as ei:
+        Settings(_env_file=None, environment="dev", jwt_secret=_DEV_JWT_SECRET,
+                 fcm_service_account_json=_credential(private_key=pem))
+    assert "RS256" in str(ei.value)
+
+
+def test_the_fcm_ladder_does_not_fire_on_a_blank_island():
+    """The cross-field arm. `test_the_whole_rendered_compose_environment_boots` is
+    the only test in this repo that can see a guard firing on the stock all-blank
+    island; this states the same property directly so the failure names itself."""
+    s = Settings(_env_file=None, environment="dev", jwt_secret=_DEV_JWT_SECRET,
+                 fcm_service_account_json="   ")
+    assert s.fcm_service_account_json == "", (
+        "a whitespace-only credential must read as ABSENT — the compose forward is "
+        "`${FCM_SERVICE_ACCOUNT_JSON:-}` and an unset host var lands in the "
+        "container as the empty string, so blank has to mean off rather than "
+        "malformed")
+
+
+# --- The fifth APNs member (design 12 Decision 3; Nick, 2026-09-10) -----------
+# The guard half of the pairing tested in tests/test_deploy_preflight.py. Both
+# halves are needed: the preflight keeps a deploy from starting, this keeps a
+# mis-set box from lying about being configured.
+
+
+def _four_apns_keys() -> dict:
+    """Exactly what both live islands carried before 2026-09-10."""
+    return {
+        "APNS_KEY_ID": "ABC123DEFG",
+        "APNS_TEAM_ID": "TEAM123456",
+        "APNS_TOPIC": "cc.example.testapp",
+        "APNS_PRIVATE_KEY": _real_p8_pem(),
+    }
+
+
+def _real_p8_pem() -> str:
+    """A genuinely parseable EC key. `config.py` checks PRESENCE IS NOT PARSEABILITY
+    (cage-match #139), so a placeholder PEM fails the wrong guard and would make the
+    all-five arm below prove nothing about the member count."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    return ec.generate_private_key(ec.SECP256R1()).private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode()
+
+
+def test_todays_live_box_shape_refuses_to_boot(monkeypatch) -> None:
+    """THE DANGER, PINNED. Four keys and no VoIP topic is now a PARTIAL set, so the
+    island refuses to boot — which is why `deploy/preflight-apns.sh` had to gain the
+    same key in the same commit. This test is not asserting desirable behaviour; it
+    is asserting the cost that makes the preflight load-bearing."""
+    from aiko_gateway.config import Settings
+    for k, v in _four_apns_keys().items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.delenv("APNS_VOIP_TOPIC", raising=False)
+    with pytest.raises(ValueError, match="apns_voip_topic"):
+        Settings()
+
+
+def test_all_five_boots(monkeypatch) -> None:
+    """The positive control: the one operator action clears it and nothing else
+    changes. Without this arm the test above would pass on a Settings() that raised
+    for any reason at all."""
+    from aiko_gateway.config import Settings
+    for k, v in _four_apns_keys().items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setenv("APNS_VOIP_TOPIC", "cc.example.testapp.voip")
+    s = Settings()
+    assert s.apns_voip_topic == "cc.example.testapp.voip"
+
+
+def test_no_apns_keys_at_all_still_boots(monkeypatch) -> None:
+    """The all-or-NONE half. Adding a fifth member must not make a blank island —
+    the standup default, and the common case — start failing."""
+    from aiko_gateway.config import Settings
+    for k in (*_four_apns_keys(), "APNS_VOIP_TOPIC"):
+        monkeypatch.delenv(k, raising=False)
+    Settings()

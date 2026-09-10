@@ -762,10 +762,15 @@ def test_a_nul_does_not_corrupt_the_value_reader(island) -> None:
 # The shape of a real live island's .env, by SEVERITY TIER rather than by copying a
 # box's current key list — a census pinned to today's boxes goes stale the first time
 # someone adds a key, and a test that must be edited to stay true stops being read.
-# Every name here is one both live islands actually carry.
+# Every name here is one both live islands carry, EXCEPT FCM_SERVICE_ACCOUNT_JSON,
+# which is here ahead of the boxes on purpose: a Firebase service-account private key
+# is downloadable exactly ONCE, so the first island to gain Android must not be the
+# run that discovers whether the guard lists it. Naming a key the boxes do not yet
+# hold only widens the fixture, which makes the totality assertion strictly stronger.
 _LIVE_SHAPED_KEYS = {
     # unrecoverable: exists nowhere but the box
     "ISLAND_SIGNING_SEED", "APNS_PRIVATE_KEY", "GITHUB_CLIENT_SECRET",
+    "FCM_SERVICE_ACCOUNT_JSON",
     # loud: the island refuses to boot without them
     "MODERATOR_USER_IDS", "CSAM_RUNBOOK_ACKNOWLEDGED",
     # silent and dangerous: reverts to the compose default and unpins the next deploy

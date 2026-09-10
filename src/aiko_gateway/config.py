@@ -228,7 +228,8 @@ class Settings(BaseSettings):
     # tab's recorded decision (`device_platform.dart`: "Google is not in the RUNTIME
     # PATH on Apple platforms") and this half must not silently contradict it — the
     # `Platform` enum's two values only mean something if each talks to its own
-    # service. Android/FCM is a separate transport behind the same door, NOT built yet.
+    # service. Android/FCM is a separate transport behind the same door (see
+    # FCM_SERVICE_ACCOUNT_JSON below) — same gates, same budget, its own wire.
     #
     # OPTIONAL, exactly like LiveKit above: absent credentials mean the island runs
     # normally and simply never pushes. An operator standing up an island gets a
@@ -240,6 +241,16 @@ class Settings(BaseSettings):
     # a device token is only valid for the topic it was issued under, so a wrong
     # topic is a silent 400 for every send, and it must be stated, not inferred.
     apns_topic: str = ""
+    # The VoIP topic — the SAME bundle id with a `.voip` suffix, which is Apple's
+    # definition rather than our choice. STATED, NOT DERIVED, by design 12 Decision
+    # 3 and Nick's ruling of 2026-09-10: the same argument the line above makes for
+    # `apns_topic` applies here unchanged. A device's VoIP token is minted under
+    # THIS topic and is valid for no other, so a wrong value is the same silent 400
+    # for every ring, and an operator who can read the value is an operator who can
+    # fix it. It joins the all-or-none group below, which is what makes a missing
+    # value abort a deploy at preflight instead of surfacing as a phone that never
+    # rings. See `apns._topic_for`.
+    apns_voip_topic: str = ""
     # SECRET — the .p8 signing key, PEM contents (host .env / SOPS), not a path.
     # Contents rather than a path deliberately: the container would otherwise need a
     # bind-mount whose absence fails at first-send (a runtime surprise) instead of at
@@ -263,7 +274,39 @@ class Settings(BaseSettings):
     # wherever you are — so it gets its own cap, keyed on the person being woken rather
     # than the sender's IP like the auth buckets. A DM peer who can legitimately send
     # can still only ring you N times a minute. Not an authn control; a blast-radius cap.
+    #
+    # METERS EVERY TRANSPORT, despite the name. The budget protects the PERSON being
+    # interrupted, so one bucket is charged once per fanout whether the recipient's
+    # devices are Apple, Android or both — a second FCM budget would hand someone
+    # holding an iPhone AND an Android twice the ring allowance. The name is kept
+    # because renaming a live Settings field costs a compose forward, a MANIFEST
+    # entry, two boxes' .env, an invariant-7b exemption and the standup key-loss
+    # guard, all for zero behaviour change. A stated deferral, not an oversight.
     apns_wake_per_recipient_per_minute: int = Field(default=6, ge=1, le=60)
+
+    # --- FCM (Android push wake) ---
+    # SECRET — the Firebase service-account JSON CONTENTS (host .env / SOPS), not a
+    # path, for the identical reason as apns_private_key above: a path would need a
+    # bind-mount whose absence fails at first send (a runtime surprise) rather than
+    # at boot, and the existing secret-delivery channel for this deployment is the
+    # .env.
+    #
+    # THE ONLY NEW FIELD, and that is a result rather than an omission. `project_id`,
+    # `client_email`, `private_key` and `token_uri` all come out of this one blob, so
+    # there is no second field to drift against it and NO all-or-none group to write
+    # — the state APNs' four-field guard exists to prevent is unrepresentable here.
+    # Deriving the project id also closes a real class: a separate FCM_PROJECT_ID
+    # that disagreed with the key would 404 for every device on the island.
+    #
+    # NO FCM_ENABLED FLAG: `fcm.is_configured()` IS the switch, mirroring APNs and
+    # LiveKit — absent credentials mean the island runs normally and simply never
+    # sends to Android.
+    #
+    # SINGLE LINE, enforced by the guard in _harden_for_production. Two line-oriented
+    # readers of this same .env already declare themselves broken on multi-line
+    # values, and JSON has no mandatory newlines — so requiring one line removes the
+    # coupling instead of guarding the window.
+    fcm_service_account_json: str = ""
 
     # Self-service registration. None → resolved by environment in the validator
     # (open in dev, closed in prod); set OPEN_REGISTRATION to override either way.
@@ -694,6 +737,15 @@ class Settings(BaseSettings):
             # cryptography accepts either, but leading whitespace breaks the
             # "-----BEGIN" header match. lstrip only.
             "apns_private_key": self.apns_private_key.lstrip(),
+            # THE FIFTH MEMBER (design 12 Decision 3; Nick, 2026-09-10). Adding it
+            # is only safe because `deploy/preflight-apns.sh` gained the same key in
+            # the SAME change: an existing box carries four of these five, so
+            # without the preflight this line turns the next version bump into a
+            # boot refusal under `restart: always`. The preflight catches it before
+            # the backup and before anything is pulled, so the operator gets a
+            # message while the island is still running. Never add a member here
+            # without adding it there.
+            "apns_voip_topic": self.apns_voip_topic.strip(),
         }
         for name, value in _apns.items():
             setattr(self, name, value)
@@ -756,6 +808,95 @@ class Settings(BaseSettings):
                     f"({_key.curve.name}). ES256 requires P-256 (secp256r1) "
                     "specifically, so this key parses but can never sign an APNs "
                     "provider token. Refusing to boot."
+                )
+
+        # FCM, the same ladder one transport over: present -> single-line ->
+        # parseable -> right shape -> usable. WITHOUT IT a malformed blob boots
+        # clean and then fails inside push_service's broad `except` as "wake failed
+        # for one device" FOREVER — a deaf island with a green /health, which is
+        # the invisible failure the APNs validator above exists to prevent.
+        #
+        # THERE IS NO ALL-OR-NONE RUNG, because there is only ONE field: project id,
+        # client email, private key and token URI all come out of this blob, so the
+        # half-configured state APNs' first guard defends against cannot occur here.
+        #
+        # EVERY RUNG IS GUARDED ON THE FIELD BEING NON-EMPTY. An island with no
+        # Firebase project must boot completely unaffected — that is most islands,
+        # and all of them today.
+        self.fcm_service_account_json = self.fcm_service_account_json.strip()
+        if self.fcm_service_account_json:
+            _blob = self.fcm_service_account_json
+            if "\n" in _blob or "\r" in _blob:
+                # NOT FUSSINESS. Two line-oriented readers of this same .env already
+                # declare themselves broken on multi-line values: deploy/lib/
+                # dotenv-read.sh emits PHANTOM KEYS for continuation lines, and
+                # deploy/preflight-apns.sh names multi-line as unhandled and
+                # explicitly closes off growing a third parser. JSON has no mandatory
+                # newlines, so requiring one line REMOVES that coupling instead of
+                # guarding the window. Google's own file already encodes the PEM's
+                # newlines as the two characters \n inside a JSON string.
+                raise ValueError(
+                    "fcm_service_account_json contains a real newline. It must be "
+                    "ONE line — the deploy tooling that reads this .env is "
+                    "line-oriented and a multi-line value produces phantom keys. "
+                    "Flatten it with: jq -c . < service-account.json  "
+                    "Refusing to boot."
+                )
+            import json as _json
+            try:
+                _cred = _json.loads(_blob)
+            except ValueError as ex:
+                raise ValueError(
+                    "fcm_service_account_json is not readable JSON "
+                    f"({type(ex).__name__}). The two usual causes are a truncated "
+                    "paste, and someone 'helpfully' expanding the private_key's "
+                    r"literal \n into real newlines, which breaks the JSON string. "
+                    "Refusing to boot rather than failing invisibly at the first "
+                    "ring."
+                ) from ex
+            if not isinstance(_cred, dict) or _cred.get("type") != "service_account":
+                # A Firebase WEB config or a google-services.json looks identical on
+                # disk — the same hazard as an App Store Connect key pasted for a
+                # .p8, and it satisfies every presence check.
+                raise ValueError(
+                    "fcm_service_account_json is JSON but not a service account "
+                    '(expected "type": "service_account"). A Firebase web config '
+                    "or google-services.json looks identical on disk; download the "
+                    "SERVICE ACCOUNT key from Project settings -> Service accounts."
+                    " Refusing to boot."
+                )
+            _missing = [k for k in ("project_id", "client_email", "private_key")
+                        if not str(_cred.get(k) or "").strip()]
+            if _missing:
+                raise ValueError(
+                    f"fcm_service_account_json is missing {_missing}. The project "
+                    "id is DERIVED from this blob (there is deliberately no second "
+                    "setting), so an absent field is not a field the island can "
+                    "fall back on. Refusing to boot."
+                )
+            # PARSEABLE IS NOT USABLE, the same rung as the P-256 check above. FCM
+            # assertions are RS256, so an EC key satisfies every presence check and
+            # can never sign one — pushing the failure right back into the swallowed
+            # background send path this validator exists to keep it out of.
+            from cryptography.hazmat.primitives.asymmetric import rsa
+            from cryptography.hazmat.primitives.serialization import (
+                load_pem_private_key,
+            )
+            try:
+                _fcm_key = load_pem_private_key(
+                    _cred["private_key"].encode(), password=None)
+            except Exception as ex:
+                raise ValueError(
+                    "fcm_service_account_json's private_key is not a readable PEM "
+                    f"({type(ex).__name__}). Refusing to boot rather than failing "
+                    "invisibly at the first ring."
+                ) from ex
+            if not isinstance(_fcm_key, rsa.RSAPrivateKey):
+                raise ValueError(
+                    "fcm_service_account_json's private_key parses but is not an "
+                    f"RSA key (got {type(_fcm_key).__name__}). Google's JWT-bearer "
+                    "assertion is RS256, so only an RSA key can sign it. Refusing "
+                    "to boot."
                 )
 
         # A2 (crucible-09 Phase A): `e2ee` is schema-reserved for Phase B and
