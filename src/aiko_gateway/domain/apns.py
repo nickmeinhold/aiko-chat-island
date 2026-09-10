@@ -209,11 +209,21 @@ class ApnsNotConfigured(RuntimeError):
 
 def is_configured() -> bool:
     """True iff every APNs credential is present. Settings enforces all-or-none at
-    boot, so in practice this is all-four-or-zero; the `all()` is still written out
+    boot, so in practice this is all-FIVE-or-zero; the `all()` is still written out
     rather than testing one field, because a future partial-config bug should turn
-    push OFF rather than half-on."""
+    push OFF rather than half-on.
+
+    `apns_voip_topic` IS ONE OF THE FIVE (Carnot, cage-match PR#172 r1). It was
+    added to the settings all-or-none group and not to this predicate, so the
+    docstring said "every APNs credential" while the tuple checked four of them —
+    the summary drifting from the set it claims to summarise. No reachable state
+    changes, because the boot validator already refuses four-of-five; that is
+    exactly why the omission was invisible, and exactly why the written-out `all()`
+    exists rather than a single-field test. A predicate defended by a guard
+    elsewhere is still wrong when read on its own."""
     return all((settings.apns_key_id, settings.apns_team_id,
-                settings.apns_topic, settings.apns_private_key))
+                settings.apns_topic, settings.apns_private_key,
+                settings.apns_voip_topic))
 
 
 def reset_for_tests() -> None:

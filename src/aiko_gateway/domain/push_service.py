@@ -623,8 +623,15 @@ async def reachability(session: AsyncSession) -> dict:
 # What an operator must set to make each transport reachable. Keyed by the STORED
 # platform string rather than the enum, so a corrupted row still gets a sentence.
 _UNREACHABLE_REMEDY = {
+    # ALL FIVE, and the fifth is not decoration (Tesla, cage-match PR#172 r1). This
+    # string is INSTRUCTIONS AN OPERATOR FOLLOWS. Naming four of the five members of
+    # config.py's all-or-none group tells them to build precisely the half-set that
+    # turns the next restart under `restart: always` into a boot refusal — a remedy
+    # that causes the outage it is printed to prevent. The credential set has one
+    # definition; every place that enumerates it has to agree with that definition,
+    # and the places a HUMAN reads are the ones where disagreeing costs most.
     Platform.APNS.value: ("Set APNS_KEY_ID / APNS_TEAM_ID / APNS_TOPIC / "
-                          "APNS_PRIVATE_KEY"),
+                          "APNS_VOIP_TOPIC / APNS_PRIVATE_KEY"),
     Platform.FCM.value: "Set FCM_SERVICE_ACCOUNT_JSON",
 }
 
@@ -822,8 +829,34 @@ async def _wake_user(session: AsyncSession, user_id: str, *, wake: WakeKind,
         # was selected, sends were attempted, and not one came back DELIVERED. The
         # per-device lines say what each transport answered; this says the ring
         # failed, which is the sentence an operator is actually looking for.
-        log.error("wake delivered_to=0 user=%s devices=%d",
-                  user_id, len(deliveries))
+        #
+        # EXCEPT WHEN THE ONLY ANSWER WAS "DEAD, BUT I CANNOT PROVE IT" (Carnot,
+        # cage-match PR#172 r1). A `DEAD_TOKEN` carrying no `reap` order is the
+        # reaper DELIBERATELY withholding authority to delete — an APNs 410 with no
+        # timestamp, say. The row is retained on purpose, so it answers the same way
+        # on every future wake, so this ERROR fires FOREVER for a state the system
+        # is correctly holding. That is precisely the warning-nobody-reads this
+        # module's own `warn_if_unreachable` note argues against, manufactured by
+        # the alarm meant to be the one signal worth trusting.
+        #
+        # The distinction is not severity-shading, it is a DIFFERENT FACT: "the ring
+        # failed and I do not know why" versus "every device I could reach is dead
+        # and I am not permitted to reap it". Only the first is an operator's
+        # emergency; the second is a cleanup backlog, and it names itself so nobody
+        # chases a ring outage that is not happening.
+        answered = [r for r in results if r is not None]
+        unreapable_dead = (
+            bool(answered)
+            and len(answered) == len(deliveries)
+            and all(r.verdict is Verdict.DEAD_TOKEN and r.reap is None
+                    for r in answered))
+        if unreapable_dead:
+            log.warning(
+                "wake delivered_to=0 user=%s devices=%d reason=dead_unreapable",
+                user_id, len(deliveries))
+        else:
+            log.error("wake delivered_to=0 user=%s devices=%d",
+                      user_id, len(deliveries))
 
     for row_id, token, updated_at, order in dead:
         # COMPARE-AND-DELETE, because there is a real TOCTOU window here and this

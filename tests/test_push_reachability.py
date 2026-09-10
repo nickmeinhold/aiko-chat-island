@@ -71,8 +71,12 @@ async def _user_with_android(session, n: int, *, username: str = "bob"):
 @pytest.fixture
 def configured(monkeypatch):
     """APNs configured, FCM not — the shape of both live islands today."""
+    # All FIVE: apns_voip_topic is part of the credential set `is_configured()`
+    # counts (Carnot, cage-match PR#172 r1), so a four-name fixture describes an
+    # island that cannot boot.
     for k, v in (("apns_key_id", "ABCDE12345"), ("apns_team_id", "TEAMID1234"),
                  ("apns_topic", "cc.example.app"),
+                 ("apns_voip_topic", "cc.example.app.voip"),
                  ("apns_private_key", "-----BEGIN PRIVATE KEY-----")):
         monkeypatch.setattr(settings, k, v, raising=False)
     monkeypatch.setattr(settings, "fcm_service_account_json", "", raising=False)
@@ -82,7 +86,8 @@ def configured(monkeypatch):
 def fcm_only(monkeypatch):
     """FCM configured, APNs not — a legitimate, bootable deployment (config.py's
     all-or-none guard makes APNs-absent a supported state)."""
-    for k in ("apns_key_id", "apns_team_id", "apns_topic", "apns_private_key"):
+    for k in ("apns_key_id", "apns_team_id", "apns_topic", "apns_private_key",
+              "apns_voip_topic"):
         monkeypatch.setattr(settings, k, "", raising=False)
     monkeypatch.setattr(settings, "fcm_service_account_json", FCM_CREDENTIAL,
                         raising=False)
@@ -90,7 +95,8 @@ def fcm_only(monkeypatch):
 
 @pytest.fixture
 def unconfigured(monkeypatch):
-    for k in ("apns_key_id", "apns_team_id", "apns_topic", "apns_private_key"):
+    for k in ("apns_key_id", "apns_team_id", "apns_topic", "apns_private_key",
+              "apns_voip_topic"):
         monkeypatch.setattr(settings, k, "", raising=False)
     monkeypatch.setattr(settings, "fcm_service_account_json", "", raising=False)
 

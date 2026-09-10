@@ -383,7 +383,17 @@ async def test_the_assertion_requests_the_narrow_messaging_scope(configured, mon
     token_request = [r for r in seen if "oauth2" in str(r.url)][0]
     body = token_request.content.decode()
     assert "grant-type%3Ajwt-bearer" in body or "grant-type:jwt-bearer" in body
-    assert fcm._SCOPE == "https://www.googleapis.com/auth/firebase.messaging"
+    # THIS TEST STUBS THE SIGNER, so it can only prove the send path FORWARDS what
+    # the signer returned — and that is what it now asserts. It previously closed on
+    # `assert fcm._SCOPE == "...firebase.messaging"`, which is a module constant
+    # compared to a literal: true whether or not the scope ever reaches a JWT, so a
+    # signer minting `cloud-platform`, or no scope at all, passed identically
+    # (Tesla, cage-match PR#172 r1). The scope claim is checked for real in
+    # `test_the_signed_assertion_actually_carries_the_narrow_scope`, which does NOT
+    # stub the signer — that is the only place the question can honestly be asked.
+    assert "stub-assertion" in body, (
+        "the token request must carry the assertion the signer produced; this is "
+        "the strongest claim a signer-stubbed test can make")
 
 
 # ------------------------------------------------------------------ configured
@@ -461,7 +471,13 @@ async def test_an_unusable_credential_returns_transient_and_never_raises(monkeyp
                         '{"project_id":"p","client_email":"e","private_key":"not-a-pem"}',
                         raising=False)
     fcm.reset_for_tests()
-    result = await fcm.send("f" * 100, {"c": "chan"})
+    # A REAL `WakePayload`, not a bare dict (Tesla, cage-match PR#172 r1). These
+    # two tests passed `{"c": "chan"}` — the WIRE shape, which is why it looked
+    # right — but production passes a `WakePayload`, and the credential path
+    # returns BEFORE `build_message` ever reads `payload.channel_id`. So the
+    # never-raises contract was proven only for an input the real door never sends:
+    # a `build_message` that raised on the actual type would sail straight through.
+    result = await fcm.send("f" * 100, WakePayload(channel_id=CHANNEL))
     assert result.verdict is Verdict.TRANSIENT
     assert result.reap is None, "an unusable credential must never reap a token"
 
@@ -474,8 +490,35 @@ async def test_an_unusable_credential_is_negative_cached(monkeypatch):
                         '{"project_id":"p","client_email":"e","private_key":"not-a-pem"}',
                         raising=False)
     fcm.reset_for_tests()
-    await fcm.send("f" * 100, {"c": "chan"})
+    await fcm.send("f" * 100, WakePayload(channel_id=CHANNEL))
     assert fcm._oauth_backoff_until is not None, (
         "the negative cache must be reachable from the credential path, not only "
         "from the HTTP-status path"
     )
+
+
+def test_the_signed_assertion_actually_carries_the_narrow_scope():
+    """`firebase.messaging`, not `cloud-platform` — asserted against the MINTED JWT.
+
+    THE ARM THAT DISCRIMINATES: this signs with a real RSA key and decodes the
+    resulting assertion, so the claim under test is a property of what
+    `_sign_assertion` PRODUCED. Change `_SCOPE` to `cloud-platform` and this
+    reddens; the signer-stubbed test upstairs would not notice, because it compared
+    a module constant to a literal and never looked inside a JWT.
+
+    Why the narrow scope matters enough to pin: `cloud-platform` also works, and is
+    a grant over every Google Cloud API this service account can touch. An island
+    minting that on every ring is handing itself authority it has no use for, and
+    nothing outside this assertion would ever reveal it.
+    """
+    import jwt as _jwt
+    cred = json.loads(_credential_without_kid())
+    assertion = _jwt.decode(fcm._sign_assertion(cred), options={
+        "verify_signature": False, "verify_aud": False})
+    assert assertion["scope"] == "https://www.googleapis.com/auth/firebase.messaging", (
+        f"the assertion requests {assertion['scope']!r}. Google will happily issue a "
+        "token for a broader scope, so nothing downstream fails loudly — the JWT is "
+        "the only place this is visible.")
+    assert assertion["iss"] == cred["client_email"], (
+        "iss must be the service-account email — Google identifies the signing key "
+        "from it, which is why omitting `kid` is safe")

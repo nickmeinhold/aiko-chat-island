@@ -138,6 +138,13 @@ def configured(monkeypatch):
     monkeypatch.setattr(settings, "apns_topic", "cc.example.app", raising=False)
     monkeypatch.setattr(settings, "apns_private_key", "-----BEGIN PRIVATE KEY-----",
                         raising=False)
+    # THE FIFTH CREDENTIAL. `apns.is_configured()` counts the VoIP topic (Carnot,
+    # cage-match PR#172 r1), matching the settings all-or-none group — so a fixture
+    # naming only four describes an island that CANNOT boot, and every test using it
+    # would silently exercise the no-configured-platform path instead of the send
+    # path it was written for.
+    monkeypatch.setattr(settings, "apns_voip_topic", "cc.example.app.voip",
+                        raising=False)
     monkeypatch.setattr(settings, "fcm_service_account_json", "", raising=False)
     apns.reset_for_tests()
     yield
@@ -158,7 +165,8 @@ def fcm_configured(monkeypatch):
 
 @pytest.fixture
 def apns_unconfigured(monkeypatch):
-    for k in ("apns_key_id", "apns_team_id", "apns_topic", "apns_private_key"):
+    for k in ("apns_key_id", "apns_team_id", "apns_topic", "apns_private_key",
+              "apns_voip_topic"):
         monkeypatch.setattr(settings, k, "", raising=False)
 
 
@@ -421,6 +429,30 @@ async def test_a_row_re_registered_during_the_send_is_not_reaped(
 
     The fake mutates the row MID-SEND, which is the window itself — not a
     simulation of it.
+
+    WHY THE FAKE RETURNS A DATELESS `ReapOrder(None)`, STATED BECAUSE IT IS NOT
+    APPLE'S BEHAVIOUR (Tesla, cage-match PR#172 r1). `apns._reap_order` returns
+    `None` — not `ReapOrder(None)` — for a 410 carrying no timestamp, so this exact
+    value is one the APNs transport can never produce; it is FCM's weaker,
+    dateless permission wearing Apple's name. That is deliberate and load-bearing,
+    but it was previously unstated, which is worse than either choice on its own:
+
+      - `reap=None` would make the row survive TRIVIALLY, because nothing would
+        attempt a delete at all. The assertion would pass without the guard under
+        test ever executing — a test that cannot produce the failure it screens for.
+      - A DATED order would let the row survive for TWO reasons at once (the triple
+        mismatch AND `updated_at <= not_reregistered_since`), so a broken triple
+        check would still go green.
+
+    A dateless-but-present order is the only value that isolates the compare-and-
+    delete triple, which is the guard this test exists for. Read it as a test of the
+    SHARED reap path, not of Apple's verdict mapping — `test_a_410_without_a_
+    timestamp_does_not_reap` is where Apple's own dateless behaviour is pinned.
+
+    Honest residual: `ReapOrder(None)` is indistinguishable from `ReapOrder()`'s
+    default, so this test cannot tell a caller that deliberately passed no date from
+    one that forgot to pass a date at all. That is a real blind spot in this
+    fixture, named rather than papered over.
     """
     alice, bob = dm
     row = (await session.execute(
@@ -1299,3 +1331,48 @@ async def test_a_stalled_apns_send_does_not_delay_the_fcm_wake(
     assert reached["at"] < 0.2, (
         f"the FCM wake waited {reached['at']:.2f}s on the stalled APNs send"
     )
+
+
+@pytest.mark.asyncio
+async def test_an_unreapable_dead_token_does_not_ring_the_operator_alarm(
+    session, dm, configured, fake_apns, caplog
+):
+    """A dead token the reaper may NOT delete must not fire the ERROR alarm on
+    every wake, forever (Carnot, cage-match PR#172 r1).
+
+    THE DEFECT. `DEAD_TOKEN` with no reap order is the reaper DELIBERATELY
+    withholding authority — an APNs 410 carrying no timestamp. The row is retained
+    ON PURPOSE, so it answers identically on every future wake, so `delivered`
+    never leaves zero and the ERROR fires forever for a state the system is
+    correctly holding. That is the warning-nobody-reads this module's own
+    `warn_if_unreachable` note argues against, manufactured by the one alarm meant
+    to be worth trusting.
+
+    WHY THIS TEST CAN FAIL. Two arms, and the second is the one that matters:
+    asserting the WARNING is present would still pass if the fix had merely ADDED a
+    line beside the ERROR — leaving the false alarm exactly where it was. So this
+    also asserts NO ERROR record exists. Reverting the fix reddens the second
+    assertion, which is the whole point of the change.
+
+    NOT a severity downgrade: it is a different FACT. "The ring failed and I do not
+    know why" is an emergency; "every device I can reach is dead and I am not
+    permitted to reap it" is a cleanup backlog. The REJECTED case above still
+    ERRORs, which is the control proving the alarm was not simply silenced.
+    """
+    alice, _bob = dm
+    fake_apns.verdict = apns.Verdict.DEAD_TOKEN
+    fake_apns.invalid_since_ms = None   # Apple sent no timestamp => no reap order
+
+    with caplog.at_level(logging.INFO, logger="aiko_gateway.push"):
+        await _wake(sender_id=alice.id)
+
+    assert any("reason=dead_unreapable" in r.message and r.levelname == "WARNING"
+               for r in caplog.records), (
+        "an unreapable dead token must name itself, so an operator can tell a "
+        f"cleanup backlog from a ring outage. Got: {caplog.text}")
+
+    assert not [r for r in caplog.records
+                if "delivered_to=0" in r.message and r.levelname == "ERROR"], (
+        "THE ARM THAT DISCRIMINATES: the ERROR alarm must be REPLACED, not "
+        "accompanied. A fix that logs the warning and still errors leaves the "
+        f"forever-alarm exactly where it was. Got: {caplog.text}")

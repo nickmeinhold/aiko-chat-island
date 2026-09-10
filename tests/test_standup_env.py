@@ -772,7 +772,18 @@ _LIVE_SHAPED_KEYS = {
     "ISLAND_SIGNING_SEED", "APNS_PRIVATE_KEY", "GITHUB_CLIENT_SECRET",
     "FCM_SERVICE_ACCOUNT_JSON",
     # loud: the island refuses to boot without them
-    "MODERATOR_USER_IDS", "CSAM_RUNBOOK_ACKNOWLEDGED",
+    # APNS_VOIP_TOPIC is listed as LOUD because it joined config.py's APNs
+    # all-or-none group: a box that loses only this key still holds four APNs
+    # credentials and refuses to boot. Widening the fixture is the whole benefit —
+    # NOT that the guard would otherwise be unable to name it. Tesla raised this in
+    # cage-match PR#172 r1 as "the guard cannot name the absence"; that half is a
+    # FALSE POSITIVE and is recorded rather than quietly dropped. standup's guard is
+    # GENERIC: it reports whatever the existing .env holds that the heredoc would
+    # destroy, so it can already name any key, including one that exists nowhere in
+    # this repo. Positive-controlled by putting a deliberately bogus key in this set
+    # and confirming the totality test still passes — which is the correct result
+    # for a generic guard, and the measurement that refuted the finding.
+    "MODERATOR_USER_IDS", "CSAM_RUNBOOK_ACKNOWLEDGED", "APNS_VOIP_TOPIC",
     # silent and dangerous: reverts to the compose default and unpins the next deploy
     "ISLAND_VERSION", "ENVIRONMENT",
     # ordinary operator config

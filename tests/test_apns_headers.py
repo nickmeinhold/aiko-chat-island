@@ -192,3 +192,33 @@ def test_send_requires_an_explicit_token_kind():
         "token_kind has a default — a caller that forgets it now sends the wrong "
         "push type instead of failing"
     )
+
+
+def test_is_configured_counts_the_voip_topic_as_a_credential(monkeypatch):
+    """Four-of-five must read as NOT configured (Carnot, cage-match PR#172 r1).
+
+    THE ARM THAT MAKES THIS DISCRIMINATE: it sets the other four to real values and
+    blanks ONLY `apns_voip_topic`. Before the fix this returned True, so the
+    assertion below is not decoration — reverting the one-line change reddens
+    exactly this test and nothing else. A test that set all five, or none, would
+    pass identically against the old four-field tuple and prove nothing.
+    """
+    for field, value in (("apns_key_id", "KEYID12345"),
+                         ("apns_team_id", "TEAMID6789"),
+                         ("apns_topic", "cc.example.app"),
+                         ("apns_private_key", "-----BEGIN PRIVATE KEY-----")):
+        monkeypatch.setattr(settings, field, value, raising=False)
+
+    monkeypatch.setattr(settings, "apns_voip_topic", "", raising=False)
+    assert apns.is_configured() is False, (
+        "four APNs credentials plus an EMPTY voip topic must read as NOT "
+        "configured: apns_voip_topic joined the settings all-or-none group, so a "
+        "predicate that ignores it claims a credential set the island does not have"
+    )
+
+    monkeypatch.setattr(settings, "apns_voip_topic", "cc.example.app.voip",
+                        raising=False)
+    assert apns.is_configured() is True, (
+        "all five present must read as configured — otherwise the guard above is "
+        "just switching push off permanently rather than tracking the credentials"
+    )
