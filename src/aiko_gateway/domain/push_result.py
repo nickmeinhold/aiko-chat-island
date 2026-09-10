@@ -77,7 +77,20 @@ class ReapOrder:
     stated rather than hidden.
     """
 
-    not_reregistered_since: dt.datetime | None = None
+    # NO DEFAULT, DELIBERATELY (Tesla, cage-match PR#172 r5). This field used to
+    # default to None — and None here means "delete with NO date arm", the
+    # DESTRUCTIVE reading. So `ReapOrder()` constructed permission to delete
+    # unboundedly out of silence, on the one irreversible operation in the module,
+    # and was byte-identical to the deliberate `ReapOrder(None)`. No fixture could
+    # tell a caller who MEANT no date from one who FORGOT to pass one.
+    #
+    # An earlier round named that residual in a docstring and left it there. This
+    # PR is the proof that naming is not gating: `fcm.py` carried a HARD GATE in
+    # capitals and the credential was provisioned on both islands anyway, hours
+    # later, by someone who had read it. Same lesson one layer down — the default
+    # is gone, `ReapOrder()` is a TypeError, and a dateless order must be written
+    # `ReapOrder(None)` on purpose. That is exactly the intent worth requiring.
+    not_reregistered_since: dt.datetime | None
 
 
 @dataclasses.dataclass(frozen=True, slots=True)

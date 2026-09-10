@@ -60,6 +60,18 @@ FCM_CREDENTIAL = (
 )
 
 
+async def _user_with_apns(session, n: int, *, username: str = "ada"):
+    """An APNs-row user, mirroring `_user_with_android` — needed so the APNs arm of
+    warn_if_unreachable can be exercised, which round 5 showed nothing did."""
+    user = await users_service.create_user(
+        session, username=username, display_name=username.title(), password="pw")
+    for i in range(n):
+        session.add(DeviceToken(user_id=user.id, platform="apns",
+                                token=f"apns-{username}-{i}" + "z" * 80))
+    await session.commit()
+    return user
+
+
 async def _user_with_android(session, n: int, *, username: str = "bob"):
     user = await users_service.create_user(
         session, username=username, display_name=username.title(), password="pw")
@@ -232,9 +244,19 @@ async def test_an_apns_island_with_android_rows_warns_and_names_fcm(
         await push_service.warn_if_unreachable(session)
     text = caplog.text
     assert "FCM_SERVICE_ACCOUNT_JSON" in text, text
-    assert "#2301" in text, text
     assert "APNS_KEY_ID" not in text, (
         "the APNs arm fired on an island whose APNs transport is healthy")
+    # #2301 IS NO LONGER ASSERTED HERE, AND THAT IS THE FIX (Tesla, cage-match
+    # PR#172 r5). The compose-forwarding advice is only true for a transport the
+    # operator can actually provision. FCM is currently a BOOT REFUSAL, so telling
+    # them to make compose forward it is telling them to crash-loop a live island —
+    # and this assertion is what REQUIRED that sentence to be present in the FCM
+    # warning, so the test was pinning the contradiction in place. The clause now
+    # lives in the APNs remedy and is asserted there
+    # (test_the_apns_remedy_still_carries_the_compose_warning), where it is true.
+    assert "#2301" not in text, (
+        "the FCM warning tells the operator to make compose forward a credential "
+        f"the island refuses to boot with. Text: {text}")
 
 
 # -------------------------------------------------------------------- /health
@@ -372,7 +394,10 @@ def _fcm_credential_for_collision() -> str:
                        "private_key": pem})
 
 
-def test_the_fcm_remedy_does_not_instruct_what_the_boot_guard_refuses():
+@pytest.mark.asyncio
+async def test_the_fcm_remedy_does_not_instruct_what_the_boot_guard_refuses(
+    session, configured, caplog
+):
     """THE COLLISION TEST (Tesla, cage-match PR#172 r4).
 
     Two facts were each pinned in isolation and never brought together:
@@ -393,7 +418,17 @@ def test_the_fcm_remedy_does_not_instruct_what_the_boot_guard_refuses():
     breath. This one does: it asserts the remedy and the guard agree, so they cannot
     drift apart again without something going red.
     """
-    remedy = push_service._UNREACHABLE_REMEDY[Platform.FCM.value]
+    # READS THE RENDERED WARNING, NOT THE DICT (Tesla, cage-match PR#172 r5).
+    # The first version of this test read `_UNREACHABLE_REMEDY[FCM]` in isolation
+    # — and the contradiction it was built to catch had moved into the TEMPLATE
+    # around that string, which told every platform to "check compose actually
+    # forwards it". So the collision test had the very isolation-blindness it
+    # exists to prevent, and passed while the rendered sentence still instructed
+    # an operator to brick a live island. Assert what the operator READS.
+    await _user_with_android(session, 2)
+    with caplog.at_level("WARNING"):
+        await push_service.warn_if_unreachable(session)
+    remedy = caplog.text
 
     # The guard must really refuse — proving this test is colliding two LIVE facts,
     # not asserting prose against a rule that has quietly been lifted.
@@ -405,5 +440,35 @@ def test_the_fcm_remedy_does_not_instruct_what_the_boot_guard_refuses():
         "the boot warning instructs the operator to set a credential the boot "
         f"guard refuses — following it bricks a live island. Remedy: {remedy!r}")
     assert "not available" in remedy.lower() or "do not set" in remedy.lower(), (
-        f"the remedy must tell the operator the transport is unavailable rather "
-        f"than how to enable it. Remedy: {remedy!r}")
+        f"the warning must tell the operator the transport is unavailable rather "
+        f"than how to enable it. Rendered: {remedy!r}")
+    assert "#2301" not in remedy, (
+        "the rendered FCM warning still tells the operator to make compose forward "
+        f"a credential the island refuses to boot with. Rendered: {remedy!r}")
+
+
+@pytest.mark.asyncio
+async def test_the_apns_remedy_still_carries_the_compose_warning(session, caplog,
+                                                                 monkeypatch):
+    """The #2301 clause must survive where it IS true — on the provisionable arm.
+
+    Moving it out of the shared template could easily have deleted it everywhere,
+    which would lose the only mitigation for the one deploy gap nothing mechanical
+    closes: `update.sh` pulls the image and never syncs the box's compose, so a
+    value set in `.env` can be inert in production with nothing saying so.
+
+    This is the OTHER half of the class fix. Round 5 showed that repairing one arm
+    and assuming the rest follows is exactly how this defect kept recurring — so
+    both arms get an assertion, in opposite directions.
+    """
+    for k in ("apns_key_id", "apns_team_id", "apns_topic", "apns_private_key",
+              "apns_voip_topic"):
+        monkeypatch.setattr(settings, k, "", raising=False)
+    await _user_with_apns(session, 2)
+    with caplog.at_level("WARNING"):
+        await push_service.warn_if_unreachable(session)
+    text = caplog.text
+    assert "APNS_KEY_ID" in text, text
+    assert "#2301" in text, (
+        "the compose-forwarding mitigation vanished from the arm where it applies "
+        f"— it was moved out of the template and must land here. Text: {text}")

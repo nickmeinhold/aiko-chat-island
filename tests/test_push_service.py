@@ -124,12 +124,18 @@ class FakeFcm:
     async def __call__(self, device_token, payload, *, collapse_key=None):
         from aiko_gateway.domain.push_result import SendResult, Verdict
         self.sent.append((device_token, payload, collapse_key))
-        reap = self.reap
-        if reap is None and self.verdict is Verdict.DEAD_TOKEN:
-            # FCM's UNREGISTERED carries NO timestamp — the shared abstraction
-            # has a genuinely weaker arm on this side, and the fake must not
-            # invent evidence the protocol cannot supply.
-            reap = ReapOrder(None)
+        # DERIVES from the production rule, like FakeApns (Tesla, cage-match PR#172
+        # r5). The APNs fake was forbidden to mirror `apns._reap_order` in r2
+        # because a duplicated rule cannot fail differently from the original — and
+        # this fake, one transport over, went on synthesising `ReapOrder(None)` by
+        # hand. The class was closed at the instance it was pointed at.
+        #
+        # What that cost: if `fcm._reap_order_for` ever WITHHOLDS the order — the
+        # fail-safe, and the live open question in claude-tasks#4199 — these policy
+        # tests would keep reaping and stay green. If it ever issued an order for a
+        # WIDER set of verdicts, they would never notice either. The tests would be
+        # describing a transport that no longer exists.
+        reap = self.reap if self.reap is not None else fcm._reap_order_for(self.verdict)
         return SendResult(self.verdict, reap)
 
 

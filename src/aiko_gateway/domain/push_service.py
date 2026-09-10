@@ -651,7 +651,10 @@ _UNREACHABLE_REMEDY = {
     # definition; every place that enumerates it has to agree with that definition,
     # and the places a HUMAN reads are the ones where disagreeing costs most.
     Platform.APNS.value: ("Set APNS_KEY_ID / APNS_TEAM_ID / APNS_TOPIC / "
-                          "APNS_VOIP_TOPIC / APNS_PRIVATE_KEY"),
+                          "APNS_VOIP_TOPIC / APNS_PRIVATE_KEY, and check this "
+                          "box's docker-compose.yml actually forwards them "
+                          "(#2301: update.sh pulls the image, it does NOT sync "
+                          "compose)"),
     # DO NOT SAY "Set FCM_SERVICE_ACCOUNT_JSON" (Tesla, cage-match PR#172 r4).
     # config.py REFUSES TO BOOT on a present credential until the Android receive
     # half exists. Both live islands already hold Android device rows, so this line
@@ -699,12 +702,25 @@ async def warn_if_unreachable(session: AsyncSession) -> None:
             platform_value,
             f"No transport exists for platform={platform_value!r} — this is a "
             "corrupted row or a code/data mismatch")
+        # THE TEMPLATE SAYS NOTHING TRANSPORT-SPECIFIC (Tesla, cage-match PR#172
+        # r5). It used to end with "...and check this box's docker-compose.yml
+        # actually forwards it (#2301)" for EVERY platform. Fixing the remedy dict
+        # alone left that clause intact, so an FCM warning told the operator "Do
+        # NOT set FCM_SERVICE_ACCOUNT_JSON" and "make sure compose forwards it" in
+        # one breath — and forwarding a present value is a boot refusal and a
+        # `restart: always` crash-loop. Third instance of one class: an
+        # operator-facing sentence that builds the state the guard refuses.
+        #
+        # The collision test could not see it, because it read the REMEDY DICT in
+        # isolation while the contradiction lived in the envelope around it. So the
+        # advice that is only true for a provisionable transport now lives IN that
+        # transport's remedy, where it can be wrong for one platform without being
+        # wrong for all of them, and the test asserts the RENDERED line.
         log.warning(
             "%d device token(s) registered on platform=%s but that transport is "
             "NOT configured on this island — those devices are UNREACHABLE and "
             "every wake for them will be silently declined. %s, or unregister "
-            "them — and check this box's docker-compose.yml actually forwards it "
-            "(#2301: update.sh pulls the image, it does NOT sync compose).",
+            "them.",
             count, platform_value, remedy)
 
 

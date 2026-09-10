@@ -222,3 +222,43 @@ def test_is_configured_counts_the_voip_topic_as_a_credential(monkeypatch):
         "all five present must read as configured — otherwise the guard above is "
         "just switching push off permanently rather than tracking the credentials"
     )
+
+
+@pytest.mark.asyncio
+async def test_the_voip_body_is_pinned_even_though_its_shape_is_an_open_question(
+    configured, captured
+):
+    """The VoIP BODY had no test at all (Carnot, cage-match PR#172 r5).
+
+    `_render` emits `aps.alert` + `sound` unconditionally and both kinds go through
+    it, so a VoIP push carries a payload whose semantics say "show a banner" under
+    `apns-push-type: voip`. The header tests pin the alert body byte-for-byte and
+    the VoIP tests pin only HEADERS — so the VoIP body could have been anything, or
+    could change to anything, and the suite would not notice.
+
+    WHAT THIS TEST DOES AND DOES NOT CLAIM. It pins TODAY'S shape so the wire cannot
+    drift silently. It does NOT assert that shape is correct — that is a cross-repo
+    contract question (the app's PushKit handler defines what a VoIP wake must
+    carry for CallKit), and this repo's standing rule is that a wire change is
+    agreed with aiko_chat_app BEFORE merge, never decided here. Raised with them
+    rather than tie-broken.
+
+    So: if someone changes the VoIP body, this reddens and forces the conversation.
+    That is the entire point — the previous state was a wire nobody was watching.
+    """
+    await apns.send("v" * 64, WakePayload(channel_id=CHANNEL),
+                    apns_environment=ApnsEnvironment.PRODUCTION,
+                    token_kind=TokenKind.VOIP)
+    import json as _json
+    payload = _json.loads(captured[-1].content.decode())
+
+    assert payload["c"] == CHANNEL, (
+        "the channel id is the ONE field the client needs to route the ring; "
+        "losing it makes the wake unactionable")
+    # Pinned as OBSERVED, not as ENDORSED — see the docstring.
+    assert payload["aps"] == {
+        "alert": {"title": "Incoming call", "body": "Tap to join"},
+        "sound": "default",
+    }, ("the VoIP body changed. That may well be an improvement — a PushKit wake "
+        "arguably should not carry an alert body at all — but it is a WIRE change "
+        "and belongs in a conversation with the app tab, not in a silent diff.")
