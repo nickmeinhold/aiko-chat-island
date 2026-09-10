@@ -166,8 +166,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..config import settings
 from ..db import SessionLocal
 from . import apns, moderation_service
-from .models import (Channel, ChannelKind, DeviceToken, Membership, Platform,
-                     ApnsEnvironment, TokenKind, User)
+from .models import (Channel, ChannelKind, DeviceToken, Membership, Message,
+                     Platform, ApnsEnvironment, TokenKind, User)
 from .push_result import ReapOrder, SendResult, Verdict, WakePayload
 from .rate_limit import limiter
 
@@ -962,6 +962,70 @@ async def _wake_user(session: AsyncSession, user_id: str, *, wake: WakeKind,
         await session.commit()
 
 
+async def _spoken_here(session: AsyncSession, *, channel_id: str,
+                       user_ids: list[str]) -> list[str]:
+    """Of these recipients, the ones who have POSTED in this channel before.
+
+    THE STRANGER GATE (claude-tasks#4216; Nick 2026-09-11, rejecting the interim
+    "accept the hole"). Before this, any authenticated user could open a DM with
+    any user id, send the call sentinel, and ring a locked phone full-screen
+    through silent mode. Blocks and bans were the only person-level gates, and both
+    are opt-OUT — they require the recipient to have already acted against someone
+    they may never have heard of.
+
+    CONDUCT, NOT CONSENT — and the vocabulary is load-bearing, not fussiness. This
+    predicate observes that you chose to speak to someone; it does not record that
+    you agreed they may ring you, and the two differ in the way that matters:
+    **there is no un-reply.** One message, ever, and that party can ring you
+    forever. A `friends` edge is declared and can be WITHDRAWN; this cannot. So
+    this gate PRECEDES that primitive and does not replace it (Nick, 2026-09-11) —
+    and calling it "consent" anywhere would quietly retire a debt that is still
+    owed.
+
+    WHAT IT DOES NOT DO. It gates the WAKE, never the INVITE. A recipient already
+    connected on the WebSocket still receives the invite frame; what stops is the
+    cold-start ring, which is the actual harm. "This person cannot call you" would
+    be a false description of it.
+
+    AGENTS ARE EXCLUDED BY DEFAULT, stated because it is a behaviour change nobody
+    should discover. An agent Principal that has never posted in a channel cannot
+    ring it — under ADR-0005 Model B a bot holds its own Principal, so an agent
+    calling a human must message first. That may be right; it is not incidental.
+
+    IT SURVIVES E2EE, WHICH `should_wake` DOES NOT. `should_wake` compares the body
+    to a cleartext sentinel and dies the day MLS lands (#1962). This reads only WHO
+    posted WHERE — never content — which the island still knows under encryption.
+    The interim gate outlives the mechanism it protects.
+
+    SOFT-DELETED MESSAGES STILL COUNT. Deleting your own message does not retract
+    having engaged, and treating it as withdrawal would invent a revocation channel
+    that this design deliberately does not have — badly, since it would be
+    all-or-nothing and invisible. Withdrawal is precisely what the `friends` edge
+    is for.
+
+    NOTHING IS RECORDED. A refused ring leaves a log line and no row: the island
+    keeps no record of who called whom ([[project_no_refused_ring_record]], Nick
+    2026-09-01). No attempted-ring table, no pair-keyed counter — which also rules
+    out telling the caller they were refused, or rate-limiting their retries.
+    """
+    if not user_ids:
+        return []
+    rows = (await session.execute(
+        select(Message.sender_user_id)
+        .where(Message.channel_id == channel_id,
+               Message.sender_user_id.in_(user_ids))
+        .distinct()
+    )).scalars().all()
+    spoken = {r for r in rows if r is not None}
+    for user_id in user_ids:
+        if user_id not in spoken:
+            # INFO, not WARNING: this is the gate working, not a fault. It names
+            # the user and the reason and stops there — see the no-record note.
+            log.info("call wake skipped user=%s channel=%s reason=no_prior_conduct",
+                     user_id, channel_id)
+    return [u for u in user_ids if u in spoken]
+
+
 async def wake_for_message(*, channel_id: str, channel_kind: ChannelKindStr, sender_id: str,
                            body: str, exclude_user_ids: set[str]) -> None:
     """Wake the other DM member's devices for an accepted call invitation.
@@ -995,6 +1059,9 @@ async def wake_for_message(*, channel_id: str, channel_kind: ChannelKindStr, sen
             recipients = await _recipients(
                 session, channel_id=channel_id, sender_id=sender_id,
                 exclude_user_ids=exclude_user_ids)
+            if wake is WakeKind.CALL_INVITE:
+                recipients = await _spoken_here(
+                    session, channel_id=channel_id, user_ids=recipients)
             payload = WakePayload(channel_id=channel_id)
             for user_id in recipients:
                 # The per-recipient budget is charged inside _wake_user, once the

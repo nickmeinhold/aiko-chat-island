@@ -36,6 +36,7 @@ from aiko_gateway.domain import apns, push_service, users_service
 import sqlalchemy as sa
 
 from aiko_gateway.domain.models import (
+    Message,
     ApnsEnvironment, Channel, ChannelKind, DeviceToken, Membership, TokenKind,
 )
 from aiko_gateway.domain.push_result import ReapOrder, SendResult, Verdict
@@ -148,6 +149,16 @@ async def dm(session, monkeypatch):
     `push_service` opens its OWN session (it runs detached from the request), so
     the factory is pointed at the test session — and must NOT close it, or the
     assertions afterwards would run against a dead session.
+
+    BOB HAS SPOKEN HERE, and that is now load-bearing (claude-tasks#4216). The
+    conduct gate only rings a recipient who has posted in the channel before, so a
+    fixture where the callee never speaks describes FIRST CONTACT — where the
+    correct behaviour is silence. Adding bob's message makes this fixture an
+    ESTABLISHED conversation, which is what every ring test here is actually about.
+    Thirteen tests began failing when the gate landed; that was the gate working,
+    not a regression, and the fix is to say which world the fixture is in rather
+    than to weaken the gate. `test_a_first_contact_call_invite_does_not_wake` holds
+    the other world.
     """
     alice = await users_service.create_user(
         session, username="alice", display_name="Alice", password="pw")
@@ -163,6 +174,8 @@ async def dm(session, monkeypatch):
         Membership(channel_id=CHANNEL, user_id=alice.id),
         Membership(channel_id=CHANNEL, user_id=bob.id),
         DeviceToken(user_id=bob.id, platform="apns", token="b" * 64),
+        Message(id="01BOBSPOKEHERE00000000000", channel_id=CHANNEL,
+                sender_user_id=bob.id, sender_kind="user", body="hi"),
     ])
     await session.commit()
 
@@ -1039,3 +1052,79 @@ async def test_an_unreapable_dead_token_does_not_ring_the_operator_alarm(
         "THE ARM THAT DISCRIMINATES: the ERROR alarm must be REPLACED, not "
         "accompanied. A fix that logs the warning and still errors leaves the "
         f"forever-alarm exactly where it was. Got: {caplog.text}")
+
+
+@pytest.mark.asyncio
+async def test_a_first_contact_call_invite_does_not_wake(
+    session, dm, configured, fake_apns, caplog
+):
+    """THE MUST-FAIL ARM for the stranger gate (claude-tasks#4216).
+
+    Before this gate, any authenticated user could open a DM with any user id, send
+    the call sentinel, and ring a locked phone full-screen through silent mode.
+    Blocks and bans were the only person-level gates and both are opt-OUT — they
+    need the recipient to have already acted against someone they may never have
+    heard of.
+
+    THE ARM: bob's message is DELETED, so the channel is first contact. The wake
+    must not happen. Without this test the gate working and the gate not running
+    are the same silence — the class that has bitten this project repeatedly — and
+    `test_a_call_invite_wakes_once_the_recipient_has_spoken` below is the control
+    that stops this passing for the wrong reason.
+    """
+    alice, bob = dm
+    await session.execute(Message.__table__.delete())
+    await session.commit()
+
+    with caplog.at_level(logging.INFO, logger="aiko_gateway.push"):
+        await _wake(sender_id=alice.id)
+
+    assert fake_apns.sent == [], (
+        "a stranger's first message rang the callee's phone — the whole point of "
+        "the gate is that this cannot happen")
+    assert any("reason=no_prior_conduct" in r.message for r in caplog.records), (
+        f"the skip must name itself so it is not indistinguishable from a delivery "
+        f"bug. Log: {caplog.text}")
+
+
+@pytest.mark.asyncio
+async def test_a_call_invite_wakes_once_the_recipient_has_spoken(
+    session, dm, configured, fake_apns
+):
+    """THE CONTROL. Same channel, same caller — bob has posted, so the ring lands.
+
+    Without this, the test above passes just as well against a gate that refuses
+    EVERY call invite, which would be a silent outage of the whole feature rather
+    than a stranger gate.
+    """
+    alice, _bob = dm
+    await _wake(sender_id=alice.id)
+    assert [t for t, _, _ in fake_apns.sent] == ["b" * 64], (
+        "an established conversation did not ring — the gate is refusing everyone")
+
+
+@pytest.mark.asyncio
+async def test_an_ordinary_message_does_not_wake_at_all_gate_or_no_gate(
+    session, dm, configured, fake_apns
+):
+    """A CALL INVITE IS THE ONLY THING THAT WAKES A HANDSET TODAY.
+
+    Written after a wrong assumption: I added a test asserting that ordinary
+    message wakes are NOT gated by prior conduct, expecting the gate to be scoped
+    to `WakeKind.CALL_INVITE`. It failed, because `should_wake` returns
+    `CALL_INVITE` or `None` and nothing else — an ordinary DM message never wakes
+    anyone at all, so there was no un-gated wake to exempt.
+
+    That makes the conduct gate cover **100%** of the wake path rather than a
+    subset, which is a stronger property than the one I set out to test and worth
+    pinning: if someone later adds a message-wake kind, this test reddens and they
+    must decide, deliberately, whether the conduct gate applies to it. Without that
+    they would inherit an un-gated wake by omission — the same silent-inheritance
+    shape `WakeKind`'s exhaustive matching exists to prevent one layer down.
+    """
+    alice, _bob = dm
+    await _wake(sender_id=alice.id, body="just saying hello")
+    assert fake_apns.sent == [], (
+        "an ordinary message woke a handset. If that is now intended, the conduct "
+        "gate (claude-tasks#4216) must be extended to cover it — a stranger's "
+        "MESSAGE waking a locked phone is the same class of harm as their call")
