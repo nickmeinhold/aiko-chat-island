@@ -1084,9 +1084,24 @@ async def test_a_first_contact_call_invite_does_not_wake(
     """
     alice, bob = dm
     await session.execute(Message.__table__.delete())
-    session.add(Message(id="01ALICEINVITE00000000000", channel_id=CHANNEL,
-                        sender_user_id=alice.id, sender_kind="user",
-                        body=push_service.CALL_INVITE_BODY))
+    session.add_all([
+        # The caller's own sentinel — production always has this by the time the
+        # wake is scheduled, so a "the channel has any row" predicate must fail.
+        Message(id="01ALICEINVITE00000000000", channel_id=CHANNEL,
+                sender_user_id=alice.id, sender_kind="user",
+                body=push_service.CALL_INVITE_BODY),
+        # AND Bob has spoken SOMEWHERE ELSE (Tesla, cage-match PR#173 r2). The
+        # predicate is TWO conjuncts — this channel AND this recipient — and the
+        # previous arm could only falsify one of them. With Bob mute everywhere,
+        # a weaker query that DROPPED `channel_id` (`sender_user_id IN (:ids)`)
+        # refused in the suite and ADMITTED in production, where Bob has posted in
+        # #general: a stranger opens a fresh DM and rings a locked phone. That is
+        # not "any row in this channel", it is "any row on the island" — which is
+        # nearly every live user, i.e. no gate at all. This row is what makes the
+        # channel conjunct falsifiable.
+        Message(id="01BOBSPOKEELSEWHERE00000", channel_id="01OTHERCHANNEL0000000000",
+                sender_user_id=bob.id, sender_kind="user", body="hi from #general"),
+    ])
     await session.commit()
 
     with caplog.at_level(logging.INFO, logger="aiko_gateway.push"):
@@ -1122,25 +1137,36 @@ async def test_an_ordinary_message_does_not_wake_at_all_gate_or_no_gate(
 ):
     """A CALL INVITE IS THE ONLY THING THAT WAKES A HANDSET TODAY.
 
-    Written after a wrong assumption: I added a test asserting that ordinary
-    message wakes are NOT gated by prior conduct, expecting the gate to be scoped
-    to `WakeKind.CALL_INVITE`. It failed, because `should_wake` returns
-    `CALL_INVITE` or `None` and nothing else — an ordinary DM message never wakes
-    anyone at all, so there was no un-gated wake to exempt.
+    Written after a wrong assumption: I added a test asserting ordinary message
+    wakes are NOT gated by prior conduct, expecting the gate to be scoped to one
+    `WakeKind` among several. It failed — `should_wake` returns `CALL_INVITE` or
+    `None` and nothing else, so an ordinary message never wakes anyone and there
+    was no un-gated wake to exempt.
 
-    That makes the conduct gate cover **100%** of the wake path rather than a
-    subset, which is a stronger property than the one I set out to test and worth
-    pinning: if someone later adds a message-wake kind, this test reddens and they
-    must decide, deliberately, whether the conduct gate applies to it. Without that
-    they would inherit an un-gated wake by omission — the same silent-inheritance
-    shape `WakeKind`'s exhaustive matching exists to prevent one layer down.
+    FIRST CONTACT, NOT THE ESTABLISHED FIXTURE (Tesla, cage-match PR#173 r2). This
+    ran against the `dm` fixture where Bob has already spoken, so gated or
+    un-gated a future message-wake kind would send, and the natural "fix" when it
+    reddened would be to assert that it DOES send — pinning nothing. With Bob mute
+    here, a new wake kind that reaches a stranger's recipient reddens this, and the
+    only way to make it green is to decide, explicitly, whether a stranger's
+    MESSAGE may wake a locked phone.
+
+    Honest scope: the real enforcement is the UNCONDITIONAL `_spoken_here` call in
+    `wake_for_message` — this test cannot see someone re-wrapping it in an
+    `if wake is WakeKind.CALL_INVITE`, the tautology this file already had to
+    unlearn. That is a code-shape guarantee, not a test one, and saying so here is
+    better than a docstring implying coverage the fixture does not have.
     """
-    alice, _bob = dm
+    alice, bob = dm
+    await session.execute(Message.__table__.delete())
+    await session.commit()
+
     await _wake(sender_id=alice.id, body="just saying hello")
     assert fake_apns.sent == [], (
-        "an ordinary message woke a handset. If that is now intended, the conduct "
-        "gate (claude-tasks#4216) must be extended to cover it — a stranger's "
-        "MESSAGE waking a locked phone is the same class of harm as their call")
+        "an ordinary message woke a handset. If that is now intended, decide "
+        "explicitly whether the conduct gate applies to it — a stranger's MESSAGE "
+        "waking a locked phone is the same class of harm as their call "
+        "(claude-tasks#4216)")
 
 
 @pytest.mark.asyncio
