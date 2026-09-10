@@ -762,12 +762,28 @@ def test_a_nul_does_not_corrupt_the_value_reader(island) -> None:
 # The shape of a real live island's .env, by SEVERITY TIER rather than by copying a
 # box's current key list — a census pinned to today's boxes goes stale the first time
 # someone adds a key, and a test that must be edited to stay true stops being read.
-# Every name here is one both live islands actually carry.
+# Every name here is one both live islands carry. FCM_SERVICE_ACCOUNT_JSON was listed
+# here ahead of the boxes; it went with the transport when design 14's temper dissolved
+# shipping an FCM send path ahead of the client's receive half. It comes back in the
+# change that ships Android end-to-end — a Firebase service-account private key is
+# downloadable exactly ONCE, so that change must not be the run that discovers whether
+# this guard lists it.
 _LIVE_SHAPED_KEYS = {
     # unrecoverable: exists nowhere but the box
     "ISLAND_SIGNING_SEED", "APNS_PRIVATE_KEY", "GITHUB_CLIENT_SECRET",
     # loud: the island refuses to boot without them
-    "MODERATOR_USER_IDS", "CSAM_RUNBOOK_ACKNOWLEDGED",
+    # APNS_VOIP_TOPIC is listed as LOUD because it joined config.py's APNs
+    # all-or-none group: a box that loses only this key still holds four APNs
+    # credentials and refuses to boot. Widening the fixture is the whole benefit —
+    # NOT that the guard would otherwise be unable to name it. Tesla raised this in
+    # cage-match PR#172 r1 as "the guard cannot name the absence"; that half is a
+    # FALSE POSITIVE and is recorded rather than quietly dropped. standup's guard is
+    # GENERIC: it reports whatever the existing .env holds that the heredoc would
+    # destroy, so it can already name any key, including one that exists nowhere in
+    # this repo. Positive-controlled by putting a deliberately bogus key in this set
+    # and confirming the totality test still passes — which is the correct result
+    # for a generic guard, and the measurement that refuted the finding.
+    "MODERATOR_USER_IDS", "CSAM_RUNBOOK_ACKNOWLEDGED", "APNS_VOIP_TOPIC",
     # silent and dangerous: reverts to the compose default and unpins the next deploy
     "ISLAND_VERSION", "ENVIRONMENT",
     # ordinary operator config

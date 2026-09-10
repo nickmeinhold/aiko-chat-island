@@ -228,7 +228,8 @@ class Settings(BaseSettings):
     # tab's recorded decision (`device_platform.dart`: "Google is not in the RUNTIME
     # PATH on Apple platforms") and this half must not silently contradict it — the
     # `Platform` enum's two values only mean something if each talks to its own
-    # service. Android/FCM is a separate transport behind the same door, NOT built yet.
+    # service. Android/FCM is a separate transport behind the same door (see
+    # FCM_SERVICE_ACCOUNT_JSON below) — same gates, same budget, its own wire.
     #
     # OPTIONAL, exactly like LiveKit above: absent credentials mean the island runs
     # normally and simply never pushes. An operator standing up an island gets a
@@ -240,6 +241,16 @@ class Settings(BaseSettings):
     # a device token is only valid for the topic it was issued under, so a wrong
     # topic is a silent 400 for every send, and it must be stated, not inferred.
     apns_topic: str = ""
+    # The VoIP topic — the SAME bundle id with a `.voip` suffix, which is Apple's
+    # definition rather than our choice. STATED, NOT DERIVED, by design 12 Decision
+    # 3 and Nick's ruling of 2026-09-10: the same argument the line above makes for
+    # `apns_topic` applies here unchanged. A device's VoIP token is minted under
+    # THIS topic and is valid for no other, so a wrong value is the same silent 400
+    # for every ring, and an operator who can read the value is an operator who can
+    # fix it. It joins the all-or-none group below, which is what makes a missing
+    # value abort a deploy at preflight instead of surfacing as a phone that never
+    # rings. See `apns._topic_for`.
+    apns_voip_topic: str = ""
     # SECRET — the .p8 signing key, PEM contents (host .env / SOPS), not a path.
     # Contents rather than a path deliberately: the container would otherwise need a
     # bind-mount whose absence fails at first-send (a runtime surprise) instead of at
@@ -263,7 +274,16 @@ class Settings(BaseSettings):
     # wherever you are — so it gets its own cap, keyed on the person being woken rather
     # than the sender's IP like the auth buckets. A DM peer who can legitimately send
     # can still only ring you N times a minute. Not an authn control; a blast-radius cap.
+    #
+    # METERS EVERY TRANSPORT, despite the name. The budget protects the PERSON being
+    # interrupted, so one bucket is charged once per fanout whether the recipient's
+    # devices are Apple, Android or both — a second FCM budget would hand someone
+    # holding an iPhone AND an Android twice the ring allowance. The name is kept
+    # because renaming a live Settings field costs a compose forward, a MANIFEST
+    # entry, two boxes' .env, an invariant-7b exemption and the standup key-loss
+    # guard, all for zero behaviour change. A stated deferral, not an oversight.
     apns_wake_per_recipient_per_minute: int = Field(default=6, ge=1, le=60)
+
 
     # Self-service registration. None → resolved by environment in the validator
     # (open in dev, closed in prod); set OPEN_REGISTRATION to override either way.
@@ -694,6 +714,15 @@ class Settings(BaseSettings):
             # cryptography accepts either, but leading whitespace breaks the
             # "-----BEGIN" header match. lstrip only.
             "apns_private_key": self.apns_private_key.lstrip(),
+            # THE FIFTH MEMBER (design 12 Decision 3; Nick, 2026-09-10). Adding it
+            # is only safe because `deploy/preflight-apns.sh` gained the same key in
+            # the SAME change: an existing box carries four of these five, so
+            # without the preflight this line turns the next version bump into a
+            # boot refusal under `restart: always`. The preflight catches it before
+            # the backup and before anything is pulled, so the operator gets a
+            # message while the island is still running. Never add a member here
+            # without adding it there.
+            "apns_voip_topic": self.apns_voip_topic.strip(),
         }
         for name, value in _apns.items():
             setattr(self, name, value)
@@ -704,6 +733,38 @@ class Settings(BaseSettings):
                 f"{sorted(_apns)} or NONE. A partial set silently fails every "
                 "push at Apple's door, which is indistinguishable on the handset "
                 "from push being switched off. Refusing to boot."
+            )
+        # PRESENCE IS NOT USABILITY, and for a PAIR that means they must DIFFER
+        # (Tesla, cage-match PR#172 r6). `apns_topic` and `apns_voip_topic` were
+        # each checked for presence and never against each other. They cannot both
+        # be right when equal: Apple issues alert tokens under the bare bundle id
+        # and VoIP tokens under a separate `.voip` topic, so equality is a CERTAIN
+        # wrong-topic for one kind — usually VoIP, because the way an operator
+        # reaches this state is copying APNS_TOPIC into the new slot.
+        #
+        # WHY IT WOULD HAVE BEEN INVISIBLE, which is the reason it is a boot
+        # refusal and not a warning: every VoIP send returns 400
+        # DeviceTokenNotForTopic -> REJECTED -> never reaped -> one ERROR line. A
+        # handset registered for BOTH kinds still gets its alert banner, so
+        # `delivered_to=0` never fires and the island looks healthy. Only the
+        # voip-only population — which this change's own comments call normal and
+        # PERMANENT, because a PushKit token needs no notification permission —
+        # goes silently, permanently deaf.
+        #
+        # The ladder above already refuses a P-256 key that parses and cannot sign,
+        # and FCM makes a disagreeing project id unrepresentable by deriving it.
+        # This is the same "parseable is not usable" rung for a two-field invariant
+        # that was left as two independent strings.
+        if (self.apns_topic and self.apns_voip_topic
+                and self.apns_topic == self.apns_voip_topic):
+            raise ValueError(
+                f"APNS_TOPIC and APNS_VOIP_TOPIC are both {self.apns_topic!r}. "
+                "They must differ: Apple issues alert tokens under the bundle id "
+                "and VoIP tokens under a separate topic (conventionally the bundle "
+                "id plus '.voip'), so an identical pair guarantees every VoIP push "
+                "is rejected with DeviceTokenNotForTopic. That failure is SILENT — "
+                "dual-registered handsets still get the alert, so no alarm fires "
+                "and only voip-only devices go deaf. Refusing to boot."
             )
         if all(_apns.values()):
             # PRESENCE IS NOT PARSEABILITY (cage-match #139, Maxwell). The guard
@@ -757,6 +818,7 @@ class Settings(BaseSettings):
                     "specifically, so this key parses but can never sign an APNs "
                     "provider token. Refusing to boot."
                 )
+
 
         # A2 (crucible-09 Phase A): `e2ee` is schema-reserved for Phase B and
         # HARD-REJECTED in EVERY environment until MLS lands. Advertising an

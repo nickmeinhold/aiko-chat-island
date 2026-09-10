@@ -19,9 +19,12 @@ Built from the domain services only (never `main`), keeping the suite's
 "never import aiko_services" isolation invariant.
 """
 from __future__ import annotations
+import time
+from sqlalchemy import delete as sa_delete
 
 import asyncio
 import contextlib
+import dataclasses
 import logging
 import datetime as dt
 
@@ -33,10 +36,20 @@ from aiko_gateway.domain import apns, push_service, users_service
 import sqlalchemy as sa
 
 from aiko_gateway.domain.models import (
-    ApnsEnvironment, Channel, ChannelKind, DeviceToken, Membership,
+    ApnsEnvironment, Channel, ChannelKind, DeviceToken, Membership, TokenKind,
 )
+from aiko_gateway.domain.push_result import ReapOrder, SendResult, Verdict
 
 CHANNEL = "01JDMCHANNELDM000000000000"
+
+# A synthetic FCM service-account blob. No key material: every FCM test here
+# replaces `apns.send` wholesale, so nothing ever signs anything.
+FCM_CREDENTIAL = (
+    '{"type":"service_account","project_id":"aiko-island-test",'
+    '"private_key_id":"0123456789abcdef",'
+    '"private_key":"-----BEGIN PRIVATE KEY-----\\nx\\n-----END PRIVATE KEY-----\\n",'
+    '"client_email":"island@aiko-island-test.iam.gserviceaccount.com"}'
+)
 
 
 class FakeApns:
@@ -51,22 +64,45 @@ class FakeApns:
     def __init__(self, verdict: apns.Verdict = apns.Verdict.DELIVERED):
         self.verdict = verdict
         # Apple's 410 timestamp, in ms. None = "Apple sent no timestamp", which
-        # the reaper must treat as NO EVIDENCE rather than as the epoch.
+        # the reaper must treat as NO EVIDENCE rather than as the epoch. Kept in
+        # Apple's own units and converted here, because converting is exactly
+        # what the real transport does with a 410 body — a fake that took a
+        # ready-made ReapOrder would skip the step where the rule lives.
         self.invalid_since_ms: int | None = None
         self.sent: list[tuple[str, dict, str | None]] = []
         # The APNs environment the service asked for, per send (#3386). Recorded
         # separately from `sent` so the existing unpacking sites stay a 3-tuple.
         self.environments: list[ApnsEnvironment] = []
+        # The token kind the service asked for, per send. Same reason.
+        self.kinds: list[TokenKind] = []
 
     async def __call__(self, device_token, payload, *, apns_environment,
-                       collapse_id=None):
+                       token_kind, collapse_id=None):
         self.sent.append((device_token, payload, collapse_id))
         self.environments.append(apns_environment)
+        self.kinds.append(token_kind)
         # Returns the SAME shape the real transport returns. A fake whose
         # contract has drifted from the real API tests a system that does not
         # exist — this one drifted once already, when send() grew SendResult, and
         # the suite caught it immediately because every test goes through here.
-        return apns.SendResult(self.verdict, self.invalid_since_ms)
+        # CALLS the real rule rather than MIRRORING it (Tesla, cage-match PR#172
+        # r2). This block used to re-implement `apns._reap_order` line for line, and
+        # said so in a comment that read as a virtue — "MIRRORS apns._reap_order
+        # EXACTLY". A mirror is not an independent instrument: the fake and the
+        # function shared a representation, so they could not fail differently.
+        # If `_reap_order` ever started returning `ReapOrder()` — the DESTRUCTIVE
+        # default, a dateless order authorising an unbounded delete — for a
+        # timestamp-less 410, this fake would keep returning None and every
+        # reap-refusal test in the suite would stay green while the island emptied
+        # the device table. The one behaviour these tests exist to protect is the
+        # one a duplicated rule cannot check.
+        #
+        # Deriving from the production function makes that change PROPAGATE into
+        # the tests instead of being hidden by them. The fake still owns the INPUT
+        # (`invalid_since_ms` — Apple's units, converted by the real code, which is
+        # where the rule lives); it no longer owns the DECISION.
+        reap = apns._reap_order(self.verdict, self.invalid_since_ms)
+        return apns.SendResult(self.verdict, reap)
 
 
 @pytest.fixture
@@ -79,9 +115,23 @@ def configured(monkeypatch):
     monkeypatch.setattr(settings, "apns_topic", "cc.example.app", raising=False)
     monkeypatch.setattr(settings, "apns_private_key", "-----BEGIN PRIVATE KEY-----",
                         raising=False)
+    # THE FIFTH CREDENTIAL. `apns.is_configured()` counts the VoIP topic (Carnot,
+    # cage-match PR#172 r1), matching the settings all-or-none group — so a fixture
+    # naming only four describes an island that CANNOT boot, and every test using it
+    # would silently exercise the no-configured-platform path instead of the send
+    # path it was written for.
+    monkeypatch.setattr(settings, "apns_voip_topic", "cc.example.app.voip",
+                        raising=False)
     apns.reset_for_tests()
     yield
     apns.reset_for_tests()
+
+
+@pytest.fixture
+def apns_unconfigured(monkeypatch):
+    for k in ("apns_key_id", "apns_team_id", "apns_topic", "apns_private_key",
+              "apns_voip_topic"):
+        monkeypatch.setattr(settings, k, "", raising=False)
 
 
 @pytest.fixture
@@ -176,20 +226,42 @@ def test_channel_kind_literal_matches_the_enum():
 @pytest.mark.parametrize(
     "kind,body,expected",
     [
-        ("dm", push_service.CALL_INVITE_BODY, True),
+        ("dm", push_service.CALL_INVITE_BODY, push_service.WakeKind.CALL_INVITE),
         # A prefix match would hand an attacker a wake primitive with arbitrary
         # trailing content — the app's `isCallInviteBody` is exact for the same reason.
-        ("dm", push_service.CALL_INVITE_BODY + " and now you ring", False),
-        ("dm", "look: " + push_service.CALL_INVITE_BODY, False),
-        ("dm", "hello", False),
+        ("dm", push_service.CALL_INVITE_BODY + " and now you ring", None),
+        ("dm", "look: " + push_service.CALL_INVITE_BODY, None),
+        ("dm", "hello", None),
         # Video is DM-only, so a call invitation in a public room is not a call.
-        ("public", push_service.CALL_INVITE_BODY, False),
-        ("private", push_service.CALL_INVITE_BODY, False),
-        ("dm", "", False),
+        ("public", push_service.CALL_INVITE_BODY, None),
+        ("private", push_service.CALL_INVITE_BODY, None),
+        ("dm", "", None),
     ],
 )
-def test_should_wake_truth_table(kind, body, expected):
+def test_should_wake_returns_the_wake_kind(kind, body, expected):
+    """The gate now returns WHAT KIND OF WAKE this is, not merely whether to
+    wake — and the router accepts a VoIP delivery only from a `WakeKind` it was
+    handed, whose only supply is this predicate.
+
+    That turns "every push this module can emit is a call invite" from a true
+    sentence about two functions four hundred lines apart into a data-flow fact.
+    When design 12 Decision 5's cancel wake lands, adding `WakeKind.CALL_END`
+    makes the router's match non-exhaustive — which is exactly the moment
+    somebody must DECIDE whether a cancel rings, instead of a non-call silently
+    inheriting a VoIP push whose penalty is invisible to `SendResult` forever.
+    """
     assert push_service.should_wake(kind, body) is expected
+
+
+def test_wake_kind_is_compared_by_identity_not_truthiness():
+    """Callers must use `is None`, never `not wake`. The one member is truthy
+    today, so a falsy-valued member added later would silently turn the gate
+    off — the failure mode being an island that stops ringing with no error."""
+    import inspect
+    for fn in (push_service.wake_for_message, push_service.schedule_wake):
+        source = inspect.getsource(fn)
+        assert "not should_wake" not in source, (
+            f"{fn.__name__} tests the WakeKind for truthiness")
 
 
 # --------------------------------------------------------------------------
@@ -240,7 +312,13 @@ async def test_payload_never_names_the_caller(session, dm, configured, fake_apns
     assert alice.id not in flat
     # The channel id IS present — it is what makes the tap land in the right
     # conversation, and it is the one identifier we accept leaking.
-    assert payload["c"] == CHANNEL
+    assert payload.channel_id == CHANNEL
+    # THE DOCTRINE IS NOW STRUCTURAL, not merely asserted. `WakePayload` has ONE
+    # field, so there is nowhere for a future "improvement" to put a caller's
+    # name — it would have to change the type, which is the difference between a
+    # commitment and a comment. The per-transport envelopes are rendered BELOW the
+    # boundary (`apns._render`) from exactly this.
+    assert [f.name for f in dataclasses.fields(payload)] == ["channel_id"]
 
 
 # --------------------------------------------------------------------------
@@ -308,6 +386,30 @@ async def test_a_row_re_registered_during_the_send_is_not_reaped(
 
     The fake mutates the row MID-SEND, which is the window itself — not a
     simulation of it.
+
+    WHY THE FAKE RETURNS A DATELESS `ReapOrder(None)`, STATED BECAUSE IT IS NOT
+    APPLE'S BEHAVIOUR (Tesla, cage-match PR#172 r1). `apns._reap_order` returns
+    `None` — not `ReapOrder(None)` — for a 410 carrying no timestamp, so this exact
+    value is one the APNs transport can never produce; it is FCM's weaker,
+    dateless permission wearing Apple's name. That is deliberate and load-bearing,
+    but it was previously unstated, which is worse than either choice on its own:
+
+      - `reap=None` would make the row survive TRIVIALLY, because nothing would
+        attempt a delete at all. The assertion would pass without the guard under
+        test ever executing — a test that cannot produce the failure it screens for.
+      - A DATED order would let the row survive for TWO reasons at once (the triple
+        mismatch AND `updated_at <= not_reregistered_since`), so a broken triple
+        check would still go green.
+
+    A dateless-but-present order is the only value that isolates the compare-and-
+    delete triple, which is the guard this test exists for. Read it as a test of the
+    SHARED reap path, not of Apple's verdict mapping — `test_a_410_without_a_
+    timestamp_does_not_reap` is where Apple's own dateless behaviour is pinned.
+
+    Honest residual: `ReapOrder(None)` is indistinguishable from `ReapOrder()`'s
+    default, so this test cannot tell a caller that deliberately passed no date from
+    one that forgot to pass a date at all. That is a real blind spot in this
+    fixture, named rather than papered over.
     """
     alice, bob = dm
     row = (await session.execute(
@@ -316,7 +418,7 @@ async def test_a_row_re_registered_during_the_send_is_not_reaped(
     assert row is not None, "fixture precondition: bob has a registered device"
 
     async def _send_then_reregister(device_token, payload, *, apns_environment,
-                                    collapse_id=None):
+                                    token_kind, collapse_id=None):
         # The device comes back to life while APNs is still answering.
         await session.execute(
             DeviceToken.__table__.update()
@@ -324,7 +426,7 @@ async def test_a_row_re_registered_during_the_send_is_not_reaped(
             .values(updated_at=dt.datetime.now(dt.UTC))
         )
         await session.commit()
-        return apns.SendResult(apns.Verdict.DEAD_TOKEN)
+        return apns.SendResult(apns.Verdict.DEAD_TOKEN, ReapOrder(None))
 
     monkeypatch.setattr(apns, "send", _send_then_reregister)
     await _wake(sender_id=alice.id)
@@ -536,7 +638,7 @@ async def test_one_exploding_device_does_not_abandon_the_others(
     reached = []
 
     async def _explode_on_first(device_token, payload, *, apns_environment,
-                                collapse_id=None):
+                                token_kind, collapse_id=None):
         if device_token.startswith("b"):
             raise RuntimeError("provider token signing blew up")
         reached.append(device_token)
@@ -548,13 +650,17 @@ async def test_one_exploding_device_does_not_abandon_the_others(
 
 
 @pytest.mark.asyncio
-async def test_a_410_without_a_timestamp_does_not_reap(
+async def test_a_dead_token_without_a_reap_order_is_not_deleted(
     session, dm, configured, fake_apns, caplog
 ):
-    """NO TIMESTAMP, NO REAP (cage-match #139 round 6, Carnot). The timestamp is
-    the only evidence distinguishing "dead" from "was dead before the reinstall".
-    This module's posture is that failing safe for a reaper means NOT deleting —
-    applied consistently, not only where it was convenient.
+    """NO REAP ORDER, NO REAP (cage-match #139 round 6, Carnot, generalised).
+
+    The refusal encodes APPLE's documented resume-if-re-registered rule, so it
+    belongs in `apns.py` and not in the shared reaper: FCM's UNREGISTERED carries
+    no timestamp at all, and a shared rule keyed on one would build an FCM reaper
+    that can never fire — a true sentence filed against the wrong owner. The
+    reaper's remaining question is the one it can answer for every transport: did
+    the transport that observed the death issue an order?
 
     Its control is `test_a_current_410_still_reaps`, which DOES supply one.
     """
@@ -574,8 +680,8 @@ async def test_a_410_without_a_timestamp_does_not_reap(
     # it — the row survived because the delete never ran, which is
     # indistinguishable from the guard working if you only count survivors. So
     # assert the REASON, and assert nothing exploded.
-    assert any("410_without_timestamp" in r.message for r in caplog.records), (
-        "the row survived, but not via the no-timestamp guard"
+    assert any("dead_without_reap_order" in r.message for r in caplog.records), (
+        "the row survived, but not via the no-reap-order guard"
     )
     assert not any(r.exc_info for r in caplog.records), (
         "the row survived because something threw, not because the guard fired"
@@ -583,7 +689,14 @@ async def test_a_410_without_a_timestamp_does_not_reap(
 
 
 def test_verdict_mapping_is_narrow():
-    """The mapping itself, at the unit level — the reaping rule stated once."""
+    """The mapping itself, at the unit level — the reaping rule stated once.
+
+    (The FCM sibling went with the transport — design 14 temper. `test_unregistered_is_the_only_
+    reaping_verdict` and its 404-without-a-detail must-fail arm), because each
+    transport's mapping is a fact about that protocol and belongs beside it. Both
+    halves are the same protective pair as the 410/400 one below: deleting either
+    breaks both.
+    """
     assert apns._verdict(200, "") is apns.Verdict.DELIVERED
     assert apns._verdict(410, "Unregistered") is apns.Verdict.DEAD_TOKEN
     # 410 reaps on STATUS alone; the reason string is not consulted.
@@ -633,16 +746,82 @@ async def test_a_blocked_peer_is_excluded(session, dm, configured, fake_apns):
 
 
 @pytest.mark.asyncio
-async def test_android_row_is_skipped_not_sent_to_apple(session, dm, configured,
-                                                        fake_apns):
-    """FCM is a separate transport behind the same door and is NOT built. An
-    Android token must never be handed to APNs — it would be a guaranteed
-    rejection, and (before the narrow reaping rule) a candidate for deletion."""
+async def test_a_handset_with_both_kinds_receives_both_pushes(
+    session, dm, configured, fake_apns, monkeypatch
+):
+    """ARM (B), PINNED so it cannot drift silently.
+
+    Rows carry no device identity, so "one push per handset" is not computable
+    and no selection rule can be correct. Sending to every selected row costs a
+    dual-registered iPhone a redundant banner beside its CallKit ring; preferring
+    voip would silently never ring an alert-only second Apple device. This module
+    already made that trade in those words: a duplicate notification is a
+    blemish, a missed call is the bug.
+
+    ONE budget slot for the fanout, because the budget protects the PERSON.
+    """
     alice, bob = dm
-    session.add(DeviceToken(user_id=bob.id, platform="fcm", token="f" * 100))
+    monkeypatch.setattr(settings, "apns_wake_per_recipient_per_minute", 1,
+                        raising=False)
+    session.add(DeviceToken(user_id=bob.id, platform="apns", token="v" * 64,
+                            token_kind=TokenKind.VOIP.value))
     await session.commit()
+
     await _wake(sender_id=alice.id)
-    assert [t for t, _, _ in fake_apns.sent] == ["b" * 64]
+    assert sorted(t for t, _, _ in fake_apns.sent) == ["b" * 64, "v" * 64]
+    assert sorted(k.value for k in fake_apns.kinds) == ["alert", "voip"]
+
+
+@pytest.mark.asyncio
+async def test_a_voip_only_recipient_is_rung_on_the_voip_row(
+    session, dm, configured, fake_apns
+):
+    """THE PERMANENT POPULATION, end to end (design 12 Decision 2.1).
+
+    A PushKit VoIP token needs no user permission at all, while a handset that
+    declined notifications cannot be RUNG by an alert push — so "holds voip and
+    never alert" is not a half-registered edge case, it is a normal and permanent
+    state. An implementation that only ever reached alert rows would leave exactly
+    the people who most need a ring unreachable, silently.
+
+    Note what this needed that the both-kinds test did not: the alert row DELETED.
+    `_wake_user`'s early return used to read "no alert-sendable row" as "this user
+    cannot be woken", and only a recipient with no alert row at all can show it.
+    """
+    alice, bob = dm
+    await session.execute(DeviceToken.__table__.delete())
+    session.add(DeviceToken(user_id=bob.id, platform="apns", token="v" * 64,
+                            token_kind=TokenKind.VOIP.value))
+    await session.commit()
+
+    await _wake(sender_id=alice.id)
+    assert [t for t, _, _ in fake_apns.sent] == ["v" * 64]
+    assert fake_apns.kinds == [TokenKind.VOIP]
+
+
+@pytest.mark.asyncio
+async def test_a_wake_that_delivered_to_nobody_is_logged_at_error(
+    session, dm, configured, fake_apns, caplog
+):
+    """THE ALARM NOTHING ELSE IN THE SYSTEM HAS. A recipient was selected, sends
+    were attempted, and not one returned DELIVERED — today that produces only
+    per-device warnings and no statement anywhere that the ring failed."""
+    alice, bob = dm
+    fake_apns.verdict = apns.Verdict.REJECTED
+    await _wake(sender_id=alice.id)
+    assert any("delivered_to=0" in r.message and r.levelname == "ERROR"
+               for r in caplog.records), caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_delivered_wake_raises_no_alarm(session, dm, configured, fake_apns,
+                                                caplog):
+    """THE CONTROL. An alarm that fires on the healthy path is the silence this
+    module keeps rediscovering, wearing a high-vis vest."""
+    alice, bob = dm
+    with caplog.at_level(logging.ERROR, logger="aiko_gateway.push"):
+        await _wake(sender_id=alice.id)
+    assert not [r for r in caplog.records if r.levelname == "ERROR"], caplog.text
 
 
 @pytest.mark.asyncio
@@ -657,38 +836,6 @@ async def test_wake_budget_is_per_recipient(session, dm, configured, fake_apns,
     for _ in range(5):
         await _wake(sender_id=alice.id)
     assert len(fake_apns.sent) == 3
-
-
-@pytest.mark.asyncio
-async def test_an_fcm_only_recipient_does_not_burn_the_apns_budget(
-    session, dm, configured, fake_apns, monkeypatch
-):
-    """A ROW IS NOT A SENDABLE ROW (cage-match #139 round 2, Carnot).
-
-    Round 1 charged the budget once the recipient was known to have *a device*.
-    A recipient holding only an Android/FCM token therefore burned an APNs wake
-    slot on every call — so an iPhone registered later in the same minute could
-    find its first real wake already throttled. Budget is now charged only when
-    there is an APNs-sendable row.
-
-    The arm that makes this meaningful: after N+1 FCM-only calls, a freshly
-    registered iPhone must STILL be wakeable. A naive implementation throttles it.
-    """
-    alice, bob = dm
-    monkeypatch.setattr(settings, "apns_wake_per_recipient_per_minute", 2,
-                        raising=False)
-    await session.execute(DeviceToken.__table__.delete())
-    session.add(DeviceToken(user_id=bob.id, platform="fcm", token="f" * 100))
-    await session.commit()
-
-    for _ in range(5):            # would exhaust a 2/min budget if charged
-        await _wake(sender_id=alice.id)
-    assert fake_apns.sent == []   # nothing sendable, nothing sent
-
-    session.add(DeviceToken(user_id=bob.id, platform="apns", token="b" * 64))
-    await session.commit()
-    await _wake(sender_id=alice.id)
-    assert len(fake_apns.sent) == 1, "the new iPhone was throttled by FCM-only calls"
 
 
 @pytest.mark.asyncio
@@ -816,3 +963,79 @@ async def test_the_send_carries_the_ROW_environment_not_the_island(
     assert by_token == {"b" * 64: "sandbox", "p" * 64: "production"}, (
         "the fanout applied one environment to every device instead of reading "
         "each row's own")
+
+
+# ---------------------------------------------------------------------------
+# CROSS-TRANSPORT TIME ISOLATION — the half of the boundary that was only a
+# comment. `_wake_user` has always claimed "Apple being down must not cost the
+# Android half of a fanout, or the reverse." While the fanout was a serial `for`
+# loop that was FALSE, and the test above could not see it: it inserts the FCM
+# row SECOND, so Apple is reached first by rowid accident, and it asserts only
+# THAT the send happened, never WHEN.
+#
+# The coupling was TIME, not exceptions. Both clients carry a 10s httpx timeout
+# and an FCM OAuth transport failure is deliberately not negative-cached, so a
+# blackholed Google cost the iPhone up to ~10s per Android row — inside the 30s
+# ring lease and outside the app's admission window.
+#
+# BOTH arms insert the SLOW transport's row FIRST, so a regression to serial
+# dispatch fails instead of passing by ordering.
+# ---------------------------------------------------------------------------
+
+
+async def _reinsert_apns_row_last(session, user_id: str, token: str) -> None:
+    """Force the APNs row to be the LAST row for this user.
+
+    The fanout query carries no ORDER BY, so rowid order applies. A test that
+    wants Apple reached second has to say so structurally rather than hope.
+    """
+    await session.execute(
+        sa_delete(DeviceToken).where(DeviceToken.user_id == user_id,
+                                     DeviceToken.platform == "apns"))
+    session.add(DeviceToken(user_id=user_id, platform="apns", token=token))
+    await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_an_unreapable_dead_token_does_not_ring_the_operator_alarm(
+    session, dm, configured, fake_apns, caplog
+):
+    """A dead token the reaper may NOT delete must not fire the ERROR alarm on
+    every wake, forever (Carnot, cage-match PR#172 r1).
+
+    THE DEFECT. `DEAD_TOKEN` with no reap order is the reaper DELIBERATELY
+    withholding authority — an APNs 410 carrying no timestamp. The row is retained
+    ON PURPOSE, so it answers identically on every future wake, so `delivered`
+    never leaves zero and the ERROR fires forever for a state the system is
+    correctly holding. That is the warning-nobody-reads this module's own
+    `warn_if_unreachable` note argues against, manufactured by the one alarm meant
+    to be worth trusting.
+
+    WHY THIS TEST CAN FAIL. Two arms, and the second is the one that matters:
+    asserting the WARNING is present would still pass if the fix had merely ADDED a
+    line beside the ERROR — leaving the false alarm exactly where it was. So this
+    also asserts NO ERROR record exists. Reverting the fix reddens the second
+    assertion, which is the whole point of the change.
+
+    NOT a severity downgrade: it is a different FACT. "The ring failed and I do not
+    know why" is an emergency; "every device I can reach is dead and I am not
+    permitted to reap it" is a cleanup backlog. The REJECTED case above still
+    ERRORs, which is the control proving the alarm was not simply silenced.
+    """
+    alice, _bob = dm
+    fake_apns.verdict = apns.Verdict.DEAD_TOKEN
+    fake_apns.invalid_since_ms = None   # Apple sent no timestamp => no reap order
+
+    with caplog.at_level(logging.INFO, logger="aiko_gateway.push"):
+        await _wake(sender_id=alice.id)
+
+    assert any("reason=dead_unreapable" in r.message and r.levelname == "WARNING"
+               for r in caplog.records), (
+        "an unreapable dead token must name itself, so an operator can tell a "
+        f"cleanup backlog from a ring outage. Got: {caplog.text}")
+
+    assert not [r for r in caplog.records
+                if "delivered_to=0" in r.message and r.levelname == "ERROR"], (
+        "THE ARM THAT DISCRIMINATES: the ERROR alarm must be REPLACED, not "
+        "accompanied. A fix that logs the warning and still errors leaves the "
+        f"forever-alarm exactly where it was. Got: {caplog.text}")

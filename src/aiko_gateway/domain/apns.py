@@ -28,17 +28,23 @@ explicitly and raises a message that names the cause.
 """
 from __future__ import annotations
 
-import dataclasses
-import enum
+import datetime as dt
 import logging
 import re
 import time
+from typing import assert_never
 
 import httpx
 import jwt
 
 from ..config import settings
-from .models import ApnsEnvironment
+from .models import ApnsEnvironment, TokenKind
+# A `from X import Y` binding, deliberately: `apns.SendResult` and `apns.Verdict`
+# keep working and keep referring to the SAME objects, so every existing caller
+# and test is untouched by the move (`is` comparisons hold). The types themselves
+# moved to `push_result` when FCM arrived — a shared vocabulary living inside one
+# of its two speakers is not shared.
+from .push_result import ReapOrder, SendResult, Verdict, WakePayload
 
 log = logging.getLogger("aiko_gateway.apns")
 
@@ -134,15 +140,61 @@ if not _already_filtered(logging.getLogger("httpx")):
 # "refresh every request" implementation is not merely wasteful, it is rejected.
 _TOKEN_REFRESH_SECONDS = 50 * 60
 
-# How long APNs may keep trying to deliver. A call is PERISHABLE in a way an
-# ordinary notification is not: a ring that surfaces ten minutes late is worse than
-# no ring at all, because the recipient reaches for a call that has already ended
-# and cannot tell that from a call they fumbled. So we let APNs DISCARD rather than
-# store-and-forward. 60s is deliberately longer than the app's 10s ring-freshness
-# gate: the two clocks answer different questions (that one decides whether to RING,
-# this one decides whether the wake is still worth delivering at all), and a wake
-# arriving at 30s still usefully says "you just missed something in here".
-_EXPIRATION_SECONDS = 60
+# The VoIP topic is the bare topic plus this suffix — an Apple PROTOCOL FACT, not
+# an inference: `<bundle>.voip` is one of a small set of suffixed namespaces on a
+# single app record (`.voip`, `.complication`, `.pushkit.fileprovider`,
+# `.location-query`), selected per request by the header. Not a second app, not a
+# second App ID, not a second credential.
+#
+# RULED 2026-09-10 (Nick): the VoIP topic is a STATED setting, not a derived
+# one — see `_topic_for` and `config.apns_voip_topic`.
+
+# How long APNs may keep trying to deliver an ALERT wake. A call is PERISHABLE in a
+# way an ordinary notification is not: a ring that surfaces ten minutes late is
+# worse than no ring at all, because the recipient reaches for a call that has
+# already ended and cannot tell that from a call they fumbled. So we let APNs
+# DISCARD rather than store-and-forward.
+#
+# SCOPED TO THE ALERT WORLD, and the scoping is the point (12a-MEASURED M4). The
+# rationale that follows was written as a general rule and is not one: 60s is
+# deliberately longer than the app's 10s ring-freshness gate because in the ALERT
+# world the two clocks answer different questions — that one decides whether to
+# RING, this one decides whether the wake is still worth delivering at all — and a
+# late alert wake still usefully says "you just missed something in here". Under
+# VoIP that same sentence describes a PHANTOM RING, so the constant forks rather
+# than being inherited.
+_ALERT_EXPIRATION_SECONDS = 60
+
+# THE RING LEASE — Nick's ruling of 2026-09-09 (claude-tasks#3744), and the
+# mechanism of record for it.
+#
+# The island owns the 30s ring ceiling. A CallKit ring is system UI drawn before
+# Dart exists and does not self-expire; the app is suspendable the instant the
+# report completes, so a client-side timer had no home. What keeps Decision 1's
+# boundary intact ("the island never INFERS an end") is that this is not a claim
+# about the call at all — the island expires ITS OWN PUSH, which is a fact about
+# our delivery.
+#
+# 30 EQUALS the app's `kCallRingDuration`, and the equality IS the derivation the
+# 12a answer asks for ("the lease and the ring should be derived from one another
+# rather than picked"). A lease longer than the ring stores a push that reports a
+# call already over; a lease shorter than the ring stops the ring reaching a phone
+# that is still supposed to be ringing.
+#
+# NOT ZERO, though `apns-expiration: 0` (deliver-once-or-discard) is the obvious
+# way to make a phantom ring structurally impossible. Zero DELETES the lease, and
+# with it the ceiling mechanism the ruling names — and it converts a three-second
+# tunnel into a permanently missed call, against this module's own doctrine that a
+# duplicate notification is a blemish while a missed call is the bug.
+#
+# COUPLED HALF, OPEN AND NOT OURS TO CLOSE: the app's `admitRing` freshness gate is
+# 10s, narrower than this lease. A stored VoIP push delivered at t=15s is admitted
+# by APNs, MUST be reported to CallKit (design 12 Decision 4 — there is no
+# on-device window in which to reconsider), and would then be refused by that gate:
+# a report-and-end, which is the ratio Apple polices. The three clocks (this lease,
+# the 30s ring, the 10s freshness) still have no stated relationship, which the
+# ruling explicitly left open.
+_VOIP_LEASE_SECONDS = 30
 
 # The provider token, cached across sends: (jwt, issued_at_monotonic).
 _cached_token: tuple[str, float] | None = None
@@ -155,64 +207,23 @@ class ApnsNotConfigured(RuntimeError):
     unconfigured optional capability is simply off."""
 
 
-@dataclasses.dataclass(frozen=True, slots=True)
-class SendResult:
-    """What Apple said, plus the ONE piece of metadata the caller cannot re-derive.
-
-    `verdict` alone was the original return type. Carnot killed that in cage-match
-    #139 round 4: a 410 body carries a `timestamp` — the moment APNs confirmed the
-    token was no longer valid — and Apple's documented rule is to resume pushing
-    if the app has registered that token AGAIN since. Reducing the response to an
-    enum threw that away, leaving the reaper unable to distinguish "this token is
-    dead" from "this token WAS dead before the user reinstalled".
-
-    For the one irreversible operation in the module, lost metadata is lost
-    reversibility. `invalid_since_ms` is None for every verdict but DEAD_TOKEN,
-    and may be None even then if Apple omits it — the caller must treat None as
-    "no timestamp evidence", never as "invalid since the epoch".
-    """
-
-    verdict: "Verdict"
-    invalid_since_ms: int | None = None
-
-
-class Verdict(enum.Enum):
-    """What Apple said, reduced to what the CALLER can act on.
-
-    Deliberately coarser than APNs' reason strings, and the coarsening is the
-    point: the only decision downstream is "delete this row or keep it", and
-    every extra distinction is a chance to delete a row we should have kept.
-    """
-
-    DELIVERED = "delivered"
-    # The device is GONE — the app was uninstalled or the token permanently
-    # invalidated. Apple states this positively (410 Unregistered). Safe to reap.
-    DEAD_TOKEN = "dead_token"
-    # Apple refused, but for a reason that may well be OURS (bad topic, bad
-    # provider key, wrong environment). NEVER reap on this — see `_verdict`.
-    REJECTED = "rejected"
-    # Network error, 429, or a 5xx. The device may be perfectly fine.
-    #
-    # DROPPED, DELIBERATELY — there is no retry, and that is a decision rather
-    # than an omission (cage-match #139: the member read as though it fed a retry
-    # loop that does not exist, sending the next reader looking for one). A wake
-    # carries `apns-expiration` of 60s because a ring that surfaces late is worse
-    # than no ring; a retry that outlives that window delivers nothing, and one
-    # inside it would have to fire within seconds of a failure Apple is already
-    # rate-limiting. So a transient failure means this particular call does not
-    # ring — the message itself is durable and the recipient still sees it on
-    # next open. If retry is ever added it belongs here with a deadline derived
-    # from the same expiration constant, not a generic backoff.
-    TRANSIENT = "transient"
-
-
 def is_configured() -> bool:
     """True iff every APNs credential is present. Settings enforces all-or-none at
-    boot, so in practice this is all-four-or-zero; the `all()` is still written out
+    boot, so in practice this is all-FIVE-or-zero; the `all()` is still written out
     rather than testing one field, because a future partial-config bug should turn
-    push OFF rather than half-on."""
+    push OFF rather than half-on.
+
+    `apns_voip_topic` IS ONE OF THE FIVE (Carnot, cage-match PR#172 r1). It was
+    added to the settings all-or-none group and not to this predicate, so the
+    docstring said "every APNs credential" while the tuple checked four of them —
+    the summary drifting from the set it claims to summarise. No reachable state
+    changes, because the boot validator already refuses four-of-five; that is
+    exactly why the omission was invisible, and exactly why the written-out `all()`
+    exists rather than a single-field test. A predicate defended by a guard
+    elsewhere is still wrong when read on its own."""
     return all((settings.apns_key_id, settings.apns_team_id,
-                settings.apns_topic, settings.apns_private_key))
+                settings.apns_topic, settings.apns_private_key,
+                settings.apns_voip_topic))
 
 
 def reset_for_tests() -> None:
@@ -289,6 +300,57 @@ def _host(apns_environment: ApnsEnvironment) -> str:
                 f"unknown APNs apns_environment: {apns_environment!r}")
 
 
+def _topic_for(token_kind: TokenKind) -> str:
+    """The APNs topic for ONE token's kind — both STATED, neither inferred.
+
+    STATED, per design 12 Decision 3 and Nick's ruling of 2026-09-10. An earlier
+    revision derived the VoIP topic as `apns_topic + ".voip"`, on the argument that
+    the suffix is Apple's definition rather than our guess. That is true and it was
+    not the deciding fact: `config.py` already says of `apns_topic` that a device
+    token "is only valid for the topic it was issued under, so a wrong topic is a
+    silent 400 for every send, and it must be stated, not inferred" — and that
+    sentence applies to a VoIP token unchanged. A value an operator can read is a
+    value an operator can fix; a derived one is only visible in this file.
+
+    The cost of stating it was real and is paid rather than dodged: the field joins
+    the all-or-none guard in `config.py`, so an existing box carrying four of five
+    keys would refuse to boot. `deploy/preflight-apns.sh` gained the same key in the
+    same change, which turns that into a deploy that aborts before touching the
+    running stack. The guard and its preflight are one mechanism in two files and
+    must always move together.
+    """
+    match token_kind:
+        case TokenKind.ALERT:
+            return settings.apns_topic
+        case TokenKind.VOIP:
+            return settings.apns_voip_topic
+        case _:
+            assert_never(token_kind)
+
+
+def _render(payload: WakePayload) -> dict:
+    """The APNs envelope for a wake. BELOW the transport boundary, because the
+    envelope is Apple's shape and only Apple's — `{"aps": {...}}` means nothing to
+    FCM, and a policy layer that builds one transport's schema is a policy layer
+    that will need a switch the day a second one arrives.
+
+    What crosses the boundary is `WakePayload`, which carries the REFUSAL (a wake
+    and a destination, never an identity) and no provider schema at all.
+
+    `"c"` rather than `"channel_id"`: an APNs payload has a 4KB ceiling and this
+    is the only custom field, so there is no reason to spend bytes on a long name.
+    That reasoning is APNs-specific and stays here with the renderer; FCM's own
+    ceiling is a different number about a different envelope.
+    """
+    return {
+        "aps": {
+            "alert": {"title": "Incoming call", "body": "Tap to join"},
+            "sound": "default",
+        },
+        "c": payload.channel_id,
+    }
+
+
 def _client() -> httpx.AsyncClient:
     global _client_singleton
     if _client_singleton is None:
@@ -347,6 +409,21 @@ def _verdict(status: int, reason: str) -> Verdict:
     This is the fail-safe direction for a REAPER specifically: a reaper that runs
     too eagerly destroys state, and destroyed state cannot be re-derived from
     anything the island holds. Failing closed here means NOT deleting.
+
+    A 410 IS TOPIC-SCOPED, NOT DEVICE-SCOPED, and that matters now that one
+    handset can hold two rows. "No longer active for this topic" is a claim about
+    `<bundle>.voip` or about the bare bundle, never about the phone — so a 410 on
+    a VoIP send reaps the VoIP row ONLY and says nothing about that handset's
+    alert row. Already correct as built, because the reaper is row-id-scoped with
+    a compare-and-delete; stated because a reader would otherwise assume device
+    scope and "tidy" the reaper into deleting both.
+
+    THE KIND/TOPIC MISMATCHES ALL LAND IN `REJECTED`, WHICH NEVER REAPS. An alert
+    token sent to `.voip`, a VoIP token sent to the bare topic, a misspelled push
+    type — every one is a 400, so a fork bug refuses every push and deletes
+    nothing. That is the correct fail-safe direction, and it is also exactly why
+    such a bug is SILENT: hence the ERROR level and the `kind=` field on the
+    refusal log line in `send`.
     """
     if status == 200:
         return Verdict.DELIVERED
@@ -371,47 +448,97 @@ def _verdict(status: int, reason: str) -> Verdict:
     return Verdict.REJECTED
 
 
-async def send(device_token: str, payload: dict, *,
+async def send(device_token: str, payload: WakePayload, *,
                apns_environment: ApnsEnvironment,
+               token_kind: TokenKind,
                collapse_id: str | None = None) -> SendResult:
-    """Push one payload to one device, in THAT DEVICE's APNs environment (#3386 —
-    ``apns_environment`` is required, with no default, so no caller can silently
-    fall back to a global switch). Returns a [SendResult]; never raises for a
-    protocol-level refusal — a failed push must not be able to fail the message
-    send that triggered it (see `push_service.wake`).
+    """Push one wake to one device, in THAT DEVICE's APNs environment and for
+    THAT TOKEN's kind. Returns a [SendResult]; never raises for a protocol-level
+    refusal — a failed push must not be able to fail the message send that
+    triggered it (see `push_service.wake_for_message`).
 
-    Returns a [SendResult]. Raises [ApnsNotConfigured] only if called on an island with no credentials,
+    BOTH `apns_environment` AND `token_kind` ARE REQUIRED, KEYWORD-ONLY, WITH NO
+    DEFAULT. The first was made that way by #3386 "so no caller can silently fall
+    back to a global switch"; the second for the identical reason one axis over.
+    A `token_kind=ALERT` default would let a caller that forgets the argument send
+    an alert push to a VoIP-only handset, which is a 400 DeviceTokenNotForTopic →
+    REJECTED → never reaped → one WARNING line → no ring. The two axes are
+    ORTHOGONAL, not alternatives: a VoIP token has its own sandbox/production
+    split and does not escape the environment question.
+
+    Raises [ApnsNotConfigured] only if called on an island with no credentials,
     which is a caller bug: `push_service` gates on `is_configured()` first.
     """
     if not is_configured():
         raise ApnsNotConfigured("APNs credentials are not set on this island")
 
+    # ONE MATCH BINDING FOUR FACTS THAT MUST NEVER DRIFT APART. Topic, push type,
+    # lifetime and collapse-eligibility are not four independent settings; they
+    # are one decision about what kind of push this is, and every mismatched pair
+    # is a distinct silent failure (a voip type on a bare topic, an alert type on
+    # a `.voip` topic, an alert lifetime on a ring). Deciding them in one place
+    # means a future kind cannot be half-taught.
+    match token_kind:
+        case TokenKind.ALERT:
+            expires_in, may_collapse = _ALERT_EXPIRATION_SECONDS, True
+        case TokenKind.VOIP:
+            expires_in, may_collapse = _VOIP_LEASE_SECONDS, False
+        case _:
+            assert_never(token_kind)
+
     headers = {
         "authorization": f"bearer {_provider_token()}",
-        "apns-topic": settings.apns_topic,
-        # `alert` (not `voip`): a VoIP push on iOS 13+ MUST synchronously report an
-        # incoming call to CallKit or the system kills the app and eventually stops
-        # delivering VoIP pushes entirely. Taking PushKit means taking mandatory
-        # CallKit with it. Apple's own documented alternative is exactly this — a
-        # UserNotifications alert — and it fits "a call is a gathering" better than
-        # a ring does: a gathering has a door that stays open and needs no 30-second
-        # synchronous window. See claude-tasks#3267.
-        "apns-push-type": "alert",
-        # 10 = deliver immediately. The alternative (5) permits Apple to hold the
-        # push to save power, which for a perishable ring is the wrong trade.
+        "apns-topic": _topic_for(token_kind),
+        # THE PUSH TYPE, and the ONE non-derivable constraint that binds what this
+        # island may send it for.
+        #
+        # Since iOS 13 Apple REQUIRES a VoIP push to be reported to CallKit before
+        # the delivery handler returns, and documents that the system terminates an
+        # app that does not — and that repeated violations stop VoIP delivery to
+        # that installation ENTIRELY, while APNs keeps returning 200. An
+        # island-side mistake would therefore produce a permanently deaf handset
+        # with a green log line, invisible to `SendResult` forever.
+        #
+        # THAT PENALTY HAS NEVER BEEN OBSERVED HERE, and the honest statement of
+        # why matters (12a-MEASURED M8). A four-push flagrant-violation arm went
+        # unpunished on a real handset, but the negative control never fired — the
+        # app was foregrounded by the launch harness, and must-report governs
+        # waking a SUSPENDED app — so the result is VOID, not a licence.
+        # `CSDVoIPApplicationKillCounts` in `com.apple.TelephonyUtilities` is the
+        # per-app kill ledger that would make it readable (M10). What IS proven is
+        # M7: CallKit rang from a VoIP push with no Dart alive, on a real handset.
+        #
+        # So the island emits VoIP ONLY for a genuine call invite — enforced
+        # upstream by `push_service.should_wake`'s exact-sentinel match and by the
+        # router accepting a VoIP delivery only from a WakeKind that gate produced.
+        # The discipline does not rest on a measured penalty: we do not spend an
+        # UNMEASURED budget.
+        "apns-push-type": token_kind.value,
+        # 10 = deliver immediately, correct for BOTH kinds. The alternative (5)
+        # permits Apple to hold the push to save power, which for a perishable
+        # ring is the wrong trade. The only documented hard priority coupling is
+        # the inverse one: push-type `background` MUST be priority 5.
         "apns-priority": "10",
-        "apns-expiration": str(int(time.time()) + _EXPIRATION_SECONDS),
+        "apns-expiration": str(int(time.time()) + expires_in),
     }
-    if collapse_id is not None:
+    if may_collapse and collapse_id is not None:
         # Two rings for the same conversation should REPLACE, not stack: the second
         # notification is not new information, and a lock screen holding four
         # identical wakes reads as a malfunction. Apple caps this at 64 bytes.
+        #
+        # THE TRANSPORT DECIDES, not the caller. Collapse identity is user-visible-
+        # notification coalescing and a VoIP push displays nothing, so the header
+        # is meaningless there at best. Whether APNs can REPLACE a QUEUED VoIP push
+        # on the strength of it is UNVERIFIED, and a silently dropped ring is the
+        # one cost this design cannot pay — CallKit's own call UUID de-duplicates
+        # anyway. Keeping the decision here means one place knows the rule rather
+        # than every call site having to remember it.
         headers["apns-collapse-id"] = collapse_id[:64]
 
     # Resolved BEFORE the request: an unknown environment must fail here, not send.
     url = f"{_host(apns_environment)}/3/device/{device_token}"
     try:
-        response = await _client().post(url, json=payload, headers=headers)
+        response = await _client().post(url, json=_render(payload), headers=headers)
     except httpx.HTTPError as ex:
         # The device is not implicated by OUR network failing.
         log.warning("apns send failed transport=%s", type(ex).__name__)
@@ -436,7 +563,31 @@ async def send(device_token: str, payload: dict, *,
     verdict = _verdict(response.status_code, reason)
     # Log the reason but NEVER the device token (it is a device-held secret whose
     # confidentiality is the boundary protecting push routing — see the DeviceToken
-    # model note) and never the provider key.
-    log.warning("apns refused status=%s reason=%s verdict=%s",
-                response.status_code, reason, verdict.value)
-    return SendResult(verdict, invalid_since_ms)
+    # model note) and never the provider key. `kind=` is carried because REJECTED
+    # is the quietest failure in this system and every kind/topic mismatch lands
+    # here: without it, telling a wrong-suffix bug from a wrong-environment bug
+    # needs a packet capture.
+    log.log(logging.ERROR if verdict is Verdict.REJECTED else logging.WARNING,
+            "apns refused status=%s reason=%s kind=%s verdict=%s",
+            response.status_code, reason, token_kind.value, verdict.value)
+    return SendResult(verdict, _reap_order(verdict, invalid_since_ms))
+
+
+def _reap_order(verdict: Verdict, invalid_since_ms: int | None) -> ReapOrder | None:
+    """Whether Apple's answer PERMITS deleting the row, and under what condition.
+
+    APPLE'S OWN RULE, not just our race guard (cage-match #139 round 4, Carnot).
+    A 410 body carries the moment APNs confirmed the token invalid, and Apple says
+    to resume pushing if the app registered that token AGAIN since. Without that
+    timestamp there is no evidence separating "this token is dead" from "this
+    token WAS dead before the user reinstalled and got the same token back", so
+    the order is WITHHELD entirely — failing safe for a reaper means not deleting.
+
+    This lives HERE, in the APNs transport, rather than in the shared reaper. The
+    rule is a fact about Apple's protocol; shared, it silently governed a
+    transport whose protocol cannot feed it (FCM's UNREGISTERED carries no
+    timestamp), building a reaper that could never fire.
+    """
+    if verdict is not Verdict.DEAD_TOKEN or invalid_since_ms is None:
+        return None
+    return ReapOrder(dt.datetime.fromtimestamp(invalid_since_ms / 1000, tz=dt.UTC))

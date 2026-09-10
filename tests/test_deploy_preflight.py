@@ -17,12 +17,21 @@ from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parents[1] / "deploy" / "preflight-apns.sh"
 
-ALL_FOUR = {
+ALL_FIVE = {
     "APNS_KEY_ID": "ABC123DEFG",
     "APNS_TEAM_ID": "TEAM123456",
     "APNS_TOPIC": "cc.example.testapp",
     "APNS_PRIVATE_KEY": "-----BEGIN PRIVATE KEY-----\\nxx\\n-----END PRIVATE KEY-----",
+    # The fifth member (design 12 Decision 3; Nick, 2026-09-10). `.voip` is Apple's
+    # definition, but the VALUE is stated so an operator can read and fix it.
+    "APNS_VOIP_TOPIC": "cc.example.testapp.voip",
 }
+
+# Retained name for the four keys BOTH LIVE ISLANDS carry today. Not a legacy alias:
+# it is the input to `test_todays_live_box_shape_aborts_the_deploy`, which is the
+# reason this whole change is safe, and it must keep meaning "what is deployed right
+# now" rather than drifting to mean "all of them".
+TODAYS_LIVE_BOX = {k: v for k, v in ALL_FIVE.items() if k != "APNS_VOIP_TOPIC"}
 
 
 def _run(tmp_path: Path, lines: list[str]) -> subprocess.CompletedProcess:
@@ -38,10 +47,10 @@ def test_no_apns_keys_at_all_is_fine(tmp_path) -> None:
     assert result.returncode == 0, result.stderr
 
 
-def test_all_four_present_is_fine(tmp_path) -> None:
+def test_all_five_present_is_fine(tmp_path) -> None:
     """A fully-configured island. Must not block a deploy either — this is what
     imagineering looks like."""
-    result = _run(tmp_path, [f"{k}={v}" for k, v in ALL_FOUR.items()])
+    result = _run(tmp_path, [f"{k}={v}" for k, v in ALL_FIVE.items()])
     assert result.returncode == 0, result.stderr
 
 
@@ -51,7 +60,7 @@ def test_a_partial_set_aborts_and_names_both_sides(tmp_path) -> None:
     The message has to name which keys are set AND which are missing: an operator
     reading 'APNs is half-configured' with no list still has to go and diff it, and
     this fires at the moment they are trying to ship something else."""
-    partial = {k: v for k, v in ALL_FOUR.items() if k != "APNS_PRIVATE_KEY"}
+    partial = {k: v for k, v in ALL_FIVE.items() if k != "APNS_PRIVATE_KEY"}
     result = _run(tmp_path, [f"{k}={v}" for k, v in partial.items()])
     assert result.returncode == 1, "a partial set must abort the deploy"
     assert "APNS_PRIVATE_KEY" in result.stderr, result.stderr
@@ -65,7 +74,7 @@ def test_a_blank_value_counts_as_UNSET_not_as_partial(tmp_path) -> None:
     UNSET to the island and the box boots fine. If this preflight counted a blank as
     'present', it would abort a deploy that would have succeeded — a false red on a
     healthy box, which is the failure mode that gets a safety check deleted."""
-    lines = [f"{k}={v}" for k, v in ALL_FOUR.items() if k != "APNS_TOPIC"]
+    lines = [f"{k}={v}" for k, v in ALL_FIVE.items() if k != "APNS_TOPIC"]
     lines.append("APNS_TOPIC=   ")
     result = _run(tmp_path, lines)
     assert result.returncode == 1, (
@@ -78,7 +87,7 @@ def test_a_blank_value_counts_as_UNSET_not_as_partial(tmp_path) -> None:
 def test_all_blank_is_the_same_as_absent(tmp_path) -> None:
     """Every key present but blank is 'the operator said nothing' four times over —
     is_configured() is False and the island boots. Must not abort."""
-    result = _run(tmp_path, [f"{k}=" for k in ALL_FOUR])
+    result = _run(tmp_path, [f"{k}=" for k in ALL_FIVE])
     assert result.returncode == 0, result.stderr
 
 
@@ -100,15 +109,15 @@ def test_export_prefixed_keys_are_seen(tmp_path) -> None:
     """`export FOO=bar` is valid dotenv. If this script missed it, four exported keys
     would read as 'none configured' — a silent pass on a box the island can boot, and
     a false abort as soon as ONE of the four is written plainly."""
-    result = _run(tmp_path, [f"export {k}={v}" for k, v in ALL_FOUR.items()])
+    result = _run(tmp_path, [f"export {k}={v}" for k, v in ALL_FIVE.items()])
     assert result.returncode == 0, result.stderr
 
 
 def test_mixed_export_and_plain_is_still_complete(tmp_path) -> None:
     """THE FALSE-RED ARM. Three plain plus one exported is FOUR keys to the island —
     it boots fine — so aborting here would block a deploy that would have worked."""
-    lines = [f"{k}={v}" for k, v in ALL_FOUR.items() if k != "APNS_PRIVATE_KEY"]
-    lines.append(f"export APNS_PRIVATE_KEY={ALL_FOUR['APNS_PRIVATE_KEY']}")
+    lines = [f"{k}={v}" for k, v in ALL_FIVE.items() if k != "APNS_PRIVATE_KEY"]
+    lines.append(f"export APNS_PRIVATE_KEY={ALL_FIVE['APNS_PRIVATE_KEY']}")
     result = _run(tmp_path, lines)
     assert result.returncode == 0, (
         "an exported key is still a key; this aborted a deploy the island would have "
@@ -117,7 +126,7 @@ def test_mixed_export_and_plain_is_still_complete(tmp_path) -> None:
 
 def test_spaces_around_equals_are_seen(tmp_path) -> None:
     """`FOO = bar` is accepted by dotenv (measured, not assumed)."""
-    result = _run(tmp_path, [f"{k} = {v}" for k, v in ALL_FOUR.items()])
+    result = _run(tmp_path, [f"{k} = {v}" for k, v in ALL_FIVE.items()])
     assert result.returncode == 0, result.stderr
 
 
@@ -125,7 +134,7 @@ def test_quoted_empty_value_counts_as_unset(tmp_path) -> None:
     """dotenv strips surrounding quotes, so APNS_TOPIC="" is EMPTY to the island, not
     the two-character string. Counting the quotes as content would call a partial box
     complete and let the crash-loop through — the silent direction."""
-    lines = [f"{k}={v}" for k, v in ALL_FOUR.items() if k != "APNS_TOPIC"]
+    lines = [f"{k}={v}" for k, v in ALL_FIVE.items() if k != "APNS_TOPIC"]
     lines.append('APNS_TOPIC=""')
     result = _run(tmp_path, lines)
     assert result.returncode == 1, "a quoted-empty value is unset, so this set is partial"
@@ -134,7 +143,7 @@ def test_quoted_empty_value_counts_as_unset(tmp_path) -> None:
 
 def test_quoted_real_value_is_seen(tmp_path) -> None:
     """NULL ARM for the quote-stripping: a quoted REAL value must still count."""
-    result = _run(tmp_path, [f'{k}="{v}"' for k, v in ALL_FOUR.items()])
+    result = _run(tmp_path, [f'{k}="{v}"' for k, v in ALL_FIVE.items()])
     assert result.returncode == 0, result.stderr
 
 
@@ -169,10 +178,51 @@ def test_blankness_matches_python_dotenv(tmp_path, line, blank_to_island) -> Non
     calls it SET the set is complete and this must pass (0). A disagreement here is
     either a false abort of a healthy box or a silent pass on one that will
     crash-loop."""
-    lines = [f"{k}={v}" for k, v in ALL_FOUR.items() if k != "APNS_TOPIC"]
+    lines = [f"{k}={v}" for k, v in ALL_FIVE.items() if k != "APNS_TOPIC"]
     lines.append(line)
     result = _run(tmp_path, lines)
     expected = 1 if blank_to_island else 0
     assert result.returncode == expected, (
         f"{line!r}: dotenv says blank={blank_to_island}, so exit should be "
         f"{expected}; got {result.returncode}.\n{result.stderr}")
+
+
+# ---------------------------------------------------------------------------
+# THE ARM THIS ENTIRE CHANGE EXISTS TO SATISFY.
+#
+# `config.py`'s all-or-none guard gained a fifth member on 2026-09-10. Both live
+# islands carry exactly the other four. So on the next version bump the island
+# would refuse to boot — and with `restart: always` that is a crash-loop on a box
+# nobody edited, which is the incident class this script was written to prevent,
+# re-created by the change that extends it.
+#
+# It is safe ONLY because this preflight gained the same key in the same commit and
+# runs BEFORE the backup and before anything is pulled. This test is the proof of
+# that pairing: it pins the shape of a REAL DEPLOYED BOX and asserts the deploy
+# stops with a readable message while the island is still serving.
+#
+# If someone ever removes APNS_VOIP_TOPIC from the loop above, this goes red — which
+# is the point. Do not "fix" it by deleting it.
+# ---------------------------------------------------------------------------
+
+
+def test_todays_live_box_shape_aborts_the_deploy(tmp_path) -> None:
+    """Four keys and no VoIP topic — imagineering and enspyr as of 2026-09-10."""
+    result = _run(tmp_path, [f"{k}={v}" for k, v in TODAYS_LIVE_BOX.items()])
+    assert result.returncode == 1, (
+        "a box carrying the pre-2026-09-10 four keys is PARTIAL under the new "
+        "guard, and the deploy must abort at preflight rather than at boot"
+    )
+    combined = result.stdout + result.stderr
+    assert "APNS_VOIP_TOPIC" in combined, (
+        "the abort must NAME the missing key — an operator reading this message is "
+        "the only reason the pairing is safe rather than merely earlier"
+    )
+
+
+def test_adding_only_the_voip_topic_clears_that_abort(tmp_path) -> None:
+    """The positive control for the arm above: the one documented operator action
+    resolves it, and nothing else has to change. Without this, the test above would
+    pass just as well if the script aborted on everything."""
+    result = _run(tmp_path, [f"{k}={v}" for k, v in ALL_FIVE.items()])
+    assert result.returncode == 0, result.stdout + result.stderr

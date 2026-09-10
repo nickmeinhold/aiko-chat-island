@@ -18,6 +18,15 @@ there is no such state: an APNs auth key (`.p8`) is environment-AGNOSTIC — the
 key authenticates against both hosts, proven 2026-08-23 — so a configured island can
 reach a sandbox token and a production token alike. Reporting "reachable for
 sandbox" separately would be a mechanism for a condition that cannot occur.
+
+WHAT IS NOW HERE, AND WHY THE ARGUMENT ABOVE DOES NOT COVER IT. Per-PLATFORM
+reachability is a genuinely different question from per-ENVIRONMENT, and the
+`.p8`-is-environment-agnostic reasoning says nothing about it. With two
+transports the old report lied in BOTH directions: an APNs-configured island
+counted its Android rows as REACHABLE (the #3397 failure in a new direction), and
+an FCM-only island would report every row unreachable AND fire the boot warning
+on every healthy boot — the warning-nobody-reads that
+`test_startup_is_silent_when_there_is_nothing_to_say` exists to prevent.
 """
 from __future__ import annotations
 
@@ -26,9 +35,11 @@ import pytest_asyncio
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
-from aiko_gateway.config import settings
+from pydantic import ValidationError
+
+from aiko_gateway.config import Settings, settings
 from aiko_gateway.domain import push_service, users_service
-from aiko_gateway.domain.models import DeviceToken
+from aiko_gateway.domain.models import DeviceToken, Platform
 
 
 async def _user_with_devices(session, n: int):
@@ -41,17 +52,47 @@ async def _user_with_devices(session, n: int):
     return user
 
 
+
+
+async def _user_with_apns(session, n: int, *, username: str = "ada"):
+    """An APNs-row user, mirroring `_user_with_android` — needed so the APNs arm of
+    warn_if_unreachable can be exercised, which round 5 showed nothing did."""
+    user = await users_service.create_user(
+        session, username=username, display_name=username.title(), password="pw")
+    for i in range(n):
+        session.add(DeviceToken(user_id=user.id, platform="apns",
+                                token=f"apns-{username}-{i}" + "z" * 80))
+    await session.commit()
+    return user
+
+
+async def _user_with_android(session, n: int, *, username: str = "bob"):
+    user = await users_service.create_user(
+        session, username=username, display_name=username.title(), password="pw")
+    for i in range(n):
+        session.add(DeviceToken(user_id=user.id, platform="fcm",
+                                token=f"fcm-{username}-{i}" + "z" * 80))
+    await session.commit()
+    return user
+
+
 @pytest.fixture
 def configured(monkeypatch):
+    """APNs configured, FCM not — the shape of both live islands today."""
+    # All FIVE: apns_voip_topic is part of the credential set `is_configured()`
+    # counts (Carnot, cage-match PR#172 r1), so a four-name fixture describes an
+    # island that cannot boot.
     for k, v in (("apns_key_id", "ABCDE12345"), ("apns_team_id", "TEAMID1234"),
                  ("apns_topic", "cc.example.app"),
+                 ("apns_voip_topic", "cc.example.app.voip"),
                  ("apns_private_key", "-----BEGIN PRIVATE KEY-----")):
         monkeypatch.setattr(settings, k, v, raising=False)
 
 
 @pytest.fixture
 def unconfigured(monkeypatch):
-    for k in ("apns_key_id", "apns_team_id", "apns_topic", "apns_private_key"):
+    for k in ("apns_key_id", "apns_team_id", "apns_topic", "apns_private_key",
+              "apns_voip_topic"):
         monkeypatch.setattr(settings, k, "", raising=False)
 
 
@@ -65,7 +106,8 @@ async def test_unconfigured_island_holding_tokens_reports_them_unreachable(
     await _user_with_devices(session, 2)
     report = await push_service.reachability(session)
     assert report == {"configured": False, "registered_devices": 2,
-                      "unreachable_devices": 2}
+                      "unreachable_devices": 2,
+                      "unreachable_by_platform": {"apns": 2}}
 
 
 async def test_unconfigured_island_with_no_tokens_is_not_a_problem(
@@ -76,18 +118,47 @@ async def test_unconfigured_island_with_no_tokens_is_not_a_problem(
     every operator learns to ignore, which is worse than no signal."""
     report = await push_service.reachability(session)
     assert report == {"configured": False, "registered_devices": 0,
-                      "unreachable_devices": 0}
+                      "unreachable_devices": 0, "unreachable_by_platform": {}}
 
 
 async def test_configured_island_reaches_every_token_it_holds(session, configured):
-    """Configured means reachable for EVERY token, sandbox and production alike:
-    the .p8 authenticates against both hosts. There is no partial-reachability
-    state to report, and inventing one would be a mechanism for an impossible
-    condition."""
+    """Configured means reachable for EVERY token of that transport, sandbox and
+    production alike: the .p8 authenticates against both hosts. There is no
+    partial-ENVIRONMENT reachability state to report, and inventing one would be a
+    mechanism for an impossible condition."""
     await _user_with_devices(session, 3)
     report = await push_service.reachability(session)
     assert report == {"configured": True, "registered_devices": 3,
-                      "unreachable_devices": 0}
+                      "unreachable_devices": 0, "unreachable_by_platform": {}}
+
+
+async def test_an_apns_island_counts_its_android_rows_as_unreachable(
+    session, configured
+):
+    """THE #3397 FAILURE IN A NEW DIRECTION. Before this the count had NO
+    platform predicate, so an APNs-configured island holding Android rows
+    reported them REACHABLE — a deaf handset with every signal reading healthy,
+    which is precisely the four-hour investigation this surface exists to end."""
+    await _user_with_devices(session, 1)
+    await _user_with_android(session, 2)
+    report = await push_service.reachability(session)
+    assert report["registered_devices"] == 3
+    assert report["unreachable_devices"] == 2
+    assert report["unreachable_by_platform"] == {"fcm": 2}
+
+
+# NO TEST FOR THE UNKNOWN-PLATFORM ARM, and the absence is deliberate.
+# `reachability` fails CLOSED on a stored platform outside the enum (an unknown
+# string counts as unreachable rather than reachable), but that state is
+# UNREPRESENTABLE through the database: `ck_device_tokens_platform` is rendered
+# FROM the enum by `_in_check`, so an INSERT or UPDATE carrying 'martian' is
+# refused — verified, not assumed. The branch is reachable only if the enum
+# SHRINKS in a later release while old rows persist.
+#
+# Kept in the code because it costs one `try` and guessing "reachable" for a
+# device nothing can send to is the one direction this surface exists to prevent;
+# given no test because a test that cannot create the failure cannot clear it —
+# the same reasoning `push_service` applies to its `is_private` arm.
 
 
 # ------------------------------------------------------- the startup log line
@@ -235,3 +306,64 @@ async def test_health_does_not_publish_a_device_population(
     assert "registered_devices" not in body
     assert "unreachable_devices" not in body
     assert '"3"' not in body and ": 3" not in body
+
+
+_DEV_JWT_SECRET = "x" * 64
+
+
+@pytest.mark.asyncio
+async def test_the_apns_remedy_still_carries_the_compose_warning(session, caplog,
+                                                                 monkeypatch):
+    """The #2301 clause must survive where it IS true — on the provisionable arm.
+
+    Moving it out of the shared template could easily have deleted it everywhere,
+    which would lose the only mitigation for the one deploy gap nothing mechanical
+    closes: `update.sh` pulls the image and never syncs the box's compose, so a
+    value set in `.env` can be inert in production with nothing saying so.
+
+    This is the OTHER half of the class fix. Round 5 showed that repairing one arm
+    and assuming the rest follows is exactly how this defect kept recurring — so
+    both arms get an assertion, in opposite directions.
+    """
+    for k in ("apns_key_id", "apns_team_id", "apns_topic", "apns_private_key",
+              "apns_voip_topic"):
+        monkeypatch.setattr(settings, k, "", raising=False)
+    await _user_with_apns(session, 2)
+    with caplog.at_level("WARNING"):
+        await push_service.warn_if_unreachable(session)
+    text = caplog.text
+    assert "APNS_KEY_ID" in text, text
+    assert "#2301" in text, (
+        "the compose-forwarding mitigation vanished from the arm where it applies "
+        f"— it was moved out of the template and must land here. Text: {text}")
+
+
+@pytest.mark.asyncio
+async def test_an_island_with_android_rows_says_NOT_BUILT_not_how_to_configure(
+    session, configured, caplog
+):
+    """The warning must name Android as UNREACHABLE and offer no action.
+
+    Replaces `test_an_apns_island_with_android_rows_warns_and_names_fcm`, which
+    required the warning to name `FCM_SERVICE_ACCOUNT_JSON` — an instruction that
+    two later rounds proved could not be given safely. Design 14's temper removed
+    the send path entirely, so there is now nothing to set and the honest warning
+    states a capability fact.
+
+    BOTH ARMS, because this surface has drifted three times in this PR alone:
+      - it must NAME the unreachable devices (silence would make an Android
+        registration indistinguishable from a delivery bug), and
+      - it must NOT hand the operator a variable to set, because none exists and a
+        remedy nobody can act on is what produced the contradiction rounds.
+    """
+    await _user_with_android(session, 2)
+    with caplog.at_level("WARNING"):
+        await push_service.warn_if_unreachable(session)
+    text = caplog.text
+    assert "platform=fcm" in text, f"the Android rows were not named: {text}"
+    assert "NOT BUILT" in text, f"the warning must state the capability fact: {text}"
+    assert "FCM_SERVICE_ACCOUNT_JSON" not in text, (
+        "the warning offers a credential to set; there is no send path, so that "
+        f"instruction cannot be acted on. Text: {text}")
+    assert "APNS_KEY_ID" not in text, (
+        "the APNs arm fired on an island whose APNs transport is healthy")

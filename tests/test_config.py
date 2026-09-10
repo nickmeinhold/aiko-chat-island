@@ -1724,3 +1724,141 @@ def test_the_identity_vars_are_forwarded_by_compose():
     env = _chat_island_environment()
     for var in ("ISLAND_ID", "ISLAND_DISPLAY_NAME", "ISLAND_SEED_PEERS"):
         assert var in env, f"{var} is not forwarded into the chat-island container"
+
+
+#
+# WITHOUT THIS LADDER a malformed blob boots clean and then fails inside
+# push_service's broad `except` as "wake failed for one device" FOREVER — a deaf
+# island with a green /health, which is the invisible failure the APNs validator
+# exists to prevent, one transport over. The rungs mirror config.py's APNs ladder
+# exactly: present -> parseable -> right shape -> usable.
+
+import json as _json
+
+def _rsa_pem() -> str:
+    """A genuinely usable RSA key, generated rather than pasted. The last rung
+    actually LOADS the key, so a decorative string cannot satisfy it."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    return key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption()).decode()
+
+
+def _credential(**overrides) -> str:
+    blob = {
+        "type": "service_account",
+        "project_id": "aiko-island-test",
+        "private_key_id": "0123456789abcdef",
+        "private_key": _rsa_pem(),
+        "client_email": "island@aiko-island-test.iam.gserviceaccount.com",
+        "token_uri": "https://oauth2.googleapis.com/token",
+    }
+    blob.update(overrides)
+    return _json.dumps(blob)
+
+
+# --- The fifth APNs member (design 12 Decision 3; Nick, 2026-09-10) -----------
+# The guard half of the pairing tested in tests/test_deploy_preflight.py. Both
+# halves are needed: the preflight keeps a deploy from starting, this keeps a
+# mis-set box from lying about being configured.
+
+
+def _four_apns_keys() -> dict:
+    """Exactly what both live islands carried before 2026-09-10."""
+    return {
+        "APNS_KEY_ID": "ABC123DEFG",
+        "APNS_TEAM_ID": "TEAM123456",
+        "APNS_TOPIC": "cc.example.testapp",
+        "APNS_PRIVATE_KEY": _real_p8_pem(),
+    }
+
+
+def _real_p8_pem() -> str:
+    """A genuinely parseable EC key. `config.py` checks PRESENCE IS NOT PARSEABILITY
+    (cage-match #139), so a placeholder PEM fails the wrong guard and would make the
+    all-five arm below prove nothing about the member count."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    return ec.generate_private_key(ec.SECP256R1()).private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode()
+
+
+def test_todays_live_box_shape_refuses_to_boot(monkeypatch) -> None:
+    """THE DANGER, PINNED. Four keys and no VoIP topic is now a PARTIAL set, so the
+    island refuses to boot — which is why `deploy/preflight-apns.sh` had to gain the
+    same key in the same commit. This test is not asserting desirable behaviour; it
+    is asserting the cost that makes the preflight load-bearing."""
+    from aiko_gateway.config import Settings
+    for k, v in _four_apns_keys().items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.delenv("APNS_VOIP_TOPIC", raising=False)
+    with pytest.raises(ValueError, match="apns_voip_topic"):
+        Settings()
+
+
+def test_all_five_boots(monkeypatch) -> None:
+    """The positive control: the one operator action clears it and nothing else
+    changes. Without this arm the test above would pass on a Settings() that raised
+    for any reason at all."""
+    from aiko_gateway.config import Settings
+    for k, v in _four_apns_keys().items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setenv("APNS_VOIP_TOPIC", "cc.example.testapp.voip")
+    s = Settings()
+    assert s.apns_voip_topic == "cc.example.testapp.voip"
+
+
+def test_no_apns_keys_at_all_still_boots(monkeypatch) -> None:
+    """The all-or-NONE half. Adding a fifth member must not make a blank island —
+    the standup default, and the common case — start failing."""
+    from aiko_gateway.config import Settings
+    for k in (*_four_apns_keys(), "APNS_VOIP_TOPIC"):
+        monkeypatch.delenv(k, raising=False)
+    Settings()
+
+
+def test_an_apns_topic_pair_that_is_identical_refuses_to_boot(monkeypatch) -> None:
+    """PRESENCE IS NOT USABILITY, for a PAIR (Tesla, cage-match PR#172 r6).
+
+    THE ARM THAT DISCRIMINATES: every other five-credential test uses
+    `cc.example.testapp` / `cc.example.testapp.voip`, so equality could never redden
+    one of them. This sets them EQUAL and changes nothing else, so it fails if and
+    only if the collision check exists.
+
+    Why equality is fatal rather than untidy: Apple issues alert tokens under the
+    bundle id and VoIP tokens under a separate topic, so an identical pair is a
+    guaranteed `DeviceTokenNotForTopic` on every VoIP send. The failure is SILENT —
+    a handset registered for both kinds still gets its alert banner, `delivered_to=0`
+    never fires, and only voip-only devices go deaf. The way an operator reaches
+    this state is copying APNS_TOPIC into the new slot, which is the single most
+    likely thing to do when a fifth credential appears.
+    """
+    from aiko_gateway.config import Settings
+    for k, v in _four_apns_keys().items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setenv("APNS_VOIP_TOPIC", _four_apns_keys()["APNS_TOPIC"])
+    with pytest.raises(ValueError) as ei:
+        Settings()
+    message = str(ei.value)
+    assert "must differ" in message, message
+    assert "DeviceTokenNotForTopic" in message, (
+        "the refusal must name Apple's actual error, so an operator who has "
+        f"already seen it in a log can connect the two. Got: {message}")
+
+
+def test_a_distinct_apns_topic_pair_still_boots(monkeypatch) -> None:
+    """THE CONTROL. A collision check that also rejected a VALID pair would take
+    push offline on both live islands, whose real values differ only by the `.voip`
+    suffix. Without this arm the test above passes just as well against a guard that
+    refuses every configuration."""
+    from aiko_gateway.config import Settings
+    for k, v in _four_apns_keys().items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setenv("APNS_VOIP_TOPIC", "cc.example.testapp.voip")
+    assert Settings().apns_voip_topic == "cc.example.testapp.voip"
