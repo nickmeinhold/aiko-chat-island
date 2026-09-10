@@ -42,6 +42,7 @@ from aiko_gateway.domain.models import (
 from aiko_gateway.domain.push_result import ReapOrder, SendResult, Verdict
 
 CHANNEL = "01JDMCHANNELDM000000000000"
+OTHER_CHANNEL = "01OTHERCHANNEL0000000000"
 
 # A synthetic FCM service-account blob. No key material: every FCM test here
 # replaces `apns.send` wholesale, so nothing ever signs anything.
@@ -1099,7 +1100,22 @@ async def test_a_first_contact_call_invite_does_not_wake(
         # not "any row in this channel", it is "any row on the island" — which is
         # nearly every live user, i.e. no gate at all. This row is what makes the
         # channel conjunct falsifiable.
-        Message(id="01BOBSPOKEELSEWHERE00000", channel_id="01OTHERCHANNEL0000000000",
+        # A REAL channel row, not an orphan message (Carnot, cage-match PR#173 r3).
+        # Prod runs SQLite with FK OFF (ISL-0002), so a message pointing at a
+        # non-existent channel inserts happily — and would have modelled a state
+        # production cannot produce, proving the predicate against a row that could
+        # not exist rather than against Bob genuinely having spoken elsewhere.
+        #
+        # Making it real immediately surfaced a schema invariant the orphan was
+        # hiding: `ck_channels_community_required` refuses a non-DM channel with a
+        # NULL community. So this is a second DM (community-less by design), which
+        # also models the attack better — Bob talks to Carol, and a stranger tries
+        # to ring him off the back of it.
+        Channel(id=OTHER_CHANNEL, name="bob-carol", kind=ChannelKind.DM.value,
+                aiko_channel="dm:bob-carol", is_private=True,
+                community_id=sa.null()),
+        Membership(channel_id=OTHER_CHANNEL, user_id=bob.id),
+        Message(id="01BOBSPOKEELSEWHERE00000", channel_id=OTHER_CHANNEL,
                 sender_user_id=bob.id, sender_kind="user", body="hi from #general"),
     ])
     await session.commit()
