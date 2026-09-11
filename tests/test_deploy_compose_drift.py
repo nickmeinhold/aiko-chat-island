@@ -34,6 +34,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -512,4 +513,147 @@ def test_update_sh_FAILS_CLOSED_when_the_guard_is_missing() -> None:
         "the missing-guard branch must FAIL CLOSED (die), not warn-and-continue: "
         "this update.sh ships with the guard, so the guard's absence means a "
         "partial sync — the very failure the guard exists to refuse"
+    )
+
+
+def test_a_BOX_ONLY_compose_override_is_refused(tmp_path) -> None:
+    """THE ONE BOX-ONLY FILE THAT CANNOT BE IGNORED (Maxwell, cage-match round 3).
+
+    Every other box-only file is deliberately invisible to this guard — the live
+    islands are carpeted in `.env.bak-*` and `update.sh.bak-pre-v0110`, and
+    reporting them would bury the line that matters. An override file is the
+    exception, and the reason is mechanical rather than stylistic.
+
+    MEASURED on the live box: `docker compose config` with no `-f` flags merged a
+    `docker-compose.override.yml` sitting beside the base file and emitted its
+    variables into the resolved config. update.sh's deploy path is exactly that —
+    a bare `docker compose pull && up` — so an override the tag has never heard
+    of is silently part of what gets deployed. That is this guard's own subject
+    matter arriving as an EXTRA file instead of an edited one, which is exactly
+    why the box-only rule would have waved it through.
+
+    Neither island carries one today. The point is that one appearing is
+    invisible to every other check in the file."""
+    box = _tree(tmp_path / "box", {**BASELINE, "docker-compose.override.yml": "services: {}\n"})
+    tag = _tree(tmp_path / "tag", BASELINE)
+
+    result = _run(box, tag)
+
+    assert result.returncode == DRIFT, (
+        "an auto-loaded override the tag does not know about must abort the deploy: "
+        + result.stdout
+        + result.stderr
+    )
+    assert "override" in result.stderr, result.stderr
+
+
+def test_an_override_the_REF_also_carries_is_compared_not_flagged(tmp_path) -> None:
+    """The must-NOT-fire half. Once the repo legitimately ships an override, it
+    stops being box-only and becomes an ordinary compared file — flagging it
+    forever would make the guard cry wolf on a correctly-synced box, which is how
+    a guard gets deleted."""
+    shipped = {**BASELINE, "docker-compose.override.yml": "services: {}\n"}
+    box = _tree(tmp_path / "box", shipped)
+    tag = _tree(tmp_path / "tag", shipped)
+
+    result = _run(box, tag)
+
+    assert result.returncode == CLEAN, result.stdout + result.stderr
+    assert f"{len(shipped)} file(s) compared" in result.stdout, (
+        "a ref-carried override must be COMPARED, not merely tolerated: " + result.stdout
+    )
+
+
+def test_a_second_root_compose_file_is_compared(tmp_path) -> None:
+    """"The compose file" is a convenient singular docker does not share. A
+    drifted `docker-compose.build.yml` (or any future fragment) must be caught on
+    the same terms as the base file."""
+    extra = {**BASELINE, "docker-compose.build.yml": "services:\n  chat-island:\n    build: .\n"}
+    box_files = dict(extra)
+    box_files["docker-compose.build.yml"] = "services:\n  chat-island:\n    build: /wrong\n"
+    box = _tree(tmp_path / "box", box_files)
+    tag = _tree(tmp_path / "tag", extra)
+
+    result = _run(box, tag)
+
+    assert result.returncode == DRIFT, result.stdout + result.stderr
+    assert "docker-compose.build.yml" in result.stderr, result.stderr
+
+
+# Every non-POSIX flag the guard depends on, with the command that proves it.
+# Adding a flag to the script without adding it here is the regression this
+# catches — and the list is the CLASS, not a collection of past incidents.
+_NON_POSIX_FLAGS = {
+    "find -L": "find -L . -type f >/dev/null",
+    "find -print0": "find . -print0 >/dev/null",
+    "find -maxdepth": "find . -maxdepth 1 >/dev/null",
+    "sort -z": r"printf 'b\0a\0' | LC_ALL=C sort -z >/dev/null",
+    "read -d ''": r"""bash -c "while IFS= read -r -d '' x; do :; done < <(printf 'a\0')" """,
+    "diff -u --label": "diff -u --label A --label B f1 f2; [ $? -le 1 ]",
+    "cmp -s": "cmp -s f1 f1",
+    "uniq -c": r"printf 'a\na\n' | uniq -c >/dev/null",
+    "tar --no-same-owner": (
+        "tar -czf t.tgz f1 && mkdir -p o && tar -xzf t.tgz -C o --no-same-owner"
+    ),
+}
+
+
+@pytest.mark.parametrize("flag,probe", sorted(_NON_POSIX_FLAGS.items()))
+def test_every_non_posix_flag_works_on_THIS_platform(flag, probe, tmp_path) -> None:
+    """THE CLASS, closed rather than the instance patched (cage-match round 3).
+
+    The guard runs on two userlands: the orchestrator's macOS BSD tools and the
+    island boxes' GNU tools. A GNU-only flag does not error loudly there — it
+    kills one pipeline and the walk silently yields nothing, which this script
+    then reports as a clean comparison. A no-op wearing a pass.
+
+    It happened: `sed -z` (BSD sed has none) made the multi-compose walk find
+    zero files. Carnot had flagged the same CLASS for `sort -z` one round
+    earlier; that specific claim was wrong — Apple's sort does support -z,
+    measured twice — and I introduced a real instance of the class it named while
+    rejecting the false instance. So the fix is the sweep, not the patch.
+
+    THIS TEST IS HALF AN INSTRUMENT ON ITS OWN. It can only speak for the
+    platform it runs on. What makes it cover both is WHERE it runs: CI is Linux,
+    development is macOS, and the same parametrised list has to pass in both
+    places before anything merges. Neither run is sufficient; the pair is."""
+    (tmp_path / "f1").write_text("a\n")
+    (tmp_path / "f2").write_text("b\n")
+    result = subprocess.run(probe, shell=True, cwd=tmp_path, capture_output=True, text=True)
+    assert result.returncode == 0, (
+        f"`{flag}` is not available on this platform ({sys.platform}); the guard "
+        f"depends on it and would silently compare nothing. stderr: {result.stderr}"
+    )
+
+
+def test_a_root_compose_file_the_box_does_not_need_is_a_WARNING(tmp_path) -> None:
+    """THE ARM THAT WAS MISSING, and its absence reached production.
+
+    The repo ships `docker-compose.build.yml` for `--from-source`. No island
+    carries it, because islands are pull-based and never build. When the
+    multi-compose walk first landed it ran the ref-only case through
+    `compare_one`, which treats a missing box file as DRIFT — so BOTH clean live
+    boxes exited 1, and the guard would have refused every healthy deploy from
+    the day it merged.
+
+    THIRTY-THREE UNIT TESTS WERE GREEN. Not one fixture had a root compose file
+    present in the ref and absent on the box, so the whole suite was blind to it
+    by construction; the only instrument that saw it was the null arm run against
+    the real boxes. That is the finding, more than the bug: a fixture family can
+    be exhaustive about the cases it contains and say nothing about the case it
+    cannot express."""
+    box = _tree(tmp_path / "box", BASELINE)
+    tag = _tree(
+        tmp_path / "tag",
+        {**BASELINE, "docker-compose.build.yml": "services:\n  chat-island:\n    build: .\n"},
+    )
+
+    result = _run(box, tag)
+
+    assert result.returncode == CLEAN, (
+        "a root compose file the box legitimately does not carry must not refuse "
+        "the deploy: " + result.stdout + result.stderr
+    )
+    assert "docker-compose.build.yml" in result.stderr, (
+        "...but it must still be named: " + result.stderr
     )

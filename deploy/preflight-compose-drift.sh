@@ -211,6 +211,9 @@ materialise_ref
 #                          update.sh.bak-pre-v0110; reporting them buries the one
 #                          line that matters under twenty that do not.
 drifted=""; drifted_n=0; compared=0
+# Declared up here, not beside the ref-side walk, because the root-compose walk
+# above also contributes to it now.
+absent=""; absent_n=0; absent_rollup=""
 
 compare_one() {
   local rel="$1" box_file ref_file
@@ -246,6 +249,65 @@ compare_one() {
 # is a refusal where any other file's absence is a warning. It is the file the
 # deploy actually runs from.
 compare_one "docker-compose.yml"
+
+# EVERY ROOT-LEVEL COMPOSE FILE, not just the one — "the compose file" is a
+# convenient singular that docker does not share. Any other `docker-compose*.yml`
+# / `compose*.yml` the ref carries is compared on the same terms as a deploy file.
+while IFS= read -r -d '' rel; do
+  rel="${rel#./}"
+  [ -n "$rel" ] || continue
+  [ "$rel" = "docker-compose.yml" ] && continue
+  # BOX-DRIVEN, like every other walk here — and this line is the whole fix for a
+  # regression that reached the live boxes before any test saw it. `compare_one`
+  # treats a missing box file as DRIFT, which is right for docker-compose.yml (it
+  # is the file the deploy runs from) and wrong for every other root compose
+  # fragment: the repo ships `docker-compose.build.yml`, no island carries it
+  # because islands never build, and refusing on its absence made BOTH clean
+  # production boxes exit 1. A guard that refuses every healthy deploy is the one
+  # outcome that cannot ship, and 33 green unit tests said nothing, because no
+  # fixture had a ref-only root compose file. Absent here is a warning, same as
+  # any other deploy file the box legitimately does not need.
+  if [ ! -e "$repo_root/$rel" ]; then
+    absent="$absent $rel"; absent_n=$((absent_n + 1))
+    continue
+  fi
+  compare_one "$rel"
+  # `${rel#./}` rather than `sed -z`, and this one is not a style call. BSD sed
+  # HAS NO -z (measured: macOS sed errors, GNU sed on the island is fine), so the
+  # pipeline died on the orchestrator and the walk silently yielded nothing —
+  # a GNU-only flag turning a comparison into a no-op, which is the exact class
+  # Carnot warned about for `sort -z`. That warning was wrong about sort (Apple's
+  # sort does support -z, measured twice) and right about the class, and I put a
+  # real instance of it one line away while rejecting the false one. Shell
+  # parameter expansion is portable and needs no process.
+done < <(cd "$tree" && find . -maxdepth 1 \( -name 'docker-compose*.yml' -o -name 'docker-compose*.yaml' \
+           -o -name 'compose*.yml' -o -name 'compose*.yaml' \) -print0 2>/dev/null \
+         | LC_ALL=C sort -z)
+
+# THE ONE BOX-ONLY FILE THAT IS NOT IGNORABLE, and the only exception in this
+# script to "a file the ref does not carry is none of our business".
+#
+# MEASURED on the live box, not read in a doc: `docker compose config` with no
+# `-f` flags merged a `docker-compose.override.yml` sitting beside the base file
+# and emitted its variables into the resolved config. `update.sh`'s deploy path is
+# exactly that — a bare `docker compose pull && up`, no `-f` — so an override the
+# tag has never heard of is silently part of what gets deployed.
+#
+# That is this guard's own subject matter: compose on the box differing from
+# compose in the tag, changing what the container sees. It arrives as an EXTRA
+# file rather than an edited one, which is precisely why the box-only rule would
+# have waved it through. Neither island carries one today (checked); the point is
+# that one appearing is invisible to every other check here.
+for ovr in compose.override.yaml compose.override.yml \
+           docker-compose.override.yaml docker-compose.override.yml; do
+  [ -e "$repo_root/$ovr" ] || continue
+  [ -f "$tree/$ovr" ] && continue   # the ref carries it too — already compared above
+  drifted="$drifted $ovr(BOX-ONLY-but-AUTO-LOADED)"; drifted_n=$((drifted_n + 1))
+  warn "$ovr exists on this box and NOT in $ref. docker compose auto-loads an
+     override file when no -f flags are given, which is how update.sh deploys — so
+     this file is silently part of the running config and no tag can account for
+     it. Every other box-only file is ignored; this one cannot be."
+done
 
 # The deploy/ walk is recursive on purpose: deploy/lib/dotenv-read.sh is the single
 # reader for every .env value these scripts touch, and a drifted copy of it
@@ -296,7 +358,6 @@ done < <(cd "$repo_root" && find -L deploy \( -type f -o -type l \) -print0 2>/d
 # up to one line per subtree with a count; files beside something the box already
 # has are named individually, because those are the ones worth reading. Full
 # information, four lines instead of forty-nine.
-absent=""; absent_n=0; absent_rollup=""
 while IFS= read -r -d '' rel; do
   [ -n "$rel" ] || continue
   if [ ! -d "$repo_root/$(dirname "$rel")" ]; then
