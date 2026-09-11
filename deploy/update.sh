@@ -169,6 +169,32 @@ elif [ -f "$SCRIPT_DIR/preflight-compose-drift.sh" ]; then
   # need) lives INSIDE the guard now, where a test can drive it — it used to sit
   # here, on the path of every real deploy, untestable (Tesla, cage-match round 2).
 
+  # COMPOSE_FILE DECIDES WHICH FILES ARE DEPLOYED, AND THE GUARD CANNOT GUESS
+  # THEM (Carnot, cage-match round 6). Measured on the live box: `docker compose
+  # config` honours COMPOSE_FILE from the ENVIRONMENT *and from .env* — setting
+  # it to `docker-compose.prod.yml` deployed that file and ignored
+  # `docker-compose.yml` entirely. The guard compares the compose files the TAG
+  # carries; with COMPOSE_FILE set, those need not be the files that get
+  # deployed at all, so a clean comparison would certify a set docker never
+  # reads.
+  #
+  # This is the fifth member of the ambient-input family, and the first one that
+  # is read by DOCKER rather than by anything in this repo — which is why the
+  # guard's own ISLAND_* detector cannot see it. Neither island sets it.
+  #
+  # Refused rather than accommodated: a preflight that cannot name the file set
+  # being deployed cannot certify it, and saying so is the honest answer. The
+  # escape hatch is named, as everywhere else here.
+  compose_file_env="${COMPOSE_FILE:-}"
+  compose_file_dotenv="$(dotenv_read "$REPO_ROOT/.env" COMPOSE_FILE)"
+  if [ -n "$compose_file_env" ] || [ -n "$compose_file_dotenv" ]; then
+    die "COMPOSE_FILE is set (${compose_file_env:-$compose_file_dotenv}), so docker
+     compose will deploy a file set this guard cannot know in advance — it compares
+     the compose files the TAG carries. A clean result would certify files docker
+     never reads. Unset COMPOSE_FILE, or deploy deliberately with:
+     deploy/update.sh --skip-drift-check"
+  fi
+
   set +e
   # ALL THREE SEAMS ARE STRIPPED (Carnot round 2 named the first; Tesla round 3
   # named the class). Each is an ambient variable that changes what "compared

@@ -1167,3 +1167,44 @@ def test_a_BROKEN_sort_is_CANNOT_LOOK_not_CLEAN(tmp_path) -> None:
         + result.stdout
         + result.stderr
     )
+
+
+# Ambient inputs read by DOCKER (not by anything in this repo) that change WHICH
+# files are deployed. The guard's ISLAND_* detector is structurally blind to
+# these — it parses this repository's scripts, and nothing here reads them.
+#
+# Considered and excluded, with reasons, because an enumeration without its
+# exclusions is just a list someone will re-derive:
+#   COMPOSE_PROJECT_NAME — renames the project, does not change the file set
+#   COMPOSE_PROFILES     — selects services within the files, not the files
+#   DOCKER_HOST          — changes the target daemon, which is out of this
+#                          guard's remit (it certifies FILES, not destinations)
+DOCKER_FILE_SET_VARS = ("COMPOSE_FILE",)
+
+
+@pytest.mark.parametrize("var", DOCKER_FILE_SET_VARS)
+def test_update_sh_REFUSES_when_docker_would_deploy_an_unknown_file_set(var) -> None:
+    """THE FIFTH MEMBER OF THE AMBIENT-INPUT FAMILY (Carnot, cage-match round 6).
+
+    Measured on the live box: `docker compose config` honours COMPOSE_FILE from
+    the environment AND from .env — set to `docker-compose.prod.yml` it deployed
+    that file and ignored `docker-compose.yml` entirely. The guard compares the
+    compose files the TAG carries; with COMPOSE_FILE set those need not be the
+    files deployed at all, so a clean comparison certifies a set docker never
+    reads.
+
+    This one is read by DOCKER rather than by any script here, which is exactly
+    why `test_the_seam_list_matches_what_the_guard_actually_reads` cannot see
+    it: that detector parses this repository. A class-detector is only as wide
+    as the artifacts it reads, and this member lives outside them — worth
+    stating, because the previous four rounds all ended with "the detector will
+    catch the next one."
+
+    Both sources must be checked, not just the environment."""
+    code = _update_sh_code()
+    assert f'"${{{var}:-}}"' in code, f"{var} must be read from the environment"
+    assert f'dotenv_read "$REPO_ROOT/.env" {var}' in code, (
+        f"{var} must ALSO be read from .env — measured: docker honours it from there too, "
+        "and checking only the environment would miss the likelier case"
+    )
+    assert "--skip-drift-check" in code, "a fail-closed branch must name its escape hatch"
