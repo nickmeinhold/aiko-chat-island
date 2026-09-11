@@ -71,6 +71,24 @@ def _run(box: Path, ref_tree: Path | None, ref: str = "v9.9.9", **env_extra):
     )
 
 
+def _compared_count(stdout: str) -> int:
+    """The number of files the script says it compared, parsed as an INTEGER.
+
+    A SUBSTRING CHECK CANNOT DO THIS JOB, and two rounds of cage-match were
+    needed to make that stick. Round 1 caught `f"{4} file"` matching
+    "14 file(s)"; the fix extended the needle to `"4 file(s) compared"` and
+    declared in a capitalised comment that it was now THE FULL STRING — which is
+    a substring of "14 file(s) compared" and "104 file(s) compared" in exactly
+    the same way (Kelvin, round 5: the comment shouts one principle and the code
+    implements the other).
+
+    So the assertion that proves the comparison was not a no-op is now arithmetic
+    rather than text. There is no third way for this to be a prefix."""
+    marker = " file(s) compared against "
+    assert marker in stdout, f"no comparison count in output: {stdout!r}"
+    return int(stdout.split(marker)[0].rsplit(":", 1)[-1].strip())
+
+
 def _tree(root: Path, files: dict[str, str]) -> Path:
     for rel, body in files.items():
         p = root / rel
@@ -232,12 +250,9 @@ def test_the_comparison_is_not_vacuous(tmp_path) -> None:
     result = _run(box, tag)
 
     assert result.returncode == CLEAN, result.stderr
-    # THE FULL STRING, not a prefix. `f"{4} file"` is a substring of "14 file(s)",
-    # "24 file(s)" and "104 file(s)" — so the one assertion whose entire job is to
-    # prove the comparison was not a no-op was itself satisfied by a whole family
-    # of wrong counts. A control that passes for reasons other than the one it
-    # names is the defect this test exists to catch, committed by the test.
-    assert f"{len(BASELINE)} file(s) compared" in result.stdout, (
+    # Parsed as an integer, for the reason in _compared_count: every textual
+    # form of this assertion has been a prefix match in disguise, twice.
+    assert _compared_count(result.stdout) == len(BASELINE), (
         "the script must state how many files it compared, or a no-op passes as a pass: "
         + result.stdout
     )
@@ -461,9 +476,9 @@ def test_the_real_fetch_resolves_a_real_tag(tmp_path) -> None:
     # It must have actually COMPARED something. A fetch that yields an empty tree
     # now dies, but asserting the count keeps this control bound to real work
     # rather than to a tolerable exit code.
-    assert "file(s) compared against v0.11.0" in result.stdout, result.stdout
-    compared = int(result.stdout.split(" file(s) compared")[0].split(": ")[-1])
-    assert compared > 3, f"only {compared} files compared against the real tag"
+    assert _compared_count(result.stdout) > 3, (
+        f"too few files compared against the real tag: {result.stdout}"
+    )
 
 
 @pytest.mark.skipif(
@@ -581,7 +596,7 @@ def test_an_override_the_REF_also_carries_is_compared_not_flagged(tmp_path) -> N
     result = _run(box, tag)
 
     assert result.returncode == CLEAN, result.stdout + result.stderr
-    assert f"{len(shipped)} file(s) compared" in result.stdout, (
+    assert _compared_count(result.stdout) == len(shipped), (
         "a ref-carried override must be COMPARED, not merely tolerated: " + result.stdout
     )
 
@@ -917,4 +932,57 @@ def test_an_UNREADABLE_deploy_dir_on_the_box_is_CANNOT_LOOK(tmp_path) -> None:
         "a walk that could not read deploy/ must not report a clean comparison: "
         + result.stdout
         + result.stderr
+    )
+
+
+def test_an_UNREADABLE_box_file_is_CANNOT_LOOK_not_DRIFT(tmp_path) -> None:
+    """A FOURTH STATE AGAIN (Carnot, cage-match round 5).
+
+    A file the deploy user cannot read passes `-f`, fails `cmp`, and was
+    reported as ordinary drift with an empty diff body — so update.sh told the
+    operator to sync a file that is byte-identical, and the real fault
+    (permissions) was never named. Measured before the fix: exit 1, "this box
+    differs", no diff shown.
+
+    I-could-not-read is a measurement failure, not an observation. The files
+    here are IDENTICAL, so anything reported as a difference is a lie about the
+    bytes as well as about the state."""
+    box = _tree(tmp_path / "box", BASELINE)
+    tag = _tree(tmp_path / "tag", BASELINE)
+    victim = box / "deploy" / "update.sh"
+    victim.chmod(0o000)
+    try:
+        result = _run(box, tag)
+    finally:
+        victim.chmod(0o644)
+
+    assert result.returncode == CANNOT_LOOK, (
+        "an unreadable file must not be reported as a difference — the bytes are "
+        "identical: " + result.stdout + result.stderr
+    )
+    assert "READ" in result.stderr, result.stderr
+
+
+def test_a_DANGLING_root_compose_symlink_is_refused_not_called_absent(tmp_path) -> None:
+    """THE SAME SHAPE, THE SAME ANSWER, EVERYWHERE (Carnot, cage-match round 5).
+
+    `-e` follows symlinks, so a dangling link reads as "not there". Under
+    `deploy/` that was already handled and produced DRIFT; at a root compose path
+    the bare `-e` remained, so the identical situation produced CLEAN with a
+    warning. One script, two answers to one question.
+
+    Every box-side presence test now routes through `_present`, which is what
+    makes the answer uniform by construction rather than by remembering."""
+    box = _tree(tmp_path / "box", BASELINE)
+    (box / "docker-compose.build.yml").symlink_to(tmp_path / "no-such-target")
+    tag = _tree(
+        tmp_path / "tag",
+        {**BASELINE, "docker-compose.build.yml": "services:\n  chat-island:\n    build: .\n"},
+    )
+
+    result = _run(box, tag)
+
+    assert result.returncode == DRIFT, (
+        "a compose fragment resolving to nothing is a broken artifact, not an "
+        "absent one: " + result.stdout + result.stderr
     )

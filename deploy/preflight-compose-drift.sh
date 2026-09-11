@@ -258,6 +258,19 @@ materialise_ref
 #   on the box only     -> IGNORE. Both boxes are carpeted in .env.bak-* and
 #                          update.sh.bak-pre-v0110; reporting them buries the one
 #                          line that matters under twenty that do not.
+# PRESENCE, DEFINED ONCE (cage-match round 5, Carnot — and the THIRD round in
+# which a fix landed on one instance of a class already named). `-e` follows a
+# symlink, so a DANGLING link reads as "not there". That is the wrong answer
+# everywhere in this script: a deploy file or a compose fragment that resolves to
+# nothing is a real artifact in a broken state, and calling it absent downgrades
+# a refusal to a warning. The deploy walk had `-e || -L`; the root-compose walk
+# and the override loop still had bare `-e`, so the identical shape produced
+# DRIFT in one place and CLEAN in another.
+#
+# Every box-side presence test now goes through here, which is what makes the
+# answer uniform by construction instead of by three people remembering.
+_present() { [ -e "$1" ] || [ -L "$1" ]; }
+
 drifted=""; drifted_n=0; compared=0
 # Declared up here, not beside the ref-side walk, because the root-compose walk
 # above also contributes to it now.
@@ -277,6 +290,18 @@ compare_one() {
     drifted="$drifted $rel(MISSING-on-this-box)"; drifted_n=$((drifted_n + 1))
     return 0
   fi
+  # UNREADABLE IS NOT "DIFFERENT" (cage-match round 5, Carnot). Without this,
+  # a file the deploy user cannot read passes `-f`, fails `cmp`, and is reported
+  # as ordinary DRIFT with an empty diff body — so update.sh tells the operator
+  # to sync a file that is already identical, and the real fault (permissions) is
+  # never named. Measured before the fix: exit 1, "this box differs", no diff.
+  # It is the four-state contract again: I-could-not-read is a measurement
+  # failure, not an observation.
+  [ -r "$box_file" ] || die "cannot READ $box_file (permissions?). That is not the same
+     as finding a difference — nothing was learned about this file, so nothing is
+     being claimed about it."
+  [ -r "$ref_file" ] || die "cannot READ $ref_file inside the $ref tree. Nothing was
+     learned about this file."
   compared=$((compared + 1))
   cmp -s "$ref_file" "$box_file" && return 0
   drifted="$drifted $rel"; drifted_n=$((drifted_n + 1))
@@ -336,7 +361,7 @@ while IFS= read -r -d '' rel; do
   # outcome that cannot ship, and 33 green unit tests said nothing, because no
   # fixture had a ref-only root compose file. Absent here is a warning, same as
   # any other deploy file the box legitimately does not need.
-  if [ ! -e "$repo_root/$rel" ]; then
+  if ! _present "$repo_root/$rel"; then
     absent="$absent $rel"; absent_n=$((absent_n + 1))
     continue
   fi
@@ -369,7 +394,7 @@ done < <(cd "$tree" && find . -maxdepth 1 \( -name 'docker-compose*.yml' -o -nam
 # that one appearing is invisible to every other check here.
 for ovr in compose.override.yaml compose.override.yml \
            docker-compose.override.yaml docker-compose.override.yml; do
-  [ -e "$repo_root/$ovr" ] || continue
+  _present "$repo_root/$ovr" || continue
   [ -f "$tree/$ovr" ] && continue   # the ref carries it too — already compared above
   drifted="$drifted $ovr(BOX-ONLY-but-AUTO-LOADED)"; drifted_n=$((drifted_n + 1))
   warn "$ovr exists on this box and NOT in $ref. docker compose auto-loads an
@@ -452,7 +477,7 @@ $(printf '%s' "$rel" | cut -d/ -f1-2)"
   # DRIFT. One file, two contradictory sentences in one run: "your box does not
   # carry this" and "your copy of this differs". `-L` catches the dangling link
   # as present, leaving exactly one report, the refusal, which is the true one.
-  { [ -e "$repo_root/$rel" ] || [ -L "$repo_root/$rel" ]; } \
+  _present "$repo_root/$rel" \
     || { absent="$absent $rel"; absent_n=$((absent_n + 1)); }
 done < <(LC_ALL=C sort -z "$box_list")
 
