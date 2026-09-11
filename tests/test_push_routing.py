@@ -61,14 +61,26 @@ def _row(row_id: str, platform: str, token_kind: str = TokenKind.ALERT.value,
 # TABLE: every cell is stated, including the one that is a skip. A member added
 # without a row here fails with a KeyError naming the missing cell, which is the
 # decision being forced rather than inherited.
-_EXPECTED: dict[tuple[TokenKind, WakeKind], str | None] = {
-    (TokenKind.ALERT, WakeKind.CALL_INVITE): None,          # delivered
-    (TokenKind.VOIP, WakeKind.CALL_INVITE): None,           # delivered
-    (TokenKind.VOIP, WakeKind.CALL_END): None,              # delivered
-    # The only skip in the table, and it is a DECISION (claude-tasks#4254): an
-    # alert push runs no app code, so it cannot end a CallKit ring, and it would
-    # render the invite's "Incoming call" copy for a hangup.
-    (TokenKind.ALERT, WakeKind.CALL_END): "end_wake_needs_voip",
+_EXPECTED: dict[tuple[TokenKind, WakeKind, bool], str | None] = {
+    # (token_kind, wake, end_wake_gate_open) -> None means delivered, else the
+    # named skip reason. THE GATE IS AN AXIS OF THE TABLE, not a special case
+    # tested elsewhere: an interlock whose closed state is not swept is an
+    # interlock nobody proves is closed.
+    (TokenKind.ALERT, WakeKind.CALL_INVITE, False): None,
+    (TokenKind.ALERT, WakeKind.CALL_INVITE, True): None,
+    (TokenKind.VOIP, WakeKind.CALL_INVITE, False): None,
+    (TokenKind.VOIP, WakeKind.CALL_INVITE, True): None,
+    # THE INTERLOCK (consolidation retro 2026-09-11). Closed by default until
+    # claude-tasks#4278 answers whether report-then-immediately-end satisfies
+    # Apple's must-report rule. Open, the end wake delivers as designed.
+    (TokenKind.VOIP, WakeKind.CALL_END, False): "end_wake_gated_pending_4278",
+    (TokenKind.VOIP, WakeKind.CALL_END, True): None,
+    # A DECISION, not an omission (claude-tasks#4254), and INDEPENDENT of the
+    # gate: an alert push runs no app code, so it cannot end a CallKit ring and
+    # would render the invite's "Incoming call" copy for a hangup. Opening the
+    # interlock must NOT start routing ends to alert rows.
+    (TokenKind.ALERT, WakeKind.CALL_END, False): "end_wake_needs_voip",
+    (TokenKind.ALERT, WakeKind.CALL_END, True): "end_wake_needs_voip",
 }
 
 
@@ -78,17 +90,17 @@ def test_the_expectation_table_covers_every_cell():
     count drops, everything stays green, and the new member is routed by
     `case _`. Asserted as a set difference so the failure NAMES the missing
     cells."""
-    every_cell = set(itertools.product(TokenKind, WakeKind))
+    every_cell = set(itertools.product(TokenKind, WakeKind, [False, True]))
     assert every_cell - set(_EXPECTED) == set(), (
         "a (TokenKind, WakeKind) cell has no stated expectation — decide what it "
         "does before the router decides for you")
 
 
 @pytest.mark.parametrize(
-    "platform,kind,wake",
-    list(itertools.product([Platform.APNS], TokenKind, WakeKind)))
+    "platform,kind,wake,gate",
+    list(itertools.product([Platform.APNS], TokenKind, WakeKind, [False, True])))
 def test_every_platform_token_kind_wake_kind_combination_is_routed(
-        platform, kind, wake):
+        platform, kind, wake, gate):
     """TOTALITY OVER THE ENUMS, so a member added without teaching the router
     about it fails HERE rather than at a handset that does not ring.
 
@@ -107,8 +119,9 @@ def test_every_platform_token_kind_wake_kind_combination_is_routed(
     requiring delivery for all of them. Two different questions, two tests.
     """
     rows = [_row("01ROW", platform.value, kind.value)]
-    deliveries, skips = plan_deliveries(rows, wake=wake, configured=BOTH)
-    expected_skip = _EXPECTED[(kind, wake)]
+    deliveries, skips = plan_deliveries(rows, wake=wake, configured=BOTH,
+                                        end_wake_gate_open=gate)
+    expected_skip = _EXPECTED[(kind, wake, gate)]
 
     if expected_skip is not None:
         assert deliveries == [], (
@@ -158,7 +171,8 @@ def test_a_new_wake_kind_must_be_routed_explicitly():
     for platform in [Platform.APNS]:   # the only platform with a send path
         rows = [_row("01ROW", platform.value, TokenKind.ALERT.value)]
         deliveries, skips = plan_deliveries(
-            rows, wake=_FutureWake.CALL_TRANSFER, configured=BOTH)
+            rows, wake=_FutureWake.CALL_TRANSFER, configured=BOTH,
+            end_wake_gate_open=True)
         assert deliveries == [], (
             f"{platform} DELIVERED an unrecognised wake kind — a future cancel "
             "would ring the handset it was meant to stop")
@@ -182,8 +196,9 @@ def test_a_handset_holding_both_kinds_yields_both_deliveries():
     """
     rows = [_row("01ALERT", Platform.APNS.value, TokenKind.ALERT.value),
             _row("01VOIP", Platform.APNS.value, TokenKind.VOIP.value)]
-    deliveries, skips = plan_deliveries(rows, wake=WakeKind.CALL_INVITE,
-                                        configured=BOTH)
+    deliveries, skips = plan_deliveries(
+        rows, wake=WakeKind.CALL_INVITE, configured=BOTH,
+        end_wake_gate_open=True)
     assert skips == []
     assert sorted(d.row_id for d in deliveries) == ["01ALERT", "01VOIP"]
 
@@ -198,7 +213,8 @@ def test_a_row_whose_transport_is_unconfigured_is_skipped_not_sent():
     rows = [_row("01APNS", Platform.APNS.value),
             _row("01FCM", Platform.FCM.value)]
     deliveries, skips = plan_deliveries(
-        rows, wake=WakeKind.CALL_INVITE, configured=frozenset({Platform.APNS}))
+        rows, wake=WakeKind.CALL_INVITE, configured=frozenset({Platform.APNS}),
+        end_wake_gate_open=True)
     assert [d.row_id for d in deliveries] == ["01APNS"]
     assert skips == [("01FCM", "transport_not_built")], (
         "an Android row must name NOT BUILT — `transport_not_configured` implies\n"
@@ -209,8 +225,9 @@ def test_nothing_is_planned_when_no_transport_is_configured():
     """The whole-island arm. Not an error and not an exception — an island with
     no push credentials simply plans nothing."""
     rows = [_row("01APNS", Platform.APNS.value), _row("01FCM", Platform.FCM.value)]
-    deliveries, skips = plan_deliveries(rows, wake=WakeKind.CALL_INVITE,
-                                        configured=frozenset())
+    deliveries, skips = plan_deliveries(
+        rows, wake=WakeKind.CALL_INVITE, configured=frozenset(),
+        end_wake_gate_open=True)
     assert deliveries == []
     assert sorted(skips) == [("01APNS", "transport_not_configured"),
                              ("01FCM", "transport_not_built")]
@@ -234,8 +251,9 @@ def test_a_corrupt_row_skips_only_that_row_and_does_not_raise(bad):
     rows = [_row("01GOOD1", Platform.APNS.value),
             _row("01BAD", **kwargs),
             _row("01GOOD2", Platform.APNS.value)]
-    deliveries, skips = plan_deliveries(rows, wake=WakeKind.CALL_INVITE,
-                                        configured=BOTH)
+    deliveries, skips = plan_deliveries(
+        rows, wake=WakeKind.CALL_INVITE, configured=BOTH,
+        end_wake_gate_open=True)
     assert sorted(d.row_id for d in deliveries) == ["01GOOD1", "01GOOD2"]
     assert skips == [("01BAD", "unroutable_row")]
 
@@ -276,7 +294,7 @@ def test_an_android_row_is_skipped_as_NOT_BUILT_whatever_kind_it_carries(kind):
     """
     deliveries, skips = plan_deliveries(
         [_row("01ROW", Platform.FCM.value, kind.value)],
-        wake=WakeKind.CALL_INVITE, configured=BOTH)
+        wake=WakeKind.CALL_INVITE, configured=BOTH, end_wake_gate_open=True)
     assert deliveries == [], "an Android row produced a delivery with no send path"
     assert skips == [("01ROW", "transport_not_built")], (
         f"an Android row must be named NOT BUILT, got {skips}")

@@ -139,6 +139,20 @@ def apns_unconfigured(monkeypatch):
 
 
 @pytest.fixture
+def end_wake_gate_open(monkeypatch):
+    """Opens the end-wake interlock for tests that are about the end wake's
+    ROUTING rather than about the gate itself.
+
+    The interlock (`END_WAKE_VOIP_GATE_OPEN`) is CLOSED in the shipped code until
+    claude-tasks#4278 answers, so without this the end-wake tests would silently
+    become tests of the gate — passing for the wrong reason, and leaving the
+    routing they were written to prove completely unexercised the day the gate
+    opens. Requesting it explicitly is what keeps the two questions separate.
+    """
+    monkeypatch.setattr(push_service, "END_WAKE_VOIP_GATE_OPEN", True)
+
+
+@pytest.fixture
 def fake_apns(monkeypatch):
     fake = FakeApns()
     monkeypatch.setattr(apns, "send", fake)
@@ -442,7 +456,7 @@ async def test_payload_never_names_the_caller(session, dm, configured, fake_apns
 
 @pytest.mark.asyncio
 async def test_an_end_wake_reaches_the_voip_row_and_skips_the_alert_row(
-    session, dm, configured, fake_apns, caplog
+    session, dm, configured, fake_apns, caplog, end_wake_gate_open
 ):
     """THE WHOLE PIECE, end to end: bob holds both an alert row (from the
     fixture) and a voip row, alice hangs up, and exactly one push goes out.
@@ -472,7 +486,7 @@ async def test_an_end_wake_reaches_the_voip_row_and_skips_the_alert_row(
 
 @pytest.mark.asyncio
 async def test_an_end_wake_carries_the_end_kind_in_the_payload(
-    session, dm, configured, fake_apns
+    session, dm, configured, fake_apns, end_wake_gate_open
 ):
     """THE FIELD THE RING'S STOPPABILITY RESTS ON.
 
@@ -504,6 +518,54 @@ async def test_an_end_wake_carries_the_end_kind_in_the_payload(
     await _wake(push_service.CALL_INVITE_BODY, sender_id=alice.id)
     _, invite_payload, _ = fake_apns.sent[0]
     assert invite_payload.kind is push_service.WakeKind.CALL_INVITE
+
+
+def test_the_end_wake_interlock_ships_closed():
+    """THE DEFAULT IS THE SAFETY PROPERTY, so it is asserted rather than assumed.
+
+    claude-tasks#4178 measured that `reportCall(endedAt:)` alone does not satisfy
+    Apple's must-report rule, and that three unreported VoIP pushes blackhole VoIP
+    delivery to that app on that device — invisibly, behind a 200. Until #4278
+    says whether report-then-immediately-end counts as reported, the island must
+    not route an end wake to a VoIP handset.
+
+    Before this constant, the only thing preventing that was the ABSENCE OF ANY
+    VOIP ROW plus a sentence in a ticket. This test is what makes flipping the
+    default a deliberate act with a red test in front of it, rather than a line
+    someone changes while doing something else.
+    """
+    assert push_service.END_WAKE_VOIP_GATE_OPEN is False, (
+        "the end-wake interlock must ship CLOSED until claude-tasks#4278 answers "
+        "whether report-then-immediately-end satisfies must-report")
+
+
+@pytest.mark.asyncio
+async def test_a_closed_interlock_refuses_the_end_wake_and_says_so(
+    session, dm, configured, fake_apns, caplog
+):
+    """THE INTERLOCK, EXERCISED END-TO-END AT ITS SHIPPED SETTING — deliberately
+    NOT requesting the `end_wake_gate_open` fixture.
+
+    A REFUSAL MUST NAME ITSELF. Routing the refusal through `plan_deliveries`'s
+    skip list rather than making the wake vanish upstream in `should_wake` is the
+    whole design: a gate that silently produced no wake would be indistinguishable
+    from a delivery bug, which is the failure mode this module has a standing rule
+    against. So this asserts BOTH halves — nothing was sent, AND the log says why.
+    """
+    alice, bob = dm
+    session.add(DeviceToken(user_id=bob.id, platform="apns", token="v" * 64,
+                            token_kind=TokenKind.VOIP.value))
+    await session.commit()
+
+    with caplog.at_level(logging.INFO, logger="aiko_gateway.push"):
+        await _wake(push_service.CALL_END_BODY, sender_id=alice.id)
+
+    assert fake_apns.sent == [], (
+        "the interlock is closed — an end wake must not reach a VoIP handset")
+    assert any("reason=end_wake_gated_pending_4278" in r.message
+               for r in caplog.records), (
+        f"the refusal must name itself; a silent skip is indistinguishable from a "
+        f"delivery bug. Log: {caplog.text}")
 
 
 @pytest.mark.asyncio

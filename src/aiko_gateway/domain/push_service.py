@@ -323,6 +323,41 @@ def is_call_invite(body: str) -> bool:
     return body == CALL_INVITE_BODY
 
 
+# THE END-WAKE INTERLOCK — CLOSED BY DEFAULT, and it is a CONSTANT rather than a
+# Settings field on purpose (consolidation retro 2026-09-11, Kelvin + Carnot
+# converging independently).
+#
+# WHAT IT DEFENDS. claude-tasks#4178 measured, on a real handset, that
+# `reportCall(with:endedAt:)` alone does NOT satisfy Apple's must-report rule, and
+# that after THREE unreported VoIP pushes iOS stops delivering VoIP to that app on
+# that device — while APNs keeps answering 200. That failure is INVISIBLE TO THIS
+# ISLAND BY CONSTRUCTION: a deaf handset and a healthy one return the same status,
+# so no SendResult, no log line and no reachability report can tell them apart.
+#
+# WHY AN INTERLOCK AND NOT A TICKET. Before this constant existed, the thing keeping
+# an end wake off a VoIP row was the ABSENCE OF ANY VOIP ROW plus a sentence in
+# claude-tasks#4265 saying we must not route one until #4278 answers. That is a fact
+# someone has to remember, and `apns.py` already carries this module's own ruling on
+# exactly that shape: a failure we cannot detect has to be made unreachable by
+# CONSTRUCTION, not watched for. The gate was the one place that ruling had not been
+# applied to itself.
+#
+# WHY NOT A `Settings` FIELD. Two reasons, and the second is the real one. (1) Cost:
+# invariant 7b makes every Settings field a compose-forwarding change, which both
+# live boxes' compose files must then carry or the v0.11.1 drift guard correctly
+# refuses the deploy. (2) SHAPE: this is not an island policy an operator should
+# tune — it is a global fact about iOS that is either still open or answered for
+# everyone. A per-island env var would let someone open it on one box at 2am with
+# no diff and no review; a constant makes opening it a commit, a cage-match and a
+# release. The audit trail IS the point.
+#
+# TO OPEN IT: #4278 must answer whether report-then-immediately-end counts as
+# reported. If yes, flip this and ship — the cost is a momentary ring per hangup.
+# If no, DO NOT flip it; the end wake needs a different transport and #4265's
+# channel-vs-call gap is still open besides.
+END_WAKE_VOIP_GATE_OPEN = False
+
+
 def is_call_end(body: str) -> bool:
     """Exact match, for the identical reason `is_call_invite` is exact — and the
     reason is NOT weaker here just because the privilege is smaller. Forging a
@@ -394,13 +429,23 @@ Delivery = ApnsDelivery
 
 def plan_deliveries(
     rows: Sequence[DeviceToken], *, wake: WakeKind,
-    configured: frozenset[Platform],
+    configured: frozenset[Platform], end_wake_gate_open: bool,
 ) -> tuple[list[Delivery], list[tuple[str, str]]]:
     """Decide what to send where. PURE, TOTAL, and it MUST NEVER RAISE.
 
-    No session, no settings read, no I/O, no await — `configured` is passed in
-    precisely so the whole routing table stays table-testable against
-    `itertools.product(Platform, TokenKind, WakeKind)`. That sweep is the real
+    No session, no settings read, no I/O, no await — `configured` AND
+    `end_wake_gate_open` are both passed in precisely so the whole routing table
+    stays table-testable against `itertools.product(Platform, TokenKind, WakeKind)`
+    crossed with the gate.
+
+    `end_wake_gate_open` IS REQUIRED AND HAS NO DEFAULT, for the same reason
+    `WakePayload.kind` does: a default of `True` would let a caller that forgets
+    the argument route an end wake to a handset the interlock exists to protect,
+    and a default of `False` would silently disable a feature someone had
+    deliberately enabled. Reading the constant inside this function would be the
+    obvious alternative and is wrong — it would make the router a function of
+    module state rather than its arguments, which is exactly the property that
+    makes this table testable at all. That sweep is the real
     merge gate here: CI runs `pytest` and `secrets-integrity` and nothing else, so
     the `assert_never` calls below buy editor-time errors and nothing in CI.
 
@@ -469,7 +514,17 @@ def plan_deliveries(
                         case (TokenKind.ALERT, WakeKind.CALL_INVITE):
                             pass
                         case (TokenKind.VOIP, WakeKind.CALL_END):
-                            pass
+                            # THE INTERLOCK. See END_WAKE_VOIP_GATE_OPEN for what
+                            # this defends and why it is a constant. Refused HERE,
+                            # with a named reason, rather than upstream in
+                            # `should_wake` — a gate that made the wake kind vanish
+                            # would be a SILENT non-delivery, which is the failure
+                            # mode this module has a standing rule against. The wake
+                            # is still produced, still gated, and still says so.
+                            if not end_wake_gate_open:
+                                skips.append(
+                                    (row.id, "end_wake_gated_pending_4278"))
+                                continue
                         case (TokenKind.ALERT, WakeKind.CALL_END):
                             # THE ONE CELL THAT IS A SKIP RATHER THAN A SEND, and
                             # it is a DECISION, not an omission (design 12
@@ -792,7 +847,8 @@ async def _wake_user(session: AsyncSession, user_id: str, *, wake: WakeKind,
         select(DeviceToken).where(DeviceToken.user_id == user_id)
     )).scalars().all()
     deliveries, skips = plan_deliveries(
-        rows, wake=wake, configured=_configured_platforms())
+        rows, wake=wake, configured=_configured_platforms(),
+        end_wake_gate_open=END_WAKE_VOIP_GATE_OPEN)
     for row_id, reason in skips:
         if reason == "unroutable_row":
             # ERROR: a row the island cannot classify at all is a data or code
