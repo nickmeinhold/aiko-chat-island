@@ -908,8 +908,19 @@ def test_the_https_pin_is_applied_when_no_seam_is_set() -> None:
     )
 
 
+@pytest.mark.skipif(
+    os.geteuid() == 0,
+    reason="root reads regardless of mode, so this arm cannot create the failure it clears",
+)
 def test_an_UNREADABLE_deploy_dir_on_the_box_is_CANNOT_LOOK(tmp_path) -> None:
     """THE WALK THAT GOES SILENT WITHOUT CHANGING THE ANSWER (Tesla, round 3).
+
+    SKIPPED AS ROOT, deliberately. A mode-000 directory does not stop root, so
+    under root this arm cannot create the failure it exists to clear — and an arm
+    that cannot go red is not evidence, whichever way it lands. CI is
+    `ubuntu-latest` with no container, so it runs as a normal user and the arm is
+    live there; a future containerised CI would skip it loudly rather than
+    reporting a pass it did not earn.
 
     `done < <(find ...)` discards the process substitution's status. If find
     fails — missing binary, unreadable directory — the stream is simply EMPTY:
@@ -935,6 +946,10 @@ def test_an_UNREADABLE_deploy_dir_on_the_box_is_CANNOT_LOOK(tmp_path) -> None:
     )
 
 
+@pytest.mark.skipif(
+    os.geteuid() == 0,
+    reason="root reads regardless of mode, so this arm cannot create the failure it clears",
+)
 def test_an_UNREADABLE_box_file_is_CANNOT_LOOK_not_DRIFT(tmp_path) -> None:
     """A FOURTH STATE AGAIN (Carnot, cage-match round 5).
 
