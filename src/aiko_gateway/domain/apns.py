@@ -220,6 +220,33 @@ _VOIP_LEASE_SECONDS = 30
 # lift, a flapping connection) by an order of magnitude over the lease, and stops
 # well short of ancient stops driving the ratio.
 #
+# WHAT WIDENING THIS COSTS, NAMED AT THE MOMENT OF THE CHOICE RATHER THAN
+# DISCOVERED LATER (Carnot, cage-match PR#176 r3 — and the finding was generated
+# by this very constant's introduction one commit earlier).
+#
+# THERE ARE TWO FAILURE MODES ON THIS ONE DIAL, and they pull in opposite
+# directions. Short: the stop expires before the device reappears, and the ring it
+# was sent to stop survives (the paragraph above). Long: a STALE stop survives into
+# a LATER call in the same channel. Alice calls, Bob's handset is off, Alice hangs
+# up; the stop is stored. Alice calls again four minutes later; Bob reappears; APNs
+# delivers BOTH, in no guaranteed order, and the payload the client uses to decide
+# says only `c` — a CHANNEL, not a call. A stop meant for the first call can end
+# the second one while it is ringing.
+#
+# BOTH MODES HAVE ONE ROOT AND IT IS NOT THIS NUMBER: the wake names a channel,
+# not a call. Given a call id there is no dial to tune — a stop matches exactly one
+# call and may live as long as it likes. That id is design 12 Decision 1's
+# client-minted ULID, and it reaches the payload only inside arm C's sealed
+# envelope (claude-tasks#4254), which is blocked on a product decision and a
+# cryptographer. So NO value here is correct; 300 is the least-bad arm while the
+# feature is inert, and tuning it further is treating a representation gap as a
+# calibration problem.
+#
+# THE WINDOW IS NOT REACHABLE TODAY and that is why this ships: an end wake is
+# routed to VoIP rows only, and both live islands hold zero (measured 2026-09-11:
+# 3 rows each, all `token_kind='alert'`). It becomes reachable the moment a build
+# registers a VoIP token. That is the gate, and it is tracked.
+#
 # THIS IS A FOURTH CLOCK AND IT IS NOT SETTLED HERE. The lease, the 30s ring and
 # the app's 10s freshness gate already "have no stated relationship, which the
 # ruling explicitly left open" — that is claude-tasks#4233, and it is where the
