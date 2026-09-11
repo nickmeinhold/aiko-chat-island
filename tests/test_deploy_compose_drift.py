@@ -1,0 +1,264 @@
+"""The compose-drift preflight (claude-tasks#4230).
+
+`update.sh` pulls an IMAGE and has never synced `docker-compose.yml`. On
+2026-09-11 that took chat.enspyr.co down: `APNS_VOIP_TOPIC` became a required
+member of config.py's all-or-none APNs group, the box's `.env` HAD the key, and
+the box's compose did not forward it — so the value sat on the host and could not
+reach the container. The box's compose differed from the tag by EXACTLY ONE LINE.
+imagineering had the identical gap and deployed clean, because its compose
+happened to get synced first. Same change, same drift, opposite outcome, one
+variable: which files the operator happened to be thinking about.
+
+`deploy/preflight-apns.sh` was the safety net that should have caught it. The
+copy ON THE BOX was dated Sep 1 and contained zero references to
+`APNS_VOIP_TOPIC` — the check written to abort before a half-set deploy could not
+see the key that would break it. Same root cause, one file over: nothing syncs
+`deploy/` either. So this guard compares the WHOLE deploy surface, not just
+compose; a stale preflight is the second half of the same outage.
+
+BOTH CONTROLS ARE BUILT HERE. The arms that must go red (a one-line compose
+drift, a stale deploy script) and the arms that must stay green (identical trees,
+a box that legitimately carries a SUBSET of the tag's deploy/, a box littered
+with `.bak-*` files the tag has never heard of). The green arms are not padding:
+both live islands are byte-identical to v0.11.0 right now, so a guard that
+refused on a clean box would block every deploy from the day it landed.
+
+FOUR EPISTEMIC STATES, NOT TWO. The script must never collapse "the ref does not
+exist" (absence), "the network refused" (error), "the trees match" (silence) and
+"a file differs" (refusal). Each gets its own exit status and its own message,
+and each has a test — `curl -sf` swallowing a 403 and reading it as "no release"
+is a failure this repo has already paid for once.
+"""
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
+
+REPO = Path(__file__).resolve().parents[1]
+SCRIPT = REPO / "deploy" / "preflight-compose-drift.sh"
+
+# Exit statuses, named so a test reads as a claim about a STATE rather than about
+# a number. 2 is deliberately not 1: "I could not look" and "I looked and it
+# differs" are different facts, and update.sh says different things about them.
+CLEAN = 0
+DRIFT = 1
+CANNOT_LOOK = 2
+
+# The literal line whose absence from enspyr's compose caused the outage. Kept
+# verbatim rather than paraphrased: the test is a reproduction, not an analogy.
+THE_MISSING_LINE = "      APNS_VOIP_TOPIC: ${APNS_VOIP_TOPIC:-}"
+
+
+def _run(box: Path, ref_tree: Path | None, ref: str = "v9.9.9", **env_extra):
+    """Drive the script with the network seam closed.
+
+    ISLAND_REF_TREE substitutes a local directory for the fetched tag. It is a
+    TEST AND OFFLINE SEAM, not a bypass — the comparison still runs in full; only
+    where the tag's bytes come from changes. The fetch half is proven separately
+    by the network-marked test below, because a seam that skipped the comparison
+    would let this whole file pass against a script that checks nothing.
+    """
+    env = {**os.environ, **env_extra}
+    if ref_tree is not None:
+        env["ISLAND_REF_TREE"] = str(ref_tree)
+    return subprocess.run(
+        [str(SCRIPT), str(box), ref], capture_output=True, text=True, env=env
+    )
+
+
+def _tree(root: Path, files: dict[str, str]) -> Path:
+    for rel, body in files.items():
+        p = root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(body)
+    return root
+
+
+# The smallest shape that is recognisably an island deploy tree: the compose file
+# the outage was about, plus the preflight that failed to catch it.
+BASELINE = {
+    "docker-compose.yml": "services:\n  chat-island:\n    environment:\n" + THE_MISSING_LINE + "\n",
+    "deploy/update.sh": "#!/usr/bin/env bash\necho update\n",
+    "deploy/preflight-apns.sh": "#!/usr/bin/env bash\necho apns\n",
+    "deploy/lib/dotenv-read.sh": "dotenv_read() { :; }\n",
+}
+
+
+def test_identical_trees_are_clean(tmp_path) -> None:
+    """THE ARM THAT MUST STAY GREEN, and the one both live boxes are in today.
+
+    If this ever goes red the guard is unshippable — it would refuse every deploy
+    of a correctly-synced island, and a check that blocks the healthy case gets
+    commented out within a week."""
+    box = _tree(tmp_path / "box", BASELINE)
+    tag = _tree(tmp_path / "tag", BASELINE)
+    result = _run(box, tag)
+    assert result.returncode == CLEAN, result.stderr
+
+
+def test_the_one_line_compose_drift_that_caused_the_outage_refuses(tmp_path) -> None:
+    """THE ARM THAT MUST GO RED — a byte-level reproduction of 2026-09-11.
+
+    The box's compose is the tag's compose minus the APNS_VOIP_TOPIC forward. This
+    is the exact state enspyr was in when the deploy dropped it, and the exact
+    state the guard exists to refuse."""
+    box_files = dict(BASELINE)
+    box_files["docker-compose.yml"] = box_files["docker-compose.yml"].replace(
+        THE_MISSING_LINE + "\n", ""
+    )
+    box = _tree(tmp_path / "box", box_files)
+    tag = _tree(tmp_path / "tag", BASELINE)
+
+    result = _run(box, tag)
+
+    assert result.returncode == DRIFT, "a compose that cannot forward a required key must abort"
+    # Naming the FILE is the minimum; showing the LINE is what turns a refusal into
+    # a fix. An operator reading "your compose differs" still has to go and diff it,
+    # and this fires while they are trying to ship something else.
+    assert "docker-compose.yml" in result.stderr, result.stderr
+    assert "APNS_VOIP_TOPIC" in result.stderr, result.stderr
+
+
+def test_a_stale_deploy_script_refuses_too(tmp_path) -> None:
+    """The second half of the same outage. preflight-apns.sh ON THE BOX predated
+    the key it needed to check for, so the net that existed to catch the compose
+    gap was itself drifted. Compose alone would have shipped a guard that still
+    misses half of what happened."""
+    box_files = dict(BASELINE)
+    box_files["deploy/preflight-apns.sh"] = "#!/usr/bin/env bash\necho stale\n"
+    box = _tree(tmp_path / "box", box_files)
+    tag = _tree(tmp_path / "tag", BASELINE)
+
+    result = _run(box, tag)
+
+    assert result.returncode == DRIFT, result.stdout + result.stderr
+    assert "preflight-apns.sh" in result.stderr, result.stderr
+
+
+def test_a_nested_deploy_lib_file_is_compared(tmp_path) -> None:
+    """deploy/lib/dotenv-read.sh is the single reader for every .env value the
+    deploy scripts touch, and a drifted copy of it mis-reads a signing seed. The
+    walk has to be recursive, not one level of deploy/."""
+    box_files = dict(BASELINE)
+    box_files["deploy/lib/dotenv-read.sh"] = "dotenv_read() { echo WRONG; }\n"
+    box = _tree(tmp_path / "box", box_files)
+    tag = _tree(tmp_path / "tag", BASELINE)
+
+    result = _run(box, tag)
+
+    assert result.returncode == DRIFT, result.stdout + result.stderr
+    assert "dotenv-read.sh" in result.stderr, result.stderr
+
+
+def test_a_tag_file_the_box_does_not_carry_warns_but_does_not_refuse(tmp_path) -> None:
+    """MEASURED, not assumed: the live boxes carry four files under deploy/ where
+    the repo carries twelve. standup.sh is a first-standup tool and has no reason
+    to sit on a running island; deploy/secrets/ is not shipped to the box at all.
+
+    A whole-directory diff would refuse on both, every time, on both islands. So
+    absence is a WARNING — it is real information (a box may be missing something
+    it now needs) but it is not evidence of the drift class that caused the
+    outage, which was a file present in both and DIFFERENT."""
+    box = _tree(tmp_path / "box", BASELINE)
+    tag = _tree(tmp_path / "tag", {**BASELINE, "deploy/standup.sh": "#!/usr/bin/env bash\n"})
+
+    result = _run(box, tag)
+
+    assert result.returncode == CLEAN, "a legitimately-absent file must not block a deploy"
+    assert "standup.sh" in result.stderr, "...but it must be named, not silently passed"
+
+
+def test_box_only_files_are_ignored(tmp_path) -> None:
+    """Both live boxes are carpeted in .env.bak-* and update.sh.bak-pre-v0110
+    files, none of which the tag has ever heard of. Reporting them would bury the
+    one line that matters under twenty that do not."""
+    box = _tree(
+        tmp_path / "box",
+        {**BASELINE, "deploy/update.sh.bak-pre-v0110": "old\n", ".env.bak-v0100": "x\n"},
+    )
+    tag = _tree(tmp_path / "tag", BASELINE)
+
+    result = _run(box, tag)
+
+    assert result.returncode == CLEAN, result.stderr
+    assert "bak" not in result.stderr, result.stderr
+
+
+def test_a_missing_compose_on_the_box_refuses(tmp_path) -> None:
+    """Distinct from a drifted one, and it must not read as 'nothing to compare'.
+    update.sh already dies if compose is absent, so this is belt-and-braces — but
+    the failure mode being guarded is the comparison quietly finding zero files
+    and reporting CLEAN."""
+    box_files = {k: v for k, v in BASELINE.items() if k != "docker-compose.yml"}
+    box = _tree(tmp_path / "box", box_files)
+    tag = _tree(tmp_path / "tag", BASELINE)
+
+    result = _run(box, tag)
+
+    assert result.returncode == DRIFT, result.stdout + result.stderr
+    assert "docker-compose.yml" in result.stderr, result.stderr
+
+
+def test_an_unresolvable_ref_is_CANNOT_LOOK_not_CLEAN(tmp_path) -> None:
+    """ABSENCE MUST NOT READ AS SILENCE. If the tag's bytes cannot be obtained, the
+    script has learned nothing about the box — and 'I could not look' is the one
+    answer that must never be spelled the same way as 'I looked and it matched'.
+
+    This is the shape that has already cost this repo once: `curl -sf` swallowing
+    a 403 and being read as 'no release exists'."""
+    box = _tree(tmp_path / "box", BASELINE)
+    result = _run(box, tmp_path / "does-not-exist")
+
+    assert result.returncode == CANNOT_LOOK, result.stdout + result.stderr
+    assert result.returncode != CLEAN
+
+
+def test_the_comparison_is_not_vacuous(tmp_path) -> None:
+    """THE CONTROL ON THE CONTROL. Every green arm above would also pass against a
+    script that compared nothing at all, so the script reports how many files it
+    actually examined and this asserts the count is the real one.
+
+    A check whose disabled value equals its success value cannot report its own
+    absence — which is exactly how a gateless step produces a byte-identical
+    result to a clean run."""
+    box = _tree(tmp_path / "box", BASELINE)
+    tag = _tree(tmp_path / "tag", BASELINE)
+
+    result = _run(box, tag)
+
+    assert result.returncode == CLEAN, result.stderr
+    assert f"{len(BASELINE)} file" in result.stdout, (
+        "the script must state how many files it compared, or a no-op passes as a pass: "
+        + result.stdout
+    )
+
+
+@pytest.mark.skipif(
+    os.environ.get("ISLAND_SKIP_NETWORK_TESTS") == "1" or shutil.which("curl") is None,
+    reason="needs outbound network to codeload.github.com",
+)
+def test_the_real_fetch_resolves_a_real_tag(tmp_path) -> None:
+    """POSITIVE CONTROL ON THE INSTRUMENT'S ONE UNTESTED HALF.
+
+    Every other test in this file closes the network seam, so all of them would
+    pass against a fetcher that never worked. This one drives the actual path an
+    island box takes: resolve v0.11.0 from the public repo over the wire, and
+    compare THIS checkout against it.
+
+    The assertion is deliberately only on the exit status being a status the
+    script defines — the working tree may legitimately differ from v0.11.0 — but
+    it must not be a crash, and it must not be CANNOT_LOOK, which is what a broken
+    fetch would produce."""
+    result = subprocess.run(
+        [str(SCRIPT), str(REPO), "v0.11.0"], capture_output=True, text=True
+    )
+    assert result.returncode in (CLEAN, DRIFT), (
+        "the live fetch must resolve v0.11.0; CANNOT_LOOK here means the fetch path is "
+        "broken and every other test in this file is measuring nothing. "
+        + result.stdout
+        + result.stderr
+    )

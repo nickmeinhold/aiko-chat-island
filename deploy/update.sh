@@ -16,6 +16,7 @@
 #   deploy/update.sh --from-source   # backup -> build from this checkout -> up -> verify
 #   deploy/update.sh --no-backup     # skip the backup (only if you back up elsewhere)
 #   deploy/update.sh --yes           # non-interactive (no confirm prompt)
+#   deploy/update.sh --skip-drift-check  # deploy despite a drifted deploy tree (LOUD)
 #
 # Pin a version by exporting ISLAND_VERSION (e.g. ISLAND_VERSION=v0.1.0) or setting
 # it in .env; default is `edge` (tracks main).
@@ -33,12 +34,13 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 [ -f docker-compose.yml ] || die "docker-compose.yml not found in $REPO_ROOT"
 
-FROM_SOURCE="false"; DO_BACKUP="true"; INTERACTIVE="true"
+FROM_SOURCE="false"; DO_BACKUP="true"; INTERACTIVE="true"; DRIFT_CHECK="true"
 while [ $# -gt 0 ]; do
   case "$1" in
     --from-source) FROM_SOURCE="true"; shift ;;
     --no-backup)   DO_BACKUP="false"; shift ;;
     --yes)         INTERACTIVE="false"; shift ;;
+    --skip-drift-check) DRIFT_CHECK="false"; shift ;;
     -h|--help)     sed -n '2,/^set -euo/p' "$0" | sed 's/^# \{0,1\}//;/^set -euo/d'; exit 0 ;;
     *)             die "unknown argument: $1 (see --help)" ;;
   esac
@@ -104,6 +106,81 @@ else
   warn "APNs preflight NOT FOUND ($SCRIPT_DIR/preflight-apns.sh) — this box's deploy
      tree predates it. A PARTIAL APNS_* set in .env will crash-loop the island after
      the recreate. Check by hand, or refresh this box's deploy/ from the repo."
+fi
+
+# --- preflight: the box's deploy tree must MATCH the tag being pulled -------
+#
+# claude-tasks#4230, and the direct fix for the outage of 2026-09-11. This script
+# pulls an IMAGE and does not sync docker-compose.yml — the box's copy is a
+# separate artifact (#2301). APNS_VOIP_TOPIC became a required member of the
+# all-or-none APNs group; enspyr's .env HAD it and enspyr's compose did not
+# FORWARD it, so the value could never reach the container and the island refused
+# to boot for several minutes. The box's compose differed from the tag by exactly
+# one line. imagineering had the identical gap and deployed clean, because its
+# compose happened to get synced first — same change, same drift, opposite
+# outcome, one variable.
+#
+# The APNs preflight above could not have caught it: the copy ON THE BOX predated
+# the key it needed to look for. Nothing syncs deploy/ either. So the check below
+# covers the whole deploy surface, including itself and this file.
+#
+# It runs BEFORE the backup and before anything is pulled, same posture as the
+# APNs preflight beside it: an operator reading the refusal still has a running
+# island.
+if [ "$FROM_SOURCE" = "true" ]; then
+  # --from-source deploys THIS CHECKOUT, so "does the box match the tag" is not
+  # the question being asked and a refusal would be nonsense.
+  :
+elif [ "$DRIFT_CHECK" != "true" ]; then
+  warn "deploy-tree drift check SKIPPED (--skip-drift-check). You are deploying an
+     image built from a tag whose compose and deploy scripts may not match the ones
+     on this box. That is the shape that took enspyr down on 2026-09-11. If the
+     island crash-loops after the recreate, this is the first thing to check."
+elif [ -f "$SCRIPT_DIR/preflight-compose-drift.sh" ]; then
+  [ -x "$SCRIPT_DIR/preflight-compose-drift.sh" ] \
+    || die "preflight-compose-drift.sh exists but is not executable — refusing to deploy with a disabled safety check. chmod +x it."
+  # The ref to compare against is the one compose will actually interpolate, read
+  # through the single dotenv reader rather than a fifth grep (deploy/lib). An
+  # unset ISLAND_VERSION means `edge`, which is this script's own documented
+  # default and tracks main.
+  # shellcheck source=lib/dotenv-read.sh
+  . "$SCRIPT_DIR/lib/dotenv-read.sh"
+  drift_ref="$(dotenv_read "$REPO_ROOT/.env" ISLAND_VERSION)"
+  [ -n "$drift_ref" ] || drift_ref="edge"
+  # .env carries `ISLAND_VERSION=0.11.0` on BOTH live boxes while the git tag is
+  # `v0.11.0` — the image registry accepts the bare form and git does not. Measured,
+  # not assumed; without this every real deploy would resolve a 404 and read as
+  # "this ref does not exist" when the ref is fine and the spelling is ours.
+  case "$drift_ref" in [0-9]*) drift_ref="v$drift_ref" ;; esac
+
+  set +e
+  "$SCRIPT_DIR/preflight-compose-drift.sh" "$REPO_ROOT" "$drift_ref"
+  drift_rc=$?
+  set -e
+  case "$drift_rc" in
+    0) ok "deploy tree matches $drift_ref" ;;
+    1) die "this box's deploy tree differs from $drift_ref (diff above) — aborting BEFORE
+     the backup; the island is still running. Sync the named files from the tag and
+     re-run. To deploy anyway: deploy/update.sh --skip-drift-check" ;;
+    # NOT THE SAME ANSWER AS 'no drift'. Exit 2 means the tag could not be
+    # obtained, so nothing whatsoever is known about this box's tree. Refusing is
+    # the conservative read of an unknown, and the operator gets an explicit,
+    # loud way through if they have checked by hand.
+    *) die "could not compare this box against $drift_ref (see above) — NOTHING was
+     checked, which is not the same as 'no drift found'. Fix the network or the ref,
+     or deploy deliberately with: deploy/update.sh --skip-drift-check" ;;
+  esac
+else
+  # ABSENT means this box's deploy tree predates the check. Same reasoning as the
+  # APNs preflight above: do not fail (that would block a deploy on exactly the
+  # drifted boxes this exists to protect), but say so loudly. This is the guard's
+  # honest bootstrap — it lives in deploy/, which is the thing that does not sync,
+  # so it starts protecting on the deploy AFTER the operator syncs deploy/.
+  warn "deploy-tree drift check NOT FOUND ($SCRIPT_DIR/preflight-compose-drift.sh) —
+     this box's deploy tree predates it. docker-compose.yml is NOT synced by this
+     script, so a tag that adds a required env forward will crash-loop the island
+     after the recreate (#4230). Refresh this box's deploy/ and docker-compose.yml
+     from the tag by hand this once."
 fi
 
 # --- step 1: back up the sole-copy DB (fail-closed) -------------------------
