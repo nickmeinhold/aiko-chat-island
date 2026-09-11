@@ -216,10 +216,16 @@ materialise_ref() {
   #
   # `tar -tzf` alone, no `find -quit`: one mechanism with one arm, rather than
   # two mechanisms where the test cannot say which one fired.
-  link_members="$(tar -tzvf "$tgz" 2>/dev/null | awk '$1 ~ /^[lh]/ {print $NF}' | head -5)" \
+  # tar's stderr is KEPT, like curl's and find's (Kelvin, round 8). Round 7 swept
+  # the find walks and left this one — the last `2>/dev/null` in the file, and I
+  # even printed "remaining: 1" while making that change without acting on it.
+  # A failure to list an archive is a measurement failure, and discarding the
+  # measurement is the same defect this file spends 600 lines refusing to commit.
+  link_members="$(tar -tzvf "$tgz" 2>"$find_err" | awk '$1 ~ /^[lh]/ {print $NF}' | head -5)" \
     || die "the archive for $ref could not even be LISTED — it is CORRUPT, truncated,
      or not a gzip stream at all. Refused before extracting anything, and still not
-     a clean comparison."
+     a clean comparison.
+     $(head -3 "$find_err")"
   if [ -n "$link_members" ]; then
     die "the archive for $ref contains LINK members, and this repository's tag
      archives contain none — so this tree is not what it claims to be. A link
@@ -236,6 +242,25 @@ materialise_ref() {
   tar -xzf "$tgz" -C "$work/tree" --no-same-owner --strip-components=1 \
     || die "the archive for $ref did not unpack — it is CORRUPT or truncated, which is
      a third thing again, and still not a clean comparison."
+  # AND A SECOND CHECK IN THE CONSUMER'S OWN REPRESENTATION (Tesla, round 8).
+  # The manifest check above parses `tar -tzvf`'s human-readable listing —
+  # `awk '$1 ~ /^[lh]/'` — while the EXTRACTOR parses the archive's typeflags.
+  # Those are two different representations of the same claim, and a listing
+  # shape awk does not model (a pax LongLink, a wrapped verbose line, a type
+  # character that is not field 1) evades the detector while the extractor
+  # happily plants the link. One representation cannot corroborate the other.
+  #
+  # So the filesystem — which is what the walk actually reads — gets the final
+  # word. This check cannot be evaded by anything the archive says, because it
+  # asks the thing that ends up on disk. The manifest check stays as the cheap
+  # EARLY refusal (nothing is written when it fires); this one is authoritative.
+  # Two mechanisms deliberately, at different layers, each with its own arm.
+  if find "$work/tree" -type l -print 2>"$find_err" | head -1 | grep -q .; then
+    die "the tree extracted for $ref CONTAINS A SYMLINK, whatever its manifest
+     claimed. This repository's tag archives contain none, and a link pointing
+     back at this box would make every comparison compare the box to itself and
+     report a match. Nothing was compared."
+  fi
   tree="$work/tree"
 }
 
@@ -418,7 +443,7 @@ while IFS= read -r -d '' rel; do
   # sort does support -z, measured twice) and right about the class, and I put a
   # real instance of it one line away while rejecting the false one. Shell
   # parameter expansion is portable and needs no process.
-done < <(cat "$sorted_list")
+done < "$sorted_list"
 
 # BOX-ONLY FILES DOCKER WOULD AUTO-LOAD — WARNED, NOT REFUSED, and the
 # downgrade is the correct answer to what changed under it (cage-match round 7).
@@ -488,6 +513,17 @@ done
 ( cd "$repo_root" && find -L deploy \( -type f -o -type l \) -print0 ) > "$raw_list" 2>"$find_err" \
   || die "could not walk deploy/ on this box (find failed). Nothing was compared.
      $(head -3 "$find_err")"
+# AND THE STREAM IS A DIRECT REDIRECT, NOT `< <(cat ...)` (Tesla, round 8 — the
+# same class a third time, in the same three lines). Round 3 nailed `find` to a
+# file so its status could not vanish; round 5 did the same for `sort`; and both
+# times the very next token poured the file through a process substitution,
+# which discards `cat`'s status exactly as it discarded theirs. DEMONSTRATED: with
+# a `cat` stub that exits 1 on PATH, a genuinely drifted deploy/update.sh reports
+# exit 0 — the 2026-09-11 outage, invisible, inside the walk written to catch it.
+#
+# `done < "$sorted_list"` has no process to fail. This is the subtractive fix:
+# not a status check on `cat`, but no `cat`.
+#
 # THE SORT'S STATUS IS CHECKED TOO (Tesla, round 5 — the same class, one layer
 # in). Round 3 staged `find` to a file precisely so its status would be the
 # terminal command's own, and then poured that file through `< <(sort -z ...)`,
@@ -499,7 +535,7 @@ LC_ALL=C sort -z "$raw_list" > "$sorted_list" \
 while IFS= read -r -d '' rel; do
   [ -n "$rel" ] || continue
   compare_one "$rel"
-done < <(cat "$sorted_list")
+done < "$sorted_list"
 
 # Files the ref carries that this box does not. Warned, never refused.
 # REPORTED IN FULL, BUT GROUPED — a correction made twice, each time by running
@@ -541,7 +577,7 @@ $(printf '%s' "$rel" | cut -d/ -f1-2)"
   # as present, leaving exactly one report, the refusal, which is the true one.
   _present "$repo_root/$rel" \
     || { absent="$absent $rel"; absent_n=$((absent_n + 1)); }
-done < <(cat "$sorted_list")
+done < "$sorted_list"
 
 if [ "$absent_n" -gt 0 ]; then
   warn "$ref carries $absent_n deploy file(s) BESIDE ones this box has — these sit in

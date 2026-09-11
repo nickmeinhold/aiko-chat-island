@@ -1127,7 +1127,22 @@ def test_a_SYMLINK_MEMBER_in_the_archive_is_refused(tmp_path) -> None:
         "a ref tree whose deploy/ is a symlink to the box would compare the box "
         "to itself and report a match: " + result.stdout + result.stderr
     )
-    assert "SYMLINK" in result.stderr.upper(), result.stderr
+    # WHICH MECHANISM FIRED, not merely that one did. Two checks cover link
+    # members — the manifest read (early, before anything is written) and the
+    # filesystem scan (authoritative, after extraction). Mutation-checked:
+    # deleting the manifest check left this arm green, because the filesystem
+    # one caught the same archive. Two mechanisms reaching one exit code is
+    # defence in depth for the operator and a blind spot for the test, the same
+    # shape as the round-3 shape check.
+    #
+    # The manifest check's distinct value is that NOTHING IS WRITTEN when it
+    # fires, and its message says so. Asserting the message is what separates
+    # them; the sibling test disables the manifest check with a tar stub so the
+    # filesystem layer is proven on its own.
+    assert "Refused BEFORE extracting anything" in result.stderr, (
+        "the manifest check must be the one that fires here, refusing before any "
+        "bytes land: " + result.stderr
+    )
 
 
 def test_a_BROKEN_sort_is_CANNOT_LOOK_not_CLEAN(tmp_path) -> None:
@@ -1281,5 +1296,186 @@ def test_a_find_failure_reports_WHY(tmp_path) -> None:
     assert result.returncode == CANNOT_LOOK, result.stdout + result.stderr
     assert "ermission" in result.stderr or "denied" in result.stderr.lower(), (
         "the refusal must carry find's own diagnostic, not just its exit status: "
+        + result.stderr
+    )
+
+
+def test_a_corrupt_archive_reports_WHY(tmp_path) -> None:
+    """The last discarded diagnostic in the file (Kelvin, cage-match round 8).
+
+    Round 7 swept `find`'s stderr into the refusal message and left `tar`'s
+    going to /dev/null — and the commit that made that change printed
+    "remaining 2>/dev/null: 1" without acting on it. One more instance of the
+    pattern this PR kept hitting: the class is named, one member is fixed, a
+    sibling six lines away is not.
+
+    A failure to list an archive is a measurement failure, and discarding the
+    measurement leaves the operator with "it is corrupt" and no way to tell a
+    truncated download from an HTML error page."""
+    box = _tree(tmp_path / "box", BASELINE)
+    base, srv = _serve_once(tmp_path, b"<html>definitely not a tarball</html>")
+    try:
+        result = subprocess.run(
+            [str(SCRIPT), str(box), "v1.2.3"],
+            capture_output=True,
+            text=True,
+            env=_clean_env(ISLAND_CODELOAD_BASE=base),
+        )
+    finally:
+        srv.shutdown()
+
+    assert result.returncode == CANNOT_LOOK, result.stdout + result.stderr
+    # ASSERTED ON WHAT TAR SAYS, NOT ON WHAT I SAY. The first version of this
+    # checked for "gzip" or "tar" in stderr — and the script's own die message
+    # contains "not a gzip stream at all", so it passed against a script that
+    # discarded tar's output entirely. Mutation-checked: it did. That is the
+    # defect this whole PR is about, committed inside the test written to close
+    # the last instance of it, which is roughly the sixth time it has happened
+    # here and the reason the mutation step is not optional.
+    #
+    # These two strings are tar's, one per userland (measured):
+    #   GNU:  "gzip: stdin: not in gzip format"
+    #   BSD:  "tar: Error opening archive: Unrecognized archive format"
+    tar_said = (
+        "not in gzip format" in result.stderr
+        or "Unrecognized archive format" in result.stderr
+    )
+    assert tar_said, (
+        "the refusal must carry tar's OWN diagnostic — without it an operator "
+        "cannot tell a truncated download from an HTML error page: " + result.stderr
+    )
+
+
+def test_update_sh_CROSS_CHECKS_the_dotenv_helper_it_depends_on() -> None:
+    """THE BOOTSTRAP CIRCULARITY (Carnot, cage-match round 8) — and a rejection
+    of mine that measurement overturned.
+
+    update.sh resolves which ref to certify by sourcing
+    `deploy/lib/dotenv-read.sh`, a file INSIDE the surface the guard then
+    certifies. My first response was that the failure direction is closed: a
+    broken helper returns empty, `drift_ref` falls back to `edge`, the box is
+    compared against main, and main differs so it refuses.
+
+    MEASURED ON THE LIVE BOX, THAT WAS FALSE. box-vs-main exits 0 today, because
+    main's deploy tree currently equals v0.11.0's. So a broken helper would have
+    the guard print a clean comparison for a ref the deploy will not use, with
+    no alarm anywhere — the collapse arriving through the bootstrap rather than
+    through a code path. Worth recording that arguing would have shipped it and
+    one ssh command did not.
+
+    The cross-check is deliberately a CRUDE grep rather than a second parser
+    (#3592 exists because this repo already had four): it shares no grammar with
+    the helper, so it fails differently, and it answers only "does .env mention
+    this key at all". Absence stays legitimate — an unpinned box tracks `edge`.
+    A key visibly present and unreadable does not."""
+    code = _update_sh_code()
+    assert "ISLAND_VERSION[[:space:]]*=" in code, (
+        "update.sh must cross-check the dotenv helper against a different "
+        "instrument before trusting its silence"
+    )
+    # The check must sit between the helper read and the `edge` fallback, or it
+    # cannot distinguish "absent" from "unreadable".
+    helper = code.index('dotenv_read "$REPO_ROOT/.env" ISLAND_VERSION')
+    crosscheck = code.index("ISLAND_VERSION[[:space:]]*=")
+    fallback = code.index('drift_ref="edge"')
+    assert helper < crosscheck < fallback, (
+        "the cross-check must run after the helper and before the edge fallback"
+    )
+
+
+def test_a_BROKEN_cat_cannot_hide_a_real_drift(tmp_path) -> None:
+    """THE SAME CLASS A THIRD TIME, in the same three lines (Tesla, round 8).
+
+    Round 3 nailed `find` to a file so its status could not vanish. Round 5 did
+    the same for `sort`. Both times the very next token poured that file through
+    `done < <(cat "$sorted_list")` — a process substitution, which discards
+    `cat`'s status exactly as it discarded theirs.
+
+    DEMONSTRATED on a real drifted file with a `cat` stub that exits 1: the run
+    reported exit 0. The 2026-09-11 outage, invisible, inside the walk written
+    to catch it.
+
+    The fix is subtractive — `done < "$sorted_list"` has no process to fail —
+    which is why this arm is about behaviour rather than about a status check.
+    """
+    box = _tree(tmp_path / "box", {**BASELINE, "deploy/update.sh": "BOX VERSION, DRIFTED\n"})
+    tag = _tree(tmp_path / "tag", BASELINE)
+
+    stubdir = tmp_path / "stub"
+    stubdir.mkdir()
+    stub = stubdir / "cat"
+    stub.write_text("#!/bin/sh\nexit 1\n")
+    stub.chmod(0o755)
+
+    result = subprocess.run(
+        [str(SCRIPT), str(box), "v9.9.9"],
+        capture_output=True,
+        text=True,
+        env=_clean_env(
+            ISLAND_REF_TREE=str(tag), PATH=f"{stubdir}:{os.environ.get('PATH', '')}"
+        ),
+    )
+
+    assert result.returncode != CLEAN, (
+        "a broken cat must not make a real drift invisible: "
+        + result.stdout
+        + result.stderr
+    )
+
+
+def test_a_symlink_the_MANIFEST_check_misses_is_still_caught_on_disk(tmp_path) -> None:
+    """TWO REPRESENTATIONS, DELIBERATELY (Tesla, round 8).
+
+    The manifest check parses `tar -tzvf`'s human listing with
+    `awk '$1 ~ /^[lh]/'`; the EXTRACTOR parses the archive's typeflags. A
+    listing shape awk does not model evades the detector while the extractor
+    plants the link — one representation cannot corroborate the other, and the
+    walk reads the filesystem, not the listing.
+
+    This arm forces exactly that split: the manifest check is disabled by a
+    `tar` stub whose LISTING output is empty while real tar does the
+    extraction, so only the filesystem-layer check can catch the link. Without
+    it the guard would follow the link, compare the box to itself, and report
+    a match."""
+    import io
+    import tarfile
+
+    box = _tree(tmp_path / "box", BASELINE)
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        body = BASELINE["docker-compose.yml"].encode()
+        info = tarfile.TarInfo("top/docker-compose.yml")
+        info.size = len(body)
+        tar.addfile(info, io.BytesIO(body))
+        link = tarfile.TarInfo("top/deploy")
+        link.type = tarfile.SYMTYPE
+        link.linkname = str(box / "deploy")
+        tar.addfile(link)
+
+    # A tar wrapper that reports an EMPTY listing for -tzvf (simulating a shape
+    # awk cannot parse) but extracts for real.
+    stubdir = tmp_path / "stub"
+    stubdir.mkdir()
+    real_tar = shutil.which("tar")
+    stub = stubdir / "tar"
+    stub.write_text(f'#!/bin/sh\ncase "$1" in -tzvf) exit 0 ;; esac\nexec {real_tar} "$@"\n')
+    stub.chmod(0o755)
+
+    base, srv = _serve_once(tmp_path, buf.getvalue())
+    try:
+        result = subprocess.run(
+            [str(SCRIPT), str(box), "v1.2.3"],
+            capture_output=True,
+            text=True,
+            env=_clean_env(
+                ISLAND_CODELOAD_BASE=base, PATH=f"{stubdir}:{os.environ.get('PATH', '')}"
+            ),
+        )
+    finally:
+        srv.shutdown()
+
+    assert result.returncode == CANNOT_LOOK, (
+        "a link the manifest check cannot see must still be caught on disk: "
+        + result.stdout
         + result.stderr
     )

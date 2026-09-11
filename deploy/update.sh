@@ -188,6 +188,33 @@ elif [ -f "$SCRIPT_DIR/preflight-compose-drift.sh" ]; then
   # ago. The class was named and one instance was left live.
   drift_ref="${ISLAND_VERSION:-}"
   [ -n "$drift_ref" ] || drift_ref="$(dotenv_read "$REPO_ROOT/.env" ISLAND_VERSION)"
+
+  # A POSITIVE CONTROL ON THE HELPER, WITH A DIFFERENT INSTRUMENT (Carnot,
+  # cage-match round 8), and the reason it exists is that my first answer to the
+  # finding was wrong.
+  #
+  # The circularity Carnot named is real: this resolves the ref by sourcing
+  # deploy/lib/dotenv-read.sh, a file INSIDE the surface the guard is about to
+  # certify. I assumed the failure direction was closed — a broken helper returns
+  # empty, drift_ref falls back to `edge`, the box gets compared against main and
+  # refuses. MEASURED on the live box, that assumption is FALSE: box-vs-main
+  # exits 0 today, because main's deploy tree happens to equal v0.11.0's. So a
+  # broken helper would have the guard print a clean comparison for a ref it is
+  # NOT deploying, silently — exactly the epistemic collapse the exit codes exist
+  # to prevent, arriving through the bootstrap instead of through a code path.
+  #
+  # The check is a DELIBERATELY CRUDE grep, not a second parser. It shares no
+  # grammar with the helper, so it fails differently: it answers only "does .env
+  # mention this key at all", and a disagreement between the two means the helper
+  # is broken rather than the key absent. Absence is legitimate (an unpinned box
+  # tracks `edge`); a key that is visibly THERE and unreadable is not.
+  if [ -z "$drift_ref" ] && [ -f "$REPO_ROOT/.env" ] \
+     && LC_ALL=C grep -aqE '^[[:space:]]*(export[[:space:]]+)?ISLAND_VERSION[[:space:]]*=' "$REPO_ROOT/.env"; then
+    die "'.env' contains an ISLAND_VERSION line but the dotenv helper read nothing
+     from it — deploy/lib/dotenv-read.sh is broken or stale. Falling back to 'edge'
+     here would compare this box against main and could print CLEAN for a ref this
+     deploy will not use. Refusing instead. Refresh deploy/ from the tag."
+  fi
   [ -n "$drift_ref" ] || drift_ref="edge"
   # The bare-version -> tag rewrite (`0.11.0` -> `v0.11.0`, which both live boxes
   # need) lives INSIDE the guard now, where a test can drive it — it used to sit
