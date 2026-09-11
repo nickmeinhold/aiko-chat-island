@@ -175,7 +175,6 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import datetime as dt
-import enum
 import logging
 from collections.abc import Callable, Sequence
 from typing import Literal, assert_never

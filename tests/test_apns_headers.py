@@ -206,6 +206,46 @@ async def test_a_voip_send_uses_the_dot_voip_topic_and_push_type_voip(
     assert before + 30 <= int(request.headers["apns-expiration"]) <= after + 30
 
 
+async def test_a_hangup_outlives_the_ring_lease_it_must_be_able_to_stop(
+    configured, captured
+):
+    """THE ASYMMETRY BETWEEN A START AND A STOP, asserted on the wire
+    (cage-match PR#176 r1, claude-tasks#4254).
+
+    An end wake used to inherit `_VOIP_LEASE_SECONDS` because `token_kind` was the
+    only axis deciding a push's lifetime — and that constant is THE RING LEASE, a
+    number whose every justifying sentence is about a ring. Discarding a late
+    invite is correct: the recipient reaches for a call that already ended.
+    Discarding a late END is never correct, because ending an already-ended call is
+    idempotent and free, while the thing it fails to stop is a CallKit ring that
+    does not self-expire. Thirty-one seconds in a lift and the handset returns to a
+    ring nothing can end — the phantom ring, arriving through the expiration header
+    instead of the missing sentinel.
+
+    THE PAIRED ARM IS THE POINT. Asserting the end's 300s alone would pass against
+    an implementation that gave EVERY VoIP push 300s — which would silently delete
+    the ring lease and restore the phantom-ring-on-a-late-invite this module
+    already fought for. The two assertions only hold together if lifetime really is
+    a function of the wake kind.
+    """
+    before = int(time.time())
+    await _send(TokenKind.VOIP, wake=WakeKind.CALL_END)
+    after = int(time.time())
+    end_expiry = int(captured[0].headers["apns-expiration"])
+    assert before + 300 <= end_expiry <= after + 300, (
+        "the hangup must outlive the ring lease; an expiring stop is a ring that "
+        "cannot be stopped")
+
+    captured.clear()
+    before = int(time.time())
+    await _send(TokenKind.VOIP)
+    after = int(time.time())
+    invite_expiry = int(captured[0].headers["apns-expiration"])
+    assert before + 30 <= invite_expiry <= after + 30, (
+        "the INVITE must keep the 30s ring lease — widening it for both kinds "
+        "deletes the ceiling and rings for a call that is already over")
+
+
 async def test_a_voip_send_never_carries_a_collapse_id(configured, captured):
     """PAIRED WITH THE ALERT ARM ABOVE, which asserts the header IS present — a
     transport that dropped `apns-collapse-id` unconditionally would satisfy this

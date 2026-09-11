@@ -112,8 +112,16 @@ class WakeKind(enum.Enum):
     """WHAT KIND OF WAKE this is — the thing `push_service.should_wake` decides,
     carried as a value instead of re-derived four hundred lines away.
 
-    A plain `Enum`, not a `StrEnum`: in this codebase a StrEnum means "persisted,
-    and drives a DB CHECK via `_in_check`". This is never persisted.
+    A plain `Enum`, not a `StrEnum`: in this codebase a StrEnum means "persisted in
+    a COLUMN, and drives a DB CHECK via `_in_check`". This is not.
+
+    THAT IS A STATEMENT ABOUT WHICH MECHANISM ENFORCES THE SET, NOT ABOUT A
+    LIGHTER COMPATIBILITY BURDEN (Kelvin, cage-match PR#176 r1: "the wire IS a
+    persistence layer, its state is just frozen somewhere else"). He is right, and
+    the burden here is arguably HEAVIER than a column's: a bad column value is one
+    island's migration, while a bad wire value is already inside handsets we cannot
+    reach. No `_in_check` guards this one — the paragraph below is the enforcement,
+    and it is prose, so read it as a warning rather than a fence.
 
     IT NOW CROSSES THE WIRE, WHICH IT DID NOT BEFORE, and that is a deliberate
     change rather than a drift — it is why this type moved out of `push_service`

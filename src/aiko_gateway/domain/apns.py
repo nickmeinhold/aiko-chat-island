@@ -44,7 +44,8 @@ from .models import ApnsEnvironment, TokenKind
 # and test is untouched by the move (`is` comparisons hold). The types themselves
 # moved to `push_result` when FCM arrived — a shared vocabulary living inside one
 # of its two speakers is not shared.
-from .push_result import ReapOrder, SendResult, Verdict, WakePayload
+from .push_result import (ReapOrder, SendResult, Verdict, WakeKind,
+                          WakePayload)
 
 log = logging.getLogger("aiko_gateway.apns")
 
@@ -195,6 +196,36 @@ _ALERT_EXPIRATION_SECONDS = 60
 # the 30s ring, the 10s freshness) still have no stated relationship, which the
 # ruling explicitly left open.
 _VOIP_LEASE_SECONDS = 30
+
+# THE END WAKE DOES NOT GET THE RING LEASE, and the asymmetry is the point
+# (claude-tasks#4254, cage-match PR#176 r1). Every sentence of the comment above is
+# about a RING — "phantom ring", "the lease", "the ceiling mechanism the ruling
+# names". A hangup inherited that number because `token_kind` used to be the only
+# axis that decided a push's lifetime, and as of the end wake it is not.
+#
+# THE TWO DIRECTIONS ARE NOT SYMMETRIC. Discarding a late INVITE is CORRECT: the
+# recipient reaches for a call that already ended and cannot tell that from a call
+# they fumbled. Discarding a late END is never correct — ending an already-ended
+# call is idempotent and free, and the thing it fails to stop is a CallKit ring
+# that design 12 states DOES NOT SELF-EXPIRE. At 30s the failure is ordinary:
+# caller hangs up, the callee's handset is in a lift for thirty-one seconds, APNs
+# discards the stop, the device returns to a ring nothing can end. That is the
+# phantom ring this whole feature exists to prevent, re-entering through the
+# expiration header instead of the missing sentinel.
+#
+# WHY 300 AND NOT UNBOUNDED. A stop must still plausibly refer to a ring the user
+# is looking at. Unbounded store-and-forward would let a stop from an hour ago
+# arrive and force a report-and-end — and that ratio is the one Apple polices
+# (see `apns-push-type` below). Five minutes covers the real failure (a tunnel, a
+# lift, a flapping connection) by an order of magnitude over the lease, and stops
+# well short of ancient stops driving the ratio.
+#
+# THIS IS A FOURTH CLOCK AND IT IS NOT SETTLED HERE. The lease, the 30s ring and
+# the app's 10s freshness gate already "have no stated relationship, which the
+# ruling explicitly left open" — that is claude-tasks#4233, and it is where the
+# four of them get reconciled. This constant is chosen to FAIL IN THE SAFE
+# DIRECTION until then, not to be the answer.
+_VOIP_END_EXPIRATION_SECONDS = 300
 
 # The provider token, cached across sends: (jwt, issued_at_monotonic).
 _cached_token: tuple[str, float] | None = None
@@ -494,10 +525,19 @@ async def send(device_token: str, payload: WakePayload, *,
     # is a distinct silent failure (a voip type on a bare topic, an alert type on
     # a `.voip` topic, an alert lifetime on a ring). Deciding them in one place
     # means a future kind cannot be half-taught.
-    match token_kind:
-        case TokenKind.ALERT:
+    # TWO AXES NOW, NOT ONE. The comment above used to say these four facts "are one
+    # decision about what kind of push this is" — true while every VoIP push was an
+    # invite, false as of the end wake (cage-match PR#176 r1). Topic, push type and
+    # collapse-eligibility really are `token_kind`'s alone: they are facts about the
+    # TRANSPORT. Lifetime is not — it is a fact about WHAT THE PUSH IS FOR, and a
+    # stop and a start want opposite answers. Matching on the pair keeps the binding
+    # the comment promises while letting the one genuinely two-axis fact vary.
+    match (token_kind, payload.kind):
+        case (TokenKind.ALERT, _):
             expires_in, may_collapse = _ALERT_EXPIRATION_SECONDS, True
-        case TokenKind.VOIP:
+        case (TokenKind.VOIP, WakeKind.CALL_END):
+            expires_in, may_collapse = _VOIP_END_EXPIRATION_SECONDS, False
+        case (TokenKind.VOIP, _):
             expires_in, may_collapse = _VOIP_LEASE_SECONDS, False
         case _:
             assert_never(token_kind)
