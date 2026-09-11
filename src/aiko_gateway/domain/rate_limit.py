@@ -1,6 +1,14 @@
 """Per-client rate limiting (#28) — originally for the public auth endpoints, and
 since #3159 for one AUTHENTICATED read as well.
 
+TWO KEYING FLAVOURS, IN TWO LAYERS. This module keys on the client IP, which is the
+only identity an UNAUTHENTICATED ceremony has. The authenticated sibling
+``rest.deps.rate_limit_user`` keys on ``user.id`` instead, and it lives in ``rest``
+rather than here because resolving the current user is an HTTP concern and ``domain``
+must not import ``rest``. Read its docstring for why an authenticated read wants the
+user key: a shared NAT makes the IP key a COUPLING between two callers, which is what
+forced the occupancy budget wide in the first place.
+
 SCOPE NOTE, because the threat model below is about unauthenticated ceremonies and no
 longer describes every consumer: the call-occupancy endpoint uses this limiter as a
 blast-radius cap on a POLLED read (it is authenticated, so credential-stuffing is not
