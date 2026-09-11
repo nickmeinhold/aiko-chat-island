@@ -32,7 +32,7 @@ import pytest_asyncio
 from aiko_gateway.config import settings
 from aiko_gateway.domain import apns
 from aiko_gateway.domain.models import ApnsEnvironment, TokenKind
-from aiko_gateway.domain.push_result import WakePayload
+from aiko_gateway.domain.push_result import WakeKind, WakePayload
 
 CHANNEL = "01JDMCHANNELDM000000000000"
 
@@ -76,9 +76,10 @@ async def captured(monkeypatch):
         await client.aclose()
 
 
-async def _send(kind: TokenKind, *, collapse_id: str | None = CHANNEL):
+async def _send(kind: TokenKind, *, collapse_id: str | None = CHANNEL,
+                wake: WakeKind = WakeKind.CALL_INVITE):
     return await apns.send(
-        "b" * 64, WakePayload(channel_id=CHANNEL),
+        "b" * 64, WakePayload(channel_id=CHANNEL, kind=wake),
         apns_environment=ApnsEnvironment.PRODUCTION,
         token_kind=kind, collapse_id=collapse_id)
 
@@ -112,9 +113,25 @@ async def test_the_alert_payload_is_byte_identical_to_the_pre_refactor_wire(
     configured, captured
 ):
     """`WakePayload` moved the payload renderer BELOW the transport boundary. The
-    dict that reaches Apple must be unchanged — this is the only assertion
-    standing between that refactor and a silently different notification on two
-    live islands."""
+    dict that reaches Apple must not change by accident — this is the only
+    assertion standing between a refactor and a silently different notification
+    on two live islands.
+
+    CHANGED ONCE, DELIBERATELY, 2026-09-11 (claude-tasks#4254): `"k"` was added.
+    Recording the reasoning here because this fence's whole job is to make the
+    next change an argued one, and a fence that is quietly re-pinned protects
+    nothing.
+
+    WHY IT IS SAFE ON THE LIVE ALERT WIRE, verified against the SHIPPED app
+    rather than promised by the app tab: `ios/Runner/AppDelegate.swift:222` reads
+    the payload as `guard let channelId = userInfo["c"] as? String` — a lookup of
+    one known key, so an unknown key is ignored structurally by every build
+    already on a handset. Nothing on any live island reads this dict
+    exhaustively.
+
+    `"k"` is `"call_invite"` here and that is not incidental: an ALERT row can
+    never receive a `CALL_END` (`push_service.plan_deliveries` skips it with
+    `end_wake_needs_voip`), so this is the only value this wire can carry."""
     import json
 
     await _send(TokenKind.ALERT)
@@ -124,10 +141,38 @@ async def test_the_alert_payload_is_byte_identical_to_the_pre_refactor_wire(
             "sound": "default",
         },
         "c": CHANNEL,
+        "k": "call_invite",
     }
 
 
 # ------------------------------------------------------------------ voip (new)
+
+async def test_the_voip_payload_of_a_hangup_says_so_on_the_wire(
+    configured, captured
+):
+    """THE RENDERED HALF of the stop/start distinction (claude-tasks#4254).
+
+    `test_push_service` asserts the policy object carries `CALL_END`; this
+    asserts the bytes Apple forwards to the handset carry it too. Adjacent
+    evidence is not behaviour — a payload can be right and the renderer can drop
+    the field, and the symptom would be a phone that rings when someone hangs up.
+
+    `"k"` IS PRESENT ON BOTH KINDS, never absent-means-invite. An absent key and
+    a defaulted key are different states, and collapsing them means the client
+    cannot tell "an island that predates the end wake" from "a ring".
+    """
+    import json as _json
+
+    await _send(TokenKind.VOIP, wake=WakeKind.CALL_END)
+    body = _json.loads(captured[0].content)
+    assert body["k"] == "call_end"
+    assert body["c"] == CHANNEL
+
+    captured.clear()
+    await _send(TokenKind.VOIP)
+    assert _json.loads(captured[0].content)["k"] == "call_invite", (
+        "the renderer must read the payload's kind, not hard-code one")
+
 
 async def test_a_voip_send_uses_the_dot_voip_topic_and_push_type_voip(
     configured, captured
@@ -159,6 +204,75 @@ async def test_a_voip_send_uses_the_dot_voip_topic_and_push_type_voip(
     assert request.headers["apns-push-type"] == "voip"
     assert request.headers["apns-priority"] == "10"
     assert before + 30 <= int(request.headers["apns-expiration"]) <= after + 30
+
+
+async def test_a_hangup_outlives_the_ring_lease_it_must_be_able_to_stop(
+    configured, captured
+):
+    """THE ASYMMETRY BETWEEN A START AND A STOP, asserted on the wire
+    (cage-match PR#176 r1, claude-tasks#4254).
+
+    An end wake used to inherit `_VOIP_LEASE_SECONDS` because `token_kind` was the
+    only axis deciding a push's lifetime — and that constant is THE RING LEASE, a
+    number whose every justifying sentence is about a ring. Discarding a late
+    invite is correct: the recipient reaches for a call that already ended.
+    Discarding a late END is never correct, because ending an already-ended call is
+    idempotent and free, while the thing it fails to stop is a CallKit ring that
+    does not self-expire. Thirty-one seconds in a lift and the handset returns to a
+    ring nothing can end — the phantom ring, arriving through the expiration header
+    instead of the missing sentinel.
+
+    THE PAIRED ARM IS THE POINT. Asserting the end's 300s alone would pass against
+    an implementation that gave EVERY VoIP push 300s — which would silently delete
+    the ring lease and restore the phantom-ring-on-a-late-invite this module
+    already fought for. The two assertions only hold together if lifetime really is
+    a function of the wake kind.
+    """
+    before = int(time.time())
+    await _send(TokenKind.VOIP, wake=WakeKind.CALL_END)
+    after = int(time.time())
+    end_expiry = int(captured[0].headers["apns-expiration"])
+    assert before + 300 <= end_expiry <= after + 300, (
+        "the hangup must outlive the ring lease; an expiring stop is a ring that "
+        "cannot be stopped")
+
+    captured.clear()
+    before = int(time.time())
+    await _send(TokenKind.VOIP)
+    after = int(time.time())
+    invite_expiry = int(captured[0].headers["apns-expiration"])
+    assert before + 30 <= invite_expiry <= after + 30, (
+        "the INVITE must keep the 30s ring lease — widening it for both kinds "
+        "deletes the ceiling and rings for a call that is already over")
+
+
+async def test_the_transport_refuses_an_unrouted_pair_rather_than_inheriting_one(
+    configured, captured
+):
+    """NO WILDCARD ON A WAKE KIND (Carnot, cage-match PR#176 r2).
+
+    Lifetime and collapse-eligibility became a two-axis decision one commit ago,
+    and the first draft of that match wildcarded the wake kind — so a third
+    `WakeKind` would have inherited an alert push's 60s lifetime with nobody
+    deciding it. `plan_deliveries` is total and forces the decision; this asserts
+    the TRANSPORT does too, because a caller can reach `send` past the router.
+
+    Both arms matter. The alert/end arm is unreachable through the door
+    (`end_wake_needs_voip` skips it) and is still refused explicitly, because
+    "unreachable today" is a property of the current router, not of this function.
+    """
+    import enum
+
+    class _FutureWake(enum.Enum):
+        CALL_TRANSFER = "call_transfer"
+
+    with pytest.raises(ValueError, match="cannot end a CallKit ring"):
+        await _send(TokenKind.ALERT, wake=WakeKind.CALL_END)
+    assert captured == [], "a refused pair must not reach Apple"
+
+    with pytest.raises(ValueError, match="unrouted push"):
+        await _send(TokenKind.VOIP, wake=_FutureWake.CALL_TRANSFER)
+    assert captured == [], "an unrouted wake kind must not reach Apple"
 
 
 async def test_a_voip_send_never_carries_a_collapse_id(configured, captured):
@@ -246,7 +360,7 @@ async def test_the_voip_body_is_pinned_even_though_its_shape_is_an_open_question
     So: if someone changes the VoIP body, this reddens and forces the conversation.
     That is the entire point — the previous state was a wire nobody was watching.
     """
-    await apns.send("v" * 64, WakePayload(channel_id=CHANNEL),
+    await apns.send("v" * 64, WakePayload(channel_id=CHANNEL, kind=WakeKind.CALL_INVITE),
                     apns_environment=ApnsEnvironment.PRODUCTION,
                     token_kind=TokenKind.VOIP)
     import json as _json

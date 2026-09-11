@@ -25,6 +25,8 @@ from sqlalchemy import delete as sa_delete
 import asyncio
 import contextlib
 import dataclasses
+import re
+import pathlib
 import logging
 import datetime as dt
 
@@ -219,6 +221,91 @@ def test_sentinel_is_pinned_byte_for_byte():
     assert push_service.CALL_INVITE_BODY[14] == "\U0001F4DE"
 
 
+def test_end_sentinel_is_pinned_byte_for_byte():
+    """The hangup's twin of `test_sentinel_is_pinned_byte_for_byte`, and it is a
+    ONE-WAY DOOR for the same reason plus one: the app has been signing this body
+    since 2026-08-22, so it is ALREADY in permanent history on enspyr. The island
+    is the late half here — it is learning to read a string the client has been
+    emitting for three weeks.
+
+    Codepoints, not just equality with itself: a look-alike substitution (U+2022
+    BULLET for U+00B7 MIDDLE DOT, a different phone emoji) would silently stop
+    every hangup from reaching a locked handset — and the failure is INVISIBLE,
+    because the call still ends everywhere the app is awake to see it. The ring
+    that does not stop is on someone else's phone.
+    """
+    assert push_service.CALL_END_BODY == "aiko:call/1 \u00b7 \U0001f4de ended the call"
+    assert [ord(c) for c in push_service.CALL_END_BODY[:14]] == [
+        ord("a"), ord("i"), ord("k"), ord("o"), ord(":"), ord("c"), ord("a"),
+        ord("l"), ord("l"), ord("/"), ord("1"), ord(" "), 0x00B7, ord(" "),
+    ]
+    assert push_service.CALL_END_BODY[14] == "\U0001F4DE"
+    # NOT THE INVITE. Both sentinels share a 12-character prefix, so a copy-paste
+    # that edited the constant's NAME and not its VALUE would leave two names for
+    # one string — and `should_wake` would return CALL_INVITE for a hangup, which
+    # is the ring-that-will-not-stop wearing a green test.
+    assert push_service.CALL_END_BODY != push_service.CALL_INVITE_BODY
+
+
+@pytest.mark.skipif(
+    not (pathlib.Path(__file__).resolve().parents[2] / "aiko_chat_app"
+         / "lib/features/call/domain/call_invite.dart").exists(),
+    reason="app repo not checked out beside this one")
+def test_both_sentinels_match_the_app_repo_source_when_it_is_present():
+    """A SECOND INSTRUMENT THAT FAILS DIFFERENTLY (the codepoint pins above are
+    the first). Those assert that the constant has not changed; this asserts that
+    it agrees with the OTHER REPO, which is the property that actually matters
+    and which no amount of self-consistency can establish. A codec pinned only
+    against its own inverse can be self-consistently wrong.
+
+    SKIPPED, NOT REQUIRED, and that is honest rather than convenient: CI has no
+    app checkout, so this cannot be the gate — the codepoint pins are. It earns
+    its place on a developer machine, where the two repos ARE side by side and a
+    drift introduced by either half surfaces the moment anyone runs the suite,
+    instead of at a handset.
+    """
+    dart = (pathlib.Path(__file__).resolve().parents[2] / "aiko_chat_app"
+            / "lib/features/call/domain/call_invite.dart").read_text()
+    for const, ours in (("kCallInviteBody", push_service.CALL_INVITE_BODY),
+                        ("kCallEndBody", push_service.CALL_END_BODY)):
+        m = re.search(r"const String " + const + r" = '([^']*)';", dart)
+        assert m, f"{const} not found in the app source — it moved or was renamed"
+        assert m.group(1) == ours, (
+            f"{const} has DRIFTED between the repos: app has {m.group(1)!r}, "
+            f"island has {ours!r}. One of the two halves stopped working and "
+            f"neither would have logged anything.")
+
+
+@pytest.mark.parametrize("body,expected", [
+    (push_service.CALL_INVITE_BODY, "CALL_INVITE"),
+    (push_service.CALL_END_BODY, "CALL_END"),
+    ("aiko:call/1 \u00b7 \U0001f4de started a call and then some", None),
+    ("aiko:call/1 \u00b7 \U0001f4de ended the call, honest", None),
+    ("hello", None),
+])
+def test_should_wake_maps_each_sentinel_to_its_own_kind(body, expected):
+    """The gate is the ONLY supply of a `WakeKind`, so this is where a hangup
+    stops being indistinguishable from a ring.
+
+    THE TWO TRAILING-CONTENT ROWS ARE THE POINT, not padding. Both sentinels are
+    matched by EXACT equality; a `startswith` would hand any sender a VoIP wake
+    primitive with arbitrary content after it, and the end sentinel is not
+    exempt just because forging a stop is the less dangerous direction — it still
+    spends the recipient's wake budget.
+    """
+    got = push_service.should_wake("dm", body)
+    assert (got.name if got is not None else None) == expected
+
+
+def test_the_end_sentinel_does_not_wake_outside_a_dm():
+    """The DM check is hoisted ABOVE both sentinels rather than repeated inside
+    each arm, so this is the assertion that the hoist actually covers the new
+    one. A per-arm copy that forgot `channel_kind` would be a wake primitive
+    aimed at every member of a public room."""
+    for kind in ("standard", "llm", "robot"):
+        assert push_service.should_wake(kind, push_service.CALL_END_BODY) is None
+
+
 def test_channel_kind_literal_matches_the_enum():
     """`ChannelKindStr` is a hand-copied duplicate of `ChannelKind` — `Literal`
     cannot be derived from an enum at type-check time — so it is exactly the kind
@@ -327,12 +414,129 @@ async def test_payload_never_names_the_caller(session, dm, configured, fake_apns
     # The channel id IS present — it is what makes the tap land in the right
     # conversation, and it is the one identifier we accept leaking.
     assert payload.channel_id == CHANNEL
-    # THE DOCTRINE IS NOW STRUCTURAL, not merely asserted. `WakePayload` has ONE
-    # field, so there is nowhere for a future "improvement" to put a caller's
-    # name — it would have to change the type, which is the difference between a
-    # commitment and a comment. The per-transport envelopes are rendered BELOW the
-    # boundary (`apns._render`) from exactly this.
-    assert [f.name for f in dataclasses.fields(payload)] == ["channel_id"]
+    # THE DOCTRINE IS STRUCTURAL, not merely asserted — and it is pinned as a
+    # CLOSED SET of fields rather than a COUNT of them. It used to read `==
+    # ["channel_id"]` with a comment reasoning from "ONE field, so there is
+    # nowhere to put a name". The count was never the property: when the end wake
+    # needed a second field (`kind`, claude-tasks#4254), that assertion failed for
+    # a change that adds no identity at all, while an attacker-shaped change —
+    # renaming `channel_id` to `caller_name` — would have kept the count at one
+    # and passed.
+    #
+    # So the guard is now "these exact fields, and nothing else". A new field
+    # still fails it, which is the whole point: adding one must be a deliberate
+    # act with this test's docstring read, not a quiet append.
+    assert [f.name for f in dataclasses.fields(payload)] == ["channel_id", "kind"]
+    # AND `kind` CANNOT CARRY AN IDENTITY, which is why its arrival does not
+    # weaken this test. It ranges over a closed enum defined in this repo — there
+    # is no free-form string in it for a display name to hide in, and a
+    # `WakeKind("alice")` is a ValueError at construction.
+    assert payload.kind in set(push_service.WakeKind)
+
+
+# --------------------------------------------------------------------------
+# The end sentinel — design 12 Decision 5, claude-tasks#4254.
+# The ring that can be started must be stoppable on a LOCKED handset, which is
+# the one place the live socket cannot reach.
+# --------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_an_end_wake_reaches_the_voip_row_and_skips_the_alert_row(
+    session, dm, configured, fake_apns, caplog
+):
+    """THE WHOLE PIECE, end to end: bob holds both an alert row (from the
+    fixture) and a voip row, alice hangs up, and exactly one push goes out.
+
+    THE SKIP IS AS LOAD-BEARING AS THE SEND. An alert push runs no app code, so
+    it cannot end a CallKit ring — and what it WOULD do is render the invite's
+    "Incoming call / Tap to join" banner for a call that just ended. So the alert
+    row is not an incidental non-delivery, it is a decision, and it must name
+    itself in the log or it is indistinguishable from the delivery bug this
+    module has a standing rule against.
+    """
+    alice, bob = dm
+    session.add(DeviceToken(user_id=bob.id, platform="apns", token="v" * 64,
+                            token_kind=TokenKind.VOIP.value))
+    await session.commit()
+
+    with caplog.at_level(logging.INFO, logger="aiko_gateway.push"):
+        await _wake(push_service.CALL_END_BODY, sender_id=alice.id)
+
+    assert fake_apns.kinds == [TokenKind.VOIP], (
+        "the hangup must reach the VoIP row and ONLY the VoIP row; "
+        f"got {fake_apns.kinds}")
+    assert fake_apns.sent[0][0] == "v" * 64
+    assert any("reason=end_wake_needs_voip" in r.message for r in caplog.records), (
+        f"the alert row's skip must name itself. Log: {caplog.text}")
+
+
+@pytest.mark.asyncio
+async def test_an_end_wake_carries_the_end_kind_in_the_payload(
+    session, dm, configured, fake_apns
+):
+    """THE FIELD THE RING'S STOPPABILITY RESTS ON.
+
+    Every PushKit push must be reported to CallKit before the handler returns. A
+    stop that arrives in the same shape as a start IS a start — Swift has no way
+    to tell them apart and rings again, which is design 16's temper finding #7
+    ("a hangup delivered as a VoIP push becomes a second ring") landing on the
+    island side. `kind` is what makes the stop stoppable.
+
+    Asserted on the POLICY object here; `test_apns_headers` asserts the rendered
+    `"k"` on the wire. Two layers, because the payload being right and the
+    envelope carrying it are different claims.
+    """
+    alice, bob = dm
+    session.add(DeviceToken(user_id=bob.id, platform="apns", token="v" * 64,
+                            token_kind=TokenKind.VOIP.value))
+    await session.commit()
+
+    await _wake(push_service.CALL_END_BODY, sender_id=alice.id)
+    assert fake_apns.sent, "no push at all — the end wake never fired"
+    _, payload, _ = fake_apns.sent[0]
+    assert payload.kind is push_service.WakeKind.CALL_END
+
+    # THE MUST-DIFFER ARM. Without it this test passes against an implementation
+    # that hard-codes CALL_END, or one that ignores `kind` entirely and renders a
+    # constant — both of which break the invite in exactly the way this field
+    # exists to prevent.
+    fake_apns.sent.clear()
+    await _wake(push_service.CALL_INVITE_BODY, sender_id=alice.id)
+    _, invite_payload, _ = fake_apns.sent[0]
+    assert invite_payload.kind is push_service.WakeKind.CALL_INVITE
+
+
+@pytest.mark.asyncio
+async def test_the_conduct_gate_runs_on_an_end_wake_too(
+    session, dm, configured, fake_apns, caplog
+):
+    """Gate 7 is called UNCONDITIONALLY rather than under `if wake is
+    CALL_INVITE`, and this is the test that the unconditional call covers the
+    second member — the exact silent bypass that `if` was replaced to prevent
+    (Tesla, cage-match PR#173 r1).
+
+    THE DIRECTION THAT MATTERS IS THE SAFE ONE, and it is worth stating why this
+    cannot strand a ringing phone. `_spoken_here` is MONOTONIC: posting history
+    only grows, so a recipient who passed the gate for the invite cannot fail it
+    for the end. There is no window in which a ring is admitted and its stop is
+    refused. What this refuses is an end wake for a ring that was never allowed
+    to happen — a wake primitive with no call behind it.
+    """
+    alice, bob = dm
+    # Remove bob's only message, so he has never spoken here.
+    await session.execute(sa_delete(Message).where(Message.sender_user_id == bob.id))
+    session.add(DeviceToken(user_id=bob.id, platform="apns", token="v" * 64,
+                            token_kind=TokenKind.VOIP.value))
+    await session.commit()
+
+    with caplog.at_level(logging.INFO, logger="aiko_gateway.push"):
+        await _wake(push_service.CALL_END_BODY, sender_id=alice.id)
+
+    assert fake_apns.sent == [], (
+        "an end wake bypassed the conduct gate — the gate must run on EVERY wake "
+        "kind, not just the one it was written for")
+    assert any("reason=no_prior_conduct" in r.message for r in caplog.records), (
+        f"the skip must name itself. Log: {caplog.text}")
 
 
 # --------------------------------------------------------------------------

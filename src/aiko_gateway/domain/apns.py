@@ -44,7 +44,8 @@ from .models import ApnsEnvironment, TokenKind
 # and test is untouched by the move (`is` comparisons hold). The types themselves
 # moved to `push_result` when FCM arrived — a shared vocabulary living inside one
 # of its two speakers is not shared.
-from .push_result import ReapOrder, SendResult, Verdict, WakePayload
+from .push_result import (ReapOrder, SendResult, Verdict, WakeKind,
+                          WakePayload)
 
 log = logging.getLogger("aiko_gateway.apns")
 
@@ -196,6 +197,63 @@ _ALERT_EXPIRATION_SECONDS = 60
 # ruling explicitly left open.
 _VOIP_LEASE_SECONDS = 30
 
+# THE END WAKE DOES NOT GET THE RING LEASE, and the asymmetry is the point
+# (claude-tasks#4254, cage-match PR#176 r1). Every sentence of the comment above is
+# about a RING — "phantom ring", "the lease", "the ceiling mechanism the ruling
+# names". A hangup inherited that number because `token_kind` used to be the only
+# axis that decided a push's lifetime, and as of the end wake it is not.
+#
+# THE TWO DIRECTIONS ARE NOT SYMMETRIC. Discarding a late INVITE is CORRECT: the
+# recipient reaches for a call that already ended and cannot tell that from a call
+# they fumbled. Discarding a late END is never correct — ending an already-ended
+# call is idempotent and free, and the thing it fails to stop is a CallKit ring
+# that design 12 states DOES NOT SELF-EXPIRE. At 30s the failure is ordinary:
+# caller hangs up, the callee's handset is in a lift for thirty-one seconds, APNs
+# discards the stop, the device returns to a ring nothing can end. That is the
+# phantom ring this whole feature exists to prevent, re-entering through the
+# expiration header instead of the missing sentinel.
+#
+# WHY 300 AND NOT UNBOUNDED. A stop must still plausibly refer to a ring the user
+# is looking at. Unbounded store-and-forward would let a stop from an hour ago
+# arrive and force a report-and-end — and that ratio is the one Apple polices
+# (see `apns-push-type` below). Five minutes covers the real failure (a tunnel, a
+# lift, a flapping connection) by an order of magnitude over the lease, and stops
+# well short of ancient stops driving the ratio.
+#
+# WHAT WIDENING THIS COSTS, NAMED AT THE MOMENT OF THE CHOICE RATHER THAN
+# DISCOVERED LATER (Carnot, cage-match PR#176 r3 — and the finding was generated
+# by this very constant's introduction one commit earlier).
+#
+# THERE ARE TWO FAILURE MODES ON THIS ONE DIAL, and they pull in opposite
+# directions. Short: the stop expires before the device reappears, and the ring it
+# was sent to stop survives (the paragraph above). Long: a STALE stop survives into
+# a LATER call in the same channel. Alice calls, Bob's handset is off, Alice hangs
+# up; the stop is stored. Alice calls again four minutes later; Bob reappears; APNs
+# delivers BOTH, in no guaranteed order, and the payload the client uses to decide
+# says only `c` — a CHANNEL, not a call. A stop meant for the first call can end
+# the second one while it is ringing.
+#
+# BOTH MODES HAVE ONE ROOT AND IT IS NOT THIS NUMBER: the wake names a channel,
+# not a call. Given a call id there is no dial to tune — a stop matches exactly one
+# call and may live as long as it likes. That id is design 12 Decision 1's
+# client-minted ULID, and it reaches the payload only inside arm C's sealed
+# envelope (claude-tasks#4254), which is blocked on a product decision and a
+# cryptographer. So NO value here is correct; 300 is the least-bad arm while the
+# feature is inert, and tuning it further is treating a representation gap as a
+# calibration problem.
+#
+# THE WINDOW IS NOT REACHABLE TODAY and that is why this ships: an end wake is
+# routed to VoIP rows only, and both live islands hold zero (measured 2026-09-11:
+# 3 rows each, all `token_kind='alert'`). It becomes reachable the moment a build
+# registers a VoIP token. That is the gate, and it is tracked.
+#
+# THIS IS A FOURTH CLOCK AND IT IS NOT SETTLED HERE. The lease, the 30s ring and
+# the app's 10s freshness gate already "have no stated relationship, which the
+# ruling explicitly left open" — that is claude-tasks#4233, and it is where the
+# four of them get reconciled. This constant is chosen to FAIL IN THE SAFE
+# DIRECTION until then, not to be the answer.
+_VOIP_END_EXPIRATION_SECONDS = 300
+
 # The provider token, cached across sends: (jwt, issued_at_monotonic).
 _cached_token: tuple[str, float] | None = None
 _client_singleton: httpx.AsyncClient | None = None
@@ -337,10 +395,25 @@ def _render(payload: WakePayload) -> dict:
     What crosses the boundary is `WakePayload`, which carries the REFUSAL (a wake
     and a destination, never an identity) and no provider schema at all.
 
-    `"c"` rather than `"channel_id"`: an APNs payload has a 4KB ceiling and this
-    is the only custom field, so there is no reason to spend bytes on a long name.
-    That reasoning is APNs-specific and stays here with the renderer; FCM's own
-    ceiling is a different number about a different envelope.
+    SHORT KEYS — `"c"`, `"k"` rather than `"channel_id"`, `"kind"`: an APNs alert
+    payload has a 4KB ceiling (VoIP is 5KB) and these are the only custom fields,
+    so there is no reason to spend bytes on long names. That reasoning is
+    APNs-specific and stays here with the renderer; FCM's own ceiling is a
+    different number about a different envelope.
+
+    `"k"` IS ON EVERY WAKE, BOTH VALUES EXPLICIT — never "absent means invite".
+    An absent key and a key whose value is the default are different epistemic
+    states that an absence-default collapses into one: the client could not tell
+    "this island predates the end wake" from "this island sent a ring", and the
+    two want opposite handling. Explicit on both means a MISSING `"k"` is a
+    detectable defect rather than a silently inherited default.
+
+    THE ALERT COPY IS THE INVITE'S, AND ONLY VoIP ROWS EVER SEE A `CALL_END`.
+    A VoIP push is delivered to the app and never displayed, so `aps.alert` is
+    inert for it — which is why a hangup does not need its own wording here. The
+    routing decision that keeps it that way lives in `push_service.plan_deliveries`
+    (`end_wake_needs_voip`), NOT in this function; if that ever changes, this copy
+    becomes a lie on screen and this paragraph is the note saying so.
     """
     return {
         "aps": {
@@ -348,6 +421,7 @@ def _render(payload: WakePayload) -> dict:
             "sound": "default",
         },
         "c": payload.channel_id,
+        "k": payload.kind.value,
     }
 
 
@@ -478,13 +552,50 @@ async def send(device_token: str, payload: WakePayload, *,
     # is a distinct silent failure (a voip type on a bare topic, an alert type on
     # a `.voip` topic, an alert lifetime on a ring). Deciding them in one place
     # means a future kind cannot be half-taught.
-    match token_kind:
-        case TokenKind.ALERT:
+    # TWO AXES NOW, NOT ONE. The comment above used to say these four facts "are one
+    # decision about what kind of push this is" — true while every VoIP push was an
+    # invite, false as of the end wake (cage-match PR#176 r1). Topic, push type and
+    # collapse-eligibility really are `token_kind`'s alone: they are facts about the
+    # TRANSPORT. Lifetime is not — it is a fact about WHAT THE PUSH IS FOR, and a
+    # stop and a start want opposite answers. Matching on the pair keeps the binding
+    # the comment promises while letting the one genuinely two-axis fact vary.
+    # EVERY CELL NAMED; NO WILDCARD ON A WAKE KIND (Carnot, cage-match PR#176 r2).
+    # The first draft of this two-axis match wrote `(TokenKind.ALERT, _)` and
+    # `(TokenKind.VOIP, _)`, which reads as tidy and is the exact silent-inheritance
+    # hole the router two files up was rebuilt to close. A third `WakeKind` would
+    # have inherited an alert push's 60s lifetime and collapse-eligibility here
+    # WITHOUT ANYONE DECIDING THAT — the policy layer forcing a decision while the
+    # transport quietly supplies a default. The finding is sharper than it looks
+    # because this fix CREATED it: lifetime only became a decision worth guarding
+    # when it stopped being a function of `token_kind` alone, one commit ago.
+    #
+    # NOT `assert_never` on the pair: tuple narrowing is unreliable and there is no
+    # type checker in CI, so the fall-through has to be a REAL runtime arm — the
+    # same reasoning `plan_deliveries` states for its own `case _`. Raising is safe
+    # here: `_send_one` wraps each device in its own boundary, so an unrouted pair
+    # costs that one device a logged skip rather than the fanout.
+    match (token_kind, payload.kind):
+        case (TokenKind.ALERT, WakeKind.CALL_INVITE):
             expires_in, may_collapse = _ALERT_EXPIRATION_SECONDS, True
-        case TokenKind.VOIP:
+        case (TokenKind.VOIP, WakeKind.CALL_INVITE):
             expires_in, may_collapse = _VOIP_LEASE_SECONDS, False
+        case (TokenKind.VOIP, WakeKind.CALL_END):
+            expires_in, may_collapse = _VOIP_END_EXPIRATION_SECONDS, False
+        case (TokenKind.ALERT, WakeKind.CALL_END):
+            # UNREACHABLE VIA THE DOOR, AND STILL WRITTEN OUT. `plan_deliveries`
+            # skips this cell as `end_wake_needs_voip`, so the only way here is a
+            # caller reaching past the router. Named rather than folded into the
+            # refusal below because the reason is specific and worth reading: an
+            # alert push runs no app code, so it cannot end a CallKit ring.
+            raise ValueError(
+                "an end wake cannot be sent to an alert token — an alert push runs "
+                "no app code and cannot end a CallKit ring; see "
+                "push_service.plan_deliveries (end_wake_needs_voip)")
         case _:
-            assert_never(token_kind)
+            raise ValueError(
+                f"unrouted push: token_kind={token_kind} wake={payload.kind}. A new "
+                "WakeKind must be given an explicit lifetime and collapse decision "
+                "here, not inherit one.")
 
     headers = {
         "authorization": f"bearer {_provider_token()}",
