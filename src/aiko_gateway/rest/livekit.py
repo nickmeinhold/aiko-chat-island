@@ -235,8 +235,27 @@ async def get_call_occupancy(
 
     channel = await _gated_dm_channel(session, user.id, channel_id)
 
+    # RELEASE THE DB CONNECTION BEFORE THE VENDOR HOP (cage-match #167, Tesla; part A
+    # item 1). Every gate above is a DB read and every line below is a network call to
+    # somebody else's server. Holding the session across that boundary means a scarce
+    # resource is pinned for the duration of a THIRD PARTY's latency — and this gateway
+    # is a single uvicorn worker over file-backed SQLite, so "scarce" is literal. At
+    # ~1 poll per second per ringing party, a LiveKit blip does not stay a LiveKit
+    # blip: N slow polls hold N sessions and the contention becomes island-wide,
+    # reaching endpoints that have nothing to do with calls.
+    #
+    # The id is copied out FIRST because ``close()`` detaches ``channel`` from the
+    # session; reading an already-loaded attribute off a detached instance happens to
+    # work, but depending on that is depending on a loading strategy nobody promised.
+    # The local makes the dependency a fact instead of a coincidence.
+    #
+    # ``close()`` is idempotent — ``get_session``'s ``async with`` still closes on the
+    # way out, so this is an EARLY release, not a change of ownership.
+    room_id = channel.id
+    await session.close()
+
     try:
-        occ = await livekit_rooms.occupancy(room=channel.id)
+        occ = await livekit_rooms.occupancy(room=room_id)
     except (livekit_rooms.LiveKitUnreachable, livekit_tokens.LiveKitNotConfigured):
         # UNKNOWN IS NOT EMPTY. Reporting live=false here would tell a ringing handset the
         # call had ended, cancelling a call that is in fact happening — the precise failure
