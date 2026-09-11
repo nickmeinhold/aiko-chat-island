@@ -364,6 +364,17 @@ async def occupancy(*, room: str) -> Occupancy:
             stamp = raw
         if stamp == 0:
             continue                      # protobuf "no value" — unstamped, not broken
+        if stamp < 0:
+            # AFTER both encodings normalize, not inside one of them (cage-match #167
+            # r5, Carnot). The round-4 rewrite moved the type check in front of the
+            # conversion and dropped the old `stamp <= 0` guard, which left the two
+            # encodings disagreeing about the same value: `"-1788700000"` was refused
+            # because `isdigit()` is False, while `-1788700000` as a JSON NUMBER sailed
+            # through and rendered `since: "1913-04-27T10:53:20Z"`. Fabricated history,
+            # from the fix for fabricated 1970s — the repair reopened the hole one
+            # encoding over, and the round-4 tests missed it because every negative arm
+            # they carried was a STRING.
+            raise LiveKitUnreachable(f"SFU sent a negative joinedAt ({stamp})")
         joined.append(stamp)
     return Occupancy(
         live=bool(participants),
