@@ -610,20 +610,52 @@ async def send(device_token: str, payload: WakePayload, *,
         # island-side mistake would therefore produce a permanently deaf handset
         # with a green log line, invisible to `SendResult` forever.
         #
-        # THAT PENALTY HAS NEVER BEEN OBSERVED HERE, and the honest statement of
-        # why matters (12a-MEASURED M8). A four-push flagrant-violation arm went
-        # unpunished on a real handset, but the negative control never fired — the
-        # app was foregrounded by the launch harness, and must-report governs
-        # waking a SUSPENDED app — so the result is VOID, not a licence.
-        # `CSDVoIPApplicationKillCounts` in `com.apple.TelephonyUtilities` is the
-        # per-app kill ledger that would make it readable (M10). What IS proven is
-        # M7: CallKit rang from a VoIP push with no Dart alive, on a real handset.
+        # THAT PENALTY IS NOW MEASURED, AND THE PARAGRAPH THIS REPLACES SAID THE
+        # OPPOSITE — it read "has never been observed here", which was true when
+        # written and reassuring in the wrong direction once it was not.
+        #
+        #   Measured 2026-09-11 by the app tab (claude-tasks#4178), iPhone 14 Pro,
+        #   iOS 26.6.1, ONE device, ONE OS version, n=2 for the threshold.
+        #
+        # Two findings, and the provenance above belongs with both — a number this
+        # small governing behaviour deserves its sample size attached, not a bare
+        # digit that a later reader will take for a platform constant:
+        #
+        #   1. A suspended app that does NOT report is terminated on EVERY push.
+        #   2. After THREE unreported pushes, iOS stops delivering VoIP to that
+        #      app on that device entirely. APNs keeps answering 200. A reinstall
+        #      clears it.
+        #
+        # (2) is why this matters here rather than only on the client: the failure
+        # is INVISIBLE TO US BY CONSTRUCTION. A deaf handset and a healthy one
+        # return the same 200, so no `SendResult`, no log line and no reachability
+        # report can distinguish them. THREE is also far below what Apple's
+        # "repeatedly" suggests.
+        #
+        # THE EARLIER RUN WAS VOID AND THE REASON IS WORTH KEEPING (12a-MEASURED
+        # M8): a four-push flagrant-violation arm went unpunished, but the negative
+        # control never fired — `devicectl --console` held a usage assertion that
+        # kept the app running-active-visible, and must-report governs waking a
+        # SUSPENDED app. The instrument, not the platform, produced that silence.
+        # The 2026-09-11 redo is admissible precisely because its negative control
+        # DID fire, three times.
+        #
+        # WHAT IS STILL NOT MEASURED, and it is the live question rather than a
+        # footnote: whether report-THEN-IMMEDIATELY-END counts as reported. Both
+        # arms above were UNREPORTED pushes, so neither speaks to it, and the two
+        # branches are not neighbours — a momentary buzz per hangup, or the
+        # blackout in (2). claude-tasks#4278 runs it, along with the nearer
+        # question of whether ending a ring CallKit is CURRENTLY SHOWING satisfies
+        # the rule; the void-era arm used an id iOS had never seen.
         #
         # So the island emits VoIP ONLY for a genuine call invite — enforced
         # upstream by `push_service.should_wake`'s exact-sentinel match and by the
         # router accepting a VoIP delivery only from a WakeKind that gate produced.
-        # The discipline does not rest on a measured penalty: we do not spend an
-        # UNMEASURED budget.
+        # The discipline used to rest on "we do not spend an UNMEASURED budget".
+        # The budget is measured now and the conclusion is unchanged and stronger:
+        # it is three, we cannot see it being spent, and a failure we cannot detect
+        # has to be made unreachable by construction rather than watched for.
+        # claude-tasks#4265 carries that as a gate on the end wake.
         "apns-push-type": token_kind.value,
         # 10 = deliver immediately, correct for BOTH kinds. The alternative (5)
         # permits Apple to hold the push to save power, which for a perishable
