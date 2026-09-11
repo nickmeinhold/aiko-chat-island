@@ -25,9 +25,13 @@ file is the working-context that isn't obvious from the code.
   `memory/reference_gha_timing_endpoint_reports_zero_billable.md`.
 - **Deploy is PULL-BASED; `--build` is wrong here** — there is NO `build:` on the
   box. Ship a fix: merge → cut `vX.Y.Z` → bump the box's `ISLAND_VERSION` →
-  `deploy/update.sh`. **`update.sh` pulls the IMAGE and does NOT sync
+  `deploy/update.sh`. **`update.sh` pulls the IMAGE and still does NOT sync
   `docker-compose.yml`** — the box's copy is a separate artifact and has drifted
-  before (#2301). Rationale, rejected alternatives, and why automating this is
+  before (#2301). Since #4230 it **refuses to deploy on drift** rather than
+  discovering it: `deploy/preflight-compose-drift.sh` fetches the tag being
+  pulled and diffs the box's compose + every `deploy/` file it carries, aborting
+  before the backup. Syncing is still the operator's hand; what changed is that
+  forgetting is now loud instead of an outage. Rationale, rejected alternatives, and why automating this is
   blocked: [ISL-0003](docs/adr/ISL-0003-pull-based-deploy-of-pinned-image.md). Verify
   the RUNNING container's image ref, not this doc. Runbook:
   `docs/deploy-passkeys-runbook.md`. Two live islands: `chat.imagineering.cc`

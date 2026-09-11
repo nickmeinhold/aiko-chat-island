@@ -16,6 +16,7 @@
 #   deploy/update.sh --from-source   # backup -> build from this checkout -> up -> verify
 #   deploy/update.sh --no-backup     # skip the backup (only if you back up elsewhere)
 #   deploy/update.sh --yes           # non-interactive (no confirm prompt)
+#   deploy/update.sh --skip-drift-check  # deploy despite a drifted deploy tree (LOUD)
 #
 # Pin a version by exporting ISLAND_VERSION (e.g. ISLAND_VERSION=v0.1.0) or setting
 # it in .env; default is `edge` (tracks main).
@@ -33,12 +34,13 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 [ -f docker-compose.yml ] || die "docker-compose.yml not found in $REPO_ROOT"
 
-FROM_SOURCE="false"; DO_BACKUP="true"; INTERACTIVE="true"
+FROM_SOURCE="false"; DO_BACKUP="true"; INTERACTIVE="true"; DRIFT_CHECK="true"
 while [ $# -gt 0 ]; do
   case "$1" in
     --from-source) FROM_SOURCE="true"; shift ;;
     --no-backup)   DO_BACKUP="false"; shift ;;
     --yes)         INTERACTIVE="false"; shift ;;
+    --skip-drift-check) DRIFT_CHECK="false"; shift ;;
     -h|--help)     sed -n '2,/^set -euo/p' "$0" | sed 's/^# \{0,1\}//;/^set -euo/d'; exit 0 ;;
     *)             die "unknown argument: $1 (see --help)" ;;
   esac
@@ -63,8 +65,32 @@ fi
 
 $DOCKER compose version >/dev/null 2>&1 || die "docker compose v2 not available"
 
+# EVERY COMPOSE CALL IS PINNED TO docker-compose.yml, and this one flag replaced
+# three rounds of guards (cage-match rounds 5-7).
+#
+# A bare `docker compose` picks its own files from the working directory, and
+# MEASURED on the live box it picks more than you would guess: `compose.yaml`
+# beside `docker-compose.yml` WINS OUTRIGHT (config emitted compose.yaml's
+# variables and ignored the other entirely), an override file is merged in, and
+# COMPOSE_FILE can redirect the whole set from the environment or from .env.
+# Each of those was found as a separate fail-open — the drift guard certifying
+# one file set while the engine burned another — and each was met with its own
+# refusal.
+#
+# Pinning ends the class instead of enumerating it. Same measurement, one row
+# down: `-f docker-compose.yml` ignores compose.yaml, ignores the override, and
+# ignores COMPOSE_FILE. The file set the guard compares is now the file set that
+# deploys, BY CONSTRUCTION rather than by prediction — which is the difference
+# between an invariant and a guard someone has to keep extending.
+#
+# Safe on both islands today: neither carries compose.yaml, an override, or
+# COMPOSE_FILE (checked), so the resolved config is byte-identical to a bare
+# invocation. The guard still WARNS if any such file appears, because a human
+# typing `docker compose` by hand here would still get it.
+COMPOSE="$DOCKER compose -f docker-compose.yml"
+
 # The island must actually be running (this is an UPDATE, not a first standup).
-$DOCKER compose ps --status running --services 2>/dev/null | grep -qx chat-island \
+$COMPOSE ps --status running --services 2>/dev/null | grep -qx chat-island \
   || die "the 'chat-island' service isn't running — use deploy/standup.sh for a first standup"
 
 # --- preflight: a PARTIAL APNS_* set now refuses to boot --------------------
@@ -106,6 +132,153 @@ else
      the recreate. Check by hand, or refresh this box's deploy/ from the repo."
 fi
 
+# --- preflight: the box's deploy tree must MATCH the tag being pulled -------
+#
+# claude-tasks#4230, and the direct fix for the outage of 2026-09-11. This script
+# pulls an IMAGE and does not sync docker-compose.yml — the box's copy is a
+# separate artifact (#2301). APNS_VOIP_TOPIC became a required member of the
+# all-or-none APNs group; enspyr's .env HAD it and enspyr's compose did not
+# FORWARD it, so the value could never reach the container and the island refused
+# to boot for several minutes. The box's compose differed from the tag by exactly
+# one line. imagineering had the identical gap and deployed clean, because its
+# compose happened to get synced first — same change, same drift, opposite
+# outcome, one variable.
+#
+# The APNs preflight above could not have caught it: the copy ON THE BOX predated
+# the key it needed to look for. Nothing syncs deploy/ either. So the check below
+# covers the whole deploy surface, including itself and this file.
+#
+# It runs BEFORE the backup and before anything is pulled, same posture as the
+# APNs preflight beside it: an operator reading the refusal still has a running
+# island.
+if [ "$FROM_SOURCE" = "true" ]; then
+  # --from-source deploys THIS CHECKOUT, so "does the box match the tag" is not
+  # the question being asked and a refusal would be nonsense.
+  :
+elif [ "$DRIFT_CHECK" != "true" ]; then
+  warn "deploy-tree drift check SKIPPED (--skip-drift-check). You are deploying an
+     image built from a tag whose compose and deploy scripts may not match the ones
+     on this box. That is the shape that took enspyr down on 2026-09-11. If the
+     island crash-loops after the recreate, this is the first thing to check."
+elif [ -f "$SCRIPT_DIR/preflight-compose-drift.sh" ]; then
+  [ -x "$SCRIPT_DIR/preflight-compose-drift.sh" ] \
+    || die "preflight-compose-drift.sh exists but is not executable — refusing to deploy with a disabled safety check. chmod +x it."
+  # The ref to compare against is the one compose will actually interpolate, read
+  # through the single dotenv reader rather than a fifth grep (deploy/lib). An
+  # unset ISLAND_VERSION means `edge`, which is this script's own documented
+  # default and tracks main.
+  # shellcheck source=lib/dotenv-read.sh
+  . "$SCRIPT_DIR/lib/dotenv-read.sh"
+  # THE SELECTOR MUST RESOLVE THE WAY COMPOSE RESOLVES IT (Tesla, cage-match
+  # round 5). Measured on the live box: `docker compose config` prefers the SHELL
+  # ENVIRONMENT over `.env` — an exported TAGVAR beat the .env value outright.
+  # Reading only `.env`, as this did, means an exported ISLAND_VERSION (direnv, a
+  # systemd `Environment=`, a leftover export, or this script's own documented
+  # `ISLAND_VERSION=v0.1.0 deploy/update.sh` pin path) makes the guard fetch and
+  # bless one tag while `docker compose pull` interpolates a DIFFERENT one.
+  #
+  # That is the 2026-09-11 outage wearing the interlock's own clothes: new image,
+  # old compose, a printed clean comparison, and an island that serves until it
+  # does not. The comment here used to claim this was "the ref compose will
+  # actually interpolate" — it was not, which is prose overclaiming the code
+  # inside the guard written to stop prose from governing deploys.
+  #
+  # And note which class this belongs to: ISLAND_VERSION is the PRODUCTION member
+  # of the ambient-input family whose three TEST members were swept two rounds
+  # ago. The class was named and one instance was left live.
+  drift_ref="${ISLAND_VERSION:-}"
+  [ -n "$drift_ref" ] || drift_ref="$(dotenv_read "$REPO_ROOT/.env" ISLAND_VERSION)"
+
+  # A POSITIVE CONTROL ON THE HELPER, WITH A DIFFERENT INSTRUMENT (Carnot,
+  # cage-match round 8), and the reason it exists is that my first answer to the
+  # finding was wrong.
+  #
+  # The circularity Carnot named is real: this resolves the ref by sourcing
+  # deploy/lib/dotenv-read.sh, a file INSIDE the surface the guard is about to
+  # certify. I assumed the failure direction was closed — a broken helper returns
+  # empty, drift_ref falls back to `edge`, the box gets compared against main and
+  # refuses. MEASURED on the live box, that assumption is FALSE: box-vs-main
+  # exits 0 today, because main's deploy tree happens to equal v0.11.0's. So a
+  # broken helper would have the guard print a clean comparison for a ref it is
+  # NOT deploying, silently — exactly the epistemic collapse the exit codes exist
+  # to prevent, arriving through the bootstrap instead of through a code path.
+  #
+  # The check is a DELIBERATELY CRUDE grep, not a second parser. It shares no
+  # grammar with the helper, so it fails differently: it answers only "does .env
+  # mention this key at all", and a disagreement between the two means the helper
+  # is broken rather than the key absent. Absence is legitimate (an unpinned box
+  # tracks `edge`); a key that is visibly THERE and unreadable is not.
+  if [ -z "$drift_ref" ] && [ -f "$REPO_ROOT/.env" ] \
+     && LC_ALL=C grep -aqE '^[[:space:]]*(export[[:space:]]+)?ISLAND_VERSION[[:space:]]*=' "$REPO_ROOT/.env"; then
+    die "'.env' contains an ISLAND_VERSION line but the dotenv helper read nothing
+     from it — deploy/lib/dotenv-read.sh is broken or stale. Falling back to 'edge'
+     here would compare this box against main and could print CLEAN for a ref this
+     deploy will not use. Refusing instead. Refresh deploy/ from the tag."
+  fi
+  [ -n "$drift_ref" ] || drift_ref="edge"
+  # The bare-version -> tag rewrite (`0.11.0` -> `v0.11.0`, which both live boxes
+  # need) lives INSIDE the guard now, where a test can drive it — it used to sit
+  # here, on the path of every real deploy, untestable (Tesla, cage-match round 2).
+
+  # NO COMPOSE_FILE REFUSAL HERE ANY MORE, and its removal is the point rather
+  # than an oversight. Round 6 added one because COMPOSE_FILE could redirect the
+  # deployed file set from the environment or .env. Round 7's measurement showed
+  # `-f docker-compose.yml` ignores COMPOSE_FILE entirely, so the refusal could
+  # now only ever block a deploy that was going to be correct — a guard whose
+  # window the pin above already closed. Subtracted, not stacked.
+
+
+  set +e
+  # ALL THREE SEAMS ARE STRIPPED (Carnot round 2 named the first; Tesla round 3
+  # named the class). Each is an ambient variable that changes what "compared
+  # against v0.11.0" MEANS, and each can arrive on a host without appearing in
+  # any command line:
+  #   ISLAND_REF_TREE       — substitutes a local directory for the fetched tag
+  #   ISLAND_REPO_SLUG      — fetches SOMEONE ELSE'S repository
+  #   ISLAND_CODELOAD_BASE  — fetches from another server entirely
+  # The slug is the nastiest: inherited, the guard compares the box against a
+  # stranger's tree and reports a match, while `docker compose pull` goes on
+  # interpolating the real image. Fixing only the first, as an earlier pass did,
+  # is patching an instance of a class that had already been named. Stripping
+  # them here makes the deploy path structurally unreachable by any of them; the
+  # guard separately announces any seam it finds set, for every other caller.
+  env -u ISLAND_REF_TREE -u ISLAND_REPO_SLUG -u ISLAND_CODELOAD_BASE \
+    "$SCRIPT_DIR/preflight-compose-drift.sh" "$REPO_ROOT" "$drift_ref"
+  drift_rc=$?
+  set -e
+  case "$drift_rc" in
+    0) ok "deploy tree matches $drift_ref" ;;
+    1) die "this box's deploy tree differs from $drift_ref (diff above) — aborting BEFORE
+     the backup; the island is still running. Sync the named files from the tag and
+     re-run. To deploy anyway: deploy/update.sh --skip-drift-check" ;;
+    # NOT THE SAME ANSWER AS 'no drift'. Exit 2 means the tag could not be
+    # obtained, so nothing whatsoever is known about this box's tree. Refusing is
+    # the conservative read of an unknown, and the operator gets an explicit,
+    # loud way through if they have checked by hand.
+    *) die "could not compare this box against $drift_ref (see above) — NOTHING was
+     checked, which is not the same as 'no drift found'. Fix the network or the ref,
+     or deploy deliberately with: deploy/update.sh --skip-drift-check" ;;
+  esac
+else
+  # FAIL CLOSED — and the reasoning is the OPPOSITE of the APNs preflight's
+  # warn-and-continue above, which an earlier draft of this block copied without
+  # re-deriving (Carnot, cage-match round 1).
+  #
+  # The APNs branch warns because an OLD update.sh can legitimately reach it. This
+  # branch cannot: the drift check ships in the SAME commit as the code you are
+  # reading, so an update.sh new enough to execute these lines came from a tag that
+  # also carries preflight-compose-drift.sh. Reaching here therefore means the
+  # operator synced update.sh and NOT the guard beside it — a partial sync, which
+  # is the precise failure mode this PR exists to stop. Warning and continuing
+  # would make the check accidentally skippable without --skip-drift-check, so the
+  # guard would be defeated by exactly the behaviour it was written to refuse.
+  die "deploy-tree drift check NOT FOUND ($SCRIPT_DIR/preflight-compose-drift.sh).
+     This update.sh ships WITH that guard, so its absence means deploy/ was synced
+     PARTIALLY — the same partial-sync that took enspyr down on 2026-09-11. Sync
+     the whole of deploy/ from the tag and re-run. To deploy anyway, deliberately:
+     deploy/update.sh --skip-drift-check"
+fi
+
 # --- step 1: back up the sole-copy DB (fail-closed) -------------------------
 if [ "$DO_BACKUP" = "true" ]; then
   log "Step 1/3 — backing up the SQLite store (online hot copy) BEFORE any change"
@@ -114,7 +287,7 @@ if [ "$DO_BACKUP" = "true" ]; then
   ts="$(date +%Y%m%d-%H%M%S)"
   # Online .backup() inside the container (no sqlite3 CLI in the slim image), then
   # copy the artifact out and remove the in-container temp. integrity_check gates.
-  $DOCKER compose exec -T chat-island python -c "
+  $COMPOSE exec -T chat-island python -c "
 import sqlite3, sys
 src = sqlite3.connect('/data/aiko.db')
 dst = sqlite3.connect('/data/_update-$ts.db')
@@ -123,9 +296,9 @@ res = dst.execute('PRAGMA integrity_check').fetchone()[0]
 print('integrity_check:', res)
 sys.exit(0 if res == 'ok' else 1)
 " || die "backup integrity_check failed — ABORTING before touching the stack"
-  $DOCKER compose cp "chat-island:/data/_update-$ts.db" "$backup_dir/aiko.db.preupdate-$ts" \
+  $COMPOSE cp "chat-island:/data/_update-$ts.db" "$backup_dir/aiko.db.preupdate-$ts" \
     || die "could not copy the backup out of the container — ABORTING"
-  $DOCKER compose exec -T chat-island rm -f "/data/_update-$ts.db" || true
+  $COMPOSE exec -T chat-island rm -f "/data/_update-$ts.db" || true
   sz=$(wc -c < "$backup_dir/aiko.db.preupdate-$ts" | tr -d ' ')
   [ "${sz:-0}" -gt 4096 ] || die "backup file is implausibly small ($sz bytes) — ABORTING"
   ok "backed up to backups/aiko.db.preupdate-$ts ($sz bytes, integrity ok)"
@@ -145,8 +318,8 @@ if [ "$FROM_SOURCE" = "true" ]; then
   $DOCKER compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 else
   log "Step 2/3 — pulling the latest published image + recreating"
-  $DOCKER compose pull
-  $DOCKER compose up -d
+  $COMPOSE pull
+  $COMPOSE up -d
 fi
 ok "stack recreated (entrypoint migrates fail-closed before serving)"
 
