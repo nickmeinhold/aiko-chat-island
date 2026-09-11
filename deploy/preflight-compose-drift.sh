@@ -193,6 +193,40 @@ materialise_ref() {
     *)   die "$codeload answered HTTP $code for $ref. Nothing was compared." ;;
   esac
 
+  # NO LINK MEMBERS — CHECKED BEFORE EXTRACTION, NOT AFTER (Tesla, rounds 5-6).
+  #
+  # Round 5 added this as a post-extraction `find -type l` scan. Tesla's round-6
+  # objection is right in principle even though its specific attack was refuted:
+  # a hostile archive whose first member is `top/deploy -> <the box's deploy>`
+  # and whose second is `top/deploy/update.sh` would, against a permissive tar,
+  # write THROUGH the freshly-extracted link into the live tree before any scan
+  # could notice. A post-condition is not a containment field.
+  #
+  # Measured, so the severity is stated honestly rather than implied: both tars
+  # already refuse that write-through — GNU tar 1.35 on the island exits 2, macOS
+  # bsdtar leaves the victim untouched — so the existing `|| die` fires today.
+  # But that safety is a property of the tar VERSION, not of this script, and
+  # reading the manifest first costs one command and depends on nothing.
+  #
+  # The rule is absolute because the fact makes it free: this repository's real
+  # v0.11.0 archive contains ZERO link members (measured). Any link means the
+  # tree is not what it claims to be — and one pointing back at this box would
+  # make every comparison compare the box to itself and report a match, which is
+  # the most complete fail-open this design admits.
+  #
+  # `tar -tzf` alone, no `find -quit`: one mechanism with one arm, rather than
+  # two mechanisms where the test cannot say which one fired.
+  link_members="$(tar -tzvf "$tgz" 2>/dev/null | awk '$1 ~ /^[lh]/ {print $NF}' | head -5)" \
+    || die "the archive for $ref could not even be LISTED — it is CORRUPT, truncated,
+     or not a gzip stream at all. Refused before extracting anything, and still not
+     a clean comparison."
+  if [ -n "$link_members" ]; then
+    die "the archive for $ref contains LINK members, and this repository's tag
+     archives contain none — so this tree is not what it claims to be. A link
+     pointing back at this box would make every comparison compare the box to
+     itself and report a match. Refused BEFORE extracting anything: $link_members"
+  fi
+
   mkdir -p "$work/tree"
   # --strip-components=1: the archive's single top directory is named for the repo
   # and the ref, which is not a name anything downstream should have to know.
@@ -202,25 +236,6 @@ materialise_ref() {
   tar -xzf "$tgz" -C "$work/tree" --no-same-owner --strip-components=1 \
     || die "the archive for $ref did not unpack — it is CORRUPT or truncated, which is
      a third thing again, and still not a clean comparison."
-  # NO SYMLINKS IN A MATERIALISED REF TREE (Tesla, round 5). The round-2 tar
-  # measurement refuted a member NAME containing `..` — both tars refuse it. It
-  # said nothing about a member that IS a symlink, and those extract fine:
-  # measured, a member `top/deploy -> /home/ubuntu/apps/aiko-chat-gateway/deploy`
-  # lands as a live link. The guard would then follow it (the walk is `find -L`),
-  # compare every box file to ITSELF, find no difference, and report CLEAN — a
-  # tarball of mirrors, and the most complete fail-open available against this
-  # design.
-  #
-  # The rule is absolute rather than a containment check because the fact makes
-  # it free: this repository's tag archive contains ZERO symlink members
-  # (measured against the real v0.11.0). So any symlink here means the tree is
-  # not what it claims to be, and no jail logic is needed to say so.
-  if find "$work/tree" -type l -print -quit 2>/dev/null | grep -q .; then
-    die "the archive for $ref contains SYMLINKS. This repository's tag archives
-     contain none, so this tree is not what it claims to be — and a link pointing
-     back at this box would make every comparison compare the box to itself and
-     report a match. Nothing was compared."
-  fi
   tree="$work/tree"
 }
 

@@ -647,7 +647,21 @@ _NON_POSIX_FLAGS = {
     "find -print0": "find . -print0 >/dev/null",
     "find -maxdepth": "find . -maxdepth 1 >/dev/null",
     "sort -z": r"printf 'b\0a\0' | LC_ALL=C sort -z >/dev/null",
-    "read -d ''": r"""bash -c "while IFS= read -r -d '' x; do :; done < <(printf 'a\0')" """,
+    # COUNTS THE RECORDS, because the obvious probe cannot fail (Tesla, round 6).
+    # `while read -r -d '' x; do :; done < <(printf 'a\0')` exits 0 whether or not
+    # -d is honoured: with it ignored, read hits EOF on a newline-less stream, the
+    # body never runs, and the `while` still exits 0. Disabled and success at the
+    # same voltage — inside the table whose entire purpose is catching that.
+    # Two NUL-delimited records must yield exactly two iterations.
+    "read -d ''": (
+        'bash -c \'n=0; while IFS= read -r -d "" x; do n=$((n+1)); done '
+        '< <(printf "a\\0b\\0"); [ "$n" -eq 2 ]\''
+    ),
+    # -quit joined the script in round 5 and was never added here — the sweep that
+    # exists to make the class complete acquired a member without noticing
+    # (Tesla, round 6). The flag itself is fine on both userlands (measured: rc=0
+    # on macOS find and GNU find), so this is a gap in the enumeration, not a bug.
+    "find -quit": "find . -type l -print -quit >/dev/null",
     "diff -u --label": "diff -u --label A --label B f1 f2; [ $? -le 1 ]",
     "cmp -s": "cmp -s f1 f1",
     "uniq -c": r"printf 'a\na\n' | uniq -c >/dev/null",
