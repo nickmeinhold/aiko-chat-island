@@ -145,7 +145,25 @@ elif [ -f "$SCRIPT_DIR/preflight-compose-drift.sh" ]; then
   # default and tracks main.
   # shellcheck source=lib/dotenv-read.sh
   . "$SCRIPT_DIR/lib/dotenv-read.sh"
-  drift_ref="$(dotenv_read "$REPO_ROOT/.env" ISLAND_VERSION)"
+  # THE SELECTOR MUST RESOLVE THE WAY COMPOSE RESOLVES IT (Tesla, cage-match
+  # round 5). Measured on the live box: `docker compose config` prefers the SHELL
+  # ENVIRONMENT over `.env` — an exported TAGVAR beat the .env value outright.
+  # Reading only `.env`, as this did, means an exported ISLAND_VERSION (direnv, a
+  # systemd `Environment=`, a leftover export, or this script's own documented
+  # `ISLAND_VERSION=v0.1.0 deploy/update.sh` pin path) makes the guard fetch and
+  # bless one tag while `docker compose pull` interpolates a DIFFERENT one.
+  #
+  # That is the 2026-09-11 outage wearing the interlock's own clothes: new image,
+  # old compose, a printed clean comparison, and an island that serves until it
+  # does not. The comment here used to claim this was "the ref compose will
+  # actually interpolate" — it was not, which is prose overclaiming the code
+  # inside the guard written to stop prose from governing deploys.
+  #
+  # And note which class this belongs to: ISLAND_VERSION is the PRODUCTION member
+  # of the ambient-input family whose three TEST members were swept two rounds
+  # ago. The class was named and one instance was left live.
+  drift_ref="${ISLAND_VERSION:-}"
+  [ -n "$drift_ref" ] || drift_ref="$(dotenv_read "$REPO_ROOT/.env" ISLAND_VERSION)"
   [ -n "$drift_ref" ] || drift_ref="edge"
   # The bare-version -> tag rewrite (`0.11.0` -> `v0.11.0`, which both live boxes
   # need) lives INSIDE the guard now, where a test can drive it — it used to sit

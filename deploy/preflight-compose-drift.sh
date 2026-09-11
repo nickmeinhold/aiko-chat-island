@@ -86,7 +86,7 @@ for _seam in ISLAND_REF_TREE ISLAND_REPO_SLUG ISLAND_CODELOAD_BASE; do
 done
 
 work=""
-work_list="$(mktemp)"
+raw_list="$(mktemp)"; sorted_list="$(mktemp)"
 # `return 0` IS THE WHOLE FUNCTION'S CONTRACT, not tidiness. An EXIT trap whose
 # last command fails REPLACES the script's exit status in bash 3.2 — and when
 # $work is empty (the ISLAND_REF_TREE path, where nothing was fetched) the test
@@ -95,7 +95,7 @@ work_list="$(mktemp)"
 # the null arm, which is the arm that exists precisely because a check cannot be
 # trusted to report its own success correctly just because it reports failure
 # correctly.
-cleanup() { [ -n "$work" ] && rm -rf "$work"; rm -f "$work_list"; return 0; }
+cleanup() { [ -n "$work" ] && rm -rf "$work"; rm -f "$raw_list" "$sorted_list"; return 0; }
 trap cleanup EXIT
 
 # --- materialise the ref ----------------------------------------------------
@@ -202,6 +202,25 @@ materialise_ref() {
   tar -xzf "$tgz" -C "$work/tree" --no-same-owner --strip-components=1 \
     || die "the archive for $ref did not unpack — it is CORRUPT or truncated, which is
      a third thing again, and still not a clean comparison."
+  # NO SYMLINKS IN A MATERIALISED REF TREE (Tesla, round 5). The round-2 tar
+  # measurement refuted a member NAME containing `..` — both tars refuse it. It
+  # said nothing about a member that IS a symlink, and those extract fine:
+  # measured, a member `top/deploy -> /home/ubuntu/apps/aiko-chat-gateway/deploy`
+  # lands as a live link. The guard would then follow it (the walk is `find -L`),
+  # compare every box file to ITSELF, find no difference, and report CLEAN — a
+  # tarball of mirrors, and the most complete fail-open available against this
+  # design.
+  #
+  # The rule is absolute rather than a containment check because the fact makes
+  # it free: this repository's tag archive contains ZERO symlink members
+  # (measured against the real v0.11.0). So any symlink here means the tree is
+  # not what it claims to be, and no jail logic is needed to say so.
+  if find "$work/tree" -type l -print -quit 2>/dev/null | grep -q .; then
+    die "the archive for $ref contains SYMLINKS. This repository's tag archives
+     contain none, so this tree is not what it claims to be — and a link pointing
+     back at this box would make every comparison compare the box to itself and
+     report a match. Nothing was compared."
+  fi
   tree="$work/tree"
 }
 
@@ -344,6 +363,15 @@ compare_one() {
 # deploy actually runs from.
 compare_one "docker-compose.yml"
 
+# Staged, status-checked, then sorted into a second file — see the sweep note at
+# the walks below. Nothing in this script reads a stream whose producer's status
+# was thrown away.
+( cd "$tree" && find . -maxdepth 1 \( -name 'docker-compose*.yml' -o -name 'docker-compose*.yaml' \
+    -o -name 'compose*.yml' -o -name 'compose*.yaml' \) -print0 ) > "$raw_list" 2>/dev/null \
+  || die "could not list root compose files in the $ref tree. Nothing was compared."
+LC_ALL=C sort -z "$raw_list" > "$sorted_list" \
+  || die "could not sort the root compose listing. Nothing was compared."
+
 # EVERY ROOT-LEVEL COMPOSE FILE, not just the one — "the compose file" is a
 # convenient singular that docker does not share. Any other `docker-compose*.yml`
 # / `compose*.yml` the ref carries is compared on the same terms as a deploy file.
@@ -374,9 +402,7 @@ while IFS= read -r -d '' rel; do
   # sort does support -z, measured twice) and right about the class, and I put a
   # real instance of it one line away while rejecting the false one. Shell
   # parameter expansion is portable and needs no process.
-done < <(cd "$tree" && find . -maxdepth 1 \( -name 'docker-compose*.yml' -o -name 'docker-compose*.yaml' \
-           -o -name 'compose*.yml' -o -name 'compose*.yaml' \) -print0 2>/dev/null \
-         | LC_ALL=C sort -z)
+done < <(cat "$sorted_list")
 
 # THE ONE BOX-ONLY FILE THAT IS NOT IGNORABLE, and the only exception in this
 # script to "a file the ref does not carry is none of our business".
@@ -434,13 +460,20 @@ done
 # compose still matches, exit 0. A failed walk was indistinguishable from a clean
 # one, which is this file's signature failure committed by the walk that looks
 # for it. Staged to a file so the status is the terminal command's own.
-box_list="$work_list"
-( cd "$repo_root" && find -L deploy \( -type f -o -type l \) -print0 ) > "$box_list" 2>/dev/null \
+( cd "$repo_root" && find -L deploy \( -type f -o -type l \) -print0 ) > "$raw_list" 2>/dev/null \
   || die "could not walk deploy/ on this box (find failed). Nothing was compared."
+# THE SORT'S STATUS IS CHECKED TOO (Tesla, round 5 — the same class, one layer
+# in). Round 3 staged `find` to a file precisely so its status would be the
+# terminal command's own, and then poured that file through `< <(sort -z ...)`,
+# whose status bash discards exactly as before. A missing sort, a rejected flag,
+# a full disk: empty stream, no deploy file compared, compose already matched,
+# exit 0. The grounding was undone one line after it was added.
+LC_ALL=C sort -z "$raw_list" > "$sorted_list" \
+  || die "could not sort this box's deploy listing. Nothing was compared."
 while IFS= read -r -d '' rel; do
   [ -n "$rel" ] || continue
   compare_one "$rel"
-done < <(LC_ALL=C sort -z "$box_list")
+done < <(cat "$sorted_list")
 
 # Files the ref carries that this box does not. Warned, never refused.
 # REPORTED IN FULL, BUT GROUPED — a correction made twice, each time by running
@@ -461,8 +494,10 @@ done < <(LC_ALL=C sort -z "$box_list")
 # up to one line per subtree with a count; files beside something the box already
 # has are named individually, because those are the ones worth reading. Full
 # information, four lines instead of forty-nine.
-( cd "$tree" && find -L deploy \( -type f -o -type l \) -print0 ) > "$box_list" 2>/dev/null \
+( cd "$tree" && find -L deploy \( -type f -o -type l \) -print0 ) > "$raw_list" 2>/dev/null \
   || die "could not walk deploy/ in the $ref tree (find failed). Nothing was compared."
+LC_ALL=C sort -z "$raw_list" > "$sorted_list" \
+  || die "could not sort the $ref deploy listing. Nothing was compared."
 while IFS= read -r -d '' rel; do
   [ -n "$rel" ] || continue
   if [ ! -d "$repo_root/$(dirname "$rel")" ]; then
@@ -479,7 +514,7 @@ $(printf '%s' "$rel" | cut -d/ -f1-2)"
   # as present, leaving exactly one report, the refusal, which is the true one.
   _present "$repo_root/$rel" \
     || { absent="$absent $rel"; absent_n=$((absent_n + 1)); }
-done < <(LC_ALL=C sort -z "$box_list")
+done < <(cat "$sorted_list")
 
 if [ "$absent_n" -gt 0 ]; then
   warn "$ref carries $absent_n deploy file(s) BESIDE ones this box has — these sit in

@@ -71,6 +71,30 @@ def _run(box: Path, ref_tree: Path | None, ref: str = "v9.9.9", **env_extra):
     )
 
 
+# Every ambient input that changes what "compared against <ref>" MEANS. Three
+# are the guard's own seams; the fourth is the production selector update.sh
+# resolves. Enumerated in ONE place so a new one cannot be added to the script
+# without this list failing to match it.
+SEAMS = ("ISLAND_REF_TREE", "ISLAND_REPO_SLUG", "ISLAND_CODELOAD_BASE")
+
+
+def _clean_env(**overrides) -> dict:
+    """os.environ with EVERY seam removed, plus explicit overrides.
+
+    A positive control that inherits the ambient environment can be green for
+    the one reason it exists to rule out. That was caught for ISLAND_REF_TREE in
+    round 2 — and the fix scrubbed exactly that one name, leaving the other two
+    live for three more rounds (Tesla, round 5). An exported
+    ISLAND_CODELOAD_BASE would have made the live-fetch control pass without
+    ever reaching codeload.github.com.
+
+    Scrubbing is centralised here so the next seam is covered by construction
+    rather than by remembering to edit two call sites."""
+    env = {k: v for k, v in os.environ.items() if k not in SEAMS}
+    env.update(overrides)
+    return env
+
+
 def _compared_count(stdout: str) -> int:
     """The number of files the script says it compared, parsed as an INTEGER.
 
@@ -425,7 +449,7 @@ def _update_sh_code() -> str:
     return "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
 
 
-@pytest.mark.parametrize("seam", ["ISLAND_REF_TREE", "ISLAND_REPO_SLUG", "ISLAND_CODELOAD_BASE"])
+@pytest.mark.parametrize("seam", SEAMS)
 def test_update_sh_STRIPS_every_ambient_seam_before_invoking(seam) -> None:
     """All three seams, as a class (Tesla, cage-match round 3).
 
@@ -462,9 +486,8 @@ def test_the_real_fetch_resolves_a_real_tag(tmp_path) -> None:
     one reason it exists to rule out. The env is scrubbed explicitly, and the
     output is asserted to show a real comparison rather than only a tolerable
     exit code."""
-    env = {k: v for k, v in os.environ.items() if k != "ISLAND_REF_TREE"}
     result = subprocess.run(
-        [str(SCRIPT), str(REPO), "v0.11.0"], capture_output=True, text=True, env=env
+        [str(SCRIPT), str(REPO), "v0.11.0"], capture_output=True, text=True, env=_clean_env()
     )
     assert result.returncode in (CLEAN, DRIFT), (
         "the live fetch must resolve v0.11.0; CANNOT_LOOK here means the fetch path is "
@@ -496,12 +519,11 @@ def test_a_nonexistent_tag_over_the_WIRE_is_CANNOT_LOOK(tmp_path) -> None:
 
     This one asks the real server for a tag that cannot exist and requires the
     answer to be CANNOT_LOOK, naming the ref."""
-    env = {k: v for k, v in os.environ.items() if k != "ISLAND_REF_TREE"}
     result = subprocess.run(
         [str(SCRIPT), str(REPO), "v0.0.0-does-not-exist"],
         capture_output=True,
         text=True,
-        env=env,
+        env=_clean_env(),
     )
     assert result.returncode == CANNOT_LOOK, (
         "a 404 from the real server must not read as a clean comparison: "
@@ -823,8 +845,7 @@ def test_a_CORRUPT_archive_is_CANNOT_LOOK(tmp_path) -> None:
     box = _tree(tmp_path / "box", BASELINE)
     base, srv = _serve_once(tmp_path, b"this is definitely not a gzip stream")
     try:
-        env = {k: v for k, v in os.environ.items() if k != "ISLAND_REF_TREE"}
-        env["ISLAND_CODELOAD_BASE"] = base
+        env = _clean_env(ISLAND_CODELOAD_BASE=base)
         result = subprocess.run(
             [str(SCRIPT), str(box), "v1.2.3"], capture_output=True, text=True, env=env
         )
@@ -844,8 +865,7 @@ def test_a_500_from_the_server_is_CANNOT_LOOK_and_names_the_status(tmp_path) -> 
     box = _tree(tmp_path / "box", BASELINE)
     base, srv = _serve_once(tmp_path, b"nope", status=500)
     try:
-        env = {k: v for k, v in os.environ.items() if k != "ISLAND_REF_TREE"}
-        env["ISLAND_CODELOAD_BASE"] = base
+        env = _clean_env(ISLAND_CODELOAD_BASE=base)
         result = subprocess.run(
             [str(SCRIPT), str(box), "v1.2.3"], capture_output=True, text=True, env=env
         )
@@ -1000,4 +1020,150 @@ def test_a_DANGLING_root_compose_symlink_is_refused_not_called_absent(tmp_path) 
     assert result.returncode == DRIFT, (
         "a compose fragment resolving to nothing is a broken artifact, not an "
         "absent one: " + result.stdout + result.stderr
+    )
+
+
+def test_update_sh_resolves_the_ref_THE_WAY_COMPOSE_DOES() -> None:
+    """THE SELECTOR AND THE PULL MUST BE ONE COIL (Tesla, cage-match round 5).
+
+    Measured on the live box: `docker compose config` prefers the SHELL
+    ENVIRONMENT over `.env` — an exported variable beat the .env value outright.
+    Reading only `.env` meant an exported ISLAND_VERSION (direnv, a systemd
+    `Environment=`, a leftover export, or update.sh's own documented
+    `ISLAND_VERSION=v0.1.0 deploy/update.sh` pin path) made the guard fetch and
+    bless one tag while `docker compose pull` interpolated a different one.
+
+    New image, old compose, a printed clean comparison: the 2026-09-11 outage
+    wearing the interlock's own clothes.
+
+    A pin rather than a behavioural test — update.sh needs docker and a running
+    island — read against comment-stripped source, because the prose above the
+    code says the same words the code does."""
+    code = _update_sh_code()
+    env_first = code.index('drift_ref="${ISLAND_VERSION:-}"')
+    dotenv_next = code.index('dotenv_read "$REPO_ROOT/.env" ISLAND_VERSION')
+    assert env_first < dotenv_next, (
+        "the exported ISLAND_VERSION must be consulted BEFORE .env, because that "
+        "is the order compose itself resolves them in"
+    )
+
+
+def test_the_seam_list_matches_what_the_guard_actually_reads() -> None:
+    """THE CLASS, PINNED — not the three instances of it.
+
+    Four rounds running, a fix landed on one member of a family already named in
+    the commit message of the fix that named it: seams (ISLAND_REF_TREE fixed,
+    ISLAND_REPO_SLUG left), symlinks (files fixed, directories left), presence
+    (deploy/ fixed, root compose left), and the ambient selector itself
+    (ISLAND_VERSION, the production member of the seam family, left live for
+    three rounds after its test siblings were swept).
+
+    Knowing "fix the class, not the instance" did not fire the check any of
+    those times. This test is the mechanism instead of the intention: it reads
+    the guard for every ISLAND_* variable it consults and requires each one to
+    be in SEAMS and stripped by update.sh. Adding a new ambient input without
+    handling it turns this red."""
+    import re
+
+    script = (REPO / "deploy" / "preflight-compose-drift.sh").read_text()
+    code = "\n".join(ln for ln in script.splitlines() if not ln.lstrip().startswith("#"))
+    # Variables the guard READS from the environment, i.e. `${NAME` or `$NAME`
+    # in a defaulting position — not ones it merely assigns.
+    read_vars = set(re.findall(r'\$\{(ISLAND_[A-Z_]+)(?::-|:\+|\})', code))
+    read_vars |= set(re.findall(r'\[ -n "\$\{(ISLAND_[A-Z_]+):-\}"', code))
+    # ISLAND_VERSION is resolved by update.sh and passed in as an argument; the
+    # guard itself never reads it, so it is not expected here.
+    unhandled = read_vars - set(SEAMS)
+    assert not unhandled, (
+        f"the guard reads ambient variable(s) {sorted(unhandled)} that are not in "
+        f"SEAMS — so they are neither announced by the guard nor stripped by "
+        f"update.sh, and each one silently changes what a clean result means"
+    )
+    assert read_vars, "the detector found no seams at all; it has stopped measuring"
+
+
+def test_a_SYMLINK_MEMBER_in_the_archive_is_refused(tmp_path) -> None:
+    """THE TARBALL OF MIRRORS (Tesla, cage-match round 5).
+
+    The round-2 tar measurement refuted a member NAME containing `..` — both
+    tars refuse those. It said nothing about a member that IS a symlink, and
+    those extract fine: measured, `top/deploy -> <the box's own deploy>` lands
+    as a live link. The walk is `find -L`, so the guard would follow it, compare
+    every box file to ITSELF, find no difference, and report CLEAN. The most
+    complete fail-open this design admits.
+
+    Refused absolutely rather than jailed, because the fact makes it free: this
+    repository's real v0.11.0 archive contains ZERO symlink members (measured),
+    so any symlink means the tree is not what it claims to be.
+
+    Served locally, so real curl and real tar do the work."""
+    import io
+    import tarfile
+
+    box = _tree(tmp_path / "box", BASELINE)
+    victim = box / "deploy"
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        body = BASELINE["docker-compose.yml"].encode()
+        info = tarfile.TarInfo("top/docker-compose.yml")
+        info.size = len(body)
+        tar.addfile(info, io.BytesIO(body))
+        link = tarfile.TarInfo("top/deploy")
+        link.type = tarfile.SYMTYPE
+        link.linkname = str(victim)  # point the ref's deploy/ at the BOX's own
+        tar.addfile(link)
+
+    base, srv = _serve_once(tmp_path, buf.getvalue())
+    try:
+        result = subprocess.run(
+            [str(SCRIPT), str(box), "v1.2.3"],
+            capture_output=True,
+            text=True,
+            env=_clean_env(ISLAND_CODELOAD_BASE=base),
+        )
+    finally:
+        srv.shutdown()
+
+    assert result.returncode == CANNOT_LOOK, (
+        "a ref tree whose deploy/ is a symlink to the box would compare the box "
+        "to itself and report a match: " + result.stdout + result.stderr
+    )
+    assert "SYMLINK" in result.stderr.upper(), result.stderr
+
+
+def test_a_BROKEN_sort_is_CANNOT_LOOK_not_CLEAN(tmp_path) -> None:
+    """THE LAST DISCARDED STATUS, armed (Tesla, cage-match round 5).
+
+    Round 3 staged `find` to a file precisely so its exit status would be the
+    terminal command's own — and then poured that file through
+    `done < <(sort -z ...)`, whose status bash discards exactly as before. The
+    grounding was undone one line after it was added. A missing sort, a rejected
+    flag, a full disk: empty stream, no deploy file compared, compose already
+    matched, exit 0.
+
+    Forced by shadowing `sort` with a stub that fails, which is the cheapest
+    real way to make that branch happen. Without the status checks this returns
+    CLEAN — mutation-checked."""
+    box = _tree(tmp_path / "box", BASELINE)
+    tag = _tree(tmp_path / "tag", BASELINE)
+
+    stubdir = tmp_path / "stub"
+    stubdir.mkdir()
+    stub = stubdir / "sort"
+    stub.write_text("#!/bin/sh\nexit 1\n")
+    stub.chmod(0o755)
+
+    env = _clean_env(
+        ISLAND_REF_TREE=str(tag),
+        PATH=f"{stubdir}:{os.environ.get('PATH', '')}",
+    )
+    result = subprocess.run(
+        [str(SCRIPT), str(box), "v9.9.9"], capture_output=True, text=True, env=env
+    )
+
+    assert result.returncode == CANNOT_LOOK, (
+        "a walk whose sort failed compared nothing, and must not say clean: "
+        + result.stdout
+        + result.stderr
     )
