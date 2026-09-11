@@ -47,7 +47,7 @@ from ..config import settings
 from ..domain import acl, livekit_rooms, livekit_tokens, moderation_service
 from ..domain.models import Membership
 from ..domain.rate_limit import rate_limit
-from .deps import CurrentUser, DbSession
+from .deps import CurrentUser, DbSession, rate_limit_user
 
 log = logging.getLogger("aiko_gateway.video")
 
@@ -197,20 +197,40 @@ async def create_video_token(
     )
 
 
-# The ring polls this for the length of a ring. The app tab's spec is ~1/s bounded by a
-# 30s ring = up to 30 requests per ring per party, and caller and callee are frequently
-# behind ONE NAT (same house, same office), so a shared-IP ring costs up to ~60. The auth
-# default of 20/60s would 429 a legitimate call partway through ringing — which the app
-# would most likely surface as the call dying for no reason. 150/60s carries two parties
-# at 1/s with headroom for a retry and a second concurrent ring, while still bounding an
-# abusive client to a read that costs one indexed DB lookup plus one ~175ms SFU call.
-_OCCUPANCY_LIMIT_PER_WINDOW = 150
+# TWO BOUNDS, BECAUSE ONE KEY CANNOT DO BOTH JOBS (part A item 2, decided with Nick
+# 2026-09-12). The app polls this ~1/s for the length of a ring: 30 requests per ring
+# per party.
+#
+# PER USER — the bound a legitimate ring must never touch. 90/60s carries three full
+# 30s rings in one minute for one person, which is already well past ordinary use
+# (ring, give up, ring again, ring again), so a real caller cannot reach it.
+#
+#     3 rings x 30 polls = 90
+#
+# The earlier version of this endpoint had ONE bound, keyed on IP at 150/60s, and that
+# number existed only because caller and callee are frequently behind ONE NAT and so
+# shared a budget. Keying an AUTHENTICATED read on the caller removes that sharing
+# rather than sizing around it: two people in one house now have two budgets.
+#
+# PER IP — the ceiling only a spray can reach, kept because per-user keying widens the
+# per-address blast radius (one IP holding N accounts holds N budgets). 600/60s is far
+# above any honest household — six simultaneous ringing parties behind one NAT — while
+# still bounding an account-farm to roughly what the single old bound allowed.
+#
+# ORDER MATTERS AND IS NOT ACCIDENTAL: the user bound is listed first so an
+# authenticated caller's own budget is what normally rejects them, with a 429 they can
+# act on. Both are consulted; a request must satisfy both.
+_OCCUPANCY_LIMIT_PER_USER = 90
+_OCCUPANCY_LIMIT_PER_IP = 600
 
 
 @router.get(
     "/channels/{channel_id}/call",
     response_model=CallOccupancyResponse,
-    dependencies=[rate_limit("call_occupancy", limit=_OCCUPANCY_LIMIT_PER_WINDOW)],
+    dependencies=[
+        rate_limit_user("call_occupancy_user", limit=_OCCUPANCY_LIMIT_PER_USER),
+        rate_limit("call_occupancy", limit=_OCCUPANCY_LIMIT_PER_IP),
+    ],
 )
 async def get_call_occupancy(
     channel_id: str, user: CurrentUser, session: DbSession, response: Response

@@ -33,6 +33,7 @@ from aiko_gateway.config import settings
 from aiko_gateway.domain import (
     livekit_rooms, livekit_tokens, moderation_service, security, users_service,
 )
+from aiko_gateway.domain import rate_limit as rate_limit_module
 from aiko_gateway.domain.models import Channel, Membership
 from aiko_gateway.rest import livekit as livekit_routes
 from aiko_gateway.rest.deps import get_session
@@ -777,3 +778,159 @@ async def test_the_gates_still_ran_before_that_release(
 
     resp = await client.get(f"/v1/channels/{ch.id}/call", headers=_headers(outsider))
     assert resp.status_code == 404
+
+
+# ---- item 2: the poll's budget was keyed on something two callers SHARE ----
+#
+# Decided with Nick 2026-09-12. The finding was "a rate-limited poll returns 429, a
+# different client code path from the 503 that means the same thing operationally".
+# The fix is not to relabel the 429 — that would throw away Retry-After and make an
+# abuse signal indistinguishable from an SFU outage. It is to notice that the only
+# reason a REAL ring could ever reach the limit was a key two callers share.
+
+@pytest.fixture
+def limiting(monkeypatch):
+    """Turn the limiter on and give each test a clean window set."""
+    monkeypatch.setattr(settings, "rate_limit_enabled", True)
+    rate_limit_module.limiter.reset()
+    yield
+    rate_limit_module.limiter.reset()
+
+
+async def _poll(client, user, channel_id, ip):
+    return await client.get(
+        f"/v1/channels/{channel_id}/call",
+        headers={**_headers(user), "x-forwarded-for": ip})
+
+
+async def test_two_callers_behind_one_nat_no_longer_share_a_budget(
+    client, session, monkeypatch, livekit_configured, limiting
+):
+    """THE POINT OF THE WHOLE CHANGE. Caller and callee in one house polled at each
+    other through a single public IP and spent one budget between them, so the budget
+    had to be widened until a legitimate ring fitted underneath it.
+
+    80 polls each is 160 through one address — comfortably past the old single per-IP
+    bound of 150, and comfortably inside both new bounds (80 < 90 per user, 160 < 600
+    per IP). Nobody is throttled, because nobody is sharing.
+
+    MUTATION: restore the single `rate_limit("call_occupancy", limit=150)` dependency
+    -> the 150th request through this address 429s and this goes red.
+    """
+    alice, peer = await _user(session, "alice"), await _user(session, "peer")
+    ch = await _dm(session)
+    await _join(session, ch, alice)
+    await _join(session, ch, peer)
+    _fake_sfu(monkeypatch, _responds({"participants": []}))
+
+    for _ in range(80):
+        assert (await _poll(client, alice, ch.id, "203.0.113.7")).status_code == 200
+        assert (await _poll(client, peer, ch.id, "203.0.113.7")).status_code == 200
+
+
+async def test_one_caller_past_their_own_budget_is_still_throttled(
+    client, session, monkeypatch, livekit_configured, limiting
+):
+    """POSITIVE CONTROL for the per-user bound: removing a coupling must not remove the
+    limit. 90 carries three full 30s rings in a minute; the 91st is refused, and with a
+    Retry-After the caller can act on rather than a relabelled 503.
+
+    MUTATION: delete the `rate_limit_user` dependency -> no 429 ever arrives, red.
+    """
+    alice, peer = await _user(session, "alice"), await _user(session, "peer")
+    ch = await _dm(session)
+    await _join(session, ch, alice)
+    await _join(session, ch, peer)
+    _fake_sfu(monkeypatch, _responds({"participants": []}))
+
+    for _ in range(90):
+        assert (await _poll(client, alice, ch.id, "203.0.113.8")).status_code == 200
+    refused = await _poll(client, alice, ch.id, "203.0.113.8")
+    assert refused.status_code == 429
+    assert int(refused.headers["retry-after"]) >= 1
+
+
+async def test_the_same_caller_from_a_new_address_is_still_throttled(
+    client, session, monkeypatch, livekit_configured, limiting
+):
+    """The user bound must not be escapable by moving networks — otherwise "keyed on
+    the user" would be decoration and the real key would still be the address.
+
+    MUTATION: key `rate_limit_user` on client_ip instead of user.id -> rotating the
+    address mints a fresh budget and this goes red.
+    """
+    alice, peer = await _user(session, "alice"), await _user(session, "peer")
+    ch = await _dm(session)
+    await _join(session, ch, alice)
+    await _join(session, ch, peer)
+    _fake_sfu(monkeypatch, _responds({"participants": []}))
+
+    for _ in range(90):
+        assert (await _poll(client, alice, ch.id, "203.0.113.9")).status_code == 200
+    assert (await _poll(client, alice, ch.id, "198.51.100.4")).status_code == 429
+
+
+async def test_both_bounds_are_actually_consulted(
+    client, session, monkeypatch, livekit_configured, limiting
+):
+    """The per-IP ceiling exists because per-user keying WIDENS the per-address blast
+    radius — one IP holding N accounts now holds N budgets. Exercising 600 requests to
+    prove it fires would be a slow test of an arithmetic constant; what actually needs
+    pinning is that the second bound is WIRED, since a dropped dependency is silent and
+    looks exactly like a passing suite.
+
+    So this reads the limiter's own state after ONE request and asserts both keys were
+    touched — the user key and the address key.
+
+    MUTATION: delete either dependency from the route -> its key is absent, red.
+    """
+    alice, peer = await _user(session, "alice"), await _user(session, "peer")
+    ch = await _dm(session)
+    await _join(session, ch, alice)
+    await _join(session, ch, peer)
+    _fake_sfu(monkeypatch, _responds({"participants": []}))
+
+    assert (await _poll(client, alice, ch.id, "203.0.113.10")).status_code == 200
+
+    keys = set(rate_limit_module.limiter._windows)
+    assert ("call_occupancy_user", f"u:{alice.id}") in keys, keys
+    assert ("call_occupancy", "203.0.113.10") in keys, keys
+
+
+async def test_an_unauthenticated_poll_spends_nobody_s_user_budget(
+    client, session, monkeypatch, livekit_configured, limiting
+):
+    """NULL CONTROL on ordering. `rate_limit_user` depends on `get_current_user`, so a
+    request with no valid token is rejected as 401 and never reaches the limiter with
+    some fabricated key.
+
+    MUTATION: key the user bound on a nullable user -> a 401 request writes a window
+    and this goes red.
+    """
+    ch = await _dm(session)
+    resp = await client.get(f"/v1/channels/{ch.id}/call",
+                            headers={"x-forwarded-for": "203.0.113.11"})
+    assert resp.status_code == 401
+    assert not any(b == "call_occupancy_user"
+                   for b, _ in rate_limit_module.limiter._windows), \
+        rate_limit_module.limiter._windows
+
+
+async def test_the_limiter_switch_still_disables_both_bounds(
+    client, session, monkeypatch, livekit_configured
+):
+    """NULL CONTROL for the fixture: `rate_limit_enabled=False` must silence the new
+    user-keyed bound too, or the suite's own switch would be lying.
+
+    MUTATION: drop the `rate_limit_enabled` check from `rate_limit_user` -> red.
+    """
+    monkeypatch.setattr(settings, "rate_limit_enabled", False)
+    rate_limit_module.limiter.reset()
+    alice, peer = await _user(session, "alice"), await _user(session, "peer")
+    ch = await _dm(session)
+    await _join(session, ch, alice)
+    await _join(session, ch, peer)
+    _fake_sfu(monkeypatch, _responds({"participants": []}))
+
+    for _ in range(95):                      # past the per-user bound of 90
+        assert (await _poll(client, alice, ch.id, "203.0.113.12")).status_code == 200
