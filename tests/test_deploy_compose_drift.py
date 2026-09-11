@@ -340,6 +340,72 @@ def test_a_newline_in_a_filename_does_not_split_the_walk(tmp_path) -> None:
     )
 
 
+def test_a_bare_version_is_normalised_to_a_tag(tmp_path) -> None:
+    """`ISLAND_VERSION=0.11.0` on both live boxes; the git tag is `v0.11.0`.
+
+    That rewrite is on the path of EVERY real deploy and used to live inline in
+    update.sh, where nothing could drive it (Tesla, cage-match round 2). Delete
+    the arm and every deploy 404s into "could not look"; worse, a later change
+    that treats 404 as an empty tree turns it CLEAN. Here it is one line with one
+    test."""
+    box = _tree(tmp_path / "box", BASELINE)
+    tag = _tree(tmp_path / "tag", BASELINE)
+
+    result = _run(box, tag, ref="0.11.0")
+
+    assert result.returncode == CLEAN, result.stderr
+    assert "v0.11.0" in result.stdout, (
+        "a bare version must be reported as the TAG it will be resolved as, not as "
+        "the string the operator typed: " + result.stdout
+    )
+
+
+def test_a_branch_ref_is_NOT_given_a_v_prefix(tmp_path) -> None:
+    """The must-not-fire half of the same rule. `edge` is update.sh's documented
+    default and tracks main; rewriting it to `vedge` would 404 every unpinned
+    box. A normaliser with no arm proving what it LEAVES ALONE is half-tested."""
+    box = _tree(tmp_path / "box", BASELINE)
+    tag = _tree(tmp_path / "tag", BASELINE)
+
+    result = _run(box, tag, ref="edge")
+
+    assert result.returncode == CLEAN, result.stderr
+    assert "vedge" not in result.stdout + result.stderr, result.stdout
+
+
+def test_the_local_tree_seam_announces_itself(tmp_path) -> None:
+    """ISLAND_REF_TREE substitutes a local directory for the fetched tag, and an
+    ambient variable that silently redefines what a check MEANS is the worst
+    shape this seam could have (Carnot, cage-match round 2): the run still prints
+    "N file(s) compared against v0.11.0" while having compared against whatever
+    was lying around. update.sh strips it so the deploy path cannot reach it at
+    all; every other caller must be told."""
+    box = _tree(tmp_path / "box", BASELINE)
+    tag = _tree(tmp_path / "tag", BASELINE)
+
+    result = _run(box, tag)
+
+    assert result.returncode == CLEAN, result.stderr
+    assert "ISLAND_REF_TREE" in result.stderr, (
+        "the seam must name itself in the output, or a local-tree comparison is "
+        "indistinguishable from a real tag comparison: " + result.stderr
+    )
+
+
+def test_update_sh_STRIPS_the_local_tree_seam_before_invoking() -> None:
+    """Regression pin, same honest caveat as the fail-closed pin above: a textual
+    instrument reading the file a textual edit would change.
+
+    Pinned because the defect is silent and total — an ISLAND_REF_TREE inherited
+    from a host environment would make every deploy compare the box against a
+    stale local tree and report clean, while still printing the tag's name."""
+    update_sh = (REPO / "deploy" / "update.sh").read_text()
+    assert "env -u ISLAND_REF_TREE" in update_sh, (
+        "update.sh must strip ISLAND_REF_TREE before invoking the guard, so the "
+        "deploy path structurally cannot compare against a local tree"
+    )
+
+
 @pytest.mark.skipif(
     os.environ.get("ISLAND_SKIP_NETWORK_TESTS") == "1" or shutil.which("curl") is None,
     reason="needs outbound network to codeload.github.com",
@@ -352,12 +418,15 @@ def test_the_real_fetch_resolves_a_real_tag(tmp_path) -> None:
     island box takes: resolve v0.11.0 from the public repo over the wire, and
     compare THIS checkout against it.
 
-    The assertion is deliberately only on the exit status being a status the
-    script defines — the working tree may legitimately differ from v0.11.0 — but
-    it must not be a crash, and it must not be CANNOT_LOOK, which is what a broken
-    fetch would produce."""
+    THE CONTROL'S OWN VALIDITY (Tesla, cage-match round 2): an earlier version
+    inherited the ambient environment, so a leaked ISLAND_REF_TREE would have
+    made it pass WITHOUT EVER FETCHING — a positive control that is green for the
+    one reason it exists to rule out. The env is scrubbed explicitly, and the
+    output is asserted to show a real comparison rather than only a tolerable
+    exit code."""
+    env = {k: v for k, v in os.environ.items() if k != "ISLAND_REF_TREE"}
     result = subprocess.run(
-        [str(SCRIPT), str(REPO), "v0.11.0"], capture_output=True, text=True
+        [str(SCRIPT), str(REPO), "v0.11.0"], capture_output=True, text=True, env=env
     )
     assert result.returncode in (CLEAN, DRIFT), (
         "the live fetch must resolve v0.11.0; CANNOT_LOOK here means the fetch path is "
@@ -365,6 +434,43 @@ def test_the_real_fetch_resolves_a_real_tag(tmp_path) -> None:
         + result.stdout
         + result.stderr
     )
+    assert "ISLAND_REF_TREE" not in result.stderr, "the seam leaked into the control"
+    # It must have actually COMPARED something. A fetch that yields an empty tree
+    # now dies, but asserting the count keeps this control bound to real work
+    # rather than to a tolerable exit code.
+    assert "file(s) compared against v0.11.0" in result.stdout, result.stdout
+    compared = int(result.stdout.split(" file(s) compared")[0].split(": ")[-1])
+    assert compared > 3, f"only {compared} files compared against the real tag"
+
+
+@pytest.mark.skipif(
+    os.environ.get("ISLAND_SKIP_NETWORK_TESTS") == "1" or shutil.which("curl") is None,
+    reason="needs outbound network to codeload.github.com",
+)
+def test_a_nonexistent_tag_over_the_WIRE_is_CANNOT_LOOK(tmp_path) -> None:
+    """THE MUST-FAIL ARM FOR THE FETCH PATH (Tesla, cage-match round 2).
+
+    The unresolvable-ref arm above closes the network seam, so it proves only
+    that a missing DIRECTORY is handled — it never touches curl, an HTTP status,
+    or the 404 branch. Those are the lines whose whole job is to keep "this ref
+    does not exist" from being spelled the way "the trees match" is spelled, and
+    nothing was driving them.
+
+    This one asks the real server for a tag that cannot exist and requires the
+    answer to be CANNOT_LOOK, naming the ref."""
+    env = {k: v for k, v in os.environ.items() if k != "ISLAND_REF_TREE"}
+    result = subprocess.run(
+        [str(SCRIPT), str(REPO), "v0.0.0-does-not-exist"],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.returncode == CANNOT_LOOK, (
+        "a 404 from the real server must not read as a clean comparison: "
+        + result.stdout
+        + result.stderr
+    )
+    assert "v0.0.0-does-not-exist" in result.stderr, result.stderr
 
 
 def test_update_sh_FAILS_CLOSED_when_the_guard_is_missing() -> None:

@@ -54,6 +54,15 @@ ref="${2:?usage: preflight-compose-drift.sh <repo-root> <ref>}"
 [ -d "$repo_root" ] || die "repo root not found: $repo_root"
 repo_root="$(cd "$repo_root" && pwd)"
 
+# NORMALISE HERE, NOT AT THE CALL SITE (Tesla, cage-match round 2). Both live
+# boxes' .env reads `ISLAND_VERSION=0.11.0` while the git tag is `v0.11.0` — the
+# image registry accepts the bare form, git does not. That rewrite is on the path
+# of EVERY real deploy, and inline in update.sh it could not be driven by a test:
+# delete the arm and every deploy 404s into "could not look", or worse, a later
+# "helpful" change turns 404 into "empty tree" and it reads CLEAN. One place, one
+# test. `edge` and `main` are branch names and pass through untouched.
+case "$ref" in [0-9]*) ref="v$ref" ;; esac
+
 # Overridable so a fork, or a rename, does not silently compare against someone
 # else's tree. Public repo: no credential is involved, and none should be — a
 # preflight that needs a token is a preflight that fails on the box that lost one.
@@ -94,6 +103,18 @@ materialise_ref() {
     [ -d "$ISLAND_REF_TREE" ] \
       || die "ISLAND_REF_TREE is set to '$ISLAND_REF_TREE' but that directory does not exist.
      Nothing was compared. Unset it to fetch $ref from $slug instead."
+    # IT MUST ANNOUNCE ITSELF (Carnot, round 2). An ambient variable that silently
+    # redefines what the check MEANS is the worst possible shape for this seam: the
+    # run still prints "N file(s) compared against v0.11.0" while having compared
+    # against whatever an inherited variable pointed at. That is the difference
+    # between "I compared this box to the tag" and "I compared it to something" —
+    # the exact epistemic collapse the exit codes exist to prevent, smuggled in
+    # through the environment instead of through a code path. update.sh strips the
+    # variable before invoking, so the deploy path cannot reach here at all; this
+    # warning is for every other caller.
+    warn "ISLAND_REF_TREE is set — comparing against the LOCAL TREE '$ISLAND_REF_TREE',
+     NOT against $ref from $slug. A clean result below says nothing about the tag
+     this box would actually deploy."
     tree="$(cd "$ISLAND_REF_TREE" && pwd)"
     return 0
   fi
@@ -116,7 +137,17 @@ materialise_ref() {
   # -w for the status, NOT -f: -f makes curl exit non-zero and discard the body,
   # collapsing 403/404/500 into one unusable signal. Errors go to a file so a curl
   # failure (DNS, TLS, timeout) is reported as ERROR rather than as absence.
-  if ! code="$(curl -sS -L --max-time 60 -o "$tgz" -w '%{http_code}' \
+  # --proto/--proto-redir '=https': `-L` alone will happily follow a redirect from
+  # https to PLAIN HTTP, which turns a TLS-protected fetch into an unauthenticated
+  # one at the exact moment its bytes decide whether a production island deploys.
+  # --max-redirs bounds the chase; --max-filesize bounds the body, because the
+  # next thing that happens to it is tar. (Tesla, round 2. Its companion claim —
+  # path traversal through `--strip-components` — is REFUTED by measurement: a
+  # member named `top/../../../escaped.txt` is refused by bsdtar AND GNU tar, and
+  # both exit non-zero, so the `|| die` below already fires. Measured on macOS 15
+  # and on the live Ubuntu box rather than reasoned about.)
+  if ! code="$(curl -sS -L --proto '=https' --proto-redir '=https' --max-redirs 3 \
+        --max-filesize 100000000 --max-time 60 -o "$tgz" -w '%{http_code}' \
         "https://codeload.github.com/$slug/tar.gz/$path" 2>"$work/curl.err")"; then
     die "could not reach codeload.github.com to fetch $ref — the NETWORK failed, so
      nothing is known about this box's deploy tree. This is not a clean result.
@@ -132,7 +163,10 @@ materialise_ref() {
   mkdir -p "$work/tree"
   # --strip-components=1: the archive's single top directory is named for the repo
   # and the ref, which is not a name anything downstream should have to know.
-  tar -xzf "$tgz" -C "$work/tree" --strip-components=1 \
+  # --no-same-owner: never let archive metadata pick the uid on a host where this
+  # may run under sudo. (Default for non-root, explicit because the deploy user is
+  # not always the one you think.)
+  tar -xzf "$tgz" -C "$work/tree" --no-same-owner --strip-components=1 \
     || die "the archive for $ref did not unpack — it is CORRUPT or truncated, which is
      a third thing again, and still not a clean comparison."
   tree="$work/tree"
@@ -225,6 +259,15 @@ compare_one "docker-compose.yml"
 # compares against its target; a BROKEN one fails `[ -f ]` and is reported as
 # drift, which is the right answer for a deploy file pointing at nothing.
 #
+# `-L` (Carnot, round 2): the round-1 symlink fix covered symlinked FILES and not
+# symlinked DIRECTORIES, which is the worse half. `deploy/lib -> /opt/island/lib`
+# is listed by `-type l` and never TRAVERSED, so `deploy/lib/dotenv-read.sh` — the
+# single reader for every .env value these scripts touch — is neither compared nor
+# warned about, because the ref-side absent check follows the link and sees it
+# present. Measured: without -L the walk yields `deploy/lib`; with -L it yields
+# `deploy/lib/dotenv-read.sh`. A fix that closed the narrow case and left the wide
+# one open is worse than none, because it reads as done.
+#
 # -print0 / read -d '' (Kelvin): a newline in a filename splits one path into two
 # in a line-oriented read, and the halves silently miss their comparison. Nothing
 # in this repo carries one today, which is the same "today" that produced the
@@ -232,21 +275,36 @@ compare_one "docker-compose.yml"
 while IFS= read -r -d '' rel; do
   [ -n "$rel" ] || continue
   compare_one "$rel"
-done < <(cd "$repo_root" && find deploy \( -type f -o -type l \) -print0 2>/dev/null | LC_ALL=C sort -z)
+done < <(cd "$repo_root" && find -L deploy \( -type f -o -type l \) -print0 2>/dev/null | LC_ALL=C sort -z)
 
 # Files the ref carries that this box does not. Warned, never refused.
-# SCOPED TO DIRECTORIES THE BOX ACTUALLY HAS, and that is a correction made by
-# running this against the real islands rather than a fixture: unscoped, it named
-# 49 files on both boxes. deploy/media/, deploy/caddy/, deploy/livekit/ and
-# deploy/secrets/ are separate stacks a gateway box has never carried, so listing
-# them is not information, it is the wall of text an operator learns to skip —
-# the same reason box-only .bak files are ignored. A file whose DIRECTORY exists
-# here is a genuine "the tag added something beside what you have"; a whole
-# subtree that has never been here is somebody else's deploy.
-absent=""; absent_n=0
+# REPORTED IN FULL, BUT GROUPED — a correction made twice, each time by running
+# this against the real islands rather than a fixture.
+#
+# First pass listed every absent file: 49 of them on both boxes, because
+# deploy/media/, deploy/caddy/, deploy/livekit/ and deploy/secrets/ are separate
+# stacks a gateway box has never carried. That is not information, it is the wall
+# of text an operator learns to skip.
+#
+# Second pass suppressed any file whose DIRECTORY is absent here — which cut it to
+# 4, and opened a new hole Tesla named in round 2: a tag adding
+# `deploy/hooks/new-guard.sh` creates a directory the box has never had, so the
+# one genuinely new thing would be the one thing silently dropped. Filtering by
+# what the box already knows about cannot report what the box has never seen.
+#
+# So nothing is dropped now. Files in a subtree the box lacks entirely are rolled
+# up to one line per subtree with a count; files beside something the box already
+# has are named individually, because those are the ones worth reading. Full
+# information, four lines instead of forty-nine.
+absent=""; absent_n=0; absent_rollup=""
 while IFS= read -r -d '' rel; do
   [ -n "$rel" ] || continue
-  [ -d "$repo_root/$(dirname "$rel")" ] || continue
+  if [ ! -d "$repo_root/$(dirname "$rel")" ]; then
+    # A subtree this box has never carried. Counted and rolled up, never dropped.
+    absent_rollup="$absent_rollup
+$(printf '%s' "$rel" | cut -d/ -f1-2)"
+    continue
+  fi
   # `-e || -L`, from the fix-interaction pass rather than from a failing test.
   # `-e` follows the link, so a BROKEN symlink reads as absent here — while the
   # compare walk above now enumerates `-type l` and reports that same file as
@@ -255,12 +313,24 @@ while IFS= read -r -d '' rel; do
   # as present, leaving exactly one report, the refusal, which is the true one.
   { [ -e "$repo_root/$rel" ] || [ -L "$repo_root/$rel" ]; } \
     || { absent="$absent $rel"; absent_n=$((absent_n + 1)); }
-done < <(cd "$tree" && find deploy \( -type f -o -type l \) -print0 2>/dev/null | LC_ALL=C sort -z)
+done < <(cd "$tree" && find -L deploy \( -type f -o -type l \) -print0 2>/dev/null | LC_ALL=C sort -z)
 
 if [ "$absent_n" -gt 0 ]; then
-  warn "$ref carries $absent_n deploy file(s) this box does not — expected for a box
-     that only ever needed a subset, but worth a glance if one of them is new:
+  warn "$ref carries $absent_n deploy file(s) BESIDE ones this box has — these sit in
+     directories the box already uses, so a new one is worth a look:
     $absent"
+fi
+if [ -n "$absent_rollup" ]; then
+  # One line per never-carried subtree with its count. The rollup is what keeps
+  # this honest without being unreadable: a brand-new `deploy/hooks/` shows up as
+  # its own line the first time it appears, rather than being filtered out for the
+  # crime of being new.
+  rollup_lines="$(printf '%s' "$absent_rollup" | grep -v '^$' | LC_ALL=C sort | uniq -c \
+    | awk '{printf "     %s/ (%s file(s))\n", $2, $1}')"
+  warn "$ref also carries these deploy SUBTREES this box has never had (normal for a
+     gateway box — media/caddy/livekit/secrets belong to other stacks — but a name
+     you do not recognise here is new):
+$rollup_lines"
 fi
 
 # THE COUNT IS NOT COSMETIC. Every green path above would also be green if this

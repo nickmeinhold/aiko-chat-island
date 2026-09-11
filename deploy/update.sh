@@ -147,14 +147,20 @@ elif [ -f "$SCRIPT_DIR/preflight-compose-drift.sh" ]; then
   . "$SCRIPT_DIR/lib/dotenv-read.sh"
   drift_ref="$(dotenv_read "$REPO_ROOT/.env" ISLAND_VERSION)"
   [ -n "$drift_ref" ] || drift_ref="edge"
-  # .env carries `ISLAND_VERSION=0.11.0` on BOTH live boxes while the git tag is
-  # `v0.11.0` — the image registry accepts the bare form and git does not. Measured,
-  # not assumed; without this every real deploy would resolve a 404 and read as
-  # "this ref does not exist" when the ref is fine and the spelling is ours.
-  case "$drift_ref" in [0-9]*) drift_ref="v$drift_ref" ;; esac
+  # The bare-version -> tag rewrite (`0.11.0` -> `v0.11.0`, which both live boxes
+  # need) lives INSIDE the guard now, where a test can drive it — it used to sit
+  # here, on the path of every real deploy, untestable (Tesla, cage-match round 2).
 
   set +e
-  "$SCRIPT_DIR/preflight-compose-drift.sh" "$REPO_ROOT" "$drift_ref"
+  # `env -u ISLAND_REF_TREE` (Carnot, cage-match round 2). That variable is the
+  # guard's offline/test seam: it substitutes a local directory for the fetched
+  # tag. Inherited from a host environment it would make the deploy path compare
+  # the box against some stale local tree and report clean, while still printing
+  # the tag's name — "I compared this box to v0.11.0" and "I compared it to
+  # whatever was lying around" become the same sentence. Stripping it here makes
+  # that unreachable from a deploy rather than merely unlikely; the guard also
+  # warns loudly if any other caller has it set.
+  env -u ISLAND_REF_TREE "$SCRIPT_DIR/preflight-compose-drift.sh" "$REPO_ROOT" "$drift_ref"
   drift_rc=$?
   set -e
   case "$drift_rc" in
