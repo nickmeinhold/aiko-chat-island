@@ -225,16 +225,36 @@ async def create_video_token(
 # a ceiling must be priced in the units it actually bounds, or the next person to tune
 # it tunes it against households instead of against the SFU.
 #
-# ORDER MATTERS, AND THE FIRST VERSION HAD IT BACKWARDS. The IP bound is listed FIRST
-# because it is the CHEAP one: `rate_limit` reads only the Request, while
-# `rate_limit_user` depends on `get_current_user`, which resolves a session and queries
-# SQLite. FastAPI resolves `dependencies=[...]` in order and stops at the first that
-# raises, so user-first made every request — including the ones about to be refused —
-# pay a session-resolution query BEFORE any limiter spoke. A rate limiter exists to
-# make abuse CHEAP to refuse; that ordering made it more expensive, on the single
-# uvicorn worker over file-backed SQLite this PR's first finding was about protecting.
-# The earlier comment defended user-first as giving "a 429 they can act on"; both
-# bounds emit a byte-identical 429 with a Retry-After, so that bought nothing.
+# ORDER MATTERS: the USER bound is first, and the round-4 change that put the IP bound
+# first was WRONG and is reverted here. Both halves of that story are worth keeping,
+# because the wrong version was argued for convincingly.
+#
+# The round-4 argument was: `rate_limit` reads only the Request while `rate_limit_user`
+# depends on `get_current_user`, which resolves a session and queries SQLite — so
+# user-first makes "every request, including the ones about to be refused, pay a DB
+# lookup before any limiter speaks". That premise was never measured. Measured
+# (2026-09-12), an unauthenticated request under each ordering:
+#
+#     user-first : 401, sequence = []                      <- nothing charged, no session
+#     IP-first   : 401, sequence = ['IP BUCKET CHARGED']
+#
+# `HTTPBearer(auto_error=True)` raises before `get_session` is ever resolved, so an
+# unauthenticated request costs nothing under EITHER ordering. Only AUTHENTICATED
+# requests pay the session query — and they must, to be authenticated at all. The
+# defect the reordering was meant to fix did not exist.
+#
+# What the reordering DID do was let unauthenticated traffic spend the authenticated
+# ring's budget: with the IP bound first, 600 junk requests from one address 429 the
+# real users behind that NAT (cage-match #167 r5, Carnot). A fix for a measured-absent
+# problem, introducing a real one, one round later.
+#
+# WHAT THE IP CEILING COSTS, not only what it permits. Every admitted poll is one
+# ListParticipants round trip, so this ceiling also bounds island->SFU traffic from one
+# address: 10/s, up from the old single bound's 2.5/s. Reaching it is account-farm-gated
+# rather than open — the per-user bound is 90, so 600 needs >=7 distinct authenticated
+# accounts each holding a real DM with a non-blocking peer — but a ceiling must be
+# priced in the units it actually bounds, or the next person to tune it tunes it against
+# households instead of against the SFU.
 _OCCUPANCY_LIMIT_PER_USER = 90
 _OCCUPANCY_LIMIT_PER_IP = 600
 
@@ -243,8 +263,8 @@ _OCCUPANCY_LIMIT_PER_IP = 600
     "/channels/{channel_id}/call",
     response_model=CallOccupancyResponse,
     dependencies=[
-        rate_limit("call_occupancy", limit=_OCCUPANCY_LIMIT_PER_IP),
         rate_limit_user("call_occupancy_user", limit=_OCCUPANCY_LIMIT_PER_USER),
+        rate_limit("call_occupancy", limit=_OCCUPANCY_LIMIT_PER_IP),
     ],
 )
 async def get_call_occupancy(
