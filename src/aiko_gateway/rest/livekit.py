@@ -3,6 +3,12 @@
 ``POST /v1/channels/{channel_id}/video-token`` mints a LiveKit JOIN token for the
 authenticated caller, scoped to the channel-as-room. Increment 1 is **DM-ONLY**.
 
+``GET /v1/channels/{channel_id}/call`` answers whether a call is happening in that
+channel RIGHT NOW (#3159) — the present-tense half a signed invitation cannot supply.
+It runs the SAME gate sequence, in the same order, for a reason worth stating once:
+two endpoints about one object whose gates diverge turn the weaker into an oracle for
+what the stronger hides. Change one, change both.
+
 Trust-boundary properties, from the codebase's established patterns:
 
   * **ACL gate before mint (existence-hiding).** ``acl.readable_channel`` collapses
@@ -38,14 +44,27 @@ from pydantic import BaseModel
 from sqlalchemy import select
 
 from ..config import settings
-from ..domain import acl, livekit_tokens, moderation_service
+from ..domain import acl, livekit_rooms, livekit_tokens, moderation_service
 from ..domain.models import Membership
 from ..domain.rate_limit import rate_limit
-from .deps import CurrentUser, DbSession
+from .deps import CurrentUser, DbSession, rate_limit_user
 
 log = logging.getLogger("aiko_gateway.video")
 
 router = APIRouter(prefix="/v1", tags=["video"])
+
+
+class CallOccupancyResponse(BaseModel):
+    """Present-tense truth about a channel's call (#3159).
+
+    COUNT ONLY, deliberately: the ring needs "is this call still happening", not "who is
+    in it". Returning identities would make this a presence probe for any channel member
+    — a strictly larger disclosure than the ring requires, on an endpoint the app polls
+    once a second. The app tab specified it this way and the island agrees.
+    """
+    live: bool
+    participants: int
+    since: str | None = None  # ISO-8601 UTC; null when the room is empty
 
 
 class VideoTokenResponse(BaseModel):
@@ -55,6 +74,67 @@ class VideoTokenResponse(BaseModel):
     url: str
     room: str
     can_publish: bool  # echoes the grant the caller actually received (read-only → False)
+
+
+async def _gated_dm_channel(session, user_id: str, channel_id: str):
+    """THE ONE DOOR both video endpoints pass through. Returns the resolved channel.
+
+    WHY THIS IS A FUNCTION AND NOT A CONVENTION (cage-match #167 r2, Carnot). The two
+    endpoints answer questions about the same object, so a gate present on one and
+    absent on the other turns the weaker into an oracle for what the stronger hides: a
+    user blocked from minting a join token could still poll occupancy and learn exactly
+    when the person who blocked them is on a call. The first version of this PR kept the
+    two gate sequences in sync by hand and PROVED the agreement with property tests
+    (``test_gates_agree_*``). That guards the window; it does not remove the coupling —
+    a third endpoint, or a new safety check added to one caller, re-opens it and the
+    tests only notice the cases they enumerate. This repo's own rule is to seal the
+    shared door rather than each caller, so the gate lives here once and the property
+    tests now verify the door is actually shared rather than that two copies still
+    match.
+
+    The order is load-bearing and unchanged from the reviewed original:
+
+      1. **Existence-hiding.** ``acl.readable_channel`` collapses "no such channel" and
+         "private channel you are not in" into the SAME ``None`` -> identical 404.
+      2. **DM-only** (cage-match #122 rd7). A group/public room cannot enforce pairwise
+         BLOCKS at a room-level token: participants are unbounded and LiveKit
+         subscription is all-or-nothing, so a blocked user could watch the blocker's
+         live camera. Fail closed to DMs until selective per-track subscription lands
+         (#2731). Private is checked too as defence in depth: migration 0020's
+         ``ck_channels_dm_private`` makes a public DM unrepresentable, so this branch is
+         unreachable through the DB today, but a future writer path would make it
+         reachable again.
+      3. **2-party cardinality from GROUND TRUTH** (cage-match #122 rd9). Resolved from
+         RAW ``Membership`` rows, never ``list_members`` — that is the visibility-shaped
+         @-mention roster, and if it ever hides blocked or soft-deleted peers a
+         list-based check would see only self and fail OPEN on the exact safety surface
+         DM-only exists to protect.
+      4. **Block in EITHER direction** -> existence-hiding 404, so the block primitive
+         traverses the video paths exactly as it traverses message fanout.
+    """
+    channel = await acl.readable_channel(session, user_id, channel_id)
+    if channel is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "channel not found")
+
+    if channel.kind != "dm" or not channel.is_private:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "video is only available in direct messages")
+
+    peer_ids = (await session.execute(
+        select(Membership.user_id).where(
+            Membership.channel_id == channel.id,
+            Membership.user_id != user_id,
+        )
+    )).scalars().all()
+    if len(peer_ids) != 1:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "video is only available in direct messages")
+    if await moderation_service.is_blocked_between(session, user_id, peer_ids[0]):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "channel not found")
+
+    return channel
 
 
 @router.post(
@@ -76,59 +156,7 @@ async def create_video_token(
             status.HTTP_503_SERVICE_UNAVAILABLE, "video is not enabled on this island"
         )
 
-    # Membership/existence gate — a non-member of a private channel (or a missing
-    # channel) is the same existence-hiding 404 as everywhere else.
-    channel = await acl.readable_channel(session, user.id, channel_id)
-    if channel is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "channel not found")
-
-    # DM-ONLY in increment 1 (cage-match #122 rd7 Carnot). Group/public rooms cannot
-    # enforce pairwise BLOCKS at a room-level token: participants are unbounded (public
-    # readers with no membership row) and LiveKit subscription is all-or-nothing, so a
-    # blocked user could watch the blocker's live camera — silently widening block
-    # semantics on a SAFETY boundary. Fail closed to DMs (2-party, where blocks ARE
-    # enforceable) until selective per-track subscription lands (#2731). The channel is
-    # already readable here, so revealing "video is DM-only" leaks nothing.
-    # DM must ALSO be private (cage-match #122 rd8 Carnot) — DEFENCE IN DEPTH, and
-    # stated honestly. This comment used to say kind='dm' was "not fully DB-constrained
-    # to is_private". That was true when written and stopped being true at migration
-    # 0020, which added `ck_channels_dm_private` (kind != 'dm' OR is_private): the
-    # malformed public DM row it warned about is now unrepresentable, and this branch
-    # is unreachable through the DB. The check STAYS — it costs one comparison, and a
-    # future writer path or a relaxed constraint would make it reachable again — but a
-    # reader was learning a false fact about the schema, which is how the next person
-    # mis-models the system (claude-tasks#3350; `push_service._recipients` carries the
-    # corrected wording this mirrors).
-    if channel.kind != "dm" or not channel.is_private:
-        raise HTTPException(
-            status.HTTP_403_FORBIDDEN,
-            "video is only available in direct messages")
-
-    # BLOCK LAYER (cage-match #122 rd6 Wu #1 / rd8 Tesla): readability is NECESSARY, not
-    # SUFFICIENT — the block primitive must traverse the video path exactly as it does
-    # message fanout (concept invariant-must-traverse-all-layers). Resolve the DM peer(s)
-    # from RAW Membership rows — NOT list_members, which is the visibility-shaped @-mention
-    # roster: if it ever hides blocked/soft-deleted peers, a list-based check would see
-    # only self and fail OPEN on the exact safety surface DM-only exists to protect
-    # (rd8 Tesla F1 — a safety gate must read ground truth, not a social proxy). A block
-    # in EITHER direction denies the join (existence-hiding 404).
-    peer_ids = (await session.execute(
-        select(Membership.user_id).where(
-            Membership.channel_id == channel.id,
-            Membership.user_id != user.id,
-        )
-    )).scalars().all()
-    # Assert 2-PARTY cardinality from ground truth (cage-match #122 rd9 Carnot):
-    # DM-only's block safety rests on the room being exactly {caller, one peer}. A
-    # malformed / migration-created private kind='dm' with 3+ members would reintroduce
-    # the multi-party pairwise-block gap DM-only closes; a singleton is an empty-room
-    # capability outside the model. Fail closed unless there is exactly one peer.
-    if len(peer_ids) != 1:
-        raise HTTPException(
-            status.HTTP_403_FORBIDDEN,
-            "video is only available in direct messages")
-    if await moderation_service.is_blocked_between(session, user.id, peer_ids[0]):
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "channel not found")
+    channel = await _gated_dm_channel(session, user.id, channel_id)
 
     # READ ≠ PUBLISH: publish (live camera/mic) requires an EXPLICIT posting
     # membership (acl.is_posting_member) on BOTH public and private channels — a
@@ -167,3 +195,145 @@ async def create_video_token(
         token=token, url=settings.livekit_url,
         room=livekit_tokens.room_for_channel(channel.id), can_publish=can_publish,
     )
+
+
+# TWO BOUNDS, BECAUSE ONE KEY CANNOT DO BOTH JOBS (part A item 2, decided with Nick
+# 2026-09-12). The app polls this ~1/s for the length of a ring: 30 requests per ring
+# per party.
+#
+# PER USER — the bound a legitimate ring must never touch. 90/60s carries three full
+# 30s rings in one minute for one person, which is already well past ordinary use
+# (ring, give up, ring again, ring again), so a real caller cannot reach it.
+#
+#     3 rings x 30 polls = 90
+#
+# The earlier version of this endpoint had ONE bound, keyed on IP at 150/60s, and that
+# number existed only because caller and callee are frequently behind ONE NAT and so
+# shared a budget. Keying an AUTHENTICATED read on the caller removes that sharing
+# rather than sizing around it: two people in one house now have two budgets.
+#
+# PER IP — the ceiling only a spray can reach, kept because per-user keying widens the
+# per-address blast radius (one IP holding N accounts holds N budgets). 600/60s is far
+# above any honest household — six simultaneous ringing parties behind one NAT — while
+# still bounding an account-farm to roughly what the single old bound allowed.
+#
+# WHAT THE IP CEILING COSTS, not only what it permits (cage-match #167 r4, Maxwell).
+# Every admitted poll is one ListParticipants round trip, so this ceiling is also the
+# bound on island->SFU traffic from one address: it went from 2.5/s to 10/s. Reaching
+# it is account-farm-gated, not open — the per-user bound is 90, so 600 needs >=7
+# distinct authenticated accounts each holding a real DM with a non-blocking peer — but
+# a ceiling must be priced in the units it actually bounds, or the next person to tune
+# it tunes it against households instead of against the SFU.
+#
+# ORDER MATTERS: the USER bound is first, and the round-4 change that put the IP bound
+# first was WRONG and is reverted here. Both halves of that story are worth keeping,
+# because the wrong version was argued for convincingly.
+#
+# The round-4 argument was: `rate_limit` reads only the Request while `rate_limit_user`
+# depends on `get_current_user`, which resolves a session and queries SQLite — so
+# user-first makes "every request, including the ones about to be refused, pay a DB
+# lookup before any limiter speaks". That premise was never measured. Measured
+# (2026-09-12), an unauthenticated request under each ordering:
+#
+#     user-first : 401, sequence = []                      <- nothing charged, no session
+#     IP-first   : 401, sequence = ['IP BUCKET CHARGED']
+#
+# `HTTPBearer(auto_error=True)` raises before `get_session` is ever resolved, so an
+# unauthenticated request costs nothing under EITHER ordering. Only AUTHENTICATED
+# requests pay the session query — and they must, to be authenticated at all. The
+# defect the reordering was meant to fix did not exist.
+#
+# What the reordering DID do was let unauthenticated traffic spend the authenticated
+# ring's budget: with the IP bound first, 600 junk requests from one address 429 the
+# real users behind that NAT (cage-match #167 r5, Carnot). A fix for a measured-absent
+# problem, introducing a real one, one round later.
+#
+# WHAT THE IP CEILING COSTS, not only what it permits. Every admitted poll is one
+# ListParticipants round trip, so this ceiling also bounds island->SFU traffic from one
+# address: 10/s, up from the old single bound's 2.5/s. Reaching it is account-farm-gated
+# rather than open — the per-user bound is 90, so 600 needs >=7 distinct authenticated
+# accounts each holding a real DM with a non-blocking peer — but a ceiling must be
+# priced in the units it actually bounds, or the next person to tune it tunes it against
+# households instead of against the SFU.
+_OCCUPANCY_LIMIT_PER_USER = 90
+_OCCUPANCY_LIMIT_PER_IP = 600
+
+
+@router.get(
+    "/channels/{channel_id}/call",
+    response_model=CallOccupancyResponse,
+    dependencies=[
+        rate_limit_user("call_occupancy_user", limit=_OCCUPANCY_LIMIT_PER_USER),
+        rate_limit("call_occupancy", limit=_OCCUPANCY_LIMIT_PER_IP),
+    ],
+)
+async def get_call_occupancy(
+    channel_id: str, user: CurrentUser, session: DbSession, response: Response
+) -> CallOccupancyResponse:
+    """Is a call happening in this channel RIGHT NOW? (#3159)
+
+    A signed call invitation is a permanent claim about the PAST; call liveness is a fact
+    about the PRESENT, and nothing in the message layer reconciles them. Without this, a
+    caller who hangs up three seconds in leaves the callee ringing, answering, and landing
+    alone in an empty room. This is the present-tense half.
+
+    THE GATE ORDER IS video-token's, DELIBERATELY AND IDENTICALLY. Both endpoints answer
+    questions about the same object, so if their gates ever diverge the weaker one becomes
+    the way to learn what the stronger one hides — a caller blocked from minting a token
+    could still watch a DM's occupancy and infer when two people are talking. Any change
+    to one gate is a change to both.
+    """
+    if not livekit_tokens.is_configured():
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "video is not enabled on this island"
+        )
+
+    channel = await _gated_dm_channel(session, user.id, channel_id)
+
+    # RELEASE THE DB CONNECTION BEFORE THE VENDOR HOP (cage-match #167, Tesla; part A
+    # item 1). Every gate above is a DB read and every line below is a network call to
+    # somebody else's server. Holding the session across that boundary means a scarce
+    # resource is pinned for the duration of a THIRD PARTY's latency — and this gateway
+    # is a single uvicorn worker over file-backed SQLite, so "scarce" is literal. At
+    # ~1 poll per second per ringing party, a LiveKit blip does not stay a LiveKit
+    # blip: N slow polls hold N sessions and the contention becomes island-wide,
+    # reaching endpoints that have nothing to do with calls.
+    #
+    # The id is copied out FIRST because ``close()`` detaches ``channel`` from the
+    # session; reading an already-loaded attribute off a detached instance happens to
+    # work, but depending on that is depending on a loading strategy nobody promised.
+    # The local makes the dependency a fact instead of a coincidence.
+    #
+    # ``close()`` is idempotent — ``get_session``'s ``async with`` still closes on the
+    # way out, so this is an EARLY release, not a change of ownership.
+    room_id = channel.id
+    await session.close()
+
+    try:
+        occ = await livekit_rooms.occupancy(room=room_id)
+    except (livekit_rooms.LiveKitUnreachable, livekit_tokens.LiveKitNotConfigured):
+        # UNKNOWN IS NOT EMPTY. Reporting live=false here would tell a ringing handset the
+        # call had ended, cancelling a call that is in fact happening — the precise failure
+        # this endpoint exists to prevent, inverted. 503 says "I cannot tell", which the app
+        # already has a code path for (it mirrors video-token's capability-disabled 503), and
+        # a ring that cannot be told to stop still stops at its own duration ceiling.
+        # no-store on the ERROR path too (cage-match #167 r2, Carnot). The success
+        # path already refuses caching; a 503 left to default behaviour could be held
+        # by an intermediary and replayed to a handset that is polling once a second,
+        # which turns a momentary SFU blip into a persistent "cannot tell". The whole
+        # endpoint is a present-tense read: NO response from it is ever cacheable.
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "call state is temporarily unavailable",
+            headers={"Cache-Control": "no-store"})
+
+    # A ring polls this: a cached answer is a stale answer, and a stale answer is exactly
+    # the bug. Never let an intermediary hold it.
+    response.headers["Cache-Control"] = "no-store"
+    # `occ.since` is already the finished wire string. NOTHING SFU-derived is computed
+    # here: the route used to convert epoch millis itself, outside the try above, so an
+    # out-of-range joinedAt raised OverflowError and escaped as a 500 (cage-match #167
+    # r3, Carnot). Rendering moved inside the 503 boundary, which is where every other
+    # judgement about the SFU's payload already lives.
+    return CallOccupancyResponse(
+        live=occ.live, participants=occ.participants, since=occ.since)
