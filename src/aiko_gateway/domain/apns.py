@@ -337,10 +337,25 @@ def _render(payload: WakePayload) -> dict:
     What crosses the boundary is `WakePayload`, which carries the REFUSAL (a wake
     and a destination, never an identity) and no provider schema at all.
 
-    `"c"` rather than `"channel_id"`: an APNs payload has a 4KB ceiling and this
-    is the only custom field, so there is no reason to spend bytes on a long name.
-    That reasoning is APNs-specific and stays here with the renderer; FCM's own
-    ceiling is a different number about a different envelope.
+    SHORT KEYS — `"c"`, `"k"` rather than `"channel_id"`, `"kind"`: an APNs alert
+    payload has a 4KB ceiling (VoIP is 5KB) and these are the only custom fields,
+    so there is no reason to spend bytes on long names. That reasoning is
+    APNs-specific and stays here with the renderer; FCM's own ceiling is a
+    different number about a different envelope.
+
+    `"k"` IS ON EVERY WAKE, BOTH VALUES EXPLICIT — never "absent means invite".
+    An absent key and a key whose value is the default are different epistemic
+    states that an absence-default collapses into one: the client could not tell
+    "this island predates the end wake" from "this island sent a ring", and the
+    two want opposite handling. Explicit on both means a MISSING `"k"` is a
+    detectable defect rather than a silently inherited default.
+
+    THE ALERT COPY IS THE INVITE'S, AND ONLY VoIP ROWS EVER SEE A `CALL_END`.
+    A VoIP push is delivered to the app and never displayed, so `aps.alert` is
+    inert for it — which is why a hangup does not need its own wording here. The
+    routing decision that keeps it that way lives in `push_service.plan_deliveries`
+    (`end_wake_needs_voip`), NOT in this function; if that ever changes, this copy
+    becomes a lie on screen and this paragraph is the note saying so.
     """
     return {
         "aps": {
@@ -348,6 +363,7 @@ def _render(payload: WakePayload) -> dict:
             "sound": "default",
         },
         "c": payload.channel_id,
+        "k": payload.kind.value,
     }
 
 

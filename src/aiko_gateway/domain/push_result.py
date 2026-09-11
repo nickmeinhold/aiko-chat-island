@@ -108,6 +108,53 @@ class SendResult:
     reap: ReapOrder | None = None
 
 
+class WakeKind(enum.Enum):
+    """WHAT KIND OF WAKE this is — the thing `push_service.should_wake` decides,
+    carried as a value instead of re-derived four hundred lines away.
+
+    A plain `Enum`, not a `StrEnum`: in this codebase a StrEnum means "persisted,
+    and drives a DB CHECK via `_in_check`". This is never persisted.
+
+    IT NOW CROSSES THE WIRE, WHICH IT DID NOT BEFORE, and that is a deliberate
+    change rather than a drift — it is why this type moved out of `push_service`
+    and into the module both transports already speak. `.value` is rendered into
+    the push envelope as `"k"`, so **these strings are a compatibility surface**:
+    editing a member's value silently changes what a handset receives, the same
+    one-way-door property `CALL_INVITE_BODY` has. Add members; never edit values.
+
+    WHY THIS IS NOT CEREMONY. "Every push this module can emit is a call invite"
+    was true only because `is_call_invite` — an EXACT equality against the pinned
+    sentinel — gated both entry points, far from the header that decides
+    `apns-push-type`. Threading the kind makes it a DATA-FLOW fact: the router
+    emits a VoIP delivery only from a `WakeKind` it was handed, and the only
+    supply is that gate.
+    """
+
+    CALL_INVITE = "call_invite"
+    # design 12 Decision 5, claude-tasks#4254. The caller hung up. Routed to VoIP
+    # rows ONLY — see `push_service.plan_deliveries` for why an alert row is a
+    # skip and not a send.
+    CALL_END = "call_end"
+
+    # THE CLIENT'S TOTAL FUNCTION ON `"k"` — a SHARED invariant, written down on
+    # this side too rather than left as the app's implementation detail (app tab,
+    # 2026-09-11, and it is their specification, not ours):
+    #
+    #   "call_invite"        -> report to CallKit, verify, sustain or end
+    #   "call_end"           -> report (must-report is unconditional), then end
+    #   unknown OR missing   -> report, then IMMEDIATELY end. NEVER sustain.
+    #
+    # THAT LAST LINE IS WHY A THIRD MEMBER IS SAFE TO ADD. Without it, an island
+    # running ahead of a handset could turn any new wake kind into a ring that
+    # nothing stops on the old build. With it, an unrecognised kind degrades to a
+    # momentary CallKit cell — a malformed-input failure mode rather than a
+    # destination — so this enum can grow without the wire needing a version.
+    #
+    # It lives HERE, at the definition of the values it ranges over, because a
+    # rule recorded only in the repo that implements it is a rule the other repo
+    # can silently stop honouring.
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class WakePayload:
     """The wake, as POLICY states it — DELIBERATELY OPAQUE, and the opacity is
@@ -134,12 +181,30 @@ class WakePayload:
     residual, judged worth the deep link; it is not a claim that the payload
     leaks nothing.
 
-    ONE FIELD, so there is nowhere to put an identity. The doctrine above used to
-    be a docstring on a dict-builder; it is now the shape of the type, which is
-    the difference between a commitment and a comment. Each transport RENDERS
-    this into its own envelope (`apns._render`, `fcm.build_message`) — the
-    envelope is provider-specific and belongs below the boundary; the refusal is
-    policy and belongs here.
+    NO FIELD HERE IS AN IDENTITY. The doctrine above used to be a docstring on a
+    dict-builder; it is now the shape of the type, which is the difference
+    between a commitment and a comment. Each transport RENDERS this into its own
+    envelope (`apns._render`, `fcm.build_message`) — the envelope is
+    provider-specific and belongs below the boundary; the refusal is policy and
+    belongs here.
+
+    IT SAID "ONE FIELD" UNTIL 2026-09-11, and the second field is `kind`. The
+    count was never the commitment — it was a true description of the type on a
+    day when one field sufficed, and the paragraph below already warned that
+    reading it as the commitment forecloses more than the decision does. The
+    commitment is the READER property, unchanged.
+
+    WHY `kind` DOES NOT SPEND IT (claude-tasks#4254, design 12 Decision 5). The
+    end wake exists so a hangup can stop a ring on a locked handset. Every
+    PushKit push must be reported to CallKit before the handler returns, so a
+    stop that arrives in the same shape as a start IS a start — the app has no
+    way to tell them apart and rings again. The field is what makes the stop
+    stoppable.
+
+    And it tells Apple nothing the sequence did not already tell them: the moment
+    an end wake is sent at all, they see two wakes for the same channel forty
+    seconds apart and can read the call duration off the timing. `"k"` names what
+    was already legible. It still names no person and no direction.
 
     WHAT THAT LAST SENTENCE DEFENDS, SAID EXPLICITLY, because its phrasing can
     foreclose more than the decision behind it does. "Nowhere to put an identity"
@@ -163,3 +228,9 @@ class WakePayload:
     """
 
     channel_id: str
+    # REQUIRED, WITH NO DEFAULT, and that is the whole safety argument. A default
+    # of CALL_INVITE would let a caller that forgets the argument render a hangup
+    # as a ring — the exact "stop becomes a start" failure this field exists to
+    # prevent, reintroduced as a silent fallback. The type makes forgetting a
+    # TypeError instead.
+    kind: WakeKind

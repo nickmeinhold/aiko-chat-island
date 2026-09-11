@@ -188,7 +188,8 @@ from ..db import SessionLocal
 from . import apns, moderation_service
 from .models import (Channel, ChannelKind, DeviceToken, Membership, Message,
                      Platform, ApnsEnvironment, TokenKind, User)
-from .push_result import ReapOrder, SendResult, Verdict, WakePayload
+from .push_result import (ReapOrder, SendResult, Verdict, WakeKind,
+                          WakePayload)
 from .rate_limit import limiter
 
 log = logging.getLogger("aiko_gateway.push")
@@ -208,6 +209,25 @@ log = logging.getLogger("aiko_gateway.push")
 # is U+00B7 MIDDLE DOT and the emoji is U+1F4DE — a look-alike substitution here
 # would silently stop every ring, and would do so with no error anywhere.
 CALL_INVITE_BODY = "aiko:call/1 · 📞 started a call"
+
+# THE PINNED CALL-END SENTINEL — the caller saying "I hung up" (design 12
+# Decision 5, claude-tasks#4254). Same wire-contract status as the invite above,
+# same one-way door, and it is ALREADY IN SIGNED HISTORY: the app has been
+# sending it since 2026-08-22, confirmed by Nick that day.
+#
+# THE ISLAND IS LATE TO IT, AND THE REASON IS WORTH KEEPING. The app's own
+# docstring on this constant says the island does not need to learn it, because
+# "push_service wakes a handset only on the INVITE body, so an end message is an
+# ordinary message to the gateway". That was TRUE of the in-app ring: a running
+# app holds a socket, so the end arrives over live fanout and no push is needed.
+# CallKit inverted it. A locked handset holds no socket, so the one message that
+# can stop a full-screen ring is the exact one nothing delivers — design 12's
+# "phone ringing for a corpse", reached from the island side.
+#
+# IT CARRIES NO PARAMETERS, deliberately (app-side reasoning): the call it ends
+# is named by the signed `replyTo`, inside the same signature. So there is no id
+# to parse here and exact equality is the whole read path — no prefix, no v2.
+CALL_END_BODY = "aiko:call/1 · 📞 ended the call"
 
 # WHICH TRANSPORTS THIS ISLAND CAN ACTUALLY SEND ON — a CONFIG-PROBE registry, and
 # nothing else.
@@ -304,27 +324,14 @@ def is_call_invite(body: str) -> bool:
     return body == CALL_INVITE_BODY
 
 
-class WakeKind(enum.Enum):
-    """WHAT KIND OF WAKE this is — the thing `should_wake` decides, carried as a
-    value instead of re-derived four hundred lines away.
-
-    A plain `Enum`, not a `StrEnum`: in this codebase a StrEnum means "persisted,
-    and drives a DB CHECK via `_in_check`". This is never persisted and never
-    crosses the wire.
-
-    WHY THIS IS NOT CEREMONY. "Every push this module can emit is a call invite"
-    is true today only because `is_call_invite` — an EXACT equality against the
-    pinned sentinel — gates both entry points, far from the header that decides
-    `apns-push-type`. Threading the kind makes it a DATA-FLOW fact: the router
-    emits a VoIP delivery only from a `WakeKind` it was handed, and the only
-    supply is that gate. When design 12 Decision 5's cancel wake lands (named
-    there as "the island's real blocker"), adding `WakeKind.CALL_END` makes the
-    router's match non-exhaustive — which is exactly the moment somebody must
-    DECIDE whether a cancel rings, rather than a non-call silently inheriting a
-    VoIP push whose penalty is invisible to `SendResult` forever.
-    """
-
-    CALL_INVITE = "call_invite"
+def is_call_end(body: str) -> bool:
+    """Exact match, for the identical reason `is_call_invite` is exact — and the
+    reason is NOT weaker here just because the privilege is smaller. Forging a
+    stop only suppresses a ring, which a hostile island could do by dropping the
+    invite anyway; but a `startswith` test would still hand any sender a VoIP
+    wake primitive with arbitrary trailing content, and the budget it spends is
+    the recipient's. Mirrors the app's `isCallEndBody`."""
+    return body == CALL_END_BODY
 
 
 def should_wake(channel_kind: ChannelKindStr, body: str) -> WakeKind | None:
@@ -341,12 +348,21 @@ def should_wake(channel_kind: ChannelKindStr, body: str) -> WakeKind | None:
     the policy gate — and a rename of the enum member would leave this predicate
     silently matching nothing, i.e. push quietly switching itself off.
 
-    CALLERS MUST TEST `is None`, NEVER `not wake`. The single member is truthy
-    today, so truthiness works by coincidence; a future member with a falsy value
+    CALLERS MUST TEST `is None`, NEVER `not wake`. Both members are truthy, so
+    truthiness still works by coincidence; a future member with a falsy value
     would turn the gate off with no error anywhere.
+
+    TWO SENTINELS, ONE GATE, and the DM check is hoisted above both rather than
+    repeated. Repeating it was the first draft and it is the shape that rots: the
+    third sentinel gets added by copying the second, and the copy that forgets
+    `channel_kind` is a wake primitive in a public room.
     """
-    if channel_kind == ChannelKind.DM.value and is_call_invite(body):
+    if channel_kind != ChannelKind.DM.value:
+        return None
+    if is_call_invite(body):
         return WakeKind.CALL_INVITE
+    if is_call_end(body):
+        return WakeKind.CALL_END
     return None
 
 
@@ -453,6 +469,36 @@ def plan_deliveries(
                             pass
                         case (TokenKind.ALERT, WakeKind.CALL_INVITE):
                             pass
+                        case (TokenKind.VOIP, WakeKind.CALL_END):
+                            pass
+                        case (TokenKind.ALERT, WakeKind.CALL_END):
+                            # THE ONE CELL THAT IS A SKIP RATHER THAN A SEND, and
+                            # it is a DECISION, not an omission (design 12
+                            # Decision 5 named this fork; design 16's temper #7
+                            # left it open in both repos).
+                            #
+                            # An alert push runs NO app code. It draws a banner
+                            # and waits for a tap. So it cannot end a CallKit
+                            # ring — and a CallKit ring can only exist on a
+                            # handset that got a VoIP push in the first place.
+                            # What an alert row would actually produce for a
+                            # hangup is `_render`'s "Incoming call / Tap to join"
+                            # banner, minutes after the call is over: an invite
+                            # rendered for its own cancellation.
+                            #
+                            # The in-app case needs nothing from us either — an
+                            # app alive enough to be ringing holds a socket, and
+                            # the end message is already on it via live fanout.
+                            # That is exactly why the island never needed this
+                            # sentinel before CallKit.
+                            #
+                            # NOT `arm (B) every selected row`: that arm trades a
+                            # duplicate banner (a blemish) against a missed call
+                            # (the bug). Here both sides of that trade are on the
+                            # same side — the send delivers no capability AND
+                            # shows the wrong words.
+                            skips.append((row.id, "end_wake_needs_voip"))
+                            continue
                         case _:
                             # NOT `assert_never`: tuple narrowing is unreliable
                             # and there is no type checker in CI, so the
@@ -1084,7 +1130,7 @@ async def wake_for_message(*, channel_id: str, channel_kind: ChannelKindStr, sen
             # decision someone makes rather than one they inherit.
             recipients = await _spoken_here(
                 session, channel_id=channel_id, user_ids=recipients)
-            payload = WakePayload(channel_id=channel_id)
+            payload = WakePayload(channel_id=channel_id, kind=wake)
             for user_id in recipients:
                 # The per-recipient budget is charged inside _wake_user, once the
                 # recipient is known to have a device worth waking.

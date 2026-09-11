@@ -48,13 +48,46 @@ def _row(row_id: str, platform: str, token_kind: str = TokenKind.ALERT.value,
 
 # ------------------------------------------------------------------ the sweep
 
-# `[WakeKind.CALL_INVITE]`, NOT `WakeKind` — the docstring below explains why, and
-# the two must not drift: a sweep over the whole enum would demand delivery for a
-# future cancel and turn the router's deliberate skip into a red test.
+# THE FULL MATRIX, WITH AN EXPECTED OUTCOME PER CELL — no member is excluded.
+#
+# This used to sweep `[WakeKind.CALL_INVITE]` only, and the exclusion was correct
+# at the time: `CALL_END` did not exist, and a sweep demanding delivery for every
+# member would have failed the router's deliberate skip and argued for shipping
+# the silent inheritance it was built to prevent.
+#
+# That reasoning expires the moment a member's matrix is KNOWN, and it does not
+# expire by itself — the exclusion would have quietly carried forward to a third
+# member for the same words. So the sweep is now total and the expectation is a
+# TABLE: every cell is stated, including the one that is a skip. A member added
+# without a row here fails with a KeyError naming the missing cell, which is the
+# decision being forced rather than inherited.
+_EXPECTED: dict[tuple[TokenKind, WakeKind], str | None] = {
+    (TokenKind.ALERT, WakeKind.CALL_INVITE): None,          # delivered
+    (TokenKind.VOIP, WakeKind.CALL_INVITE): None,           # delivered
+    (TokenKind.VOIP, WakeKind.CALL_END): None,              # delivered
+    # The only skip in the table, and it is a DECISION (claude-tasks#4254): an
+    # alert push runs no app code, so it cannot end a CallKit ring, and it would
+    # render the invite's "Incoming call" copy for a hangup.
+    (TokenKind.ALERT, WakeKind.CALL_END): "end_wake_needs_voip",
+}
+
+
+def test_the_expectation_table_covers_every_cell():
+    """THE TABLE IS ONLY A GATE IF IT IS TOTAL. Without this, adding a `WakeKind`
+    and forgetting its rows makes the sweep below silently smaller — the test
+    count drops, everything stays green, and the new member is routed by
+    `case _`. Asserted as a set difference so the failure NAMES the missing
+    cells."""
+    every_cell = set(itertools.product(TokenKind, WakeKind))
+    assert every_cell - set(_EXPECTED) == set(), (
+        "a (TokenKind, WakeKind) cell has no stated expectation — decide what it "
+        "does before the router decides for you")
+
+
 @pytest.mark.parametrize(
     "platform,kind,wake",
-    list(itertools.product([Platform.APNS], TokenKind, [WakeKind.CALL_INVITE])))
-def test_every_platform_token_kind_combination_is_routed_for_call_invite(
+    list(itertools.product([Platform.APNS], TokenKind, WakeKind)))
+def test_every_platform_token_kind_wake_kind_combination_is_routed(
         platform, kind, wake):
     """TOTALITY OVER THE ENUMS, so a member added without teaching the router
     about it fails HERE rather than at a handset that does not ring.
@@ -75,16 +108,24 @@ def test_every_platform_token_kind_combination_is_routed_for_call_invite(
     """
     rows = [_row("01ROW", platform.value, kind.value)]
     deliveries, skips = plan_deliveries(rows, wake=wake, configured=BOTH)
+    expected_skip = _EXPECTED[(kind, wake)]
+
+    if expected_skip is not None:
+        assert deliveries == [], (
+            f"{kind}/{wake} was DELIVERED; the table says it is skipped as "
+            f"{expected_skip!r}")
+        assert skips == [("01ROW", expected_skip)], (
+            f"{kind}/{wake} must skip with the named reason {expected_skip!r} — "
+            f"a silent drop is how the decision gets missed. Got: {skips}")
+        return
+
     assert skips == [], f"{platform}/{kind}/{wake} was skipped"
     assert len(deliveries) == 1
     delivered = deliveries[0]
     assert delivered.row_id == "01ROW"
-    if platform is Platform.APNS:
-        assert isinstance(delivered, ApnsDelivery)
-        assert delivered.token_kind is kind, (
-            "an APNs delivery lost the row's kind — the header fork reads it")
-    else:
-        assert isinstance(delivered, FcmDelivery)
+    assert isinstance(delivered, ApnsDelivery)
+    assert delivered.token_kind is kind, (
+        "an APNs delivery lost the row's kind — the header fork reads it")
 
 
 def test_a_new_wake_kind_must_be_routed_explicitly():
@@ -99,16 +140,25 @@ def test_a_new_wake_kind_must_be_routed_explicitly():
     a HIGH-priority data ring for a cancel. This drives a synthetic member through
     both arms and requires a NAMED SKIP, which is what forces the next author to
     make a decision rather than inherit one.
+
+    `CALL_END` HAS SINCE SHIPPED (claude-tasks#4254), which is why the synthetic
+    member below was renamed: a stand-in that names a real member stops standing
+    in for anything.
     """
     import enum
 
     class _FutureWake(enum.Enum):
-        CALL_END = "call_end"
+        # DELIBERATELY NOT `CALL_END` ANY MORE. This stand-in was named for the
+        # member that did not exist yet; `CALL_END` is now real and routed, so
+        # reusing the name here would have tested nothing while reading as
+        # though it tested the future. The stand-in has to be a kind the router
+        # has genuinely never seen.
+        CALL_TRANSFER = "call_transfer"
 
     for platform in [Platform.APNS]:   # the only platform with a send path
         rows = [_row("01ROW", platform.value, TokenKind.ALERT.value)]
         deliveries, skips = plan_deliveries(
-            rows, wake=_FutureWake.CALL_END, configured=BOTH)
+            rows, wake=_FutureWake.CALL_TRANSFER, configured=BOTH)
         assert deliveries == [], (
             f"{platform} DELIVERED an unrecognised wake kind — a future cancel "
             "would ring the handset it was meant to stop")
