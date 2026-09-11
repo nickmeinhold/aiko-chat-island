@@ -86,7 +86,7 @@ for _seam in ISLAND_REF_TREE ISLAND_REPO_SLUG ISLAND_CODELOAD_BASE; do
 done
 
 work=""
-raw_list="$(mktemp)"; sorted_list="$(mktemp)"
+raw_list="$(mktemp)"; sorted_list="$(mktemp)"; find_err="$(mktemp)"
 # `return 0` IS THE WHOLE FUNCTION'S CONTRACT, not tidiness. An EXIT trap whose
 # last command fails REPLACES the script's exit status in bash 3.2 — and when
 # $work is empty (the ISLAND_REF_TREE path, where nothing was fetched) the test
@@ -95,7 +95,7 @@ raw_list="$(mktemp)"; sorted_list="$(mktemp)"
 # the null arm, which is the arm that exists precisely because a check cannot be
 # trusted to report its own success correctly just because it reports failure
 # correctly.
-cleanup() { [ -n "$work" ] && rm -rf "$work"; rm -f "$raw_list" "$sorted_list"; return 0; }
+cleanup() { [ -n "$work" ] && rm -rf "$work"; rm -f "$raw_list" "$sorted_list" "$find_err"; return 0; }
 trap cleanup EXIT
 
 # --- materialise the ref ----------------------------------------------------
@@ -382,8 +382,9 @@ compare_one "docker-compose.yml"
 # the walks below. Nothing in this script reads a stream whose producer's status
 # was thrown away.
 ( cd "$tree" && find . -maxdepth 1 \( -name 'docker-compose*.yml' -o -name 'docker-compose*.yaml' \
-    -o -name 'compose*.yml' -o -name 'compose*.yaml' \) -print0 ) > "$raw_list" 2>/dev/null \
-  || die "could not list root compose files in the $ref tree. Nothing was compared."
+    -o -name 'compose*.yml' -o -name 'compose*.yaml' \) -print0 ) > "$raw_list" 2>"$find_err" \
+  || die "could not list root compose files in the $ref tree. Nothing was compared.
+     $(head -3 "$find_err")"
 LC_ALL=C sort -z "$raw_list" > "$sorted_list" \
   || die "could not sort the root compose listing. Nothing was compared."
 
@@ -419,29 +420,36 @@ while IFS= read -r -d '' rel; do
   # parameter expansion is portable and needs no process.
 done < <(cat "$sorted_list")
 
-# THE ONE BOX-ONLY FILE THAT IS NOT IGNORABLE, and the only exception in this
-# script to "a file the ref does not carry is none of our business".
+# THE BOX-ONLY FILES THAT ARE NOT IGNORABLE — THE WHOLE AUTO-LOADED SET.
 #
-# MEASURED on the live box, not read in a doc: `docker compose config` with no
-# `-f` flags merged a `docker-compose.override.yml` sitting beside the base file
-# and emitted its variables into the resolved config. `update.sh`'s deploy path is
-# exactly that — a bare `docker compose pull && up`, no `-f` — so an override the
-# tag has never heard of is silently part of what gets deployed.
+# This script's one exception to "a file the ref does not carry is none of our
+# business", and it exists because docker reads these whether or not the tag has
+# ever heard of them. `update.sh` deploys with a bare `docker compose pull && up`
+# — no -f — so compose picks its own files from the working directory.
 #
-# That is this guard's own subject matter: compose on the box differing from
-# compose in the tag, changing what the container sees. It arrives as an EXTRA
-# file rather than an edited one, which is precisely why the box-only rule would
-# have waved it through. Neither island carries one today (checked); the point is
-# that one appearing is invisible to every other check here.
-for ovr in compose.override.yaml compose.override.yml \
-           docker-compose.override.yaml docker-compose.override.yml; do
-  _present "$repo_root/$ovr" || continue
-  [ -f "$tree/$ovr" ] && continue   # the ref carries it too — already compared above
-  drifted="$drifted $ovr(BOX-ONLY-but-AUTO-LOADED)"; drifted_n=$((drifted_n + 1))
-  warn "$ovr exists on this box and NOT in $ref. docker compose auto-loads an
-     override file when no -f flags are given, which is how update.sh deploys — so
-     this file is silently part of the running config and no tag can account for
-     it. Every other box-only file is ignored; this one cannot be."
+# MEASURED ON THE LIVE BOX, both halves:
+#   * `compose.yaml` beside `docker-compose.yml` WINS: `docker compose config`
+#     emitted compose.yaml's variables and ignored docker-compose.yml entirely.
+#   * an override file is MERGED into whichever base was chosen.
+# So a box-only `compose.yaml` would be the file that deploys, while this guard
+# certified `docker-compose.yml` — the interlock blessing one file set while the
+# engine burns another.
+#
+# The list is the COMPLETE set docker auto-selects, not the subset that occurred
+# to me. An earlier pass enumerated only the four `*.override.*` names and left
+# the four base names out, which is the same shape as every other class-fix in
+# this PR: the family was named, one branch of it was swept. Order matches
+# docker's own precedence so the message can say which file actually wins.
+for auto in compose.yaml compose.yml docker-compose.yaml docker-compose.yml \
+            compose.override.yaml compose.override.yml \
+            docker-compose.override.yaml docker-compose.override.yml; do
+  _present "$repo_root/$auto" || continue
+  [ -f "$tree/$auto" ] && continue   # the ref carries it too — already compared above
+  drifted="$drifted $auto(BOX-ONLY-but-AUTO-LOADED)"; drifted_n=$((drifted_n + 1))
+  warn "$auto exists on this box and NOT in $ref. docker compose auto-loads it when
+     no -f flags are given, which is how update.sh deploys — so this file is part
+     of the running config and no tag can account for it. Every other box-only
+     file is ignored; these cannot be."
 done
 
 # The deploy/ walk is recursive on purpose: deploy/lib/dotenv-read.sh is the single
@@ -475,8 +483,13 @@ done
 # compose still matches, exit 0. A failed walk was indistinguishable from a clean
 # one, which is this file's signature failure committed by the walk that looks
 # for it. Staged to a file so the status is the terminal command's own.
-( cd "$repo_root" && find -L deploy \( -type f -o -type l \) -print0 ) > "$raw_list" 2>/dev/null \
-  || die "could not walk deploy/ on this box (find failed). Nothing was compared."
+# STDERR IS KEPT, NOT DISCARDED (Kelvin, round 7). Catching the exit status and
+# throwing away the diagnostic leaves an operator with "find failed" and nothing
+# to act on — flying on instruments with the one gauge that explains the scream
+# taped over. Same treatment curl already gets a hundred lines up.
+( cd "$repo_root" && find -L deploy \( -type f -o -type l \) -print0 ) > "$raw_list" 2>"$find_err" \
+  || die "could not walk deploy/ on this box (find failed). Nothing was compared.
+     $(head -3 "$find_err")"
 # THE SORT'S STATUS IS CHECKED TOO (Tesla, round 5 — the same class, one layer
 # in). Round 3 staged `find` to a file precisely so its status would be the
 # terminal command's own, and then poured that file through `< <(sort -z ...)`,
@@ -509,8 +522,9 @@ done < <(cat "$sorted_list")
 # up to one line per subtree with a count; files beside something the box already
 # has are named individually, because those are the ones worth reading. Full
 # information, four lines instead of forty-nine.
-( cd "$tree" && find -L deploy \( -type f -o -type l \) -print0 ) > "$raw_list" 2>/dev/null \
-  || die "could not walk deploy/ in the $ref tree (find failed). Nothing was compared."
+( cd "$tree" && find -L deploy \( -type f -o -type l \) -print0 ) > "$raw_list" 2>"$find_err" \
+  || die "could not walk deploy/ in the $ref tree (find failed). Nothing was compared.
+     $(head -3 "$find_err")"
 LC_ALL=C sort -z "$raw_list" > "$sorted_list" \
   || die "could not sort the $ref deploy listing. Nothing was compared."
 while IFS= read -r -d '' rel; do

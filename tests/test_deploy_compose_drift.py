@@ -1222,3 +1222,72 @@ def test_update_sh_REFUSES_when_docker_would_deploy_an_unknown_file_set(var) -> 
         "and checking only the environment would miss the likelier case"
     )
     assert "--skip-drift-check" in code, "a fail-closed branch must name its escape hatch"
+
+
+# Every filename `docker compose` will load on its own with no -f flags, in its
+# own precedence order. MEASURED on the live box, both halves: `compose.yaml`
+# beside `docker-compose.yml` WINS outright (config emitted compose.yaml's
+# variables and ignored the other), and an override is merged into whichever
+# base was chosen.
+DOCKER_AUTOLOADED = (
+    "compose.yaml",
+    "compose.yml",
+    "docker-compose.yaml",
+    "compose.override.yaml",
+    "compose.override.yml",
+    "docker-compose.override.yaml",
+    "docker-compose.override.yml",
+)
+
+
+@pytest.mark.parametrize("name", DOCKER_AUTOLOADED)
+def test_every_box_only_AUTOLOADED_compose_file_is_refused(name, tmp_path) -> None:
+    """THE COMPLETE SET, not the subset that occurred to me (Carnot, round 7).
+
+    This guard's one exception to "a file the ref does not carry is none of our
+    business" — because docker reads these whether or not the tag has heard of
+    them, and update.sh deploys with a bare `docker compose pull && up`.
+
+    An earlier pass enumerated only the four `*.override.*` names and left the
+    base names out. That gap is the sharper half: `compose.yaml` does not merely
+    get merged, it WINS over `docker-compose.yml` — so a box-only one is the
+    file that actually deploys while the guard certifies a file docker never
+    reads. The interlock blessing one file set while the engine burns another.
+
+    Parametrised over the whole set so adding a name to the script without
+    adding it here, or vice versa, is visible."""
+    box = _tree(tmp_path / "box", {**BASELINE, name: "services: {}\n"})
+    tag = _tree(tmp_path / "tag", BASELINE)
+
+    result = _run(box, tag)
+
+    assert result.returncode == DRIFT, (
+        f"a box-only {name} is auto-loaded by docker and must abort the deploy: "
+        + result.stdout
+        + result.stderr
+    )
+    assert name in result.stderr, result.stderr
+
+
+def test_a_find_failure_reports_WHY(tmp_path) -> None:
+    """Keeping the exit status and discarding the reason leaves an operator with
+    "find failed" and nothing to act on (Kelvin, round 7).
+
+    Driven through the unreadable-directory path, which is a real failure with a
+    real diagnostic."""
+    if os.geteuid() == 0:
+        pytest.skip("root reads regardless of mode; this arm cannot create the failure")
+    box = _tree(tmp_path / "box", BASELINE)
+    tag = _tree(tmp_path / "tag", BASELINE)
+    deploy = box / "deploy"
+    deploy.chmod(0o000)
+    try:
+        result = _run(box, tag)
+    finally:
+        deploy.chmod(0o755)
+
+    assert result.returncode == CANNOT_LOOK, result.stdout + result.stderr
+    assert "ermission" in result.stderr or "denied" in result.stderr.lower(), (
+        "the refusal must carry find's own diagnostic, not just its exit status: "
+        + result.stderr
+    )
