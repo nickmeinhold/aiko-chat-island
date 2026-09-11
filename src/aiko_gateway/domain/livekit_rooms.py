@@ -42,9 +42,24 @@ from . import livekit_tokens
 log = logging.getLogger("aiko_gateway.video")
 
 # Short by design: the app polls this ~1/s for the duration of a ring, so a slow SFU
-# must degrade to "I don't know" quickly rather than queueing requests behind it. The
-# measured round trip is ~0.175s, so this is ~11x headroom, not a tight race.
-_TIMEOUT_SECONDS = 2.0
+# must degrade to "I don't know" quickly rather than queueing requests behind it.
+#
+# STATED PER-PHASE BECAUSE A SCALAR IS NOT A DEADLINE (cage-match #167, Tesla; part A
+# item 6). ``httpx.Timeout(2.0)`` sets connect/read/write/pool to 2.0s EACH, so the
+# worst-case wall clock is their SUM, not 2.0s. The comment this replaces claimed
+# "~11x headroom" on a 0.175s round trip; against a 1/s poll the real ceiling was 8s,
+# during which the next seven polls had already been issued. The phases are therefore
+# named individually and the bound is arithmetic a reader can check:
+#
+#     connect 1.0 + read 1.5 + write 0.5 + pool 0.5  =  3.5s worst case
+#
+# ``read`` is the only phase a slow SFU can actually stretch, and 1.5s is ~8.5x the
+# measured 0.175s round trip. ``pool`` is short on purpose: if the pool is saturated
+# because earlier polls are still in flight, waiting is exactly the wrong move — the
+# honest answer is "I cannot tell you right now", which the route already renders as
+# 503 and which the ring already has a code path for.
+_TIMEOUT = httpx.Timeout(connect=1.0, read=1.5, write=0.5, pool=0.5)
+_TIMEOUT_WORST_CASE_SECONDS = 3.5  # the sum above, asserted by a test so it cannot drift
 
 _LIST_PARTICIPANTS_PATH = "/twirp/livekit.RoomService/ListParticipants"
 
@@ -84,13 +99,26 @@ def _api_base() -> str:
     one configured value covers both and there is no second setting to drift. Scheme is
     mapped wss->https / ws->http; anything else is a config error the boot validator
     already refuses (``livekit_url`` must be wss:// for a remote SFU).
+
+    THE PATH IS CARRIED, NOT DISCARDED (cage-match #167, Tesla; part A item 3). The
+    first version built the origin from scheme+netloc alone, so the day an island is
+    configured ``wss://host/livekit`` — a perfectly ordinary reverse-proxy layout — the
+    Twirp call would go to ``https://host/twirp/...`` instead of
+    ``https://host/livekit/twirp/...``. That failure is nastier than it sounds: every
+    poll would 503 "correctly" (the module's honest cannot-tell), while ``video-token``
+    kept working, because tokens are minted locally and never touch this base. A whole
+    feature silently dark behind a truthful error message, with the one endpoint an
+    operator would test to check LiveKit health still green.
+
+    The trailing slash is stripped so ``wss://host/livekit/`` and ``wss://host/livekit``
+    produce the same base — the path constants below all start with ``/``.
     """
     parts = urlparse(settings.livekit_url)
     scheme = {"wss": "https", "ws": "http"}.get(parts.scheme)
     if scheme is None or not parts.hostname:
         raise LiveKitUnreachable(
             f"livekit_url is not a usable websocket URL: {settings.livekit_url!r}")
-    return urlunparse((scheme, parts.netloc, "", "", "", ""))
+    return urlunparse((scheme, parts.netloc, parts.path.rstrip("/"), "", "", ""))
 
 
 # One pooled client, not one per request. MEASURED against the live imagineering
@@ -112,7 +140,7 @@ def _client() -> httpx.AsyncClient:
     """The pooled client, created on first use."""
     global _client_singleton
     if _client_singleton is None:
-        _client_singleton = httpx.AsyncClient(timeout=_TIMEOUT_SECONDS)
+        _client_singleton = httpx.AsyncClient(timeout=_TIMEOUT)
     return _client_singleton
 
 
@@ -191,6 +219,24 @@ def _participants_from(body: object) -> list[dict]:
         if not isinstance(p, dict):
             raise LiveKitUnreachable(
                 f"SFU participant entry is a {type(p).__name__}, not an object")
+        if not p:
+            # An entry with NO fields at all is not a person (cage-match #167, Tesla;
+            # part A item 4). Counting it inflates ``participants`` and can hold
+            # ``live`` true on a payload we plainly do not understand.
+            #
+            # THE BREAK DIRECTION IS THE ARGUMENT, and it is the same one this module
+            # already makes for a missing ``participants`` key. Refusing means 503
+            # "cannot tell" — loud, and the ring still stops at its own ceiling.
+            # Counting means a silent phantom occupant. Loud beats silent.
+            #
+            # HONESTLY UNMEASURED, and this is the right place to say so: ``live: true``
+            # has only ever been produced by a mock (the PR's own stated residual), so
+            # no real occupied room has been inspected at the byte level the way the
+            # empty-room shape was. If LiveKit ever marshals a real participant whose
+            # every field is at its protobuf default, this turns that room into a 503.
+            # The two-handset arm is where that gets measured; until then the failure
+            # is bounded (a degraded ring, never a cancelled one) and visible.
+            raise LiveKitUnreachable("SFU participant entry has no fields")
     return participants
 
 
@@ -229,7 +275,26 @@ async def occupancy(*, room: str) -> Occupancy:
             json={"room": namespaced},
             headers={"Authorization": f"Bearer {token}"},
         )
-    except httpx.HTTPError as exc:
+    except (httpx.HTTPError, RuntimeError) as exc:
+        # RuntimeError IS IN THIS TUPLE ON PURPOSE (cage-match #167, Tesla; part A
+        # item 5). ``aclose()`` nulls the singleton at shutdown, but a request that
+        # already grabbed the reference keeps a handle on the now-closed client, and
+        # httpx answers that with ``RuntimeError("Cannot send a request, as the client
+        # has been closed.")`` — which is NOT an ``httpx.HTTPError``. Uncaught, a poll
+        # racing shutdown escaped as a 500: a gateway error blamed on the SFU's
+        # behalf, on the one endpoint whose entire contract is that it either knows or
+        # honestly says it does not. A client closed underneath us is precisely
+        # "cannot tell", so it renders as 503 like every other way the answer failed
+        # to arrive.
+        #
+        # NOTE FOR ANYONE WIDENING THIS TRY: ``LiveKitUnreachable`` subclasses
+        # RuntimeError, so anything raising it from INSIDE this block would be caught
+        # here and re-wrapped, losing its own message. Today nothing does — the shape
+        # and stamp refusals all happen below — and a guard against a state that cannot
+        # occur was deleted rather than kept, because its comment would have asserted a
+        # mechanism that never fires. ``test_a_shape_refusal_keeps_its_own_message``
+        # goes red the moment that stops being true.
+        #
         # Log the class, never the token. A ringing handset polls this, so a persistent
         # SFU outage would otherwise write one line per second per ring.
         log.warning("livekit ListParticipants failed room=%s err=%s",
