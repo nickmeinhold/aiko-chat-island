@@ -758,6 +758,9 @@ def test_a_ref_tree_with_compose_but_NO_deploy_is_CANNOT_LOOK(tmp_path) -> None:
     box's update.sh said DRIFTED."""
     box = _tree(tmp_path / "box", {**BASELINE, "deploy/update.sh": "DRIFTED\n"})
     tag = _tree(tmp_path / "tag", {"docker-compose.yml": BASELINE["docker-compose.yml"]})
+    # NOTE: this arm omits deploy/ ENTIRELY. Its sibling below forces the case
+    # this one structurally cannot reach — a deploy/ that exists and is EMPTY —
+    # which is the shape the directory check was blind to (Tesla, round 8).
 
     result = _run(box, tag)
 
@@ -1479,3 +1482,39 @@ def test_a_symlink_the_MANIFEST_check_misses_is_still_caught_on_disk(tmp_path) -
         + result.stdout
         + result.stderr
     )
+
+
+def test_a_ref_tree_whose_deploy_IS_EMPTY_is_CANNOT_LOOK(tmp_path) -> None:
+    """THE EMPTY DIRECTORY, which the directory check was blind to (Tesla, round 8).
+
+    Round 3 found that a ref tree with no `deploy/` made every box script
+    "box-only" and therefore ignored, so a drifted `update.sh` read as CLEAN.
+    The fix was `[ -d "$tree/deploy" ]` — and `-d` is true of a VACANT folder.
+    A well-formed hostile tree (HTTP 200, valid gzip, no link members, compose
+    bytes matching the box, `deploy/` present and hollow) was indistinguishable
+    from a blessed tag.
+
+    MEASURED before the fix: `1 file(s) compared`, exit 0, with the box's
+    update.sh visibly different. That is the fourth time in this PR a family was
+    named and one branch of it swept — the absent case closed, the empty case
+    left live, in the very commit that named the class.
+
+    The invariant is no longer about directories: if the box carries deploy
+    files and the ref carries none, nothing was learned about any of them.
+
+    ITS SIBLING ARM CANNOT CREATE THIS. `test_a_ref_tree_with_compose_but_NO_
+    deploy_is_CANNOT_LOOK` omits the directory entirely, which is the one shape
+    the old check already caught — an arm that cannot go red for the case it is
+    guarding."""
+    box = _tree(tmp_path / "box", {**BASELINE, "deploy/update.sh": "DRIFTED ON THE BOX\n"})
+    tag = _tree(tmp_path / "tag", {"docker-compose.yml": BASELINE["docker-compose.yml"]})
+    (tag / "deploy").mkdir()          # present, and hollow
+
+    result = _run(box, tag)
+
+    assert result.returncode == CANNOT_LOOK, (
+        "a ref whose deploy/ is empty certifies nothing about the box's scripts: "
+        + result.stdout
+        + result.stderr
+    )
+    assert "carries NONE" in result.stderr, result.stderr

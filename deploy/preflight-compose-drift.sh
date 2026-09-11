@@ -500,6 +500,22 @@ done
 # in a line-oriented read, and the halves silently miss their comparison. Nothing
 # in this repo carries one today, which is the same "today" that produced the
 # outage this file exists to refuse.
+# HOW MANY DEPLOY FILES EACH SIDE CARRIES — because "the ref has a deploy/
+# directory" was the wrong invariant (Tesla, round 8). `[ -d ]` is true of a
+# VACANT folder, and a ref tree carrying a matching compose plus an empty
+# deploy/ makes every script on the box "a file the ref does not have" —
+# box-only, ignored by design — so a drifted update.sh reads as CLEAN.
+# MEASURED before the fix: `1 file(s) compared`, exit 0, with the box's
+# update.sh visibly different. Round 3 named this exact class and closed the
+# ABSENT instance with a directory bit; the EMPTY instance stayed live, which
+# is the fourth time in this PR a family was named and one branch swept.
+#
+# The honest invariant is not about directories at all: if this box carries
+# deploy files and the ref carries none, NOTHING WAS LEARNED about any of them.
+# That is checkable exactly, cannot false-positive on a legitimately minimal
+# box, and is enforced below where both counts exist.
+box_deploy_n=0; ref_deploy_n=0
+
 # THE WALK'S EXIT STATUS IS CHECKED (Tesla, round 3). In `done < <(find ...)` the
 # process substitution's status is discarded: if find is missing, or deploy/ is
 # unreadable, the stream is simply EMPTY — no files compared, nothing drifted,
@@ -534,6 +550,7 @@ LC_ALL=C sort -z "$raw_list" > "$sorted_list" \
   || die "could not sort this box's deploy listing. Nothing was compared."
 while IFS= read -r -d '' rel; do
   [ -n "$rel" ] || continue
+  box_deploy_n=$((box_deploy_n + 1))
   compare_one "$rel"
 done < "$sorted_list"
 
@@ -563,6 +580,7 @@ LC_ALL=C sort -z "$raw_list" > "$sorted_list" \
   || die "could not sort the $ref deploy listing. Nothing was compared."
 while IFS= read -r -d '' rel; do
   [ -n "$rel" ] || continue
+  ref_deploy_n=$((ref_deploy_n + 1))
   if [ ! -d "$repo_root/$(dirname "$rel")" ]; then
     # A subtree this box has never carried. Counted and rolled up, never dropped.
     absent_rollup="$absent_rollup
@@ -578,6 +596,16 @@ $(printf '%s' "$rel" | cut -d/ -f1-2)"
   _present "$repo_root/$rel" \
     || { absent="$absent $rel"; absent_n=$((absent_n + 1)); }
 done < "$sorted_list"
+
+# THE INVARIANT, ENFORCED WHERE BOTH COUNTS EXIST. A box with deploy files and
+# a ref with none means every one of them was skipped as box-only and the run
+# learned nothing about the scripts it exists to certify — including the stale
+# preflight-apns.sh that was half of the 2026-09-11 outage.
+if [ "$box_deploy_n" -gt 0 ] && [ "$ref_deploy_n" -eq 0 ]; then
+  die "this box carries $box_deploy_n file(s) under deploy/ and the tree for $ref
+     carries NONE, so every one of them was skipped as box-only. A clean result
+     would mean nothing. The ref did not materialise as this repository."
+fi
 
 if [ "$absent_n" -gt 0 ]; then
   warn "$ref carries $absent_n deploy file(s) BESIDE ones this box has — these sit in
