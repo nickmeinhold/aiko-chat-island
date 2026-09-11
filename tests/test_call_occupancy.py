@@ -36,7 +36,6 @@ from aiko_gateway.domain import (
 from aiko_gateway.domain import rate_limit as rate_limit_module
 from aiko_gateway.domain.models import Channel, Membership
 from aiko_gateway.rest import livekit as livekit_routes
-from aiko_gateway.rest.livekit import _OCCUPANCY_LIMIT_PER_IP
 from aiko_gateway.rest.deps import get_session
 
 _LK_KEY = "APItestkey000000"
@@ -1007,30 +1006,50 @@ async def test_unstamped_is_still_ordinary_not_an_error(
     assert (occ.live, occ.participants, occ.since) == (True, 1, None)
 
 
-async def test_the_cheap_ip_bound_is_consulted_before_the_one_that_queries_the_db(
+async def test_an_unauthenticated_poll_charges_NEITHER_bucket(
     client, session, monkeypatch, livekit_configured, limiting
 ):
-    """Maxwell's round-4 finding. `rate_limit` reads only the Request; `rate_limit_user`
-    depends on `get_current_user`, which resolves a session against SQLite. FastAPI
-    resolves `dependencies=[...]` in order and stops at the first that raises, so
-    listing the user bound first made every request — including refused ones — pay a DB
-    query before any limiter spoke.
+    """The round-4 reordering (IP bound first) is reverted, and this is what pins it.
 
-    The probe is ordering-sensitive by construction: an UNAUTHENTICATED request carries
-    no user, so if the IP bound runs first it can refuse on address alone and return
-    429. If the user bound runs first, `get_current_user` rejects with 401 and the IP
-    bound is never reached.
+    Round 4 moved the IP bound in front of the user bound on the argument that
+    user-first made every request pay a session query before any limiter spoke. That
+    premise was never measured, and it is false: `HTTPBearer(auto_error=True)` raises
+    before `get_session` is resolved, so an unauthenticated request costs nothing under
+    either ordering. What the reordering actually did was let unauthenticated traffic
+    spend the authenticated ring's budget — 600 junk requests from one address would
+    429 the real users behind that NAT (cage-match #167 r5, Carnot).
 
-    MUTATION: swap the two dependencies back -> the 601st request returns 401, not 429,
-    and this goes red.
+    MUTATION: put `rate_limit("call_occupancy", ...)` first again -> the IP window
+    appears and this goes red.
     """
-    ip = "203.0.113.13"
-    for _ in range(_OCCUPANCY_LIMIT_PER_IP):
-        rate_limit_module.limiter.hit("call_occupancy", ip, _OCCUPANCY_LIMIT_PER_IP, 60)
-
     ch = await _dm(session)
     resp = await client.get(f"/v1/channels/{ch.id}/call",
-                            headers={"x-forwarded-for": ip})   # NO Authorization header
-    assert resp.status_code == 429, (
-        "the address bound did not refuse before authentication — the cheap guard is "
-        "running behind a database query")
+                            headers={"x-forwarded-for": "203.0.113.13"})  # no Authorization
+    assert resp.status_code == 401
+    assert not rate_limit_module.limiter._windows, (
+        "an unauthenticated request charged a rate-limit bucket — junk traffic can now "
+        f"spend a real ring's budget: {rate_limit_module.limiter._windows}")
+
+
+@pytest.mark.parametrize("arm,value", [
+    ("negative JSON number — the round-4 rewrite dropped `stamp <= 0`", -1788700000),
+    ("negative decimal string — isdigit() already refused this one", "-1788700000"),
+])
+async def test_a_negative_joined_at_is_cannot_tell_in_BOTH_encodings(
+    monkeypatch, livekit_configured, arm, value
+):
+    """The two encodings must agree about the same value, and for one round they did not.
+
+    Round 4 moved the type check in front of the conversion and dropped the old
+    `stamp <= 0` guard. The string arm still refused `"-1788700000"` (isdigit() is
+    False), but the NUMBER arm sailed through and rendered
+    `since: "1913-04-27T10:53:20Z"` — fabricated history, produced by the fix for
+    fabricated 1970s. Round 4's negative arms were all strings, which is exactly why
+    its own tests could not see it.
+
+    MUTATION: delete the `stamp < 0` branch -> the number arm goes red, the string arm
+    stays green. That asymmetry IS the bug, and a string-only test can never show it.
+    """
+    _fake_sfu(monkeypatch, _responds({"participants": [{"joinedAt": value}]}))
+    with pytest.raises(livekit_rooms.LiveKitUnreachable):
+        await livekit_rooms.occupancy(room="chan-abc")
