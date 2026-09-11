@@ -28,11 +28,11 @@ was standing on the undecided half.
 | # | Round 1 flaw | Status now | Why |
 |---|---|---|---|
 | 1 | The "momentary ring" is not a designed topology | **HOLDS — now measured, and the mechanism was wrong** | A report-and-end *is* perceptible (flash + buzz, measured blind). But it **counts as reported**, so it is not the must-report violation round 1 called it. |
-| 2 | Arm (B) does not implement Nick's ruling | **RULED — arm (A)**, 2026-09-12 | See below. Round 1 was right that it was not ours to fold. |
+| 2 | Arm (B) does not implement Nick's ruling | **FORK REFUSED — re-derivation owed** | Round 1 was right it was not ours to fold. The arms were all one cell of a two-cell space, with the third cell imaginary. |
 | 3 | The ring-lease reframe is a rename unless the wire carries the distinction | **HOLDS, partially discharged** | The wire now carries `"k"` (v0.12.0). The *call-identity* half is untouched and is claude-tasks#4265. |
 | 4 | The three clocks must collapse in THIS document | **HOLDS** | Still unowned. #4265 is its representation. |
 | 5 | "No new transport" is false | **DISCHARGED** | Its gate ran (#4178, #4278) *and* its "premature" amendment expired: VoIP shipped in v0.11.0, so the population now exists. |
-| 6 | Arm (C)'s unlinkability is already spent | **SUPERSEDED — surface, do not fold** | App design 20 accepts arm C on a different property. A later record; not ours to tie-break. |
+| 6 | Arm (C)'s unlinkability is already spent | **CLOSED (12a's arm C) / SUPERSEDED (design 20's)** | Two different arm Cs. 12a's capability is closed — its trigger is provably unmet. Design 20's sealed envelope is a later record on a different property. |
 | 7 | The UUID contract is a theorem about a copier | **HOLDS, partially discharged** | `"k"`'s total function covers unknown/missing. The **equality check** is still owed. |
 | 8 | Multi-device key-set freshness | **HANDED OFF** | App tab's §1c, their surface. |
 | 9 | The arms were never re-derived | **HOLDS — and one prescribed arm is now void** | Round 1 prescribed "rate-limiting, reputation, **report-and-end budget**". There is no budget. |
@@ -156,25 +156,94 @@ Owed as a ticket, not built here.
 
 ---
 
-## Flaw 2 — RULED, 2026-09-12
+## Flaw 2 — the fork was REFUSED, and the refusal is the finding
 
 Round 1: *"Surface flaw 2 to Nick: arm (B) may not implement his 2026-09-01 ruling. That is his
-to rule on, not ours to fold."* Surfaced with the buzz now measured rather than feared.
+to rule on, not ours to fold."* Surfaced 2026-09-12 with the buzz measured rather than feared.
 
-**Nick's call: arm (A).** The ring/no-ring fork moves to the island's send door, using proxies
-the island **already holds** — group-vs-DM, and blocked-pair. A non-friend DM invite the island
-can classify gets no VoIP wake at all: genuine silence, no buzz, no Recents, no DND
-punch-through.
+**He ruled an arm, then asked the question that dissolved the fork:** *"are we going down the
+path of allowing the island to know who's friends with whom?"* On the re-put he took none of
+the arms. **The arms all accepted that a stranger's invite reaches the VoIP path, and argued
+only about how to undo it afterwards.**
 
-**What this does and does not claim.** The island's gate is **coarser than consent** and this
-is stated rather than hidden: the island cannot know "friend", so some non-friends still ring
-and the device still refuses them locally. Arm (A) does not create an island-side friendship
-fact and does not introduce a directory — it spends only facts the island holds today, which is
-what keeps it consistent with ADR-0004 and with the 2026-08-25 sender-anonymity ruling.
+### THE STRUCTURAL RESULT — there is no third cell, and this is why every arm slid
 
-The residual buzz set shrinks from *every stranger* to *strangers the island cannot classify*.
+Two facts, both already established in this bundle, neither previously put side by side:
 
----
+1. **In a DM, the channel IS the pair.** A DM channel is a two-party object; naming it names
+   both ends. (`_gated_dm_channel` enforces exactly this: `len(peer_ids) != 1` is a 403.)
+2. **iOS has no silent VoIP.** Every PushKit delivery must be reported to CallKit before the
+   handler returns. *You can foghorn a message; you cannot foghorn a ring.*
+
+Therefore:
+
+> **Any island-side ring/no-ring selectivity WITHIN DMs is the friend edge, by construction —
+> regardless of how it is derived, what it is named, or how careful the derivation is. And any
+> device-side selectivity is a buzz, by construction, because the push already arrived.**
+
+**Those are the only two cells.** The third cell — *silence for a stranger, without the island
+knowing the pair* — does not exist on this platform. Every proposal that promised it was
+smuggling the edge in under another name:
+
+| proposal | the smuggle |
+|---|---|
+| 12a arm (A) "publish the consent fact" | explicit; 12a rejects it on ADR-0004 |
+| "gate on proxies the island already holds" | the gradient: group-vs-DM → *have they ever messaged* → the edge |
+| a per-channel ring opt-in | in a DM, a per-channel fact IS a per-pair fact |
+| 12a arm (C), blind-signed capability | withdrawn by 12a; and #3745: *restricting the caller set SHRINKS the anonymity set* |
+
+This is the same shape as the trilemma round 1 said did not dissolve but *"was recategorised
+into a cell Apple does not sell"* (Tesla) — recurring one level down, on the consent axis
+instead of the ring axis, and **both tabs wanted the third cell again for the same reason: it
+is the only cell where the product is nice.**
+
+### Arm (C) is CLOSED, not parked
+
+12a held (C) as *"the named escape if flaw 9 measurement says the report-and-end ratio is
+untenable."* The measurement says **there is no ratio** — a report-and-end counts as reported,
+and must-report is a consecutive counter that any successful report resets. **(C)'s trigger
+condition can no longer be met.**
+
+Round 1's warning is the reason to close rather than park it: *"leave (C) loaded as the escape
+and production will grab it at the first Apple warning."* A parked arm with a dead trigger is
+precisely what gets grabbed, because nobody re-reads the trigger.
+
+### The question that was never asked, and is now the live one
+
+**Why is a stranger's DM invite on the VoIP path at all?**
+
+Both arms took VoIP-for-every-DM-invite as the given and negotiated the cleanup. But the island
+has held a transport fork since v0.10.0 — `token_kind` is `VOIP` or `ALERT` — and an alert push
+is not a CallKit report: no buzz, no Recents entry, no must-report obligation. A stranger's call
+arriving as *"X is calling"*, tappable, is not a degraded ring; it is a different and arguably
+more honest product.
+
+That reframes the grade as **the recipient's interruption policy**, which is what the friends
+crucible already named and nothing built:
+
+> **Graded reachability** (Carnot's spark): `urgent` / `ring` / `glow` / `silent`, **set by the
+> recipient**, per tie, per direction. *"Real product value, zero machinery — the piece worth
+> building first regardless."*
+
+**And the structural result binds it too, which is the honest part.** `ring`-vs-`glow` enforced
+island-side, per DM, is the edge. So graded reachability does not escape the two cells — it
+**changes what the cells cost**:
+
+- the island-side cell stops being "learn who is friends with whom" and becomes "learn which
+  channels this user accepts rings in", which is a *notification preference the recipient
+  authors deliberately*, correlates with friendship without being it, is revocable instantly by
+  its owner at the enforcement point, and needs no distribution channel (the three objections
+  that disqualified arm (C));
+- the device-side cell stops costing a buzz-and-vanish and costs only that strangers arrive as
+  notifications rather than rings.
+
+**Whether that re-pricing is enough to change the answer is NOT decided here, and this document
+declines to pick.** What it fixes is that the previous fork was a choice between two cells with
+one of them mispriced and the third one imaginary.
+
+**OWED: re-derive the arm set under "what is the recipient's interruption policy, and who
+enforces it", not under "how do we undo a ring we already sent."** That is a design pass, not a
+paragraph.
 
 ## Dispositions that survive round 1 unchanged
 
@@ -248,7 +317,7 @@ load-bearing for anything in the ring path?**
 | Stateless construction, or price the per-call state | island | flaw 10 / #3170 |
 | Arm C — which property, and is it in the ring path? | cross-tab | (owed) |
 | Multi-device key-set freshness | app | their §1c |
-| Arm (A) build: the send-door gate on group-vs-DM and blocked-pair | island | [#4326](https://github.com/nickmeinhold/claude-tasks/issues/4326) (Nick 2026-09-12) |
+| Re-derive the ring grade as the recipient's interruption policy | island + app | [#4326](https://github.com/nickmeinhold/claude-tasks/issues/4326) (re-scoped, Nick 2026-09-12) |
 
 **What this document is NOT.** It is not a decision of record for anything except flaw 2, which
 is Nick's and is attributed. It does not meet flaw 10's gate. It builds nothing. It rests in
