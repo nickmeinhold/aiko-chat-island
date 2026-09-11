@@ -36,6 +36,7 @@ from aiko_gateway.domain import (
 from aiko_gateway.domain import rate_limit as rate_limit_module
 from aiko_gateway.domain.models import Channel, Membership
 from aiko_gateway.rest import livekit as livekit_routes
+from aiko_gateway.rest.livekit import _OCCUPANCY_LIMIT_PER_IP
 from aiko_gateway.rest.deps import get_session
 
 _LK_KEY = "APItestkey000000"
@@ -790,11 +791,16 @@ async def test_the_gates_still_ran_before_that_release(
 
 @pytest.fixture
 def limiting(monkeypatch):
-    """Turn the limiter on and give each test a clean window set."""
+    """Turn the limiter on for this test.
+
+    NO reset() here, deliberately: `tests/conftest.py` already has an autouse
+    `_reset_rate_limiter` that clears the global limiter around every test. An earlier
+    version of this fixture reset it too, which was not merely redundant — it made the
+    fixture LOOK like the thing providing isolation, so a reader would trust the wrong
+    mechanism and a change to conftest would silently stop being noticed here
+    (cage-match #167 r4, Maxwell).
+    """
     monkeypatch.setattr(settings, "rate_limit_enabled", True)
-    rate_limit_module.limiter.reset()
-    yield
-    rate_limit_module.limiter.reset()
 
 
 async def _poll(client, user, channel_id, ip):
@@ -925,7 +931,6 @@ async def test_the_limiter_switch_still_disables_both_bounds(
     MUTATION: drop the `rate_limit_enabled` check from `rate_limit_user` -> red.
     """
     monkeypatch.setattr(settings, "rate_limit_enabled", False)
-    rate_limit_module.limiter.reset()
     alice, peer = await _user(session, "alice"), await _user(session, "peer")
     ch = await _dm(session)
     await _join(session, ch, alice)
@@ -934,3 +939,98 @@ async def test_the_limiter_switch_still_disables_both_bounds(
 
     for _ in range(95):                      # past the per-user bound of 90
         assert (await _poll(client, alice, ch.id, "203.0.113.12")).status_code == 200
+
+
+# ---- cage-match #167 round 4: int() is a coercer, not a validator ----
+
+@pytest.mark.parametrize("arm,value", [
+    ("bool true — int(True) == 1 == 1970", True),
+    ("bool false — hidden by `False == 0` in the old skip test", False),
+    ("float", 1788700000.9),
+    ("list", [1788700000]),
+    ("object", {"seconds": 1788700000}),
+    ("non-ASCII numeral — str.isdigit() alone says True", "١٢٣"),
+])
+async def test_a_wrong_typed_joined_at_is_cannot_tell_not_an_invented_time(
+    monkeypatch, livekit_configured, arm, value
+):
+    """Carnot's round-4 finding, and the bool arm is the one that mattered.
+
+    `int(raw)` does not VALIDATE, it COERCES. `{"joinedAt": true}` became `int(True)`
+    == 1 and rendered as `since: "1970-01-01T00:00:01Z"` — a fabricated present-tense
+    timestamp emitted by the one module whose stated invariant is that an unreadable
+    payload yields "cannot determine" and never an invented time.
+
+    The `false` arm is the other half and it failed in the opposite direction: because
+    `False == 0` in Python, the old skip test classed it as an ordinary unstamped
+    participant. One wrong type, swallowed two different ways, neither of them a 503.
+
+    MUTATION: restore the bare `try: stamp = int(raw)` -> the bool arms and the float
+    arm go red (list/object/non-ASCII already raised).
+    """
+    _fake_sfu(monkeypatch, _responds({"participants": [{"joinedAt": value}]}))
+    with pytest.raises(livekit_rooms.LiveKitUnreachable):
+        await livekit_rooms.occupancy(room="chan-abc")
+
+
+@pytest.mark.parametrize("arm,value,expected", [
+    ("int64 as a JSON number", 1788700000, "2026-09-06T13:06:40Z"),
+    ("int64 as a decimal string", "1788700000", "2026-09-06T13:06:40Z"),
+])
+async def test_both_legitimate_int64_encodings_still_render(
+    monkeypatch, livekit_configured, arm, value, expected
+):
+    """NULL CONTROL. protobuf-JSON marshals an int64 as EITHER a number OR a decimal
+    string, so a type check that admitted only one would break the feature against a
+    real SFU while passing every arm above.
+
+    MUTATION: accept only `str` (or only `int`) -> one of these goes red.
+    """
+    _fake_sfu(monkeypatch, _responds({"participants": [{"joinedAt": value}]}))
+    occ = await livekit_rooms.occupancy(room="chan-abc")
+    assert occ.since == expected
+
+
+@pytest.mark.parametrize("arm,value", [("absent", None), ("zero int", 0), ("zero string", "0")])
+async def test_unstamped_is_still_ordinary_not_an_error(
+    monkeypatch, livekit_configured, arm, value
+):
+    """NULL CONTROL for the other direction: protobuf omits or zeroes a field with no
+    value, and an unstamped participant is ORDINARY. A type check strict enough to
+    reject those would 503 rooms that are merely young.
+
+    MUTATION: treat 0 as malformed -> red.
+    """
+    entry = {"identity": "real"} if value is None else {"identity": "real", "joinedAt": value}
+    _fake_sfu(monkeypatch, _responds({"participants": [entry]}))
+    occ = await livekit_rooms.occupancy(room="chan-abc")
+    assert (occ.live, occ.participants, occ.since) == (True, 1, None)
+
+
+async def test_the_cheap_ip_bound_is_consulted_before_the_one_that_queries_the_db(
+    client, session, monkeypatch, livekit_configured, limiting
+):
+    """Maxwell's round-4 finding. `rate_limit` reads only the Request; `rate_limit_user`
+    depends on `get_current_user`, which resolves a session against SQLite. FastAPI
+    resolves `dependencies=[...]` in order and stops at the first that raises, so
+    listing the user bound first made every request — including refused ones — pay a DB
+    query before any limiter spoke.
+
+    The probe is ordering-sensitive by construction: an UNAUTHENTICATED request carries
+    no user, so if the IP bound runs first it can refuse on address alone and return
+    429. If the user bound runs first, `get_current_user` rejects with 401 and the IP
+    bound is never reached.
+
+    MUTATION: swap the two dependencies back -> the 601st request returns 401, not 429,
+    and this goes red.
+    """
+    ip = "203.0.113.13"
+    for _ in range(_OCCUPANCY_LIMIT_PER_IP):
+        rate_limit_module.limiter.hit("call_occupancy", ip, _OCCUPANCY_LIMIT_PER_IP, 60)
+
+    ch = await _dm(session)
+    resp = await client.get(f"/v1/channels/{ch.id}/call",
+                            headers={"x-forwarded-for": ip})   # NO Authorization header
+    assert resp.status_code == 429, (
+        "the address bound did not refuse before authentication — the cheap guard is "
+        "running behind a database query")

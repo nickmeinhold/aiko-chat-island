@@ -327,18 +327,43 @@ async def occupancy(*, room: str) -> Occupancy:
     # out-of-range ones — three equally malformed values, treated three ways, for no
     # reason a reader could state. Consistency here is the actual fix; the OverflowError
     # Carnot found was one arbitrary branch of it.
+    # THE TYPE IS CHECKED BEFORE THE CONVERSION, NOT BY IT (cage-match #167 r4, Carnot).
+    # `int(raw)` is not a validator, it is a COERCER, and it accepted two things the SFU
+    # can never legitimately mean:
+    #   * `{"joinedAt": true}`  -> int(True) == 1 -> since "1970-01-01T00:00:01Z"
+    #   * `{"joinedAt": 1788700000.9}` -> silently floored
+    # The first is the one that matters: a FABRICATED present-tense timestamp, produced
+    # by the one module whose stated invariant is that a payload we do not understand
+    # yields "cannot determine" and never an invented time. It reached the wire because
+    # bool is a subclass of int in Python — and the skip test above hid the other half of
+    # it, since `False == 0` is True, so `{"joinedAt": false}` was silently classed as an
+    # ordinary unstamped participant. One wrong type, swallowed two different ways,
+    # neither of them the promised 503.
+    #
+    # protobuf-JSON marshals an int64 as EITHER a JSON number OR a decimal string, so
+    # those two are the whole legitimate vocabulary. Anything else — bool, float, list,
+    # object — is the SFU asserting something we cannot read, which is the same class as
+    # a wrong-typed `participants` field and gets the same answer.
+    #
+    # `isascii()` is not decoration: `"٣".isdigit()` is True and `int("٣")` is 3, so a
+    # digits-only test alone would accept a non-ASCII numeral as a timestamp.
     joined = []
     for p in participants:
         raw = p.get("joinedAt")
-        if raw is None or raw == 0 or raw == "0":
-            continue                      # protobuf "no value" — unstamped, not broken
-        try:
-            stamp = int(raw)
-        except (TypeError, ValueError) as exc:
+        if raw is None:
+            continue                      # absent — protobuf "no value", unstamped
+        if isinstance(raw, bool) or not isinstance(raw, (int, str)):
             raise LiveKitUnreachable(
-                f"SFU sent an unreadable joinedAt ({raw!r})") from exc
-        if stamp <= 0:
-            raise LiveKitUnreachable(f"SFU sent a non-positive joinedAt ({stamp})")
+                f"SFU sent a joinedAt of type {type(raw).__name__}, not an int64")
+        if isinstance(raw, str):
+            if not (raw.isascii() and raw.isdigit()):
+                raise LiveKitUnreachable(
+                    f"SFU sent an unreadable joinedAt ({raw!r})")
+            stamp = int(raw)
+        else:
+            stamp = raw
+        if stamp == 0:
+            continue                      # protobuf "no value" — unstamped, not broken
         joined.append(stamp)
     return Occupancy(
         live=bool(participants),

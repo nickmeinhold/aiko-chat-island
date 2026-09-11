@@ -217,9 +217,24 @@ async def create_video_token(
 # above any honest household — six simultaneous ringing parties behind one NAT — while
 # still bounding an account-farm to roughly what the single old bound allowed.
 #
-# ORDER MATTERS AND IS NOT ACCIDENTAL: the user bound is listed first so an
-# authenticated caller's own budget is what normally rejects them, with a 429 they can
-# act on. Both are consulted; a request must satisfy both.
+# WHAT THE IP CEILING COSTS, not only what it permits (cage-match #167 r4, Maxwell).
+# Every admitted poll is one ListParticipants round trip, so this ceiling is also the
+# bound on island->SFU traffic from one address: it went from 2.5/s to 10/s. Reaching
+# it is account-farm-gated, not open — the per-user bound is 90, so 600 needs >=7
+# distinct authenticated accounts each holding a real DM with a non-blocking peer — but
+# a ceiling must be priced in the units it actually bounds, or the next person to tune
+# it tunes it against households instead of against the SFU.
+#
+# ORDER MATTERS, AND THE FIRST VERSION HAD IT BACKWARDS. The IP bound is listed FIRST
+# because it is the CHEAP one: `rate_limit` reads only the Request, while
+# `rate_limit_user` depends on `get_current_user`, which resolves a session and queries
+# SQLite. FastAPI resolves `dependencies=[...]` in order and stops at the first that
+# raises, so user-first made every request — including the ones about to be refused —
+# pay a session-resolution query BEFORE any limiter spoke. A rate limiter exists to
+# make abuse CHEAP to refuse; that ordering made it more expensive, on the single
+# uvicorn worker over file-backed SQLite this PR's first finding was about protecting.
+# The earlier comment defended user-first as giving "a 429 they can act on"; both
+# bounds emit a byte-identical 429 with a Retry-After, so that bought nothing.
 _OCCUPANCY_LIMIT_PER_USER = 90
 _OCCUPANCY_LIMIT_PER_IP = 600
 
@@ -228,8 +243,8 @@ _OCCUPANCY_LIMIT_PER_IP = 600
     "/channels/{channel_id}/call",
     response_model=CallOccupancyResponse,
     dependencies=[
-        rate_limit_user("call_occupancy_user", limit=_OCCUPANCY_LIMIT_PER_USER),
         rate_limit("call_occupancy", limit=_OCCUPANCY_LIMIT_PER_IP),
+        rate_limit_user("call_occupancy_user", limit=_OCCUPANCY_LIMIT_PER_USER),
     ],
 )
 async def get_call_occupancy(
