@@ -529,3 +529,251 @@ async def test_a_sane_stamp_still_renders(monkeypatch, livekit_configured):
     _fake_sfu(monkeypatch, _responds({"participants": [{"joinedAt": "1788700000"}]}))
     occ = await livekit_rooms.occupancy(room="chan-abc")
     assert occ.since == "2026-09-06T13:06:40Z"
+
+
+# =========================================================================
+# PART A (cage-match #167 round 2, Tesla; partitioned on claude-tasks#4023)
+#
+# Six findings that are NOT consequences of the 1Hz polling model, and therefore
+# had to be fixed whichever way the poll-vs-push design question lands. Nick's
+# 2026-09-09 disposition: "it stays open, and part A gets fixed."
+#
+# Each arm below names the mutation that turns it red, so a later reader can check
+# the test discriminates rather than merely passes.
+# =========================================================================
+
+# ---- item 6: the timeout was a scalar pretending to be a deadline ----
+
+def test_timeout_is_per_phase_and_the_stated_bound_is_its_arithmetic():
+    """`httpx.Timeout(2.0)` sets FOUR phase timeouts to 2.0s each — worst case 8s, not
+    2s. The module now names the phases; this pins that the documented worst case is
+    really the sum of what is configured, so the comment cannot drift from the code.
+
+    MUTATION: restore `httpx.Timeout(2.0)` -> connect becomes 2.0 and the sum is 8.0,
+    both assertions red.
+    """
+    t = livekit_rooms._TIMEOUT
+    phases = {"connect": t.connect, "read": t.read, "write": t.write, "pool": t.pool}
+    assert all(v is not None for v in phases.values()), phases
+    # Distinct per phase — the whole point. A single scalar would make these all equal.
+    assert len(set(phases.values())) > 1, f"all phases identical, still a scalar: {phases}"
+    assert sum(phases.values()) == livekit_rooms._TIMEOUT_WORST_CASE_SECONDS
+
+
+def test_the_pooled_client_actually_uses_that_timeout(monkeypatch, livekit_configured):
+    """NULL CONTROL for the test above: the constant could be perfect and unused.
+
+    MUTATION: build the client with `timeout=None` -> red.
+    """
+    monkeypatch.setattr(livekit_rooms, "_client_singleton", None)
+    assert livekit_rooms._client().timeout == livekit_rooms._TIMEOUT
+
+
+# ---- item 3: _api_base() dropped any path component ----
+
+@pytest.mark.parametrize("configured,expected", [
+    ("wss://sfu.example.test",           "https://sfu.example.test"),
+    ("wss://sfu.example.test/livekit",   "https://sfu.example.test/livekit"),
+    ("wss://sfu.example.test/livekit/",  "https://sfu.example.test/livekit"),
+    ("ws://localhost:7880/sfu",          "http://localhost:7880/sfu"),
+])
+def test_api_base_carries_the_path_prefix(monkeypatch, livekit_configured,
+                                          configured, expected):
+    """A reverse-proxied SFU at `wss://host/livekit` must not have its prefix dropped.
+
+    The bare-host arm is the NULL CONTROL: a fix that always appended something would
+    pass the three path arms and break every island in production today.
+
+    MUTATION: restore `urlunparse((scheme, parts.netloc, "", "", "", ""))` -> the three
+    path arms go red, the bare-host arm stays green (which is exactly why the bare-host
+    arm alone could never have caught this).
+    """
+    monkeypatch.setattr(settings, "livekit_url", configured)
+    assert livekit_rooms._api_base() == expected
+
+
+async def test_a_path_prefixed_sfu_is_called_at_the_right_root(
+    monkeypatch, livekit_configured
+):
+    """The failure this prevents is quiet: every poll 503s "correctly" while
+    video-token keeps working, because tokens never touch this base.
+
+    MUTATION: drop the path in `_api_base` -> the asserted URL loses `/livekit`.
+    """
+    monkeypatch.setattr(settings, "livekit_url", "wss://sfu.example.test/livekit")
+    handler = _responds({"participants": []})
+    _fake_sfu(monkeypatch, handler)
+
+    await livekit_rooms.occupancy(room="chan-abc")
+
+    assert str(handler.last_request.url) == (
+        "https://sfu.example.test/livekit/twirp/livekit.RoomService/ListParticipants")
+
+
+# ---- item 4: {} counted as a participant ----
+
+async def test_a_fieldless_participant_entry_is_unknown_not_an_occupant(
+    monkeypatch, livekit_configured
+):
+    """`{}` passes an isinstance check and then inflates the count — a phantom occupant
+    holding `live` true on a payload we do not understand. Same break direction as a
+    missing `participants` key: 503 "cannot tell" is loud, a phantom is silent.
+
+    MUTATION: delete the `if not p:` branch -> this returns live=True/participants=1.
+    """
+    _fake_sfu(monkeypatch, _responds({"participants": [{}]}))
+    with pytest.raises(livekit_rooms.LiveKitUnreachable):
+        await livekit_rooms.occupancy(room="chan-abc")
+
+
+async def test_a_fieldless_entry_alongside_a_real_one_still_refuses(
+    monkeypatch, livekit_configured
+):
+    """The count is wrong even when only ONE entry is junk, so the refusal cannot be
+    conditional on the whole list being junk.
+
+    MUTATION: refuse only when EVERY entry is empty -> red.
+    """
+    _fake_sfu(monkeypatch, _responds({"participants": [
+        {"identity": "real", "joinedAt": "1788700000"}, {},
+    ]}))
+    with pytest.raises(livekit_rooms.LiveKitUnreachable):
+        await livekit_rooms.occupancy(room="chan-abc")
+
+
+async def test_a_participant_with_fields_is_still_an_occupant(
+    monkeypatch, livekit_configured
+):
+    """NULL CONTROL. A refusal that rejected every participant would pass both arms
+    above while making `live: true` unreachable — i.e. breaking the entire feature.
+
+    MUTATION: `if not p` -> `if True` -> red.
+    """
+    _fake_sfu(monkeypatch, _responds({"participants": [{"identity": "real"}]}))
+    occ = await livekit_rooms.occupancy(room="chan-abc")
+    assert (occ.live, occ.participants, occ.since) == (True, 1, None)
+
+
+async def test_fieldless_participant_reaches_the_route_as_503_not_500(
+    client, session, monkeypatch, livekit_configured
+):
+    alice, peer = await _user(session, "alice"), await _user(session, "peer")
+    ch = await _dm(session)
+    await _join(session, ch, alice)
+    await _join(session, ch, peer)
+    _fake_sfu(monkeypatch, _responds({"participants": [{}]}))
+
+    resp = await client.get(f"/v1/channels/{ch.id}/call", headers=_headers(alice))
+    assert resp.status_code == 503
+    assert "live" not in resp.json()
+
+
+# ---- item 5: a client closed underneath an in-flight poll escaped as a 500 ----
+
+async def test_a_client_closed_mid_flight_is_cannot_tell_not_a_gateway_error(
+    monkeypatch, livekit_configured
+):
+    """`aclose()` nulls the singleton at shutdown, but a request that already grabbed
+    the reference holds a CLOSED client. httpx answers that with a bare RuntimeError,
+    which is not an `httpx.HTTPError` — so before this fix a poll racing shutdown
+    escaped as a 500, blaming the gateway for the SFU.
+
+    NOT SIMULATED: the client is genuinely closed and the real httpx raises. A mock
+    raising RuntimeError would prove only that the except clause matches the exception
+    the test itself chose.
+
+    MUTATION: narrow the except back to `httpx.HTTPError` -> RuntimeError propagates
+    and `pytest.raises(LiveKitUnreachable)` goes red on an unexpected RuntimeError.
+    """
+    _fake_sfu(monkeypatch, _responds({"participants": []}))
+    await livekit_rooms.occupancy(room="chan-abc")          # pool a real client
+    closed = livekit_rooms._client_singleton
+    await closed.aclose()
+    monkeypatch.setattr(livekit_rooms, "_client_singleton", closed)  # the racing handle
+
+    with pytest.raises(livekit_rooms.LiveKitUnreachable):
+        await livekit_rooms.occupancy(room="chan-abc")
+
+
+async def test_a_shape_refusal_keeps_its_own_message(monkeypatch, livekit_configured):
+    """Guard on the widened except: catching RuntimeError must never become a catch-all
+    that re-wraps the module's OWN LiveKitUnreachable and destroys its message.
+
+    THIS TEST'S FIRST VERSION WAS A LIE, and the mutation harness is what said so. It
+    was written as the null control for an `except LiveKitUnreachable: raise` arm added
+    alongside the RuntimeError catch — but deleting that arm did not turn this red,
+    because the shape and stamp refusals happen BELOW the try, so the arm was guarding a
+    state that cannot occur. The arm was deleted rather than kept with a comment
+    asserting a mechanism that never fires.
+
+    What remains is a real pin on a real future mistake, with the mutation to match.
+
+    MUTATION: move `_participants_from(body)` INSIDE the try -> the RuntimeError arm
+    now catches it, the message becomes "SFU request failed: LiveKitUnreachable", red.
+    """
+    _fake_sfu(monkeypatch, _responds({"participants": "not-a-list"}))
+    with pytest.raises(livekit_rooms.LiveKitUnreachable) as caught:
+        await livekit_rooms.occupancy(room="chan-abc")
+    assert "not a list" in str(caught.value)
+
+
+# ---- item 1: the DB session was held open across the vendor hop ----
+
+async def test_the_db_session_is_released_before_the_sfu_is_asked(
+    client, session, monkeypatch, livekit_configured
+):
+    """A scarce resource must not be pinned for the duration of a third party's
+    latency. This gateway is one uvicorn worker over file-backed SQLite, so N slow
+    polls holding N sessions turns a LiveKit blip into island-wide contention.
+
+    The probe runs INSIDE the fake SFU handler — i.e. at the exact moment the vendor
+    call is in flight, which is the only moment the claim is about.
+
+    MUTATION: delete `await session.close()` from the route -> `in_transaction()` is
+    True while the SFU is being asked, and this goes red.
+    """
+    alice, peer = await _user(session, "alice"), await _user(session, "peer")
+    ch = await _dm(session)
+    await _join(session, ch, alice)
+    await _join(session, ch, peer)
+
+    observed = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        observed["in_transaction"] = session.in_transaction()
+        return httpx.Response(200, json={"participants": []})
+
+    _fake_sfu(monkeypatch, handler)
+    resp = await client.get(f"/v1/channels/{ch.id}/call", headers=_headers(alice))
+
+    assert resp.status_code == 200
+    assert observed["in_transaction"] is False, (
+        "the DB session was still in a transaction while the SFU was being asked")
+
+
+async def test_the_gates_still_ran_before_that_release(
+    client, session, monkeypatch, livekit_configured
+):
+    """NULL CONTROL for the release: satisfying "no transaction is open during the SFU
+    call" by simply not gating would pass the test above while stripping every ACL check
+    off the endpoint. This pins that an outsider is still refused.
+
+    MEASURED WHILE WRITING THIS, and it corrects the control's first draft: moving the
+    `close()` ABOVE the gate does NOT break anything, because SQLAlchemy reopens a
+    transaction on the session's next use. So "the release moved too early" is not a
+    reachable failure and cannot be the control — the reachable one is the gate being
+    weakened or dropped, which is what this arm actually mutates.
+
+    MUTATION: replace `_gated_dm_channel` with a bare `acl.readable_channel` (the
+    weakest plausible "simplification") -> the outsider is no longer refused and this
+    goes red.
+    """
+    outsider = await _user(session, "outsider")
+    a, b = await _user(session, "a"), await _user(session, "b")
+    ch = await _dm(session)
+    await _join(session, ch, a)
+    await _join(session, ch, b)
+    _fake_sfu(monkeypatch, _responds({"participants": []}))
+
+    resp = await client.get(f"/v1/channels/{ch.id}/call", headers=_headers(outsider))
+    assert resp.status_code == 404
