@@ -231,9 +231,112 @@ def test_the_comparison_is_not_vacuous(tmp_path) -> None:
     result = _run(box, tag)
 
     assert result.returncode == CLEAN, result.stderr
-    assert f"{len(BASELINE)} file" in result.stdout, (
+    # THE FULL STRING, not a prefix. `f"{4} file"` is a substring of "14 file(s)",
+    # "24 file(s)" and "104 file(s)" — so the one assertion whose entire job is to
+    # prove the comparison was not a no-op was itself satisfied by a whole family
+    # of wrong counts. A control that passes for reasons other than the one it
+    # names is the defect this test exists to catch, committed by the test.
+    assert f"{len(BASELINE)} file(s) compared" in result.stdout, (
         "the script must state how many files it compared, or a no-op passes as a pass: "
         + result.stdout
+    )
+
+
+def test_an_EMPTY_ref_tree_is_CANNOT_LOOK_not_CLEAN(tmp_path) -> None:
+    """THE VACUOUS-COMPARISON ARM (cage-match round 1, Maxwell).
+
+    A tree that materialises but holds nothing makes every per-file compare take
+    its "the ref does not have this file" exit, so the walk finds no matches,
+    nothing drifts, and the script would exit 0 having compared literally zero
+    files. That is "I could not look" spelled exactly like "I looked and it
+    matched" — the same fail-open as `die` inside a subshell, one function over.
+
+    Forced, not observed: the ref tree is real and readable and simply empty."""
+    box = _tree(tmp_path / "box", BASELINE)
+    empty = tmp_path / "empty-tag"
+    empty.mkdir()
+
+    result = _run(box, empty)
+
+    assert result.returncode == CANNOT_LOOK, (
+        "an empty ref tree must not read as a clean comparison: "
+        + result.stdout
+        + result.stderr
+    )
+
+
+def test_a_ref_tree_with_no_compose_is_CANNOT_LOOK(tmp_path) -> None:
+    """Narrower sibling of the above, and the one that actually fires in the wild:
+    a tarball that unpacked with the wrong number of leading path components. The
+    deploy files line up, `docker-compose.yml` does not, and a compose-blind pass
+    would report clean on the one file the whole check is named for."""
+    box = _tree(tmp_path / "box", BASELINE)
+    tag = _tree(
+        tmp_path / "tag", {k: v for k, v in BASELINE.items() if k != "docker-compose.yml"}
+    )
+
+    result = _run(box, tag)
+
+    assert result.returncode == CANNOT_LOOK, result.stdout + result.stderr
+
+
+def test_a_symlinked_deploy_file_is_still_compared(tmp_path) -> None:
+    """`find -type f` EXCLUDES symlinks (cage-match round 1, Maxwell + Carnot
+    independently). A box with `deploy/update.sh -> /opt/island/update.sh` would
+    drop that file from the compared set silently, and its drift would report as
+    a clean pass — a hole in the guard, in the population of boxes most likely to
+    have a hand-rolled layout.
+
+    The arm forces the bad state: the symlink's TARGET is drifted, so a walk that
+    skips symlinks returns CLEAN and only a walk that follows them returns
+    DRIFT."""
+    box = _tree(tmp_path / "box", {k: v for k, v in BASELINE.items() if k != "deploy/update.sh"})
+    real = tmp_path / "elsewhere-update.sh"
+    real.write_text("#!/usr/bin/env bash\necho STALE\n")
+    (box / "deploy" / "update.sh").symlink_to(real)
+    tag = _tree(tmp_path / "tag", BASELINE)
+
+    result = _run(box, tag)
+
+    assert result.returncode == DRIFT, (
+        "a symlinked deploy file whose target is stale must not read as clean: "
+        + result.stdout
+        + result.stderr
+    )
+    assert "update.sh" in result.stderr, result.stderr
+
+
+def test_a_broken_symlink_under_deploy_refuses(tmp_path) -> None:
+    """Follow-on from the same change: once symlinks are enumerated, one pointing
+    at nothing fails the `-f` test. Refusing is the right answer — a deploy file
+    that resolves to nothing is not a box in a state anyone should pull onto."""
+    box = _tree(tmp_path / "box", {k: v for k, v in BASELINE.items() if k != "deploy/update.sh"})
+    (box / "deploy" / "update.sh").symlink_to(tmp_path / "no-such-target")
+    tag = _tree(tmp_path / "tag", BASELINE)
+
+    result = _run(box, tag)
+
+    assert result.returncode == DRIFT, result.stdout + result.stderr
+
+
+def test_a_newline_in_a_filename_does_not_split_the_walk(tmp_path) -> None:
+    """A line-oriented read of `find` output splits one path into two on an
+    embedded newline, and both halves silently miss their comparison (cage-match
+    round 1, Kelvin). Nothing in this repo carries such a name today — which is
+    the same "today" that produced the outage this file refuses.
+
+    The arm forces it: the weird-named file is DRIFTED, so a split walk reports
+    clean and only a NUL-delimited walk reports drift."""
+    weird = "deploy/we ird\nname.sh"
+    box = _tree(tmp_path / "box", {**BASELINE, weird: "box version\n"})
+    tag = _tree(tmp_path / "tag", {**BASELINE, weird: "tag version\n"})
+
+    result = _run(box, tag)
+
+    assert result.returncode == DRIFT, (
+        "a drifted file whose name contains a newline must still be caught: "
+        + result.stdout
+        + result.stderr
     )
 
 
@@ -261,4 +364,46 @@ def test_the_real_fetch_resolves_a_real_tag(tmp_path) -> None:
         "broken and every other test in this file is measuring nothing. "
         + result.stdout
         + result.stderr
+    )
+
+
+def test_update_sh_FAILS_CLOSED_when_the_guard_is_missing() -> None:
+    """The partial-sync branch, pinned (cage-match round 1, Carnot).
+
+    `update.sh` requires docker and a running island, so its branches cannot be
+    driven from here. This is therefore a REGRESSION PIN, not a behavioural
+    proof, and the difference matters: it is a textual instrument reading the
+    same file a textual edit would change, so it shares that edit's blind spot
+    and cannot see a branch that is correct in source and wrong in effect.
+
+    It is still worth having. The defect it pins is specific and has already
+    happened once in this file's history: the missing-guard branch was first
+    written as `warn`-and-continue, copied from the APNs preflight above without
+    re-deriving why that one warns. The APNs branch warns because an OLD
+    update.sh can legitimately reach it; this branch cannot, because the guard
+    ships in the same commit as the code that calls it — so reaching it means a
+    partial sync, the exact failure this PR exists to refuse, and warning would
+    make the check skippable without `--skip-drift-check`.
+
+    A future edit that relaxes it back to a warning is the regression, and it
+    would look entirely reasonable in a diff."""
+    update_sh = (REPO / "deploy" / "update.sh").read_text()
+
+    marker = "deploy-tree drift check NOT FOUND"
+    assert marker in update_sh, (
+        "the missing-guard branch has been renamed or removed — re-point this pin "
+        "at whatever replaced it rather than deleting it"
+    )
+    branch = update_sh[update_sh.index(marker) :]
+    # The `die` must be the thing that REPORTS this state, not a die somewhere
+    # further down the file: take only up to the end of that message block.
+    head = branch[: branch.index("fi")]
+    assert "--skip-drift-check" in head, (
+        "a fail-closed branch must name its escape hatch, or the operator's only "
+        "route past a legitimately-blocked deploy is to edit the script"
+    )
+    assert "die " in update_sh[max(0, update_sh.index(marker) - 200) : update_sh.index(marker)], (
+        "the missing-guard branch must FAIL CLOSED (die), not warn-and-continue: "
+        "this update.sh ships with the guard, so the guard's absence means a "
+        "partial sync — the very failure the guard exists to refuse"
     )

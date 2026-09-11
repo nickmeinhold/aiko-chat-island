@@ -147,6 +147,18 @@ materialise_ref() {
 tree=""
 materialise_ref
 
+# THE REF TREE MUST CONTAIN THE FILE THIS CHECK IS NAMED FOR. Without this, an
+# empty or wrong-shaped tree (a tarball that unpacks to nothing, a
+# --strip-components that ate the whole thing, an ISLAND_REF_TREE pointed at an
+# unrelated directory) makes every compare_one() take its `[ -f "$ref_file" ] ||
+# return 0` exit, compare NOTHING, and exit 0 — "I could not look" wearing
+# "clean"'s clothes for the second time in one file. Found in self-review by
+# asking what the count is EVIDENCE of: it was printed and never acted on, which
+# is what an unenforced invariant looks like.
+[ -f "$tree/docker-compose.yml" ] \
+  || die "the tree for $ref has no docker-compose.yml at its root — the ref was not
+     materialised correctly (empty archive, wrong ISLAND_REF_TREE, unexpected
+     layout). NOTHING was compared, and that is not a clean result."
 # --- compare ----------------------------------------------------------------
 #
 # ENUMERATION IS BOX-DRIVEN, and that is the whole reason this is not a recursive
@@ -171,9 +183,12 @@ compare_one() {
   box_file="$repo_root/$rel"; ref_file="$tree/$rel"
   [ -f "$ref_file" ] || return 0          # box-only: ignored, see above
   if [ ! -f "$box_file" ]; then
-    # Only reachable for a file the caller asserted must exist (compose). A file
-    # the box simply does not carry never gets here — it is enumerated from the
-    # ref side and warned about instead.
+    # Two ways in. (1) docker-compose.yml, named explicitly below, whose absence
+    # is a refusal rather than a warning. (2) a BROKEN SYMLINK: the walk now
+    # enumerates -type l, and `-f` follows the link, so a deploy file pointing at
+    # nothing lands here and is refused — which is the right answer for it. A file
+    # the box simply does not carry never reaches this branch; it is enumerated
+    # from the ref side and warned about instead.
     drifted="$drifted $rel(MISSING-on-this-box)"; drifted_n=$((drifted_n + 1))
     return 0
   fi
@@ -201,10 +216,23 @@ compare_one "docker-compose.yml"
 # The deploy/ walk is recursive on purpose: deploy/lib/dotenv-read.sh is the single
 # reader for every .env value these scripts touch, and a drifted copy of it
 # mis-reads a signing seed. One level of deploy/ would not see it.
-while IFS= read -r rel; do
+# `-o -type l` (Maxwell + Carnot, converging independently): plain `-type f`
+# EXCLUDES symlinks, so a box with `deploy/update.sh -> /opt/island/update.sh` —
+# a perfectly plausible shape for a hand-built deploy tree — drops that file from
+# the compared set SILENTLY and its drift becomes invisible. A hole that reports
+# as a clean pass, in exactly the population of boxes most likely to have a
+# hand-rolled layout. `[ -f ]` and `cmp` both follow the link, so a live symlink
+# compares against its target; a BROKEN one fails `[ -f ]` and is reported as
+# drift, which is the right answer for a deploy file pointing at nothing.
+#
+# -print0 / read -d '' (Kelvin): a newline in a filename splits one path into two
+# in a line-oriented read, and the halves silently miss their comparison. Nothing
+# in this repo carries one today, which is the same "today" that produced the
+# outage this file exists to refuse.
+while IFS= read -r -d '' rel; do
   [ -n "$rel" ] || continue
   compare_one "$rel"
-done < <(cd "$repo_root" && find deploy -type f 2>/dev/null | LC_ALL=C sort)
+done < <(cd "$repo_root" && find deploy \( -type f -o -type l \) -print0 2>/dev/null | LC_ALL=C sort -z)
 
 # Files the ref carries that this box does not. Warned, never refused.
 # SCOPED TO DIRECTORIES THE BOX ACTUALLY HAS, and that is a correction made by
@@ -216,11 +244,18 @@ done < <(cd "$repo_root" && find deploy -type f 2>/dev/null | LC_ALL=C sort)
 # here is a genuine "the tag added something beside what you have"; a whole
 # subtree that has never been here is somebody else's deploy.
 absent=""; absent_n=0
-while IFS= read -r rel; do
+while IFS= read -r -d '' rel; do
   [ -n "$rel" ] || continue
   [ -d "$repo_root/$(dirname "$rel")" ] || continue
-  [ -f "$repo_root/$rel" ] || { absent="$absent $rel"; absent_n=$((absent_n + 1)); }
-done < <(cd "$tree" && find deploy -type f 2>/dev/null | LC_ALL=C sort)
+  # `-e || -L`, from the fix-interaction pass rather than from a failing test.
+  # `-e` follows the link, so a BROKEN symlink reads as absent here — while the
+  # compare walk above now enumerates `-type l` and reports that same file as
+  # DRIFT. One file, two contradictory sentences in one run: "your box does not
+  # carry this" and "your copy of this differs". `-L` catches the dangling link
+  # as present, leaving exactly one report, the refusal, which is the true one.
+  { [ -e "$repo_root/$rel" ] || [ -L "$repo_root/$rel" ]; } \
+    || { absent="$absent $rel"; absent_n=$((absent_n + 1)); }
+done < <(cd "$tree" && find deploy \( -type f -o -type l \) -print0 2>/dev/null | LC_ALL=C sort -z)
 
 if [ "$absent_n" -gt 0 ]; then
   warn "$ref carries $absent_n deploy file(s) this box does not — expected for a box
@@ -235,6 +270,16 @@ fi
 # a glance that the guard was awake.
 printf 'compose/deploy drift check: %s file(s) compared against %s\n' "$compared" "$ref"
 
+# NO `compared -gt 0` FLOOR HERE, and its absence is the considered answer rather
+# than an omission. One was added as a belt on the vacuous-comparison fix and then
+# mutation-tested: deleting it changed no test result, which is the signature of a
+# check whose disabled value equals its enabled value. Chasing why rather than
+# writing an arm for it: `compared` is 0 only if docker-compose.yml failed to
+# increment it, the ref-side copy is guaranteed present by the check above, so the
+# box's copy must have been missing — and that already pushed `drifted_n` to 1.
+# The floor was therefore unreachable except to REPLACE a truthful drift refusal
+# with a vaguer "could not look". The invariant it was groping for is enforced one
+# screen up, where it is proven by an arm that actually goes red.
 if [ "$drifted_n" -gt 0 ]; then
   die "this box's deploy tree differs from $ref in $drifted_n file(s):
     $drifted

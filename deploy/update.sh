@@ -171,16 +171,23 @@ elif [ -f "$SCRIPT_DIR/preflight-compose-drift.sh" ]; then
      or deploy deliberately with: deploy/update.sh --skip-drift-check" ;;
   esac
 else
-  # ABSENT means this box's deploy tree predates the check. Same reasoning as the
-  # APNs preflight above: do not fail (that would block a deploy on exactly the
-  # drifted boxes this exists to protect), but say so loudly. This is the guard's
-  # honest bootstrap — it lives in deploy/, which is the thing that does not sync,
-  # so it starts protecting on the deploy AFTER the operator syncs deploy/.
-  warn "deploy-tree drift check NOT FOUND ($SCRIPT_DIR/preflight-compose-drift.sh) —
-     this box's deploy tree predates it. docker-compose.yml is NOT synced by this
-     script, so a tag that adds a required env forward will crash-loop the island
-     after the recreate (#4230). Refresh this box's deploy/ and docker-compose.yml
-     from the tag by hand this once."
+  # FAIL CLOSED — and the reasoning is the OPPOSITE of the APNs preflight's
+  # warn-and-continue above, which an earlier draft of this block copied without
+  # re-deriving (Carnot, cage-match round 1).
+  #
+  # The APNs branch warns because an OLD update.sh can legitimately reach it. This
+  # branch cannot: the drift check ships in the SAME commit as the code you are
+  # reading, so an update.sh new enough to execute these lines came from a tag that
+  # also carries preflight-compose-drift.sh. Reaching here therefore means the
+  # operator synced update.sh and NOT the guard beside it — a partial sync, which
+  # is the precise failure mode this PR exists to stop. Warning and continuing
+  # would make the check accidentally skippable without --skip-drift-check, so the
+  # guard would be defeated by exactly the behaviour it was written to refuse.
+  die "deploy-tree drift check NOT FOUND ($SCRIPT_DIR/preflight-compose-drift.sh).
+     This update.sh ships WITH that guard, so its absence means deploy/ was synced
+     PARTIALLY — the same partial-sync that took enspyr down on 2026-09-11. Sync
+     the whole of deploy/ from the tag and re-run. To deploy anyway, deliberately:
+     deploy/update.sh --skip-drift-check"
 fi
 
 # --- step 1: back up the sole-copy DB (fail-closed) -------------------------
