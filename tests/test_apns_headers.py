@@ -246,6 +246,35 @@ async def test_a_hangup_outlives_the_ring_lease_it_must_be_able_to_stop(
         "deletes the ceiling and rings for a call that is already over")
 
 
+async def test_the_transport_refuses_an_unrouted_pair_rather_than_inheriting_one(
+    configured, captured
+):
+    """NO WILDCARD ON A WAKE KIND (Carnot, cage-match PR#176 r2).
+
+    Lifetime and collapse-eligibility became a two-axis decision one commit ago,
+    and the first draft of that match wildcarded the wake kind — so a third
+    `WakeKind` would have inherited an alert push's 60s lifetime with nobody
+    deciding it. `plan_deliveries` is total and forces the decision; this asserts
+    the TRANSPORT does too, because a caller can reach `send` past the router.
+
+    Both arms matter. The alert/end arm is unreachable through the door
+    (`end_wake_needs_voip` skips it) and is still refused explicitly, because
+    "unreachable today" is a property of the current router, not of this function.
+    """
+    import enum
+
+    class _FutureWake(enum.Enum):
+        CALL_TRANSFER = "call_transfer"
+
+    with pytest.raises(ValueError, match="cannot end a CallKit ring"):
+        await _send(TokenKind.ALERT, wake=WakeKind.CALL_END)
+    assert captured == [], "a refused pair must not reach Apple"
+
+    with pytest.raises(ValueError, match="unrouted push"):
+        await _send(TokenKind.VOIP, wake=_FutureWake.CALL_TRANSFER)
+    assert captured == [], "an unrouted wake kind must not reach Apple"
+
+
 async def test_a_voip_send_never_carries_a_collapse_id(configured, captured):
     """PAIRED WITH THE ALERT ARM ABOVE, which asserts the header IS present — a
     transport that dropped `apns-collapse-id` unconditionally would satisfy this

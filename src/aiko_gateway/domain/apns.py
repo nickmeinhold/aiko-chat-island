@@ -532,15 +532,43 @@ async def send(device_token: str, payload: WakePayload, *,
     # TRANSPORT. Lifetime is not — it is a fact about WHAT THE PUSH IS FOR, and a
     # stop and a start want opposite answers. Matching on the pair keeps the binding
     # the comment promises while letting the one genuinely two-axis fact vary.
+    # EVERY CELL NAMED; NO WILDCARD ON A WAKE KIND (Carnot, cage-match PR#176 r2).
+    # The first draft of this two-axis match wrote `(TokenKind.ALERT, _)` and
+    # `(TokenKind.VOIP, _)`, which reads as tidy and is the exact silent-inheritance
+    # hole the router two files up was rebuilt to close. A third `WakeKind` would
+    # have inherited an alert push's 60s lifetime and collapse-eligibility here
+    # WITHOUT ANYONE DECIDING THAT — the policy layer forcing a decision while the
+    # transport quietly supplies a default. The finding is sharper than it looks
+    # because this fix CREATED it: lifetime only became a decision worth guarding
+    # when it stopped being a function of `token_kind` alone, one commit ago.
+    #
+    # NOT `assert_never` on the pair: tuple narrowing is unreliable and there is no
+    # type checker in CI, so the fall-through has to be a REAL runtime arm — the
+    # same reasoning `plan_deliveries` states for its own `case _`. Raising is safe
+    # here: `_send_one` wraps each device in its own boundary, so an unrouted pair
+    # costs that one device a logged skip rather than the fanout.
     match (token_kind, payload.kind):
-        case (TokenKind.ALERT, _):
+        case (TokenKind.ALERT, WakeKind.CALL_INVITE):
             expires_in, may_collapse = _ALERT_EXPIRATION_SECONDS, True
+        case (TokenKind.VOIP, WakeKind.CALL_INVITE):
+            expires_in, may_collapse = _VOIP_LEASE_SECONDS, False
         case (TokenKind.VOIP, WakeKind.CALL_END):
             expires_in, may_collapse = _VOIP_END_EXPIRATION_SECONDS, False
-        case (TokenKind.VOIP, _):
-            expires_in, may_collapse = _VOIP_LEASE_SECONDS, False
+        case (TokenKind.ALERT, WakeKind.CALL_END):
+            # UNREACHABLE VIA THE DOOR, AND STILL WRITTEN OUT. `plan_deliveries`
+            # skips this cell as `end_wake_needs_voip`, so the only way here is a
+            # caller reaching past the router. Named rather than folded into the
+            # refusal below because the reason is specific and worth reading: an
+            # alert push runs no app code, so it cannot end a CallKit ring.
+            raise ValueError(
+                "an end wake cannot be sent to an alert token — an alert push runs "
+                "no app code and cannot end a CallKit ring; see "
+                "push_service.plan_deliveries (end_wake_needs_voip)")
         case _:
-            assert_never(token_kind)
+            raise ValueError(
+                f"unrouted push: token_kind={token_kind} wake={payload.kind}. A new "
+                "WakeKind must be given an explicit lifetime and collapse decision "
+                "here, not inherit one.")
 
     headers = {
         "authorization": f"bearer {_provider_token()}",
