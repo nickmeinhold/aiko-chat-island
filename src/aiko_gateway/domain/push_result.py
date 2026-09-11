@@ -140,6 +140,26 @@ class WakePayload:
     this into its own envelope (`apns._render`, `fcm.build_message`) — the
     envelope is provider-specific and belongs below the boundary; the refusal is
     policy and belongs here.
+
+    WHAT THAT LAST SENTENCE DEFENDS, SAID EXPLICITLY, because its phrasing can
+    foreclose more than the decision behind it does. "Nowhere to put an identity"
+    is a true description of the type as it stands today and a MECHANISM, not the
+    property. The property is the paragraph at the top and it is about a READER:
+    the provider must not learn who calls whom. Design 12 Decision 6 states it
+    the same way — "nothing about who-calls-whom ON APPLE'S WIRE".
+
+    The difference matters for one live question (claude-tasks#4254, and the app
+    tab's design 20). An envelope SEALED TO THE CALLEE would put bytes in this
+    payload that are an identity to the recipient and ciphertext to Apple. Under
+    the structural reading that is excluded by wording; under the property it is
+    not excluded at all, because the provider learns nothing it did not already
+    learn from the wake itself. A future reader should not conclude from "ONE
+    FIELD" that the question is already settled — it is open, it belongs to Nick,
+    and the crypto in it needs a specialist (claude-tasks#4185).
+
+    Nothing here is a decision to carry such an envelope. It is a statement of
+    which property this type is protecting, so that whoever decides is deciding
+    the real thing rather than arguing with a sentence.
     """
 
     channel_id: str
