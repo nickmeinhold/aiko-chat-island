@@ -152,15 +152,21 @@ elif [ -f "$SCRIPT_DIR/preflight-compose-drift.sh" ]; then
   # here, on the path of every real deploy, untestable (Tesla, cage-match round 2).
 
   set +e
-  # `env -u ISLAND_REF_TREE` (Carnot, cage-match round 2). That variable is the
-  # guard's offline/test seam: it substitutes a local directory for the fetched
-  # tag. Inherited from a host environment it would make the deploy path compare
-  # the box against some stale local tree and report clean, while still printing
-  # the tag's name — "I compared this box to v0.11.0" and "I compared it to
-  # whatever was lying around" become the same sentence. Stripping it here makes
-  # that unreachable from a deploy rather than merely unlikely; the guard also
-  # warns loudly if any other caller has it set.
-  env -u ISLAND_REF_TREE "$SCRIPT_DIR/preflight-compose-drift.sh" "$REPO_ROOT" "$drift_ref"
+  # ALL THREE SEAMS ARE STRIPPED (Carnot round 2 named the first; Tesla round 3
+  # named the class). Each is an ambient variable that changes what "compared
+  # against v0.11.0" MEANS, and each can arrive on a host without appearing in
+  # any command line:
+  #   ISLAND_REF_TREE       — substitutes a local directory for the fetched tag
+  #   ISLAND_REPO_SLUG      — fetches SOMEONE ELSE'S repository
+  #   ISLAND_CODELOAD_BASE  — fetches from another server entirely
+  # The slug is the nastiest: inherited, the guard compares the box against a
+  # stranger's tree and reports a match, while `docker compose pull` goes on
+  # interpolating the real image. Fixing only the first, as an earlier pass did,
+  # is patching an instance of a class that had already been named. Stripping
+  # them here makes the deploy path structurally unreachable by any of them; the
+  # guard separately announces any seam it finds set, for every other caller.
+  env -u ISLAND_REF_TREE -u ISLAND_REPO_SLUG -u ISLAND_CODELOAD_BASE \
+    "$SCRIPT_DIR/preflight-compose-drift.sh" "$REPO_ROOT" "$drift_ref"
   drift_rc=$?
   set -e
   case "$drift_rc" in

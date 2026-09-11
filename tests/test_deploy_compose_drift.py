@@ -393,17 +393,39 @@ def test_the_local_tree_seam_announces_itself(tmp_path) -> None:
     )
 
 
-def test_update_sh_STRIPS_the_local_tree_seam_before_invoking() -> None:
-    """Regression pin, same honest caveat as the fail-closed pin above: a textual
-    instrument reading the file a textual edit would change.
+def _update_sh_code() -> str:
+    """update.sh with every comment line removed.
 
-    Pinned because the defect is silent and total — an ISLAND_REF_TREE inherited
-    from a host environment would make every deploy compare the box against a
-    stale local tree and report clean, while still printing the tag's name."""
-    update_sh = (REPO / "deploy" / "update.sh").read_text()
-    assert "env -u ISLAND_REF_TREE" in update_sh, (
-        "update.sh must strip ISLAND_REF_TREE before invoking the guard, so the "
-        "deploy path structurally cannot compare against a local tree"
+    THE POINT OF THIS FUNCTION IS A BUG IT ALREADY CAUGHT (Tesla, cage-match
+    round 3). The seam pin below used to grep the whole file for
+    `env -u ISLAND_REF_TREE` — a string that also appears in the COMMENT
+    explaining why the command is there. Delete the actual command, keep the
+    comment, and the test stayed green while every deploy compared against
+    whatever local tree was lying around.
+
+    A control satisfied by the prose describing the thing it checks does not
+    depend on the thing it checks. That is the exact defect class this whole PR
+    is about, committed inside its own verification."""
+    text = (REPO / "deploy" / "update.sh").read_text()
+    return "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
+
+
+@pytest.mark.parametrize("seam", ["ISLAND_REF_TREE", "ISLAND_REPO_SLUG", "ISLAND_CODELOAD_BASE"])
+def test_update_sh_STRIPS_every_ambient_seam_before_invoking(seam) -> None:
+    """All three seams, as a class (Tesla, cage-match round 3).
+
+    Each changes what "compared against v0.11.0" MEANS, and each is an ambient
+    environment variable that can arrive on a host without appearing in any
+    command line. An earlier pass stripped exactly one and left the siblings
+    live — patching an instance of a class that had already been named.
+    ISLAND_REPO_SLUG is the dangerous one: inherited, it fetches someone else's
+    tarball, and if that tree matches the box the guard reports the trees match
+    while `docker compose pull` still interpolates the real image.
+
+    Read against comment-stripped source, for the reason in _update_sh_code."""
+    assert f"-u {seam}" in _update_sh_code(), (
+        f"update.sh must strip {seam} before invoking the guard, so the deploy "
+        f"path structurally cannot be redirected by an inherited environment"
     )
 
 
@@ -686,3 +708,213 @@ def test_a_refusal_SHOWS_the_diff_body_not_just_the_filename(tmp_path) -> None:
         "a truncated diff must say how much was cut, not leave a silent tail"
     )
     assert "differs from" in result.stderr, "the refusal itself must still print"
+
+
+def test_a_ref_tree_with_compose_but_NO_deploy_is_CANNOT_LOOK(tmp_path) -> None:
+    """THE INTERSECTION-OF-ONE FAIL-OPEN (Tesla, cage-match round 3).
+
+    A ref tree holding a matching `docker-compose.yml` and nothing else passes
+    the compose-exists check, and then every script on the box is "a file the ref
+    does not have" — box-only, ignored by design — so a drifted `update.sh` reads
+    as CLEAN. The compose check certifies ONE FILE; nothing certified the SHAPE.
+
+    GitHub's real archive always carries both, which is precisely why the happy
+    path hides it. Measured before the fix: this exact tree exited 0 while the
+    box's update.sh said DRIFTED."""
+    box = _tree(tmp_path / "box", {**BASELINE, "deploy/update.sh": "DRIFTED\n"})
+    tag = _tree(tmp_path / "tag", {"docker-compose.yml": BASELINE["docker-compose.yml"]})
+
+    result = _run(box, tag)
+
+    assert result.returncode == CANNOT_LOOK, (
+        "a ref tree with no deploy/ cannot certify anything about the box's "
+        "scripts, and must not say clean: " + result.stdout + result.stderr
+    )
+    # ASSERT THE MESSAGE, NOT ONLY THE CODE. Mutation-checked: with the explicit
+    # shape check removed, the ref-side walk ALSO fails (find has no deploy/ to
+    # read) and the run still exits 2 — so an exit-code-only assertion passes
+    # against a script missing the check it is named for. Two mechanisms reaching
+    # the same exit is defence in depth for the operator and a blind spot for the
+    # test; pinning the sentence separates them.
+    assert "did not materialise as this repository" in result.stderr, (
+        "the shape check must be the thing that fires, with its own message: "
+        + result.stderr
+    )
+
+
+def test_a_symlinked_DIRECTORY_under_deploy_is_traversed(tmp_path) -> None:
+    """THE ARM THE -L FIX NEVER HAD (Tesla, cage-match round 3).
+
+    `-L` was added in round 2 so `deploy/lib -> /opt/island/lib` is traversed
+    rather than merely listed. The suite only ever forced a FILE symlink — which
+    `-type l` already catches without `-L` — so removing `-L` left every test
+    green. Mutation-checked: it did.
+
+    Here the drifted file lives BEHIND a symlinked directory, so only a
+    following walk can see it."""
+    box = _tree(tmp_path / "box", {k: v for k, v in BASELINE.items() if not k.startswith("deploy/lib")})
+    real_lib = tmp_path / "elsewhere-lib"
+    real_lib.mkdir()
+    (real_lib / "dotenv-read.sh").write_text("dotenv_read() { echo DRIFTED; }\n")
+    (box / "deploy" / "lib").symlink_to(real_lib, target_is_directory=True)
+    tag = _tree(tmp_path / "tag", BASELINE)
+
+    result = _run(box, tag)
+
+    assert result.returncode == DRIFT, (
+        "a drifted file behind a symlinked directory must not read as clean: "
+        + result.stdout
+        + result.stderr
+    )
+    assert "dotenv-read.sh" in result.stderr, result.stderr
+
+
+def _serve_once(tmp_path, body: bytes, status: int = 200):
+    """A one-request local HTTP server, returning (base_url, thread).
+
+    This exists so the FETCH path can be driven offline. Before the
+    ISLAND_CODELOAD_BASE seam, the only way to reach curl+tar was the real
+    codeload, which always serves a well-formed archive — so the "the archive is
+    corrupt" branch and every non-200 status but 404 were unreachable by any
+    test. Mutation-checked at the time: deleting the tar `|| die` left the whole
+    suite green."""
+    import http.server
+    import threading
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            self.send_response(status)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):  # silence
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return f"http://127.0.0.1:{srv.server_port}", srv
+
+
+def test_a_CORRUPT_archive_is_CANNOT_LOOK(tmp_path) -> None:
+    """THE THIRD EPISTEMIC STATE, finally driven (Tesla, cage-match round 3).
+
+    "the ref does not exist", "the network refused" and "the archive is corrupt"
+    are three different facts the script's prose distinguishes — and only the
+    first two had arms. A truncated or non-gzip body reaching `tar` must be
+    CANNOT_LOOK, never a clean comparison against an empty tree.
+
+    Served locally rather than mocked, so curl and tar are the real ones."""
+    box = _tree(tmp_path / "box", BASELINE)
+    base, srv = _serve_once(tmp_path, b"this is definitely not a gzip stream")
+    try:
+        env = {k: v for k, v in os.environ.items() if k != "ISLAND_REF_TREE"}
+        env["ISLAND_CODELOAD_BASE"] = base
+        result = subprocess.run(
+            [str(SCRIPT), str(box), "v1.2.3"], capture_output=True, text=True, env=env
+        )
+    finally:
+        srv.shutdown()
+
+    assert result.returncode == CANNOT_LOOK, result.stdout + result.stderr
+    assert "CORRUPT" in result.stderr or "did not unpack" in result.stderr, result.stderr
+
+
+def test_a_500_from_the_server_is_CANNOT_LOOK_and_names_the_status(tmp_path) -> None:
+    """The `*)` arm of the HTTP branch — everything that is neither 200 nor 404.
+
+    `curl -sf` swallowing a 403 and reading as "no release exists" is a shape
+    this repo has already paid for once, and the branch written to prevent it
+    had no test."""
+    box = _tree(tmp_path / "box", BASELINE)
+    base, srv = _serve_once(tmp_path, b"nope", status=500)
+    try:
+        env = {k: v for k, v in os.environ.items() if k != "ISLAND_REF_TREE"}
+        env["ISLAND_CODELOAD_BASE"] = base
+        result = subprocess.run(
+            [str(SCRIPT), str(box), "v1.2.3"], capture_output=True, text=True, env=env
+        )
+    finally:
+        srv.shutdown()
+
+    assert result.returncode == CANNOT_LOOK, result.stdout + result.stderr
+    assert "500" in result.stderr, "the status must be named, not folded into a generic error"
+
+
+def test_an_ambient_seam_ANNOUNCES_itself(tmp_path) -> None:
+    """Every seam must say so. update.sh strips all three, but any other caller
+    (a human at a shell, a future script) must be told that a clean result does
+    not mean what an unconfigured clean result means."""
+    box = _tree(tmp_path / "box", BASELINE)
+    tag = _tree(tmp_path / "tag", BASELINE)
+
+    result = _run(box, tag, ISLAND_REPO_SLUG="someone/else")
+
+    assert "ISLAND_REPO_SLUG" in result.stderr, (
+        "a seam that can be silent is not a seam, it is a trapdoor: " + result.stderr
+    )
+
+
+def test_the_https_pin_is_applied_when_no_seam_is_set() -> None:
+    """The protocol pin is SCOPED to the default host, so prove it still binds
+    there. Two halves, because either alone is weak:
+
+    1. the flags are on the default path (read from comment-stripped source, for
+       the reason in _update_sh_code — a pin satisfied by prose explaining it is
+       not a pin);
+    2. the flag combination actually refuses http, driven against curl itself
+       rather than assumed from the manpage.
+
+    Scoping a security control to make a test pass would be the wrong trade. The
+    seam that relaxes it is announced by the guard and stripped by update.sh, so
+    it cannot reach a deploy — but none of that matters if the default stopped
+    pinning."""
+    code = "\n".join(
+        ln
+        for ln in (REPO / "deploy" / "preflight-compose-drift.sh").read_text().splitlines()
+        if not ln.lstrip().startswith("#")
+    )
+    assert "--proto =https --proto-redir =https" in code, (
+        "the default fetch path must pin https; -L alone will follow a redirect "
+        "down to plain HTTP"
+    )
+    assert 'ISLAND_CODELOAD_BASE:-}" ] && proto_args=' in code, (
+        "the pin must be applied precisely when the base is NOT overridden"
+    )
+
+    refused = subprocess.run(
+        ["curl", "-sS", "--proto", "=https", "--proto-redir", "=https",
+         "-o", os.devnull, "http://example.invalid/x"],
+        capture_output=True, text=True,
+    )
+    assert refused.returncode != 0, (
+        "curl with the pin must refuse an http URL outright; if this passes, the "
+        "flags are not doing what the default path relies on them for"
+    )
+
+
+def test_an_UNREADABLE_deploy_dir_on_the_box_is_CANNOT_LOOK(tmp_path) -> None:
+    """THE WALK THAT GOES SILENT WITHOUT CHANGING THE ANSWER (Tesla, round 3).
+
+    `done < <(find ...)` discards the process substitution's status. If find
+    fails — missing binary, unreadable directory — the stream is simply EMPTY:
+    no files compared, nothing drifted, compose still matches, exit 0. A failed
+    walk was indistinguishable from a clean one, which is this file's signature
+    failure committed by the walk that looks for it.
+
+    Forced with a mode-000 directory, which is the cheapest real way to make
+    find fail. Mutation-checked: without the status check this returns CLEAN."""
+    box = _tree(tmp_path / "box", BASELINE)
+    tag = _tree(tmp_path / "tag", BASELINE)
+    deploy = box / "deploy"
+    deploy.chmod(0o000)
+    try:
+        result = _run(box, tag)
+    finally:
+        deploy.chmod(0o755)  # so tmp_path cleanup can run
+
+    assert result.returncode == CANNOT_LOOK, (
+        "a walk that could not read deploy/ must not report a clean comparison: "
+        + result.stdout
+        + result.stderr
+    )

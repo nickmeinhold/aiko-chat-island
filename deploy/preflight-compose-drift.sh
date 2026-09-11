@@ -63,12 +63,30 @@ repo_root="$(cd "$repo_root" && pwd)"
 # test. `edge` and `main` are branch names and pass through untouched.
 case "$ref" in [0-9]*) ref="v$ref" ;; esac
 
-# Overridable so a fork, or a rename, does not silently compare against someone
-# else's tree. Public repo: no credential is involved, and none should be — a
-# preflight that needs a token is a preflight that fails on the box that lost one.
+# THE THREE SEAMS, HANDLED AS ONE CLASS (Tesla, round 3). Each of these changes
+# what "compared against $ref" MEANS, and each is an ambient environment variable
+# — so each can arrive on a production host without appearing in any command line.
+# An earlier pass fixed exactly one of them (ISLAND_REF_TREE) and left its
+# siblings live, which is patching an instance where the class was already named:
+# ISLAND_REPO_SLUG inherited from a host fetches SOMEONE ELSE'S tarball, and if
+# that tree happens to match the box the guard reports the trees match while
+# `docker compose pull` still interpolates the real image.
+#
+# Two enforcements, because either alone is insufficient: update.sh strips ALL
+# THREE before invoking, so the deploy path cannot reach them; and every one of
+# them announces itself here, so any other caller is told what it is really
+# comparing. A seam that can be silent is not a seam, it is a trapdoor.
 slug="${ISLAND_REPO_SLUG:-nickmeinhold/aiko-chat-island}"
+codeload="${ISLAND_CODELOAD_BASE:-https://codeload.github.com}"
+for _seam in ISLAND_REF_TREE ISLAND_REPO_SLUG ISLAND_CODELOAD_BASE; do
+  eval "_v=\${$_seam:-}"
+  [ -n "$_v" ] || continue
+  warn "$_seam is set ('$_v') — this run does NOT mean what an unconfigured run
+     means. A clean result below says nothing about the tag this box would deploy."
+done
 
 work=""
+work_list="$(mktemp)"
 # `return 0` IS THE WHOLE FUNCTION'S CONTRACT, not tidiness. An EXIT trap whose
 # last command fails REPLACES the script's exit status in bash 3.2 — and when
 # $work is empty (the ISLAND_REF_TREE path, where nothing was fetched) the test
@@ -77,7 +95,7 @@ work=""
 # the null arm, which is the arm that exists precisely because a check cannot be
 # trusted to report its own success correctly just because it reports failure
 # correctly.
-cleanup() { [ -n "$work" ] && rm -rf "$work"; return 0; }
+cleanup() { [ -n "$work" ] && rm -rf "$work"; rm -f "$work_list"; return 0; }
 trap cleanup EXIT
 
 # --- materialise the ref ----------------------------------------------------
@@ -112,9 +130,6 @@ materialise_ref() {
     # through the environment instead of through a code path. update.sh strips the
     # variable before invoking, so the deploy path cannot reach here at all; this
     # warning is for every other caller.
-    warn "ISLAND_REF_TREE is set — comparing against the LOCAL TREE '$ISLAND_REF_TREE',
-     NOT against $ref from $slug. A clean result below says nothing about the tag
-     this box would actually deploy."
     tree="$(cd "$ISLAND_REF_TREE" && pwd)"
     return 0
   fi
@@ -146,10 +161,28 @@ materialise_ref() {
   # member named `top/../../../escaped.txt` is refused by bsdtar AND GNU tar, and
   # both exit non-zero, so the `|| die` below already fires. Measured on macOS 15
   # and on the live Ubuntu box rather than reasoned about.)
-  if ! code="$(curl -sS -L --proto '=https' --proto-redir '=https' --max-redirs 3 \
+  # THE PROTOCOL PIN IS SCOPED TO THE DEFAULT HOST, and that scoping is the
+  # answer to a real tension rather than a convenience. `--proto '=https'` must
+  # hold absolutely on the path a production island takes — it is what stops `-L`
+  # following a redirect down to plain HTTP and turning a TLS-protected fetch
+  # into an unauthenticated one at the moment its bytes decide whether an island
+  # deploys. But it also, correctly, refuses a `http://127.0.0.1:PORT` base — and
+  # that base is the only way to drive the corrupt-archive and non-404 HTTP arms
+  # without the network, which are branches that otherwise have no test at all.
+  #
+  # So: unoverridden, https is mandatory. Overridden, the operator's scheme is
+  # honoured — and that override is already announced by the seam loop above and
+  # already stripped by update.sh, so it cannot reach a deploy. Weakening the
+  # default to make a test pass would have been the wrong trade; scoping it is
+  # not the same move.
+  proto_args=""
+  [ -z "${ISLAND_CODELOAD_BASE:-}" ] && proto_args="--proto =https --proto-redir =https"
+  # shellcheck disable=SC2086 -- proto_args is a controlled two-flag literal set here,
+  # never user input; quoting it would pass one empty argument in the default case.
+  if ! code="$(curl -sS -L $proto_args --max-redirs 3 \
         --max-filesize 100000000 --max-time 60 -o "$tgz" -w '%{http_code}' \
-        "https://codeload.github.com/$slug/tar.gz/$path" 2>"$work/curl.err")"; then
-    die "could not reach codeload.github.com to fetch $ref — the NETWORK failed, so
+        "$codeload/$slug/tar.gz/$path" 2>"$work/curl.err")"; then
+    die "could not reach $codeload to fetch $ref — the NETWORK failed, so
      nothing is known about this box's deploy tree. This is not a clean result.
      $(tr -d '\r' < "$work/curl.err" | head -3)"
   fi
@@ -157,7 +190,7 @@ materialise_ref() {
     200) : ;;
     404) die "$slug has no ref '$ref' (looked at $path). Check ISLAND_VERSION in .env —
      it is the tag this deploy will pull, and a typo here means a typo there." ;;
-    *)   die "codeload.github.com answered HTTP $code for $ref. Nothing was compared." ;;
+    *)   die "$codeload answered HTTP $code for $ref. Nothing was compared." ;;
   esac
 
   mkdir -p "$work/tree"
@@ -193,6 +226,21 @@ materialise_ref
   || die "the tree for $ref has no docker-compose.yml at its root — the ref was not
      materialised correctly (empty archive, wrong ISLAND_REF_TREE, unexpected
      layout). NOTHING was compared, and that is not a clean result."
+# AND IT MUST HAVE deploy/ (Tesla, round 3). A ref tree holding a matching compose
+# and nothing else is well-formed enough to pass the check above, and then every
+# script the box carries is "a file the ref does not have" — box-only, ignored —
+# so a drifted update.sh reads as CLEAN. The compose check alone certifies one
+# file; this certifies the SHAPE. GitHub's real archive always has both, which is
+# exactly why the happy path hides it.
+[ -d "$tree/deploy" ] \
+  || die "the tree for $ref has no deploy/ directory. Every script on this box would
+     be treated as box-only and skipped, so a clean result would mean nothing.
+     The ref did not materialise as this repository."
+# The mirror: a box with no deploy/ at all cannot be compared meaningfully either,
+# and saying so beats silently comparing one file.
+[ -d "$repo_root/deploy" ] \
+  || die "this box has no deploy/ directory, but $ref does. Nothing here matches the
+     shape of an island deploy tree." 1
 # --- compare ----------------------------------------------------------------
 #
 # ENUMERATION IS BOX-DRIVEN, and that is the whole reason this is not a recursive
@@ -355,10 +403,19 @@ done
 # in a line-oriented read, and the halves silently miss their comparison. Nothing
 # in this repo carries one today, which is the same "today" that produced the
 # outage this file exists to refuse.
+# THE WALK'S EXIT STATUS IS CHECKED (Tesla, round 3). In `done < <(find ...)` the
+# process substitution's status is discarded: if find is missing, or deploy/ is
+# unreadable, the stream is simply EMPTY — no files compared, nothing drifted,
+# compose still matches, exit 0. A failed walk was indistinguishable from a clean
+# one, which is this file's signature failure committed by the walk that looks
+# for it. Staged to a file so the status is the terminal command's own.
+box_list="$work_list"
+( cd "$repo_root" && find -L deploy \( -type f -o -type l \) -print0 ) > "$box_list" 2>/dev/null \
+  || die "could not walk deploy/ on this box (find failed). Nothing was compared."
 while IFS= read -r -d '' rel; do
   [ -n "$rel" ] || continue
   compare_one "$rel"
-done < <(cd "$repo_root" && find -L deploy \( -type f -o -type l \) -print0 2>/dev/null | LC_ALL=C sort -z)
+done < <(LC_ALL=C sort -z "$box_list")
 
 # Files the ref carries that this box does not. Warned, never refused.
 # REPORTED IN FULL, BUT GROUPED — a correction made twice, each time by running
@@ -379,6 +436,8 @@ done < <(cd "$repo_root" && find -L deploy \( -type f -o -type l \) -print0 2>/d
 # up to one line per subtree with a count; files beside something the box already
 # has are named individually, because those are the ones worth reading. Full
 # information, four lines instead of forty-nine.
+( cd "$tree" && find -L deploy \( -type f -o -type l \) -print0 ) > "$box_list" 2>/dev/null \
+  || die "could not walk deploy/ in the $ref tree (find failed). Nothing was compared."
 while IFS= read -r -d '' rel; do
   [ -n "$rel" ] || continue
   if [ ! -d "$repo_root/$(dirname "$rel")" ]; then
@@ -395,7 +454,7 @@ $(printf '%s' "$rel" | cut -d/ -f1-2)"
   # as present, leaving exactly one report, the refusal, which is the true one.
   { [ -e "$repo_root/$rel" ] || [ -L "$repo_root/$rel" ]; } \
     || { absent="$absent $rel"; absent_n=$((absent_n + 1)); }
-done < <(cd "$tree" && find -L deploy \( -type f -o -type l \) -print0 2>/dev/null | LC_ALL=C sort -z)
+done < <(LC_ALL=C sort -z "$box_list")
 
 if [ "$absent_n" -gt 0 ]; then
   warn "$ref carries $absent_n deploy file(s) BESIDE ones this box has — these sit in
