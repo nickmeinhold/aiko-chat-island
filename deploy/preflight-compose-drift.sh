@@ -232,15 +232,36 @@ compare_one() {
   compared=$((compared + 1))
   cmp -s "$ref_file" "$box_file" && return 0
   drifted="$drifted $rel"; drifted_n=$((drifted_n + 1))
+  # THE DIFF IS CAPTURED ONCE, WITH ITS STATUS HANDLED EXPLICITLY — and this is a
+  # concession to a reviewer who was wrong three times about the same lines, on a
+  # point that was nonetheless worth conceding.
+  #
+  # The previous shape relied on `{ ... } >&2 || true` to suppress errexit for a
+  # `total="$(diff | wc -l)"` assignment, because `diff` exits 1 on a difference
+  # and `pipefail` propagates it. That WORKS — driven on bash 3.2/macOS and bash
+  # 5/Linux, on a 3-line and a 60-line divergence, the diff prints, the truncation
+  # notice prints, the refusal prints. Carnot called it a live bug in rounds 2, 3
+  # and 4 and it was refuted with a run each time.
+  #
+  # But the third raising is a fact about the CODE, not only about the reviewer:
+  # the correctness of the red path — the one path this whole file exists to
+  # execute — rested on a subtle rule about where errexit is disabled, three
+  # levels of nesting from the thing it protects. An editor deleting a `|| true`
+  # that looks decorative would break the refusal and every green test would stay
+  # green. Explicit `set +e` around one capture says what it means, needs no rule
+  # to read, and runs `diff` once instead of twice.
+  local total diff_out
+  set +e
+  diff_out="$(diff -u --label "$ref:$rel" --label "this box:$rel" "$ref_file" "$box_file")"
+  set -e
+  total=$(printf '%s\n' "$diff_out" | wc -l | tr -d ' ')
   {
     printf '\n--- %s: this box differs from %s ---\n' "$rel" "$ref"
-    # -u with explicit labels: without them the header is two temp paths, and an
+    # Labels are not cosmetic: without them the header is two temp paths and the
     # operator cannot tell which side is theirs. Truncated because a wholesale
-    # divergence would otherwise scroll the actionable cases off the screen; the
-    # count says how much was cut rather than leaving a silent tail.
-    local total
-    total="$(diff -u --label "$ref:$rel" --label "this box:$rel" "$ref_file" "$box_file" | wc -l | tr -d ' ')"
-    diff -u --label "$ref:$rel" --label "this box:$rel" "$ref_file" "$box_file" | head -40
+    # divergence would scroll the actionable cases off the screen; the count says
+    # how much was cut rather than leaving a silent tail.
+    printf '%s\n' "$diff_out" | head -40
     [ "$total" -gt 40 ] && printf '    ... (%s more diff lines)\n' "$((total - 40))"
   } >&2 || true
 }

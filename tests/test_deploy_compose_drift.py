@@ -657,3 +657,32 @@ def test_a_root_compose_file_the_box_does_not_need_is_a_WARNING(tmp_path) -> Non
     assert "docker-compose.build.yml" in result.stderr, (
         "...but it must still be named: " + result.stderr
     )
+
+
+def test_a_refusal_SHOWS_the_diff_body_not_just_the_filename(tmp_path) -> None:
+    """"Refuse and show" is the guard's stated contract and nothing asserted the
+    SHOW half directly (cage-match rounds 2-4, Carnot, three times).
+
+    Carnot's specific claim — that errexit aborts the block before the diff is
+    printed — was refuted with a run on each platform. But the repetition was
+    worth listening to on a different axis: the red path's correctness rested on
+    a subtle rule about where errexit is disabled, and nothing in the suite would
+    have noticed if a future edit broke it. An operator who gets a refusal naming
+    a file, with no diff, has to go and diff it by hand at the exact moment they
+    were trying to ship something else.
+
+    Both halves are asserted here: the changed line's CONTENT, and the truncation
+    notice on a divergence larger than the 40-line window."""
+    long_box = "\n".join(str(i) for i in range(200)) + "\n"
+    long_tag = "\n".join(str(i + 1000) for i in range(200)) + "\n"
+    box = _tree(tmp_path / "box", {**BASELINE, "docker-compose.yml": long_box})
+    tag = _tree(tmp_path / "tag", {**BASELINE, "docker-compose.yml": long_tag})
+
+    result = _run(box, tag)
+
+    assert result.returncode == DRIFT, result.stdout + result.stderr
+    assert "@@" in result.stderr, "the unified diff body must reach the operator"
+    assert "more diff lines" in result.stderr, (
+        "a truncated diff must say how much was cut, not leave a silent tail"
+    )
+    assert "differs from" in result.stderr, "the refusal itself must still print"
