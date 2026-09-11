@@ -65,8 +65,32 @@ fi
 
 $DOCKER compose version >/dev/null 2>&1 || die "docker compose v2 not available"
 
+# EVERY COMPOSE CALL IS PINNED TO docker-compose.yml, and this one flag replaced
+# three rounds of guards (cage-match rounds 5-7).
+#
+# A bare `docker compose` picks its own files from the working directory, and
+# MEASURED on the live box it picks more than you would guess: `compose.yaml`
+# beside `docker-compose.yml` WINS OUTRIGHT (config emitted compose.yaml's
+# variables and ignored the other entirely), an override file is merged in, and
+# COMPOSE_FILE can redirect the whole set from the environment or from .env.
+# Each of those was found as a separate fail-open — the drift guard certifying
+# one file set while the engine burned another — and each was met with its own
+# refusal.
+#
+# Pinning ends the class instead of enumerating it. Same measurement, one row
+# down: `-f docker-compose.yml` ignores compose.yaml, ignores the override, and
+# ignores COMPOSE_FILE. The file set the guard compares is now the file set that
+# deploys, BY CONSTRUCTION rather than by prediction — which is the difference
+# between an invariant and a guard someone has to keep extending.
+#
+# Safe on both islands today: neither carries compose.yaml, an override, or
+# COMPOSE_FILE (checked), so the resolved config is byte-identical to a bare
+# invocation. The guard still WARNS if any such file appears, because a human
+# typing `docker compose` by hand here would still get it.
+COMPOSE="$DOCKER compose -f docker-compose.yml"
+
 # The island must actually be running (this is an UPDATE, not a first standup).
-$DOCKER compose ps --status running --services 2>/dev/null | grep -qx chat-island \
+$COMPOSE ps --status running --services 2>/dev/null | grep -qx chat-island \
   || die "the 'chat-island' service isn't running — use deploy/standup.sh for a first standup"
 
 # --- preflight: a PARTIAL APNS_* set now refuses to boot --------------------
@@ -169,31 +193,13 @@ elif [ -f "$SCRIPT_DIR/preflight-compose-drift.sh" ]; then
   # need) lives INSIDE the guard now, where a test can drive it — it used to sit
   # here, on the path of every real deploy, untestable (Tesla, cage-match round 2).
 
-  # COMPOSE_FILE DECIDES WHICH FILES ARE DEPLOYED, AND THE GUARD CANNOT GUESS
-  # THEM (Carnot, cage-match round 6). Measured on the live box: `docker compose
-  # config` honours COMPOSE_FILE from the ENVIRONMENT *and from .env* — setting
-  # it to `docker-compose.prod.yml` deployed that file and ignored
-  # `docker-compose.yml` entirely. The guard compares the compose files the TAG
-  # carries; with COMPOSE_FILE set, those need not be the files that get
-  # deployed at all, so a clean comparison would certify a set docker never
-  # reads.
-  #
-  # This is the fifth member of the ambient-input family, and the first one that
-  # is read by DOCKER rather than by anything in this repo — which is why the
-  # guard's own ISLAND_* detector cannot see it. Neither island sets it.
-  #
-  # Refused rather than accommodated: a preflight that cannot name the file set
-  # being deployed cannot certify it, and saying so is the honest answer. The
-  # escape hatch is named, as everywhere else here.
-  compose_file_env="${COMPOSE_FILE:-}"
-  compose_file_dotenv="$(dotenv_read "$REPO_ROOT/.env" COMPOSE_FILE)"
-  if [ -n "$compose_file_env" ] || [ -n "$compose_file_dotenv" ]; then
-    die "COMPOSE_FILE is set (${compose_file_env:-$compose_file_dotenv}), so docker
-     compose will deploy a file set this guard cannot know in advance — it compares
-     the compose files the TAG carries. A clean result would certify files docker
-     never reads. Unset COMPOSE_FILE, or deploy deliberately with:
-     deploy/update.sh --skip-drift-check"
-  fi
+  # NO COMPOSE_FILE REFUSAL HERE ANY MORE, and its removal is the point rather
+  # than an oversight. Round 6 added one because COMPOSE_FILE could redirect the
+  # deployed file set from the environment or .env. Round 7's measurement showed
+  # `-f docker-compose.yml` ignores COMPOSE_FILE entirely, so the refusal could
+  # now only ever block a deploy that was going to be correct — a guard whose
+  # window the pin above already closed. Subtracted, not stacked.
+
 
   set +e
   # ALL THREE SEAMS ARE STRIPPED (Carnot round 2 named the first; Tesla round 3
@@ -254,7 +260,7 @@ if [ "$DO_BACKUP" = "true" ]; then
   ts="$(date +%Y%m%d-%H%M%S)"
   # Online .backup() inside the container (no sqlite3 CLI in the slim image), then
   # copy the artifact out and remove the in-container temp. integrity_check gates.
-  $DOCKER compose exec -T chat-island python -c "
+  $COMPOSE exec -T chat-island python -c "
 import sqlite3, sys
 src = sqlite3.connect('/data/aiko.db')
 dst = sqlite3.connect('/data/_update-$ts.db')
@@ -263,9 +269,9 @@ res = dst.execute('PRAGMA integrity_check').fetchone()[0]
 print('integrity_check:', res)
 sys.exit(0 if res == 'ok' else 1)
 " || die "backup integrity_check failed — ABORTING before touching the stack"
-  $DOCKER compose cp "chat-island:/data/_update-$ts.db" "$backup_dir/aiko.db.preupdate-$ts" \
+  $COMPOSE cp "chat-island:/data/_update-$ts.db" "$backup_dir/aiko.db.preupdate-$ts" \
     || die "could not copy the backup out of the container — ABORTING"
-  $DOCKER compose exec -T chat-island rm -f "/data/_update-$ts.db" || true
+  $COMPOSE exec -T chat-island rm -f "/data/_update-$ts.db" || true
   sz=$(wc -c < "$backup_dir/aiko.db.preupdate-$ts" | tr -d ' ')
   [ "${sz:-0}" -gt 4096 ] || die "backup file is implausibly small ($sz bytes) — ABORTING"
   ok "backed up to backups/aiko.db.preupdate-$ts ($sz bytes, integrity ok)"
@@ -285,8 +291,8 @@ if [ "$FROM_SOURCE" = "true" ]; then
   $DOCKER compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 else
   log "Step 2/3 — pulling the latest published image + recreating"
-  $DOCKER compose pull
-  $DOCKER compose up -d
+  $COMPOSE pull
+  $COMPOSE up -d
 fi
 ok "stack recreated (entrypoint migrates fail-closed before serving)"
 

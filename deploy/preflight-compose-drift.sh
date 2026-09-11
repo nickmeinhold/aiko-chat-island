@@ -420,36 +420,34 @@ while IFS= read -r -d '' rel; do
   # parameter expansion is portable and needs no process.
 done < <(cat "$sorted_list")
 
-# THE BOX-ONLY FILES THAT ARE NOT IGNORABLE — THE WHOLE AUTO-LOADED SET.
+# BOX-ONLY FILES DOCKER WOULD AUTO-LOAD — WARNED, NOT REFUSED, and the
+# downgrade is the correct answer to what changed under it (cage-match round 7).
 #
-# This script's one exception to "a file the ref does not carry is none of our
-# business", and it exists because docker reads these whether or not the tag has
-# ever heard of them. `update.sh` deploys with a bare `docker compose pull && up`
-# — no -f — so compose picks its own files from the working directory.
+# These were a refusal for three rounds, because a bare `docker compose` picks
+# its own files and MEASURED on the live box it picks more than you would guess:
+# `compose.yaml` beside `docker-compose.yml` WINS OUTRIGHT, and an override is
+# merged into whichever base won. So a box-only one WAS the file that deployed
+# while this guard certified another — the interlock blessing one file set while
+# the engine burned a different one.
 #
-# MEASURED ON THE LIVE BOX, both halves:
-#   * `compose.yaml` beside `docker-compose.yml` WINS: `docker compose config`
-#     emitted compose.yaml's variables and ignored docker-compose.yml entirely.
-#   * an override file is MERGED into whichever base was chosen.
-# So a box-only `compose.yaml` would be the file that deploys, while this guard
-# certified `docker-compose.yml` — the interlock blessing one file set while the
-# engine burns another.
+# update.sh now pins `-f docker-compose.yml` on every compose call, which
+# (measured, same session) ignores compose.yaml, the override, and COMPOSE_FILE.
+# The file set this guard compares IS the file set that deploys, by construction.
+# Refusing over these files would therefore block a deploy that is going to be
+# correct — a guard crying wolf, which is how guards get deleted.
 #
-# The list is the COMPLETE set docker auto-selects, not the subset that occurred
-# to me. An earlier pass enumerated only the four `*.override.*` names and left
-# the four base names out, which is the same shape as every other class-fix in
-# this PR: the family was named, one branch of it was swept. Order matches
-# docker's own precedence so the message can say which file actually wins.
-for auto in compose.yaml compose.yml docker-compose.yaml docker-compose.yml \
+# They are still worth naming, because the pin protects `update.sh` and not a
+# human typing `docker compose logs` in this directory. That is a real thing to
+# know about your box; it is not a reason to stop a correct deploy.
+for auto in compose.yaml compose.yml docker-compose.yaml \
             compose.override.yaml compose.override.yml \
             docker-compose.override.yaml docker-compose.override.yml; do
   _present "$repo_root/$auto" || continue
   [ -f "$tree/$auto" ] && continue   # the ref carries it too — already compared above
-  drifted="$drifted $auto(BOX-ONLY-but-AUTO-LOADED)"; drifted_n=$((drifted_n + 1))
-  warn "$auto exists on this box and NOT in $ref. docker compose auto-loads it when
-     no -f flags are given, which is how update.sh deploys — so this file is part
-     of the running config and no tag can account for it. Every other box-only
-     file is ignored; these cannot be."
+  warn "$auto exists on this box and NOT in $ref. update.sh pins
+     '-f docker-compose.yml', so THIS deploy is unaffected — but any bare
+     'docker compose' command run by hand in this directory will load it, and
+     compose.yaml in particular WINS over docker-compose.yml."
 done
 
 # The deploy/ walk is recursive on purpose: deploy/lib/dotenv-read.sh is the single

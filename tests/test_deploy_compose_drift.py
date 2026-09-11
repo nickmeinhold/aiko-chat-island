@@ -575,35 +575,19 @@ def test_update_sh_FAILS_CLOSED_when_the_guard_is_missing() -> None:
     )
 
 
-def test_a_BOX_ONLY_compose_override_is_refused(tmp_path) -> None:
-    """THE ONE BOX-ONLY FILE THAT CANNOT BE IGNORED (Maxwell, cage-match round 3).
-
-    Every other box-only file is deliberately invisible to this guard — the live
-    islands are carpeted in `.env.bak-*` and `update.sh.bak-pre-v0110`, and
-    reporting them would bury the line that matters. An override file is the
-    exception, and the reason is mechanical rather than stylistic.
-
-    MEASURED on the live box: `docker compose config` with no `-f` flags merged a
-    `docker-compose.override.yml` sitting beside the base file and emitted its
-    variables into the resolved config. update.sh's deploy path is exactly that —
-    a bare `docker compose pull && up` — so an override the tag has never heard
-    of is silently part of what gets deployed. That is this guard's own subject
-    matter arriving as an EXTRA file instead of an edited one, which is exactly
-    why the box-only rule would have waved it through.
-
-    Neither island carries one today. The point is that one appearing is
-    invisible to every other check in the file."""
-    box = _tree(tmp_path / "box", {**BASELINE, "docker-compose.override.yml": "services: {}\n"})
-    tag = _tree(tmp_path / "tag", BASELINE)
-
-    result = _run(box, tag)
-
-    assert result.returncode == DRIFT, (
-        "an auto-loaded override the tag does not know about must abort the deploy: "
-        + result.stdout
-        + result.stderr
-    )
-    assert "override" in result.stderr, result.stderr
+# `test_a_BOX_ONLY_compose_override_is_refused` LIVED HERE and was deleted on
+# purpose in cage-match round 7, not weakened until it passed. It asserted that a
+# box-only override aborts the deploy, which was TRUE and NECESSARY while
+# update.sh ran a bare `docker compose` — the override was merged into the real
+# deploy, so certifying without it was a fail-open.
+#
+# update.sh now pins `-f docker-compose.yml`, which (measured) ignores overrides
+# entirely. The old assertion would now demand a refusal of a deploy that is
+# going to be correct. `test_a_box_only_autoloaded_file_WARNS_but_does_not_refuse`
+# covers the whole auto-loaded family at the behaviour that is now true.
+#
+# Recorded rather than quietly dropped: a deleted test is a retired claim, and the
+# reason it retired is the interesting part.
 
 
 def test_an_override_the_REF_also_carries_is_compared_not_flagged(tmp_path) -> None:
@@ -1183,52 +1167,20 @@ def test_a_BROKEN_sort_is_CANNOT_LOOK_not_CLEAN(tmp_path) -> None:
     )
 
 
-# Ambient inputs read by DOCKER (not by anything in this repo) that change WHICH
-# files are deployed. The guard's ISLAND_* detector is structurally blind to
-# these — it parses this repository's scripts, and nothing here reads them.
-#
-# Considered and excluded, with reasons, because an enumeration without its
-# exclusions is just a list someone will re-derive:
-#   COMPOSE_PROJECT_NAME — renames the project, does not change the file set
-#   COMPOSE_PROFILES     — selects services within the files, not the files
-#   DOCKER_HOST          — changes the target daemon, which is out of this
-#                          guard's remit (it certifies FILES, not destinations)
-DOCKER_FILE_SET_VARS = ("COMPOSE_FILE",)
+# COMPOSE_FILE ONCE HAD A REFUSAL HERE, AND ITS REMOVAL IS RECORDED RATHER THAN
+# SILENT. Round 6 added one: COMPOSE_FILE redirects the deployed file set from
+# the environment or from .env, so a clean comparison could certify files docker
+# never read. Round 7 measured that `-f docker-compose.yml` ignores COMPOSE_FILE
+# outright, and update.sh now pins that on every call — so the refusal could only
+# ever block a deploy that was going to be correct. The guard was subtracted, and
+# its test with it; `test_update_sh_PINS_the_compose_file_on_every_invocation` is
+# what protects the property now, at the layer where it is actually true.
 
 
-@pytest.mark.parametrize("var", DOCKER_FILE_SET_VARS)
-def test_update_sh_REFUSES_when_docker_would_deploy_an_unknown_file_set(var) -> None:
-    """THE FIFTH MEMBER OF THE AMBIENT-INPUT FAMILY (Carnot, cage-match round 6).
 
-    Measured on the live box: `docker compose config` honours COMPOSE_FILE from
-    the environment AND from .env — set to `docker-compose.prod.yml` it deployed
-    that file and ignored `docker-compose.yml` entirely. The guard compares the
-    compose files the TAG carries; with COMPOSE_FILE set those need not be the
-    files deployed at all, so a clean comparison certifies a set docker never
-    reads.
-
-    This one is read by DOCKER rather than by any script here, which is exactly
-    why `test_the_seam_list_matches_what_the_guard_actually_reads` cannot see
-    it: that detector parses this repository. A class-detector is only as wide
-    as the artifacts it reads, and this member lives outside them — worth
-    stating, because the previous four rounds all ended with "the detector will
-    catch the next one."
-
-    Both sources must be checked, not just the environment."""
-    code = _update_sh_code()
-    assert f'"${{{var}:-}}"' in code, f"{var} must be read from the environment"
-    assert f'dotenv_read "$REPO_ROOT/.env" {var}' in code, (
-        f"{var} must ALSO be read from .env — measured: docker honours it from there too, "
-        "and checking only the environment would miss the likelier case"
-    )
-    assert "--skip-drift-check" in code, "a fail-closed branch must name its escape hatch"
-
-
-# Every filename `docker compose` will load on its own with no -f flags, in its
-# own precedence order. MEASURED on the live box, both halves: `compose.yaml`
-# beside `docker-compose.yml` WINS outright (config emitted compose.yaml's
-# variables and ignored the other), and an override is merged into whichever
-# base was chosen.
+# Every filename `docker compose` will load on its own with no -f flags.
+# MEASURED on the live box: `compose.yaml` beside `docker-compose.yml` WINS
+# outright, and an override is merged into whichever base was chosen.
 DOCKER_AUTOLOADED = (
     "compose.yaml",
     "compose.yml",
@@ -1240,33 +1192,73 @@ DOCKER_AUTOLOADED = (
 )
 
 
+def test_update_sh_PINS_the_compose_file_on_every_invocation() -> None:
+    """THE FLAG THAT REPLACED THREE ROUNDS OF GUARDS (cage-match rounds 5-7).
+
+    Rounds 5, 6 and 7 each found a different way for docker to deploy a file
+    set the guard had not certified: COMPOSE_FILE from the environment,
+    COMPOSE_FILE from .env, a box-only override merged in, and finally a
+    box-only `compose.yaml` that WINS outright over docker-compose.yml. Each got
+    its own refusal.
+
+    Measured on the live box, one row further down the same table:
+    `-f docker-compose.yml` ignores compose.yaml, ignores the override, and
+    ignores COMPOSE_FILE. Pinning ends the class instead of enumerating it — the
+    file set the guard compares IS the file set that deploys, by construction
+    rather than by prediction.
+
+    So this asserts the property the whole family reduces to: no compose
+    invocation in update.sh may be unpinned. A future edit adding a bare
+    `docker compose` re-opens every one of those windows at once."""
+    code = _update_sh_code()
+    assert 'COMPOSE="$DOCKER compose -f docker-compose.yml"' in code, (
+        "update.sh must define a pinned compose invocation"
+    )
+    # The property is "no compose invocation WITHOUT an explicit -f", not
+    # "everything literally uses $COMPOSE": the --from-source path pins two
+    # files by hand (`-f docker-compose.yml -f docker-compose.build.yml`) and is
+    # equally deterministic. `compose version` takes no files at all. Writing
+    # the assertion as the property rather than as the idiom keeps it from
+    # flagging a correct line — a check that fires on something harmless gets
+    # relaxed, and a relaxed check stops catching the thing it was for.
+    unpinned = [
+        ln.strip()
+        for ln in code.splitlines()
+        if "$DOCKER compose" in ln
+        and "COMPOSE=" not in ln
+        and "compose version" not in ln
+        and "-f " not in ln
+    ]
+    assert not unpinned, (
+        "every compose call must go through the pinned $COMPOSE, or docker picks "
+        f"its own files again: {unpinned}"
+    )
+
+
 @pytest.mark.parametrize("name", DOCKER_AUTOLOADED)
-def test_every_box_only_AUTOLOADED_compose_file_is_refused(name, tmp_path) -> None:
-    """THE COMPLETE SET, not the subset that occurred to me (Carnot, round 7).
+def test_a_box_only_autoloaded_file_WARNS_but_does_not_refuse(name, tmp_path) -> None:
+    """Warned, not refused — and the downgrade is the correct answer to what
+    changed under it (cage-match round 7).
 
-    This guard's one exception to "a file the ref does not carry is none of our
-    business" — because docker reads these whether or not the tag has heard of
-    them, and update.sh deploys with a bare `docker compose pull && up`.
+    These were a refusal for three rounds, correctly: a bare `docker compose`
+    would have loaded them, so a box-only one WAS the file that deployed while
+    the guard certified another. update.sh now pins `-f docker-compose.yml`, so
+    refusing over them would block a deploy that is going to be correct — a
+    guard crying wolf, which is how guards get deleted.
 
-    An earlier pass enumerated only the four `*.override.*` names and left the
-    base names out. That gap is the sharper half: `compose.yaml` does not merely
-    get merged, it WINS over `docker-compose.yml` — so a box-only one is the
-    file that actually deploys while the guard certifies a file docker never
-    reads. The interlock blessing one file set while the engine burns another.
-
-    Parametrised over the whole set so adding a name to the script without
-    adding it here, or vice versa, is visible."""
+    Still named, because the pin protects update.sh and not a human typing
+    `docker compose logs` in this directory."""
     box = _tree(tmp_path / "box", {**BASELINE, name: "services: {}\n"})
     tag = _tree(tmp_path / "tag", BASELINE)
 
     result = _run(box, tag)
 
-    assert result.returncode == DRIFT, (
-        f"a box-only {name} is auto-loaded by docker and must abort the deploy: "
+    assert result.returncode == CLEAN, (
+        f"{name} cannot affect a pinned deploy, so it must not block one: "
         + result.stdout
         + result.stderr
     )
-    assert name in result.stderr, result.stderr
+    assert name in result.stderr, f"...but it must still be named: {result.stderr}"
 
 
 def test_a_find_failure_reports_WHY(tmp_path) -> None:
