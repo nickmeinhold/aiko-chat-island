@@ -179,12 +179,20 @@ end, replay, reconnect, second device, old build).
 and 2 are load-bearing, and flaw 2 is **cross-repo** (it lands on the app tab's design 20 as hard
 as on this document, via the sealed-envelope trilemma).
 
-Before round 2:
+Before round 2 — **FILED, because a list in a design doc is not where open work is looked for
+in this repo** (open work lives in `claude-tasks` under `project:aiko-chat-island`; a
+"before round 2" list in git is readable but mis-homed, which is worse than hidden because it
+looks filed):
 
-1. **Name the lease** and price it against #3170, or explicitly drop what it was buying.
+1. **Name the lease** and price it against #3170, or explicitly drop what it was buying —
+   [#4373](https://github.com/nickmeinhold/claude-tasks/issues/4373)
 2. **Hand flaw 2's trilemma to the app tab** — *statelessness / locked-phone join / sealed
-   envelope, pick two* — it strikes design 20's adversary model directly.
+   envelope, pick two* — it strikes design 20's adversary model directly —
+   [#4374](https://github.com/nickmeinhold/claude-tasks/issues/4374)
 3. **Do not delete `kind == "dm"`** before #4326 exists. It is the live interruption-policy gate.
-4. **Split §0's table** into identity / memory / routing before anything is built on it.
+   Recorded as a precondition comment on
+   [#4326](https://github.com/nickmeinhold/claude-tasks/issues/4326).
+4. **Split §0's table** into identity / memory / routing before anything is built on it —
+   [#4375](https://github.com/nickmeinhold/claude-tasks/issues/4375)
 
 **Nothing in design 14 is decided, and nothing is built.**
