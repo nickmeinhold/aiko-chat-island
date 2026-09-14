@@ -77,10 +77,26 @@ which is a product question, not an engineering unknown.
 
 ### And the one branch that is still dark
 
-`reportCall(with:endedAt:)` **alone** retracts a live ring — proven by a *missing* event: an
-unanswered CallKit ring self-expires at ~60s, ten of twelve `report` pushes fired
-`CXEndCallAction` exactly 60s later, and the only two that did not are the two rings the
-`endlive` pushes ended.
+`reportCall(with:endedAt:)` **alone** retracts a live ring — proven by a *missing* event: ten of
+twelve `report` pushes fired `CXEndCallAction` exactly 60s later, and the only two that did not
+are the two rings the `endlive` pushes ended.
+
+> **SCOPED 2026-09-14, after Nick asked "how do you know it was 60 seconds?"** This sentence
+> previously read *"an unanswered CallKit ring self-expires at ~60s"* — a claim about **CallKit**
+> inherited verbatim from app design 16 v2 §7c and restated here as a platform property. What is
+> actually established is narrower and was checked rather than assumed:
+> **on iPhone 14 Pro / iOS 26.6.1, with one `CXProviderConfiguration`, ten of twelve unanswered
+> rings received a `CXEndCallAction` at exactly 60s.** The two candidate non-iOS sources were
+> eliminated — the harness (`1f3b3c1`) contains no 60s timer (its only `asyncAfter` is `+10`, and
+> every `reportCall(endedAt:)` in it is immediate and in another arm), and the operator confirmed
+> he dismissed nothing. So it is iOS. It is **not** established as a general CallKit guarantee:
+> n=1 device, n=1 OS version, and no Apple documentation was checked.
+>
+> The provenance is the lesson, and the harness commit predicted it in its own message —
+> *"a tool's own log string is its author's hypothesis, and it is inherited as fact by every later
+> reader because it is phrased in the confident register."* That commit fixed
+> `log("ended by user")` for exactly this, and its own prose then asserted the 60s mechanism one
+> section later, and this document inherited it the next day.
 
 That makes `endedAt`-alone look like a strict improvement for the live-ring case: no report, no
 buzz, ring gone. **The must-report status of `endedAt`-alone against a LIVE ring is
