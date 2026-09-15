@@ -37,10 +37,20 @@ def default_apns_environment() -> str:
             else ApnsEnvironment.PRODUCTION).value
 
 
+# The bound on an opaque client-minted identifier — the only constraint an OPEN
+# set can carry. Must equal the ORM column's width and revision 0026's
+# `_INSTALL_WIDTH`; `tests/test_migrations.py` holds the three together. Enforced
+# HERE as well as in the pydantic model so the in-process and test paths meet the
+# same door as the wire (SQLite does not enforce VARCHAR width, so without this a
+# too-long value would simply be stored).
+INSTALL_ID_MAX_LENGTH = 64
+
+
 async def register_device(
     session: AsyncSession, *, user_id: str, platform: str, token: str,
     apns_environment: ApnsEnvironment | None = None,
     token_kind: TokenKind | None = None,
+    install_id: str | None = None,
 ) -> DeviceToken:
     """Register (or re-register) a push token for ``user_id``. Idempotent and
     race-safe: keyed on the globally-unique token.
@@ -104,6 +114,22 @@ async def register_device(
         never reaped, one WARNING line, and no ring. That is this feature's own
         failure mode, self-inflicted.
 
+    ``install_id`` (claude-tasks#4384) is WHICH HANDSET this token is on — an
+    opaque, client-minted, per-install string, and the fact ``plan_deliveries``
+    needed to stop sending a dual-registered iPhone a ring and a banner. It is the
+    only OPEN set on this row, so it is typed ``str`` rather than an enum and the
+    door checks what an open set can be checked for: non-empty, and within the
+    column's width.
+
+    ITS RESOLUTION RULE IS THE SAME ONE, AND ITS DEFAULT IS DIFFERENT. Omission
+    preserves on reassign, for the reason the two paragraphs above give twice
+    over: a client that stops sending the field is an ordinary regression (an app
+    rollback), and answering it by NULLing a known identity would put the handset
+    back to a ring plus a banner. But on INSERT, absent means NULL rather than a
+    constant — there is no value that is honest about a client that did not
+    speak, and the router reads NULL as "its own handset", which is exactly the
+    pre-#4384 behaviour. Absent is legal, permanently.
+
     NO ``default_token_kind()`` HELPER AND NO SETTING. ``apns_environment`` needs a
     function because its default is a per-island fact; ``token_kind``'s default is
     a CONSTANT that is part of the wire contract, and a per-island setting would
@@ -136,6 +162,28 @@ async def register_device(
             f"token_kind must be a TokenKind, got {type(token_kind).__name__} "
             f"({token_kind!r}). The closed set has one definition; a bare string "
             "here would reach the DB as an unvalidated value.")
+    # AN OPEN SET STILL HAS A DOOR (claude-tasks#4384). `install_id` carries no
+    # enum and no DB CHECK, so the two things it CAN be wrong about are checked
+    # here: an empty string (which the router would have to treat as "no
+    # identity" anyway — better to refuse it at the door than store a value that
+    # means nothing) and a value past the column width (invisible on SQLite,
+    # a truncation or a raise on Postgres). ValueError, not TypeError: unlike the
+    # two guards above these are VALUE complaints about a correctly-typed string.
+    if install_id is not None:
+        if not isinstance(install_id, str):
+            raise TypeError(
+                f"install_id must be a str or None, got "
+                f"{type(install_id).__name__} ({install_id!r}).")
+        if not install_id:
+            raise ValueError(
+                "install_id must be non-empty or absent. An empty string is not "
+                "an identity — the router reads it as 'no install', so storing "
+                "it records a fact that is not one.")
+        if len(install_id) > INSTALL_ID_MAX_LENGTH:
+            raise ValueError(
+                f"install_id is {len(install_id)} characters, over the "
+                f"{INSTALL_ID_MAX_LENGTH}-character column width. SQLite would "
+                "store it anyway and Postgres would not, so it is refused here.")
     declared_kind = token_kind.value if token_kind is not None else None
     resolved_kind = (declared_kind if declared_kind is not None
                      else TokenKind.ALERT.value)
@@ -144,7 +192,8 @@ async def register_device(
     # server-default column is unpopulated on the instance until something reloads
     # it. Same reason `apns_environment` is passed explicitly one line up.
     row = DeviceToken(user_id=user_id, platform=platform, token=token,
-                      apns_environment=resolved, token_kind=resolved_kind)
+                      apns_environment=resolved, token_kind=resolved_kind,
+                      install_id=install_id)
     try:
         async with session.begin_nested():
             session.add(row)
@@ -175,6 +224,8 @@ async def register_device(
             existing.apns_environment = declared
         if declared_kind is not None:
             existing.token_kind = declared_kind
+        if install_id is not None:
+            existing.install_id = install_id
         existing.updated_at = _utcnow()  # explicit: onupdate fires only on a changed-col flush
         await session.commit()
         return existing

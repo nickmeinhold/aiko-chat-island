@@ -20,7 +20,7 @@ Built from the domain services only (never `main`), keeping the suite's
 """
 from __future__ import annotations
 import time
-from sqlalchemy import delete as sa_delete
+from sqlalchemy import delete as sa_delete, select as sa_select
 
 import asyncio
 import contextlib
@@ -1029,14 +1029,15 @@ async def test_a_blocked_peer_is_excluded(session, dm, configured, fake_apns):
 async def test_a_handset_with_both_kinds_receives_both_pushes(
     session, dm, configured, fake_apns, monkeypatch
 ):
-    """ARM (B), PINNED so it cannot drift silently.
+    """ARM (B) FOR ROWS WITH NO INSTALL IDENTITY, PINNED so it cannot drift.
 
-    Rows carry no device identity, so "one push per handset" is not computable
-    and no selection rule can be correct. Sending to every selected row costs a
-    dual-registered iPhone a redundant banner beside its CallKit ring; preferring
-    voip would silently never ring an alert-only second Apple device. This module
-    already made that trade in those words: a duplicate notification is a
-    blemish, a missed call is the bug.
+    Neither row below carries an `install_id`, which is the state of every row on
+    both live islands and of every client that does not send one. Without that
+    fact the router cannot tell one handset from two, so it sends to both: a
+    redundant banner beside the ring (a blemish) rather than risking never
+    ringing an alert-only second Apple device (a missed call). The grouped case,
+    where the identity exists and the banner is suppressed, is swept in
+    `tests/test_push_routing.py`.
 
     ONE budget slot for the fanout, because the budget protects the PERSON.
     """
@@ -1050,6 +1051,67 @@ async def test_a_handset_with_both_kinds_receives_both_pushes(
     await _wake(sender_id=alice.id)
     assert sorted(t for t, _, _ in fake_apns.sent) == ["b" * 64, "v" * 64]
     assert sorted(k.value for k in fake_apns.kinds) == ["alert", "voip"]
+
+
+@pytest.mark.asyncio
+async def test_a_shared_install_id_rings_once_end_to_end(
+    session, dm, configured, fake_apns, monkeypatch
+):
+    """THE COLUMN HAS TO SURVIVE THE ROUND TRIP, not merely exist.
+
+    `test_push_routing.py` sweeps the pure function against constructed rows.
+    This is the only arm that goes through the DATABASE — rows written, read back
+    by `_wake_user`'s own select, and grouped — so it is what discriminates "the
+    router groups correctly" from "the router groups correctly and the column
+    reaches it". A `plan_deliveries` that never sees `install_id` because the
+    select or the model dropped it would leave every routing test green.
+
+    The alert row is the one the fixture already registered; it is given the same
+    install identity as the VoIP row added here, which is what a dual-registered
+    iPhone looks like. One push goes out, and it is the ring.
+    """
+    alice, bob = dm
+    existing = (await session.execute(
+        sa_select(DeviceToken).where(DeviceToken.token == "b" * 64))).scalar_one()
+    existing.install_id = "one-handset"
+    session.add(DeviceToken(user_id=bob.id, platform="apns", token="v" * 64,
+                            token_kind=TokenKind.VOIP.value,
+                            install_id="one-handset"))
+    await session.commit()
+
+    await _wake(sender_id=alice.id)
+    assert [t for t, _, _ in fake_apns.sent] == ["v" * 64], (
+        "the banner went out beside the ring — the install grouping did not "
+        "reach the router through the database")
+    assert [k.value for k in fake_apns.kinds] == ["voip"]
+
+
+@pytest.mark.asyncio
+async def test_two_installs_each_get_their_push_end_to_end(
+    session, dm, configured, fake_apns, monkeypatch
+):
+    """THE OTHER HALF, and it is the one that must never regress: the missed call.
+
+    The second device is alert-only and a DIFFERENT install, so nothing in the
+    first group may speak for it. If this ever goes green with one push, the
+    island has quietly adopted arm (A) and an iPad stops ringing.
+    """
+    alice, bob = dm
+    existing = (await session.execute(
+        sa_select(DeviceToken).where(DeviceToken.token == "b" * 64))).scalar_one()
+    existing.install_id = "phone"
+    session.add(DeviceToken(user_id=bob.id, platform="apns", token="v" * 64,
+                            token_kind=TokenKind.VOIP.value,
+                            install_id="phone"))
+    session.add(DeviceToken(user_id=bob.id, platform="apns", token="i" * 64,
+                            token_kind=TokenKind.ALERT.value,
+                            install_id="ipad"))
+    await session.commit()
+
+    await _wake(sender_id=alice.id)
+    assert sorted(t for t, _, _ in fake_apns.sent) == ["i" * 64, "v" * 64], (
+        "an alert-only second install did not get its push — that is the missed "
+        "call arm (B) exists to make impossible")
 
 
 @pytest.mark.asyncio

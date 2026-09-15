@@ -820,3 +820,77 @@ def test_downgrading_0025_refuses_while_a_voip_row_exists(tmp_path, monkeypatch)
     con.close()
     assert "token_kind" in cols, "the refused downgrade dropped the column anyway"
     assert kinds == ["alert", "voip"], f"rows were altered by a refused downgrade: {kinds}"
+
+
+def test_the_0026_install_id_width_is_one_constant_in_four_places() -> None:
+    """THE WIDTH IS A SHADOW CLOSED SET, and it is written down four times.
+
+    `install_id` carries no CHECK — it is an OPEN set — so its only bound is
+    length, and that bound is asserted by the ORM column, revision 0026's
+    `_INSTALL_WIDTH`, the service door's `INSTALL_ID_MAX_LENGTH`, and the REST
+    model's `max_length`. SQLite does not enforce VARCHAR width, so three of those
+    four can drift apart with the suite entirely green and the divergence only
+    appears on Postgres, or as a value the wire accepts and the door refuses.
+
+    This is 0025's `_KIND_WIDTH` lesson applied at authoring time rather than at
+    round 5 of a cage-match: a hand-picked constant does not track anything by
+    itself, so what gets enforced is the EQUALITY, not the number.
+    """
+    import importlib.util
+    from pathlib import Path
+
+    from aiko_gateway.domain.devices_service import INSTALL_ID_MAX_LENGTH
+    from aiko_gateway.domain.models import DeviceToken
+    from aiko_gateway.rest.devices import RegisterDeviceReq
+
+    rev = (Path(__file__).resolve().parents[1] / "alembic" / "versions"
+           / "0026_device_token_install_id.py")
+    spec = importlib.util.spec_from_file_location("_rev0026", rev)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    orm_width = DeviceToken.__table__.c.install_id.type.length
+    wire_width = next(
+        m.max_length
+        for m in RegisterDeviceReq.model_fields["install_id"].metadata
+        if getattr(m, "max_length", None) is not None)
+
+    assert orm_width == mod._INSTALL_WIDTH == INSTALL_ID_MAX_LENGTH == wire_width, (
+        f"the install_id width disagrees across its four declarations: ORM "
+        f"String({orm_width}), revision 0026 {mod._INSTALL_WIDTH}, service door "
+        f"{INSTALL_ID_MAX_LENGTH}, wire model {wire_width}. SQLite enforces none "
+        "of them, so nothing else will notice.")
+
+
+def test_the_0026_column_is_nullable_with_no_default(tmp_path, monkeypatch) -> None:
+    """THE SAFETY PROPERTY OF THE WHOLE CHANGE, read off the MIGRATED DDL.
+
+    NULL means "this client did not say which handset", and the router reads
+    every NULL as its own handset — which is precisely the pre-#4384 behaviour.
+    A NOT NULL column, or any server_default, would assert an identity nobody
+    established and could group unrelated rows: arm (A)'s missed call, arrived at
+    by a backfill. 0025's server_default WAS its backfill; this column's absence
+    of one is the same argument run the other way, and it is only a guarantee if
+    something reads the DDL.
+    """
+    from alembic import command
+    from sqlalchemy import create_engine, inspect
+
+    _async_url, sync_url = _point_app_at(tmp_path, monkeypatch)
+    command.upgrade(migrate._alembic_config(), "head")
+
+    engine = create_engine(sync_url, future=True)
+    try:
+        col = next(c for c in inspect(engine).get_columns("device_tokens")
+                   if c["name"] == "install_id")
+    finally:
+        engine.dispose()
+
+    assert col["nullable"] is True, (
+        "install_id is NOT NULL in the migrated schema — every pre-existing row "
+        "would need a value, and any value invented for them asserts a shared "
+        "handset that nothing established")
+    assert col["default"] is None, (
+        f"install_id carries a server_default ({col['default']!r}); a default "
+        "would group every row that never declared an identity into one handset, "
+        "which suppresses rings on unrelated devices")
