@@ -189,16 +189,14 @@ def test_a_new_wake_kind_must_be_routed_explicitly():
 # ------------------------------------------------------------------ the fanout
 
 def test_a_handset_holding_both_kinds_yields_both_deliveries():
-    """ARM (B) FOR ROWS WITH NO INSTALL IDENTITY — which is every row on both live
-    islands today, and every row from a client that does not send `install_id`.
+    """ARM (B), CHOSEN DELIBERATELY. Rows carry NO device identity the router may
+    act on — an alert token and a voip token for one phone are two unrelated
+    strings, and design 12 Decision 2a explicitly refuses to infer pairing.
 
-    The router now prefers voip WITHIN an install group (below), but it can only
-    do that where an identity exists. Absent one, an alert token and a voip token
-    are two unrelated strings and design 12 Decision 2a refuses to infer pairing,
-    so a selection rule here would be guessing: arm (A) would silently never ring
-    an alert-only SECOND Apple device while any voip row exists (a MISSED CALL),
-    against arm (B)'s redundant banner beside the ring (a BLEMISH). This is the
-    cell that keeps costing the blemish, deliberately.
+    Arm (A), voip-preferred, would silently never ring an alert-only SECOND Apple
+    device (an iPad, an old phone) while any voip row exists: a MISSED CALL. Arm
+    (B) costs a dual-registered iPhone a CallKit ring plus a redundant banner: a
+    BLEMISH. This module already made that exact trade, in those words.
     """
     rows = [_row("01ALERT", Platform.APNS.value, TokenKind.ALERT.value),
             _row("01VOIP", Platform.APNS.value, TokenKind.VOIP.value)]
@@ -306,19 +304,20 @@ def test_an_android_row_is_skipped_as_NOT_BUILT_whatever_kind_it_carries(kind):
         f"an Android row must be named NOT BUILT, got {skips}")
 
 
-# ------------------------------------------------------- per-install grouping
+# ---------------------------------------------------- install_id is INERT here
 
-# THE SECOND DIMENSION (claude-tasks#4384). `install_id` is the device identity
-# the routing table never had: two rows carrying the same non-null value are two
-# tokens for ONE handset, so a CallKit ring and a banner would both land on the
-# same screen. Grouping is on `install_id` ALONE — `_wake_user` fetches one
-# user's rows, so a user component in the key would be a constant.
+# THE COLUMN IS STORED AND NOT READ (claude-tasks#4384). `install_id` was minted
+# to be the device identity the routing table never had, and the first cut of
+# this PR used it to prefer voip within a group. The cage-match (PR#179, all four
+# families) refused that unanimously: the value is client-minted and the OS
+# clones it on a device restore, so one value can cover TWO physical handsets and
+# the suppression silences the second one's only reach. Suppression waits on the
+# value being device-bound at the client (app-side, claude-tasks#3385).
 #
-# THE SUPPRESSION IS ONE-DIRECTIONAL AND NARROW: within a group that has a
-# DELIVERABLE voip row for a CALL_INVITE, that group's alert rows are skipped
-# with a named reason. A null `install_id` is NOT an identity — it neither
-# suppresses nor is suppressed — because grouping all nulls together would
-# re-create the missed call for two un-upgraded devices.
+# So these are NEGATIVE tests, and that is the point. Every one of them asserts
+# that carrying an install identity changes NOTHING about what gets pushed. They
+# are the guard against someone restoring the preference without reading
+# `plan_deliveries`' docstring.
 
 def _install_rows(*specs: tuple[str, str, str | None]) -> list[DeviceToken]:
     """(row_id, token_kind, install_id) triples as APNs rows."""
@@ -349,37 +348,41 @@ def test_install_id_is_inert_for_a_lone_row(kind, wake, gate, install):
         assert skips == [("01ROW", expected_skip)]
 
 
-def test_a_dual_registered_handset_rings_once():
-    """THE BUG THIS EXISTS TO CLOSE (claude-tasks#4384). One handset, two tokens,
-    one install id: the CallKit ring goes, the redundant banner does not — and the
-    banner is SKIPPED WITH A REASON, not dropped."""
+def test_a_shared_install_id_suppresses_nothing():
+    """THE PIN ON THE INVARIANT. One install id across an alert row and a voip
+    row is the exact input the withdrawn preference read, and the router must
+    treat it as it treats any other pair: BOTH deliver, nothing is skipped.
+
+    A future reader who restores the preference without reading
+    `plan_deliveries`' docstring turns this red first. That is its whole job."""
     rows = _install_rows(("01ALERT", TokenKind.ALERT.value, "install-1"),
                          ("01VOIP", TokenKind.VOIP.value, "install-1"))
     deliveries, skips = plan_deliveries(
         rows, wake=WakeKind.CALL_INVITE, configured=BOTH,
         end_wake_gate_open=True)
-    assert [d.row_id for d in deliveries] == ["01VOIP"]
-    assert skips == [("01ALERT", "voip_preferred_same_install")]
+    assert sorted(d.row_id for d in deliveries) == ["01ALERT", "01VOIP"]
+    assert skips == []
 
 
 def test_an_alert_only_second_install_still_gets_its_push():
-    """ARM (B) ACROSS GROUPS, which is the property that keeps the missed call
-    impossible. The iPad is its own install; no voip row exists for it, so
-    nothing in another group may speak for it."""
+    """THE MISSED CALL, IMPOSSIBLE BY CONSTRUCTION. The iPad's alert row is a
+    second handset's only reach. Under arm (B) nothing can speak for it — not the
+    phone's voip row, and not a shared install id if a restore ever produced one,
+    which is the collision that retired the preference."""
     rows = _install_rows(("01ALERT", TokenKind.ALERT.value, "phone"),
                          ("01VOIP", TokenKind.VOIP.value, "phone"),
-                         ("01IPAD", TokenKind.ALERT.value, "ipad"))
+                         ("01IPAD", TokenKind.ALERT.value, "phone"))
     deliveries, skips = plan_deliveries(
         rows, wake=WakeKind.CALL_INVITE, configured=BOTH,
         end_wake_gate_open=True)
-    assert sorted(d.row_id for d in deliveries) == ["01IPAD", "01VOIP"]
-    assert skips == [("01ALERT", "voip_preferred_same_install")]
+    assert sorted(d.row_id for d in deliveries) == [
+        "01ALERT", "01IPAD", "01VOIP"]
+    assert skips == []
 
 
 def test_two_null_install_rows_both_still_get_pushes():
     """OLDER CLIENTS ARE BIT-FOR-BIT UNAFFECTED. Two un-upgraded devices are two
-    nulls; grouping them together would be exactly the missed call arm (A) was
-    rejected for, now reached by a column that says nothing."""
+    nulls, and a column that says nothing may not cost anyone a push."""
     rows = _install_rows(("01ALERT1", TokenKind.ALERT.value, None),
                          ("01ALERT2", TokenKind.ALERT.value, None),
                          ("01VOIP", TokenKind.VOIP.value, None))
@@ -402,9 +405,9 @@ def test_a_null_install_alert_row_is_not_suppressed_by_a_grouped_voip_row():
     assert skips == []
 
 
-def test_a_null_install_voip_row_suppresses_nothing():
-    """The mirror. A voip row with no identity cannot claim an alert row's
-    handset, so the alert row keeps arm (B)."""
+def test_a_null_install_voip_row_costs_an_alert_row_nothing():
+    """The mirror of the case above: a one-sided identity is still no identity,
+    and the alert row keeps arm (B) either way."""
     rows = _install_rows(("01ALERT", TokenKind.ALERT.value, "phone"),
                          ("01VOIP", TokenKind.VOIP.value, None))
     deliveries, skips = plan_deliveries(
@@ -415,10 +418,8 @@ def test_a_null_install_voip_row_suppresses_nothing():
 
 
 def test_an_empty_install_id_is_not_an_identity():
-    """`''` IS THE NULL CASE, NOT A GROUP. The wire rejects it (min_length=1) and
-    no code path writes it, but a stored empty string grouping every such row
-    together is the same missed call as grouping the nulls — so it fails toward
-    delivery."""
+    """`''` IS THE NULL CASE. The wire rejects it (min_length=1) and no code path
+    writes it; a stored one must still cost nobody a push."""
     rows = _install_rows(("01ALERT", TokenKind.ALERT.value, ""),
                          ("01VOIP", TokenKind.VOIP.value, ""))
     deliveries, skips = plan_deliveries(
@@ -428,11 +429,10 @@ def test_an_empty_install_id_is_not_an_identity():
     assert skips == []
 
 
-def test_an_unsendable_voip_row_does_not_suppress_its_groups_alert_row():
-    """PREFERENCE FOLLOWS THE DELIVERY, NOT THE ROW. A voip row that this island
-    cannot actually send to (here: not a routable kind at all) must not silence
-    the one row in the group that WOULD have rung — that would be a missed call
-    produced by a row that never left the building."""
+def test_an_unsendable_voip_row_leaves_a_same_install_alert_row_alone():
+    """A row that never left the building cannot cost another row its push. Here
+    the voip row is not a routable kind at all, and the alert row sharing its
+    install id still delivers."""
     rows = [_row("01ALERT", Platform.APNS.value, TokenKind.ALERT.value,
                  install_id="phone"),
             _row("01BADVOIP", Platform.APNS.value, "shout", install_id="phone")]
@@ -443,10 +443,9 @@ def test_an_unsendable_voip_row_does_not_suppress_its_groups_alert_row():
     assert skips == [("01BADVOIP", "unroutable_row")]
 
 
-def test_a_gated_end_wake_voip_row_does_not_suppress_anything():
-    """The interlock's closed state is a SKIP, so it cannot be a preference
-    either. Asserted on the CALL_END cell where the alert row has its own named
-    skip — the new reason must not displace `end_wake_needs_voip`."""
+def test_a_gated_end_wake_keeps_its_own_named_skips_under_one_install():
+    """The end-wake cells each own a named skip. A shared install id must not
+    displace `end_wake_needs_voip` or the interlock's reason with anything."""
     rows = _install_rows(("01ALERT", TokenKind.ALERT.value, "phone"),
                          ("01VOIP", TokenKind.VOIP.value, "phone"))
     deliveries, skips = plan_deliveries(
@@ -457,10 +456,9 @@ def test_a_gated_end_wake_voip_row_does_not_suppress_anything():
                              ("01VOIP", "end_wake_gated_pending_4278")]
 
 
-def test_a_delivered_end_wake_does_not_suppress_its_groups_alert_row():
-    """NON-INVITE WAKES ARE UNAFFECTED. With the interlock open the voip row
-    delivers, and the alert row still carries its own decision — the grouping
-    pass is scoped to CALL_INVITE and must not reach here."""
+def test_a_delivered_end_wake_leaves_a_same_install_alert_row_alone():
+    """With the interlock open the voip row delivers, and the alert row still
+    carries its own CALL_END decision rather than anything install-derived."""
     rows = _install_rows(("01ALERT", TokenKind.ALERT.value, "phone"),
                          ("01VOIP", TokenKind.VOIP.value, "phone"))
     deliveries, skips = plan_deliveries(

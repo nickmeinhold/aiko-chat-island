@@ -115,20 +115,20 @@ async def register_device(
         failure mode, self-inflicted.
 
     ``install_id`` (claude-tasks#4384) is WHICH HANDSET this token is on — an
-    opaque, client-minted, per-install string, and the fact ``plan_deliveries``
-    needed to stop sending a dual-registered iPhone a ring and a banner. It is the
-    only OPEN set on this row, so it is typed ``str`` rather than an enum and the
-    door checks what an open set can be checked for: non-empty, and within the
-    column's width.
+    opaque, client-minted, per-install string. It is STORED, not routed on:
+    ``plan_deliveries`` refuses to suppress a push on a claim the island cannot
+    authenticate, and holds the argument. It is the only OPEN set on this row, so
+    it is typed ``str`` rather than an enum and the door checks what an open set
+    can be checked for: non-empty, and within the column's width. The REST model
+    additionally enforces a charset; this door does not.
 
     ITS RESOLUTION RULE IS THE SAME ONE, AND ITS DEFAULT IS DIFFERENT. Omission
     preserves on reassign, for the reason the two paragraphs above give twice
     over: a client that stops sending the field is an ordinary regression (an app
-    rollback), and answering it by NULLing a known identity would put the handset
-    back to a ring plus a banner. But on INSERT, absent means NULL rather than a
-    constant — there is no value that is honest about a client that did not
-    speak, and the router reads NULL as "its own handset", which is exactly the
-    pre-#4384 behaviour. Absent is legal, permanently.
+    rollback), and answering it by NULLing a known identity would discard a fact
+    nothing else can restate until the next registration. But on INSERT, absent
+    means NULL rather than a constant — there is no value that is honest about a
+    client that did not speak. Absent is legal, permanently.
 
     NO ``default_token_kind()`` HELPER AND NO SETTING. ``apns_environment`` needs a
     function because its default is a per-island fact; ``token_kind``'s default is

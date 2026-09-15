@@ -4,33 +4,40 @@
 is on, so an alert token and a VoIP token for one phone are two unrelated 64-hex
 strings and "one push per handset" is not computable. The visible cost is a
 CallKit ring with a redundant banner stacked behind it, seen on a real device on
-2026-09-14. This column is the missing fact, minted by the client per app
-INSTALL and sent with every registration.
+2026-09-14. This column RECORDS that fact — minted by the client per app INSTALL
+and sent with every registration — so the client half can start sending it.
+
+THE ROUTER DOES NOT YET READ IT, and that is a decision, not an oversight. A
+client-minted string is swept into iCloud Backup / Android Auto Backup, so a
+device restore can put two PHYSICAL handsets under one value; preferring VoIP
+within such a group silences the second handset's only reach. `plan_deliveries`
+carries the full argument (cage-match PR#179). Storing the claim and trusting it
+are separate steps, and only the first one ships here.
 
 NULLABLE, AND WITH NO server_default — the deliberate OPPOSITE of 0025, whose
 whole note was that its server_default IS its backfill. That worked because
 'absent means alert' was a TRUE statement about every pre-existing row. There is
 no such constant here: any non-null value written into old rows would assert that
-two tokens share a handset, and nothing established that. So NULL means UNKNOWN,
-the router treats every unknown as its own handset, and pre-#4384 clients keep
-their current behaviour exactly. There is no data migration to write, for the
-opposite reason to 0025's.
+two tokens share a handset, and nothing established that. So NULL means UNKNOWN.
+There is no data migration to write, for the opposite reason to 0025's.
 
 NOT UNIQUE and NOT INDEXED. One install legitimately holds several rows — that is
-the point — and the only reader groups rows already in memory for ONE user
-(`push_service.plan_deliveries`), so there is no query to serve.
+the point — and there is no query to serve: the eventual reader works over rows
+already in memory for ONE user (`push_service.plan_deliveries`).
 
 NO CHECK CONSTRAINT: `install_id` is an OPEN set, unlike every other constrained
-column on this table. The only bound that exists is length and charset, and both
-are enforced where the value enters (the REST model and the service door). A
-CHECK could only restate the width, which SQLite does not enforce anyway.
+column on this table. Its bounds are WIDTH, enforced at both doors (the REST
+model and the service door), and CHARSET, enforced at the REST model only — an
+in-process caller can store a value the wire would 422, which costs nothing today
+because the value reaches no log line and no query. A CHECK could only restate the
+width, which SQLite does not enforce anyway.
 
 DESYNC IS SAFE IN BOTH DIRECTIONS HERE, which is worth stating because 0024 and
 0025 both had to warn the opposite. An app that sends `install_id` to an island
 without this column gets a 201 and the field is discarded — the result is today's
 behaviour, a redundant banner, not a silent non-delivery. And an island that has
 this column but no client sending it is every row NULL, which is also today's
-behaviour. The ordering rule still stands (island deploys first) but nothing
+behaviour. Nothing routes on the value in either direction yet. The ordering rule still stands (island deploys first) but nothing
 breaks if it is violated; the 201 echoes the stored value so the app can tell.
 
 SQLite cannot ALTER TABLE ... ADD CONSTRAINT, so batch_alter_table rebuilds the
@@ -82,10 +89,9 @@ def downgrade() -> None:
     0025 refuses to downgrade once any VoIP row exists because the column is the
     only durable distinction between two token kinds, and losing it routes an
     alert push to a VoIP token: a 400, never reaped, no ring. Losing `install_id`
-    costs nothing of that shape. The router simply stops being able to group, so
-    every row becomes its own handset again and arm (B) resumes — a redundant
-    banner, which is a BLEMISH, and the exact state this island shipped in for
-    the whole of v0.12.x. Nothing becomes undeliverable and no push is misrouted.
+    costs nothing of that shape, and today costs nothing at all: no code path
+    reads the column, so dropping it changes no delivery. Nothing becomes
+    undeliverable and no push is misrouted.
 
     The value itself is client-derivable: the next registration from any install
     restates it. So the drop is recoverable by the ordinary operation of the

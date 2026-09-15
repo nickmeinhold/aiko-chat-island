@@ -49,33 +49,38 @@ class RegisterDeviceReq(BaseModel):
     # log, no reachability entry.
     token_kind: TokenKind | None = None
     # WHICH HANDSET this token is on (claude-tasks#4384). OPTIONAL and PERMANENTLY
-    # so: None means "the client did not say", the router then treats the row as
-    # its own handset, and that is precisely today's behaviour — so an app built
-    # before this field existed is bit-for-bit unaffected and no backfill exists.
+    # so: None means "the client did not say", and an app built before this field
+    # existed is bit-for-bit unaffected. The value is STORED AND NOT ROUTED ON —
+    # `push_service.plan_deliveries` holds the argument for why a claim the island
+    # cannot authenticate does not get to suppress a push.
     #
     # THE ONLY OPEN SET ON THIS MODEL, and constrained accordingly. `platform`,
     # `apns_environment` and `token_kind` are enums because each is a closed set
     # the island defines; `install_id` is minted by the CLIENT and opaque to us,
     # so an enum is unrepresentable and the honest bound is shape:
     #
-    #   * `min_length=1` — an empty string is not an identity. The router has to
-    #     treat it as "no install" (grouping every empty-string row together
-    #     would suppress rings on unrelated handsets), so accepting one would
-    #     store a value that means nothing. 422 at the boundary instead.
+    #   * `min_length=1` — an empty string is not an identity, so storing one
+    #     would mean nothing to any future reader and would invite exactly the
+    #     grouping mistake ('' as a shared handset) that costs a ring. 422 at the
+    #     boundary instead.
     #   * `max_length=64` — the column's width, shared with
     #     `devices_service.INSTALL_ID_MAX_LENGTH` and revision 0026. SQLite does
     #     not enforce VARCHAR width, so without this the overflow is invisible
     #     until the day this runs on Postgres.
     #   * `pattern` — a conservative opaque-identifier charset that covers a UUID
     #     (`identifierForVendor` renders as one) with room for prefixes. This is
-    #     a value that reaches log lines and grouping keys; there is no reason a
-    #     handset identity needs whitespace, control characters or punctuation,
-    #     and refusing them costs a real client nothing.
+    #     a value a future reader will put in log lines and grouping keys; there
+    #     is no reason a handset identity needs whitespace, control characters or
+    #     punctuation, and refusing them costs a real client nothing. Enforced
+    #     HERE ONLY — the service door checks type, emptiness and width, so an
+    #     in-process caller can store what the wire would 422 (cage-match PR#179,
+    #     Maxwell + Tesla). Harmless while nothing reads the column; it is the
+    #     thing to close before anything does.
     #
     # NOT A NEW TRACKING SURFACE, stated here rather than discovered in the
     # visibility-boundary doc (claude-tasks#3695): the island already stores every
-    # one of this user's tokens under their user id, so grouping them adds no fact
-    # it could not already derive. It learns which of a user's OWN rows share a
+    # one of this user's tokens under their user id, so this adds no fact it could
+    # not already derive. It learns which of a user's OWN rows claim to share a
     # screen, and nothing that crosses users.
     install_id: str | None = Field(
         default=None, min_length=1, max_length=64,

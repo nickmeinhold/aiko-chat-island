@@ -823,17 +823,17 @@ class DeviceToken(Base):
     token_kind: Mapped[str] = mapped_column(
         String(16), nullable=False, server_default=TokenKind.ALERT.value)
     # WHICH HANDSET THIS TOKEN IS ON (claude-tasks#4384) — an opaque, client-minted,
-    # per-INSTALL string. Two rows carrying the same value are two tokens for one
-    # screen, which is the fact `plan_deliveries` needed and never had: without it
-    # a dual-registered iPhone gets a CallKit ring AND a redundant banner.
+    # per-INSTALL string, stored so the client half can send it. It is a CLAIM the
+    # island cannot authenticate, and `plan_deliveries` deliberately does not read
+    # it: the OS clones a self-minted id across a device restore, so one value can
+    # cover two physical handsets. That docstring holds the argument.
     #
     # NULLABLE WITH NO server_default, which is the OPPOSITE of `token_kind` one
     # line up and is the whole safety argument. There is no constant that is
     # honest for a pre-existing row: 'absent means alert' was a true statement
     # about every old row, whereas any non-null install id invented here would
     # assert that two rows share a handset when nothing established that. NULL
-    # means UNKNOWN, and the router treats each unknown as its own handset — so
-    # older clients keep arm (B) exactly, and no backfill exists to write.
+    # means UNKNOWN, and no backfill exists to write.
     #
     # NOT UNIQUE. One install legitimately holds several rows (an alert token and
     # a VoIP token, and historically more), which is the entire point.

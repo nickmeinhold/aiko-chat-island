@@ -459,47 +459,43 @@ def plan_deliveries(
     corrupted kind fell out of every bucket and vanished with no line at all —
     the one silent cell in a design named for having none.
 
-    THE SELECTION RULE: VOIP-PREFERRED WITHIN AN INSTALL, ARM (B) ACROSS INSTALLS.
-    Both an alert row and a voip row for one handset is the NORMAL state (design
-    12 Decision 2), and the two tokens are unrelated strings, so which handset a
-    row is on is a fact the router cannot derive — it has to be told. `install_id`
-    (claude-tasks#4384) is that fact: rows sharing a non-null value are tokens on
-    ONE screen. The two arms being traded off are:
+    ARM (B): EVERY SELECTED ROW GETS A PUSH. Both an alert row and a voip row for
+    one handset is the NORMAL state (design 12 Decision 2), and rows carry NO
+    device identity the router may act on — the two tokens are unrelated strings
+    and Decision 2a explicitly refuses to infer pairing. The two arms cost:
 
       (A) voip-preferred — an alert-only SECOND Apple device (an iPad, an older
           phone) never rings while any voip row exists: a MISSED CALL.
       (B) send to every selected row — a dual-registered iPhone gets a CallKit
           ring AND a redundant banner: a BLEMISH.
 
-    Applied per group, both costs vanish: the iPhone's alert row loses to its own
-    voip row (the banner goes), and the iPad is a different group so nothing can
-    speak for it (the missed call stays impossible).
+    (B), for the reason this module already gives in its own words: a duplicate
+    notification is a blemish; a missed call is the bug. Its safety is a PROPERTY
+    of the arm, not of the row population: (B) suppresses nothing, so it cannot
+    silently fail to deliver, whatever mix of kinds the tables hold. Do not
+    re-derive that safety from the population — the islands are no longer
+    alert-only (measured 2026-09-15: enspyr 4 alert / 1 voip, imagineering 3
+    alert / 1 voip), and a live count is a fact with an expiry date.
 
-    A NULL `install_id` IS NOT AN IDENTITY, and every null is ITS OWN group. Two
-    un-upgraded devices are two nulls, and grouping them would produce exactly
-    arm (A)'s missed call via a column that says nothing. So a null row neither
-    suppresses nor is suppressed, and a pre-#4384 client is bit-for-bit
-    unaffected. An empty string is treated the same way, for the same reason.
+    `install_id` IS STORED AND IS DELIBERATELY NOT READ HERE. The column
+    (claude-tasks#4384) carries a CLIENT-MINTED string the island cannot
+    authenticate, and the OS clones it: a self-minted value in NSUserDefaults or
+    SharedPreferences is swept into iCloud Backup / Android Auto Backup, so a
+    device restore puts TWO PHYSICAL handsets under one value. Preferring voip
+    within such a group silences the alert row that is the second handset's only
+    reach — arm (A)'s missed call, arrived at through the very column minted to
+    forbid it (cage-match PR#179, unanimous). No shape heuristic rescues it:
+    inferring a handset from the token-kind multiset is exactly the inference
+    Decision 2a refuses, and its false positive misses the same call.
 
-    GROUPED ON `install_id` ALONE, not `(user_id, install_id)`: the only caller,
-    `_wake_user`, selects rows for ONE user, so a user component would be a
-    constant carried through the key. If a second caller ever passes a mixed-user
-    sequence, this comment is the thing that has to change with it.
-
-    THE PREFERENCE FOLLOWS THE DELIVERY, NOT THE ROW. A voip row that is skipped
-    for any reason — unconfigured transport, a corrupted column, the end-wake
-    interlock — never suppresses anything, because a row that produced no push
-    cannot stand in for one. That is the fail-toward-delivery direction, and it is
-    what keeps this from manufacturing arm (A)'s missed call out of a skip. It is
-    also scoped to CALL_INVITE: for CALL_END the alert row already has its own
-    named decision and there is nothing to prefer.
+    So this is a MISSING FACT, not a tuning dial. Suppression waits on the value
+    being DEVICE-BOUND at the client — backup-excluded storage, or an API that
+    does not restore onto another body — which is app-side work (claude-tasks#3385).
+    Until that ships, storing the field and trusting it for preference stay
+    separate, and the redundant banner stands.
     """
     deliveries: list[Delivery] = []
     skips: list[tuple[str, str]] = []
-    # The grouping pass's two accumulators, filled ONLY from rows that reached a
-    # delivery — see the docstring on why a skipped voip row must not suppress.
-    install_of: dict[str, str] = {}      # delivered row_id -> its install_id
-    voip_installs: set[str] = set()      # installs with a deliverable ring
     for row in rows:
         try:
             # THE ORM EDGE — every closed-set column becomes its enum HERE, in one
@@ -583,36 +579,10 @@ def plan_deliveries(
                     deliveries.append(ApnsDelivery(
                         row.id, row.token, row.updated_at,
                         ApnsEnvironment(row.apns_environment), kind))
-                    # Recorded INSIDE the guard and AFTER the append, so a row
-                    # that raised on its way here contributes no identity.
-                    # Falsy-or-None collapses '' into "no identity": an empty
-                    # string is not a handset, and treating it as one would group
-                    # every such row together — arm (A)'s missed call, arrived at
-                    # through a column that says nothing. Fails toward delivery.
-                    install = row.install_id or None
-                    if install is not None:
-                        install_of[row.id] = install
-                        if (kind is TokenKind.VOIP
-                                and wake is WakeKind.CALL_INVITE):
-                            voip_installs.add(install)
                 case _:
                     assert_never(platform)
         except ValueError:
             skips.append((row.id, "unroutable_row"))
-    if voip_installs:
-        # A SECOND PASS, not a lookahead inside the first. The preference is a
-        # property of the WHOLE group and a row can arrive before the voip row
-        # that outranks it, so it cannot be decided one row at a time. Kept
-        # outside the per-row try on purpose: it touches no ORM attribute and no
-        # enum constructor, so there is nothing here that can raise.
-        kept: list[Delivery] = []
-        for delivery in deliveries:
-            if (delivery.token_kind is TokenKind.ALERT
-                    and install_of.get(delivery.row_id) in voip_installs):
-                skips.append((delivery.row_id, "voip_preferred_same_install"))
-            else:
-                kept.append(delivery)
-        deliveries = kept
     return deliveries, skips
 
 

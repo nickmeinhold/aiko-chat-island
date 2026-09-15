@@ -865,13 +865,12 @@ def test_the_0026_install_id_width_is_one_constant_in_four_places() -> None:
 def test_the_0026_column_is_nullable_with_no_default(tmp_path, monkeypatch) -> None:
     """THE SAFETY PROPERTY OF THE WHOLE CHANGE, read off the MIGRATED DDL.
 
-    NULL means "this client did not say which handset", and the router reads
-    every NULL as its own handset — which is precisely the pre-#4384 behaviour.
-    A NOT NULL column, or any server_default, would assert an identity nobody
-    established and could group unrelated rows: arm (A)'s missed call, arrived at
-    by a backfill. 0025's server_default WAS its backfill; this column's absence
-    of one is the same argument run the other way, and it is only a guarantee if
-    something reads the DDL.
+    NULL means "this client did not say which handset". A NOT NULL column, or any
+    server_default, would assert an identity nobody established, and the first
+    reader of this column would then group unrelated rows: arm (A)'s missed call,
+    arrived at by a backfill. 0025's server_default WAS its backfill; this
+    column's absence of one is the same argument run the other way, and it is
+    only a guarantee if something reads the DDL.
     """
     from alembic import command
     from sqlalchemy import create_engine, inspect
@@ -892,5 +891,5 @@ def test_the_0026_column_is_nullable_with_no_default(tmp_path, monkeypatch) -> N
         "handset that nothing established")
     assert col["default"] is None, (
         f"install_id carries a server_default ({col['default']!r}); a default "
-        "would group every row that never declared an identity into one handset, "
-        "which suppresses rings on unrelated devices")
+        "would put every row that never declared an identity into one handset, "
+        "which is a missed call waiting for the first reader of this column")

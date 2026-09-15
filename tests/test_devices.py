@@ -277,17 +277,19 @@ def test_the_openapi_document_types_the_registration_echo() -> None:
 
 # ------------------------------------------------------------- the install id
 #
-# claude-tasks#4384. `install_id` is WHICH HANDSET a token is on — the fact
-# `plan_deliveries` needed to stop sending a dual-registered iPhone a CallKit
-# ring and a redundant banner. The ROUTING arm is swept in test_push_routing.py;
-# these are the wire and door arms.
+# claude-tasks#4384. `install_id` is the client's CLAIM about which handset a
+# token is on. It is stored and not routed on — `plan_deliveries` holds the
+# argument, and test_push_routing.py sweeps the inertness. These are the wire and
+# door arms: the field has to round-trip honestly before anything can ever use
+# it, and a value that arrives corrupted is worse than one that never arrives.
 
 
 async def test_an_install_id_round_trips_to_the_row_and_the_echo(client, session):
     """THE ROW, NOT JUST THE ECHO — the discrimination PR#170 r4 had to add for
     `token_kind`, applied at the point it is cheap rather than after a review
     finds it. A service that echoes `req.install_id` faithfully and stores NULL
-    passes an echo-only assertion while the grouping silently never happens."""
+    passes an echo-only assertion while the column stays empty forever — and the
+    echo is the client's only desync detector."""
     bob = await _user(session, "installbob")
     resp = await client.post(
         "/v1/devices", headers=_headers(bob),
@@ -321,11 +323,11 @@ async def test_an_omitted_install_id_stores_null_and_echoes_null(client, session
 async def test_a_malformed_install_id_is_a_422_not_a_silent_store(
         client, session, bad):
     """THE ONLY OPEN SET ON THIS MODEL, so the boundary checks what shape can be
-    checked for. An empty string is not an identity (the router must read it as
-    'no install', so storing one records a fact that is not one); anything over
-    the column width is invisible on SQLite and a failure on Postgres; and a
-    value that reaches log lines and grouping keys has no business carrying
-    whitespace or control characters."""
+    checked for. An empty string is not an identity, so storing one records a
+    fact that is not one; anything over the column width is invisible on SQLite
+    and a failure on Postgres; and a value a future reader will put in log lines
+    and grouping keys has no business carrying whitespace or control
+    characters."""
     alice = await _user(session, f"installbad{abs(hash(bad))}")
     resp = await client.post(
         "/v1/devices", headers=_headers(alice),
@@ -358,7 +360,8 @@ async def test_reassign_preserves_an_install_id_the_client_stopped_sending(
     """OMISSION PRESERVES, the same rule `apns_environment` and `token_kind`
     follow, and for the same reason: 'the client stopped sending the field' is an
     ordinary regression (an app rollback), and answering it by NULLing a known
-    identity would put the handset straight back to a ring plus a banner."""
+    identity would discard a fact nothing can restate until the client registers
+    again."""
     alice = await _user(session, "installkeep")
     await devices_service.register_device(
         session, user_id=alice.id, platform="apns", token="q" * 64,
