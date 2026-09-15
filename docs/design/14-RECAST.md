@@ -46,7 +46,7 @@ One row, keyed by the client-minted call ULID that wire v2 already carries:
 | `call_ulid` | the island accepts an invite wake | the wake path | Kelvin's replay: without a spent-ULID memory a valid unexpired invite for a finished call re-wakes every participant |
 | `issued_at` | same | the reaper | bounds the row's own life |
 | `expires_at` | same, **set by the island** | the ceiling timer | Nick's 2026-09-09 ruling — the island owns the 30s ceiling; a ceiling needs something to fire against |
-| `woken` (the device rows charged) | same | the end path | Carnot: *was a charge paired* — this is #4325's suppression of a lone `call_end` |
+| ~~`woken` (the device rows charged)~~ | — | — | **REMOVED by §1.6.** The charge is paired by paying two at invite time, not by remembering who; the ceiling needs the tokens in process only |
 | `state ∈ {ringing, settled}` | on end, or on expiry | the wake path | Carnot: *is this end lone* |
 
 **That is the whole object.** Four of Carnot's four remembered facts, one deadline, no
@@ -127,6 +127,77 @@ paired and against which ULID — a count and a deadline may be sufficient, with
 held only in process memory for the send. If that is true, the lease holds no pair at all and
 the conflict evaporates. **That is the first thing round 3 should test**, and it is filed
 rather than assumed.
+
+### 1.6 The count-only test, RUN — and the lease comes off disk recipient-free
+
+§1.5 named a test: *does the lease need to name recipients at all?* Run against each guarantee
+separately, because they do not need the same things.
+
+| guarantee | what it actually needs | recipients? |
+|---|---|---|
+| **replay-spentness** (Kelvin's ghost call) | has this ULID been seen, and is it settled | **no** — `call_ulid` + `state` |
+| **drop a lone `call_end`** (#4325) | does a lease exist for this ULID | **no** — `call_ulid` |
+| **pair the wake charge** (#4325) | that the end's charge was already paid | **no** — see below |
+| **the ring ceiling** (Nick 2026-09-09) | something to *send* at T+30 | **YES** — and this is the whole of §1.5 |
+
+**Three of four are recipient-free, and the third is free for a reason worth stating.** #4325's
+own words are *"a call is one interruption costing two wakes"* — so charge **two at invite
+time**, in the recipient's bucket, atomically. An end wake arriving against a live lease is then
+free, and the island needs to know only that the lease exists. The end wake's own recipient
+comes from the incoming end message, not from the lease. The pairing never reads a stored
+recipient; it reads a paid-in-advance reservation. That is #4325's prescription taken literally
+rather than approximated.
+
+**The ceiling is the only guarantee that needs the pair**, because at expiry the island must
+*send*, and APNs needs a token. Two apparent escapes both fail:
+
+- *Store the channel id instead of the device rows.* Not cheaper — **in a DM the channel IS the
+  pair**, which is this repo's own established result. Same fact wearing a channel's clothes.
+- *Set the push's APNs TTL to 30s and let Apple drop it.* That genuinely is the island expiring
+  its own push with zero state, but it bounds **entry**, not the ring: it does nothing about a
+  ring already reported at t=2s. Insufficient for the ceiling as ruled.
+
+### The escape that does work: the recipients never reach disk
+
+§1.5's two readings turned on **process memory versus a row** — *"on disk, survives a crash,
+greppable, subpoenable, in a way an in-flight local variable is not."* That distinction is the
+answer, not just the framing of the problem:
+
+> **On disk: `(call_ulid, issued_at, expires_at, state)`. Nothing pair-shaped.**
+> **In process for the window: the tokens to fire the expiry wake**, held in the scheduled
+> expiry task — where they already live for the duration of the send.
+
+The ceiling's recipients are needed for exactly the ~30 seconds the process is already holding
+them, and they are held where they already are. Nothing is written that a later reader, a
+backup, or a subpoena can recover. **`plan_deliveries`'s table, §1.1, loses its fourth row.**
+
+**What this costs, stated rather than discovered:** a process restart inside a live ring drops
+that ring's island-enforced ceiling. The degradation is bounded and already measured — the ring
+still ends, at iOS's ~60s rather than our 30s (claude-tasks#4278, n=1 device/OS, so scope it).
+The gateway is **single-worker by construction** (`worker_guard`), so there is no second worker
+holding a ceiling this one cannot see; if `GATEWAY_ALLOW_MULTIWORKER` is ever set, this
+degrades further and that is the tripwire to record alongside the wake budget's identical one.
+
+### 1.7 What is left for Nick, now much narrower
+
+§1.5 asked whether the lease collides with *no refused-ring record* (2026-09-01) and ring-path
+sender-anonymity (2026-08-25). After the test, the collision is **not with the lease**. It is
+with **the ceiling alone**, and only in process memory.
+
+If that is still too much, there is a real fork and it is a product trade, not an engineering
+one — because **the ceiling's first stated reason has already been corrected**. It is no longer
+*"nothing stops the ring, so the island must"*; #4278 measured a ring self-expiring at ~60s. It
+is now *"it stops at 60s and we want 30s."* So:
+
+> **Is holding who-we-rang in process for 30 seconds the price of a 30-second ring instead of a
+> ~60-second one?**
+
+Answer *no* and the ceiling goes back to iOS, the lease becomes recipient-free end to end, and
+Nick's two rulings are untouched by anything. Answer *yes* and the lease ships as above.
+**Nothing else in this design depends on which way that goes** — which is the point of having
+run the test rather than asking the broad question.
+
+---
 
 ---
 
@@ -240,8 +311,9 @@ sentence that quoted it**. §3's table is retracted pending that decision, which
 
 | item | owner | |
 |---|---|---|
-| **§1.5 — does a ~30s lease collide with *no refused-ring record* (2026-09-01) and ring-path sender-anonymity (2026-08-25)?** | **Nick** | blocks the lease; nothing proceeds past it |
-| Test whether the lease can hold a **count** rather than the woken device rows — if so §1.5 evaporates | island | first thing round 3 tries |
+| ~~§1.5 — does a ~30s lease collide with the two rulings?~~ | — | **NARROWED by §1.6/§1.7** — not the lease, the ceiling, and only in process |
+| ~~Test whether the lease can hold a **count**~~ | island | **DONE — §1.6.** 3 of 4 guarantees are recipient-free; the ceiling alone needs the pair, and only in process memory |
+| **Nick's remaining call, narrowed:** is holding who-we-rang in process for ~30s the price of a 30s ring instead of iOS's measured ~60s? | **Nick** | nothing else depends on it |
 | 12a flaw 4 re-opened: M4's CallKit condition has fired, so the 60s/10s divergence needs re-deciding and the alert-world rationale in `apns.py` explicitly retired | island | adjacent to #4382, #4265 |
 | §2b retracted; §3's first rows retracted — design 14 itself is NOT edited, per the convention that a design of record is answered rather than rewritten | — | done here |
 
