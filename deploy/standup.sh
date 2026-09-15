@@ -659,9 +659,10 @@ if [ -n "${_dropped// /}" ]; then
       continuation line of a multi-line value, and its parent key is in this same list —
       so naming the whole list consents to destroying the very secret the fragments came
       from. There is no safe way past this case yet; that is what preserve-on-rewrite
-      (claude-tasks#3921) is for. Copy the file aside and leave standup alone.
+      (claude-tasks#4437) is for. Copy the file aside and leave standup alone.
 
-  The real fix is preserve-on-rewrite rather than refuse — see claude-tasks#3921."
+  The real fix is preserve-on-rewrite rather than refuse, and it is UNBUILT —
+  claude-tasks#4437. (#3921 is closed, but it closed on this refusal, not on that fix.)"
 fi
 
 mv "$ENV_TMP" "$ENV_FILE"

@@ -36,7 +36,7 @@ footgun; the sealed door makes that order unrepresentable). ``verify_actuation``
 public for pure, side-effect-free verification.
 
 Caller / operational contract this boundary DEPENDS ON but cannot itself enforce (the
-commander + the LiveKit transport are out of this repo — tracked as follow-ups):
+commander + the LiveKit transport are out of this repo — claude-tasks#2749, #2750):
   * The **commander** must mint a strictly-increasing per-robot ``seq`` from DURABLE state:
     if the commander restarts and its counter resets, envelopes are rejected until seq
     climbs back past the bridge's persisted high-water (a self-inflicted denial of

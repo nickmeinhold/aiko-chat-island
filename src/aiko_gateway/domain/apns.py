@@ -242,10 +242,21 @@ _VOIP_LEASE_SECONDS = 30
 # feature is inert, and tuning it further is treating a representation gap as a
 # calibration problem.
 #
-# THE WINDOW IS NOT REACHABLE TODAY and that is why this ships: an end wake is
-# routed to VoIP rows only, and both live islands hold zero (measured 2026-09-11:
-# 3 rows each, all `token_kind='alert'`). It becomes reachable the moment a build
-# registers a VoIP token. That is the gate, and it is tracked.
+# THE WINDOW IS NOT REACHABLE TODAY — but NOT for the reason first written here,
+# and the correction matters more than the conclusion. The original text rested on
+# an empty population: "both live islands hold zero [VoIP rows] (measured
+# 2026-09-11)", with "a build registers a VoIP token" named as the gate. That gate
+# HAS FIRED. Re-measured 2026-09-15 against both live databases: enspyr
+# `alert 4 / voip 1`, imagineering `alert 3 / voip 1`.
+#
+# What actually holds the window shut is `push_service.END_WAKE_VOIP_GATE_OPEN`
+# (False), a coded interlock that refuses the (VOIP, CALL_END) cell with a named
+# reason. Opening it is claude-tasks#4265's decision, not a population fact.
+#
+# Stating both is the point: a guard whose written reason has expired reads as
+# safe to a reader who checks the reason rather than the mechanism, and reads as
+# BROKEN to a reader who knows the population changed. Neither reader would find
+# the interlock from the sentence this replaced.
 #
 # THIS IS A FOURTH CLOCK AND IT IS NOT SETTLED HERE. The lease, the 30s ring and
 # the app's 10s freshness gate already "have no stated relationship, which the

@@ -216,7 +216,7 @@ class IslandDirectory:
         failed/stale/down rounds until the next successful admit overwrites it — i.e.
         last-verified-within-window, NOT continuous posture. Correct for the A4 declaration
         foundation; a consumer that treats it as live commitment (A5) must add a
-        clear-on-failed-admit / re-admit policy first (tracked as an A5 follow-up)."""
+        clear-on-failed-admit / re-admit policy first (claude-tasks#2507)."""
         if self._self is not None and peer_id == self._self.id:
             return
         peer = self._peers.get(peer_id)

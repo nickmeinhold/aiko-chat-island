@@ -152,7 +152,7 @@ dotenv_keys() {
   # without which grep prints "Binary file ... matches" and emits no lines at all. Kept
   # because it is harmless and would matter if `_raw` were ever populated another way;
   # named honestly rather than left wearing a purpose it does not serve here. Deleting
-  # it is tracked separately — it is a behaviour change on a seed-destroying path and
+  # it is claude-tasks#3986 — it is a behaviour change on a seed-destroying path and
   # does not belong in a commit about pipeline status.
   local _stripped _names
   _stripped="$(printf '%s\n' "$_raw" | tr -d '\000')" || return $?

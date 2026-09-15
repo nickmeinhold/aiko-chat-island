@@ -337,7 +337,8 @@ def is_fresh(
     recency check that accepts only an ``int`` CANNOT be mistaken for a trust gate and
     CANNOT bless a non-manifest. The verify-THEN-fresh composition order is the A4
     admission door's job (a single fail-closed ``verify_manifest`` → ``is_fresh``
-    path), tracked as its own task — NOT a promise smuggled into this helper.
+    path) — that door is ``admit_manifest`` below, built under claude-tasks#2469.
+    Named here so this helper is read as one half of it, not as a trust gate.
 
     NO DEFAULT WINDOW: ``max_age_ms`` is REQUIRED so a caller consciously chooses its
     freshness policy rather than silently inheriting one (a forgotten default is
