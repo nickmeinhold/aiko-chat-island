@@ -303,8 +303,11 @@ materialise_ref
 # --- compare ----------------------------------------------------------------
 #
 # ENUMERATION IS BOX-DRIVEN, and that is the whole reason this is not a recursive
-# diff. Measured on both live islands: the box carries FOUR files under deploy/
-# where the repo carries twelve. standup.sh is a first-standup tool with no reason
+# diff. Measured on both live islands 2026-09-15 (`ls -1 ~/apps/aiko-chat-gateway/deploy/`):
+# the box carries FIVE non-backup entries under deploy/ where the repo carries twelve.
+# It was FOUR when this comment was written; the fifth is THIS FILE, which #4230 added
+# after that count. Dated and with its instrument named because the number is a fact
+# about the boxes, not about the code — see docs/reference/expiring-justifications.md. standup.sh is a first-standup tool with no reason
 # to sit on a running island and deploy/secrets/ is never shipped to a box at all,
 # so a whole-directory diff would refuse on every deploy of both islands, forever.
 #
