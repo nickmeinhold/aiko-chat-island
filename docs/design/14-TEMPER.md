@@ -195,4 +195,7 @@ looks filed):
 4. **Split §0's table** into identity / memory / routing before anything is built on it —
    [#4375](https://github.com/nickmeinhold/claude-tasks/issues/4375)
 
+**ANSWERED 2026-09-15 by [`14-RECAST.md`](14-RECAST.md)** for items 1 and 4 (the two this
+repo owns). Item 2 remains cross-tab (#4374); item 3's constraint is unchanged.
+
 **Nothing in design 14 is decided, and nothing is built.**
