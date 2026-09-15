@@ -822,6 +822,26 @@ class DeviceToken(Base):
     # migration exists to write.
     token_kind: Mapped[str] = mapped_column(
         String(16), nullable=False, server_default=TokenKind.ALERT.value)
+    # WHICH HANDSET THIS TOKEN IS ON (claude-tasks#4384) — an opaque, client-minted,
+    # per-INSTALL string, stored so the client half can send it. It is a CLAIM the
+    # island cannot authenticate, and `plan_deliveries` deliberately does not read
+    # it: the OS clones a self-minted id across a device restore, so one value can
+    # cover two physical handsets. That docstring holds the argument.
+    #
+    # NULLABLE WITH NO server_default, which is the OPPOSITE of `token_kind` one
+    # line up and is the whole safety argument. There is no constant that is
+    # honest for a pre-existing row: 'absent means alert' was a true statement
+    # about every old row, whereas any non-null install id invented here would
+    # assert that two rows share a handset when nothing established that. NULL
+    # means UNKNOWN, and no backfill exists to write.
+    #
+    # NOT UNIQUE. One install legitimately holds several rows (an alert token and
+    # a VoIP token, and historically more), which is the entire point.
+    #
+    # NO CHECK CONSTRAINT: this is an OPEN set, not a closed one. The bound that
+    # exists is length, enforced at the REST boundary and at the service door;
+    # a DB CHECK could only restate the width, and SQLite does not enforce width.
+    install_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[dt.datetime] = mapped_column(

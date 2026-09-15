@@ -461,10 +461,8 @@ def plan_deliveries(
 
     ARM (B): EVERY SELECTED ROW GETS A PUSH. Both an alert row and a voip row for
     one handset is the NORMAL state (design 12 Decision 2), and rows carry NO
-    device identity — the two tokens are unrelated strings and Decision 2a
-    explicitly refuses to infer pairing. So "one push per handset" is NOT
-    COMPUTABLE, which makes this a REPRESENTATION gap rather than a tuning
-    choice, and no selection rule can be correct. The two arms cost:
+    device identity the router may act on — the two tokens are unrelated strings
+    and Decision 2a explicitly refuses to infer pairing. The two arms cost:
 
       (A) voip-preferred — an alert-only SECOND Apple device (an iPad, an older
           phone) never rings while any voip row exists: a MISSED CALL.
@@ -472,12 +470,29 @@ def plan_deliveries(
           ring AND a redundant banner: a BLEMISH.
 
     (B), for the reason this module already gives in its own words: a duplicate
-    notification is a blemish; a missed call is the bug. It is also the only arm
-    with no silent non-delivery, and it makes the deploy trivially safe — every
-    row on both live islands is `token_kind='alert'` by server_default today and
-    the alert ring is proven on real handsets, so it must keep ringing. Closing
-    the residual properly needs a device/install identifier on the registration
-    wire and per-group selection; that is filed, not built here.
+    notification is a blemish; a missed call is the bug. Its safety is a PROPERTY
+    of the arm, not of the row population: (B) suppresses nothing, so it cannot
+    silently fail to deliver, whatever mix of kinds the tables hold. Do not
+    re-derive that safety from the population — the islands are no longer
+    alert-only (measured 2026-09-15: enspyr 4 alert / 1 voip, imagineering 3
+    alert / 1 voip), and a live count is a fact with an expiry date.
+
+    `install_id` IS STORED AND IS DELIBERATELY NOT READ HERE. The column
+    (claude-tasks#4384) carries a CLIENT-MINTED string the island cannot
+    authenticate, and the OS clones it: a self-minted value in NSUserDefaults or
+    SharedPreferences is swept into iCloud Backup / Android Auto Backup, so a
+    device restore puts TWO PHYSICAL handsets under one value. Preferring voip
+    within such a group silences the alert row that is the second handset's only
+    reach — arm (A)'s missed call, arrived at through the very column minted to
+    forbid it (cage-match PR#179, unanimous). No shape heuristic rescues it:
+    inferring a handset from the token-kind multiset is exactly the inference
+    Decision 2a refuses, and its false positive misses the same call.
+
+    So this is a MISSING FACT, not a tuning dial. Suppression waits on the value
+    being DEVICE-BOUND at the client — backup-excluded storage, or an API that
+    does not restore onto another body — which is app-side work (claude-tasks#3385).
+    Until that ships, storing the field and trusting it for preference stay
+    separate, and the redundant banner stands.
     """
     deliveries: list[Delivery] = []
     skips: list[tuple[str, str]] = []

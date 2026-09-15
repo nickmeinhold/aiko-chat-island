@@ -273,3 +273,130 @@ def test_the_openapi_document_types_the_registration_echo() -> None:
         assert schema_name in ref, (
             f"RegisterDeviceResp.{field} is not typed as {schema_name} in the "
             f"document — it resolved to {props[field]!r}")
+
+
+# ------------------------------------------------------------- the install id
+#
+# claude-tasks#4384. `install_id` is the client's CLAIM about which handset a
+# token is on. It is stored and not routed on — `plan_deliveries` holds the
+# argument, and test_push_routing.py sweeps the inertness. These are the wire and
+# door arms: the field has to round-trip honestly before anything can ever use
+# it, and a value that arrives corrupted is worse than one that never arrives.
+
+
+async def test_an_install_id_round_trips_to_the_row_and_the_echo(client, session):
+    """THE ROW, NOT JUST THE ECHO — the discrimination PR#170 r4 had to add for
+    `token_kind`, applied at the point it is cheap rather than after a review
+    finds it. A service that echoes `req.install_id` faithfully and stores NULL
+    passes an echo-only assertion while the column stays empty forever — and the
+    echo is the client's only desync detector."""
+    bob = await _user(session, "installbob")
+    resp = await client.post(
+        "/v1/devices", headers=_headers(bob),
+        json={"platform": "apns", "token": "m" * 64, "install_id": "handset-1"})
+    assert resp.status_code == 201
+    assert resp.json()["install_id"] == "handset-1"
+    row = (await session.execute(
+        select(DeviceToken).where(DeviceToken.token == "m" * 64))).scalar_one()
+    assert row.install_id == "handset-1", (
+        "the router echoed the install id but the row stored "
+        f"{row.install_id!r} — the echo is not evidence of storage")
+
+
+async def test_an_omitted_install_id_stores_null_and_echoes_null(client, session):
+    """ABSENT IS LEGAL, PERMANENTLY, and the echo says so rather than going quiet.
+    NULL is what every pre-#4384 client produces and what every existing row
+    holds; the router reads it as 'its own handset', which is today's behaviour
+    exactly."""
+    alice = await _user(session, "installalice")
+    resp = await client.post("/v1/devices", headers=_headers(alice),
+                             json={"platform": "apns", "token": "n" * 64})
+    assert resp.status_code == 201
+    assert resp.json()["install_id"] is None
+    row = (await session.execute(
+        select(DeviceToken).where(DeviceToken.token == "n" * 64))).scalar_one()
+    assert row.install_id is None
+
+
+@pytest.mark.parametrize("bad", ["", "x" * 65, "has space", "tab\there",
+                                 "semi;colon", "new\nline"])
+async def test_a_malformed_install_id_is_a_422_not_a_silent_store(
+        client, session, bad):
+    """THE ONLY OPEN SET ON THIS MODEL, so the boundary checks what shape can be
+    checked for. An empty string is not an identity, so storing one records a
+    fact that is not one; anything over the column width is invisible on SQLite
+    and a failure on Postgres; and a value a future reader will put in log lines
+    and grouping keys has no business carrying whitespace or control
+    characters."""
+    alice = await _user(session, f"installbad{abs(hash(bad))}")
+    resp = await client.post(
+        "/v1/devices", headers=_headers(alice),
+        json={"platform": "apns", "token": "o" * 64, "install_id": bad})
+    assert resp.status_code == 422, (
+        f"install_id={bad!r} was accepted; the boundary is the only thing "
+        "checking an open set's shape")
+    assert (await session.execute(
+        select(DeviceToken).where(DeviceToken.token == "o" * 64)
+    )).scalar_one_or_none() is None, "a rejected registration still wrote a row"
+
+
+@pytest.mark.parametrize("bad,exc", [("", ValueError), ("x" * 65, ValueError),
+                                     (object(), TypeError)])
+async def test_the_service_door_refuses_a_bad_install_id_too(session, bad, exc):
+    """THE DOOR, NOT THE ROUTE (one door). The route is pydantic-validated so no
+    HTTP path reaches these, but this module has in-process callers by design and
+    'no caller does that today' is exactly the guarantee a second caller removes
+    — the same argument `token_kind`'s TypeError guard already makes one screen
+    up. There is no DB CHECK behind this column to catch it."""
+    alice = await _user(session, f"installdoor{abs(id(bad))}")
+    with pytest.raises(exc):
+        await devices_service.register_device(
+            session, user_id=alice.id, platform="apns", token="p" * 64,
+            install_id=bad)
+
+
+async def test_reassign_preserves_an_install_id_the_client_stopped_sending(
+        session):
+    """OMISSION PRESERVES, the same rule `apns_environment` and `token_kind`
+    follow, and for the same reason: 'the client stopped sending the field' is an
+    ordinary regression (an app rollback), and answering it by NULLing a known
+    identity would discard a fact nothing can restate until the client registers
+    again."""
+    alice = await _user(session, "installkeep")
+    await devices_service.register_device(
+        session, user_id=alice.id, platform="apns", token="q" * 64,
+        install_id="handset-9")
+    row = await devices_service.register_device(
+        session, user_id=alice.id, platform="apns", token="q" * 64)
+    assert row.install_id == "handset-9"
+
+
+async def test_reassign_lets_a_declared_install_id_win(session):
+    """DECLARATION WINS — the other half of the same rule. A handset that
+    re-mints its identity (a reinstall) must be able to say so."""
+    alice = await _user(session, "installnew")
+    await devices_service.register_device(
+        session, user_id=alice.id, platform="apns", token="r" * 64,
+        install_id="handset-old")
+    row = await devices_service.register_device(
+        session, user_id=alice.id, platform="apns", token="r" * 64,
+        install_id="handset-new")
+    assert row.install_id == "handset-new"
+
+
+def test_the_openapi_document_describes_the_install_id_on_both_halves() -> None:
+    """THE CONTRACT THE APP TAB READS, on the REQUEST and the ECHO.
+
+    The request half alone tells a client the island ACCEPTS `install_id` and not
+    that it STORES one — which is the exact gap `RegisterDeviceResp` was created
+    to close for `token_kind`, and a new optional field is precisely where it
+    reopens. An island that has not deployed this discards the field silently and
+    still answers 201, so the echo is the app's only instrument."""
+    from aiko_gateway.main import app
+
+    schemas = app.openapi()["components"]["schemas"]
+    assert "install_id" in schemas["RegisterDeviceReq"]["properties"], (
+        "openapi.json does not document install_id on the request")
+    assert "install_id" in schemas["RegisterDeviceResp"]["properties"], (
+        "openapi.json documents install_id on the request but not the echo — a "
+        "client cannot tell an island that stored it from one that dropped it")

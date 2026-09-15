@@ -48,6 +48,43 @@ class RegisterDeviceReq(BaseModel):
     # registration is the most complete silence available — no row, no wake-time
     # log, no reachability entry.
     token_kind: TokenKind | None = None
+    # WHICH HANDSET this token is on (claude-tasks#4384). OPTIONAL and PERMANENTLY
+    # so: None means "the client did not say", and an app built before this field
+    # existed is bit-for-bit unaffected. The value is STORED AND NOT ROUTED ON —
+    # `push_service.plan_deliveries` holds the argument for why a claim the island
+    # cannot authenticate does not get to suppress a push.
+    #
+    # THE ONLY OPEN SET ON THIS MODEL, and constrained accordingly. `platform`,
+    # `apns_environment` and `token_kind` are enums because each is a closed set
+    # the island defines; `install_id` is minted by the CLIENT and opaque to us,
+    # so an enum is unrepresentable and the honest bound is shape:
+    #
+    #   * `min_length=1` — an empty string is not an identity, so storing one
+    #     would mean nothing to any future reader and would invite exactly the
+    #     grouping mistake ('' as a shared handset) that costs a ring. 422 at the
+    #     boundary instead.
+    #   * `max_length=64` — the column's width, shared with
+    #     `devices_service.INSTALL_ID_MAX_LENGTH` and revision 0026. SQLite does
+    #     not enforce VARCHAR width, so without this the overflow is invisible
+    #     until the day this runs on Postgres.
+    #   * `pattern` — a conservative opaque-identifier charset that covers a UUID
+    #     (`identifierForVendor` renders as one) with room for prefixes. This is
+    #     a value a future reader will put in log lines and grouping keys; there
+    #     is no reason a handset identity needs whitespace, control characters or
+    #     punctuation, and refusing them costs a real client nothing. Enforced
+    #     HERE ONLY — the service door checks type, emptiness and width, so an
+    #     in-process caller can store what the wire would 422 (cage-match PR#179,
+    #     Maxwell + Tesla). Harmless while nothing reads the column; it is the
+    #     thing to close before anything does.
+    #
+    # NOT A NEW TRACKING SURFACE, stated here rather than discovered in the
+    # visibility-boundary doc (claude-tasks#3695): the island already stores every
+    # one of this user's tokens under their user id, so this adds no fact it could
+    # not already derive. It learns which of a user's OWN rows claim to share a
+    # screen, and nothing that crosses users.
+    install_id: str | None = Field(
+        default=None, min_length=1, max_length=64,
+        pattern=r"^[A-Za-z0-9_.:-]+$")
 
 
 class UnregisterDeviceReq(BaseModel):
@@ -87,6 +124,13 @@ class RegisterDeviceResp(BaseModel):
     platform: Platform
     apns_environment: ApnsEnvironment
     token_kind: TokenKind
+    # ECHOED FOR THE SAME REASON `token_kind` is, and it is the app's only
+    # instrument: an island that has not deployed this DISCARDS the field
+    # silently (pydantic's extra="ignore") and answers 201. The echo is how the
+    # client learns whether the island kept what it sent. `None` here is a
+    # complete answer, not a missing one — it means the island stored no install
+    # identity for this row.
+    install_id: str | None = None
 
 
 @router.post("/devices", status_code=status.HTTP_201_CREATED)
@@ -97,7 +141,8 @@ async def register_device(
     Idempotent: re-registering the same token is a no-op reassign, still 201."""
     row = await svc.register_device(
         session, user_id=user.id, platform=req.platform.value, token=req.token,
-        apns_environment=req.apns_environment, token_kind=req.token_kind)
+        apns_environment=req.apns_environment, token_kind=req.token_kind,
+        install_id=req.install_id)
     # Echo the RESOLVED environment and kind, not the requested ones: a client that
     # sent nothing learns what the island picked for it, which is the only way it
     # can notice a mismatch with the build it actually is.
@@ -120,7 +165,7 @@ async def register_device(
     return RegisterDeviceResp(
         id=row.id, platform=Platform(row.platform),
         apns_environment=ApnsEnvironment(row.apns_environment),
-        token_kind=TokenKind(row.token_kind))
+        token_kind=TokenKind(row.token_kind), install_id=row.install_id)
 
 
 @router.delete("/devices", status_code=status.HTTP_204_NO_CONTENT)
