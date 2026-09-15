@@ -366,12 +366,38 @@ def test_a_shared_install_id_suppresses_nothing():
 
 def test_an_alert_only_second_install_still_gets_its_push():
     """THE MISSED CALL, IMPOSSIBLE BY CONSTRUCTION. The iPad's alert row is a
-    second handset's only reach. Under arm (B) nothing can speak for it — not the
-    phone's voip row, and not a shared install id if a restore ever produced one,
-    which is the collision that retired the preference."""
+    second handset's only reach, and here it carries the phone's install id —
+    the restore collision that retired the preference. Nothing may speak for it.
+
+    Paired with `test_two_distinct_installs_each_deliver` — the same three rows
+    under two HONEST ids. A re-added preference reddens BOTH, and the pair exists
+    for what it leaves behind: measured against the suppression, this arm
+    delivers `['01VOIP']` (the iPad is dark, a MISSED CALL) and its sibling
+    delivers `['01IPAD', '01VOIP']` (one redundant banner, a BLEMISH). Same
+    mechanism, two costs an order apart. One arm alone cannot show that."""
     rows = _install_rows(("01ALERT", TokenKind.ALERT.value, "phone"),
                          ("01VOIP", TokenKind.VOIP.value, "phone"),
                          ("01IPAD", TokenKind.ALERT.value, "phone"))
+    deliveries, skips = plan_deliveries(
+        rows, wake=WakeKind.CALL_INVITE, configured=BOTH,
+        end_wake_gate_open=True)
+    assert sorted(d.row_id for d in deliveries) == [
+        "01ALERT", "01IPAD", "01VOIP"]
+    assert skips == []
+
+
+def test_two_distinct_installs_each_deliver():
+    """TWO REAL HANDSETS, TWO HONEST IDS — the shape the withdrawn preference was
+    designed for, kept in the PURE sweep so it sits beside the code someone
+    editing `plan_deliveries` will have open. Arm (B) sends to all three; a
+    preference here would cost only `01ALERT`, the redundant banner.
+
+    The collided half of the pair is
+    `test_an_alert_only_second_install_still_gets_its_push`, where the same
+    mechanism costs a whole handset instead. Read them together."""
+    rows = _install_rows(("01ALERT", TokenKind.ALERT.value, "phone"),
+                         ("01VOIP", TokenKind.VOIP.value, "phone"),
+                         ("01IPAD", TokenKind.ALERT.value, "ipad"))
     deliveries, skips = plan_deliveries(
         rows, wake=WakeKind.CALL_INVITE, configured=BOTH,
         end_wake_gate_open=True)
