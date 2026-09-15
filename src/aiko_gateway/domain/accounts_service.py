@@ -176,8 +176,8 @@ async def delete_user_account(session: AsyncSession, user_id: str) -> None:
     # handle/PII) that resolves to nothing post-deletion, and it parallels how a
     # `reply_to` reference to this user's tombstone likewise persists — we tombstone
     # the departing user's OWN rows, never rewrite everyone else's. Full inbound-span
-    # scrubbing (a JSON rewrite across all messages targeting the id) is tracked as a
-    # follow-up, not done here; the residual is a dangling opaque pointer, not exposed
+    # scrubbing (a JSON rewrite across all messages targeting the id) is
+    # claude-tasks#2705, not done here; the residual is a dangling opaque pointer, not exposed
     # content. See test_delete_wipes_mention_spans (outbound) + its inbound sibling.
     await session.execute(
         update(Message)
