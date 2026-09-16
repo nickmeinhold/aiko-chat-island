@@ -141,8 +141,7 @@ def _deny_if_banned(user: User) -> None:
 
 @router.post("/register", dependencies=[rate_limit("account")])
 async def register(req: RegisterReq, session: DbSession) -> dict:
-    if not settings.open_registration:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "registration is closed")
+    _require_may_provision_account()
     try:
         user = await users_service.create_user(
             session, username=req.username,
@@ -373,6 +372,10 @@ async def social_claim(req: SocialClaimReq, session: DbSession) -> dict:
     # Social claim — gated on social sign-in being enabled.
     if not settings.social_signin_enabled:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "social sign-in is disabled")
+    # ...and then through the SAME provisioning door as every other account
+    # creator, declaring its `open_registration` exemption explicitly rather than
+    # having it be the accident of never asking.
+    _require_may_provision_account(via_social=True)
     try:
         user = await users_service.create_social_user(
             session,
@@ -415,7 +418,47 @@ def _short(value: object, n: int = 10) -> str:
     return s[:n] + ("…" if len(s) > n else "")
 
 
-def _require_open_registration() -> None:
+def _require_may_provision_account(*, via_social: bool = False) -> None:
+    """THE ONE PLACE that answers "may a NEW ACCOUNT be created right now?".
+
+    Every route that creates a user calls this and nothing else decides it. Before
+    it there were three doors consulting two different flags and no one place to
+    read the answer: `/register` and the passkey pair on `open_registration`,
+    `social/claim` on `social_signin_enabled`. A cage-match (Kelvin + Carnot,
+    independently) called that out as the defect it is — *"disclosure is not
+    enforcement: a future config-only social rollout can reopen account creation
+    without touching code, tests, or the flag an operator would reasonably audit."*
+
+    SOCIAL IS EXEMPT FROM `open_registration`, AND THAT IS A RECORDED DECISION,
+    NOT AN OVERSIGHT — which is why this is a predicate with a parameter rather
+    than one flag for everything. `config.py` REJECTS `open_registration=True` at
+    boot in production (an open `/register` exposes every channel while I2
+    membership, #36, is unenforced), while social sign-in *may* be enabled in
+    production — Nick, 2026-06-27, the same I2 risk named and accepted "for the
+    current early-users phase so the live gateway is reachable at all".
+
+    So collapsing both onto `open_registration`, which is what the panel
+    prescribed, would make social sign-in permanently unable to create an account
+    in production and silently retire that decision. The finding was right and the
+    prescribed fix was not; the panel could not see it because `config.py` is not
+    in this diff.
+
+    What changes: the exemption is now ONE explicit, tested branch in ONE function
+    instead of an emergent property of which flag each route happened to check.
+    An operator reads one predicate; a reviewer sees the asymmetry stated; and if
+    the exemption is ever withdrawn, it is deleted here and every door moves at
+    once.
+    """
+    if via_social:
+        # Gated by its OWN switch, deliberately. The caller has already checked
+        # `social_signin_enabled` and would not be here otherwise; this branch
+        # exists so the exemption is VISIBLE at the provisioning door rather than
+        # inferable only from that door's absence.
+        return
+    _require_open_registration_flag()
+
+
+def _require_open_registration_flag() -> None:
     """Refuse an account-CREATING request on an island with registration closed.
 
     ONE PREDICATE, TWO CALL SITES, and that is the whole point. `/v1/auth/register`
@@ -446,7 +489,7 @@ async def passkey_register_start(session: DbSession) -> dict:
 
     Gated: a closed island refuses here rather than letting a user complete a
     biometric ceremony that `finish` would then reject."""
-    _require_open_registration()
+    _require_may_provision_account()
     result = await passkey_service.start_registration(session)
     log.info("passkey.register.start: challenge issued state=%s ttl=%ss",
              _short(result.get("state")), settings.passkey_challenge_ttl_seconds)
@@ -466,7 +509,7 @@ async def passkey_register_finish(req: PasskeyFinishReq, session: DbSession) -> 
     THE CHOKEPOINT. Gated before the challenge is consumed, so a caller that
     skipped `start` — or held a challenge from before registration was closed —
     still meets the gate, and a refused request burns nothing."""
-    _require_open_registration()
+    _require_may_provision_account()
     raw = await passkey_service.consume_challenge(
         session, req.state, PasskeyOperation.REGISTER)
     if raw is None:

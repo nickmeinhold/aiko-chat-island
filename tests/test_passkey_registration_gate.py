@@ -105,3 +105,40 @@ async def test_passkey_authenticate_start_is_NOT_gated(client, monkeypatch):
     resp = await client.post("/v1/auth/passkey/authenticate/start")
     assert resp.status_code != 403, (
         "closing registration locked out existing users — sign-in is not signup")
+
+
+async def test_social_claim_is_exempt_from_open_registration(client, monkeypatch):
+    """THE EXEMPTION, PINNED WITH A **VALID** PROVISIONING TOKEN — because with a
+    bogus one this test cannot fail for the reason it names.
+
+    `/social/claim` decodes the token FIRST and answers 401 on a bad one, before
+    either gate. A version of this test using `"not-a-real-token"` passed while
+    never reaching the provisioning door at all: a check whose success value is
+    indistinguishable from its disabled value, which is the exact class this
+    session has spent the day removing. Caught before merge; recorded so it is not
+    reintroduced.
+
+    WHY THE EXEMPTION EXISTS: `config.py` REJECTS `open_registration=True` in
+    production, while social sign-in MAY be enabled there (Nick, 2026-06-27). A
+    cage-match panel (Kelvin + Carnot, independently) prescribed routing social
+    through `open_registration`; that would make social sign-in permanently unable
+    to provision an account in production and silently retire that decision. The
+    panel could not see it — `config.py` is not in this diff.
+
+    So: registration CLOSED, social ENABLED, a REAL provisioning token. The claim
+    must succeed. If it ever answers "registration is closed", the exemption has
+    been lost.
+    """
+    from aiko_gateway.domain import security
+
+    monkeypatch.setattr(settings, "open_registration", False)
+    monkeypatch.setattr(settings, "social_signin_enabled", True)
+    prov = security.issue_provisioning("google", "sub-exempt-check")
+    resp = await client.post("/v1/auth/social/claim", json={
+        "provisioning_token": prov, "handle": "exemptcheck"})
+    assert "registration is closed" not in resp.text, (
+        "the social exemption was lost — social sign-in can no longer provision an "
+        "account on a closed island, which is PERMANENTLY the case in production, "
+        "and reverses the 2026-06-27 decision")
+    assert resp.status_code == 200, (
+        f"expected the claim to succeed, got {resp.status_code}: {resp.text[:200]}")
