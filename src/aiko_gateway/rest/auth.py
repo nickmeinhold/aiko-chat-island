@@ -415,11 +415,38 @@ def _short(value: object, n: int = 10) -> str:
     return s[:n] + ("…" if len(s) > n else "")
 
 
+def _require_open_registration() -> None:
+    """Refuse an account-CREATING request on an island with registration closed.
+
+    ONE PREDICATE, TWO CALL SITES, and that is the whole point. `/v1/auth/register`
+    has carried this check since #38 while the passkey pair did not, so the gate
+    covered the door nobody uses and left open the one the app ships: measured
+    against a live island 2026-09-15, an anonymous `passkey/register/start`
+    returned 200 with a handle allocated while `/register` returned 403 in the
+    same breath. A guard is only a guard over the callers that reach it.
+
+    THE SAME 403 AND THE SAME WORDING as `/register`, deliberately. Which door a
+    closed island was knocked on is not information a caller is owed, and a second
+    phrasing would be a second thing to keep in sync.
+
+    NOT applied to `add/finish` or to `authenticate/*`: those act on an account
+    that already exists. Closing registration means no new ACCOUNTS, never no new
+    keys and never no sign-in — conflating them would lock out the very users the
+    island is for.
+    """
+    if not settings.open_registration:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "registration is closed")
+
+
 @router.post("/passkey/register/start", dependencies=[rate_limit("passkey")])
 async def passkey_register_start(session: DbSession) -> dict:
     """Begin registration for an ANONYMOUS caller (first-passkey-creates-account).
     Returns {state, options} — the raw WebAuthn-JSON the platform authenticator
-    parses. No body, no prior session."""
+    parses. No body, no prior session.
+
+    Gated: a closed island refuses here rather than letting a user complete a
+    biometric ceremony that `finish` would then reject."""
+    _require_open_registration()
     result = await passkey_service.start_registration(session)
     log.info("passkey.register.start: challenge issued state=%s ttl=%ss",
              _short(result.get("state")), settings.passkey_challenge_ttl_seconds)
@@ -434,7 +461,12 @@ async def passkey_register_finish(req: PasskeyFinishReq, session: DbSession) -> 
     session. Account creation is atomic with the challenge burn, so a credential can
     never be orphaned by a rejected handle claim (the #1728 root cause — persistence
     was gated on a handle claim that collided with a pre-existing account). Returns
-    the SAME authenticated shape as authenticate/finish + the social/broker door."""
+    the SAME authenticated shape as authenticate/finish + the social/broker door.
+
+    THE CHOKEPOINT. Gated before the challenge is consumed, so a caller that
+    skipped `start` — or held a challenge from before registration was closed —
+    still meets the gate, and a refused request burns nothing."""
+    _require_open_registration()
     raw = await passkey_service.consume_challenge(
         session, req.state, PasskeyOperation.REGISTER)
     if raw is None:
