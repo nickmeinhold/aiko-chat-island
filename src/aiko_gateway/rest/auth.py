@@ -487,9 +487,24 @@ async def passkey_register_start(session: DbSession) -> dict:
     Returns {state, options} — the raw WebAuthn-JSON the platform authenticator
     parses. No body, no prior session.
 
-    Gated: a closed island refuses here rather than letting a user complete a
-    biometric ceremony that `finish` would then reject."""
-    _require_may_provision_account()
+    DELIBERATELY UNGATED, and reverting that is a production outage — read this
+    before "tightening" it. THIS ROUTE IS ALSO `add/start`: there is no such
+    endpoint, and `passkey/add/finish` consumes a challenge issued HERE ("reuses
+    /passkey/register/start for the challenge (identity-agnostic); the
+    Authorization bearer is what distinguishes an add from a first-passkey
+    register"). One hallway, two rooms.
+
+    So a gate here is not "refuse early" — it is a PERMANENT LOCKOUT of
+    device-add on every production island, because `open_registration` is
+    force-closed there as standing law. An existing user could never add a second
+    passkey again. An earlier revision of this change did exactly that, and its
+    own test asserted the lockout as correct; Tesla caught it in cage-match round
+    1 while two other families approved of the gate's placement.
+
+    A challenge on its own provisions nothing. `register/finish` is the real
+    chokepoint — `create_passkey_account` is called from there and nowhere else —
+    and it is gated before the challenge is consumed, so nothing an anonymous
+    caller starts here can become an account."""
     result = await passkey_service.start_registration(session)
     log.info("passkey.register.start: challenge issued state=%s ttl=%ss",
              _short(result.get("state")), settings.passkey_challenge_ttl_seconds)
