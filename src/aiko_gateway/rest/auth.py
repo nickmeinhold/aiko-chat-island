@@ -395,7 +395,12 @@ async def social_claim(req: SocialClaimReq, session: DbSession) -> dict:
 # Passwordless credential sign-in. `start` mints a single-use challenge; `finish`
 # verifies the device's attestation/assertion (py_webauthn) and routes into the
 # SAME outcome shape as /social + the broker (the app's one _resolveOutcome door).
-# Endpoints are UNGATED (deploy-dark) — only the /providers advertisement is gated
+# `register/finish` IS GATED on account provisioning (see
+# `_require_may_provision_account`); `start`, `add/*` and `authenticate/*` are
+# ungated (deploy-dark) — only the /providers advertisement is gated besides.
+# Corrected in cage-match PR#182 round 2: this line still read "Endpoints are
+# UNGATED" after the gate landed, and stale liturgy at a trust boundary is how
+# the next visitor deletes a gate as "not the design".
 # on settings.passkey_enabled, so the flow can be exercised on a real device before
 # the app surfaces the buttons (the handoff's "deploy endpoints, advertise last").
 
@@ -450,10 +455,17 @@ def _require_may_provision_account(*, via_social: bool = False) -> None:
     once.
     """
     if via_social:
-        # Gated by its OWN switch, deliberately. The caller has already checked
-        # `social_signin_enabled` and would not be here otherwise; this branch
-        # exists so the exemption is VISIBLE at the provisioning door rather than
-        # inferable only from that door's absence.
+        # Gated by its OWN switch — AND RE-CHECKED HERE RATHER THAN TRUSTED.
+        # `social_claim` does check it first today, so this is redundant today.
+        # It is not redundant tomorrow: Tesla, cage-match round 2 — *"a copy-paste
+        # of `via_social=True` is a provisioning door with no kill switch. The
+        # single-door claim is true only for the default path."* A door whose
+        # exemption depends on every future caller remembering a check elsewhere
+        # is not a door. Re-reading the flag costs an attribute lookup and makes
+        # the claim in this docstring true of ANY caller, not just the careful one.
+        if not settings.social_signin_enabled:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN, "social sign-in is disabled")
         return
     _require_open_registration_flag()
 

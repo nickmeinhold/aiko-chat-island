@@ -9,10 +9,17 @@ left open the one the app actually ships. Measured against the live island on
 with an account handle allocated, while `/v1/auth/register` returned 403 in the
 same breath.
 
-BOTH HALVES ARE GATED, not just `finish`. `finish` is the chokepoint that creates
-the account and is the one that must hold; `start` is gated too so a closed island
-says so before a user completes a biometric ceremony that cannot succeed. A caller
-that skips `start` still meets the gate at `finish`.
+ONLY `finish` IS GATED, AND GATING `start` IS A PRODUCTION OUTAGE. An earlier
+revision of this file said the opposite — "both halves are gated" — while the tests
+below it existed to keep `start` OPEN. That paragraph was the round-1 outage written
+as scripture, and a future editor "aligning" the code to it would have re-broken
+device-add on both live islands. Tesla, cage-match round 2: *"Burn the paragraph."*
+
+`register/start` is ALSO `add/start`: there is no such endpoint, and
+`passkey/add/finish` consumes a challenge issued there. `register/finish` is the
+true chokepoint — `create_passkey_account` is called from there and nowhere else —
+and the gate sits before `consume_challenge`, so nothing an anonymous caller starts
+can become an account and a refused request burns nothing.
 
 `add/finish` is deliberately NOT gated: it requires `CurrentUser` and attaches a
 credential to an account that already exists. Closing registration must not stop
@@ -145,6 +152,23 @@ async def test_passkey_authenticate_start_is_NOT_gated(client, monkeypatch):
         f"sign-in is not signup, but a closed island answered {resp.status_code} "
         "— asserting == 200 rather than != 403 because a 500 would bless the "
         "weaker form (Tesla, round 1)")
+
+
+async def test_passkey_authenticate_finish_is_NOT_gated(client, monkeypatch):
+    """Sign-in's FINISH half, pinned separately from its start (Tesla, round 2).
+
+    `authenticate/start` returning 200 does not speak for `authenticate/finish`; a
+    body-level `open_registration` check pasted into finish would be invisible to
+    the start arm. With a bogus challenge the answer must be about the CHALLENGE
+    (400/401), never "registration is closed".
+    """
+    monkeypatch.setattr(settings, "open_registration", False)
+    resp = await client.post("/v1/auth/passkey/authenticate/finish",
+                             json=_FINISH_BODY)
+    assert "registration is closed" not in resp.text, (
+        "closing registration broke SIGN-IN's finish half — signup is not sign-in")
+    assert resp.status_code in (400, 401), (
+        f"expected a challenge-shaped refusal, got {resp.status_code}")
 
 
 async def test_social_claim_is_exempt_from_open_registration(client, monkeypatch):

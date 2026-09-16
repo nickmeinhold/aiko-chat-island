@@ -219,6 +219,37 @@ def test_open_registration_override_allowed_in_dev():
     assert s.open_registration is False
 
 
+def test_prod_warns_when_social_reopens_account_creation(caplog):
+    """The flag's name is a lie in exactly one configuration; say so at boot.
+
+    `open_registration=False` reads as "no new accounts", but `/v1/auth/social/claim`
+    provisions accounts under `social_signin_enabled` — deliberately (2026-06-27:
+    prod force-closes open_registration while permitting social). A cage-match
+    (Carnot, both rounds) called the silence the defect, not the exemption.
+
+    WARNING, not refusal: the configuration is legal and intended. What is not
+    acceptable is an operator holding it without being told.
+    """
+    import logging
+    with caplog.at_level(logging.WARNING):
+        Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
+                 passkey_enabled=True, social_signin_enabled=True,
+                 google_client_ids=["x.apps.googleusercontent.com"], **_PROD_MOD)
+    assert any("ACCOUNT CREATION IS OPEN" in r.message for r in caplog.records), (
+        "the combination that makes open_registration's name a lie booted silently")
+
+
+def test_prod_does_NOT_warn_when_social_is_off(caplog):
+    """THE NEGATIVE CONTROL. A warning that always fires tells an operator nothing,
+    and would pass the test above."""
+    import logging
+    with caplog.at_level(logging.WARNING):
+        Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
+                 passkey_enabled=True, **_PROD_MOD)
+    assert not any("ACCOUNT CREATION IS OPEN" in r.message for r in caplog.records), (
+        "warned about social reopening account creation while social is disabled")
+
+
 # --- invariant 3: social sign-in client-ID allowlist (#13) ------------------
 
 def test_prod_social_enabled_without_client_ids_raises():
