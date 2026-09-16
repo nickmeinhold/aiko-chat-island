@@ -29,7 +29,31 @@ from httpx import ASGITransport, AsyncClient
 from aiko_gateway.domain import messages_service, signing
 from aiko_gateway.domain.models import Channel, User
 from aiko_gateway.main import app
-from tests.test_message_signing_carriage import _origin_for
+
+
+def _signed_origin(priv: Ed25519PrivateKey, *, channel_id: str, client_msg_id: str,
+                   signed_at_ms: int, body: str, reply_to: str | None) -> dict:
+    """Build a real signed envelope, using the gateway's OWN signing_bytes +
+    encode_multikey.
+
+    Deliberately NOT imported from `test_message_signing_carriage`: a cross-test
+    import resolves under `python -m pytest` (which puts CWD on sys.path) and
+    ModuleNotFounds under bare `pytest`, which is what CI runs — green locally,
+    red there. The multikey encoding is not what this file tests (its external
+    known-answer vector lives with the carriage tests); what this file needs is a
+    signature the live path will accept.
+    """
+    raw_pub = priv.public_key().public_bytes_raw()
+    sig = priv.sign(signing.signing_bytes(
+        raw_pubkey=raw_pub, channel_id=channel_id, client_msg_id=client_msg_id,
+        signed_at_ms=signed_at_ms, body=body, reply_to=reply_to))
+    return {
+        "v": 1, "alg": "EdDSA", "key_version": 1,
+        "sender_pubkey": signing.encode_multikey(raw_pub),
+        "client_msg_id": client_msg_id,
+        "signed_at_ms": signed_at_ms,
+        "sig": base64.urlsafe_b64encode(sig).decode().rstrip("="),
+    }
 
 
 def _parse_like_the_app(doc) -> bool | None:
@@ -103,7 +127,7 @@ async def test_the_claim_is_true_of_the_running_carriage(client, session):
 
     priv = Ed25519PrivateKey.generate()
     cmid, ts, body = "cap-roundtrip", 1720000000123, "hello world"
-    raw = _origin_for(priv, channel_id=channel.id, client_msg_id=cmid,
+    raw = _signed_origin(priv, channel_id=channel.id, client_msg_id=cmid,
                       signed_at_ms=ts, body=body, reply_to=None)
 
     origin = signing.validate_origin(raw, frame_client_msg_id=cmid)
