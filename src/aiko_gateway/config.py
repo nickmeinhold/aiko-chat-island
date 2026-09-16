@@ -7,6 +7,10 @@ present in os.environ before any aiko import composes a process.
 """
 from __future__ import annotations
 
+import logging
+
+_log = logging.getLogger(__name__)
+
 from typing import Literal
 from urllib.parse import urlparse
 
@@ -1064,6 +1068,41 @@ class Settings(BaseSettings):
         # open in dev, closed in prod.
         if self.open_registration is None:
             self.open_registration = not self.is_production
+        # THE FLAG DOES NOT MEAN WHAT ITS NAME MEANS, AND THAT MUST BE
+        # AUDIBLE AT THE MOMENT IT STOPS BEING TRUE (cage-match PR#182,
+        # Carnot, both rounds). `open_registration=False` is read by an
+        # operator as "no new accounts". It is not: `social/claim` provisions
+        # accounts under `social_signin_enabled`, deliberately and by Nick's
+        # 2026-06-27 decision — production force-closes `open_registration`
+        # while permitting social, so the two CANNOT be collapsed without
+        # retiring that decision.
+        #
+        # What was actually wrong was not the exemption but its SILENCE: the
+        # combination that makes the name a lie produced no signal anywhere.
+        # Carnot's own alternative — "rename/split the operator-facing
+        # guarantee so the config cannot imply a false invariant" — is a
+        # breaking change to an operator surface and is not this PR's to make;
+        # saying it out loud at boot is, and it closes the same gap. A WARNING
+        # rather than a refusal because this configuration is LEGAL and
+        # intended; what is not acceptable is holding it without being told.
+        if (self.is_production and self.social_signin_enabled
+                and self.open_registration is False):
+            _log.warning(
+                "ACCOUNT CREATION IS OPEN despite open_registration=False: "
+                "social_signin_enabled=True, and /v1/auth/social/claim "
+                "provisions new accounts under THAT flag. This is legal and "
+                "deliberate (2026-06-27), but 'registration is closed' is "
+                "then true only of the password and passkey doors. To close "
+                "account creation entirely, also set SOCIAL_SIGNIN_ENABLED=false."
+            )
+        #
+        # PLACED HERE, AFTER THE DEFAULT IS RESOLVED, AND THAT IS LOAD-BEARING.
+        # An earlier revision put this inside the production branch above, where
+        # `open_registration` is still None — so `is False` was never true and the
+        # warning could not fire. Caught by its own test, which is the only reason
+        # it is not a warning that ships silently disabled: the exact class it was
+        # added to prevent.
+
         return self
 
     def export_aiko_env(self) -> None:

@@ -141,8 +141,7 @@ def _deny_if_banned(user: User) -> None:
 
 @router.post("/register", dependencies=[rate_limit("account")])
 async def register(req: RegisterReq, session: DbSession) -> dict:
-    if not settings.open_registration:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "registration is closed")
+    _require_may_provision_account()
     try:
         user = await users_service.create_user(
             session, username=req.username,
@@ -373,6 +372,10 @@ async def social_claim(req: SocialClaimReq, session: DbSession) -> dict:
     # Social claim — gated on social sign-in being enabled.
     if not settings.social_signin_enabled:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "social sign-in is disabled")
+    # ...and then through the SAME provisioning door as every other account
+    # creator, declaring its `open_registration` exemption explicitly rather than
+    # having it be the accident of never asking.
+    _require_may_provision_account(via_social=True)
     try:
         user = await users_service.create_social_user(
             session,
@@ -392,7 +395,12 @@ async def social_claim(req: SocialClaimReq, session: DbSession) -> dict:
 # Passwordless credential sign-in. `start` mints a single-use challenge; `finish`
 # verifies the device's attestation/assertion (py_webauthn) and routes into the
 # SAME outcome shape as /social + the broker (the app's one _resolveOutcome door).
-# Endpoints are UNGATED (deploy-dark) — only the /providers advertisement is gated
+# `register/finish` IS GATED on account provisioning (see
+# `_require_may_provision_account`); `start`, `add/*` and `authenticate/*` are
+# ungated (deploy-dark) — only the /providers advertisement is gated besides.
+# Corrected in cage-match PR#182 round 2: this line still read "Endpoints are
+# UNGATED" after the gate landed, and stale liturgy at a trust boundary is how
+# the next visitor deletes a gate as "not the design".
 # on settings.passkey_enabled, so the flow can be exercised on a real device before
 # the app surfaces the buttons (the handoff's "deploy endpoints, advertise last").
 
@@ -415,11 +423,100 @@ def _short(value: object, n: int = 10) -> str:
     return s[:n] + ("…" if len(s) > n else "")
 
 
+def _require_may_provision_account(*, via_social: bool = False) -> None:
+    """THE ONE PLACE that answers "may a NEW ACCOUNT be created right now?".
+
+    Every route that creates a user calls this and nothing else decides it. Before
+    it there were three doors consulting two different flags and no one place to
+    read the answer: `/register` and the passkey pair on `open_registration`,
+    `social/claim` on `social_signin_enabled`. A cage-match (Kelvin + Carnot,
+    independently) called that out as the defect it is — *"disclosure is not
+    enforcement: a future config-only social rollout can reopen account creation
+    without touching code, tests, or the flag an operator would reasonably audit."*
+
+    SOCIAL IS EXEMPT FROM `open_registration`, AND THAT IS A RECORDED DECISION,
+    NOT AN OVERSIGHT — which is why this is a predicate with a parameter rather
+    than one flag for everything. `config.py` REJECTS `open_registration=True` at
+    boot in production (an open `/register` exposes every channel while I2
+    membership, #36, is unenforced), while social sign-in *may* be enabled in
+    production — Nick, 2026-06-27, the same I2 risk named and accepted "for the
+    current early-users phase so the live gateway is reachable at all".
+
+    So collapsing both onto `open_registration`, which is what the panel
+    prescribed, would make social sign-in permanently unable to create an account
+    in production and silently retire that decision. The finding was right and the
+    prescribed fix was not; the panel could not see it because `config.py` is not
+    in this diff.
+
+    What changes: the exemption is now ONE explicit, tested branch in ONE function
+    instead of an emergent property of which flag each route happened to check.
+    An operator reads one predicate; a reviewer sees the asymmetry stated; and if
+    the exemption is ever withdrawn, it is deleted here and every door moves at
+    once.
+    """
+    if via_social:
+        # Gated by its OWN switch — AND RE-CHECKED HERE RATHER THAN TRUSTED.
+        # `social_claim` does check it first today, so this is redundant today.
+        # It is not redundant tomorrow: Tesla, cage-match round 2 — *"a copy-paste
+        # of `via_social=True` is a provisioning door with no kill switch. The
+        # single-door claim is true only for the default path."* A door whose
+        # exemption depends on every future caller remembering a check elsewhere
+        # is not a door. Re-reading the flag costs an attribute lookup and makes
+        # the claim in this docstring true of ANY caller, not just the careful one.
+        if not settings.social_signin_enabled:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN, "social sign-in is disabled")
+        return
+    _require_open_registration_flag()
+
+
+def _require_open_registration_flag() -> None:
+    """Refuse an account-CREATING request on an island with registration closed.
+
+    ONE PREDICATE, TWO CALL SITES, and that is the whole point. `/v1/auth/register`
+    has carried this check since #38 while the passkey pair did not, so the gate
+    covered the door nobody uses and left open the one the app ships: measured
+    against a live island 2026-09-15, an anonymous `passkey/register/start`
+    returned 200 with a handle allocated while `/register` returned 403 in the
+    same breath. A guard is only a guard over the callers that reach it.
+
+    THE SAME 403 AND THE SAME WORDING as `/register`, deliberately. Which door a
+    closed island was knocked on is not information a caller is owed, and a second
+    phrasing would be a second thing to keep in sync.
+
+    NOT applied to `add/finish` or to `authenticate/*`: those act on an account
+    that already exists. Closing registration means no new ACCOUNTS, never no new
+    keys and never no sign-in — conflating them would lock out the very users the
+    island is for.
+    """
+    if not settings.open_registration:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "registration is closed")
+
+
 @router.post("/passkey/register/start", dependencies=[rate_limit("passkey")])
 async def passkey_register_start(session: DbSession) -> dict:
     """Begin registration for an ANONYMOUS caller (first-passkey-creates-account).
     Returns {state, options} — the raw WebAuthn-JSON the platform authenticator
-    parses. No body, no prior session."""
+    parses. No body, no prior session.
+
+    DELIBERATELY UNGATED, and reverting that is a production outage — read this
+    before "tightening" it. THIS ROUTE IS ALSO `add/start`: there is no such
+    endpoint, and `passkey/add/finish` consumes a challenge issued HERE ("reuses
+    /passkey/register/start for the challenge (identity-agnostic); the
+    Authorization bearer is what distinguishes an add from a first-passkey
+    register"). One hallway, two rooms.
+
+    So a gate here is not "refuse early" — it is a PERMANENT LOCKOUT of
+    device-add on every production island, because `open_registration` is
+    force-closed there as standing law. An existing user could never add a second
+    passkey again. An earlier revision of this change did exactly that, and its
+    own test asserted the lockout as correct; Tesla caught it in cage-match round
+    1 while two other families approved of the gate's placement.
+
+    A challenge on its own provisions nothing. `register/finish` is the real
+    chokepoint — `create_passkey_account` is called from there and nowhere else —
+    and it is gated before the challenge is consumed, so nothing an anonymous
+    caller starts here can become an account."""
     result = await passkey_service.start_registration(session)
     log.info("passkey.register.start: challenge issued state=%s ttl=%ss",
              _short(result.get("state")), settings.passkey_challenge_ttl_seconds)
@@ -434,7 +531,12 @@ async def passkey_register_finish(req: PasskeyFinishReq, session: DbSession) -> 
     session. Account creation is atomic with the challenge burn, so a credential can
     never be orphaned by a rejected handle claim (the #1728 root cause — persistence
     was gated on a handle claim that collided with a pre-existing account). Returns
-    the SAME authenticated shape as authenticate/finish + the social/broker door."""
+    the SAME authenticated shape as authenticate/finish + the social/broker door.
+
+    THE CHOKEPOINT. Gated before the challenge is consumed, so a caller that
+    skipped `start` — or held a challenge from before registration was closed —
+    still meets the gate, and a refused request burns nothing."""
+    _require_may_provision_account()
     raw = await passkey_service.consume_challenge(
         session, req.state, PasskeyOperation.REGISTER)
     if raw is None:
