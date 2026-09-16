@@ -314,6 +314,7 @@ app.add_middleware(ContentSizeLimitMiddleware, max_bytes=settings.max_request_by
 
 from .rest.deps import DbSession  # noqa: E402
 from .rest import auth as auth_routes  # noqa: E402
+from .rest import capabilities as capability_routes  # noqa: E402
 from .rest import channels as channel_routes  # noqa: E402
 from .rest import communities as community_routes  # noqa: E402
 from .rest import devices as device_routes  # noqa: E402
@@ -334,6 +335,7 @@ from .rest.errors import register_error_handlers  # noqa: E402
 register_error_handlers(app)  # structured ban-403 body (single door, mirrors tests)
 app.include_router(auth_routes.router)
 app.include_router(auth_routes.me_router)
+app.include_router(capability_routes.router)
 app.include_router(channel_routes.router)
 app.include_router(community_routes.router)
 app.include_router(device_routes.router)
