@@ -1563,3 +1563,171 @@ async def test_the_predicate_filters_a_mixed_recipient_list(session, dm):
     assert kept == [bob.id], (
         f"the predicate must keep only the recipient who has posted here; "
         f"got {kept}")
+
+
+# --------------------------------------------------------------------------
+# claude-tasks#4486 — the reaper's tz comparison, and the loop it used to abandon.
+#
+# All three of these were RED before the fix and each fails for its own reason.
+# The class: this database stores datetimes with no zone, so a column read back
+# is NAIVE while every datetime this codebase constructs is AWARE. Any comparison
+# between them raises, and SQLAlchemy's ORM `delete()`/`update()` re-runs the WHERE
+# in PYTHON against in-session objects by default, which is where they meet.
+# --------------------------------------------------------------------------
+
+def test_as_stored_converts_by_instant_not_by_wall_clock():
+    """MEASURED, and the reason `_as_stored` exists rather than a bare
+    synchronize_session=False.
+
+    SQLAlchemy's SQLite DateTime bind processor IGNORES tzinfo and formats the
+    wall-clock fields, so pushing the comparison to SQL is correct only while every
+    datetime in the system happens to be UTC. `_as_stored` converts first, so the
+    same INSTANT in any zone lands on the same stored string.
+    """
+    instant = dt.datetime(2026, 8, 21, 11, 0, tzinfo=dt.UTC)
+    same_instant_in_bangkok = instant.astimezone(dt.timezone(dt.timedelta(hours=7)))
+    assert same_instant_in_bangkok.hour == 18, "fixture: genuinely a different wall clock"
+
+    assert push_service._as_stored(instant) == dt.datetime(2026, 8, 21, 11, 0)
+    assert push_service._as_stored(same_instant_in_bangkok) == \
+        push_service._as_stored(instant), (
+            "two spellings of one instant must compare identically against storage")
+    assert push_service._as_stored(instant).tzinfo is None, (
+        "storage holds no zone; a tz-aware value here is the bug this guards")
+
+
+@pytest.mark.asyncio
+async def test_reaping_a_dead_row_held_live_in_the_session_does_not_raise(
+    session, dm, configured, fake_apns, monkeypatch
+):
+    """THE PRODUCTION CRASH, reproduced (claude-tasks#4486).
+
+    Observed twice on chat.enspyr.co during the 2026-09-15 call tests: every ring
+    that touched a dead token raised `TypeError: can't compare offset-naive and
+    offset-aware datetimes` out of the reaper's DELETE.
+
+    The precondition the existing reaper tests do not establish is the one that
+    matters: **the row must be a live ORM object in the session's identity map**,
+    loaded from the database and therefore holding a NAIVE `updated_at`. Only then
+    does the default `synchronize_session='evaluate'` have something to compare the
+    transport's tz-AWARE date against. A test over the query shape alone cannot
+    reach it, which is why the reaper was well covered and still broke in
+    production on its first real 410.
+    """
+    alice, bob = dm
+    # TWO ROWS, AND THAT IS THE WHOLE PRECONDITION — established by measurement
+    # after a one-row version of this test passed against the unfixed code, which
+    # would have shipped a reproduction that reproduces nothing. The issue said so
+    # plainly ("two stale production rows for nick bounce 410 each time") and it
+    # was read past. With a single row the evaluation never reaches the tz compare;
+    # with two it does, and raises exactly as production did.
+    session.add(DeviceToken(user_id=bob.id, platform="apns", token="c" * 64))
+    await session.commit()
+
+    live = (await session.execute(
+        sa.select(DeviceToken).where(DeviceToken.user_id == bob.id)
+    )).scalars().all()
+    assert len(live) == 2, "fixture precondition: the user has two registered devices"
+    assert all(r.updated_at.tzinfo is None for r in live), (
+        "fixture precondition: SQLite hands back a NAIVE datetime — if this ever "
+        "becomes aware the storage convention changed and this whole class is fixed")
+
+    fake_apns.verdict = apns.Verdict.DEAD_TOKEN
+    fake_apns.invalid_since_ms = int(
+        dt.datetime.now(dt.UTC).timestamp() * 1000)  # aware, newer than the row
+
+    await _wake(sender_id=alice.id)   # RAISED TypeError before the fix
+
+    survivors = (await session.execute(
+        DeviceToken.__table__.select().where(DeviceToken.user_id == bob.id)
+    )).all()
+    assert survivors == [], "the dead rows must actually be reaped, not merely not-crash"
+
+
+@pytest.mark.asyncio
+async def test_a_reap_order_in_another_zone_is_compared_by_instant(
+    session, dm, configured, monkeypatch
+):
+    """THE MUST-FAIL ARM for `_as_stored`, and the reason the fix is not just
+    `synchronize_session=False`.
+
+    The row re-registered at 12:00 UTC. The transport reports the token died at
+    11:00 UTC, spelled `18:00+07:00`. Apple's rule says KEEP the row: our
+    registration is newer than the invalidation.
+
+    Hand that straight to SQLite and the bind processor drops the zone, comparing
+    `12:00 <= 18:00` and reaping a live device. The bug would be invisible on both
+    live islands, which run UTC — it needs only one transport, or one future
+    island, that does not.
+    """
+    alice, bob = dm
+    await session.execute(
+        DeviceToken.__table__.update()
+        .where(DeviceToken.user_id == bob.id)
+        .values(updated_at=dt.datetime(2026, 8, 21, 12, 0, tzinfo=dt.UTC))
+    )
+    await session.commit()
+
+    bangkok = dt.timezone(dt.timedelta(hours=7))
+    died_at = dt.datetime(2026, 8, 21, 11, 0, tzinfo=dt.UTC).astimezone(bangkok)
+    assert died_at.hour == 18, "fixture: the wall clock reads LATER than the row"
+
+    async def _dead_in_another_zone(device_token, payload, *, apns_environment,
+                                    token_kind, collapse_id=None):
+        return apns.SendResult(apns.Verdict.DEAD_TOKEN, ReapOrder(died_at))
+
+    monkeypatch.setattr(apns, "send", _dead_in_another_zone)
+    await _wake(sender_id=alice.id)
+
+    survivors = (await session.execute(
+        DeviceToken.__table__.select().where(DeviceToken.user_id == bob.id)
+    )).all()
+    assert len(survivors) == 1, (
+        "a device registered AFTER the invalidation instant was reaped — the zone "
+        "was read as wall-clock, not converted")
+
+
+@pytest.mark.asyncio
+async def test_one_recipients_fault_does_not_abandon_the_others(
+    session, dm, configured, monkeypatch, caplog
+):
+    """THE HALF THAT MATTERS MOST, and it is not the TypeError.
+
+    `_wake_user` is called from a loop over recipients. Any raise inside it used to
+    unwind the whole loop, so in a group **every recipient after the failing one was
+    never woken at all** — a missed call with no error the caller can see, and no
+    row anywhere recording that it happened.
+
+    The tz bug was one way in. This pins the property rather than that instance: a
+    fault against recipient #1 must cost recipient #1 only.
+    """
+    alice, bob = dm
+    woken: list[str] = []
+    calls: list[str] = []
+
+    async def _explode_for_the_first(session_, user_id, *, wake, payload, collapse_id):
+        calls.append(user_id)
+        if len(calls) == 1:
+            raise RuntimeError("this recipient's device row is wedged")
+        woken.append(user_id)
+
+    monkeypatch.setattr(push_service, "_wake_user", _explode_for_the_first)
+    monkeypatch.setattr(push_service, "_spoken_here",
+                        lambda s, *, channel_id, user_ids: _identity(user_ids))
+    monkeypatch.setattr(push_service, "_recipients",
+                        lambda s, *, channel_id, sender_id, exclude_user_ids:
+                        _identity(["recipient-one", "recipient-two", "recipient-three"]))
+
+    with caplog.at_level(logging.ERROR, logger="aiko_gateway.push"):
+        await _wake(sender_id=alice.id)
+
+    assert calls == ["recipient-one", "recipient-two", "recipient-three"], (
+        "the loop stopped at the fault — recipients after it were abandoned")
+    assert woken == ["recipient-two", "recipient-three"]
+    assert any("recipient-one" in r.getMessage() for r in caplog.records), (
+        "a swallowed fault with no log is worse than the crash it replaced")
+
+
+async def _identity(value):
+    """Await-able passthrough, so a monkeypatched coroutine can return a literal."""
+    return value

@@ -193,6 +193,24 @@ from .rate_limit import limiter
 
 log = logging.getLogger("aiko_gateway.push")
 
+
+def _as_stored(when: dt.datetime) -> dt.datetime:
+    """A datetime in the representation this database actually holds.
+
+    MEASURED, not assumed: SQLAlchemy's SQLite DateTime bind processor IGNORES
+    tzinfo and formats the wall-clock fields, so the same INSTANT expressed as
+    `+07` binds to a string seven hours after its UTC spelling. Every row here is
+    written by `models._utcnow()` (aware UTC) and read back NAIVE, because SQLite
+    stores no zone — so comparisons are correct today only because every datetime
+    in this codebase happens to be UTC, and nothing enforces that.
+
+    Converting to UTC and dropping the zone makes the instant correct by
+    construction rather than by convention, whatever zone a transport hands us.
+    The whole-codebase fix (a TypeDecorator so reads come back aware) is
+    claude-tasks#4504; this is the local guard until it lands.
+    """
+    return when.astimezone(dt.timezone.utc).replace(tzinfo=None)
+
 # THE PINNED CALL-INVITATION SENTINEL — a WIRE CONTRACT, not a display string.
 #
 # The app signs this exact body and the island must recognise the exact same
@@ -1082,8 +1100,19 @@ async def _wake_user(session: AsyncSession, user_id: str, *, wake: WakeKind,
             # date would have to carry its reversibility elsewhere,
             # and for the falsifier if that reasoning is wrong.
             conditions.append(
-                DeviceToken.updated_at <= order.not_reregistered_since)
-        outcome = await session.execute(delete(DeviceToken).where(*conditions))
+                DeviceToken.updated_at <= _as_stored(order.not_reregistered_since))
+        # synchronize_session=False, and it is load-bearing rather than tidy
+        # (claude-tasks#4486). The default 'evaluate' re-runs this WHERE in PYTHON
+        # against every in-session object — and the rows we just sent to ARE in the
+        # identity map, loaded a few lines above. `updated_at` comes back from
+        # SQLite NAIVE while a transport's date is tz-AWARE, so that comparison
+        # raises TypeError, unwinding out of _wake_user and abandoning every
+        # remaining recipient. The DELETE is by primary key; there is nothing to
+        # synchronise. Same treatment, same reason, as users_service's handle
+        # cooldown.
+        outcome = await session.execute(
+            delete(DeviceToken).where(*conditions)
+            .execution_options(synchronize_session=False))
         if outcome.rowcount:
             log.info("reaped dead device row user=%s device=%s", user_id, row_id)
         else:
@@ -1204,8 +1233,20 @@ async def wake_for_message(*, channel_id: str, channel_kind: ChannelKindStr, sen
             for user_id in recipients:
                 # The per-recipient budget is charged inside _wake_user, once the
                 # recipient is known to have a device worth waking.
-                await _wake_user(session, user_id, wake=wake, payload=payload,
-                                 collapse_id=channel_id)
+                #
+                # ISOLATED PER RECIPIENT (claude-tasks#4486). This loop used to let
+                # one recipient's fault unwind the whole thing, so in a group every
+                # recipient AFTER the failing one was never woken — a missed call
+                # with no signal anywhere the caller can see. The tz bug above was
+                # one way in; it is not the only way a single recipient's wake can
+                # raise, and the next one should cost that recipient only. Logged
+                # per recipient so the blast radius is one name, not a channel.
+                try:
+                    await _wake_user(session, user_id, wake=wake, payload=payload,
+                                     collapse_id=channel_id)
+                except Exception:
+                    log.exception("wake failed for one recipient user=%s channel=%s "
+                                  "(other recipients continue)", user_id, channel_id)
     except Exception:
         # Deliberately broad. This runs detached in a background task, where an
         # escaping exception is logged by asyncio at GC time (or lost) rather than
