@@ -209,23 +209,16 @@ def _as_stored(when: dt.datetime) -> dt.datetime:
     The whole-codebase fix (a TypeDecorator so reads come back aware) is
     claude-tasks#4504; this is the local guard until it lands.
 
-    A NAIVE input is returned UNCHANGED, because `astimezone` on a naive datetime
-    assumes the HOST LOCAL zone: on the box this was written on, a naive `11:00`
-    came back `04:00` — a seven-hour shift, inside the guard whose entire job is to
-    stop a seven-hour shift.
-
-    BE PRECISE ABOUT WHAT THAT ARM IS AND IS NOT (cage-match PR#184 round 2,
-    Tesla). Refusing `astimezone` is right. But the only caller is a TRANSPORT
-    instant (`order.not_reregistered_since`), never a column read — so the arm is
-    NOT "this value came from the database and is already stored-shaped". A naive
-    value arriving here is a transport that failed to attach a zone, and passing
-    it through assumes it meant UTC. That assumption is unobservably true today,
-    because every datetime constructed in this codebase is aware UTC and the only
-    live transport stamps `tz=dt.UTC` explicitly. If a transport ever hands over a
-    naive LOCAL instant, this arm compares it by wall clock — quietly, and here.
+    NAIVE INPUT IS UNREPRESENTABLE, so there is no branch here for it (cage-match
+    PR#184 r3, Carnot and Tesla independently). `ReapOrder` refuses to hold a
+    zone-less instant at construction. An earlier revision of this function
+    passed naive through unchanged, which reads as fail-safe and is not: an
+    unzoned LOCAL time would compare as though it were UTC and reap a device that
+    re-registered hours after the invalidation — fail-UNSAFE, in the one
+    irreversible operation this module has, inside the guard added to prevent
+    exactly that. The malformed state is refused where it is built rather than
+    tolerated where it is used.
     """
-    if when.tzinfo is None:
-        return when
     return when.astimezone(dt.timezone.utc).replace(tzinfo=None)
 
 # THE PINNED CALL-INVITATION SENTINEL — a WIRE CONTRACT, not a display string.

@@ -92,6 +92,33 @@ class ReapOrder:
     # `ReapOrder(None)` on purpose. That is exactly the intent worth requiring.
     not_reregistered_since: dt.datetime | None
 
+    def __post_init__(self) -> None:
+        """A naive datetime is REFUSED AT CONSTRUCTION, so the reaper never has to
+        decide what a zone-less instant meant (cage-match PR#184 r3, Carnot and
+        Tesla independently).
+
+        The date arm exists to make a DELETE conditional, and a datetime with no
+        zone cannot say which instant it names. The reaper's own doctrine is that
+        failing safe means NOT deleting — but a naive value silently read as UTC
+        fails the other way: a local `18:00` compares as though it were `18:00Z`
+        and reaps a device that re-registered hours after the invalidation. The
+        guard for that used to live downstream, in `push_service._as_stored`, as
+        a pass-through branch. A guard is the wrong shape here: the malformed
+        state should not be constructible at all.
+
+        This mirrors the field's OTHER refusal, which is why it belongs here. A
+        missing date must be written `ReapOrder(None)` on purpose because silence
+        once meant "delete unboundedly"; a zone-less date is the same failure in
+        a different disguise — an order that looks bounded and is not.
+        """
+        if (self.not_reregistered_since is not None
+                and self.not_reregistered_since.tzinfo is None):
+            raise ValueError(
+                "ReapOrder.not_reregistered_since must be timezone-aware: a naive "
+                "instant cannot be compared against a stored UTC timestamp without "
+                "assuming a zone, and assuming wrong DELETES a live device. Pass "
+                "an aware datetime, or ReapOrder(None) to date nothing.")
+
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class SendResult:

@@ -1731,32 +1731,6 @@ async def test_one_recipients_fault_does_not_abandon_the_others(
 async def _identity(value):
     """Await-able passthrough, so a monkeypatched coroutine can return a literal."""
     return value
-
-
-# --------------------------------------------------------------------------
-# cage-match PR#184 — the two findings the panel converged on, each with the
-# must-fail arm the first version of these tests lacked.
-# --------------------------------------------------------------------------
-
-def test_as_stored_leaves_a_naive_datetime_alone():
-    """MUST-FAIL ARM for `_as_stored`'s naive input (Tesla + Maxwell, PR#184).
-
-    `astimezone` on a NAIVE datetime assumes the HOST LOCAL zone. The original
-    helper sent every input through it, so on any box that is not UTC a value
-    already in storage form was shifted by the host offset — measured at the time
-    of writing as `11:00` becoming `04:00` — *inside the guard whose entire
-    purpose is to prevent a wall-clock shift.*
-
-    A naive value here is by definition already stored-shaped: this database hands
-    back nothing else. So the correct handling is to leave it exactly as it is.
-    """
-    already_stored = dt.datetime(2026, 8, 21, 11, 0)
-    assert already_stored.tzinfo is None, "fixture: this is the storage representation"
-    assert push_service._as_stored(already_stored) == already_stored, (
-        "a naive datetime was converted — on a non-UTC host this silently moves the "
-        "instant by the host's offset, which is the exact bug _as_stored exists to stop")
-
-
 @pytest.mark.asyncio
 async def test_a_recipient_whose_fault_POISONS_THE_SESSION_does_not_cost_the_others(
     session, dm, configured, monkeypatch, caplog
@@ -1870,3 +1844,23 @@ async def test_consuming_a_nonce_works_with_one_already_in_the_session(session):
 
     assert await nonce_service.consume_nonce(session, nonce) is True, (
         "the consume raised or matched nothing with a live row in the identity map")
+
+
+def test_a_reap_order_refuses_a_naive_instant():
+    """The malformed state is now UNCONSTRUCTIBLE, which is why `_as_stored` no
+    longer carries a branch for it (cage-match PR#184 r3).
+
+    Both other constructions stay legal and are asserted here, because a guard
+    that rejects everything is indistinguishable from a broken constructor: the
+    dateless order is a deliberate, documented refusal to date the evidence, and
+    an aware instant is the normal path.
+    """
+    naive = dt.datetime(2026, 8, 21, 11, 0)
+    assert naive.tzinfo is None, "fixture: the input under test carries no zone"
+    with pytest.raises(ValueError, match="timezone-aware"):
+        ReapOrder(naive)
+
+    # The two legal constructions — the discriminating half.
+    assert ReapOrder(None).not_reregistered_since is None
+    aware = dt.datetime(2026, 8, 21, 11, 0, tzinfo=dt.UTC)
+    assert ReapOrder(aware).not_reregistered_since == aware
