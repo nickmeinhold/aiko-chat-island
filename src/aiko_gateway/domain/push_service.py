@@ -208,7 +208,18 @@ def _as_stored(when: dt.datetime) -> dt.datetime:
     construction rather than by convention, whatever zone a transport hands us.
     The whole-codebase fix (a TypeDecorator so reads come back aware) is
     claude-tasks#4504; this is the local guard until it lands.
+
+    A NAIVE input is returned UNCHANGED, and that arm is the whole reason this is
+    a function rather than one inline expression (cage-match PR#184, Tesla +
+    Maxwell, measured). `astimezone` on a naive datetime assumes the HOST LOCAL
+    zone: on the box this was written on, a naive `11:00` came back `04:00` — a
+    seven-hour shift, inside the guard whose entire job is to stop a seven-hour
+    shift. And a naive value here is BY DEFINITION already in storage form, since
+    that is the only representation this database hands back. Converting it would
+    corrupt the one input that needs no conversion.
     """
+    if when.tzinfo is None:
+        return when
     return when.astimezone(dt.timezone.utc).replace(tzinfo=None)
 
 # THE PINNED CALL-INVITATION SENTINEL — a WIRE CONTRACT, not a display string.
@@ -1247,6 +1258,18 @@ async def wake_for_message(*, channel_id: str, channel_kind: ChannelKindStr, sen
                 except Exception:
                     log.exception("wake failed for one recipient user=%s channel=%s "
                                   "(other recipients continue)", user_id, channel_id)
+                    # ROLLING BACK IS WHAT MAKES THE ISOLATION REAL (cage-match
+                    # PR#184 — Carnot and Tesla independently, confirmed by
+                    # measurement). Catching alone is SYNTACTIC isolation: after a
+                    # DBAPI-level fault SQLAlchemy deactivates the transaction, so
+                    # the next recipient's first statement on this shared session
+                    # raises PendingRollbackError and is lost too. Measured: a
+                    # PK violation on recipient #1 makes recipient #2 fail with
+                    # PendingRollbackError, and a rollback() recovers it. Without
+                    # this line the loop still walks and every later recipient
+                    # still dies — the same abandonment, now wearing a log line
+                    # per victim instead of one traceback.
+                    await session.rollback()
     except Exception:
         # Deliberately broad. This runs detached in a background task, where an
         # escaping exception is logged by asyncio at GC time (or lost) rather than

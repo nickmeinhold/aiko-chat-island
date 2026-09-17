@@ -1731,3 +1731,118 @@ async def test_one_recipients_fault_does_not_abandon_the_others(
 async def _identity(value):
     """Await-able passthrough, so a monkeypatched coroutine can return a literal."""
     return value
+
+
+# --------------------------------------------------------------------------
+# cage-match PR#184 — the two findings the panel converged on, each with the
+# must-fail arm the first version of these tests lacked.
+# --------------------------------------------------------------------------
+
+def test_as_stored_leaves_a_naive_datetime_alone():
+    """MUST-FAIL ARM for `_as_stored`'s naive input (Tesla + Maxwell, PR#184).
+
+    `astimezone` on a NAIVE datetime assumes the HOST LOCAL zone. The original
+    helper sent every input through it, so on any box that is not UTC a value
+    already in storage form was shifted by the host offset — measured at the time
+    of writing as `11:00` becoming `04:00` — *inside the guard whose entire
+    purpose is to prevent a wall-clock shift.*
+
+    A naive value here is by definition already stored-shaped: this database hands
+    back nothing else. So the correct handling is to leave it exactly as it is.
+    """
+    already_stored = dt.datetime(2026, 8, 21, 11, 0)
+    assert already_stored.tzinfo is None, "fixture: this is the storage representation"
+    assert push_service._as_stored(already_stored) == already_stored, (
+        "a naive datetime was converted — on a non-UTC host this silently moves the "
+        "instant by the host's offset, which is the exact bug _as_stored exists to stop")
+
+
+@pytest.mark.asyncio
+async def test_a_recipient_whose_fault_POISONS_THE_SESSION_does_not_cost_the_others(
+    session, dm, configured, monkeypatch, caplog
+):
+    """THE ARM THE FIRST VERSION OF THIS TEST COULD NOT REDDEN (Tesla, PR#184).
+
+    `test_one_recipients_fault_does_not_abandon_the_others` replaces `_wake_user`
+    with a function raising a pure `RuntimeError` — which never touches the
+    session, so it cannot detect the failure that actually matters. Catching an
+    exception is only SYNTACTIC isolation: after a DBAPI-level fault SQLAlchemy
+    deactivates the transaction, and the NEXT recipient's first statement on the
+    shared session raises `PendingRollbackError` and is lost too. The loop walks,
+    every later recipient still dies, and the only difference from the bug this
+    PR fixes is one log line per victim instead of one traceback.
+
+    So this fault is a REAL database error on the REAL session, and the assertion
+    is that the recipients after it are still woken.
+    """
+    alice, bob = dm
+    # Capture the id as a PLAIN STRING before the wake. `rollback()` expires every
+    # ORM object in the session, so a later `bob.id` would trigger a lazy reload and
+    # raise MissingGreenlet — the test's own artifact, not the behaviour under test.
+    # (Production is unaffected: `wake_for_message` carries recipient ids as strings
+    # from `_recipients`, never as live ORM objects.)
+    bob_id = bob.id
+    woken: list[str] = []
+    calls: list[str] = []
+
+    async def _poison_then_wake(session_, user_id, *, wake, payload, collapse_id):
+        calls.append(user_id)
+        if len(calls) == 1:
+            # THE FAULT SHAPE MATTERS, and picking the wrong one cost a round.
+            # A failed Core `execute` does NOT deactivate the transaction — a test
+            # built on one passed with the rollback REMOVED, i.e. it could not
+            # detect the absence of the fix it existed to prove. A failed ORM
+            # FLUSH does deactivate it (measured: the next statement raises
+            # PendingRollbackError, and rollback() recovers), and a flush is
+            # reachable here because `_wake_user` commits.
+            session_.add(DeviceToken(id="d" * 26, user_id=bob_id,
+                                     platform="apns", token="dup" * 8))
+            session_.add(DeviceToken(id="d" * 26, user_id=bob_id,
+                                     platform="apns", token="dup2" * 8))
+            await session_.flush()   # -> IntegrityError, transaction DEACTIVATED
+            return
+        # Every later recipient must be able to USE the session, not merely be reached.
+        await session_.execute(sa.select(DeviceToken).where(DeviceToken.user_id == bob_id))
+        woken.append(user_id)
+
+    monkeypatch.setattr(push_service, "_wake_user", _poison_then_wake)
+    monkeypatch.setattr(push_service, "_spoken_here",
+                        lambda s, *, channel_id, user_ids: _identity(user_ids))
+    monkeypatch.setattr(push_service, "_recipients",
+                        lambda s, *, channel_id, sender_id, exclude_user_ids:
+                        _identity(["poisoner", "victim-one", "victim-two"]))
+
+    with caplog.at_level(logging.ERROR, logger="aiko_gateway.push"):
+        await _wake(sender_id=alice.id)
+
+    assert calls == ["poisoner", "victim-one", "victim-two"], "the loop stopped walking"
+    assert woken == ["victim-one", "victim-two"], (
+        "recipients after the poisoner were REACHED but could not use the session — "
+        "catching without rolling back is isolation in syntax only")
+
+
+@pytest.mark.asyncio
+async def test_consuming_a_challenge_works_with_one_already_in_the_session(session):
+    """The sibling fix's positive control (Tesla's concern, PR#184): nonce and
+    passkey gained `synchronize_session=False` and no test.
+
+    The precondition is the same one that took two attempts to find for the
+    reaper: a row of this type must already be in the session's identity map, or
+    the Python-evaluation path the fix removes is never reached and the test
+    passes either way.
+    """
+    from aiko_gateway.domain import passkey_service
+    from aiko_gateway.domain.models import PasskeyChallenge
+
+    state = await passkey_service._store_challenge(
+        session, raw=b"x" * 32, operation=passkey_service.PasskeyOperation.REGISTER)
+
+    live = (await session.execute(sa.select(PasskeyChallenge))).scalars().all()
+    assert live, "fixture precondition: a challenge row is in the identity map"
+    assert all(c.expires_at.tzinfo is None for c in live), (
+        "fixture precondition: SQLite hands expires_at back NAIVE, which is what "
+        "makes the Python-side comparison against aware _utcnow() a TypeError")
+
+    out = await passkey_service.consume_challenge(
+        session, state, passkey_service.PasskeyOperation.REGISTER)
+    assert out is not None, "the consume raised or matched nothing with a live row in the map"
