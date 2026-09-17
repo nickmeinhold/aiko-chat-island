@@ -1846,3 +1846,27 @@ async def test_consuming_a_challenge_works_with_one_already_in_the_session(sessi
     out = await passkey_service.consume_challenge(
         session, state, passkey_service.PasskeyOperation.REGISTER)
     assert out is not None, "the consume raised or matched nothing with a live row in the map"
+
+
+@pytest.mark.asyncio
+async def test_consuming_a_nonce_works_with_one_already_in_the_session(session):
+    """THE MISSING TWIN (Tesla, PR#184 round 2). `passkey_service` got a live-map
+    positive control and `nonce_service` got the identical fix with none — and a
+    fix whose absence no test can detect is the silence this module has already
+    paid for once. Fixing one of a sibling pair and not the other is the same gap
+    one level up.
+    """
+    from aiko_gateway.domain import nonce_service
+    from aiko_gateway.domain.models import SocialNonce
+
+    nonce = await nonce_service.issue_nonce(session)
+    await session.commit()
+
+    live = (await session.execute(sa.select(SocialNonce))).scalars().all()
+    assert live, "fixture precondition: a nonce row is in the identity map"
+    assert all(n.expires_at.tzinfo is None for n in live), (
+        "fixture precondition: SQLite hands expires_at back NAIVE — that is what "
+        "makes the Python-side comparison against aware _utcnow() a TypeError")
+
+    assert await nonce_service.consume_nonce(session, nonce) is True, (
+        "the consume raised or matched nothing with a live row in the identity map")

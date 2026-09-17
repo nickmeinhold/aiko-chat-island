@@ -209,14 +209,20 @@ def _as_stored(when: dt.datetime) -> dt.datetime:
     The whole-codebase fix (a TypeDecorator so reads come back aware) is
     claude-tasks#4504; this is the local guard until it lands.
 
-    A NAIVE input is returned UNCHANGED, and that arm is the whole reason this is
-    a function rather than one inline expression (cage-match PR#184, Tesla +
-    Maxwell, measured). `astimezone` on a naive datetime assumes the HOST LOCAL
-    zone: on the box this was written on, a naive `11:00` came back `04:00` — a
-    seven-hour shift, inside the guard whose entire job is to stop a seven-hour
-    shift. And a naive value here is BY DEFINITION already in storage form, since
-    that is the only representation this database hands back. Converting it would
-    corrupt the one input that needs no conversion.
+    A NAIVE input is returned UNCHANGED, because `astimezone` on a naive datetime
+    assumes the HOST LOCAL zone: on the box this was written on, a naive `11:00`
+    came back `04:00` — a seven-hour shift, inside the guard whose entire job is to
+    stop a seven-hour shift.
+
+    BE PRECISE ABOUT WHAT THAT ARM IS AND IS NOT (cage-match PR#184 round 2,
+    Tesla). Refusing `astimezone` is right. But the only caller is a TRANSPORT
+    instant (`order.not_reregistered_since`), never a column read — so the arm is
+    NOT "this value came from the database and is already stored-shaped". A naive
+    value arriving here is a transport that failed to attach a zone, and passing
+    it through assumes it meant UTC. That assumption is unobservably true today,
+    because every datetime constructed in this codebase is aware UTC and the only
+    live transport stamps `tz=dt.UTC` explicitly. If a transport ever hands over a
+    naive LOCAL instant, this arm compares it by wall clock — quietly, and here.
     """
     if when.tzinfo is None:
         return when

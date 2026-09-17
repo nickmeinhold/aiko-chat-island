@@ -136,6 +136,14 @@ async def consume_challenge(
         # atomicity the fold exists for, and compares a SQLite-NAIVE expires_at
         # against tz-AWARE _utcnow(), which raises TypeError. Same treatment and
         # same reason as users_service's handle cooldown.
+        #
+        # `False`, not `'fetch'`, and the difference is not "nothing to
+        # synchronise" (cage-match PR#184 round 2, Tesla). A copy of this row
+        # already in the identity map keeps `consumed=False` in Python after the
+        # UPDATE has burned it. That is safe HERE because this function reads
+        # `rowcount` and never the object — but it is a stale-object guarantee,
+        # not an absent one, and the next caller to read the ORM object after a
+        # consume is the one who finds out.
         .execution_options(synchronize_session=False)
     )
     if result.rowcount != 1:
