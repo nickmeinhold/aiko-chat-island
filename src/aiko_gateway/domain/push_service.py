@@ -195,29 +195,16 @@ log = logging.getLogger("aiko_gateway.push")
 
 
 def _as_stored(when: dt.datetime) -> dt.datetime:
-    """A datetime in the representation this database actually holds.
+    """An aware datetime in the representation this database actually holds.
 
-    MEASURED, not assumed: SQLAlchemy's SQLite DateTime bind processor IGNORES
-    tzinfo and formats the wall-clock fields, so the same INSTANT expressed as
-    `+07` binds to a string seven hours after its UTC spelling. Every row here is
-    written by `models._utcnow()` (aware UTC) and read back NAIVE, because SQLite
-    stores no zone — so comparisons are correct today only because every datetime
-    in this codebase happens to be UTC, and nothing enforces that.
+    MEASURED: SQLAlchemy's SQLite DateTime bind processor IGNORES tzinfo and
+    formats the wall-clock fields, so the same instant spelled `+07` binds seven
+    hours after its UTC spelling. Rows are written aware (`models._utcnow`) and
+    read back naive, since SQLite stores no zone.
 
-    Converting to UTC and dropping the zone makes the instant correct by
-    construction rather than by convention, whatever zone a transport hands us.
-    The whole-codebase fix (a TypeDecorator so reads come back aware) is
-    claude-tasks#4504; this is the local guard until it lands.
-
-    NAIVE INPUT IS UNREPRESENTABLE, so there is no branch here for it (cage-match
-    PR#184 r3, Carnot and Tesla independently). `ReapOrder` refuses to hold a
-    zone-less instant at construction. An earlier revision of this function
-    passed naive through unchanged, which reads as fail-safe and is not: an
-    unzoned LOCAL time would compare as though it were UTC and reap a device that
-    re-registered hours after the invalidation — fail-UNSAFE, in the one
-    irreversible operation this module has, inside the guard added to prevent
-    exactly that. The malformed state is refused where it is built rather than
-    tolerated where it is used.
+    Naive input cannot reach here: `ReapOrder` refuses a zone-less instant at
+    construction. Retire this with claude-tasks#4504 (a TypeDecorator making
+    reads aware) — the two cannot both be load-bearing.
     """
     return when.astimezone(dt.timezone.utc).replace(tzinfo=None)
 
@@ -1111,14 +1098,11 @@ async def _wake_user(session: AsyncSession, user_id: str, *, wake: WakeKind,
             # and for the falsifier if that reasoning is wrong.
             conditions.append(
                 DeviceToken.updated_at <= _as_stored(order.not_reregistered_since))
-        # synchronize_session=False, and it is load-bearing rather than tidy
-        # (claude-tasks#4486). The default 'evaluate' re-runs this WHERE in PYTHON
-        # against every in-session object — and the rows we just sent to ARE in the
-        # identity map, loaded a few lines above. `updated_at` comes back from
-        # SQLite NAIVE while a transport's date is tz-AWARE, so that comparison
-        # raises TypeError, unwinding out of _wake_user and abandoning every
-        # remaining recipient. The DELETE is by primary key; there is nothing to
-        # synchronise. Same treatment, same reason, as users_service's handle
+        # synchronize_session=False is load-bearing, not tidy (claude-tasks#4486).
+        # The default 'evaluate' re-runs this WHERE in Python against in-session
+        # objects — and the rows just sent to are in the identity map, loaded
+        # above — comparing a SQLite-naive `updated_at` to an aware transport date
+        # and raising TypeError. Same fix, same reason, as users_service's handle
         # cooldown.
         outcome = await session.execute(
             delete(DeviceToken).where(*conditions)
@@ -1244,30 +1228,21 @@ async def wake_for_message(*, channel_id: str, channel_kind: ChannelKindStr, sen
                 # The per-recipient budget is charged inside _wake_user, once the
                 # recipient is known to have a device worth waking.
                 #
-                # ISOLATED PER RECIPIENT (claude-tasks#4486). This loop used to let
-                # one recipient's fault unwind the whole thing, so in a group every
-                # recipient AFTER the failing one was never woken — a missed call
-                # with no signal anywhere the caller can see. The tz bug above was
-                # one way in; it is not the only way a single recipient's wake can
-                # raise, and the next one should cost that recipient only. Logged
-                # per recipient so the blast radius is one name, not a channel.
+                # Isolated per recipient (claude-tasks#4486): one fault here used
+                # to unwind the loop, so in a group every recipient after it went
+                # unwoken with no signal the caller could see.
                 try:
                     await _wake_user(session, user_id, wake=wake, payload=payload,
                                      collapse_id=channel_id)
                 except Exception:
                     log.exception("wake failed for one recipient user=%s channel=%s "
                                   "(other recipients continue)", user_id, channel_id)
-                    # ROLLING BACK IS WHAT MAKES THE ISOLATION REAL (cage-match
-                    # PR#184 — Carnot and Tesla independently, confirmed by
-                    # measurement). Catching alone is SYNTACTIC isolation: after a
-                    # DBAPI-level fault SQLAlchemy deactivates the transaction, so
-                    # the next recipient's first statement on this shared session
-                    # raises PendingRollbackError and is lost too. Measured: a
-                    # PK violation on recipient #1 makes recipient #2 fail with
-                    # PendingRollbackError, and a rollback() recovers it. Without
-                    # this line the loop still walks and every later recipient
-                    # still dies — the same abandonment, now wearing a log line
-                    # per victim instead of one traceback.
+                    # The rollback is what makes that isolation real, not decor.
+                    # After a DBAPI-level fault SQLAlchemy deactivates the
+                    # transaction, so without it the next recipient's first
+                    # statement on this shared session raises PendingRollbackError
+                    # and is lost too — the same abandonment, one log line per
+                    # victim instead of one traceback.
                     await session.rollback()
     except Exception:
         # Deliberately broad. This runs detached in a background task, where an

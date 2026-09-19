@@ -130,20 +130,15 @@ async def consume_challenge(
             PasskeyChallenge.operation == operation.value,
         )
         .values(consumed=True)
-        # synchronize_session=False (claude-tasks#4486). This is a single-use
-        # CONSUME folded into the write, so the predicate must be evaluated by the
-        # DB — re-running it in Python against the identity map both undermines the
-        # atomicity the fold exists for, and compares a SQLite-NAIVE expires_at
-        # against tz-AWARE _utcnow(), which raises TypeError. Same treatment and
-        # same reason as users_service's handle cooldown.
+        # synchronize_session=False (claude-tasks#4486): this consume folds the
+        # predicate into the write, so the DB must evaluate it — re-running it in
+        # Python against the identity map both breaks that atomicity and compares
+        # a SQLite-naive expires_at to an aware _utcnow(), raising TypeError.
         #
-        # `False`, not `'fetch'`, and the difference is not "nothing to
-        # synchronise" (cage-match PR#184 round 2, Tesla). A copy of this row
-        # already in the identity map keeps `consumed=False` in Python after the
-        # UPDATE has burned it. That is safe HERE because this function reads
-        # `rowcount` and never the object — but it is a stale-object guarantee,
-        # not an absent one, and the next caller to read the ORM object after a
-        # consume is the one who finds out.
+        # `False`, not `'fetch'`: a copy of this row already in the map keeps
+        # `consumed=False` after the UPDATE has burned it. Safe while this
+        # function reads only `rowcount` — a stale-object guarantee, not an
+        # absent one.
         .execution_options(synchronize_session=False)
     )
     if result.rowcount != 1:

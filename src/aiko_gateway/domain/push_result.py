@@ -93,23 +93,16 @@ class ReapOrder:
     not_reregistered_since: dt.datetime | None
 
     def __post_init__(self) -> None:
-        """A naive datetime is REFUSED AT CONSTRUCTION, so the reaper never has to
-        decide what a zone-less instant meant (cage-match PR#184 r3, Carnot and
-        Tesla independently).
+        """A naive datetime is REFUSED AT CONSTRUCTION (claude-tasks#4486).
 
-        The date arm exists to make a DELETE conditional, and a datetime with no
-        zone cannot say which instant it names. The reaper's own doctrine is that
-        failing safe means NOT deleting — but a naive value silently read as UTC
-        fails the other way: a local `18:00` compares as though it were `18:00Z`
-        and reaps a device that re-registered hours after the invalidation. The
-        guard for that used to live downstream, in `push_service._as_stored`, as
-        a pass-through branch. A guard is the wrong shape here: the malformed
-        state should not be constructible at all.
+        The date arm makes a DELETE conditional, and a zone-less instant cannot
+        say which moment it names. Read as UTC, a local `18:00` compares as
+        `18:00Z` and reaps a device that re-registered hours after the
+        invalidation — the wrong direction, since this module's doctrine is that
+        failing safe for a reaper means NOT deleting.
 
-        This mirrors the field's OTHER refusal, which is why it belongs here. A
-        missing date must be written `ReapOrder(None)` on purpose because silence
-        once meant "delete unboundedly"; a zone-less date is the same failure in
-        a different disguise — an order that looks bounded and is not.
+        Mirrors this field's other refusal: `ReapOrder()` is a TypeError because
+        silence once meant "delete unboundedly".
         """
         if (self.not_reregistered_since is not None
                 and self.not_reregistered_since.tzinfo is None):
