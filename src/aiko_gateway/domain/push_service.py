@@ -193,6 +193,21 @@ from .rate_limit import limiter
 
 log = logging.getLogger("aiko_gateway.push")
 
+
+def _as_stored(when: dt.datetime) -> dt.datetime:
+    """An aware datetime in the representation this database actually holds.
+
+    MEASURED: SQLAlchemy's SQLite DateTime bind processor IGNORES tzinfo and
+    formats the wall-clock fields, so the same instant spelled `+07` binds seven
+    hours after its UTC spelling. Rows are written aware (`models._utcnow`) and
+    read back naive, since SQLite stores no zone.
+
+    Naive input cannot reach here: `ReapOrder` refuses a zone-less instant at
+    construction. Retire this with claude-tasks#4504 (a TypeDecorator making
+    reads aware) — the two cannot both be load-bearing.
+    """
+    return when.astimezone(dt.timezone.utc).replace(tzinfo=None)
+
 # THE PINNED CALL-INVITATION SENTINEL — a WIRE CONTRACT, not a display string.
 #
 # The app signs this exact body and the island must recognise the exact same
@@ -1082,8 +1097,16 @@ async def _wake_user(session: AsyncSession, user_id: str, *, wake: WakeKind,
             # date would have to carry its reversibility elsewhere,
             # and for the falsifier if that reasoning is wrong.
             conditions.append(
-                DeviceToken.updated_at <= order.not_reregistered_since)
-        outcome = await session.execute(delete(DeviceToken).where(*conditions))
+                DeviceToken.updated_at <= _as_stored(order.not_reregistered_since))
+        # synchronize_session=False is load-bearing, not tidy (claude-tasks#4486).
+        # The default 'evaluate' re-runs this WHERE in Python against in-session
+        # objects — and the rows just sent to are in the identity map, loaded
+        # above — comparing a SQLite-naive `updated_at` to an aware transport date
+        # and raising TypeError. Same fix, same reason, as users_service's handle
+        # cooldown.
+        outcome = await session.execute(
+            delete(DeviceToken).where(*conditions)
+            .execution_options(synchronize_session=False))
         if outcome.rowcount:
             log.info("reaped dead device row user=%s device=%s", user_id, row_id)
         else:
@@ -1204,8 +1227,23 @@ async def wake_for_message(*, channel_id: str, channel_kind: ChannelKindStr, sen
             for user_id in recipients:
                 # The per-recipient budget is charged inside _wake_user, once the
                 # recipient is known to have a device worth waking.
-                await _wake_user(session, user_id, wake=wake, payload=payload,
-                                 collapse_id=channel_id)
+                #
+                # Isolated per recipient (claude-tasks#4486): one fault here used
+                # to unwind the loop, so in a group every recipient after it went
+                # unwoken with no signal the caller could see.
+                try:
+                    await _wake_user(session, user_id, wake=wake, payload=payload,
+                                     collapse_id=channel_id)
+                except Exception:
+                    log.exception("wake failed for one recipient user=%s channel=%s "
+                                  "(other recipients continue)", user_id, channel_id)
+                    # The rollback is what makes that isolation real, not decor.
+                    # After a DBAPI-level fault SQLAlchemy deactivates the
+                    # transaction, so without it the next recipient's first
+                    # statement on this shared session raises PendingRollbackError
+                    # and is lost too — the same abandonment, one log line per
+                    # victim instead of one traceback.
+                    await session.rollback()
     except Exception:
         # Deliberately broad. This runs detached in a background task, where an
         # escaping exception is logged by asyncio at GC time (or lost) rather than

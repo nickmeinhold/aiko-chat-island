@@ -92,6 +92,26 @@ class ReapOrder:
     # `ReapOrder(None)` on purpose. That is exactly the intent worth requiring.
     not_reregistered_since: dt.datetime | None
 
+    def __post_init__(self) -> None:
+        """A naive datetime is REFUSED AT CONSTRUCTION (claude-tasks#4486).
+
+        The date arm makes a DELETE conditional, and a zone-less instant cannot
+        say which moment it names. Read as UTC, a local `18:00` compares as
+        `18:00Z` and reaps a device that re-registered hours after the
+        invalidation — the wrong direction, since this module's doctrine is that
+        failing safe for a reaper means NOT deleting.
+
+        Mirrors this field's other refusal: `ReapOrder()` is a TypeError because
+        silence once meant "delete unboundedly".
+        """
+        if (self.not_reregistered_since is not None
+                and self.not_reregistered_since.tzinfo is None):
+            raise ValueError(
+                "ReapOrder.not_reregistered_since must be timezone-aware: a naive "
+                "instant cannot be compared against a stored UTC timestamp without "
+                "assuming a zone, and assuming wrong DELETES a live device. Pass "
+                "an aware datetime, or ReapOrder(None) to date nothing.")
+
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class SendResult:

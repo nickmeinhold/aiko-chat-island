@@ -94,7 +94,8 @@ async def _store_challenge(
     # Opportunistic bounded cleanup (same piggy-back as nonce_service) so an
     # unauthenticated /start flood can't grow the table without bound.
     await session.execute(
-        delete(PasskeyChallenge).where(PasskeyChallenge.expires_at <= _utcnow()))
+        delete(PasskeyChallenge).where(PasskeyChallenge.expires_at <= _utcnow())
+        .execution_options(synchronize_session=False))
     session.add(PasskeyChallenge(
         state=state,
         operation=operation.value,
@@ -129,6 +130,16 @@ async def consume_challenge(
             PasskeyChallenge.operation == operation.value,
         )
         .values(consumed=True)
+        # synchronize_session=False (claude-tasks#4486): this consume folds the
+        # predicate into the write, so the DB must evaluate it — re-running it in
+        # Python against the identity map both breaks that atomicity and compares
+        # a SQLite-naive expires_at to an aware _utcnow(), raising TypeError.
+        #
+        # `False`, not `'fetch'`: a copy of this row already in the map keeps
+        # `consumed=False` after the UPDATE has burned it. Safe while this
+        # function reads only `rowcount` — a stale-object guarantee, not an
+        # absent one.
+        .execution_options(synchronize_session=False)
     )
     if result.rowcount != 1:
         return None

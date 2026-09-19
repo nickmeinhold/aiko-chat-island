@@ -44,7 +44,8 @@ async def issue_nonce(session: AsyncSession) -> str:
     # expiry), piggy-backed on issue so there's no separate sweeper at this scale;
     # a periodic sweep / rate-limit is the follow-up if volume ever warrants it.
     await session.execute(
-        delete(SocialNonce).where(SocialNonce.expires_at <= _utcnow()))
+        delete(SocialNonce).where(SocialNonce.expires_at <= _utcnow())
+        .execution_options(synchronize_session=False))
     nonce = secrets.token_urlsafe(32)
     session.add(SocialNonce(
         nonce=nonce,
@@ -89,5 +90,15 @@ async def consume_nonce(session: AsyncSession, nonce: str) -> bool:
             SocialNonce.expires_at > now,
         )
         .values(consumed=True)
+        # synchronize_session=False (claude-tasks#4486): this consume folds the
+        # predicate into the write, so the DB must evaluate it — re-running it in
+        # Python against the identity map both breaks that atomicity and compares
+        # a SQLite-naive expires_at to an aware _utcnow(), raising TypeError.
+        #
+        # `False`, not `'fetch'`: a copy of this row already in the map keeps
+        # `consumed=False` after the UPDATE has burned it. Safe while this
+        # function reads only `rowcount` — a stale-object guarantee, not an
+        # absent one.
+        .execution_options(synchronize_session=False)
     )
     return result.rowcount == 1
