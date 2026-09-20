@@ -104,6 +104,26 @@ class UtcDateTime(TypeDecorator):
     # warning, not a correctness issue — but there is no reason to take either.
     cache_ok = True
 
+    def coerce_compared_value(self, op: object, value: object) -> "UtcDateTime":
+        """Keep THIS type on the right-hand side of a comparison.
+
+        ``TypeDecorator``'s default delegates to ``impl``, and SQLAlchemy 2.0
+        measurably hands the decorator back anyway — ``Column <= <aware +07>``
+        binds ``06:00``, not ``13:00``, verified before this override was added.
+        So there is no live bug here and this is not a fix.
+
+        It is the DIFFERENCE BETWEEN A MEASUREMENT AND A GUARANTEE (Tesla,
+        cage-match PR#185 r2). Without this method the WHERE-bind conversion —
+        the exact path that once reaped a live device, and that nonce expiry and
+        the reaper DELETE both ride — rests on a library internal nothing in this
+        codebase asserts, damped only by a test. A version that restores the
+        documented delegation would silently un-damp it, and the failure would
+        look like the original bug: correct by coincidence, which is the thing
+        this whole module exists to end. One line moves the guarantee off
+        SQLAlchemy's behaviour and onto ours.
+        """
+        return self
+
     def process_bind_param(
         self, value: dt.datetime | None, dialect: object
     ) -> dt.datetime | None:

@@ -1634,6 +1634,23 @@ async def test_reaping_a_dead_row_held_live_in_the_session_does_not_raise(
     )).all()
     assert survivors == [], "the dead rows must actually be reaped, not merely not-crash"
 
+    # THE RE-ARMED ARM — the sibling this class's first pass MISSED (Tesla,
+    # cage-match PR#185 r2). #4504 removed the TypeError that used to make
+    # `evaluate` fail here, so "does not raise" plus "rows are gone" would BOTH
+    # stay green with `synchronize_session=False` deleted — the reaper's own
+    # regression test, disarmed, on the path that actually reaped production.
+    # Its two consume siblings were re-armed in round 1 and this one was not:
+    # two instances of a class fixed, the third left, by the author who had just
+    # named the class.
+    #
+    # The observable: with the flag False, SQLAlchemy does NOT synchronise the
+    # bulk DELETE into the session, so the objects loaded above survive in the
+    # identity map. Under `evaluate` they are marked deleted and evicted.
+    assert all(r in session for r in live), (
+        "the in-session copies were evicted — synchronize_session is not False "
+        "on the reaper DELETE, so the predicate is being re-run in Python"
+    )
+
 
 @pytest.mark.asyncio
 async def test_a_reap_order_in_another_zone_is_compared_by_instant(

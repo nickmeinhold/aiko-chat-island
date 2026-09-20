@@ -158,3 +158,52 @@ async def test_none_passes_through(session):
     )).scalar_one()
     assert row.handle_changed_at is None
     assert row.created_at.tzinfo is not None
+
+
+@pytest.mark.asyncio
+async def test_the_capped_insert_select_path_stores_the_instant(session):
+    """THE FUSE FOR `literal(now, UtcDateTime)` (Tesla, cage-match PR#185 r2).
+
+    Round 1 closed a real bypass: `signing_keys_service._capped_insert` built its
+    INSERT...SELECT with a bare `literal(now)`, which infers the GENERIC DateTime,
+    so the row was written through SQLAlchemy's plain SQLite processor and the
+    column type never saw the value — no UTC normalisation, no naive rejection,
+    on the live send path.
+
+    It was fixed with a comment and no test. Tesla: "Revert the second argument
+    and this file stays green. The comment is a prophecy; a +07 `now` on the
+    SELECT-list would make it a fuse." Exactly the class this PR is about — a fix
+    whose absence nothing can detect.
+
+    So: drive the real service with a `now` spelled +07. The stored instant must
+    be the UTC one. Strip the type argument and the stored value moves seven
+    hours and this fails.
+    """
+    from aiko_gateway.domain import signing_keys_service
+    from aiko_gateway.domain.ids import new_ulid
+    from aiko_gateway.domain.models import SigningKey, User
+
+    user = User(id=new_ulid(), username="capped-insert", display_name="ci",
+                aiko_username="capped_insert")
+    session.add(user)
+    await session.commit()
+
+    instant = dt.datetime(2026, 9, 20, 6, 0, tzinfo=dt.timezone.utc)
+    in_bangkok = instant.astimezone(dt.timezone(dt.timedelta(hours=7)))
+    assert in_bangkok.hour == 13, "fixture: genuinely a different wall clock"
+
+    stmt = signing_keys_service._capped_insert(
+        key_id=new_ulid(), user_id=user.id, pubkey="z6MkTestKeyForCappedInsert",
+        key_version=1, now=in_bangkok, max_keys=8)
+    await session.execute(stmt)
+    await session.commit()
+    session.expunge_all()
+
+    row = (await session.execute(
+        select(SigningKey).where(SigningKey.user_id == user.id)
+    )).scalar_one()
+    assert row.first_seen_at == instant, (
+        "the INSERT...SELECT stored the wall clock, not the instant — the "
+        "literal() bind bypassed UtcDateTime"
+    )
+    assert row.last_seen_at == instant
