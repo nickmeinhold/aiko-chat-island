@@ -1,0 +1,114 @@
+"""Column types that make an illegal value unrepresentable (claude-tasks#4504).
+
+``UtcDateTime`` is the only member so far. It exists because
+``DateTime(timezone=True)`` is a LIE on SQLite, and SQLite is the sole engine in
+dev AND prod (see CLAUDE.md).
+
+THE MEASURED FACT. Every datetime this codebase constructs is aware
+(``models._utcnow()`` is ``datetime.now(timezone.utc)``; there is no naive
+construction anywhere in ``src/``). SQLite stores no zone, so every value read
+back is NAIVE, and comparing one to a freshly-constructed aware value raises
+``TypeError``. That is the crash fixed locally at six sites; this is the class.
+
+THE SHARPER FACT, and the reason a per-site patch was never enough: SQLAlchemy's
+SQLite ``DateTime`` bind processor IGNORES ``tzinfo`` and formats the wall-clock
+fields. Measured::
+
+    aware UTC                    -> '2026-09-16 09:31:36.811194'
+    aware +07 (the SAME instant) -> '2026-09-16 16:31:36.811194'
+    naive                        -> '2026-09-16 09:31:36.811194'
+
+So pushing a comparison down into SQL — which is what
+``synchronize_session=False`` at each patched site achieves — is correct ONLY
+while every datetime in the system happens to be UTC. Nothing enforced that. The
+sites were correct by coincidence, and the coincidence was invisible.
+
+WHAT THIS TYPE DOES, both directions, so neither half can drift:
+
+  * BIND — a naive value is REJECTED, loudly, at the write. An aware value is
+    converted to UTC and stored with its zone dropped, so the stored digits are
+    always UTC digits regardless of what zone the caller held.
+  * RESULT — the read value gets ``tzinfo=UTC`` attached, so it comes back AWARE,
+    matching what the codebase constructs. A comparison in Python can no longer
+    raise.
+
+WHY REJECT RATHER THAN COERCE a naive bind. Assuming "naive means UTC" would
+silently write a wrong instant the first time someone hands us a local-zone
+wall-clock, which is precisely the failure the measured table above describes.
+Rejecting turns an invisible data defect into a loud error at the moment of the
+write — the earliest point where the caller still has the context to fix it. This
+is the whole point of a typed boundary: move the catch from COMMIT (or from a
+`TypeError` in some unrelated comparison months later) to construction.
+
+NO MIGRATION. The underlying storage is unchanged — this is still a
+``DateTime`` column holding the same ISO-ish text SQLite always held. Only the
+Python-side round trip changes, so ``alembic heads`` is untouched (ISL-0001).
+
+TIMEZONE=TRUE IS KEPT on ``impl`` deliberately: on SQLite it is inert (which is
+the bug), but it is the honest declaration of intent, and on any engine that
+respects it the bind conversion below is a no-op rather than a contradiction.
+"""
+from __future__ import annotations
+
+import datetime as dt
+
+from sqlalchemy import DateTime
+from sqlalchemy.types import TypeDecorator
+
+__all__ = ["UtcDateTime"]
+
+
+class NaiveDatetimeRejected(TypeError):
+    """A naive datetime reached a ``UtcDateTime`` column.
+
+    A ``TypeError`` subclass because that is what the un-typed code raised when
+    the same mistake surfaced at comparison time — the kinship is the point.
+
+    MEASURED, and NOT what a first draft of this docstring claimed: SQLAlchemy
+    wraps a bind-processor exception in ``StatementError``, so a caller catching
+    ``TypeError`` does NOT catch this. That is the better outcome — a broad
+    ``except TypeError`` swallowing a bad write is exactly the paper-over this
+    type exists to end — but it means the raise surfaces as a
+    ``StatementError`` whose ``__cause__`` is this class. Tests assert on that
+    shape (``test_naive_bind_is_rejected_at_the_write``); code should not try to
+    catch it at all.
+    """
+
+
+class UtcDateTime(TypeDecorator):
+    """A ``DateTime`` column that is aware on both sides of the wire.
+
+    Binds: aware -> UTC, zone dropped for storage. Naive -> rejected.
+    Results: naive from the DB -> UTC-aware. ``None`` passes through untouched
+    (a nullable deadline is a legitimate value, not a missing one).
+    """
+
+    impl = DateTime(timezone=True)
+    # No Python-visible state, so SQLAlchemy may cache compiled statements
+    # against this type. Omitting it is a silent per-statement perf loss plus a
+    # warning, not a correctness issue — but there is no reason to take either.
+    cache_ok = True
+
+    def process_bind_param(
+        self, value: dt.datetime | None, dialect: object
+    ) -> dt.datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
+            raise NaiveDatetimeRejected(
+                "a naive datetime reached a UtcDateTime column; construct it "
+                "aware (models._utcnow(), or datetime.now(timezone.utc)) — "
+                "storing it would record wall-clock digits whose zone is a guess"
+            )
+        return value.astimezone(dt.timezone.utc).replace(tzinfo=None)
+
+    def process_result_value(
+        self, value: dt.datetime | None, dialect: object
+    ) -> dt.datetime | None:
+        if value is None:
+            return None
+        # An engine that DID honour timezone=True hands back an aware value;
+        # normalise it rather than assuming it is already UTC.
+        if value.tzinfo is not None:
+            return value.astimezone(dt.timezone.utc)
+        return value.replace(tzinfo=dt.timezone.utc)

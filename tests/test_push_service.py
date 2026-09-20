@@ -1569,31 +1569,21 @@ async def test_the_predicate_filters_a_mixed_recipient_list(session, dm):
 # claude-tasks#4486 — the reaper's tz comparison, and the loop it used to abandon.
 #
 # All three of these were RED before the fix and each fails for its own reason.
-# The class: this database stores datetimes with no zone, so a column read back
-# is NAIVE while every datetime this codebase constructs is AWARE. Any comparison
+# The class (CLOSED by claude-tasks#4504 — kept as the record of what was fixed):
+# this database stores datetimes with no zone, so a column read back WAS NAIVE
+# while every datetime this codebase constructs is AWARE. Any comparison
 # between them raises, and SQLAlchemy's ORM `delete()`/`update()` re-runs the WHERE
 # in PYTHON against in-session objects by default, which is where they meet.
 # --------------------------------------------------------------------------
 
-def test_as_stored_converts_by_instant_not_by_wall_clock():
-    """MEASURED, and the reason `_as_stored` exists rather than a bare
-    synchronize_session=False.
-
-    SQLAlchemy's SQLite DateTime bind processor IGNORES tzinfo and formats the
-    wall-clock fields, so pushing the comparison to SQL is correct only while every
-    datetime in the system happens to be UTC. `_as_stored` converts first, so the
-    same INSTANT in any zone lands on the same stored string.
-    """
-    instant = dt.datetime(2026, 8, 21, 11, 0, tzinfo=dt.UTC)
-    same_instant_in_bangkok = instant.astimezone(dt.timezone(dt.timedelta(hours=7)))
-    assert same_instant_in_bangkok.hour == 18, "fixture: genuinely a different wall clock"
-
-    assert push_service._as_stored(instant) == dt.datetime(2026, 8, 21, 11, 0)
-    assert push_service._as_stored(same_instant_in_bangkok) == \
-        push_service._as_stored(instant), (
-            "two spellings of one instant must compare identically against storage")
-    assert push_service._as_stored(instant).tzinfo is None, (
-        "storage holds no zone; a tz-aware value here is the bug this guards")
+# RETIRED with `_as_stored` itself (claude-tasks#4504):
+# `test_as_stored_converts_by_instant_not_by_wall_clock` tested a helper that
+# stripped the zone to match what SQLite held. That helper's own docstring said to
+# delete it once the TypeDecorator landed ("the two cannot both be load-bearing").
+# The PROPERTY it asserted — the same instant in two zones compares equal across a
+# round trip — did NOT go with it. It is now asserted one layer down, against the
+# column type that owns it:
+# `tests/test_utc_datetime_type.py::test_zone_is_normalised_not_ignored`.
 
 
 @pytest.mark.asyncio
@@ -1628,9 +1618,10 @@ async def test_reaping_a_dead_row_held_live_in_the_session_does_not_raise(
         sa.select(DeviceToken).where(DeviceToken.user_id == bob.id)
     )).scalars().all()
     assert len(live) == 2, "fixture precondition: the user has two registered devices"
-    assert all(r.updated_at.tzinfo is None for r in live), (
-        "fixture precondition: SQLite hands back a NAIVE datetime — if this ever "
-        "becomes aware the storage convention changed and this whole class is fixed")
+    assert all(r.updated_at.tzinfo is not None for r in live), (
+        "fixture precondition INVERTED, exactly as this assertion predicted: reads "
+        "ARE aware now (claude-tasks#4504, domain/types.UtcDateTime) and the class "
+        "IS fixed. The reap assertion below is what still earns this test its keep")
 
     fake_apns.verdict = apns.Verdict.DEAD_TOKEN
     fake_apns.invalid_since_ms = int(
@@ -1648,8 +1639,13 @@ async def test_reaping_a_dead_row_held_live_in_the_session_does_not_raise(
 async def test_a_reap_order_in_another_zone_is_compared_by_instant(
     session, dm, configured, monkeypatch
 ):
-    """THE MUST-FAIL ARM for `_as_stored`, and the reason the fix is not just
-    `synchronize_session=False`.
+    """THE MUST-FAIL ARM for zone-correct comparison, and the reason the fix was
+    never just `synchronize_session=False`.
+
+    STILL GREEN under claude-tasks#4504 with a DIFFERENT implementer: `_as_stored`
+    is gone and `domain/types.UtcDateTime` now does the instant conversion at the
+    column. The property under test is unchanged, which is the point of asserting
+    behaviour rather than a helper.
 
     The row re-registered at 12:00 UTC. The transport reports the token died at
     11:00 UTC, spelled `18:00+07:00`. Apple's rule says KEEP the row: our
@@ -1804,6 +1800,15 @@ async def test_consuming_a_challenge_works_with_one_already_in_the_session(sessi
     reaper: a row of this type must already be in the session's identity map, or
     the Python-evaluation path the fix removes is never reached and the test
     passes either way.
+
+    WEAKENED BY claude-tasks#4504, stated rather than hidden. This test caught a
+    missing `synchronize_session=False` because the Python-evaluation path raised
+    TypeError on a naive-vs-aware compare. Reads are aware now, so that path no
+    longer raises: REMOVING THE FIX WOULD LEAVE THIS TEST PASSING. What survives is
+    the live-map precondition plus the no-raise assertion — real, but no longer
+    discriminating on the thing the fix is for. Those `synchronize_session=False`
+    calls are now held by the atomicity argument in their own comments, not by a
+    failing test. Flagged for review rather than quietly downgraded.
     """
     from aiko_gateway.domain import passkey_service
     from aiko_gateway.domain.models import PasskeyChallenge
@@ -1813,9 +1818,9 @@ async def test_consuming_a_challenge_works_with_one_already_in_the_session(sessi
 
     live = (await session.execute(sa.select(PasskeyChallenge))).scalars().all()
     assert live, "fixture precondition: a challenge row is in the identity map"
-    assert all(c.expires_at.tzinfo is None for c in live), (
-        "fixture precondition: SQLite hands expires_at back NAIVE, which is what "
-        "makes the Python-side comparison against aware _utcnow() a TypeError")
+    assert all(c.expires_at.tzinfo is not None for c in live), (
+        "fixture precondition INVERTED by claude-tasks#4504: reads are AWARE now "
+        "(domain/types.UtcDateTime) — see this test's weakened-reach note")
 
     out = await passkey_service.consume_challenge(
         session, state, passkey_service.PasskeyOperation.REGISTER)
@@ -1829,6 +1834,15 @@ async def test_consuming_a_nonce_works_with_one_already_in_the_session(session):
     fix whose absence no test can detect is the silence this module has already
     paid for once. Fixing one of a sibling pair and not the other is the same gap
     one level up.
+
+    WEAKENED BY claude-tasks#4504, stated rather than hidden. This test caught a
+    missing `synchronize_session=False` because the Python-evaluation path raised
+    TypeError on a naive-vs-aware compare. Reads are aware now, so that path no
+    longer raises: REMOVING THE FIX WOULD LEAVE THIS TEST PASSING. What survives is
+    the live-map precondition plus the no-raise assertion — real, but no longer
+    discriminating on the thing the fix is for. Those `synchronize_session=False`
+    calls are now held by the atomicity argument in their own comments, not by a
+    failing test. Flagged for review rather than quietly downgraded.
     """
     from aiko_gateway.domain import nonce_service
     from aiko_gateway.domain.models import SocialNonce
@@ -1838,17 +1852,19 @@ async def test_consuming_a_nonce_works_with_one_already_in_the_session(session):
 
     live = (await session.execute(sa.select(SocialNonce))).scalars().all()
     assert live, "fixture precondition: a nonce row is in the identity map"
-    assert all(n.expires_at.tzinfo is None for n in live), (
-        "fixture precondition: SQLite hands expires_at back NAIVE — that is what "
-        "makes the Python-side comparison against aware _utcnow() a TypeError")
+    assert all(n.expires_at.tzinfo is not None for n in live), (
+        "fixture precondition INVERTED by claude-tasks#4504: reads are AWARE now "
+        "(domain/types.UtcDateTime) — see this test's weakened-reach note")
 
     assert await nonce_service.consume_nonce(session, nonce) is True, (
         "the consume raised or matched nothing with a live row in the identity map")
 
 
 def test_a_reap_order_refuses_a_naive_instant():
-    """The malformed state is now UNCONSTRUCTIBLE, which is why `_as_stored` no
-    longer carries a branch for it (cage-match PR#184 r3).
+    """The malformed state is UNCONSTRUCTIBLE at the `ReapOrder` boundary
+    (cage-match PR#184 r3) — which is why `_as_stored` needed no naive branch.
+    That helper is gone (claude-tasks#4504); this guard outlives it as the OUTER
+    of two refusals, with `UtcDateTime` refusing naive at the column itself.
 
     Both other constructions stay legal and are asserted here, because a guard
     that rejects everything is indistinguishable from a broken constructor: the
