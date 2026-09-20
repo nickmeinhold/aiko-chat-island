@@ -12,13 +12,14 @@ import datetime as dt
 import enum
 
 from sqlalchemy import (
-    JSON, BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer,
+    JSON, BigInteger, Boolean, CheckConstraint, ForeignKey, Index, Integer,
     PrimaryKeyConstraint, String, Text, UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from ..db import Base
 from .ids import new_ulid
+from .types import UtcDateTime
 
 
 def _utcnow() -> dt.datetime:
@@ -305,14 +306,14 @@ class User(Base):
     # email-match would be account takeover. Nullable: Apple only returns email on
     # first consent (and may be a private-relay address).
     email: Mapped[str | None] = mapped_column(String(320), nullable=True)
-    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    created_at: Mapped[dt.datetime] = mapped_column(UtcDateTime, default=_utcnow)
     # Moderation ban (Piece B, #7). NULL = active; a timestamp = suspended FROM
     # this island (per-island, reversible, forward-looking — see moderation_service.
     # ban_user). Enforced at every auth ingress via users_service.is_banned; it does
     # NOT delete the user row (distinct from account deletion) nor their past
     # messages (use take-down for content).
     banned_at: Mapped[dt.datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True)
+        UtcDateTime, nullable=True)
     # Session-revocation generation (#1914). Every access/refresh token embeds the
     # `gen` it was minted at; a token is honoured only while its gen == this column.
     # Bumping it (recovery finalize re-key) invalidates EVERY outstanding token for
@@ -331,7 +332,7 @@ class User(Base):
     # limits churn on the mutable label so @-mentions/DMs that resolve key->handle
     # stay stable (see project_identity_social_cluster).
     handle_changed_at: Mapped[dt.datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True)
+        UtcDateTime, nullable=True)
     # What this account IS (#3096). server_default 'human' so every pre-existing row
     # backfills as a human account — the honest reading, since no agent account can
     # exist before this migration. Set at CREATION only: there is deliberately no
@@ -360,7 +361,7 @@ class SocialIdentity(Base):
     provider_sub: Mapped[str] = mapped_column(String(255), nullable=False)
     user_id: Mapped[str] = mapped_column(
         ForeignKey("users.id"), nullable=False, index=True)
-    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    created_at: Mapped[dt.datetime] = mapped_column(UtcDateTime, default=_utcnow)
 
 
 class Channel(Base):
@@ -469,7 +470,7 @@ class Channel(Base):
     community_id: Mapped[str | None] = mapped_column(
         ForeignKey("communities.id"), nullable=True, index=True,
         default=DEFAULT_COMMUNITY_ID)
-    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    created_at: Mapped[dt.datetime] = mapped_column(UtcDateTime, default=_utcnow)
 
 
 class Membership(Base):
@@ -487,7 +488,7 @@ class Membership(Base):
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), primary_key=True)
     role: Mapped[str] = mapped_column(String(16), nullable=False, default="member")  # member|admin
     can_post: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
-    joined_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    joined_at: Mapped[dt.datetime] = mapped_column(UtcDateTime, default=_utcnow)
 
 
 class Community(Base):
@@ -548,14 +549,14 @@ class Community(Base):
     # column but leaves population to a later increment (no per-channel last-ULID
     # rollup yet), so directory sort is `members`/`name` for now. NULL at seed.
     last_activity_at: Mapped[dt.datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True)
+        UtcDateTime, nullable=True)
     # Community-level takedown (#32): moderation can remove a whole community as a
     # unit (channels/messages already have their own takedown). Inert until the B2
     # discovery/join read paths consult it; carried now so the model is complete.
     taken_down_at: Mapped[dt.datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True)
+        UtcDateTime, nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), default=_utcnow)
+        UtcDateTime, default=_utcnow)
 
 
 class CommunityMembership(Base):
@@ -575,7 +576,7 @@ class CommunityMembership(Base):
         ForeignKey("users.id"), primary_key=True)
     role: Mapped[str] = mapped_column(String(16), nullable=False, default="member")
     joined_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), default=_utcnow)
+        UtcDateTime, default=_utcnow)
 
 
 class Message(Base):
@@ -619,15 +620,15 @@ class Message(Base):
     # no mentions and every bus-born message; message_view omits the key when
     # NULL (absent == "no mentions", mirroring origin's absent == "unverified").
     mentions: Mapped[list[dict] | None] = mapped_column(JSON, nullable=True)
-    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    created_at: Mapped[dt.datetime] = mapped_column(UtcDateTime, default=_utcnow)
     # NEIGHBOR CONSTRAINT for a future edit mutator (#2706): `mentions` offsets index
     # `body`. Any path that REWRITES `body` (an edit endpoint keyed on this column)
     # MUST re-validate or clear `mentions`, or spans dangle into the new text — the
     # same reasoning the account-deletion tombstone applies when it replaces body.
     # No edit route exists yet; this constraint travels with the column so the next
     # edit PR inherits it.
-    edited_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    deleted_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    edited_at: Mapped[dt.datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    deleted_at: Mapped[dt.datetime | None] = mapped_column(UtcDateTime, nullable=True)
 
 
 class UserBlock(Base):
@@ -648,7 +649,7 @@ class UserBlock(Base):
         ForeignKey("users.id"), primary_key=True)
     blocked_user_id: Mapped[str] = mapped_column(
         ForeignKey("users.id"), primary_key=True, index=True)
-    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    created_at: Mapped[dt.datetime] = mapped_column(UtcDateTime, default=_utcnow)
 
 
 class MessageReport(Base):
@@ -680,9 +681,9 @@ class MessageReport(Base):
     reporter_user_id: Mapped[str | None] = mapped_column(
         ForeignKey("users.id"), nullable=True)
     reason: Mapped[str] = mapped_column(String(32), nullable=False)
-    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    created_at: Mapped[dt.datetime] = mapped_column(UtcDateTime, default=_utcnow)
     resolved_at: Mapped[dt.datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True)
+        UtcDateTime, nullable=True)
     # Piece B: WHO actioned the report and HOW. Both NULL while pending. The FK is
     # nullable so a moderator's own later account deletion doesn't cascade-destroy
     # the report's audit trail (mirrors reporter_user_id anonymization).
@@ -744,7 +745,7 @@ class Retraction(Base):
     channel_id: Mapped[str] = mapped_column(
         ForeignKey("channels.id"), nullable=False)
     created_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), default=_utcnow)
+        UtcDateTime, default=_utcnow)
 
 
 class DeviceToken(Base):
@@ -843,9 +844,9 @@ class DeviceToken(Base):
     # a DB CHECK could only restate the width, and SQLite does not enforce width.
     install_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), default=_utcnow)
+        UtcDateTime, default=_utcnow)
     updated_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
+        UtcDateTime, default=_utcnow, onupdate=_utcnow)
 
 
 class SigningKey(Base):
@@ -929,9 +930,9 @@ class SigningKey(Base):
     # rotation/revocation lifecycle; a fixed pubkey keeps its first-seen version.
     key_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     first_seen_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), default=_utcnow)
+        UtcDateTime, default=_utcnow)
     last_seen_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), default=_utcnow)
+        UtcDateTime, default=_utcnow)
 
 
 class OAuthHandoff(Base):
@@ -962,11 +963,11 @@ class OAuthHandoff(Base):
     code: Mapped[str] = mapped_column(String(64), primary_key=True)
     payload: Mapped[str] = mapped_column(Text, nullable=False)
     expires_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False)
+        UtcDateTime, nullable=False)
     consumed: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False)
     created_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), default=_utcnow)
+        UtcDateTime, default=_utcnow)
 
 
 class OAuthState(Base):
@@ -1010,11 +1011,11 @@ class OAuthState(Base):
     # code_verifier (the gateway↔provider PKCE secret).
     app_challenge: Mapped[str | None] = mapped_column(Text, nullable=True)
     expires_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False)
+        UtcDateTime, nullable=False)
     consumed: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False)
     created_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), default=_utcnow)
+        UtcDateTime, default=_utcnow)
 
 
 class SocialNonce(Base):
@@ -1040,11 +1041,11 @@ class SocialNonce(Base):
     __tablename__ = "social_nonces"
     nonce: Mapped[str] = mapped_column(String(64), primary_key=True)
     expires_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False)
+        UtcDateTime, nullable=False)
     consumed: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False)
     created_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), default=_utcnow)
+        UtcDateTime, default=_utcnow)
 
 
 class PasskeyCredential(Base):
@@ -1077,9 +1078,9 @@ class PasskeyCredential(Base):
     transports: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON array
     aaguid: Mapped[str | None] = mapped_column(String(36), nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), default=_utcnow)
+        UtcDateTime, default=_utcnow)
     last_used_at: Mapped[dt.datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True)
+        UtcDateTime, nullable=True)
 
 
 class PasskeyChallenge(Base):
@@ -1102,11 +1103,11 @@ class PasskeyChallenge(Base):
     state: Mapped[str] = mapped_column(String(64), primary_key=True)
     operation: Mapped[str] = mapped_column(String(16), nullable=False)
     expires_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False)
+        UtcDateTime, nullable=False)
     consumed: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False)
     created_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), default=_utcnow)
+        UtcDateTime, default=_utcnow)
 
 
 class RecoveryPolicy(Base):
@@ -1141,7 +1142,7 @@ class RecoveryPolicy(Base):
     # service enforces 1 <= threshold_k <= n at enroll time; stored as-is.
     threshold_k: Mapped[int] = mapped_column(Integer, nullable=False)
     created_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), default=_utcnow)
+        UtcDateTime, default=_utcnow)
 
 
 class RecoveryApprover(Base):
@@ -1176,7 +1177,7 @@ class RecoveryApprover(Base):
     # A client-side hint only ("mum's phone"), opaque to the gateway. Nullable.
     label: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), default=_utcnow)
+        UtcDateTime, default=_utcnow)
 
 
 class PendingRecovery(Base):
@@ -1218,11 +1219,11 @@ class PendingRecovery(Base):
     # advanced (a repeated finish can't push the window out; §7). The finalize
     # DELETE folds `veto_deadline <= :now` into its WHERE.
     veto_deadline: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False)
+        UtcDateTime, nullable=False)
     # sha256 hex of the high-entropy finalize token (never the raw token).
     finalize_token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     created_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), default=_utcnow)
+        UtcDateTime, default=_utcnow)
 
 
 class MessageReaction(Base):
@@ -1317,4 +1318,4 @@ class MessageReaction(Base):
     # matches an unsigned row and can upgrade it to signed (cage-match Tesla r2 P1).
     origin: Mapped[dict | None] = mapped_column(JSON(none_as_null=True), nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), default=_utcnow)
+        UtcDateTime, default=_utcnow)

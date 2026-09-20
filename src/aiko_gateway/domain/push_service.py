@@ -194,20 +194,6 @@ from .rate_limit import limiter
 log = logging.getLogger("aiko_gateway.push")
 
 
-def _as_stored(when: dt.datetime) -> dt.datetime:
-    """An aware datetime in the representation this database actually holds.
-
-    MEASURED: SQLAlchemy's SQLite DateTime bind processor IGNORES tzinfo and
-    formats the wall-clock fields, so the same instant spelled `+07` binds seven
-    hours after its UTC spelling. Rows are written aware (`models._utcnow`) and
-    read back naive, since SQLite stores no zone.
-
-    Naive input cannot reach here: `ReapOrder` refuses a zone-less instant at
-    construction. Retire this with claude-tasks#4504 (a TypeDecorator making
-    reads aware) — the two cannot both be load-bearing.
-    """
-    return when.astimezone(dt.timezone.utc).replace(tzinfo=None)
-
 # THE PINNED CALL-INVITATION SENTINEL — a WIRE CONTRACT, not a display string.
 #
 # The app signs this exact body and the island must recognise the exact same
@@ -1097,13 +1083,19 @@ async def _wake_user(session: AsyncSession, user_id: str, *, wake: WakeKind,
             # date would have to carry its reversibility elsewhere,
             # and for the falsifier if that reasoning is wrong.
             conditions.append(
-                DeviceToken.updated_at <= _as_stored(order.not_reregistered_since))
+                DeviceToken.updated_at <= order.not_reregistered_since)
         # synchronize_session=False is load-bearing, not tidy (claude-tasks#4486).
         # The default 'evaluate' re-runs this WHERE in Python against in-session
         # objects — and the rows just sent to are in the identity map, loaded
-        # above — comparing a SQLite-naive `updated_at` to an aware transport date
-        # and raising TypeError. Same fix, same reason, as users_service's handle
-        # cooldown.
+        # above — which both breaks the atomicity of folding the predicate into
+        # the write and re-implements the comparison in a second place.
+        #
+        # The TZ half of that reasoning is GONE as of claude-tasks#4504: reads are
+        # aware now (`domain/types.UtcDateTime`), so a Python-side compare would no
+        # longer TypeError. The ATOMICITY half stands alone and is why this stays.
+        # `_as_stored` — which stripped the zone to match what SQLite held — is
+        # retired with it, exactly as its docstring instructed; the bound value is
+        # now the aware instant and the column type normalises it.
         outcome = await session.execute(
             delete(DeviceToken).where(*conditions)
             .execution_options(synchronize_session=False))
