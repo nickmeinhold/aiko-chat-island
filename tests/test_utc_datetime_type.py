@@ -207,3 +207,31 @@ async def test_the_capped_insert_select_path_stores_the_instant(session):
         "literal() bind bypassed UtcDateTime"
     )
     assert row.last_seen_at == instant
+
+
+@pytest.mark.asyncio
+async def test_a_non_datetime_comparand_is_named_not_an_attributeerror(session):
+    """`TypeDecorator.coerce_compared_value` returns self BY DEFAULT (SQLAlchemy
+    source: "By default, returns self"), so EVERY comparand reaches this type —
+    including a `date`, an ISO string, or a unix float.
+
+    Pre-existing, not a regression: the default has always routed here. What was
+    wrong is that they died on `AttributeError: 'date' object has no attribute
+    'tzinfo'` — an error strictly worse than a plain DateTime column would give,
+    raised by the type whose entire job is to give a better one.
+
+    Two cage-match rounds (PR#185 r2, r3) were spent adding and then narrowing a
+    `coerce_compared_value` override to "guarantee" routing that the documented
+    default already guaranteed. Both were no-ops. This is what was actually left.
+    """
+    for bad in (dt.date(2026, 9, 20), "2026-09-20 06:00:00", 1789876800.0):
+        with pytest.raises(StatementError) as caught:
+            await session.execute(
+                select(SocialNonce).where(SocialNonce.expires_at <= bad))
+        assert isinstance(caught.value.__cause__, NaiveDatetimeRejected), (
+            f"a {type(bad).__name__} comparand raised {caught.value.__cause__!r} "
+            "rather than this type's named error")
+        assert type(bad).__name__ in str(caught.value.__cause__), (
+            "the error must name the offending type, or it is no better than "
+            "the AttributeError it replaced")
+        await session.rollback()

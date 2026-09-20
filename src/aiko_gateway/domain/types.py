@@ -104,31 +104,50 @@ class UtcDateTime(TypeDecorator):
     # warning, not a correctness issue — but there is no reason to take either.
     cache_ok = True
 
-    def coerce_compared_value(self, op: object, value: object) -> "UtcDateTime":
-        """Keep THIS type on the right-hand side of a comparison.
-
-        ``TypeDecorator``'s default delegates to ``impl``, and SQLAlchemy 2.0
-        measurably hands the decorator back anyway — ``Column <= <aware +07>``
-        binds ``06:00``, not ``13:00``, verified before this override was added.
-        So there is no live bug here and this is not a fix.
-
-        It is the DIFFERENCE BETWEEN A MEASUREMENT AND A GUARANTEE (Tesla,
-        cage-match PR#185 r2). Without this method the WHERE-bind conversion —
-        the exact path that once reaped a live device, and that nonce expiry and
-        the reaper DELETE both ride — rests on a library internal nothing in this
-        codebase asserts, damped only by a test. A version that restores the
-        documented delegation would silently un-damp it, and the failure would
-        look like the original bug: correct by coincidence, which is the thing
-        this whole module exists to end. One line moves the guarantee off
-        SQLAlchemy's behaviour and onto ours.
-        """
-        return self
+    # NO ``coerce_compared_value`` OVERRIDE — and the reason is worth the lines,
+    # because two cage-match rounds were spent adding one and then narrowing it.
+    #
+    # Tesla (r2) reported that ``TypeDecorator``'s default DELEGATES this to
+    # ``impl``, so a compared value would skip the decorator and SQLite would
+    # format ``+07`` as ``13:00``. The behaviour was measured and found correct
+    # (a ``+07`` fence binds ``06:00``), but the MECHANISM claim was taken on
+    # trust and an override was added to "convert a measurement into a
+    # guarantee". It converted nothing.
+    #
+    # GROUNDED AGAINST THE SOURCE (r3), which is where this should have started:
+    #
+    #     sqlalchemy/sql/type_api.py :: TypeDecorator.coerce_compared_value
+    #         """... By default, returns self."""
+    #         return self
+    #
+    # The default IS ``return self``. Compared values have always reached this
+    # type; there was never a coincidence here to harden. The override was pure
+    # restatement, and the r3 "narrowing" of it was a second no-op on top (its
+    # ``super()`` call returns ``self`` as well). Both removed.
+    #
+    # The one REAL thing that came out of it is handled in ``process_bind_param``
+    # below: because every RHS reaches us, a non-datetime comparand hits our bind
+    # processor, and it used to die on ``AttributeError: 'date' object has no
+    # attribute 'tzinfo'``. That is PRE-EXISTING — not a regression, since the
+    # default always routed here — and it is now a named error instead.
 
     def process_bind_param(
         self, value: dt.datetime | None, dialect: object
     ) -> dt.datetime | None:
         if value is None:
             return None
+        if not isinstance(value, dt.datetime):
+            # Every comparand reaches us (TypeDecorator.coerce_compared_value
+            # returns self by default), so a `date`, an ISO string or a unix
+            # float lands here. Previously that died on AttributeError deep in
+            # the tzinfo check — an error message strictly worse than the one a
+            # plain DateTime column would have produced, raised by a type whose
+            # entire job is to produce a BETTER one. Name it instead.
+            raise NaiveDatetimeRejected(
+                f"a {type(value).__name__} reached a UtcDateTime column or "
+                "comparison; this type takes timezone-aware datetimes only "
+                "(models._utcnow(), or datetime.now(timezone.utc))"
+            )
         if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
             raise NaiveDatetimeRejected(
                 "a naive datetime reached a UtcDateTime column; construct it "
