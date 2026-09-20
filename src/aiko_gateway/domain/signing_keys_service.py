@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .ids import new_ulid
 from .models import SigningKey, _utcnow
+from .types import UtcDateTime
 
 
 async def record_signing_key(
@@ -136,9 +137,18 @@ def _capped_insert(*, key_id: str, user_id: str, pubkey: str,
     sees the committed row), so a burst can no longer overshoot. Mirrors
     ``communities_service._new_join_insert`` — the codebase's established pattern
     for folding a predicate into a write."""
+    # `literal(now, UtcDateTime)`, NOT a bare `literal(now)` (claude-tasks#4504,
+    # cage-match PR#185 r1). A bare literal infers the GENERIC `DateTime`, so this
+    # INSERT...SELECT binds through SQLAlchemy's plain SQLite processor and
+    # BYPASSES the column type entirely — no UTC normalisation and no naive
+    # rejection, on the live send path. Measured: an instant spelled `+07` binds
+    # as `13:00` where the column type binds `06:00`, a seven-hour error, and a
+    # naive value is accepted silently. It is correct today only because `now` is
+    # always `_utcnow()` — which is exactly the correct-by-coincidence this change
+    # exists to end. Naming the type here restores the guarantee on this path.
     under_cap = select(
         literal(key_id), literal(user_id), literal(pubkey),
-        literal(key_version), literal(now), literal(now),
+        literal(key_version), literal(now, UtcDateTime), literal(now, UtcDateTime),
     ).where(
         (select(func.count()).select_from(SigningKey)
          .where(SigningKey.user_id == user_id).scalar_subquery()) < max_keys

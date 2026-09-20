@@ -65,6 +65,58 @@ async def test_zone_is_normalised_not_ignored(session):
     assert rows["as-utc"] == rows["as-bangkok"], (
         "the same instant stored in two zones came back as two different times"
     )
+    # ANCHOR TO THE ORIGINAL INSTANT, not just to each other (Tesla, cage-match
+    # PR#185 r1). Pairwise equality alone would still pass if BOTH spellings were
+    # mangled the same way — a check whose success value could coexist with the
+    # defect. Comparing against `instant` is what makes it discriminating.
+    assert rows["as-utc"] == instant, "round trip did not preserve the instant"
+    assert rows["as-bangkok"] == instant, "the +07 spelling drifted off the instant"
+
+
+@pytest.mark.asyncio
+async def test_a_zoned_value_binds_as_utc_in_a_where_clause(session):
+    """THE SHARPER HALF, at the type's own layer (Tesla, cage-match PR#185 r1).
+
+    The test above covers INSERT and SELECT. The bug that actually reaped a live
+    device was on a WHERE BIND — and that harmonic was asserted only over in
+    `test_push_service.py`. If that test were ever simplified, the claim this
+    change exists to make would go ungrounded while this file stayed green.
+
+    A row expires at 06:30 UTC. We query `expires_at <= 06:00 UTC`, spelled
+    `13:00+07`. The row must NOT match: 06:30 is after 06:00. Bind the wall clock
+    instead of the instant and the comparison becomes `06:30 <= 13:00` — true —
+    and the row is wrongly selected.
+    """
+    session.add(_nonce("where-bind", dt.datetime(2026, 9, 20, 6, 30, tzinfo=dt.timezone.utc)))
+    await session.commit()
+
+    fence_utc = dt.datetime(2026, 9, 20, 6, 0, tzinfo=dt.timezone.utc)
+    fence_bangkok = fence_utc.astimezone(dt.timezone(dt.timedelta(hours=7)))
+    assert fence_bangkok.hour == 13, "fixture: genuinely a different wall clock"
+
+    for label, fence in (("utc", fence_utc), ("+07", fence_bangkok)):
+        hit = (await session.execute(
+            select(SocialNonce).where(
+                SocialNonce.nonce == "where-bind",
+                SocialNonce.expires_at <= fence,
+            )
+        )).scalars().all()
+        assert hit == [], (
+            f"the {label} spelling of the fence matched a row that expires AFTER it "
+            "— the WHERE bind used the wall clock, not the instant"
+        )
+
+    # The discriminating other half: a fence that genuinely IS later must match,
+    # or a WHERE that matches nothing would pass this test for the wrong reason.
+    later = dt.datetime(2026, 9, 20, 7, 0, tzinfo=dt.timezone.utc).astimezone(
+        dt.timezone(dt.timedelta(hours=7)))
+    hit = (await session.execute(
+        select(SocialNonce).where(
+            SocialNonce.nonce == "where-bind",
+            SocialNonce.expires_at <= later,
+        )
+    )).scalars().all()
+    assert len(hit) == 1, "a genuinely-later fence must still match"
 
 
 @pytest.mark.asyncio

@@ -35,18 +35,33 @@ WHAT THIS TYPE DOES, both directions, so neither half can drift:
 WHY REJECT RATHER THAN COERCE a naive bind. Assuming "naive means UTC" would
 silently write a wrong instant the first time someone hands us a local-zone
 wall-clock, which is precisely the failure the measured table above describes.
-Rejecting turns an invisible data defect into a loud error at the moment of the
-write — the earliest point where the caller still has the context to fix it. This
-is the whole point of a typed boundary: move the catch from COMMIT (or from a
-`TypeError` in some unrelated comparison months later) to construction.
+Rejecting turns an invisible data defect into a loud error at the WRITE, instead
+of a `TypeError` in some unrelated comparison months later.
+
+SCOPE OF THE CATCH, stated precisely (Tesla, cage-match PR#185 r1). It fires at
+BIND/FLUSH, not at object construction: ``SocialNonce(expires_at=<naive>)`` is
+still representable and sits in the identity map until the write. An earlier
+draft of this docstring said "construction", which promised a guarantee this type
+does not provide — the outer refusals that ARE constructor-level live in the
+domain objects (``ReapOrder`` raises on a zone-less instant). Two layers, and
+this is the lower one.
 
 NO MIGRATION. The underlying storage is unchanged — this is still a
 ``DateTime`` column holding the same ISO-ish text SQLite always held. Only the
 Python-side round trip changes, so ``alembic heads`` is untouched (ISL-0001).
 
-TIMEZONE=TRUE IS KEPT on ``impl`` deliberately: on SQLite it is inert (which is
-the bug), but it is the honest declaration of intent, and on any engine that
-respects it the bind conversion below is a no-op rather than a contradiction.
+TIMEZONE=TRUE ON ``impl``: kept as the honest declaration of intent, and on
+SQLite it is inert (which is the bug this type works around).
+
+DO NOT READ IT AS PORTABILITY — an earlier draft of this paragraph claimed the
+bind conversion would be "a no-op rather than a contradiction" on an engine that
+respects the flag, and that is BACKWARDS (Tesla and Carnot, independently,
+cage-match PR#185 r1). ``process_bind_param`` ends in ``replace(tzinfo=None)``,
+so against a real ``timestamptz`` column it hands over naive digits that the
+server then interprets in ITS session zone — the contradiction, not the no-op.
+SQLite is the sole engine in dev and prod, so this tree is correct; the next
+island that "just uses Postgres" must give this type dialect-specific bind
+behaviour FIRST. Tracked rather than hand-waved.
 """
 from __future__ import annotations
 

@@ -1801,14 +1801,23 @@ async def test_consuming_a_challenge_works_with_one_already_in_the_session(sessi
     the Python-evaluation path the fix removes is never reached and the test
     passes either way.
 
-    WEAKENED BY claude-tasks#4504, stated rather than hidden. This test caught a
-    missing `synchronize_session=False` because the Python-evaluation path raised
-    TypeError on a naive-vs-aware compare. Reads are aware now, so that path no
-    longer raises: REMOVING THE FIX WOULD LEAVE THIS TEST PASSING. What survives is
-    the live-map precondition plus the no-raise assertion — real, but no longer
-    discriminating on the thing the fix is for. Those `synchronize_session=False`
-    calls are now held by the atomicity argument in their own comments, not by a
-    failing test. Flagged for review rather than quietly downgraded.
+    RE-ARMED after claude-tasks#4504 disarmed it (cage-match PR#185 r1, all three
+    families). The original teeth were accidental: this caught a missing
+    `synchronize_session=False` because the Python-evaluation path raised TypeError
+    on a naive-vs-aware compare. Reads are aware now, so that path no longer
+    raises and the no-raise assertion alone would pass with the fix REMOVED.
+
+    The replacement asserts the flag's actual observable effect instead of a
+    crash it used to cause. With `synchronize_session=False` SQLAlchemy does NOT
+    synchronise matched in-session objects, so the live copy keeps `consumed=False`
+    after the UPDATE has burned the row; under the default `evaluate` it would be
+    set to True. Asserting that staleness therefore fails if the flag is removed —
+    verified by flipping it, not by assuming.
+
+    Note what this does and does not defend. Single-use still lives in the SQL
+    WHERE, so two sessions cannot double-spend either way; what the flag protects
+    is one session's identity map from lying quietly (Tesla's framing: the next
+    copy-paste consume without it "will not crash at 3am; it will desync").
     """
     from aiko_gateway.domain import passkey_service
     from aiko_gateway.domain.models import PasskeyChallenge
@@ -1825,6 +1834,15 @@ async def test_consuming_a_challenge_works_with_one_already_in_the_session(sessi
     out = await passkey_service.consume_challenge(
         session, state, passkey_service.PasskeyOperation.REGISTER)
     assert out is not None, "the consume raised or matched nothing with a live row in the map"
+    # THE RE-ARMED ARM: the live copy must still read unconsumed. Under the
+    # default `evaluate` it would have been synchronised to True, so this line is
+    # what fails when the flag is removed.
+    assert live[0].consumed is False, (
+        "the in-session copy was synchronised — synchronize_session is not False")
+    burned = (await session.execute(
+        sa.select(PasskeyChallenge.consumed).where(PasskeyChallenge.state == state)
+    )).scalar_one()
+    assert burned is True, "the DB row was not actually burned"
 
 
 @pytest.mark.asyncio
@@ -1835,14 +1853,23 @@ async def test_consuming_a_nonce_works_with_one_already_in_the_session(session):
     paid for once. Fixing one of a sibling pair and not the other is the same gap
     one level up.
 
-    WEAKENED BY claude-tasks#4504, stated rather than hidden. This test caught a
-    missing `synchronize_session=False` because the Python-evaluation path raised
-    TypeError on a naive-vs-aware compare. Reads are aware now, so that path no
-    longer raises: REMOVING THE FIX WOULD LEAVE THIS TEST PASSING. What survives is
-    the live-map precondition plus the no-raise assertion — real, but no longer
-    discriminating on the thing the fix is for. Those `synchronize_session=False`
-    calls are now held by the atomicity argument in their own comments, not by a
-    failing test. Flagged for review rather than quietly downgraded.
+    RE-ARMED after claude-tasks#4504 disarmed it (cage-match PR#185 r1, all three
+    families). The original teeth were accidental: this caught a missing
+    `synchronize_session=False` because the Python-evaluation path raised TypeError
+    on a naive-vs-aware compare. Reads are aware now, so that path no longer
+    raises and the no-raise assertion alone would pass with the fix REMOVED.
+
+    The replacement asserts the flag's actual observable effect instead of a
+    crash it used to cause. With `synchronize_session=False` SQLAlchemy does NOT
+    synchronise matched in-session objects, so the live copy keeps `consumed=False`
+    after the UPDATE has burned the row; under the default `evaluate` it would be
+    set to True. Asserting that staleness therefore fails if the flag is removed —
+    verified by flipping it, not by assuming.
+
+    Note what this does and does not defend. Single-use still lives in the SQL
+    WHERE, so two sessions cannot double-spend either way; what the flag protects
+    is one session's identity map from lying quietly (Tesla's framing: the next
+    copy-paste consume without it "will not crash at 3am; it will desync").
     """
     from aiko_gateway.domain import nonce_service
     from aiko_gateway.domain.models import SocialNonce
@@ -1858,6 +1885,13 @@ async def test_consuming_a_nonce_works_with_one_already_in_the_session(session):
 
     assert await nonce_service.consume_nonce(session, nonce) is True, (
         "the consume raised or matched nothing with a live row in the identity map")
+    # THE RE-ARMED ARM — see the docstring. `evaluate` would set this True.
+    assert live[0].consumed is False, (
+        "the in-session copy was synchronised — synchronize_session is not False")
+    burned = (await session.execute(
+        sa.select(SocialNonce.consumed).where(SocialNonce.nonce == nonce)
+    )).scalar_one()
+    assert burned is True, "the DB row was not actually burned"
 
 
 def test_a_reap_order_refuses_a_naive_instant():
