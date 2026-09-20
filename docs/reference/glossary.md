@@ -36,6 +36,29 @@ message and present it as their own.
 observed-usage roster, not an ownership claim. This is exactly where the external
 specialist's caveat landed ("assuming it binds users to public encryption keys").
 
+### Passkey / WebAuthn
+A login credential whose private key is generated *inside* the phone's secure hardware
+(Secure Enclave, Android Keystore) and **cannot be extracted**. Login is a
+challenge-response: the island sends a challenge, the phone signs it, the island
+verifies. **[BUILT]** — `passkey_challenge_ttl_seconds`, 5 minutes.
+
+This IS proof of possession, performed at registration and again at every login. Note
+what it proves: *the holder of this credential is here*. It says nothing about any other
+key the same user might hold.
+
+### The two key pairs (and why the sign-up challenge doesn't cover both)
+A user has **two independent key pairs that do not know about each other**:
+
+1. **The passkey credential** — hardware-bound, challenged every login. **[BUILT]**
+2. **The Ed25519 message-signing key** — app-generated in software, and the island first
+   learns of it as a *side effect of a message arriving*. No ceremony, nothing proven.
+   **[BUILT, unproven]**
+
+So sign-up proves key 1 and says nothing about key 2. The obvious fix, and it is cheap:
+present the signing public key **during the passkey ceremony** and have the client sign
+the same challenge with both keys. One round trip already being paid for, both keys proven
+at once, tied to the same account at the same moment. **[PROPOSED — Nick, 2026-09-20]**
+
 ### Nonce
 A random value used exactly once, so a captured message cannot be replayed later.
 "Number used once". The challenge in PoP is a nonce. **[BUILT]** — `nonce_service.py`
