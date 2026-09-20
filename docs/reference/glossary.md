@@ -64,6 +64,50 @@ A random value used exactly once, so a captured message cannot be replayed later
 "Number used once". The challenge in PoP is a nonce. **[BUILT]** — `nonce_service.py`
 handles social sign-in nonces.
 
+### Domain separation
+Mixing a purpose tag into whatever gets signed (or derived), so a signature minted for
+one purpose is structurally unusable for another. **[BUILT]** — `signing.py` uses
+`DOMAIN_TAG = "aikochat:msg:v1:EdDSA"` for messages and a different tag for recovery
+approvals, so a chat signature can never be replayed as a recovery approval.
+
+This is also why a passkey's signature cannot be borrowed to sign messages: WebAuthn
+does its own domain separation, and its signatures commit to "a WebAuthn assertion
+happened at origin X", not to your message.
+
+### User verification
+The biometric or PIN gesture a passkey requires before it will sign. **[BUILT]** —
+`passkey_require_user_verification: bool = True`. It is why a passkey cannot be the
+message-signing key: every message would prompt for Face ID.
+
+### COSE
+The binary format a WebAuthn public key arrives in, carrying its own algorithm
+identifier. **[BUILT]** — stored as `base64url(COSE)` on the passkey row.
+
+### PRF (pseudorandom function)
+A function of a **secret key** and an **input** whose output looks random, with two
+properties in tension:
+
+- **Deterministic** — same key and input give the same output, forever.
+- **Unpredictable without the key** — the output is indistinguishable from noise, and
+  outputs never reveal the key.
+
+Think of it as a hash function with a secret ingredient. It gives you **a secret you
+never have to store**, because you can always recompute it.
+
+### WebAuthn PRF extension
+The authenticator holds the PRF key inside secure hardware and returns 32 bytes for a
+salt you supply. Same passkey plus same salt gives the same bytes on any device holding
+that passkey; without the passkey they are unobtainable.
+
+Feed them to a key derivation function and you get a signing key that is **bound to the
+passkey without being the passkey** — never stored, never sent to the island,
+regenerable on a new phone as soon as the passkey syncs. A different salt
+(`aikochat:signing:v1` vs `aikochat:encryption:v1`) yields a completely independent key,
+which satisfies the "use two keys" advice from one credential.
+
+**[PROPOSED]** — nothing built or decided. The open catch is uneven platform support
+across iOS, Android and browsers, which we have not measured.
+
 ### Ed25519
 The signature algorithm we use. Fast, small keys (32 bytes), modern. **[BUILT]** —
 the island allowlists `alg: "EdDSA"` server-side and never trusts the algorithm
