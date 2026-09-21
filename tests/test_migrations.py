@@ -966,11 +966,20 @@ def test_sender_kind_check_literal_matches_the_enum(tmp_path, monkeypatch) -> No
         "aiko_origin, created_at) VALUES "
         "('pm1','pc1',NULL,'unknown','hi',0,'2026-01-01T00:00:00+00:00')")
     try:
-        with pytest.raises(sqlite3.IntegrityError):
+        # NAME THE CONSTRAINT. A bare raises() hears any integrity failure as proof
+        # this CHECK fired — a PK collision, a NOT NULL, an FK — so the assertion
+        # would stay green while observing something it never measured. Third
+        # instance of one class in this change (Tesla found the first in
+        # test_check_constraints; a class sweep found this one and its sibling
+        # below), which is why it is fixed as a class rather than per finding.
+        with pytest.raises(sqlite3.IntegrityError) as exc:
             con.execute(
                 "INSERT INTO messages (id, channel_id, sender_user_id, sender_kind, "
                 "body, aiko_origin, created_at) VALUES "
                 "('pm2','pc1',NULL,'hologram','hi',0,'2026-01-01T00:00:00+00:00')")
+        assert "ck_messages_sender_kind" in str(exc.value) or "CHECK" in str(exc.value), (
+            "'hologram' was refused, but not demonstrably by the sender_kind CHECK — "
+            f"this gate cannot tell you the constraint reached the DB. Error: {exc.value}")
     finally:
         con.close()
 
@@ -1048,12 +1057,17 @@ def test_0027_renames_actor_rows_and_then_closes_the_set(tmp_path, monkeypatch) 
 
         # The constraint is live on the MIGRATED (not freshly created) table, and
         # the OLD name is now refused — the rename is a closure, not a relabel.
-        with pytest.raises(IntegrityError):
+        # Named, for the same reason as its siblings: without it, 'ma9' colliding
+        # on the primary key would read as "the old name was rejected".
+        with pytest.raises(IntegrityError) as exc:
             with engine.begin() as c:
                 c.execute(text(
                     "INSERT INTO messages (id, channel_id, sender_user_id, "
                     "sender_kind, body, aiko_origin, created_at) VALUES "
                     "('ma9','mc1',NULL,'actor','hi',1,'2026-01-01T00:00:00+00:00')"))
+        assert "ck_messages_sender_kind" in str(exc.value) or "CHECK" in str(exc.value), (
+            "the old value was refused, but not demonstrably by the sender_kind "
+            f"CHECK — the rename may be a relabel. Error: {exc.value}")
 
         # THE REBUILD MUST NOT COST THE UNIQUE CONSTRAINT. batch_alter_table
         # recreates `messages` (create-new + copy + swap), and this table carries
