@@ -6,6 +6,12 @@ already decided was wrong.
 
 === WHY THE RENAME (Nick's call, 2026-09-20) ===
 
+Provenance, since it is three steps and not one: Nick flagged the COLLISION ("in aiko
+services actors are an important, well defined catagory"); the inversion argument below
+came from reading `actor.py` after that; he then agreed with it and ruled the rename.
+Derived and endorsed, which is the normal shape — recorded only so a later reader knows
+the reasoning is open to challenge on its merits, while the decision is not.
+
 In aiko_services an `Actor` is a precise and nearly OPPOSITE thing.
 `aiko_services/main/actor.py:198` defines `class Actor(Service)` on the Hewitt
 actor model: a registered name, a protocol string, an ordered priority mailbox at

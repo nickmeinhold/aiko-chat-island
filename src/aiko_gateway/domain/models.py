@@ -292,7 +292,10 @@ class SenderKind(enum.StrEnum):
     island failed to learn about them.
 
     IT WAS CALLED 'actor' UNTIL 0027, AND THE RENAME IS THE POINT (Nick,
-    2026-09-20). In aiko_services an `Actor` is a precise thing and close to the
+    2026-09-20). He flagged the collision — "in aiko services actors are an important,
+    well defined catagory" — the inversion argument below came from reading the source
+    after that, and he then agreed with it and ruled the rename. Derived and endorsed,
+    not decreed. In aiko_services an `Actor` is a precise thing and close to the
     OPPOSITE of this: `main/actor.py:198` defines `class Actor(Service)` on the
     Hewitt actor model, with a registered name, a protocol string, an ordered
     priority mailbox at `{topic_path}/in`, leases, a lifecycle, and an EC producer
