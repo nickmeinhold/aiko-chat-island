@@ -140,3 +140,44 @@ def test_member_roster_carries_the_account_kind():
     human = _user(UserKind.HUMAN, name="armbot")
     assert _member_view(SimpleNamespace(
         user_id=human.id, role="member", can_post=True), human)["kind"] == "human"
+
+
+def test_sender_kind_is_a_superset_of_user_kind():
+    """SenderKind must contain every UserKind value, or sends 500 in production.
+
+    Both writers of `messages.sender_kind` CONSTRUCT a member from an account's
+    `users.kind` — `messages_service.py:180` (`sender_kind=SenderKind(user.kind)`)
+    and `_kind_for`'s identified-sender arm. `SenderKind(...)` is a constructor, not
+    a cast: handed a value the enum lacks it raises `ValueError`, and it raises on
+    the SEND PATH. So a `UserKind` member with no counterpart in `SenderKind` is an
+    unhandled 500 on every message that class of account sends.
+
+    Measured before this test existed: `SenderKind("service")` raises
+    `ValueError: 'service' is not a valid SenderKind`.
+
+    WHY THIS IS THE DANGEROUS SHAPE. The blast radius is the narrowest possible —
+    only the new account type breaks, every existing user is unaffected, and the
+    suite stays green because no fixture has the new kind yet. A coupling that
+    fails for exactly one new thing is far harder to notice than one that fails for
+    everything, which is why it gets a test rather than a comment. Add a member to
+    `UserKind` and this goes red here, at import-time speed, instead of at the first
+    message a service account sends.
+
+    The relation is deliberately ONE-WAY. `SenderKind` may hold members `UserKind`
+    does not — `unknown` is exactly that, an island fact about a failed lookup
+    rather than an account kind — so this asserts subset, never equality.
+    """
+    from aiko_gateway.domain.models import SenderKind, UserKind
+
+    user_values = {m.value for m in UserKind}
+    sender_values = {m.value for m in SenderKind}
+    missing = user_values - sender_values
+
+    assert not missing, (
+        f"UserKind member(s) {sorted(missing)} have no SenderKind counterpart. "
+        "Both sender_kind writers do SenderKind(user.kind), which RAISES on an "
+        "unknown value — so an account of this kind would 500 on every message it "
+        "sends. Add the member to SenderKind, add it to the ck_messages_sender_kind "
+        "CHECK in a migration, and tell the app tab before deploying (the wire "
+        "carries this value as sender.kind)."
+    )

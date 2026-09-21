@@ -1000,16 +1000,21 @@ def test_0027_renames_actor_rows_and_then_closes_the_set(tmp_path, monkeypatch) 
     command.upgrade(migrate._alembic_config(), "0026")
 
     engine = create_engine(sync_url)
-    try:
-        with engine.begin() as c:
-            c.execute(text(
-                "INSERT INTO communities (id, name, slug, visibility, category, "
-                "created_at) VALUES (:cid, 'Aiko', 'aiko', 'public', 'general', :ts)"
-            ), {"cid": "0" * 26, "ts": "2026-01-01T00:00:00+00:00"})
-    except Exception:
-        # The seeded community may already exist at this revision; either way the
-        # channel insert below is what matters.
-        pass
+    # NO community seed here, and NO try/except around the setup. An earlier version
+    # of this test inserted a community inside a bare `except Exception: pass`, and
+    # the insert named a `slug` column that does not exist on this table — so it threw
+    # on every run and the swallow hid it. The test still passed (FK enforcement is off
+    # per ISL-0002, so the channel below did not need a real parent), which made the
+    # fixture unable to distinguish "already seeded" from "my SQL is wrong" while it
+    # was in fact the second. Migration 0009 already seeds the default community, so
+    # the insert was never needed; asserting that is both the fix and the guard.
+    with engine.connect() as c:
+        seeded = c.execute(text(
+            "SELECT id FROM communities WHERE id = :cid"
+        ), {"cid": "0" * 26}).scalar_one_or_none()
+    assert seeded == "0" * 26, (
+        "migration 0009 should have seeded the default community by revision 0026; "
+        f"found {seeded!r}. The channel insert below depends on it.")
     try:
         with engine.begin() as c:
             c.execute(text(
@@ -1050,6 +1055,33 @@ def test_0027_renames_actor_rows_and_then_closes_the_set(tmp_path, monkeypatch) 
                     "sender_kind, body, aiko_origin, created_at) VALUES "
                     "('ma9','mc1',NULL,'actor','hi',1,'2026-01-01T00:00:00+00:00')"))
 
+        # THE REBUILD MUST NOT COST THE UNIQUE CONSTRAINT. batch_alter_table
+        # recreates `messages` (create-new + copy + swap), and this table carries
+        # uq_channel_client_msg — the constraint that makes optimistic send
+        # idempotent. If a rebuild silently dropped it, every client retry would
+        # become a duplicate message and nothing would object. 0027's docstring
+        # argues FK-safety for the swap at length and says nothing about this, so
+        # the risk was considered in one dimension only. Asserted functionally
+        # (the database refuses the duplicate), not by reading the DDL — a
+        # constraint present in CREATE TABLE text but not enforced is exactly the
+        # check-that-cannot-report-its-own-absence this suite hunts.
+        with engine.begin() as c:
+            c.execute(text(
+                "INSERT INTO messages (id, channel_id, sender_user_id, "
+                "sender_kind, body, client_msg_id, aiko_origin, created_at) VALUES "
+                "('mu1','mc1',NULL,'human','hi','dup',0,:ts)"
+            ), {"ts": "2026-01-01T00:00:00+00:00"})
+        with pytest.raises(IntegrityError) as exc:
+            with engine.begin() as c:
+                c.execute(text(
+                    "INSERT INTO messages (id, channel_id, sender_user_id, "
+                    "sender_kind, body, client_msg_id, aiko_origin, created_at) "
+                    "VALUES ('mu2','mc1',NULL,'human','hi','dup',0,:ts)"
+                ), {"ts": "2026-01-01T00:00:00+00:00"})
+        assert "client_msg_id" in str(exc.value), (
+            "the 0027 rebuild lost uq_channel_client_msg — a resent client_msg_id "
+            f"would now duplicate instead of no-op. Error was: {exc.value}")
+
         # And the downgrade puts the data back, in the reverse order (drop the
         # constraint, THEN rename) — otherwise it would write a value the
         # still-present CHECK rejects.
@@ -1057,7 +1089,7 @@ def test_0027_renames_actor_rows_and_then_closes_the_set(tmp_path, monkeypatch) 
         with engine.connect() as c:
             back = dict(c.execute(text(
                 "SELECT sender_kind, count(*) FROM messages GROUP BY 1")).all())
-        assert back == {"actor": 2, "human": 1}, (
+        assert back == {"actor": 2, "human": 2}, (
             f"the downgrade did not restore the old value: {back}")
     finally:
         engine.dispose()

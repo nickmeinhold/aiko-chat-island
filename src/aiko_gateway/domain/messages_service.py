@@ -241,6 +241,10 @@ def _kind_for(channel: Channel, sender_user: User | None) -> SenderKind:
     docstring argues for about 'group'.
     """
     if sender_user is not None:
+        # Constructing, not casting: this RAISES if users.kind holds a value
+        # SenderKind lacks. See the superset note on SenderKind — the two enums are
+        # coupled, and the test that pins it is the only thing keeping a future
+        # UserKind member from 500-ing this function in production.
         return SenderKind(sender_user.kind)
     return SenderKind.UNKNOWN  # no island account matched this sender
 

@@ -350,6 +350,19 @@ class SenderKind(enum.StrEnum):
     AGENT = "agent"
     UNKNOWN = "unknown"
 
+    # THIS SET MUST REMAIN A SUPERSET OF UserKind, and the coupling is load-bearing
+    # rather than incidental. Both writers of sender_kind CONSTRUCT a member from an
+    # account's `users.kind` (`SenderKind(user.kind)` — messages_service:180 and the
+    # identified-sender arm of _kind_for), so a UserKind member with no counterpart
+    # here raises ValueError ON THE SEND PATH: an unhandled 500 for every message
+    # that class of account sends, surfacing in production rather than at import.
+    #
+    # It holds today only because the two sets happen to line up. Adding 'service' or
+    # 'system' to UserKind without adding it here would break sends for exactly the
+    # new account type and nothing else — the narrowest possible blast radius, which
+    # is also the hardest to notice. `test_sender_kind_is_a_superset_of_user_kind`
+    # pins it so that addition goes red in the suite instead.
+
 
 def _in_check(column: str, values: type[enum.StrEnum]) -> str:
     """SQL `column IN ('a', 'b')` derived FROM the enum members, so the DB CHECK
