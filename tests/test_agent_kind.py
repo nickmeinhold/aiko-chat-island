@@ -77,20 +77,35 @@ async def test_user_kind_defaults_to_human(session):
 
 @pytest.mark.asyncio
 async def test_sender_kind_prefers_the_account_over_the_channel(session):
-    """A HUMAN posting in a 'robot' channel is still a human (#3096).
+    """A HUMAN posting in a 'robot' channel is still a human (#3096 — agent
+    identity / honest sender kind).
 
-    This pins the direction of the fix. ``_kind_for``'s unidentified-sender arm
-    falls back to the channel's kind, which answers "where was this sent" rather
-    than "who sent it". That fallback is correct ONLY when there is no account to
-    ask; the moment there is one, the account wins. Getting this backwards would
-    badge every human in a robot channel as a robot.
+    This pins the direction of the fix: the ACCOUNT wins over the channel whenever
+    there is an account to ask. Getting it backwards would badge every human in a
+    robot channel as a robot.
+
+    THE THIRD ASSERTION CHANGED with #3144 (the sender_kind closed set). It used to
+    read ``_kind_for(channel, None) == "robot"`` — the channel-kind fallback. That
+    arm is gone: nothing can create a channel of kind llm/robot (the three writers
+    of channels.kind hardcode DM or 'standard'), so it was dead by construction,
+    and keeping it once SenderKind pinned three members would have made it write a
+    value the DB CHECK rejects. An unidentified sender is UNKNOWN now, whatever the
+    channel claims to be — spelled 'unknown' and not 'actor' because aiko_services'
+    Actor is a REGISTERED bus participant, the opposite of an unidentified one
+    (Nick, 2026-09-20; see SenderKind).
+
+    Note the fixture proves the point: ``_channel(kind="robot")`` is an in-memory
+    object. No code path could produce that row.
     """
     channel, human = _channel(kind="robot"), _user(UserKind.HUMAN)
     assert messages_service._kind_for(channel, human) == "human"
     agent = _user(UserKind.AGENT, uid="a" * 26, name="armbot")
     assert messages_service._kind_for(channel, agent) == "agent"
-    # No account to ask -> the channel is the only signal left.
-    assert messages_service._kind_for(channel, None) == "robot"
+    # No account to ask -> UNKNOWN, and the channel's kind is NOT consulted. Asserted
+    # against a 'robot' channel specifically: under the old arm this returned
+    # "robot", so the fixture discriminates the change rather than merely agreeing
+    # with it.
+    assert messages_service._kind_for(channel, None) == "unknown"
 
 
 def test_member_roster_carries_the_account_kind():
@@ -125,3 +140,44 @@ def test_member_roster_carries_the_account_kind():
     human = _user(UserKind.HUMAN, name="armbot")
     assert _member_view(SimpleNamespace(
         user_id=human.id, role="member", can_post=True), human)["kind"] == "human"
+
+
+def test_sender_kind_is_a_superset_of_user_kind():
+    """SenderKind must contain every UserKind value, or sends 500 in production.
+
+    Both writers of `messages.sender_kind` CONSTRUCT a member from an account's
+    `users.kind` — `messages_service.py:180` (`sender_kind=SenderKind(user.kind)`)
+    and `_kind_for`'s identified-sender arm. `SenderKind(...)` is a constructor, not
+    a cast: handed a value the enum lacks it raises `ValueError`, and it raises on
+    the SEND PATH. So a `UserKind` member with no counterpart in `SenderKind` is an
+    unhandled 500 on every message that class of account sends.
+
+    Measured before this test existed: `SenderKind("service")` raises
+    `ValueError: 'service' is not a valid SenderKind`.
+
+    WHY THIS IS THE DANGEROUS SHAPE. The blast radius is the narrowest possible —
+    only the new account type breaks, every existing user is unaffected, and the
+    suite stays green because no fixture has the new kind yet. A coupling that
+    fails for exactly one new thing is far harder to notice than one that fails for
+    everything, which is why it gets a test rather than a comment. Add a member to
+    `UserKind` and this goes red here, at import-time speed, instead of at the first
+    message a service account sends.
+
+    The relation is deliberately ONE-WAY. `SenderKind` may hold members `UserKind`
+    does not — `unknown` is exactly that, an island fact about a failed lookup
+    rather than an account kind — so this asserts subset, never equality.
+    """
+    from aiko_gateway.domain.models import SenderKind, UserKind
+
+    user_values = {m.value for m in UserKind}
+    sender_values = {m.value for m in SenderKind}
+    missing = user_values - sender_values
+
+    assert not missing, (
+        f"UserKind member(s) {sorted(missing)} have no SenderKind counterpart. "
+        "Both sender_kind writers do SenderKind(user.kind), which RAISES on an "
+        "unknown value — so an account of this kind would 500 on every message it "
+        "sends. Add the member to SenderKind, add it to the ck_messages_sender_kind "
+        "CHECK in a migration, and tell the app tab before deploying (the wire "
+        "carries this value as sender.kind)."
+    )

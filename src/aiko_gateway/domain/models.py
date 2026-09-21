@@ -251,6 +251,119 @@ class ReportResolution(enum.StrEnum):
     DISMISSED = "dismissed"
 
 
+class SenderKind(enum.StrEnum):
+    """Closed set of `messages.sender_kind` — what kind of sender produced a
+    message, for honest client rendering (#3144). Drives the DB CHECK on
+    messages.sender_kind via _in_check, same single-source pattern as
+    ChannelKind/Role/Platform.
+
+    THIS IS THE FIRST PLACE THE SET IS STATED. Until now the vocabulary was
+    EMERGENT from `messages_service._kind_for`'s control flow — two members
+    borrowed from UserKind, two from ChannelKind, and one bare literal declared
+    nowhere at all. A reader had to trace three branches to learn what the column
+    could hold, and nothing enforced the answer: this was the only closed-set-
+    shaped column in the schema absent from all 13 _in_check call sites.
+
+    THREE MEMBERS, NOT FIVE, and the two that are missing are the argument. The
+    set is pinned to what a writer can actually produce. `llm` and `robot` were
+    reachable only through _kind_for's CHANNEL fallback, and no code path can
+    create a channel of those kinds — the three writers of channels.kind are
+    dm_service (hardcoded DM), channels_service (hardcoded 'standard') and
+    memberships_service (a 'standard' default whose only caller never passes it).
+    So those two arms were dead BY CONSTRUCTION, not merely unexercised, and the
+    live distribution agrees: across both islands, 2026-09-20, sender_kind holds
+    only 'human' and the unknown-sender value (enspyr 171/76, imagineering 44/2 —
+    stored as 'actor' at measurement time, renamed by 0027) and no channel is
+    anything but 'dm' or 'standard'.
+
+    Nick's ruling 2026-09-20 on the ambiguity — an absent writer here means NOT
+    BUILT, not declined. So llm/robot channels remain intended, and the work that
+    makes one creatable adds BOTH the channels.kind writer AND these two members,
+    in ONE migration. That is the same one-step-at-a-time shape ChannelKind's own
+    docstring argues for about 'group': pre-permitting a value without the thing
+    that produces it makes a CHECK wider than reality, so the constraint cannot
+    catch the case it appears to be catching.
+
+    'unknown' IS A SENTINEL, NOT A PEER OF THE OTHER TWO. 'human' and 'agent' are
+    CLAIMS about who sent a message, read from the sender's own account. 'unknown'
+    is the ABSENCE of one: _kind_for returns it whenever the account lookup fails,
+    and that lookup is a match of the bus message's `username` against
+    users.aiko_username. It does not describe the sender; it describes what the
+    island failed to learn about them.
+
+    IT WAS CALLED 'actor' UNTIL 0027, AND THE RENAME IS THE POINT (Nick,
+    2026-09-20). In aiko_services an `Actor` is a precise thing and close to the
+    OPPOSITE of this: `main/actor.py:198` defines `class Actor(Service)` on the
+    Hewitt actor model, with a registered name, a protocol string, an ordered
+    priority mailbox at `{topic_path}/in`, leases, a lifecycle, and an EC producer
+    publishing its state — there is an entire `ActorDiscovery` class for finding
+    them. An Actor is the most strongly IDENTIFIED participant on the bus. Using
+    its name for "we could not identify this sender" inverts the term, and a reader
+    who knows the framework reads the old value as a STRONGER identity claim than
+    'human' rather than the absence of one.
+
+    The rename is not pedantry, because the old name looked right for the wrong
+    reason. `aiko-chat-bridge/examples/reference_robot.py:60` is
+    `class ReferenceRobot(Actor)` — so @@armbot, which produced 58 of the 76 rows
+    that held the old value, genuinely IS an aiko Actor. The island never checked
+    that. It failed a users lookup and fell back to a word that happened to fit 76%
+    of the time; for the other 18 rows — messages a PERSON typed — it asserted that
+    a registered bus service had spoken.
+
+    "A registered aiko Actor sent this" remains a claim nobody can make here, and
+    if it is ever wanted it needs its own member derived from a real Actor lookup,
+    not a fallback that is coincidentally right.
+
+    MEASURED, 2026-09-20, chat.enspyr.co, the whole message history:
+
+        sender_kind='unknown'  ->  aiko_origin=1, 76 rows  (stored 'actor' before 0027)
+        sender_kind='human'  ->  aiko_origin=0, 171 rows
+
+    The split is total. In production this column has never once distinguished a
+    robot from a person — it has encoded exactly one bit, whether a message arrived
+    over the BUS or through the GATEWAY. The 76 break down as 58 messages from
+    `@@armbot` (a real robot, which has no User row on either island — precisely
+    the account #3096 exists to give it) and 18 messages a HUMAN typed
+    (`@@armbot wave`, `@@armbot bend your elbow a bit`) which returned from the bus
+    carrying no username and were therefore badged as not-a-person. That second
+    group is the honesty column failing in the opposite direction to the one #3096
+    fixed, and it has its own ticket.
+
+    So the set is honest about what it can currently know, and the docstring should
+    not oversell it. Give armbot an account and its 58 become 'agent'; fix the
+    username round-trip and the 18 become 'human'; what remains for 'unknown' is a
+    genuinely anonymous bus speaker, which is what 'unknown' says on its face.
+
+    THE READ PATH STAYS PERMISSIVE, deliberately, and this is a cross-tab
+    decision. aiko_chat_app's SenderKind.fromWire has a `default:` arm that
+    degrades an unrecognised value to its generic-actor badge
+    (message.dart:22, documented as a rule at chat_screen.dart:759). Closing the
+    island's READ path too — raising on an out-of-set stored value — would 500 a
+    history fetch on a value the consumer has already said it handles. So: CHECK
+    on the write, plain Mapped[str] on the column, no load-time coercion. This is
+    the OPPOSITE of the fail-closed ruling at rest/devices.py:169, and the
+    difference is the consumer contract: there the echo IS the desync detector and
+    a wrong value corrupts the instrument, here the client degrades by design.
+    """
+
+    HUMAN = "human"
+    AGENT = "agent"
+    UNKNOWN = "unknown"
+
+    # THIS SET MUST REMAIN A SUPERSET OF UserKind, and the coupling is load-bearing
+    # rather than incidental. Both writers of sender_kind CONSTRUCT a member from an
+    # account's `users.kind` (`SenderKind(user.kind)` — messages_service:180 and the
+    # identified-sender arm of _kind_for), so a UserKind member with no counterpart
+    # here raises ValueError ON THE SEND PATH: an unhandled 500 for every message
+    # that class of account sends, surfacing in production rather than at import.
+    #
+    # It holds today only because the two sets happen to line up. Adding 'service' or
+    # 'system' to UserKind without adding it here would break sends for exactly the
+    # new account type and nothing else — the narrowest possible blast radius, which
+    # is also the hardest to notice. `test_sender_kind_is_a_superset_of_user_kind`
+    # pins it so that addition goes red in the suite instead.
+
+
 def _in_check(column: str, values: type[enum.StrEnum]) -> str:
     """SQL `column IN ('a', 'b')` derived FROM the enum members, so the DB CHECK
     can never drift from the Python closed set — change the enum, the constraint
@@ -584,15 +697,26 @@ class Message(Base):
     __table_args__ = (
         # Idempotent optimistic send: a resent client_msg_id no-ops, not dupes.
         UniqueConstraint("channel_id", "client_msg_id", name="uq_channel_client_msg"),
+        # Closed set at the DB (#3144), matching the posture ck_channels_kind and
+        # ck_users_kind already give their columns. sender_kind drives the client's
+        # human-vs-agent badge, and the #2633 cage-match ruled that a
+        # rendering-relevant kind must not rest on an unenforced open string.
+        CheckConstraint(_in_check("sender_kind", SenderKind),
+                        name="ck_messages_sender_kind"),
     )
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=new_ulid)
     channel_id: Mapped[str] = mapped_column(ForeignKey("channels.id"), nullable=False, index=True)
-    # Null when the sender is a non-gateway aiko actor (llm/robot/external REPL).
+    # Null when no island account matched the bus message's username — the sender
+    # is then stamped SenderKind.UNKNOWN. (Said 'llm/robot/external REPL' until
+    # 0027; llm/robot were retired as unproducible, so the honest statement is about
+    # the FAILED LOOKUP, not about what kind of thing was on the other end.)
     sender_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
-    # human|agent|llm|robot|actor. The first two come from the SENDER's own
-    # users.kind (#3096); the last three are CHANNEL-derived fallbacks used only
-    # when no island account identifies the sender (_kind_for). Still an
-    # unenforced open string at the DB — #3144 tracks the closed-set CHECK.
+    # human|agent|unknown — the SenderKind closed set, CHECK-enforced since #3144.
+    # The first two come from the SENDER's own users.kind (#3096); 'unknown' is the
+    # no-account-matched fallback used when no island account identifies the
+    # sender (_kind_for). Typed Mapped[str] and NOT Mapped[SenderKind] on purpose:
+    # the write is closed by ck_messages_sender_kind, the READ stays permissive so
+    # a downgrade-then-upgrade cannot 500 a history fetch. See SenderKind.
     sender_kind: Mapped[str] = mapped_column(String(16), nullable=False)
     sender_label: Mapped[str | None] = mapped_column(String(128), nullable=True)
     body: Mapped[str] = mapped_column(Text, nullable=False)

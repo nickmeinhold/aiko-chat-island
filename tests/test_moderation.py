@@ -190,13 +190,18 @@ async def test_third_party_sees_everyone(session):
 
 
 async def test_external_actor_messages_always_visible(session):
-    """A NULL-sender message (LLM/robot/REPL) can't be in a block relationship,
-    so it is visible to everyone regardless of blocks."""
+    """A NULL-sender message (an anonymous bus speaker) can't be in a block
+    relationship, so it is visible to everyone regardless of blocks.
+
+    Kind is UNKNOWN, not "llm": #3144 (the sender_kind closed set) retired llm/robot
+    because nothing can create a channel of those kinds. What this test needs is
+    only a sender with no account to block, which UNKNOWN is.
+    """
     ch = await _public_channel(session)
     a = await _user(session, "alice")
     b = await _user(session, "bob")
     await _msg(session, mid=1, channel=ch, sender=b)
-    await _msg(session, mid=2, channel=ch, sender=None, kind="llm", sender_user_id=None)
+    await _msg(session, mid=2, channel=ch, sender=None, kind="unknown", sender_user_id=None)
     await moderation_service.block_user(session, a.id, b.id)
 
     rows = await messages_service.get_history(session, ch.id, a.id, limit=50)

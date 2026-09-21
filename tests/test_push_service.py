@@ -192,7 +192,7 @@ async def dm(session, monkeypatch):
         Membership(channel_id=CHANNEL, user_id=bob.id),
         DeviceToken(user_id=bob.id, platform="apns", token="b" * 64),
         Message(id="01BOBSPOKEHERE00000000000", channel_id=CHANNEL,
-                sender_user_id=bob.id, sender_kind="user", body="hi"),
+                sender_user_id=bob.id, sender_kind="human", body="hi"),
     ])
     await session.commit()
 
@@ -1414,7 +1414,7 @@ async def test_a_first_contact_call_invite_does_not_wake(
         # The caller's own sentinel — production always has this by the time the
         # wake is scheduled, so a "the channel has any row" predicate must fail.
         Message(id="01ALICEINVITE00000000000", channel_id=CHANNEL,
-                sender_user_id=alice.id, sender_kind="user",
+                sender_user_id=alice.id, sender_kind="human",
                 body=push_service.CALL_INVITE_BODY),
         # AND Bob has spoken SOMEWHERE ELSE (Tesla, cage-match PR#173 r2). The
         # predicate is TWO conjuncts — this channel AND this recipient — and the
@@ -1441,7 +1441,7 @@ async def test_a_first_contact_call_invite_does_not_wake(
                 community_id=sa.null()),
         Membership(channel_id=OTHER_CHANNEL, user_id=bob.id),
         Message(id="01BOBSPOKEELSEWHERE00000", channel_id=OTHER_CHANNEL,
-                sender_user_id=bob.id, sender_kind="user", body="hi from #general"),
+                sender_user_id=bob.id, sender_kind="human", body="hi from #general"),
     ])
     await session.commit()
 
