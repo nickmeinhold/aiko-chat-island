@@ -692,3 +692,73 @@ def test_downgrade_0022_to_0021_round_trips_a_fat_row(tmp_path, monkeypatch):
                 "ON u.id = m.user_id")).scalar_one() == 1
     finally:
         engine.dispose()
+
+
+_INSERT_MESSAGE = (
+    "INSERT INTO messages (id, channel_id, sender_user_id, sender_kind, body, "
+    "aiko_origin, created_at) VALUES "
+    "(:mid, 'c1', NULL, :kind, 'hi', 0, '" + _TS + "')"
+)
+
+
+def test_sender_kind_check_rejects_out_of_set(tmp_path, monkeypatch):
+    """messages.sender_kind is closed to human|agent|actor by a DB CHECK (#3144 —
+    the sender_kind closed set), the same defense-beyond-the-API posture
+    ck_channels_kind and ck_users_kind already give their columns.
+
+    THE WITNESS IS NOT A MEMBER OF ANY ENUM, and that is deliberate. The app tab
+    found the inverse trap the same day: a green test proving "an unknown
+    sender_kind degrades to a badge" whose witness was fromWire('agent') — a value
+    that was not unknown at all but a real member of this island's set, which the
+    client then mishandled. The contract was right, the witness was wrong, and the
+    green is precisely why nobody looked. So 'hologram' here, never a value any
+    system might legitimately start sending.
+
+    A DISTINCT message id per insert so a failure can ONLY be the sender_kind
+    CHECK, never a PK collision (the test-green-for-the-wrong-reason trap, Carnot
+    PR#24 — the distinct-key discipline this file already uses for role and kind).
+    """
+    engine = _fresh_at_head(tmp_path, monkeypatch)
+    try:
+        with engine.begin() as c:
+            c.execute(text(_INSERT_CHANNEL), {"jp": "invite_only"})
+            # All three members accepted, each on its own id.
+            for i, kind in enumerate(("human", "agent", "unknown")):
+                c.execute(text(_INSERT_MESSAGE), {"mid": f"m{i}", "kind": kind})
+        with pytest.raises(IntegrityError) as exc:
+            with engine.begin() as c:
+                c.execute(text(_INSERT_MESSAGE), {"mid": "m9", "kind": "hologram"})
+        assert "ck_messages_sender_kind" in str(exc.value) or "CHECK" in str(exc.value)
+    finally:
+        engine.dispose()
+
+
+def test_sender_kind_check_rejects_the_retired_channel_kinds(tmp_path, monkeypatch):
+    """'llm' and 'robot' are NOT members, and this pins that as a decision.
+
+    They were reachable only through _kind_for's channel-kind fallback, and nothing
+    can create a channel of those kinds — the three writers of channels.kind are
+    dm_service (hardcoded DM), channels_service (hardcoded 'standard') and
+    memberships_service (a 'standard' default whose only caller never passes it).
+    Dead by construction; the arm was removed in the same change that added this
+    CHECK, because a branch that writes a value the CHECK rejects is a trap rather
+    than dead weight.
+
+    Nick's ruling 2026-09-20: an absent writer here means NOT BUILT, not declined.
+    So this test is a TRIPWIRE, not a prohibition — the change that makes an
+    llm/robot channel creatable is expected to delete it, restore _kind_for's arm,
+    and add both members in one migration. Failing here means someone re-introduced
+    the producer without the matching set, which is the half-invariant
+    ChannelKind's docstring argues against about 'group'.
+    """
+    engine = _fresh_at_head(tmp_path, monkeypatch)
+    try:
+        with engine.begin() as c:
+            c.execute(text(_INSERT_CHANNEL), {"jp": "invite_only"})
+        for i, retired in enumerate(("llm", "robot")):
+            with pytest.raises(IntegrityError):
+                with engine.begin() as c:
+                    c.execute(text(_INSERT_MESSAGE),
+                              {"mid": f"r{i}", "kind": retired})
+    finally:
+        engine.dispose()

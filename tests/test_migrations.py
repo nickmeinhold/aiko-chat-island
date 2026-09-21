@@ -893,3 +893,171 @@ def test_the_0026_column_is_nullable_with_no_default(tmp_path, monkeypatch) -> N
         f"install_id carries a server_default ({col['default']!r}); a default "
         "would put every row that never declared an identity into one handset, "
         "which is a missed call waiting for the first reader of this column")
+
+
+def test_sender_kind_check_literal_matches_the_enum(tmp_path, monkeypatch) -> None:
+    """Parity gate for ck_messages_sender_kind (#3144 — the sender_kind closed set).
+
+    Revision 0027 hand-writes its CHECK literal because alembic's compare_metadata
+    is CHECK-blind on SQLite, so nothing but this test stops the migration's set and
+    the SenderKind enum from drifting apart. Both halves are asserted the way PR#170
+    (token_kind) established: the SOURCE literals must agree, AND the constraint must
+    actually be in the migrated DDL attached to the right column, AND the database
+    must refuse an out-of-set value. Any one alone stays green while the others rot.
+    """
+    import re as _re
+    import sqlite3
+    from alembic import command
+    from aiko_gateway import migrate
+    from aiko_gateway.domain.models import SenderKind, _in_check
+
+    _async_url, sync_url = _point_app_at(tmp_path, monkeypatch)
+    command.upgrade(migrate._alembic_config(), "head")
+
+    con = sqlite3.connect(sync_url.replace("sqlite:///", ""))
+    ddl = con.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='messages'"
+    ).fetchone()[0]
+
+    assert "ck_messages_sender_kind" in ddl, (
+        "the migrated messages table carries no sender_kind CHECK — 0027 did not "
+        "reach the DB")
+
+    # Balanced extraction, same reason as the token_kind gate above: a naive
+    # `\(([^)]*)\)` stops at the close paren inside `IN ('human', 'agent', 'actor')`
+    # and compares a truncated clause that can never match.
+    def _check_clause(ddl_text: str, name: str) -> str | None:
+        anchor = _re.search(rf"{name}\s+CHECK\s*\(", ddl_text, _re.I)
+        if not anchor:
+            return None
+        i = anchor.end()
+        depth = 1
+        for j in range(i, len(ddl_text)):
+            if ddl_text[j] == "(":
+                depth += 1
+            elif ddl_text[j] == ")":
+                depth -= 1
+                if depth == 0:
+                    return ddl_text[i:j]
+        return None
+
+    clause = _check_clause(ddl, "ck_messages_sender_kind")
+    assert clause, f"could not extract the sender_kind CHECK clause from: {ddl!r}"
+
+    def _norm(x: str) -> str:
+        return "".join(str(x).lower().split()).replace('"', "'")
+
+    # Compare the TARGET EXPRESSION, not just the member literals: scanning for
+    # 'human'/'agent'/'actor' is satisfied by a CHECK on the wrong column that
+    # happens to contain them.
+    assert _norm(clause) == _norm(_in_check("sender_kind", SenderKind)), (
+        f"the migrated CHECK clause is {clause!r}, which is not what _in_check "
+        f"renders ({_in_check('sender_kind', SenderKind)!r})")
+
+    # THE WORK OUTPUT, not the nameplate: everything above still reads generated
+    # text. Only a refused write binds the constraint to this column.
+    con.execute(
+        "INSERT INTO channels (id, name, kind, aiko_channel, is_private, "
+        "join_policy, community_id, created_at) VALUES "
+        "('pc1','c','standard','aiko/pc',0,'invite_only',?, '2026-01-01T00:00:00+00:00')",
+        ("0" * 26,))
+    con.execute(
+        "INSERT INTO messages (id, channel_id, sender_user_id, sender_kind, body, "
+        "aiko_origin, created_at) VALUES "
+        "('pm1','pc1',NULL,'unknown','hi',0,'2026-01-01T00:00:00+00:00')")
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            con.execute(
+                "INSERT INTO messages (id, channel_id, sender_user_id, sender_kind, "
+                "body, aiko_origin, created_at) VALUES "
+                "('pm2','pc1',NULL,'hologram','hi',0,'2026-01-01T00:00:00+00:00')")
+    finally:
+        con.close()
+
+
+def test_0027_renames_actor_rows_and_then_closes_the_set(tmp_path, monkeypatch) -> None:
+    """The DATA half of 0027, which the parity gate above cannot reach.
+
+    That test drives a FRESH database, so it proves the CHECK exists and bites but
+    never exercises the UPDATE — there are no legacy rows to convert. This one stops
+    at 0026, seeds the exact shape both live islands hold, then upgrades and reads
+    the rows back.
+
+    It also pins the ORDER, which is the part that could silently rot. The UPDATE
+    must run BEFORE create_check_constraint: batch_alter_table rebuilds `messages`
+    and copies every row through, so a surviving 'actor' row would fail the new
+    constraint mid-rebuild and abort the migration on a live box. Swap the two
+    statements in 0027 and this test goes red rather than discovering it during a
+    production deploy.
+
+    Seeded counts are the measured live ones (chat.enspyr.co, 2026-09-20): 'human'
+    rows that must be untouched alongside 'actor' rows that must all move.
+    """
+    from sqlalchemy import text
+    from sqlalchemy.exc import IntegrityError
+
+    _async_url, sync_url = _point_app_at(tmp_path, monkeypatch)
+    command.upgrade(migrate._alembic_config(), "0026")
+
+    engine = create_engine(sync_url)
+    try:
+        with engine.begin() as c:
+            c.execute(text(
+                "INSERT INTO communities (id, name, slug, visibility, category, "
+                "created_at) VALUES (:cid, 'Aiko', 'aiko', 'public', 'general', :ts)"
+            ), {"cid": "0" * 26, "ts": "2026-01-01T00:00:00+00:00"})
+    except Exception:
+        # The seeded community may already exist at this revision; either way the
+        # channel insert below is what matters.
+        pass
+    try:
+        with engine.begin() as c:
+            c.execute(text(
+                "INSERT INTO channels (id, name, kind, aiko_channel, is_private, "
+                "join_policy, community_id, created_at) VALUES "
+                "('mc1','c','standard','aiko/mc',0,'invite_only',:cid,:ts)"
+            ), {"cid": "0" * 26, "ts": "2026-01-01T00:00:00+00:00"})
+            for mid, kind in (("ma1", "actor"), ("ma2", "actor"), ("mh1", "human")):
+                c.execute(text(
+                    "INSERT INTO messages (id, channel_id, sender_user_id, "
+                    "sender_kind, body, aiko_origin, created_at) VALUES "
+                    "(:mid,'mc1',NULL,:kind,'hi',1,:ts)"
+                ), {"mid": mid, "kind": kind, "ts": "2026-01-01T00:00:00+00:00"})
+
+        # Legacy rows are present and the constraint is NOT yet there — if this
+        # fails, the fixture is not reproducing the pre-migration state and
+        # everything below would be testing nothing.
+        with engine.connect() as c:
+            before = dict(c.execute(text(
+                "SELECT sender_kind, count(*) FROM messages GROUP BY 1")).all())
+        assert before == {"actor": 2, "human": 1}, before
+
+        command.upgrade(migrate._alembic_config(), "0027")
+
+        with engine.connect() as c:
+            after = dict(c.execute(text(
+                "SELECT sender_kind, count(*) FROM messages GROUP BY 1")).all())
+        assert after == {"unknown": 2, "human": 1}, (
+            f"0027 left rows unconverted: {after}. Every 'actor' row must become "
+            "'unknown', and 'human' rows must not be touched.")
+
+        # The constraint is live on the MIGRATED (not freshly created) table, and
+        # the OLD name is now refused — the rename is a closure, not a relabel.
+        with pytest.raises(IntegrityError):
+            with engine.begin() as c:
+                c.execute(text(
+                    "INSERT INTO messages (id, channel_id, sender_user_id, "
+                    "sender_kind, body, aiko_origin, created_at) VALUES "
+                    "('ma9','mc1',NULL,'actor','hi',1,'2026-01-01T00:00:00+00:00')"))
+
+        # And the downgrade puts the data back, in the reverse order (drop the
+        # constraint, THEN rename) — otherwise it would write a value the
+        # still-present CHECK rejects.
+        command.downgrade(migrate._alembic_config(), "0026")
+        with engine.connect() as c:
+            back = dict(c.execute(text(
+                "SELECT sender_kind, count(*) FROM messages GROUP BY 1")).all())
+        assert back == {"actor": 2, "human": 1}, (
+            f"the downgrade did not restore the old value: {back}")
+    finally:
+        engine.dispose()

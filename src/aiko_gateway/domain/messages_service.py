@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..aiko.payload import InboundMessage
 from . import acl, channels_service, dm_service, moderation_service, signing_keys_service
 from .ids import new_ulid
-from .models import Channel, ChannelKind, Message, Retraction, User
+from .models import Channel, ChannelKind, Message, Retraction, SenderKind, User
 
 
 class BlockedDmSend(Exception):
@@ -177,7 +177,7 @@ async def create_outbound(
         # use — so hardcoding here is precisely how an agent would end up wearing a
         # human badge. Kept identical in shape to _kind_for's identified-sender arm;
         # both writers of sender_kind must answer "who sent it".
-        sender_kind=user.kind,
+        sender_kind=SenderKind(user.kind),
         sender_label=user.display_name,
         body=body,
         reply_to=reply_to,
@@ -197,7 +197,7 @@ async def create_outbound(
     return row, True
 
 
-def _kind_for(channel: Channel, sender_user: User | None) -> str:
+def _kind_for(channel: Channel, sender_user: User | None) -> SenderKind:
     """What KIND of sender produced this message, for honest client rendering.
 
     An identified sender answers from its OWN account kind (#3096) — not the
@@ -206,17 +206,43 @@ def _kind_for(channel: Channel, sender_user: User | None) -> str:
     agents got User rows. ADR-0005 (app tab) makes an agent a first-class
     Principal, so it must be able to say so on the wire.
 
-    An UNidentified sender (sender_user is None) still falls back to the CHANNEL's
-    kind, because that is the only signal available: an anonymous bus speaker
-    carries no island identity to ask. That fallback answers "where was this
-    sent", not "who sent it", and is a known weakness rather than a design — it is
-    exactly what #3096 exists to retire, by giving bus actors real accounts.
+    An UNidentified sender falls back to UNKNOWN, which states a fact about the
+    ISLAND rather than about the sender: no row in users matched this message's
+    bus `username`. It is a known weakness rather than a design — exactly what
+    #3096 (agent identity) exists to retire, by giving bus participants real
+    accounts. The member was called 'actor' until 0027; see SenderKind for why
+    borrowing aiko_services' term for an unidentified sender inverted it.
+
+    THE CHANNEL-KIND ARM IS GONE (#3144). This used to read
+
+        if channel.kind in ("llm", "robot"):
+            return channel.kind
+
+    and it could not fire. Nothing creates a channel of those kinds: the three
+    writers of channels.kind are dm_service (hardcoded DM), channels_service
+    (hardcoded 'standard') and memberships_service (a 'standard' default whose
+    only caller never passes it). Dead by construction, not merely unexercised —
+    and the live data agrees, both islands holding only 'human' and the
+    unknown-sender value across every message ever sent.
+
+    REMOVED RATHER THAN MARKED, which is the opposite of what the app tab did
+    with its matching llm/robot render arms, and the difference is worth stating.
+    Marking is right when the dead code is inert: theirs renders a badge nobody
+    receives, and deleting a path that may come back costs more than a comment.
+    Here the arm is not inert, it is CONTRADICTORY — SenderKind pins three
+    members, so if this branch ever did fire it would write a value
+    ck_messages_sender_kind rejects, turning a silent nothing into a 500 on send.
+    Code that cannot run is a comment; code that cannot run WITHOUT breaking is a
+    trap.
+
+    When llm/robot channels get built (Nick 2026-09-20: not built, not declined),
+    the change that makes one creatable restores this arm AND adds the two
+    SenderKind members in ONE migration — the same paired step ChannelKind's
+    docstring argues for about 'group'.
     """
     if sender_user is not None:
-        return sender_user.kind
-    if channel.kind in ("llm", "robot"):
-        return channel.kind
-    return "actor"  # external REPL / unknown bus participant
+        return SenderKind(sender_user.kind)
+    return SenderKind.UNKNOWN  # no island account matched this sender
 
 
 async def persist_inbound(session: AsyncSession, msg: InboundMessage) -> Message | None:

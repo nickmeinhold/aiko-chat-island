@@ -77,20 +77,35 @@ async def test_user_kind_defaults_to_human(session):
 
 @pytest.mark.asyncio
 async def test_sender_kind_prefers_the_account_over_the_channel(session):
-    """A HUMAN posting in a 'robot' channel is still a human (#3096).
+    """A HUMAN posting in a 'robot' channel is still a human (#3096 — agent
+    identity / honest sender kind).
 
-    This pins the direction of the fix. ``_kind_for``'s unidentified-sender arm
-    falls back to the channel's kind, which answers "where was this sent" rather
-    than "who sent it". That fallback is correct ONLY when there is no account to
-    ask; the moment there is one, the account wins. Getting this backwards would
-    badge every human in a robot channel as a robot.
+    This pins the direction of the fix: the ACCOUNT wins over the channel whenever
+    there is an account to ask. Getting it backwards would badge every human in a
+    robot channel as a robot.
+
+    THE THIRD ASSERTION CHANGED with #3144 (the sender_kind closed set). It used to
+    read ``_kind_for(channel, None) == "robot"`` — the channel-kind fallback. That
+    arm is gone: nothing can create a channel of kind llm/robot (the three writers
+    of channels.kind hardcode DM or 'standard'), so it was dead by construction,
+    and keeping it once SenderKind pinned three members would have made it write a
+    value the DB CHECK rejects. An unidentified sender is UNKNOWN now, whatever the
+    channel claims to be — spelled 'unknown' and not 'actor' because aiko_services'
+    Actor is a REGISTERED bus participant, the opposite of an unidentified one
+    (Nick, 2026-09-20; see SenderKind).
+
+    Note the fixture proves the point: ``_channel(kind="robot")`` is an in-memory
+    object. No code path could produce that row.
     """
     channel, human = _channel(kind="robot"), _user(UserKind.HUMAN)
     assert messages_service._kind_for(channel, human) == "human"
     agent = _user(UserKind.AGENT, uid="a" * 26, name="armbot")
     assert messages_service._kind_for(channel, agent) == "agent"
-    # No account to ask -> the channel is the only signal left.
-    assert messages_service._kind_for(channel, None) == "robot"
+    # No account to ask -> UNKNOWN, and the channel's kind is NOT consulted. Asserted
+    # against a 'robot' channel specifically: under the old arm this returned
+    # "robot", so the fixture discriminates the change rather than merely agreeing
+    # with it.
+    assert messages_service._kind_for(channel, None) == "unknown"
 
 
 def test_member_roster_carries_the_account_kind():

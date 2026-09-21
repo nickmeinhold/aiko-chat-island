@@ -92,7 +92,9 @@ async def test_hard_delete_cascades_messages_and_memberships(session):
     session.add_all([
         Membership(channel_id="C1", user_id="U1", role="member"),
         Message(id="M1", channel_id="C1", sender_user_id="U1", sender_kind="human", body="hi"),
-        Message(id="M2", channel_id="C1", sender_user_id=None, sender_kind="llm", body="yo"),
+        # An unidentified bus speaker is UNKNOWN (#3144 — the sender_kind closed
+        # set). Was "llm", a member retired because nothing can create an llm channel.
+        Message(id="M2", channel_id="C1", sender_user_id=None, sender_kind="unknown", body="yo"),
     ])
     await session.commit()
 
