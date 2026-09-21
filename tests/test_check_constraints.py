@@ -702,7 +702,7 @@ _INSERT_MESSAGE = (
 
 
 def test_sender_kind_check_rejects_out_of_set(tmp_path, monkeypatch):
-    """messages.sender_kind is closed to human|agent|actor by a DB CHECK (#3144 —
+    """messages.sender_kind is closed to human|agent|unknown by a DB CHECK (#3144 —
     the sender_kind closed set), the same defense-beyond-the-API posture
     ck_channels_kind and ck_users_kind already give their columns.
 

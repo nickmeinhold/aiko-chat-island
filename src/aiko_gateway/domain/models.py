@@ -706,7 +706,10 @@ class Message(Base):
     )
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=new_ulid)
     channel_id: Mapped[str] = mapped_column(ForeignKey("channels.id"), nullable=False, index=True)
-    # Null when the sender is a non-gateway aiko actor (llm/robot/external REPL).
+    # Null when no island account matched the bus message's username — the sender
+    # is then stamped SenderKind.UNKNOWN. (Said 'llm/robot/external REPL' until
+    # 0027; llm/robot were retired as unproducible, so the honest statement is about
+    # the FAILED LOOKUP, not about what kind of thing was on the other end.)
     sender_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     # human|agent|unknown — the SenderKind closed set, CHECK-enforced since #3144.
     # The first two come from the SENDER's own users.kind (#3096); 'unknown' is the

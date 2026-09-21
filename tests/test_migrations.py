@@ -924,7 +924,7 @@ def test_sender_kind_check_literal_matches_the_enum(tmp_path, monkeypatch) -> No
         "reach the DB")
 
     # Balanced extraction, same reason as the token_kind gate above: a naive
-    # `\(([^)]*)\)` stops at the close paren inside `IN ('human', 'agent', 'actor')`
+    # `\(([^)]*)\)` stops at the close paren inside `IN ('human', 'agent', 'unknown')`
     # and compares a truncated clause that can never match.
     def _check_clause(ddl_text: str, name: str) -> str | None:
         anchor = _re.search(rf"{name}\s+CHECK\s*\(", ddl_text, _re.I)
@@ -948,7 +948,7 @@ def test_sender_kind_check_literal_matches_the_enum(tmp_path, monkeypatch) -> No
         return "".join(str(x).lower().split()).replace('"', "'")
 
     # Compare the TARGET EXPRESSION, not just the member literals: scanning for
-    # 'human'/'agent'/'actor' is satisfied by a CHECK on the wrong column that
+    # 'human'/'agent'/'unknown' is satisfied by a CHECK on the wrong column that
     # happens to contain them.
     assert _norm(clause) == _norm(_in_check("sender_kind", SenderKind)), (
         f"the migrated CHECK clause is {clause!r}, which is not what _in_check "
