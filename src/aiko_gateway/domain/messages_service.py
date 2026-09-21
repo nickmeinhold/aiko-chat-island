@@ -198,6 +198,15 @@ async def create_outbound(
 
 
 def _kind_for(channel: Channel, sender_user: User | None) -> SenderKind:
+    # `channel` IS CURRENTLY UNREAD, and that is deliberate rather than an
+    # oversight (Tesla, cage-match PR#186). It is kept so the restore documented
+    # below is a one-line change at this call site rather than a signature change
+    # rippling through callers and tests. But an unread parameter ASSERTS a
+    # dependency that no longer exists: a future hand adding llm/robot back to
+    # SenderKind will see it and conclude the channel arm is already live. It is
+    # not. `test_sender_kind_prefers_the_account_over_the_channel` pins the
+    # current behaviour by passing a 'robot' channel and asserting 'unknown' —
+    # if this function ever consults `channel` again, that test must change too.
     """What KIND of sender produced this message, for honest client rendering.
 
     An identified sender answers from its OWN account kind (#3096) — not the

@@ -756,9 +756,18 @@ def test_sender_kind_check_rejects_the_retired_channel_kinds(tmp_path, monkeypat
         with engine.begin() as c:
             c.execute(text(_INSERT_CHANNEL), {"jp": "invite_only"})
         for i, retired in enumerate(("llm", "robot")):
-            with pytest.raises(IntegrityError):
+            # NAME THE CONSTRAINT, exactly as the hologram sibling above does
+            # (Tesla, cage-match PR#186). A bare `pytest.raises(IntegrityError)`
+            # hears ANY integrity failure as proof the CHECK fired — a PK
+            # collision, an FK, a NOT NULL — so the test would stay green while
+            # reporting something it never observed. Asymmetric armor is not
+            # armor: the same file was already doing this correctly 30 lines up.
+            with pytest.raises(IntegrityError) as exc:
                 with engine.begin() as c:
                     c.execute(text(_INSERT_MESSAGE),
                               {"mid": f"r{i}", "kind": retired})
+            assert "ck_messages_sender_kind" in str(exc.value) or "CHECK" in str(exc.value), (
+                f"'{retired}' was refused, but not by the sender_kind CHECK — this "
+                f"test cannot tell you the set is closed. Error was: {exc.value}")
     finally:
         engine.dispose()
