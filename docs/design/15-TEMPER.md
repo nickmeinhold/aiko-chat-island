@@ -151,5 +151,6 @@ shape the panel converged on, unprompted, from four directions:
   ISL-0003.
 
 **Owed to Nick:** the re-pick. This strike invalidates the option he chose on 2026-09-21,
-and the panel's alternative is work that already has a home (#47 / #1577 / #2301), so the
+and the panel's alternative is work that already has a home (**#2301**; `#47` in older docs
+does not resolve — see #4750), so the
 choice is his to make rather than one to infer.
