@@ -1,6 +1,34 @@
 # Declarative island deploy v2 — design (#2301)
 
-Status: **design, not build-ready** (2026-09-24). Owed a `/design-temper` before any code,
+> ## ⚠️ RECAST AT TEMPER — 4/4 FAMILIES, 2026-09-24. DO NOT BUILD FROM THIS FILE YET.
+>
+> Full panel, no dark seat, **unanimous RECAST — no DISSOLVE**. The direction survives; this
+> assembly does not. Ten fatal flaws with dispositions: **[16-TEMPER.md](16-TEMPER.md)**.
+> Raw strikes: `16-strikes/`.
+>
+> **Two are data-loss-grade and gate any build regardless of how the rest folds:**
+> - **The backup lands in the pruned generation.** An unchanged `update.sh` invoked from
+>   `current/deploy` resolves its relative backup path *into* `releases/<ts>/`, which §6 then
+>   prunes. The only undo for the recorded FATAL is stored in the thing that rotates.
+> - **`deploy/**` ships every island's ciphertext to every island.** `deploy/secrets/` holds
+>   both `.sops` files; the quantifier in §3 had no denylist.
+>
+> Headline structural finding: **§2 and §5 are the same wire pulled to opposite grounds** —
+> the shape that killed design 15's increment 2. §2 claims the loop dissolved; §5 will not
+> place a generation until the box answers, §6 will not without the age key, and because
+> `.env` is inside the cohort, *a one-line public compose forward — the exact 2026-09-11
+> repair — cannot move unless that key is alive.* §8 already says so in plain words.
+>
+> Also refuted: §4's *"before it nothing is live, after it everything is"* is v1's overclaim
+> relocated from `mv` into the word **live**; `GENERATION.txt` answers "what was placed", not
+> "what is running", while §3 grants it ISL-0003's authority; §5 collapses drift detection and
+> change delivery, so a legitimate change is indistinguishable from drift; §5a trusts a letter
+> the shipper wrote to itself, and absence of `current` must not be genesis.
+>
+> Status: **RECAST round 1 of ≤3.** Fold flaw 4's command split first — it simplifies several
+> others. Then re-strike.
+
+Status: **RECAST at temper 2026-09-24** (was: design, not build-ready). Struck and returned,
 per v1's own closing rule: *"Do not mark v2 'battle-tested' on the strength of v1's strike."*
 
 **Nick's pick, 2026-09-24 (#4750, option 1)**, after #4684 — move deploy tooling into the
