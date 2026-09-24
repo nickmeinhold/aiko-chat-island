@@ -284,6 +284,29 @@ class SenderKind(enum.StrEnum):
     that produces it makes a CHECK wider than reality, so the constraint cannot
     catch the case it appears to be catching.
 
+    ADDING A MEMBER HERE IS A CROSS-TAB EVENT — TELL THE APP TAB BEFORE YOU SHIP
+    IT (aiko_chat_app, 2026-09-24, measured on their side not inferred). Their
+    render switches (`chat_screen.dart:800-815`, `:829-838`) are exhaustive over
+    their own enum with NO default arm, so Dart 3 turns a new member they know
+    about into a COMPILE ERROR — that half is mechanised and needs nothing from
+    us. But their `fromWire` ends in a totalising `default:` that folds any
+    unrecognised wire string to `unknown`, deliberately: a client must not crash
+    on a value from a newer island, and fail-soft is right at a wire boundary.
+
+    The consequence is precise, and it does not trip any alarm on either side: a
+    sixth member shipped from here RENDERS AS THE GENERIC UNKNOWN BADGE in the
+    app, silently, with nothing anywhere reporting it. Their exhaustiveness check
+    protects against a new ENUM MEMBER; it cannot protect against a new WIRE
+    VALUE, because the fold absorbs it before the switch is ever reached.
+
+    Note the asymmetry with our own history, because it is the reason this note
+    exists rather than a test: the rogue `"user"` value was caught HERE by a CHECK
+    constraint, which is an instrument that can come back non-empty. The app has
+    no counterpart — a folded value is indistinguishable from a genuinely unknown
+    sender. **A fold is not a decision.** So the coordination is: name the member
+    to the app tab, let them add the arm, then ship. Reciprocal to the cross-tab
+    grounding rule in CLAUDE.md; their half is recorded in their repo.
+
     'unknown' IS A SENTINEL, NOT A PEER OF THE OTHER TWO. 'human' and 'agent' are
     CLAIMS about who sent a message, read from the sender's own account. 'unknown'
     is the ABSENCE of one: _kind_for returns it whenever the account lookup fails,
