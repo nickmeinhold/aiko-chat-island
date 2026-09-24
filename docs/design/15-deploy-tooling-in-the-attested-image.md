@@ -1,7 +1,43 @@
 # Deploy tooling in the attested image — design (#4684)
 
-Status: **design, not build-ready** (2026-09-24). Owed a `/design-temper` before any
-code. Nick's call 2026-09-21: option 2 — move this repo's deploy tooling into the
+> ## ⚠️ DISSOLVED AT TEMPER — 4/4 FAMILIES, 2026-09-24. DO NOT BUILD FROM THIS FILE.
+>
+> `/design-temper` run `dt-1790262504`, full panel (Maxwell, Kelvin, Carnot, Tesla), no dark
+> seat, **unanimous DISSOLVE**. Nick's 2026-09-21 option 2 was struck and does not proceed
+> to a build. Verdict and the seven deduped fatal flaws: **[15-TEMPER.md](15-TEMPER.md)**.
+>
+> The headline: the dissolving alternative was already in the bundle. Declarative-deploy v2
+> ships the complete cohort from the control side and *removes* the unsynced surface rather
+> than shrinking it. Carnot's framing — **"the class was not 'too much shell'; it was 'the
+> thing that must enforce drift is itself unsynced'"**.
+>
+> Specific claims below that are now REFUTED, not merely outweighed:
+> - **§4b** — "before anything is pulled is thrift, not safety" is **wrong on its own terms**.
+>   `docker pull` mutates a shared multi-tenant host; §5d forbids prune; every refused deploy
+>   is a permanent allocation, and a full disk stops the island while the old container reads
+>   as "up". The #4684 retraction is **upheld**.
+> - **§4c / §5a** — mutually exclusive. Verifying SLSA needs a cosign-class verifier; §5a
+>   forbids a toolchain on the box. Increment 2 cannot be built.
+> - **§8** — Increment 1 is **not** independent of §4. Those functions read secret-bearing
+>   files, and the shim pins no `--entrypoint`, so a container's non-zero exit is
+>   indistinguishable from REFUSED — collapsing §5b's own three outcomes.
+> - **§5c** — `SHIM_CONTRACT` is prose functioning as executable governance, the exact thing
+>   this design quotes as its warrant. No channel here delivers shim updates.
+> - **§3f** — "14%" is a unit error: the denominator is padded with bootstrap and
+>   control-side lines. Line count is not the hazard; one forwarding decision is.
+>
+> **What survived, unanimously**, and should outlive this document: the three-home frame
+> (§1); `standup.sh`'s bootstrap constraint being total (§3b — #4684 does not know this, and
+> it belongs in ISL-0003 regardless); the docker-socket rejection (§3e); REFUSED / PASSED /
+> COULD NOT RUN, fail closed (§5b); `verify-secrets.sh` being control-side (§3a); §6's
+> non-goal; and §7's decisions-not-parsers split — which argues for **closed-set types and
+> tests in CI**, not for a language boundary on a sovereign box's deploy path.
+>
+> Kept for the reasoning and the rejected alternatives. **The re-pick is Nick's** — the
+> strike lands on the frame he chose, same posture as the reactive-deploy temper.
+
+Status: **DISSOLVED at temper 2026-09-24** (was: design, not build-ready; the temper it was
+owed is done and is what dissolved it). Nick's call 2026-09-21: option 2 — move this repo's deploy tooling into the
 already-attested image, leave a thin shim on the box. Scoped to **this repo's scripts
 only**; cage-match's own Dart rewrite lives in `claude-skills` and is that session's
 work.
