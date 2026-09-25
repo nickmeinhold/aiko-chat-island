@@ -1,7 +1,34 @@
 # Declarative island config delivery — design (#2301)
 
-Status: **round 3, a subtraction** (2026-09-25). Owed a final strike; the built PR still owes a
-`/cage-match`.
+> ## ⚠️ ROUND 3 STRUCK — NOT SOUND. BUDGET EXHAUSTED. NOT BUILD-READY.
+>
+> 1 SOUND (Carnot) vs 3 RECAST. Three of three rounds used; `/design-temper`'s rule is **stop
+> and report**, not a fourth fold. Status: **UN-TEMPERED (provisional)**. Verdict and the three
+> closing findings: **[16-TEMPER.md](16-TEMPER.md)**; strikes in `16-strikes/round3/`.
+>
+> **The subtraction was real — all four families said so**, and Carnot, who dissolved round 2
+> on economy grounds, **reversed to SOUND**: *"a small control-side shipper plus restore… no
+> longer burning a boiler to move one valve."*
+>
+> **What withheld SOUND is that the central subtraction does not work. MEASURED:**
+> `docker-compose.yml:48,329,344` use `${ISLAND_VERSION:-edge}` — Compose *interpolation*,
+> resolved from the process env or the project-directory `.env`, and `update.sh:90` passes no
+> `--env-file`. **The pin cannot leave `.env`.** Either it stays, and the shipper writes it, so
+> §3's "cannot change the image" is false and the deleted digest gate was load-bearing — or it
+> goes, and §7's cutover refuses every first ship while the next `up` interpolates **`edge`,
+> which tracks `main`**, on both islands. The one-command collapse, the unreachable FATAL and
+> the ungated `restore` all descend from this.
+>
+> Also fatal: **§8's keyless generation is §1 inverted** — the value was present and the
+> forward absent; now the forward is present and the value absent. And **§3 asserts
+> `update.sh` is unchanged while §4 requires it to apply generations** — those cannot both be
+> true; either the ship is a no-op, or the project directory becomes `releases/<ts>` and every
+> relative bind moves with it.
+>
+> **Do not build from this file.** Two ways forward are recorded in the temper, and the choice
+> is Nick's.
+
+Status: **NOT BUILD-READY — round 3 struck, budget exhausted** (2026-09-25).
 
 **Nick's pick 2026-09-24 (#4750, option 1)**, then two temper rounds:
 [16-TEMPER.md](16-TEMPER.md), strikes in `16-strikes/`. Round 1: RECAST 4/4, ten flaws of

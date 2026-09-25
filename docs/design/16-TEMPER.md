@@ -481,3 +481,154 @@ the same bar for round 3, and it is not "fix these":
 **Owed to Nick:** this is a second decision point, and it is his. Round 3 can be attempted, but
 it should be attempted *only* as a subtraction. A round 3 that adds a ninth mechanism has
 answered Carnot by proving him right.
+
+---
+
+# ROUND 3 — struck 2026-09-25, `dt-1790310533` — FINAL ROUND
+
+**Overall verdict: NOT SOUND. 1 SOUND (Carnot) vs 3 RECAST (Maxwell, Kelvin, Tesla).**
+Full panel, no dark seat.
+
+**Round budget exhausted — ≤3 rounds, and this was 3.** Per `/design-temper`'s own rule the
+disposition is **stop and report**, not a fourth fold. Status:
+**UN-TEMPERED (provisional) — NOT BUILD-READY.**
+
+**The subtraction was real. All four families said so**, including the three that withheld
+SOUND. Three commands → one; `deploy/**` → three enumerated files; two acknowledgements → one;
+digest-gated restore → plain restore; `local/` deleted; 284 lines removed against 226 added.
+Carnot — who DISSOLVED round 2 on economy grounds — **reversed to SOUND** and recorded that its
+economy test now passes: *"this is now a small control-side shipper plus restore… no longer
+burning a boiler to move one valve."* It also affirmed §1's cohort-of-two argument over its own
+`.env`-only alternative.
+
+**What withheld SOUND is not size. It is that the central subtraction does not work.**
+
+## Per-family verdicts
+
+| Family | Verdict | One-line |
+|---|---|---|
+| Carnot | **SOUND** | Economy test passes; subtraction real, not cosmetic; cohort-of-two beats `.env`-only. |
+| Maxwell | RECAST | `ISLAND_VERSION` cannot leave `.env` — **measured**: removing it unpins both islands to `edge`. |
+| Kelvin | RECAST | The Genesis Barrier (`n=0` unreachable); the keyless ship is a void, not a subtraction. |
+| Tesla | RECAST | *"The pin never leaves the only file Compose will read"*, and `update.sh` is asserted both ways and specified neither. |
+
+**Carnot's SOUND rests on a premise the other three refuted**, and its own fold-back names the
+hazard it missed: *"Do not let `ISLAND_VERSION` leak back through another env key or compose
+substitution. Feynman's rule applies: the easiest person to fool is the one who renamed the
+coupling."* It gave the pin's departure as its **reason** for SOUND.
+
+## The three findings that end the round
+
+### R3-1. The pin never left. **MEASURED.** [Maxwell, Tesla; Kelvin adjacent]
+
+`docker-compose.yml:48,329,344` — `image: ghcr.io/…:${ISLAND_VERSION:-edge}`. That is **Compose
+interpolation**, resolved from the process environment or **the project-directory `.env`**, and
+`update.sh:90` runs `docker compose -f docker-compose.yml` with **no `--env-file`**.
+
+Tesla's two horns, with no third:
+- **The pin is in the shipped `.env`** → the shipper writes it, `restore` swings it, *"cannot
+  change the image" is prose of the class this design quotes as its warrant*, and **the digest
+  gate was deleted because of a departure that never happened.** `restore` of a generation
+  whose `.env` names the old tag, followed by the operator's ordinary `update.sh`, pulls that
+  tag onto an `aiko_data` possibly at schema *N+1* — **the recorded FATAL, reached by the
+  recovery path**, with the sqlite path no longer printed because the boundary was declared
+  uncrossable.
+- **The pin is not in the shipped `.env`** → §7's full-byte cutover against the live `.env`
+  (where ISL-0003 puts it) **refuses on every first ship**, and the next `up` interpolates an
+  empty tag — i.e. **`edge`, which tracks `main`.** Both islands, silently, on the next
+  `update.sh`.
+
+Every escape reintroduces something deleted: preserve the box's line → **templating**, v1's
+deleted fossil; export it → ISL-0003's measured hazard where an exported pin beats `.env` and
+the guard blesses one tag while `pull` fetches another; `--env-file` → a second env source, the
+precedence class this repo has already been bitten by.
+
+**The one-command collapse, the unreachable-by-construction FATAL, and the ungated `restore`
+all descend from this.** It does not hold, so they do not.
+
+### R3-2. The keyless generation is §1 pulled to the opposite ground. [Kelvin, Tesla, Maxwell — all three]
+
+§1's single sentence is that `.env` and `docker-compose.yml` **move together or not at all.**
+§8 then ships compose and `mosquitto.conf` *without* `.env` and calls it the 2026-09-11 repair.
+
+Kelvin's literal reading is worse than Maxwell's: `current` names a directory with **no `.env`
+at all** — the old one sits in `releases/<previous>/`, which Compose does not walk back to. So
+it is not a mismatch, it is a **void**: every variable unset. Tesla's charitable reading is the
+mirror incident — *"the value was present and the forward was absent. Now the forward is
+present and the value is absent. Same outage, halves swapped."* And it is **the path of least
+resistance**, so it runs exactly when git is ahead of the box's secrets.
+
+Kelvin's disposition, adopted: *"You cannot engineer your way out of a lost key with a tool
+that requires the products of that key."* **There is no keyless ship.** Break-glass is the
+second age recipient — a social process — which round 2 had already accepted as the whole
+answer.
+
+**Tesla also partly refutes §1's strong form**, and this is owed to Carnot: while
+`preflight-compose-drift.sh` aborts `update.sh` before `up` when compose differs from the tag,
+**a stale compose never becomes the incident** — so `.env`-alone is *not* still the September
+incident. *"I am not dissolving the cohort for the overclaim. I am saying the overclaim is what
+licensed the split, and the split is fatal."*
+
+### R3-3. `update.sh` is asserted both ways and specified neither. [Tesla; Kelvin's Genesis Barrier is its `n=0` face]
+
+The design says `update.sh` is **unchanged** *and* that generations are what gets applied.
+Tesla: those cannot both be true.
+
+- **It never looks at the generation** → the swing changes a name nothing reads, *"backups land
+  where they land today" is true because the ship did not happen*, and **the ship is a no-op.**
+- **It is pointed at the generation** → the project directory becomes `releases/<ts>`, **every
+  relative bind moves with it**, and R2-2's backup arithmetic is back — with the inode gate
+  deleted on the grounds that no new arithmetic existed.
+
+*"The design asserts both directories and specifies neither invocation."*
+
+**And the gap survives a reboot.** New compose, new `.env` on disk; old containers, old mounts,
+old environment in the daemon; `/health` green about the old world — until something that can
+see `current` actually runs. `restart: unless-stopped` restarts the **existing** container; it
+does not re-read compose. Worse, the design's own discriminator inverts: *"GENERATION.txt is
+newer than the running containers"* fails once a restart refreshes start times without
+refreshing config — **the file becomes the older fact and the signal goes quiet.** The fact
+that survives is the one §5a already queries: canonical `working_dir` of the running project
+versus `realpath(current)`.
+
+**Kelvin's Genesis Barrier is the same defect at `n=0`:** a fresh `standup.sh` box has
+`aiko_data`, no containers, no `current/`. §5a reads that as *stopped tenant → REFUSE
+`--adopt`*; §5 reads missing `current` as COULD NOT RUN. **The tool cannot adopt a box because
+it is not already under management.** And `mv -T current.next current` when `current` is a real
+directory rather than a symlink **fails the rename** — a case specified for the reverse
+direction only, whose natural repair is the plain `mv` the design forbids.
+
+## What holds (affirmed in all three rounds)
+
+The cargo/vehicle cut — *"do not recast this back into a shim, a contract integer, or an image
+entrypoint."* Three enumerated files and **no executables**; the denylist stays buried; the
+human compiler is back to a diff the size of the incident that sized it. The swing for files:
+staging under `REMOTE_PATH`, `mv -T` symlink-onto-symlink, plain `mv` forbidden. Three daemon
+answers with the external volume as the tenant; `standup.sh` the only genesis. Secret posture
+entire. No scheduler, no pull, no recreate in the shipper. The subtractive middle — **a
+templating layer in any future fold is the fossil; kill it on sight.** `mosquitto.conf` earns
+its seat (Tesla: *"a bind target of the compose you ship; leaving it outside would make the
+cohort lie"*). And §1's sentence survives **as a constraint on any tool allowed to change
+compose**, even though its strong form does not.
+
+## Disposition — STOP. Two honest ways forward, and the choice is Nick's.
+
+**A. Write Tesla's four sentences, then stop.** Tesla is explicit that its remaining fold-backs
+are **not** a ninth mechanism: kill the keyless generation (no replacement); **name the one
+`update.sh` invocation** — cwd, `-f`, `--project-directory` — plus the single inode assertion;
+**stop saying the pin left** and restore the gate as one comparison (refuse when the running
+tag and the live `.env` pin disagree; `restore` refuses across an `ISLAND_VERSION` difference
+and prints the sqlite path); and **name the first ship** as its own transition gated by the §7
+cutover diff alone. *"Write the four sentences. The next fold is smaller only if it is these,
+and then stops."* — This is a round 4, which the budget forbids; it needs Nick's explicit
+extension, not an inference.
+
+**B. Take the honest remainder.** Tesla again: *"If 'update.sh unchanged' is kept as pride and
+the project directory is left unnamed, the ship is a no-op and Carnot's `.env`-only tool is the
+honest remainder — but that is you dropping the sentence, not me adding a machine."* That lands
+on the narrow `.env`-only tool, or on **option 3** — one manual sync per box plus the preflight
+that already exists and already works.
+
+**Recorded so it cannot be lost either way:** `preflight-compose-drift.sh` is a real compiler,
+it ran clean on both boxes on 2026-09-21, and three rounds of adversarial review have not found
+a reason to re-solve it.
