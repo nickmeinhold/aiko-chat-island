@@ -1,34 +1,29 @@
 # Declarative island config delivery — design (#2301)
 
-> ## ⚠️ ROUND 3 STRUCK — NOT SOUND. BUDGET EXHAUSTED. NOT BUILD-READY.
+> ## ROUND 4 — folded on Nick's ruling + a measurement. Owed one final strike.
 >
-> 1 SOUND (Carnot) vs 3 RECAST. Three of three rounds used; `/design-temper`'s rule is **stop
-> and report**, not a fourth fold. Status: **UN-TEMPERED (provisional)**. Verdict and the three
-> closing findings: **[16-TEMPER.md](16-TEMPER.md)**; strikes in `16-strikes/round3/`.
+> Round 3 was **NOT SOUND** (1 SOUND / 3 RECAST) on three findings. Two are now gone, and the
+> third was never separable from the second. Full history: **[16-TEMPER.md](16-TEMPER.md)**.
 >
-> **The subtraction was real — all four families said so**, and Carnot, who dissolved round 2
-> on economy grounds, **reversed to SOUND**: *"a small control-side shipper plus restore… no
-> longer burning a boiler to move one valve."*
+> **Nick, 2026-09-25: *"the key can be the responsibility of the operator."*** That ruling
+> deletes §8's keyless generation outright (R3-2) — all three adversary families found it
+> fatal, and Kelvin's disposition is now ratified: *"You cannot engineer your way out of a lost
+> key with a tool that requires the products of that key."*
 >
-> **What withheld SOUND is that the central subtraction does not work. MEASURED:**
-> `docker-compose.yml:48,329,344` use `${ISLAND_VERSION:-edge}` — Compose *interpolation*,
-> resolved from the process env or the project-directory `.env`, and `update.sh:90` passes no
-> `--env-file`. **The pin cannot leave `.env`.** Either it stays, and the shipper writes it, so
-> §3's "cannot change the image" is false and the deleted digest gate was load-bearing — or it
-> goes, and §7's cutover refuses every first ship while the next `up` interpolates **`edge`,
-> which tracks `main`**, on both islands. The one-command collapse, the unreachable FATAL and
-> the ungated `restore` all descend from this.
+> **The principle generalises past the key, and that is what unlocked R3-1: the operator owns
+> what is theirs; the repo owns config.** Key custody is the operator's — **so is the version
+> pin.**
 >
-> Also fatal: **§8's keyless generation is §1 inverted** — the value was present and the
-> forward absent; now the forward is present and the value absent. And **§3 asserts
-> `update.sh` is unchanged while §4 requires it to apply generations** — those cannot both be
-> true; either the ship is a no-op, or the project directory becomes `releases/<ts>` and every
-> relative bind moves with it.
+> **MEASURED 2026-09-25 on both live boxes:** `docker compose` accepts **repeated
+> `--env-file` and merges them** — enspyr 2.40.3 and imagineering v5.1.0 both resolved
+> `--env-file a.env --env-file b.env` to `image: busybox:one-two`. So the pin *can* leave the
+> shipped file without unpinning anything, with no templating and no export path.
 >
-> **Do not build from this file.** Two ways forward are recorded in the temper, and the choice
-> is Nick's.
+> Round 4 is a **further subtraction**: one emergency mode deleted, one required mitigation
+> downgraded to advice, and the pin genuinely gone from the cohort — paid for with **one line**
+> in `update.sh`, which is the line Tesla's own fold-back demanded be written down anyway.
 
-Status: **NOT BUILD-READY — round 3 struck, budget exhausted** (2026-09-25).
+Status: **round 4, folded; owed a final strike** (2026-09-25).
 
 **Nick's pick 2026-09-24 (#4750, option 1)**, then two temper rounds:
 [16-TEMPER.md](16-TEMPER.md), strikes in `16-strikes/`. Round 1: RECAST 4/4, ten flaws of
@@ -114,34 +109,67 @@ its drift.** That is a capability we have. `.env` is the one we do not.
 
 ---
 
-## 3. One command, and the FATAL becomes unreachable
+## 3. The pin leaves the cohort — measured, not asserted
 
-**`ISLAND_VERSION` moves out of the cohort.** It lives on the box, operator-owned, in a file
-the shipper does not write.
+**`ISLAND_VERSION` lives in `pin.env`: operator-owned, outside every generation, never written
+by the shipper.**
 
-Round 2's R2-4 found that the pin living inside the shipped `.env` re-coupled the split:
-`ship-config` was shut exactly when git was ahead of the box — *the normal state between bump
-and release* — so the dangerous door became the only door. Taking the pin out does not repair
-that. It **removes the condition**:
+`docker-compose.yml:48,329,344` read `${ISLAND_VERSION:-edge}` — Compose **interpolation**,
+resolved from the process environment or the project-directory `.env`. Round 3 found the pin
+therefore could not leave, because `update.sh:90` passed **no `--env-file`** and Compose would
+fall through to the default: **`edge`, which tracks `main`.**
 
-- The shipper **cannot change the image.** Not "refuses to" — cannot; it does not write the
-  file that names it.
-- Therefore it cannot trigger a migration. **The recorded FATAL is unreachable by this tool by
-  construction**, rather than disarmed by a command split.
-- Therefore `restore` cannot cross a digest boundary, and needs **no digest gate**.
-- Therefore **`ship-config` / `ship-release` collapse into one command.**
+**Measured on both live boxes, 2026-09-25:**
 
-Image upgrades continue to work exactly as ISL-0003 documents and as we did on 2026-09-21: bump
-`ISLAND_VERSION` by hand, run `deploy/update.sh`. **Unchanged, already proven, not this
-design's business.**
+```
+enspyr        Docker Compose 2.40.3
+imagineering  Docker Compose v5.1.0
+both:  docker compose -f … --env-file a.env --env-file b.env config
+       ->  image: busybox:one-two
+```
+
+**Compose accepts repeated `--env-file` and merges them.** So the pin leaves the shipped file
+and is still interpolated — via a second source the shipper does not write.
+
+**The cost is one line**, and it is the line Tesla's round-3 fold-back demanded be written down
+regardless (see §4a). It is **not** any of the three escapes round 3 ruled out: it is not
+templating (v1's deleted fossil), not an exported variable (ISL-0003's measured hazard where an
+exported pin beats `.env` and the guard blesses one tag while `pull` fetches another), and not a
+replacement of `.env` by a different single file.
+
+**Now the claim is true rather than prose:**
+
+- The shipper **cannot change the image.** It does not write `pin.env`. Not "refuses to."
+- Therefore it cannot trigger a migration. **The recorded FATAL is unreachable by this tool.**
+- Therefore `restore` cannot move the pin either — it swings generations, and the pin is not in
+  one. **No digest gate**, and this time for a reason that holds.
+- Therefore **one command**, not two.
+
+**Kelvin's Ghost, closed by assertion rather than by trust.** Round 3's Gemini strike noted the
+pin could return through *any* variable in an `image:` key. **CI asserts that the only variable
+appearing in any `image:` key is `ISLAND_VERSION`** — a grep-shaped test over the compose file
+in the repo. Anything else is a red build.
+
+Image upgrades are unchanged and stay the operator's: edit `pin.env`, run `deploy/update.sh`.
+Exactly as ISL-0003 documents and as we did on 2026-09-21.
 
 | | |
 |---|---|
-| **`ship <island>`** | place a generation, swing `current`. Never pulls, never recreates, never writes the pin. |
+| **`ship <island>`** | place a generation, swing `current`. Never pulls, never recreates, **never writes `pin.env`**. |
 | **`restore <ts>`** | swing `current` back. Same operation, backwards. |
 
-After either, the operator runs `update.sh` when they choose — the same human decision as
-today, at the same moment.
+### 3d. Cutover: the pin must be lifted out of the committed `.env` first
+
+`deploy/secrets/<island>.env.sops` was a **verbatim** lift of each box's `.env` on 2026-09-06,
+and the pin is in there — measured on the boxes today at `.env:12` (enspyr) and `.env:14`
+(imagineering).
+
+**One-time, before the first ship, per island, in this order:** write `pin.env` on the box
+carrying the island's *current* `ISLAND_VERSION`; remove that line from the island's `.sops`
+file; update `update.sh`'s invocation (§4a). **Verify by reading `docker compose … config` and
+confirming the resolved image tag is unchanged** — an affirming check, not a grep for absence.
+Until all three are done for an island, that island is not shippable, and the tool refuses it
+rather than assuming.
 
 ---
 
@@ -168,6 +196,36 @@ today, at the same moment.
   source is a directory, destination is a symlink, and `mv` refuses. Its natural repair is
   dropping `-T`, which **nests the new generation inside the old one**: the defect `-T` exists
   to prevent. **Fail closed if `mv` has no `-T`. Never fall back to plain `mv`.**
+
+### 4a. The one invocation, written down
+
+Round 3's third finding was that this design asserted `update.sh` was **unchanged** *and* that
+generations are what gets applied — *"those cannot both be true."* Either it never reads the
+generation, in which case **the ship is a no-op**, or it does, and the project directory becomes
+`releases/<ts>` and every relative bind moves with it.
+
+**It is not unchanged. The delta is one line, and here it is:**
+
+```sh
+docker compose \
+  --project-directory "$REMOTE_PATH/current" \
+  -f "$REMOTE_PATH/current/docker-compose.yml" \
+  --env-file "$REMOTE_PATH/current/.env" \
+  --env-file "$REMOTE_PATH/pin.env" \
+  up -d
+```
+
+`-f` stays pinned for the reason it was pinned (measured: `compose.yaml` beside
+`docker-compose.yml` wins outright, an override merges, `COMPOSE_FILE` redirects the set).
+
+**And the assertion round 3 said was deleted on a false premise is now writable, because the
+project directory is finally named:** a CI test runs the real backup path with *this*
+invocation and asserts **the canonical parent of the written inode** is `<REMOTE_PATH>/backups`,
+outside `releases/`. **A string helper must not be able to pass it** — round 2's gate could be
+satisfied by `printf`, which is why this is specified as an inode and not a path.
+
+`<REMOTE_PATH>/backups` is the single path exempted from §6's outside-the-generation grep.
+**One path, named — not a prefix and not a class.**
 
 **What the swing does and does not do** — round 1's overclaim, kept deleted:
 
@@ -200,8 +258,15 @@ not an input.
   and only that, is drift. *(This also deletes `local/`'s reason to exist — see §6.)*
 - **SHOW `target - baseline`** as the intentional change. Three files. Do not call it drift.
 - A **half-applied state** — swing landed, operator has not run `update.sh` — is **not drift**
-  and must not be typed as it. `GENERATION.txt` is newer than the running containers; the
-  shipper says so and offers continue-or-restore.
+  and must not be typed as it.
+
+  **The discriminator is not a timestamp, and round 3 is why.** *"`GENERATION.txt` is newer
+  than the running containers"* inverts the moment any restart refreshes start times without
+  refreshing config — and `restart: unless-stopped` restarts the **existing** container without
+  re-reading compose, so **the gap survives a reboot** and the signal goes quiet exactly when it
+  is needed. **Half-applied is: the running project's canonical `working_dir` !=
+  `realpath(current)`.** That is a fact the daemon keeps, it is the same query §5a already
+  makes, and no restart can launder it.
 
 **Outcomes:** REFUSED (non-zero, diff on stderr, box untouched) / PASSED (zero) / **COULD NOT
 RUN (non-zero, fail closed)** — ssh failed, `current` missing or dangling, island unidentified,
@@ -224,9 +289,34 @@ Query `docker ps -a` / the labels, never default `compose ls`:
 | labels present, path elsewhere | **REFUSE** — wrong tenant |
 | **no containers, but external volume `aiko_data` exists** | **REFUSE** — this is a *stopped tenant*, not an absence |
 | no containers, no `aiko_data` | absence. `--adopt` permitted (explicit flag only) |
+| **containers present, no `GENERATION.txt`** | **FIRST SHIP** — its own state, see 5b |
 | inspect error | **COULD NOT RUN** |
 
 **Absence of `current` is never genesis.** Genesis is `standup.sh`, once.
+
+### 5b. The first ship is its own state — Kelvin's Genesis Barrier
+
+Round 3's Gemini strike found that the two live islands were an **unnamed state**, and worse, an
+unreachable one: a box with containers running but no `current/` trips *"missing `current` =
+COULD NOT RUN"*, while a freshly stood-up box with `aiko_data` and no containers trips *"stopped
+tenant = REFUSE `--adopt`"*. **The tool could not adopt a box because the box was not already
+adopted.**
+
+A first ship is **containers present, `working_dir` under this `REMOTE_PATH`, no
+`GENERATION.txt`.** It is:
+
+- **not** gated by `live != baseline` — there is no baseline yet, and demanding one is the
+  Catch-22;
+- **not** `--adopt`, which means *"no island here"*, a different claim entirely;
+- gated by **§7's cutover diff alone**: decrypted sops bytes against the live `.env`, REFUSE on
+  mismatch. That gate exists precisely to stop a first flip consecrating box drift or
+  clobbering production secrets, and round 3 found it was never reached.
+
+**And the swing itself differs on a first ship**, which round 3 also caught: `current` is not
+yet a symlink, so `mv -T current.next current` onto a **real directory** fails the rename — a
+case §4 specified only in the reverse direction. It **fails closed with a named error** and a
+specified rename-aside of the existing tree. **It never falls through to the plain `mv` §4
+forbids.**
 
 ---
 
@@ -276,18 +366,37 @@ mitigations was the wrong word for the wrong risk.)*
 clean checkout, can write config to every island it ships. The push model concentrates that
 authority. This is the cost of the model, stated rather than engineered around.
 
+**Out of scope, by Nick's ruling 2026-09-25:** *availability of the operator's own key.* Key
+custody is the operator's, like their ssh key. The design does not engineer around losing it —
+see the break-glass paragraph below, which is why the keyless generation is gone.
+
 **Mitigated:**
-- *Availability* — **a second age recipient**, so one laptop is not the only decrypt path.
 - *Operator error* — the shipper **refuses a dirty tree** and stamps the **tree hash of the
   shipped manifest** into `GENERATION.txt`. One check, not a component. *(Kelvin's round-1
   `curl | bash` alternative stays **rejected**: remote code execution on the operator's
   machine is ISL-0003's founding objection to push-CD.)*
 
-**Break-glass now works keyless, and this is a consequence of the subtraction rather than a
-new mechanism.** Round 2 found that recovery required the key whose loss was the emergency.
-With `.env` separable from the cohort, **a compose-only generation — `docker-compose.yml` plus
-`mosquitto.conf`, both public — ships with no key at all.** That is *exactly* the 2026-09-11
-repair: a one-line compose forward. The emergency path is the ordinary path minus one file.
+**Break-glass for a lost key is a SOCIAL process, and there is no keyless ship — Nick,
+2026-09-25: *"the key can be the responsibility of the operator."***
+
+Round 3 had a compose-only generation that shipped without `.env`, sold as the 2026-09-11
+repair. All three adversary families killed it, and Kelvin's reading was the worst: `current`
+would name a directory with **no `.env` at all** — not a mismatch but a **void**, every variable
+unset. Tesla's was the mirror: *"the value was present and the forward was absent. Now the
+forward is present and the value is absent. Same outage, halves swapped."* And it was **the path
+of least resistance**, so it would run exactly when git was ahead of the box's secrets.
+
+It also broke §1, which is this design's one sentence: **`.env` and `docker-compose.yml` move
+together or not at all.** A mechanism that splits the pair to work around a lost key contradicts
+the reason the pair exists.
+
+**Deleted, not replaced.** Kelvin's disposition, now ratified: *"You cannot engineer your way
+out of a lost key with a tool that requires the products of that key."* **A ship carries all its
+files or does not happen.**
+
+Consequently the **second age recipient is advice to an operator, not a requirement of this
+design.** It was a mitigation for key loss; key custody is now out of scope. Recommend it in
+the runbook; do not build around its absence.
 
 **Unchanged and honest:** ISL-0003's limit is closed for operators who ship generations and
 unchanged for those who do not. `standup.sh` remains irreducibly box-resident (#4749) — it
@@ -296,34 +405,54 @@ no generation. **No scheduler anywhere; the shipper never initiates.**
 
 ---
 
-## 9. Round 2's eight flaws, and how this round answers them
+## 9. Round 3's three findings, and how round 4 answers them
 
-| | Round 2 flaw | Answer | By |
+| | Round 3 finding | Answer | By |
 |---|---|---|---|
-| R2-1 | `mv -T` operands missing | §4 writes both commands; plain `mv` fallback forbidden | **repair** (2 lines) |
-| R2-2 | backup gate a constant satisfies | shipper never invokes `update.sh`; no new path arithmetic exists | **deletion** |
-| R2-3 | stopped project reads as missing | §5a, three daemon answers; `aiko_data` decides | **repair** |
-| R2-4 | split re-couples via `ISLAND_VERSION` | pin leaves the cohort; one command; FATAL unreachable | **deletion** |
-| R2-5 | `local/` is the bypass | deleted; hash alone | **deletion** |
-| R2-6 | denylist defaults next path to cargo | three enumerated files; no `deploy/**` | **deletion** |
-| R2-7 | break-glass needs the lost key | compose-only generation ships keyless | **deletion** |
-| R2-8 | "Mitigations" mis-titled | §8 renamed; compromise stated as accepted | **repair** |
+| R3-1 | the pin cannot leave `.env`; removing it unpins both islands to `edge` | repeated `--env-file`, **measured on both boxes**; `pin.env` is operator-owned and never shipped | **measurement + one line** |
+| R3-2 | the keyless generation is §1 inverted — a void, not a subtraction | **deleted, not replaced.** Key custody is the operator's (Nick, 2026-09-25) | **ruling** |
+| R3-3 | `update.sh` asserted unchanged *and* required to apply generations | §4a writes the invocation; the inode assertion becomes writable because the project directory is finally named | **the same one line** |
 
-**Five deletions, three repairs, no new mechanism.** Against round 2: three commands → one;
-`deploy/**` + governed manifest → three names; two acknowledgements → one; digest-gated restore
-→ plain restore; `local/` → gone.
+Carried with them, from round 3's smaller findings: **Kelvin's Genesis Barrier** (§5b — the
+first ship is its own state, gated by the cutover diff alone), **the reboot-survives-the-gap
+discriminator** (§5 — canonical `working_dir` vs `realpath(current)`, never a timestamp), the
+**first-ship swing** onto a real directory failing closed rather than falling through to plain
+`mv` (§5b), **Kelvin's Ghost** closed by a CI assertion that `ISLAND_VERSION` is the only
+variable in any `image:` key (§3), and the **one-time pin cutover** (§3d).
+
+**Is round 4 smaller? Split the question, because the two answers differ and the honest one is
+not the flattering one.**
+
+**Mechanisms: fewer.** One emergency mode deleted (keyless ship). One required mitigation
+downgraded to advice (second age recipient). One key ceremony moved out of scope. Added: a
+Compose flag, an invocation that was always implicitly required, and a CI assertion. **No new
+component.**
+
+**Prose: LONGER — 302 lines to ~430.** That is a real reversal of round 3's direction and it is
+stated rather than buried. The growth is `.env`-cutover procedure (§3d), three
+previously-unnamed states (§5b), and the written-out invocation (§4a). Some of it is history
+that belongs in `16-TEMPER.md` and not here; a reader should judge whether §3d in particular is
+a paragraph or a migration project, which is why §10.5 puts exactly that to the strike.
+
+**The claim this design makes is therefore narrow: the mechanism count fell and the page count
+rose.** If the strike finds the page count is the honest measure, that is a finding, not a
+defence I have already prepared against.
 
 ## 10. What the final strike should hit
 
-1. **Is the cohort-of-two argument sound?** §1 claims `.env`-alone reproduces 2026-09-11
-   because the value and its forwarding live in different files. If that is wrong, Carnot's
-   narrow tool wins and this design should dissolve.
-2. **Does `ISLAND_VERSION` actually leave cleanly**, or does something else in the shipped
-   `.env` couple to the image version in a way that reintroduces R2-4?
-3. **Is `mosquitto.conf` earning its place**, or is it a third file smuggled in by symmetry?
-   The 2026-09-11 incident involved two.
-4. **Does §5's all-file-facts comparison really fix R2-4's half-swing**, or does "placed but not
-   `up`" still have a state the tool mis-types?
-5. **The economy test, final call.** One command, three files, no executables, no scheduler, no
-   pull. Is this now *"a small control-side shipper plus restore"* — or is even this more than
-   `.env` is worth?
+1. **The `--env-file` claim is measured on today's boxes** (2.40.3 and v5.1.0). Is it a stable
+   contract or a version-dependent behaviour? What happens on a third-party island running an
+   older Compose — and does the tool detect that, or unpin them to `edge` silently?
+2. **§3d's cutover has an ordering.** `pin.env` written, sops line removed, invocation updated.
+   What is the state between steps, and does the tool refuse an island mid-cutover as claimed?
+3. **§5b names the first ship — is it now reachable?** Trace both live boxes and a fresh
+   `standup.sh` box through §5a's table and §5b together, and check that no box lands in two
+   rows or none.
+4. **The half-applied discriminator is now a daemon fact.** Does `working_dir !=
+   realpath(current)` have a false positive — e.g. an operator who legitimately ran compose from
+   elsewhere once?
+5. **Has the subtraction held?** Round 4 removed an emergency mode and a key ceremony and added
+   a flag. Is that genuinely smaller, or is the one-time cutover (§3d) a migration project
+   wearing a paragraph?
+6. **Carnot's economy test, one last time.** One command, three files, no executables, no pull,
+   no key ceremony — with a one-time pin migration. Does it still pass?
