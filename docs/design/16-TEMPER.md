@@ -632,3 +632,125 @@ that already exists and already works.
 **Recorded so it cannot be lost either way:** `preflight-compose-drift.sh` is a real compiler,
 it ran clean on both boxes on 2026-09-21, and three rounds of adversarial review have not found
 a reason to re-solve it.
+
+---
+
+# ROUND 4 — struck 2026-09-25, `dt-1790347...` — budget extended by Nick
+
+**Overall verdict: NOT SOUND. 1 SOUND (Carnot) vs 3 RECAST (Maxwell, Kelvin, Tesla).**
+Full panel, no dark seat. **Same split as round 3.**
+
+**What round 4 closed, and it closed cleanly.** Nick ruled *"the key can be the responsibility
+of the operator"*, which **deleted** the keyless generation rather than fixing it, downgraded
+the second age recipient to runbook advice, and put key availability out of scope. A
+**measurement on both live boxes** — `docker compose` accepts repeated `--env-file` and merges,
+2.40.3 and v5.1.0 — let `ISLAND_VERSION` move to operator-owned `pin.env`. Tesla: *"the pin
+*can* live outside the generation with no templating, no export, and no second ship command…
+The cargo/vehicle cut did not grow a component; it grew a flag."*
+
+All three of Kelvin's round-3 findings: **DISCHARGED.** Two of Tesla's four fold-backs: **YES.**
+
+**Carnot reversed to SOUND again** and answered the size question directly: *"Round 4 finally
+pays in the right currency: deleted mechanisms, not prettier guards… Mechanism count is the
+right primary measure here."* Its economy test passes.
+
+**What withheld SOUND: three findings, and Maxwell/Kelvin/Tesla found the first two
+independently.**
+
+### R4-1. `pin.env` is a fourth box-resident file whose absence silently means `edge`
+
+Nothing ships it, nothing syncs it, no preflight reads it, and the shipper deliberately does not
+write it — while compose still says `${ISLAND_VERSION:-edge}`.
+
+Tesla sharpened it past where Maxwell and Kelvin left it: **a missing `--env-file` target fails
+closed (Compose errors — the kind default). An EMPTY file, or one with no `ISLAND_VERSION` key,
+succeeds** — and interpolation falls to `edge`. *"Before this round that default was dead code
+on a box whose `.env` always carried the pin. Round 4 made it the live fallback of a fourth
+box-resident file that nothing ships, nothing hashes, nothing preflights, and nothing checks
+for a key."* And: *"Nick's ruling gives the operator the pin; it does not license a default that
+unpins."*
+
+**DISPOSITION — a deletion, not a guard.** Remove `:-edge` from all three `image:` lines and use
+`${ISLAND_VERSION:?…}`. An unset pin then errors at `config` time, before any pull, naming the
+file. `edge` stays available by *writing* it — a choice, not an accident. *(Kelvin proposed
+wrapping the invocation in an assert; Maxwell's and Tesla's removal is preferred, for Carnot's
+stated reason: deleted mechanisms beat prettier guards.)*
+
+### R4-2. §3d's cutover and §5b's first-ship gate are the same gate, inverted
+
+§3d strips the pin from the `.sops` file **before** the first ship. §7/§5b refuse the first ship
+unless decrypted sops bytes match the live `.env` (measured: pin still at `.env:12` enspyr,
+`.env:14` imagineering). **So the required preparation is the refuse condition.**
+
+Kelvin: *"The tool cannot adopt a box because the box has been correctly prepared for
+adoption."* Tesla: *"Mid-cutover, 'done,' and 'box drift' are the same byte predicate. The tool
+cannot distinguish them."* Maxwell added the ordering half: §4a's invocation references
+`current/.env`, which does not exist before the first ship, so completing the cutover leaves the
+island unable to deploy.
+
+**DISPOSITION — Tesla's four-step fail-closed order, which also removes the exception Kelvin
+proposed:** (1) write `pin.env` from the box's current pin; (2) install the §4a invocation;
+(3) verify with **that** invocation that `docker compose config` resolves the **same** image tag
+as before; (4) **then** remove the line from live `.env` *and* from sops — after which the
+byte-diff is equal and the first ship proceeds with **no exception list**. *(Kelvin's
+`grep -v '^ISLAND_VERSION='` before the diff is rejected: a byte-exact comparison with one
+permitted exception is how v1's deleted field-by-field comparison returns.)*
+
+### R4-3. The half-applied discriminator compares two names of the same live symlink — MEASURED, and it cannot work as written
+
+**Tesla alone.** §4a passes `--project-directory "$REMOTE_PATH/current"`; §5 then asks whether
+the daemon's canonical `working_dir` != `realpath(current)`. Tesla: *"One comparison, two
+implementations, both wrong unless you have measured that Compose stores EvalSymlinks-at-`up`."*
+
+**Measured 2026-09-25 on `chat.enspyr.co`**, with a throwaway project using exactly this shape
+(`current -> releases/r1`, `--project-directory $PWD/current`):
+
+```
+com.docker.compose.project.working_dir  ->  /tmp/symtest/current
+```
+
+**The daemon records the symlink path, not the resolved release.** So:
+- **realpath both sides** → both resolve through the *swung* symlink to the same place → they
+  are **always equal** → half-applied is **invisible**, including across the reboot gap this
+  predicate was written to catch.
+- **do not realpath** → `.../current` != `.../releases/<ts>` → **always unequal** → every
+  healthy box reads half-applied until the alarm is ignored.
+
+**Tesla's prediction was exact and the measurement confirms it. The discriminator must be
+replaced, not tuned** — it needs a daemon fact frozen at `up` that the swing cannot retarget.
+`config_files` is not it (also `current/...`).
+
+## The pattern, stated because it is now four rounds long
+
+Each round's fix has created the next round's flaw, in the same shape: **the failure relocates
+rather than resolves.**
+
+| Round | Fix | Next round's flaw |
+|---|---|---|
+| 1 | three states (baseline/target/live) | baseline had no home |
+| 2 | take `ISLAND_VERSION` out of the cohort | it cannot leave `.env` |
+| 3 | `pin.env` | empty `pin.env` silently means `edge` |
+| 4 | `--project-directory current` | the discriminator cannot work |
+
+**The counter-reading is equally available and equally honest:** the findings are converging —
+ten design flaws, then eight of mechanism, then three, then three of which two are one-line
+deletions — and every round has discharged everything the prior round raised.
+
+**Both readings feel identical from inside.** That is this project's standing crux, and it is
+why the disposition below is Nick's and not the panel's.
+
+## Disposition
+
+**NOT SOUND at round 4 of an extended budget.** Options, stated without a recommendation
+because the author has now said "almost there" four times:
+
+- **Fold round 5.** R4-1 and R4-2 are deletions and an ordering; R4-3 needs a genuinely
+  different mechanism and the measurement already says which family of answer is disqualified.
+  Tesla's closing: *"Write the two predicates so they agree on the first ship, fail closed on
+  an empty pin, and name an inode the swing cannot retarget — and then, this time, **stop**."*
+- **Stop and fall back**, to Carnot's narrow `.env`-only tool or to option 3 — one manual sync
+  per box plus the preflight that already exists, ran clean on 2026-09-21, and has survived
+  four rounds of adversarial review without anyone finding a reason to replace it.
+
+**One fossil to remove either way:** the word *"unchanged"* still sits in §2 describing
+`update.sh`. Tesla: *"A fossil word here reopens R3-3 without another finding."*

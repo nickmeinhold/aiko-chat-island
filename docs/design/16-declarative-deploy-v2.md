@@ -1,29 +1,28 @@
 # Declarative island config delivery — design (#2301)
 
-> ## ROUND 4 — folded on Nick's ruling + a measurement. Owed one final strike.
+> ## ROUND 4 STRUCK — NOT SOUND (1 SOUND / 3 RECAST). DO NOT BUILD FROM THIS FILE.
 >
-> Round 3 was **NOT SOUND** (1 SOUND / 3 RECAST) on three findings. Two are now gone, and the
-> third was never separable from the second. Full history: **[16-TEMPER.md](16-TEMPER.md)**.
+> Nick's key ruling and the `--env-file` measurement **closed two of round 3's three findings
+> cleanly** — the keyless ship is deleted, all of Kelvin's round-3 findings discharged, and
+> Carnot reversed to SOUND: *"round 4 finally pays in the right currency: deleted mechanisms,
+> not prettier guards."* Three findings withheld it. Full record: **[16-TEMPER.md](16-TEMPER.md)**.
 >
-> **Nick, 2026-09-25: *"the key can be the responsibility of the operator."*** That ruling
-> deletes §8's keyless generation outright (R3-2) — all three adversary families found it
-> fatal, and Kelvin's disposition is now ratified: *"You cannot engineer your way out of a lost
-> key with a tool that requires the products of that key."*
+> - **R4-1** — `pin.env` is a fourth box-resident file nothing ships, syncs or checks, and an
+>   **empty** one succeeds while interpolation falls to **`edge`, which tracks `main`**. A
+>   missing file fails closed; an empty one does not. Fix is a deletion: `${ISLAND_VERSION:?}`.
+> - **R4-2** — §3d's cutover strips the pin from sops *before* the first ship, and §7 refuses
+>   the first ship unless sops matches the live `.env`. **The required preparation is the
+>   refuse condition.**
+> - **R4-3 — MEASURED, and it cannot work as written.** §5's half-applied discriminator
+>   compares `working_dir` to `realpath(current)`. On `chat.enspyr.co` the daemon records
+>   **`/tmp/symtest/current` — the symlink, not the release.** So realpath-both → always equal
+>   → half-applied invisible; realpath-neither → always unequal → every healthy box alarms.
+>   Tesla predicted exactly this; the measurement confirms it.
 >
-> **The principle generalises past the key, and that is what unlocked R3-1: the operator owns
-> what is theirs; the repo owns config.** Key custody is the operator's — **so is the version
-> pin.**
->
-> **MEASURED 2026-09-25 on both live boxes:** `docker compose` accepts **repeated
-> `--env-file` and merges them** — enspyr 2.40.3 and imagineering v5.1.0 both resolved
-> `--env-file a.env --env-file b.env` to `image: busybox:one-two`. So the pin *can* leave the
-> shipped file without unpinning anything, with no templating and no export path.
->
-> Round 4 is a **further subtraction**: one emergency mode deleted, one required mitigation
-> downgraded to advice, and the pin genuinely gone from the cohort — paid for with **one line**
-> in `update.sh`, which is the line Tesla's own fold-back demanded be written down anyway.
+> **Also: the word "unchanged" still sits in §2 describing `update.sh` — a fossil that reopens
+> R3-3.** §4a is the truth; §2 is the leftover.
 
-Status: **round 4, folded; owed a final strike** (2026-09-25).
+Status: **NOT SOUND — round 4 struck** (2026-09-25).
 
 **Nick's pick 2026-09-24 (#4750, option 1)**, then two temper rounds:
 [16-TEMPER.md](16-TEMPER.md), strikes in `16-strikes/`. Round 1: RECAST 4/4, ten flaws of
