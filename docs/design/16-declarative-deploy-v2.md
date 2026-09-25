@@ -1,360 +1,302 @@
-# Declarative island deploy v2 — design (#2301)
+# Declarative island config delivery — design (#2301)
 
-Status: **round 2, folded from a 4/4 RECAST** (2026-09-24). Owed a re-strike before any code;
-the built PR additionally owes a `/cage-match` — this is deploy and secret handling, which is
-cage-match-by-law.
+Status: **round 3, a subtraction** (2026-09-25). Owed a final strike; the built PR still owes a
+`/cage-match`.
 
-**Nick's pick, 2026-09-24 (#4750, option 1)**, after #4684 was DISSOLVED 4/4. Round 1 of this
-document was itself RECAST 4/4 — verdict and the ten flaws in
-**[16-TEMPER.md](16-TEMPER.md)**, raw strikes in `16-strikes/`. This is the fold.
+**Nick's pick 2026-09-24 (#4750, option 1)**, then two temper rounds:
+[16-TEMPER.md](16-TEMPER.md), strikes in `16-strikes/`. Round 1: RECAST 4/4, ten flaws of
+design. Round 2: RECAST 3, **DISSOLVE 1**, eight flaws of mechanism — and both Carnot and Tesla
+set the same bar for this round:
 
-> **TWO LAYERS ARE DELETED AND MUST NOT RETURN.**
->
-> **From v1's temper (finding 7):** no `.env.template`, no `envsubst`, no render step, no
-> missing-var map, no byte-match-as-proof gate. Store the **complete** encrypted `.env` per
-> island. *"The artifact in git IS the artifact on the box."*
->
-> **From round 1's temper:** no shim, no contract integer, no image entrypoint. Tesla:
-> *"That corpse stays buried."*
->
-> A templating layer or a box-resident vehicle appearing in a later revision is a fossil
-> returning and should be struck on sight.
+> **The next fold gets smaller. A round 3 that adds a ninth mechanism has answered Carnot by
+> proving him right.**
+
+**This round removes rather than repairs.** Three commands become one. `deploy/**` plus a
+governed manifest becomes three enumerated files. Two acknowledgement classes become one.
+Digest-gated `restore` becomes plain `restore`. `local/` is deleted. **Six of round 2's eight
+flaws are discharged by deletion, not by guard.**
+
+The name changed with the scope: this ships **config**, not deploy tooling.
+
+> **DELETED AND MUST NOT RETURN.** No `.env.template`, `envsubst`, render step or
+> byte-match-as-proof (v1). No shim, contract integer or image entrypoint (round 1) — *"that
+> corpse stays buried."* No `local/` overlay, no denylist governance, no second ship command,
+> no executable cargo (round 3). Any of these reappearing is a fossil.
 
 ---
 
-## 1. The problem, stated as a property
+## 1. The problem, and the one sentence that scopes this design
 
-The island is two halves that update by different mechanisms. **The image updates itself** —
-pinned, pulled, exact. **`docker-compose.yml`, `deploy/` and `.env` arrive by hand**, and
-drift.
-
-On 2026-09-11 that cost `chat.enspyr.co` several minutes: `APNS_VOIP_TOPIC` became required,
-the box's `.env` had it, the box's **compose did not forward it**, and the island refused to
-boot. One line of difference. imagineering had the identical gap and deployed clean because
-its compose had been hand-copied more recently — **one variable: which files the operator
-happened to be thinking about.**
+On 2026-09-11 `chat.enspyr.co` went down for several minutes. `APNS_VOIP_TOPIC` became
+required; the box's **`.env` had it**; the box's **`docker-compose.yml` did not forward it**.
+One line of difference. imagineering had the identical gap and deployed clean because its
+compose had been hand-copied more recently.
 
 ISL-0003 names the class: **prose functioning as executable governance with no compiler.**
 
-**Already fixed; do not re-solve.** `preflight-compose-drift.sh` refuses on drift, before the
-backup and before anything is pulled. It is a real compiler and it ran clean on both boxes on
-2026-09-21. Option 3 on #4750 — *accept the limit* — was a genuinely close call for this
-reason.
+**What already works and must not be re-solved.** `preflight-compose-drift.sh` **refuses** on
+compose and `deploy/` drift, before the backup and before anything is pulled. It is a real
+compiler; it ran clean on both boxes on 2026-09-21. Round 2's DISSOLVE rested on this and it
+is correct.
 
-**What remains:** the guard lives in `deploy/`, the half that does not sync. **The detector
-cannot move the thing it detects.**
+**What it structurally cannot do**, and the whole remaining justification:
 
-> **ROUND 1 CARRIED A THESIS LINE HERE AND IT HAS BEEN DELETED.** It read: *"stop detecting
-> drift, and remove the thing that drifts — a cohort that arrives complete has nothing to
-> compare against itself."* Tesla: that sentence contradicts §5, which correctly **keeps** a
-> refusal because local state is real, and *"is how an implementer rebuilds auto-sync."* The
-> banner at the top of this file exists because a stale claim beside a live mechanism is how
-> a deleted layer returns. **The thesis was that claim.** Drift detection stays. What changes
-> is that the repo-authoritative files arrive as a cohort instead of as a manual prelude.
+> `.env` holds per-box secrets and **cannot be compared against a public tag.** It is invisible
+> to every existing guard. And **`.env` and `docker-compose.yml` are the pair that broke** —
+> the value was in one and the forwarding was in the other.
 
----
+**Therefore they must move together or not at all.** That is the entire design.
 
-## 2. What push does and does not dissolve
-
-**What it dissolves, and this is real.** Design 15 died on a bootstrap loop: box-resident code
-had to *fetch* the code that replaced it. A push has no such loop — the control side holds the
-repo, the key and ssh, and can lay `deploy/` down as **cargo** rather than needing it as the
-**vehicle**. That asymmetry is why option 1 was reachable and option 2 was not.
-
-**What it does not dissolve — stated here because round 1 claimed otherwise and §8 contradicted
-it in plain words.**
-
-- **§5 will not place a generation until the box answers.** `current` must be readable and the
-  island identified; COULD NOT RUN fails closed. *A dangling `current` is a repair that
-  requires the artifact whose corruption is the failure.*
-- **§6 will not place one without the age key**, and because `.env` is inside the cohort,
-  **a one-line public compose forward — the exact 2026-09-11 repair — cannot move unless that
-  key is alive.** Key loss blocks every config change, not merely secret rotation.
-- **The control side is itself unsynced.** An operator running the shipper from a stale
-  checkout produces a malformed generation. The drift moved from the box's `deploy/` to the
-  operator's clone.
-- **ISL-0003's limit is unchanged for anyone not using this path.**
-
-**The true claim, in words that cannot be quoted as "the loop is gone":**
-
-> The box-resident fetcher loop is dead. The control side is a single point of **availability**
-> and of **compromise** for every island it ships. ISL-0003's limit is closed only for
-> operators who walk this path.
-
-**Mitigations, required rather than optional:**
-
-- **A second age recipient**, so one laptop is not the only decrypt path. Without it, a lost
-  key is a permanently unmaintainable island.
-- **Break-glass is specified as *placing a generation and swinging `current`*** — never as
-  editing live files. A hand-edit in the old tree is drift the next ship refuses, so recovery
-  must re-enter the cohort or it is not recovery.
-- **The shipper pins its own provenance.** It refuses to run from a checkout whose HEAD is not
-  an ancestor of the remote's default branch, and stamps its own git sha into `GENERATION.txt`.
-  *(Kelvin proposed `curl … | bash` instead. **Rejected** — that is remote code execution on
-  the operator's machine, ISL-0003's founding objection to push-CD. The finding was right and
-  the fix was not.)*
+It is also why Carnot's `.env`-only tool — the round-2 DISSOLVE's alternative — is not quite
+right: shipping `.env` alone, against a compose file that arrived separately, **reproduces the
+exact shape of 2026-09-11.** A cohort of two is the smallest thing that cannot.
 
 ---
 
-## 3. What a generation is — a closed manifest, not a quantifier
-
-Round 1 said *"every box-resident file the repo is authoritative for"* and *"ALL of
-`deploy/`"*. Tesla: a universal wearing an enumeration, with an open exclusion no tool can
-evaluate — and it **shipped every island's ciphertext to every island.**
-
-**The shipped set is a denylist-closed manifest, asserted in CI:**
+## 2. What is shipped: three files, enumerated
 
 ```
-INCLUDE  docker-compose.yml
-INCLUDE  mosquitto.conf
-INCLUDE  deploy/**
-  DENY   deploy/secrets/**        # every island's ciphertext; ships nothing
-  DENY   deploy/islands/**        # control-side manifests
-  DENY   deploy/verify-secrets.sh # control-side: guards repo artifacts, not box state
-  DENY   <the shipper itself>     # control-side vehicle, never cargo
-DECIDED: caddy/ is OUT — it belongs to the reverse-proxy stack, not the island.
-         (v1 carried it; round 1 silently dropped it. Now stated either way.)
+docker-compose.yml
+mosquitto.conf
+.env                 # decrypted from deploy/secrets/<island>.env.sops
 ```
 
-**The denylist is the closed set.** "Legitimately local" is not a membership rule and must not
-appear as one.
+**That is the complete list.** Not a pattern, not a quantifier minus a denylist — three names.
 
-```
-<REMOTE_PATH>/
-  releases/
-    20260924-233000/
-      docker-compose.yml
-      deploy/                  # per the manifest above
-      mosquitto.conf
-      .env                     # decrypted from deploy/secrets/<island>.env.sops
-      GENERATION.txt
-  current -> releases/20260924-233000     # swung with `mv -T`
-  backups/                     # OUTSIDE every generation — see 3b
-  local/                       # OUTSIDE every generation — see 3c
-```
+**`deploy/**` is NOT shipped.** Round 2's R2-6 said a denylist *"defaults the next path to
+cargo"* and Tesla called its own round-1 phrase *"the denylist is the closed set"* a fossil.
+The subtraction dissolves the governance problem rather than solving it: with three enumerated
+files there is no next ambiguous directory, no allowlist CI to maintain, no `<the shipper
+itself>` pronoun, and **nothing executable is shipped at all.**
 
-**Never in a generation:** `aiko_data` (external named volume), `backups/`, `local/`.
+`deploy/` keeps arriving by hand — **guarded, loudly, by the preflight that already refuses on
+its drift.** That is a capability we have. `.env` is the one we do not.
 
-### 3a. `.env` is why this earns its keep
+**Consequences of shipping no executables, all of them deletions:**
 
-`preflight-compose-drift.sh` **cannot reach `.env` by construction** — per-box secrets versus a
-public tag. It is the one file no existing guard can see and it is half the config surface.
-Shipping the cohort covers it because the control side holds the key. **That capability, plus
-`deploy/` arriving as cargo instead of as a manual prelude, is the entire marginal gain over
-option 3.** Narrower than "the class is closed." Worth doing.
-
-### 3b. `backups/` is outside the generation, and CI proves it
-
-**Round 1's worst defect.** `update.sh` is invoked from `current/deploy` — that is,
-`releases/<ts>/deploy` — so an unchanged script resolves its *relative* backup path **into the
-generation**, which retention then prunes. **The only undo for the recorded FATAL would be
-stored in the thing that rotates.**
-
-- Backups resolve to `<REMOTE_PATH>/backups`, absolute, never relative to the generation.
-- **A CI test asserts it**: with cwd at `releases/<ts>/deploy`, the resolved backup path is
-  `<REMOTE_PATH>/backups` and is not under `releases/`. This is a gate, not a note.
-- **Prune never unlinks** the target of `current`, nor the generation whose digest is running.
-- **Prune shreds `.env`** before removing a generation — plaintext secrets, one per generation.
-
-### 3c. `local/` is where box-local state lives
-
-Round 1 quoted v1's *"a box may legitimately carry local state"* and then removed the state's
-home: an operator's 3am edit to `current/.env` is not clobbered, it is **orphaned** — the file
-still exists and still says what they wrote.
-
-`local/` sits outside `releases/` and survives every flip. A generation records a manifest hash
-of what it placed; if `current/` has been modified since placement, the ship is **REFUSED**,
-turning an orphaned edit into a caught one.
+- **R2-7's two acknowledgement classes: DELETED.** There are no `deploy/**` hunks to
+  acknowledge separately, because there are none. Tesla: *"do not grow a third prompt and call
+  it a gate"* — this grows zero. One review of a three-file diff, which is the size the human
+  compiler was sized for in 2026-09-11.
+- **R2-2's backup-path problem: DISSOLVED.** It arose because `update.sh` would run from inside
+  a generation and Compose resolves binds from the canonical project directory. **The shipper
+  never invokes `update.sh`.** `update.sh` stays where it is, box-resident, unchanged, run by
+  the operator exactly as ISL-0003 documents. Backups land where they land today. There is no
+  new path arithmetic, so there is no gate to write and no gate that a constant could satisfy.
+- **The daemon-root delivery concern is gone.** Nothing the shipper places executes.
 
 ---
 
-## 4. Two ships and one restore — the split that closes the FATAL
+## 3. One command, and the FATAL becomes unreachable
 
-Round 1 had one command and claimed *"before it, nothing is live; after it, everything is."*
-That is v1's overclaim relocated from `mv` into the word **live**: `rename(2)` swings one
-directory entry, and containers, the pulled image and `aiko_data` do not swing with it.
+**`ISLAND_VERSION` moves out of the cohort.** It lives on the box, operator-owned, in a file
+the shipper does not write.
 
-**The honest statement, which replaces it:**
+Round 2's R2-4 found that the pin living inside the shipped `.env` re-coupled the split:
+`ship-config` was shut exactly when git was ahead of the box — *the normal state between bump
+and release* — so the dangerous door became the only door. Taking the pin out does not repair
+that. It **removes the condition**:
 
-> The swing atomically changes **which files `current` names**. Running containers change only
-> after `up` returns healthy. There are **two facts on disk** — *intended* and
-> *running-as-of-last-green* — and incident response must be told which one it is reading.
+- The shipper **cannot change the image.** Not "refuses to" — cannot; it does not write the
+  file that names it.
+- Therefore it cannot trigger a migration. **The recorded FATAL is unreachable by this tool by
+  construction**, rather than disarmed by a command split.
+- Therefore `restore` cannot cross a digest boundary, and needs **no digest gate**.
+- Therefore **`ship-config` / `ship-release` collapse into one command.**
 
-### 4a. The three commands
-
-| Command | May change the pin? | Pulls | Refuses when |
-|---|---|---|---|
-| **`ship-config`** | **no** | never | `ISLAND_VERSION` or image digest differs from what is running |
-| **`ship-release`** | **yes** — the only path that may | **by resolved digest, never by tag** | no bare `--yes` accepted |
-| **`restore <ts>`** | **no** | never | the generation left and entered name **different digests** |
-
-`restore` across a digest boundary **refuses and prints the absolute path of the sqlite
-backup.** There is **no image rollback in the tool.** Round 1 left this as an open question;
-leaving the trigger armed and naming it is not staying clear of the FATAL.
-
-Why the split does the work: `ISLAND_VERSION` lives in the cohort's `.env`, so under one
-command a compose fix and a migration become **one gesture** whenever the encrypted env has
-been bumped. Separating them means the ordinary operation — the 2026-09-11 repair — **cannot**
-carry a migration.
-
-### 4b. Bind the digest
-
-`GENERATION.txt` records an image digest while inherited `update.sh` pulls a mutable tag
-(`ISLAND_VERSION`; ISL-0003's `edge`/`latest` exist). The file would be wrong twice: once
-because the flip precedes `up`, and again because the tag can move between resolve and pull.
-**`ship-release` resolves the digest control-side and pulls that digest.** This was design 15's
-one surviving technical gain and it needs no policy to move.
-
-### 4c. Pin the syscall: `mv -T`
-
-A plain `mv` onto an existing symlink-to-directory **nests the new generation inside the old
-one** and the one-inode swap never happens. Staging stays **mandatorily under `REMOTE_PATH`**,
-never `/tmp` — `/tmp` turns `mv` into copy+unlink and reopens the truncation class that caused
-the original incident. Fail if `releases/<ts>/` already exists.
-
----
-
-## 5. Baseline, target, live — the predicate must name the state it proves
-
-Round 1 diffed the box against the generation being shipped and refused on difference. Carnot:
-that makes **a legitimate config update indistinguishable from unauthorised drift** — a
-specification bug, not an implementation detail.
-
-**Three states, never two:**
+Image upgrades continue to work exactly as ISL-0003 documents and as we did on 2026-09-21: bump
+`ISLAND_VERSION` by hand, run `deploy/update.sh`. **Unchanged, already proven, not this
+design's business.**
 
 | | |
 |---|---|
-| **baseline** | the generation the operator believes the box is running |
+| **`ship <island>`** | place a generation, swing `current`. Never pulls, never recreates, never writes the pin. |
+| **`restore <ts>`** | swing `current` back. Same operation, backwards. |
+
+After either, the operator runs `update.sh` when they choose — the same human decision as
+today, at the same moment.
+
+---
+
+## 4. Placement and the swing
+
+```
+<REMOTE_PATH>/
+  releases/<ts>/{docker-compose.yml, mosquitto.conf, .env, GENERATION.txt}
+  current -> releases/<ts>
+  backups/          # untouched by this design; update.sh owns it, as today
+```
+
+- Staging **mandatorily under `REMOTE_PATH`**, never `/tmp` — `/tmp` turns `mv` into
+  copy+unlink and reopens the truncation class that caused the original incident.
+- Fail if `releases/<ts>/` already exists.
+- **The swing, written as two commands because round 2 found the flag alone does not work:**
+
+  ```sh
+  ln -s "releases/$TS" current.next
+  mv -T current.next current          # symlink onto symlink: one rename(2)
+  ```
+
+  **`mv -T releases/$TS current` is a specified failure, not an implementation choice** —
+  source is a directory, destination is a symlink, and `mv` refuses. Its natural repair is
+  dropping `-T`, which **nests the new generation inside the old one**: the defect `-T` exists
+  to prevent. **Fail closed if `mv` has no `-T`. Never fall back to plain `mv`.**
+
+**What the swing does and does not do** — round 1's overclaim, kept deleted:
+
+> The swing atomically changes **which files `current` names**. Running containers change only
+> when the operator runs `update.sh`. **Two facts on disk — placed, and running-as-of-last-`up`
+> — and incident response must be told which one it is reading.**
+
+`GENERATION.txt` records **what was placed**: git sha, tree hash of the shipped manifest,
+island, operator, UTC. It does **not** claim to say what is running; ISL-0003's rule stands
+unamended — *verify the running container, not the doc.*
+
+---
+
+## 5. Refuse and show
+
+**Three states** (Carnot, round 1), with round 2's correction that they must all be facts of
+the same kind:
+
+| | |
+|---|---|
+| **baseline** | the tree hash in the box's `current/GENERATION.txt` — **a file fact, read from the box** |
 | **target** | the generation being shipped |
-| **live** | what ssh actually reads from `current` |
+| **live** | the hash of `current/`'s actual bytes, recomputed now |
 
-- **REFUSE when `live != baseline`.** That, and only that, is drift.
-- **SHOW `target - baseline`** as the intentional change for human review. **Do not call it
-  drift.**
+Round 2 found `baseline` had no home and that the comparison mixed a process-belief with a
+directory. **Both are now read from the box and both are file facts.** The operator's belief is
+not an input.
 
-ISL-0003's refuse-and-show posture survives verbatim: refuse and show, never auto-sync. A box
-may legitimately carry local state (§3c), and silently clobbering it is how #2301 became
-standing instead of caught.
+- **REFUSE when `live != baseline`** — someone changed `current/` after it was placed. That,
+  and only that, is drift. *(This also deletes `local/`'s reason to exist — see §6.)*
+- **SHOW `target - baseline`** as the intentional change. Three files. Do not call it drift.
+- A **half-applied state** — swing landed, operator has not run `update.sh` — is **not drift**
+  and must not be typed as it. `GENERATION.txt` is newer than the running containers; the
+  shipper says so and offers continue-or-restore.
 
-### 5a. Two privilege classes, two acknowledgements
+**Outcomes:** REFUSED (non-zero, diff on stderr, box untouched) / PASSED (zero) / **COULD NOT
+RUN (non-zero, fail closed)** — ssh failed, `current` missing or dangling, island unidentified,
+or **any daemon inspect error**. A check that could not run is not a check that passed.
 
-Refuse-and-show worked in 2026-09-11 because the diff was **one forwarding line a person could
-read**. A cohort of all `deploy/` plus compose plus `.env` saturates that: *the operator
-rubber-stamps a wall, and the line that matters is the one they did not see.*
+### 5a. Tenant identity: three daemon answers, not two
 
-And the classes are not equivalent. **Hunks under `deploy/**` are not config** — on enspyr they
-execute as `sudo -n docker`, daemon-root, the moment the control side invokes the new
-`update.sh`.
+Both boxes are shared. Round 2 found that a **stopped** project and a **missing** project gave
+the same signal, and that signal permitted `--adopt` onto a surviving volume.
 
-**The diff is presented as per-file hunks, and executable hunks under `deploy/**` require a
-separate acknowledgement from config hunks.** *The human is the compiler only if the two
-privilege classes are not one yes.*
+Compose project identity is **container labels**; default queries list only running projects,
+and `compose down` removes the labels — **but not the external volume.** `aiko_data` survives,
+and `aiko_data` is the tenant.
 
-### 5b. Three outcomes, fail closed
+Query `docker ps -a` / the labels, never default `compose ls`:
 
-| Outcome | Meaning | Exit |
-|---|---|---|
-| **REFUSED** | compared, and said no | non-zero, diff on stderr, box untouched |
-| **PASSED** | compared, and affirmed | zero |
-| **COULD NOT RUN** | ssh failed, `current` missing/unreadable/dangling, island unidentified | **non-zero** |
+| Daemon says | Action |
+|---|---|
+| labels present, `working_dir` under this `REMOTE_PATH` | **proceed** |
+| labels present, path elsewhere | **REFUSE** — wrong tenant |
+| **no containers, but external volume `aiko_data` exists** | **REFUSE** — this is a *stopped tenant*, not an absence |
+| no containers, no `aiko_data` | absence. `--adopt` permitted (explicit flag only) |
+| inspect error | **COULD NOT RUN** |
 
-A check that could not run is not a check that passed.
-
-### 5c. Ask the daemon, not the letter the shipper wrote itself
-
-Round 1 identified the island from `current/GENERATION.txt` — **authored by the control side**.
-A wrong first write poisons every later preflight: the check confirms the box matches the lie.
-
-Worse, round 1 treated **absence of `current` as adoption**. Docker's identity is project
-`aiko` plus external volume `aiko_data`, **constant across directories on a shared host** — so
-an empty wrong path gets adopted, `compose up` runs, and **it attaches to the real tenant's
-volume from a decoy directory.** Split brain, with the drift detector pointed at the decoy.
-
-- **Absence of `current` is never genesis.** Genesis is `standup.sh`, once. Deletion, a
-  dangling symlink, and "please adopt" are three different states.
-- **Adoption is an explicit `--adopt` flag**, never inferred.
-- **On every ship**, read live `.env` `DOMAIN` **and ask docker which compose-file path project
-  `aiko` was last started from**; refuse unless that path resolves under this `REMOTE_PATH`, or
-  the project does not exist and `--adopt` was passed.
+**Absence of `current` is never genesis.** Genesis is `standup.sh`, once.
 
 ---
 
-## 6. Secrets
+## 6. `local/` is deleted
 
-Carried from v1's temper, plus what round 1 forgot.
+Round 1 offered a directory **or** a hash for box-local state; round 2's fold took both, and
+all three adversary families found the result. The overlay sat outside the hash, survived every
+flip, and the first shipped compose referencing it would make effective config `cohort ⊕
+local/` **with the drift predicate still green.**
 
-- **`sops -d` never reaches a shell environment.** `/proc/<pid>/environ` is readable, `set -x`
-  echoes, children inherit, argv is visible, `trap` does not run on SIGKILL. Decrypt to a
-  `umask 077` **file**; never `export`; `set +x` around the region.
-- **`<island>.conf` is parsed as DATA, never sourced.** `source` on the age-key host is
-  arbitrary code execution from a fat-fingered config. Strict `KEY=VALUE` allowlist; validate
-  `REMOTE_PATH` and `SSH_ALIAS` against a pattern.
-- **Shred the laptop's temp plaintext on every exit**, including the local half of the copy.
-  Round 1 specified the box and forgot the pocket.
-- **Modes at creation, not chmod-after:** generation directories `0700`, `.env` `0600`.
-- **Capped retention** with shred-before-unlink (§3b).
-- **A second age recipient** (§2), so the key is not a single point of failure.
+**One mechanism: the manifest hash in §5 REFUSES a modified `current/`.** A 3am edit is caught,
+not orphaned, and the operator is shown what they changed.
 
----
-
-## 7. The recorded FATAL
-
-Image rollback is not database rollback: migrate to N+1, fail `/health`, roll back the image,
-and old code runs against a forward-migrated schema. Tesla, in the original crucible:
-*"backup without restore-on-failure is a souvenir, not a spine."* Gated on the additive-only
-migration lint (#3188 / #2615).
-
-**Round 1 named it and left it armed.** The fold disarms it mechanically rather than in prose,
-because *"it must say so where an operator reads it"* **is** prose functioning as executable
-governance — the class this design quotes as its warrant:
-
-- `ship-config` cannot change the pin, so the ordinary operation cannot carry a migration.
-- `ship-release` is the only path that can, pulls by digest, and takes no bare `--yes`.
-- `restore` refuses across a digest boundary and prints the backup path.
-- **No scheduler anywhere.** Round 1 forbade one *inside the generation*, which does not forbid
-  one on the control side — now the natural home for a Friday cron, with inherited `--yes` as
-  the accelerator. **The shipper is invoked by a human. It never initiates.**
+- **Nothing in the shipped manifest may reference a path outside the generation**, and **CI
+  greps for that**. Three files makes this checkable by reading.
+- The tree hash is stored in `GENERATION.txt`, so `GENERATION.txt` is **excluded from the
+  hashed set** — stated here because round 2 caught the hash being stored inside the bytes it
+  hashes.
 
 ---
 
-## 8. Bootstrap, cutover, and the honest limit
+## 7. Secrets
 
-**`standup.sh` is irreducibly box-resident (#4749).** It creates `aiko_data`, writes the
-genesis `.env`, and pulls the image — at that moment there is no generation and no image. This
-pins bootstrap **orchestration**, not ongoing deploy **policy**.
-
-**Cutover, restored from v1's temper and missing in round 1.** Round 1's *"writes generation 1
-around"* the live `.env` either consecrates box drift as the new authority or clobbers
-production secrets — in one gesture, with no review. v1's finding 1 killed
-byte-match-**as-proof**; it did not kill the **direct diff of the real object**:
-
-> Before the first flip, `diff` the decrypted sops bytes against the live `.env` and **REFUSE
-> on mismatch.** Do not consecrate and do not clobber. The operator reconciles, then adopts.
-
-**The honest limit.** This helps an operator who uses the control-side path. A stranger either
-adopts the same tooling — possible; public repo, their own age key — or hand-syncs as today. So
-**ISL-0003's limit is closed for operators who ship generations and unchanged for those who do
-not.** What it removes is the *default* path being the drifting one, which is what actually
-caused 2026-09-11: not an absent capability, a procedure.
+- **`sops -d` never reaches a shell environment.** Decrypt to a `umask 077` **file**; never
+  `export`; `set +x` around the region. `/proc/<pid>/environ` is readable, children inherit,
+  argv is visible, and `trap` does not run on SIGKILL.
+- **`<island>.conf` parsed as DATA, never sourced.** Strict `KEY=VALUE` allowlist; validate
+  `REMOTE_PATH` and `SSH_ALIAS`.
+- **Shred both ends** — the box's temp *and the laptop's*.
+- **Modes at creation, not chmod-after:** generation `0700`, `.env` `0600`.
+- **Retention:** keep N (3). Never unlink the target of `current`. **Shred `.env` before
+  removing a generation.** With three files, `.env` is the only secret-shaped one — which is
+  checkable by reading rather than by maintaining a list.
+- **Cutover (v1's temper, restored):** before the first flip, `diff` the decrypted sops bytes
+  against the live `.env` and **REFUSE on mismatch.** Neither consecrate box drift nor clobber
+  production secrets.
 
 ---
 
-## 9. What the re-strike should hit
+## 8. Accepted risks and tradeoffs
 
-1. **§2's mitigations** — does a second age recipient plus a provenance-pinned shipper actually
-   discharge the single-point-of-compromise finding, or only the single-point-of-availability
-   half? Compromise of the control side now reaches both islands' config.
-2. **§3's denylist** — is it closed, or will it acquire exceptions until it is the curated
-   hand-list this design exists to retire? The `caddy/` decision is stated; what is the rule
-   that decides the *next* ambiguous directory?
-3. **§4's split** — does `ship-config` refusing on a digest difference make the common case
-   *harder*, such that operators reach for `ship-release` routinely and the separation
-   evaporates in practice?
-4. **§5a's two acknowledgements** — is a second prompt a real gate or a second reflex? What
-   makes an operator actually read the executable hunks?
-5. **§3c's `local/`** — does a composed-over local directory reintroduce, at a different layer,
-   the two-sources-of-truth problem the cohort exists to remove?
-6. **Option 3, once more on implementation grounds.** After this fold the mechanism is larger
-   than round 1's. Carnot's economy test: *if the implementation exceeds a small control-side
-   shipper plus restore, fall back to one manual `deploy/` sync per box plus the existing
-   preflight.* Does the folded design still pass its own test?
+*(Renamed from "Mitigations" — Kelvin, round 2: a second recipient and provenance pinning
+address availability and operator error. **Neither touches compromise.** Calling them
+mitigations was the wrong word for the wrong risk.)*
+
+**Accepted, central, and not mitigated:** a compromised control side, holding a valid key and a
+clean checkout, can write config to every island it ships. The push model concentrates that
+authority. This is the cost of the model, stated rather than engineered around.
+
+**Mitigated:**
+- *Availability* — **a second age recipient**, so one laptop is not the only decrypt path.
+- *Operator error* — the shipper **refuses a dirty tree** and stamps the **tree hash of the
+  shipped manifest** into `GENERATION.txt`. One check, not a component. *(Kelvin's round-1
+  `curl | bash` alternative stays **rejected**: remote code execution on the operator's
+  machine is ISL-0003's founding objection to push-CD.)*
+
+**Break-glass now works keyless, and this is a consequence of the subtraction rather than a
+new mechanism.** Round 2 found that recovery required the key whose loss was the emergency.
+With `.env` separable from the cohort, **a compose-only generation — `docker-compose.yml` plus
+`mosquitto.conf`, both public — ships with no key at all.** That is *exactly* the 2026-09-11
+repair: a one-line compose forward. The emergency path is the ordinary path minus one file.
+
+**Unchanged and honest:** ISL-0003's limit is closed for operators who ship generations and
+unchanged for those who do not. `standup.sh` remains irreducibly box-resident (#4749) — it
+creates `aiko_data`, writes the genesis `.env`, and pulls the image, so at that moment there is
+no generation. **No scheduler anywhere; the shipper never initiates.**
+
+---
+
+## 9. Round 2's eight flaws, and how this round answers them
+
+| | Round 2 flaw | Answer | By |
+|---|---|---|---|
+| R2-1 | `mv -T` operands missing | §4 writes both commands; plain `mv` fallback forbidden | **repair** (2 lines) |
+| R2-2 | backup gate a constant satisfies | shipper never invokes `update.sh`; no new path arithmetic exists | **deletion** |
+| R2-3 | stopped project reads as missing | §5a, three daemon answers; `aiko_data` decides | **repair** |
+| R2-4 | split re-couples via `ISLAND_VERSION` | pin leaves the cohort; one command; FATAL unreachable | **deletion** |
+| R2-5 | `local/` is the bypass | deleted; hash alone | **deletion** |
+| R2-6 | denylist defaults next path to cargo | three enumerated files; no `deploy/**` | **deletion** |
+| R2-7 | break-glass needs the lost key | compose-only generation ships keyless | **deletion** |
+| R2-8 | "Mitigations" mis-titled | §8 renamed; compromise stated as accepted | **repair** |
+
+**Five deletions, three repairs, no new mechanism.** Against round 2: three commands → one;
+`deploy/**` + governed manifest → three names; two acknowledgements → one; digest-gated restore
+→ plain restore; `local/` → gone.
+
+## 10. What the final strike should hit
+
+1. **Is the cohort-of-two argument sound?** §1 claims `.env`-alone reproduces 2026-09-11
+   because the value and its forwarding live in different files. If that is wrong, Carnot's
+   narrow tool wins and this design should dissolve.
+2. **Does `ISLAND_VERSION` actually leave cleanly**, or does something else in the shipped
+   `.env` couple to the image version in a way that reintroduces R2-4?
+3. **Is `mosquitto.conf` earning its place**, or is it a third file smuggled in by symmetry?
+   The 2026-09-11 incident involved two.
+4. **Does §5's all-file-facts comparison really fix R2-4's half-swing**, or does "placed but not
+   `up`" still have a state the tool mis-types?
+5. **The economy test, final call.** One command, three files, no executables, no scheduler, no
+   pull. Is this now *"a small control-side shipper plus restore"* — or is even this more than
+   `.env` is worth?
