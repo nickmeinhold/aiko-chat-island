@@ -204,3 +204,24 @@ The standing alternative, if this ever becomes onerous: split `APNS_PRIVATE_KEY`
 own binary artifact and keep the rest as dotenv-SOPS with visible key names. That was
 priced during review and deferred, not rejected — it trades one always-opaque file for
 two files with a sharper boundary.
+
+## Checking a live island against these files
+
+```sh
+.venv/bin/python deploy/check-env-drift.py --all
+```
+
+**Read-only.** Decrypts an island's copy here, reads the box's live `.env` over ssh, and
+reports **which keys** differ — never their values (same convention, and same reasoning, as
+`MANIFEST.txt` above). Exit 0 match / 1 differs / 2 could not run, which **fails closed**.
+
+It never writes to a box. That is deliberate and expensive to have learned: a design that
+*shipped* `.env` went four rounds of `/design-temper` without reaching SOUND, and every finding
+was about writing or about the generation directory writing required — see
+`docs/design/16-TEMPER.md`. Drift is **fixed by hand**, exactly as compose drift already is when
+`preflight-compose-drift.sh` refuses.
+
+This closes the one gap that guard cannot: `.env` holds per-box secrets, so there is nothing
+public to compare it against, and until now half the config surface was unverifiable. Its first
+run found both islands' committed copy pinned at `ISLAND_VERSION=0.9.5` while both boxes ran
+`0.15.0` — six releases of invisible drift in the artifact this directory calls authoritative.
