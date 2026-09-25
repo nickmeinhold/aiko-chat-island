@@ -249,3 +249,235 @@ other dispositions get simpler once the pin can only move on one command.
 **Still true from v1's closing rule:** this assembly must survive a clean ≥2-family strike
 *after* the fold, and the built PR still owes a `/cage-match` — this is deploy and secret
 handling, which is cage-match-by-law.
+
+---
+
+# ROUND 2 — struck 2026-09-25, `dt-1790306164`
+
+**Overall verdict: RECAST (3) vs DISSOLVE (1) — RECAST stands, but on notice.**
+Full panel, no dark seat. Maxwell RECAST, Kelvin RECAST, Tesla RECAST, **Carnot DISSOLVE**.
+DISSOLVE is decisive at ≥2 families; one is a strong finding to answer, not a kill.
+
+**The round's real result is not the verdict.** Two families independently concluded that the
+*next* fold must be **smaller** or the answer is option 3:
+
+> **Carnot:** *"The fold repaired the design by spending the justification… The design's own
+> mitigations are evidence against it."*
+>
+> **Tesla:** *"§9.6 is already groaning: this paper is past 'a small control-side shipper plus
+> restore.' The next fold gets smaller. If these six corrections cannot be specified without
+> new machinery, round 3 is option 3."*
+
+Round 1 found ten flaws of design. Round 2 found six of **mechanism** — smaller, more
+concrete, and three of them are things that simply do not work as written. That is the right
+trajectory for a recast. It is also the trajectory that runs out of road.
+
+## Per-family verdicts
+
+| Family | Verdict | One-line |
+|---|---|---|
+| Maxwell | RECAST | Break-glass requires the key whose loss is the emergency; `baseline` has no specified home. |
+| Kelvin | RECAST | `local/` resurrects two-sources-of-truth; "Mitigations" should read "Accepted Risks" — compromise is untouched. |
+| Carnot | **DISSOLVE** | Fails its own economy test. The engine is now larger than the work it extracts. |
+| Tesla | RECAST | `mv -T` as written errors; the backup gate a constant can satisfy; a stopped project reads as a missing one. |
+
+## Did the fold discharge round 1?
+
+| R1 flaw | Verdict | Note |
+|---|---|---|
+| 1 — backup in pruned generation | **PARTIAL** | the gate cannot fail the way the bytes fail (see R2-1) |
+| 2 — every island's ciphertext | **PARTIAL** | today's paths denied; `deploy/**` still defaults the *next* path to cargo |
+| 3 — §2's false dissolution | **DISCHARGED** | thesis dead, claim honest; compromise named but untouched |
+| 4 — FATAL armed / atomicity / digest | **PARTIAL** | split + digest are right; `mv -T` operands missing; `ship-config` has no legal sibling |
+| 5 — drift/delivery collapse | **PARTIAL** | three states named; the equality compares a belief to a directory |
+| 6 — self-letter identity | **PARTIAL** | absence no longer genesis; the daemon question goes silent when stopped |
+| 7 — human compiler | **DISCHARGED** | two privilege classes, two acknowledgements. *Do not grow a third prompt and call it a gate.* |
+| 8 — local state homeless | **PARTIAL** | `local/` is now the bypass the refusal teaches |
+| 9 — cutover gate | **DISCHARGED** | |
+| 10 — hygiene | **DISCHARGED** | |
+
+## New flaws (most-severe first)
+
+### R2-1. `mv -T`, as §4c words it, does not succeed — and its natural repair is the bug it was added to kill. **[Tesla, checked before striking]**
+
+§4c pins the flag and omits the operands. An implementer writing from *"swung with `mv -T`"*
+produces `mv -T releases/<ts> current`: **source is a directory, destination is a symlink,
+which is not a directory — GNU `mv` refuses** (`cannot overwrite non-directory with
+directory`). The 3am repair of that error is **dropping `-T`**, and a plain `mv` of a directory
+onto a symlink-to-directory **nests the new generation inside the old one** — precisely the
+defect `-T` was added to prevent.
+
+Every later invariant — prune the target of `current`, the backup arithmetic, "under
+`releases/`" — assumes a shape the literal syscall never produces.
+
+**FOLD:** write both commands — `ln -s releases/<ts> current.next` then
+`mv -T current.next current`, symlink onto symlink, one `rename(2)`, both under `REMOTE_PATH`.
+State that `mv -T` of the *generation directory* onto `current` is a **specified failure**, not
+an implementation choice. **Fail closed if `mv` has no `-T`; never fall back to plain `mv`.**
+
+### R2-2. The backup gate runs where the failure cannot occur, and a constant satisfies it. **[Tesla, Maxwell]**
+
+Round 1's worst flaw was discharged *conditionally on a CI test*, and the test as specified
+asserts **a resolved string at a synthetic cwd**. `printf '%s/backups' "$REMOTE_PATH"` passes
+it — without reading that cwd, without executing `update.sh`, without an inode.
+
+Worse, Tesla traced the real path: the backup is written by inherited `update.sh` via Python
+`.backup()` **inside the container**, onto a bind whose host side **Compose resolves from the
+canonical project directory**. `current` is a symlink; the daemon's project directory is
+`releases/<ts>`. The same relative arithmetic that is correct from *logical* `current/deploy`
+is **one directory short from the physical cwd** — and lands in the generation retention then
+prunes. *"At 3am the green check and the shredded sqlite are the same generation."*
+
+**FOLD:** the gate invokes the backup logic that actually ships, from **both** `current/deploy`
+and the physical `releases/<ts>/deploy`, and asserts **the canonical parent of the written
+inode** is `<REMOTE_PATH>/backups`. A string helper must not be able to pass it. Relative binds
+in the shipped compose file are part of the same assertion.
+
+### R2-3. A stopped project and a missing project are the same signal, and the signal is `--adopt`. **[Tesla, Maxwell]**
+
+§5c asks the daemon *which compose-file path project `aiko` was last started from.* That is not
+a project record — it is **two container labels**, and `docker compose ls` / `docker ps` list
+**running** projects by default. `docker compose down` removes the containers and therefore the
+labels — **and does not remove an external volume.** `aiko_data` survives, and `aiko_data` *is*
+the tenant.
+
+§5c reads the empty answer as *"the project does not exist"*, and that branch plus `--adopt` is
+allowed to `compose up`. **Adopt of a decoy `REMOTE_PATH` onto a surviving `aiko_data` is the
+split brain flaw 6 existed to close, entered through maintenance instead of through a missing
+`current`.** An inspect *error* is also not classified as COULD NOT RUN, so daemon failure
+types as the same empty. *"The design asks the fact the daemon forgets and ignores the fact it
+keeps."*
+
+**FOLD:** three daemon answers, not two. Labels present and the path under this `REMOTE_PATH` →
+proceed. Labels present, path elsewhere → REFUSE. No containers → **do not call this absence**:
+if external volume `aiko_data` exists, this is a **stopped tenant** and `--adopt` is REFUSED.
+Inspect errors are COULD NOT RUN. Query `ps -a` / the labels, never default `compose ls`.
+
+### R2-4. The split re-couples through the one file, and the half-swing is typed as drift. **[Tesla, Maxwell]**
+
+`ISLAND_VERSION` lives in the cohort `.env`. `ship-config` refuses when the pin differs from
+what is running and never pulls; `ship-release` is the only other mover and it pulls. So the
+ordinary repair — a compose forward, the 2026-09-11 line — is legal **only while the encrypted
+env's pin already matches the running image.** The moment git is ahead (**the normal state
+between bump and release**), or the box has drifted, or the island tracks a moving tag, **the
+safe door is shut and the dangerous door is the only door.** *"Two labels on one wire."*
+
+And §5 makes the crash window worse: **baseline** is *what the operator believes is running*;
+**live** is *what ssh reads from `current`*. §4 correctly says those diverge when the swing
+landed and `up` did not — so `live != baseline` **REFUSES, and the repair of a half-applied
+ship is classified as drift.** Maxwell, independently: `baseline` has **no specified home** —
+control-side it is a fourth thing that can drift; box-side it *is* `live` and the distinction
+collapses. *"Three states were named; the equality compares a process-belief to a directory."*
+
+**FOLD:** take `ISLAND_VERSION` out of the blob `ship-config` replaces, **or** have
+`ship-config` rewrite the placed pin to the **running** digest, show that override, and refuse
+to `up` any other image. Name the half-swing as its own state with continue-or-restore, not as
+drift. Say where `baseline` is persisted. Baseline and live are both **file** facts; *what is
+running* is a **daemon** fact and is not the same comparison.
+
+### R2-5. `local/` is the bypass the refusal teaches. **[Tesla, Kelvin, Maxwell — all three]**
+
+Round 1's disposition offered a directory **or** a hash. The fold did **both**. The hash watches
+`current/`; `local/` sits outside it and survives every flip — and the section's stated reason
+for existing is the 3am edit that the hash now correctly REFUSES. So the operator is refused,
+then shown a directory the hash does not cover, whose membership rule is *"box-local state"* —
+**the phrase §3 forbids as a membership rule.**
+
+The first time a shipped compose file or `update.sh` references it (`env_file`, a bind, a
+source), effective config is `cohort ⊕ local/`, **the drift predicate stays green, and "the
+artifact in git IS the artifact on the box" is false again.** Nothing in CI forbids the
+reference. Kelvin independently: *"An ambiguous state is a cold fault waiting for a phase
+transition."* Separately: the manifest hash is stored in `GENERATION.txt`, **inside the tree
+being hashed** — either always dirty, or excluded by an implementer with no spec.
+
+**FOLD:** **delete the overlay.** One mechanism: the manifest hash REFUSES a modified
+`current/`. Nothing in the shipped manifest may reference `local/`, **and CI greps for that
+reference.** Record the hash outside the hashed bytes. If `local/` survives at all it is
+scratch, not config, and the cohort cannot see it.
+
+### R2-6. A denylist is closed only for the paths already imagined. **[Tesla, Carnot, Maxwell]**
+
+`INCLUDE deploy/** minus a denylist` **defaults the next path to cargo.** The rule for the next
+ambiguous directory is unwritten (§9.2 admits it). CI asserting the denylist stays green when
+`deploy/keys/`, a second sops tree, or the shipper's real path appears — **the entry is still
+the pronoun `<the shipper itself>`.** The first miss replicates to every island, is retained
+for N generations, and **shred is specified only for `.env`.**
+
+Tesla on its own round-1 words: *"I called the denylist 'the closed set' in round 1. That
+phrase is the fossil."*
+
+**FOLD:** replace the denylist with an **allowlist**. CI lists the tree that would ship and
+**fails on any unclassified path** — unclassified is a red build, zero islands touched. Name
+the shipper by path. Shred every secret-shaped file the cohort could have carried, not only
+`.env`.
+
+### R2-7. Break-glass requires the key whose loss is the emergency. **[Maxwell]**
+
+§2 states that key loss blocks every config change, then specifies recovery as *"placing a
+generation and swinging `current`"* — which contains `.env`, which needs decryption, which
+needs the key. Hand-editing is what the next ship refuses. **The door was closed and no other
+was opened.**
+
+**FOLD:** specify break-glass for the keyless case, or state plainly that there is none and the
+second recipient is the whole answer — a named risk with an owner, not a silent gap. Candidate:
+allow a **signed, config-only generation** (compose + `deploy/`, no `.env`) so a compose forward
+ships without touching secrets. *That is exactly the 2026-09-11 repair and it needs no key.*
+
+### R2-8. "Mitigations" is the wrong heading. **[Kelvin]**
+
+A second age recipient and provenance pinning mitigate **availability** and **operator error**.
+Neither touches **compromise** — a compromised control side with a valid key and a clean
+checkout unlocks every island. *"The entropy has not been reduced; it has been concentrated to
+a critical mass."*
+
+**FOLD:** rename to **Accepted Risks and Tradeoffs**, and say plainly that control-side
+compromise is the central accepted risk of the push model.
+
+## Carnot's DISSOLVE, recorded in full because it is the decision Nick may have to make
+
+Not a kill at 1 family, but the strongest single argument in the round, and it must not be
+filed as a dissent:
+
+- **The economy test fails.** *"The design no longer resembles a small control-side shipper
+  plus restore; it is a deployment subsystem. The added machinery is not accidental polish, it
+  is required to make the subsystem safe enough to exist."*
+- **The marginal gain is too narrow for the new trusted surface.** The existing preflight ran
+  clean on both boxes on 2026-09-21; the remaining gap is `.env` plus avoiding a manual
+  prelude — *"that does not justify centralizing decrypt authority and deployment authority
+  into this much mechanism."*
+- **Its alternative, which is narrower than option 1 and larger than option 3:** keep the
+  preflight; build a **narrow `.env`-only tool** — decrypt one island's complete SOPS `.env`,
+  compare to live, require explicit review, place mode-correctly, shred temps, **stop**. *"Do
+  not combine it with executable deploy delivery."*
+
+Maxwell reached the same escape hatch independently before reading Carnot's strike.
+
+## What holds (unanimous across both rounds)
+
+The cargo/vehicle cut. The subtractive middle — no template, no render, no byte-match proof.
+One same-filesystem `rename(2)` as the right joint **for files** (only the operands are wrong).
+The secret posture. `ship-release` pulling a control-side-resolved digest; `restore` refusing
+across a digest boundary and printing the sqlite path; no image rollback in the tool; no
+scheduler; the shipper never initiates. Cutover refusing a mismatched `.env`. Three outcomes,
+fail closed. `aiko_data` external and outside the cohort. `standup.sh` box-resident. Option 3's
+preflight is a real compiler and is not re-solved. And §2's honesty — *"do not decorate it back
+into 'the loop is gone.'"*
+
+Tesla on the human-compiler discharge, worth keeping as a constraint on round 3: **"Do not grow
+a third prompt and call it a gate."**
+
+## Disposition
+
+**RECAST — round 2 of ≤3. One round remains.**
+
+The eight folds above are specified and could be written. But two families independently set
+the same bar for round 3, and it is not "fix these":
+
+> **The next fold must be SMALLER than this one.** If R2-1 through R2-8 cannot be discharged
+> without new machinery, the honest answer is **option 3** — one manual `deploy/` sync per box
+> plus the preflight that already exists — or **Carnot's narrow `.env`-only tool**, which is
+> the smallest thing that captures the gain that actually motivated this.
+
+**Owed to Nick:** this is a second decision point, and it is his. Round 3 can be attempted, but
+it should be attempted *only* as a subtraction. A round 3 that adds a ninth mechanism has
+answered Carnot by proving him right.
