@@ -1,5 +1,34 @@
 # Declarative island config delivery — design (#2301)
 
+> ## SUPERSEDED 2026-09-25 by `deploy/check-env-drift.py` — a READ-ONLY check.
+>
+> **Nick: *"I think we've over-complicated this."*** He was right, and Carnot had said it in
+> round 2. Four rounds of `/design-temper` never reached SOUND
+> (**[16-TEMPER.md](16-TEMPER.md)**, strikes in `16-strikes/`).
+>
+> **The actual gap is one sentence:** `preflight-compose-drift.sh` already refuses on compose
+> and `deploy/` drift; it cannot see `.env`, because `.env` holds per-box secrets and there is
+> nothing public to compare it against. So half the config surface has never been checkable.
+>
+> **Everything in this document exists because it assumed the tool had to WRITE to the box.**
+> Take writing away and the generation directory, the symlink swing, `restore`,
+> baseline/target/live, the half-applied discriminator, adoption, the first-ship state and the
+> pin migration all stop existing — **and so does every one of the twenty-plus findings across
+> four rounds.** Not one of them survives a read-only tool. That is the tell that the
+> complexity was never in the problem.
+>
+> What shipped instead: **decrypt, ssh, diff, report key names, exit non-zero.** ~200 lines
+> with its comments, no new file on the box, nothing to sync or prune or roll back. It refuses
+> and shows, matching ISL-0003's posture for ISL-0003's stated reason.
+>
+> **Its first run found six releases of real drift**: the repo's encrypted copy of both islands
+> said `ISLAND_VERSION=0.9.5` while both boxes ran `0.15.0`, and nothing could see it.
+>
+> **Kept for the rejected alternatives and the reasoning** — the same reason
+> `47-declarative-deploy/DESIGN.md` is kept. **Do not build from this file.** If a future
+> revision proposes writing to the box, it inherits all four rounds of findings and must
+> answer them.
+
 > ## ROUND 4 STRUCK — NOT SOUND (1 SOUND / 3 RECAST). DO NOT BUILD FROM THIS FILE.
 >
 > Nick's key ruling and the `--env-file` measurement **closed two of round 3's three findings
