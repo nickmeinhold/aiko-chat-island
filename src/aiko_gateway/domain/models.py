@@ -696,6 +696,69 @@ class Membership(Base):
     joined_at: Mapped[dt.datetime] = mapped_column(UtcDateTime, default=_utcnow)
 
 
+class ChannelReadPosition(Base):
+    """Where a user has read up to in a channel — the ISLAND half of Nick's ruling
+    2026-09-25, *"different devices should see the same thing"* (#4834a).
+
+    THIS REVERSES A CONTRACT THAT WAS RECORDED ON BOTH SIDES, which is why it is a
+    cross-tab change and not an addition. `rest/dm.py`'s `list_dms` docstring says
+    *"NO ``unread`` (client-side per the contract — the island has no read-position
+    store)"*, and the app's `channel_read_store.dart` says its watermarks *"never
+    leave the device"*. Both were right about the old design. The measured
+    consequence is the one Nick named: two handsets disagree about what is unread
+    until each is opened.
+
+    SEQ, NOT MAX-ON-ULID, and the reason is the whole design. The obvious merge —
+    keep the greatest `last_read` — makes MARK-AS-UNREAD IMPOSSIBLE: moving the
+    watermark backwards writes a LOWER ulid, which always loses to the stored one.
+    The app tab got this wrong first, Nick rejected it, and they corrected to a
+    client-supplied monotonic `seq`: a mark-as-unread writes a HIGHER seq carrying a
+    LOWER last_read, and wins. Verified here rather than taken on trust — the
+    argument is checkable and it holds.
+
+    So the merge rule is `seq`-max, and `last_read` is CARRIED not compared. A
+    write whose seq is not greater than the stored seq is a no-op, which makes the
+    endpoint idempotent and makes a stale device's late replay harmless.
+
+    ONE ROW PER (user, channel). The PK leads with `user_id`, the INVERSE of
+    `Membership` — deliberately. Every access path here is user-first ("my read
+    positions"), whereas memberships are read channel-first; #2633 had to add
+    `ix_memberships_user_id` precisely because that table's composite PK led with
+    the wrong column for a user-first query. Leading correctly costs nothing now
+    and saves the same index later.
+
+    LAST_READ MAY BE THE EMPTY STRING. That is the app's first-sight floor for a
+    channel empty at settle time (`channel_read_store.dart`), not a missing value.
+    Storing it as `''` rather than NULL keeps the column NOT NULL and keeps an
+    absence meaning exactly one thing — a row that does not exist. An absence with
+    two causes is the defect class this repo keeps re-finding.
+
+    NOT A GENERAL KEY-VALUE STORE, and the app tab's argument for that is better
+    than mine was: the two multi-device consumers have DIFFERENT conflict semantics
+    — a watermark wants version-max, a device label wants last-write-wins. One
+    general store either lies to one consumer or grows a per-key merge policy,
+    which is the generality creep that killed design 16.
+    """
+    __tablename__ = "channel_read_positions"
+    __table_args__ = (
+        # A negative seq cannot be a monotonic counter, and a client that sends
+        # one is either buggy or probing. Refusing at the column means the merge
+        # rule below never has to reason about it.
+        CheckConstraint("seq >= 0", name="ck_channel_read_positions_seq"),
+    )
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), primary_key=True)
+    channel_id: Mapped[str] = mapped_column(
+        ForeignKey("channels.id"), primary_key=True)
+    # A 26-char ULID, or '' (the first-sight floor). NOT a closed set, so it is
+    # correctly absent from test_closed_set_guard's vocabulary shapes.
+    last_read: Mapped[str] = mapped_column(String(26), nullable=False)
+    # CLIENT-SUPPLIED monotonic version. The island never mints it: the island
+    # cannot order two devices' edits, which is the entire reason the client owns
+    # the counter.
+    seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[dt.datetime] = mapped_column(UtcDateTime, default=_utcnow)
+
+
 class Community(Base):
     """A community ("server") that owns channels (#32, Option B / Phase B1).
 
