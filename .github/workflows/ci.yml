@@ -27,6 +27,35 @@ jobs:
 
       - run: pytest
 
+  # Stage 1 of #4824 put operator-side deploy tooling in Dart, and pytest cannot
+  # see any of it. Without this job the Dart half is untested on CI while the
+  # Python half is gated — which breaks the reason CI exists here at all
+  # (decided 2026-09-01: "this repo is meant to have outside contributors, so CI
+  # is what makes a stranger's PR safe to merge"). A second language is a second
+  # gate, not a second opinion.
+  #
+  # `dart analyze --fatal-infos` rather than plain analyze: analysis_options.yaml
+  # raises a non-exhaustive switch to an ERROR because the sealed outcome type is
+  # the whole argument for the rewrite, and a gate that lets warnings through
+  # would not enforce the property the code was written to have.
+  deploy-dart:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: '3.13.0' # pinned: pubspec says ^3.13.0, and "latest stable" is a
+                        # moving gate that can go red on a day nobody touched it
+      - run: dart pub get
+        working-directory: deploy/dart
+      - run: dart analyze --fatal-infos
+        working-directory: deploy/dart
+      - run: dart test
+        working-directory: deploy/dart
+      - name: Formatting
+        run: dart format --output=none --set-exit-if-changed .
+        working-directory: deploy/dart
+
   # Key-free verification of the committed encrypted island config. Runs on every push
   # because the artifacts sit in a PUBLIC repo permanently: a dropped recipient or an
   # added one is invisible in a binary diff, and a plaintext slip cannot be un-pushed.
