@@ -771,3 +771,106 @@ def test_sender_kind_check_rejects_the_retired_channel_kinds(tmp_path, monkeypat
                 f"test cannot tell you the set is closed. Error was: {exc.value}")
     finally:
         engine.dispose()
+
+
+_INSERT_REPORT = (
+    "INSERT INTO message_reports (id, message_id, reporter_user_id, reason, "
+    "created_at) VALUES (:rid, 'm0', 'u1', :reason, '" + _TS + "')"
+)
+
+
+def test_report_reason_check_rejects_out_of_set(tmp_path, monkeypatch):
+    """message_reports.reason is closed to the six REPORT_REASONS by a DB CHECK
+    (0028), the same defense-beyond-the-API posture its own table's `resolution`
+    column already had.
+
+    THE ASYMMETRY IS THE POINT. Piece B gave `resolution` — which only ops writes
+    — an enum and a CHECK. `reason` — which any user writes over the wire — got a
+    pydantic enum at the route and nothing underneath, so
+    `moderation_service.report_message` took a bare str and an out-of-set value
+    written through it PERSISTED (measured 2026-09-26, with sender_kind refusing
+    the same shape of write as the control). The gate was on the trusted writer.
+
+    THE WITNESS IS NOT A MEMBER OF ANY SET and is not a plausible future reason,
+    for the sibling sender_kind test's stated reason: a witness that some system
+    might legitimately start sending turns a green into a lie nobody rereads.
+
+    A DISTINCT report id per insert so a failure can ONLY be the reason CHECK,
+    never a PK collision or the UNIQUE(message_id, reporter_user_id) — which
+    ALSO fires as an IntegrityError and would otherwise fake this green. That is
+    why every accepted member below reuses one id via delete, and the rejected
+    witness gets its own.
+    """
+    engine = _fresh_at_head(tmp_path, monkeypatch)
+    try:
+        with engine.begin() as c:
+            c.execute(text(_INSERT_CHANNEL), {"jp": "invite_only"})
+            c.execute(text(_insert_user("u1")))
+            c.execute(text(_INSERT_MESSAGE), {"mid": "m0", "kind": "human"})
+            # All six members accepted. The UNIQUE(message_id, reporter_user_id)
+            # means only one report may stand at a time, so each is deleted
+            # before the next — otherwise the second insert fails on the unique
+            # key and this loop would "prove" the CHECK rejects a valid member.
+            for i, reason in enumerate(
+                    ("spam", "harassment", "hate", "violence", "sexual", "other")):
+                c.execute(text(_INSERT_REPORT), {"rid": f"rep{i}", "reason": reason})
+                c.execute(text("DELETE FROM message_reports WHERE id = :rid"),
+                          {"rid": f"rep{i}"})
+        with pytest.raises(IntegrityError) as exc:
+            with engine.begin() as c:
+                c.execute(text(_INSERT_REPORT),
+                          {"rid": "rep9", "reason": "vibes"})
+        # NAME THE CONSTRAINT: a bare IntegrityError here could be the unique key
+        # or the FK, and the test would report a closure it never observed.
+        assert "ck_message_reports_reason" in str(exc.value) or "CHECK" in str(exc.value), (
+            "'vibes' was refused, but not by the reason CHECK — this test cannot "
+            f"tell you the set is closed. Error was: {exc.value}")
+    finally:
+        engine.dispose()
+
+
+def test_0028_folds_an_out_of_set_row_rather_than_aborting(tmp_path, monkeypatch):
+    """0028's repair arm, which 0027 deliberately did not have.
+
+    A stranger's island (this repo is public and takes outside operators, decided
+    2026-09-01) may hold a hand-written row. Without the arm that row fails the
+    new CHECK during batch_alter_table's row copy and ABORTS the upgrade mid
+    rebuild — the wedged-boot failure ISL-0001 exists to prevent. `other` is the
+    set's own catch-all, so folding is honest here where folding into 'unknown'
+    would not have been in 0027.
+
+    Seeded at 0027 and upgraded, not inserted at head: at head the CHECK is
+    already live and the bad row could not be created, so a test that skipped the
+    upgrade path would be asserting against a world that cannot happen.
+    """
+    db = tmp_path / "fold.db"
+    monkeypatch.setattr(settings, "db_url", f"sqlite+aiosqlite:///{db}")
+    cfg = migrate._alembic_config()
+    command.upgrade(cfg, "0027")
+    engine = create_engine(f"sqlite:///{db}")
+    try:
+        with engine.begin() as c:
+            c.execute(text(_INSERT_CHANNEL), {"jp": "invite_only"})
+            c.execute(text(_insert_user("u1")))
+            c.execute(text(_INSERT_MESSAGE), {"mid": "m0", "kind": "human"})
+            c.execute(text(_INSERT_REPORT), {"rid": "rep0", "reason": "NOT_A_REASON"})
+            # Prove the row is really there pre-upgrade, so a vacuous pass (the
+            # insert silently failing) cannot masquerade as a successful fold.
+            assert c.execute(text(
+                "SELECT reason FROM message_reports WHERE id='rep0'")).scalar_one() \
+                == "NOT_A_REASON"
+    finally:
+        engine.dispose()
+    command.upgrade(cfg, "0028")
+    engine = create_engine(f"sqlite:///{db}")
+    try:
+        with engine.begin() as c:
+            assert c.execute(text(
+                "SELECT reason FROM message_reports WHERE id='rep0'")).scalar_one() \
+                == "other"
+            # And the constraint is live afterwards — the fold must not have been
+            # achieved by skipping the constraint it exists to make room for.
+            with pytest.raises(IntegrityError):
+                c.execute(text(_INSERT_REPORT), {"rid": "rep9", "reason": "vibes"})
+    finally:
+        engine.dispose()

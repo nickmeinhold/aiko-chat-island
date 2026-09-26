@@ -16,7 +16,6 @@ private-channel message stays existence-hidden behind the same 404).
 from __future__ import annotations
 
 import logging
-from enum import Enum
 from typing import Literal
 from urllib.parse import urlparse
 
@@ -26,6 +25,7 @@ from pydantic import BaseModel
 
 from ..config import settings
 from ..domain import moderation_service
+from ..domain.models import ReportReason
 from ..realtime import envelopes
 from .deps import CurrentUser, DbSession, ModeratorUser
 
@@ -56,9 +56,12 @@ async def _deliver_moderation_alert(url: str, payload: dict) -> None:
                     host, type(exc).__name__)
 
 
-# Closed set, mirrors moderation_service.REPORT_REASONS — an unknown reason is a
-# 422 at the boundary, never a free-text blob in the column.
-ReportReason = Enum("ReportReason", {r: r for r in moderation_service.REPORT_REASONS}, type=str)
+# Closed set — an unknown reason is a 422 at the boundary. This used to build its
+# own Enum from moderation_service.REPORT_REASONS; it now uses the domain enum
+# directly, which is also what drives the DB CHECK (0028). The dynamic rebuild
+# was never wrong, but it made the boundary look like the place the set was
+# enforced, and for this column it was the ONLY place — the service took a bare
+# str and the column had no constraint. One name, three layers.
 
 
 class ReportReq(BaseModel):
