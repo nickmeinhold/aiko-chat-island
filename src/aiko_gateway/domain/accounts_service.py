@@ -44,7 +44,8 @@ from . import (
     recovery_service, signing_keys_service)
 from .memberships_service import ROLE_ADMIN
 from .models import (
-    Community, CommunityMembership, Membership, Message, SocialIdentity, User)
+    ChannelReadPosition, Community, CommunityMembership, Membership, Message,
+    SocialIdentity, User)
 
 # What a tombstoned message's author label becomes once the account is gone.
 DELETED_USER_LABEL = "[deleted user]"
@@ -253,6 +254,14 @@ async def delete_user_account(session: AsyncSession, user_id: str) -> None:
         delete(SocialIdentity).where(SocialIdentity.user_id == user_id))
     await session.execute(
         delete(Membership).where(Membership.user_id == user_id))
+    # Read positions (#4834a). DELETE, not anonymize: a read position is a
+    # PRIVATE note about where its owner got to, useful to nobody else and part
+    # of no audit trail — unlike a report (anonymized, ops still needs it) or an
+    # authored message (tombstoned, the conversation would otherwise lose a
+    # turn). Nothing survives it being gone.
+    await session.execute(
+        delete(ChannelReadPosition).where(
+            ChannelReadPosition.user_id == user_id))
     # Finally the account row itself.
     # NO token_generation bump here (#1914): deletion HARD-removes the user row, and
     # every auth ingress (get_current_user, refresh, WS handshake) fails closed when
