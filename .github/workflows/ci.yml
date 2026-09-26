@@ -77,5 +77,19 @@ jobs:
           echo "$SOPS_SHA  /tmp/sops" | sha256sum -c -
           sudo install -m 0755 /tmp/sops /usr/local/bin/sops
           sops --version
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: '3.13.0' # pinned; see the deploy-dart job for why
+      - run: dart pub get
+        working-directory: deploy/dart
       - name: Verify committed secrets
-        run: ./deploy/verify-secrets.sh
+        # DART, not deploy/verify-secrets.sh (#4824 Stage 1). This is the ONE
+        # script under deploy/ that does not run on a sovereign box, so ISL-0003's
+        # no-toolchain argument does not reach it.
+        #
+        # It adds a third outcome the shell could not express: exit 2, DID NOT
+        # VERIFY, when fewer checks ran than the tree's contents require. Every
+        # silence bug in verify-secrets.sh's history — a rename making the glob
+        # match nothing, a PR deleting every secrets file, a tool dying mid-pipe —
+        # produced "no failures found" over an empty set and exited 0.
+        run: dart run deploy/dart/bin/verify_secrets.dart
