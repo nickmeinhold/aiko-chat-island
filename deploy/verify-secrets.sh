@@ -1,4 +1,12 @@
 #!/usr/bin/env bash
+# SUPERSEDED 2026-09-26 by deploy/dart/bin/verify_secrets.dart (#4824 Stage 1).
+# CI's secrets-integrity job now runs the Dart version; this file is no longer the
+# gate. It is kept rather than deleted for one operational reason: the box carries a
+# copy of deploy/, and preflight-compose-drift.sh diffs every deploy/ file it holds
+# against the tag being pulled — so removing this file makes every un-synced box
+# refuse its next deploy. Removal pairs with a compose/deploy sync, not with this
+# commit.
+#
 # Verify the committed encrypted island config — WITHOUT any private key.
 #
 # WHY THIS EXISTS (Carnot, cage-match on PR#166): every load-bearing proof for that
