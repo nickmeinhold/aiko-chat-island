@@ -184,7 +184,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import settings
 from ..db import SessionLocal
-from . import apns, moderation_service
+from . import apns, fcm, moderation_service
 from .models import (Channel, ChannelKind, DeviceToken, Membership, Message,
                      Platform, ApnsEnvironment, TokenKind, User)
 from .push_result import (ReapOrder, SendResult, Verdict, WakeKind,
@@ -245,23 +245,14 @@ CALL_END_BODY = "aiko:call/1 · 📞 ended the call"
 # Iterating a registry to dispatch would be a second door wearing a dict — sending
 # goes through the single `match` on the Delivery union in `_wake_user` and
 # nowhere else.
-def _fcm_not_built() -> bool:
-    """Android is NOT BUILT — never configured, by construction, not by config.
-
-    The totality guard below demands an answer for every `Platform` member, and
-    this is the honest one. It is a FUNCTION rather than a bare `False` so the
-    reason has somewhere to live: design 14's temper dissolved shipping an FCM
-    send path ahead of the client's receive half, so there is no credential an
-    operator could set that would make this True. When Android ships end-to-end,
-    this is replaced by a real `fcm.is_configured` — and the closed-set guard is
-    what will make sure every other address gets updated in the same change.
-    """
-    return False
-
-
 _CONFIG_PROBES: dict[Platform, Callable[[], bool]] = {
     Platform.APNS: apns.is_configured,
-    Platform.FCM: _fcm_not_built,
+    # A REAL PROBE since claude-tasks#4421 (2026-10-05). Until then this was
+    # `_fcm_not_built`, a constant False, because design 14's temper dissolved
+    # shipping a send path ahead of the client's receive half. The receive half
+    # is now built and hardware-verified app-side, so the credential IS the switch,
+    # the same as APNs and LiveKit.
+    Platform.FCM: fcm.is_configured,
 }
 
 # TOTALITY AT IMPORT, not at first ring. A `Platform` member added without a probe
@@ -420,12 +411,21 @@ class ApnsDelivery:
 
 
 
-# ONE MEMBER TODAY. Kept as an alias rather than collapsed to ApnsDelivery:
-# `Platform` is still a closed set with a live FCM member (both islands hold
-# Android rows), so the router's exhaustiveness is a real property, not a
-# formality — and design 14's temper was explicit that a second transport
-# must EARN the shared shape rather than have it predicted for it.
-Delivery = ApnsDelivery
+@dataclasses.dataclass(frozen=True, slots=True)
+class FcmDelivery:
+    """One push to send to Google. NO environment and NO token kind: FCM has one
+    registry and one endpoint per project, and carrying a field the transport
+    cannot honour would read as a routing decision nothing downstream makes."""
+
+    row_id: str
+    token: str
+    updated_at: dt.datetime
+
+
+# TWO MEMBERS since claude-tasks#4421. Design 14's temper said a second transport
+# must EARN the shared shape rather than have it predicted for it; the shape it
+# earned is a SEPARATE member, not a widened ApnsDelivery with optional fields.
+Delivery = ApnsDelivery | FcmDelivery
 
 
 def plan_deliveries(
@@ -507,13 +507,6 @@ def plan_deliveries(
             # reason instead of raising into a fanout.
             platform = Platform(row.platform)
             kind = TokenKind(row.token_kind)
-            # NOT-BUILT IS CHECKED FIRST, and the order is the point: a transport
-            # this island cannot speak at all must not be reported as
-            # `transport_not_configured`, which names something the operator could
-            # fix. There is nothing to fix — Android has no send path here yet.
-            if platform is Platform.FCM:
-                skips.append((row.id, "transport_not_built"))
-                continue
             if platform not in configured:
                 # OPERATOR-FIXABLE, and loud enough to be findable without being
                 # the alarm. The property it preserves: an Android device that
@@ -580,6 +573,42 @@ def plan_deliveries(
                     deliveries.append(ApnsDelivery(
                         row.id, row.token, row.updated_at,
                         ApnsEnvironment(row.apns_environment), kind))
+                case Platform.FCM:
+                    # THE ONE REAL ROUTING DIFFERENCE FROM APNs (claude-tasks#4421,
+                    # the app tab's contract). Android has ONE token kind: FCM rows
+                    # register as `alert`, and ring-ness is a property of the
+                    # MESSAGE (data-only + HIGH), not of the token. So BOTH wakes go
+                    # to the alert row.
+                    #
+                    # `end_wake_needs_voip` MUST NOT CARRY OVER. Its whole argument
+                    # is that an APNs alert push runs no app code and so cannot end
+                    # a ring. A data-only FCM push DOES run app code — that is how
+                    # it rings in the first place — and the receiver dismisses on a
+                    # matching `c` (measured: 1ms after delivery). Applying the APNs
+                    # skip here would mean an Android hangup never stops the other
+                    # phone ringing.
+                    #
+                    # NOR does `end_wake_gate_open`. That interlock defends iOS's
+                    # must-report-to-CallKit obligation against a handset build
+                    # that cannot handle a VoIP end push (#4278). Android has no
+                    # must-report rule: a lone `call_end` is a no-op on the
+                    # receiver, so there is nothing for the gate to protect.
+                    match (kind, wake):
+                        case (TokenKind.ALERT, WakeKind.CALL_INVITE):
+                            pass
+                        case (TokenKind.ALERT, WakeKind.CALL_END):
+                            pass
+                        case (TokenKind.VOIP, _):
+                            # Not a state the app can produce — Android has no VoIP
+                            # token. A row claiming one is corrupt or forged, and
+                            # it gets a NAMED reason rather than a guessed send.
+                            skips.append((row.id, "fcm_has_no_voip_kind"))
+                            continue
+                        case _:
+                            raise ValueError(
+                                f"unrouted fcm wake kind={kind} wake={wake}")
+                    deliveries.append(
+                        FcmDelivery(row.id, row.token, row.updated_at))
                 case _:
                     assert_never(platform)
         except ValueError:
@@ -779,15 +808,13 @@ _UNREACHABLE_REMEDY = {
                           "box's docker-compose.yml actually forwards them "
                           "(#2301: update.sh pulls the image, it does NOT sync "
                           "compose)"),
-    # NOT BUILT, so there is NOTHING an operator can set (design 14 temper). The
-    # earlier wording told them to set a credential, then a later round told them
-    # NOT to set it while a boot guard refused it — two rounds of findings were
-    # that contradiction leaking across surfaces. With no FCM send path there is no
-    # credential, no guard and no contradiction: the remedy states a fact about the
-    # island's capabilities rather than an action the operator cannot usefully take.
-    Platform.FCM.value: ("Android push is NOT BUILT on this island — there is no "
-                         "credential to set. These devices are unreachable until "
-                         "the Android transport ships with its client receive half"),
+    # A REAL CREDENTIAL AGAIN, since the send path exists (claude-tasks#4421). The
+    # NOT-BUILT wording this replaced was correct only while there was no send path;
+    # left in place it would now tell an operator something false about the island.
+    Platform.FCM.value: ("Set FCM_SERVICE_ACCOUNT_JSON (single-line service-account "
+                         "JSON, `jq -c .`), and check this box's docker-compose.yml "
+                         "actually forwards it (#2301). Hold until the app's Android "
+                         "receive half is merged — see claude-tasks#4421"),
 }
 
 
@@ -962,6 +989,13 @@ async def _wake_user(session: AsyncSession, user_id: str, *, wake: WakeKind,
                     log.info("apns sent device=%s env=%s kind=%s verdict=%s",
                              delivery.row_id, delivery.apns_environment.value,
                              delivery.token_kind.value, result.verdict.value)
+                case FcmDelivery():
+                    result = await fcm.send(delivery.token, payload,
+                                            collapse_key=collapse_id)
+                    # Same semantic record as the APNs line above: the row's ULID,
+                    # never the token.
+                    log.info("fcm sent device=%s verdict=%s",
+                             delivery.row_id, result.verdict.value)
                 case _:
                     assert_never(delivery)
         except Exception:

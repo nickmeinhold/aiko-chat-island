@@ -296,9 +296,12 @@ async def lifespan(app: FastAPI):
             # it. All three are no-ops on an island with push unconfigured.
             # Imported here rather than at module scope to keep the import graph of
             # `main` unchanged for the clean-checkout route-table tests.
-            from .domain import apns, push_service
+            from .domain import apns, fcm, push_service
             await push_service.aclose()
+            # Every transport closes AFTER the drain, for the reason above — the
+            # FCM client is the same hazard as the APNs one, one provider over.
             await apns.aclose()
+            await fcm.aclose()
     finally:
         # Outermost: runs whether startup raised before yield or cleanup raised.
         release_single_worker_lock()

@@ -34,7 +34,7 @@ import pytest
 import pytest_asyncio
 
 from aiko_gateway.config import settings
-from aiko_gateway.domain import apns, push_service, users_service
+from aiko_gateway.domain import apns, fcm, push_service, users_service
 import sqlalchemy as sa
 
 from aiko_gateway.domain.models import (
@@ -482,6 +482,58 @@ async def test_an_end_wake_reaches_the_voip_row_and_skips_the_alert_row(
     assert fake_apns.sent[0][0] == "v" * 64
     assert any("reason=end_wake_needs_voip" in r.message for r in caplog.records), (
         f"the alert row's skip must name itself. Log: {caplog.text}")
+
+
+@pytest.fixture
+def fake_fcm(monkeypatch):
+    """An island holding an FCM credential, with Google replaced by a recorder.
+    Returns the list of (token, payload, collapse_key) sends."""
+    monkeypatch.setattr(settings, "fcm_service_account_json", FCM_CREDENTIAL,
+                        raising=False)
+    fcm.reset_for_tests()
+    sent: list = []
+
+    async def _send(device_token, payload, *, collapse_key=None):
+        sent.append((device_token, payload, collapse_key))
+        return SendResult(Verdict.DELIVERED)
+
+    monkeypatch.setattr(fcm, "send", _send)
+    yield sent
+    fcm.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_an_android_hangup_reaches_fcm_with_the_gate_closed(
+    session, dm, configured, fake_apns, fake_fcm
+):
+    """THE APP TAB'S ROUTING ASK, end to end (claude-tasks#4421): an Android
+    handset has ONE token kind, so the hangup must reach its alert row. Copying
+    the APNs `end_wake_needs_voip` skip across would leave the other phone ringing.
+
+    THE GATE IS DELIBERATELY LEFT CLOSED (no `end_wake_gate_open`). The #4278
+    interlock protects iOS's must-report-to-CallKit rule; Android has none, so
+    the end wake must reach FCM while the APNs VoIP end stays gated. Both halves
+    asserted, so this cannot pass by the gate happening to be open.
+    """
+    alice, bob = dm
+    session.add_all([
+        DeviceToken(user_id=bob.id, platform="fcm", token="android-token-1",
+                    token_kind=TokenKind.ALERT.value),
+        DeviceToken(user_id=bob.id, platform="apns", token="v" * 64,
+                    token_kind=TokenKind.VOIP.value),
+    ])
+    await session.commit()
+
+    await _wake(push_service.CALL_END_BODY, sender_id=alice.id)
+    assert [(t, p.kind) for t, p, _ in fake_fcm] == [
+        ("android-token-1", push_service.WakeKind.CALL_END)]
+    assert fake_apns.sent == [], (
+        "the APNs VoIP end went out with the #4278 interlock closed")
+
+    fake_fcm.clear()
+    await _wake(push_service.CALL_INVITE_BODY, sender_id=alice.id)
+    assert [(t, p.kind) for t, p, _ in fake_fcm] == [
+        ("android-token-1", push_service.WakeKind.CALL_INVITE)]
 
 
 @pytest.mark.asyncio

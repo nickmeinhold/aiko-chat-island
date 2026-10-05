@@ -339,31 +339,27 @@ async def test_the_apns_remedy_still_carries_the_compose_warning(session, caplog
 
 
 @pytest.mark.asyncio
-async def test_an_island_with_android_rows_says_NOT_BUILT_not_how_to_configure(
+async def test_an_apns_island_with_android_rows_names_the_fcm_credential(
     session, configured, caplog
 ):
-    """The warning must name Android as UNREACHABLE and offer no action.
+    """The warning must name Android as UNREACHABLE and say what to set.
 
-    Replaces `test_an_apns_island_with_android_rows_warns_and_names_fcm`, which
-    required the warning to name `FCM_SERVICE_ACCOUNT_JSON` — an instruction that
-    two later rounds proved could not be given safely. Design 14's temper removed
-    the send path entirely, so there is now nothing to set and the honest warning
-    states a capability fact.
+    While FCM had no send path this asserted the OPPOSITE — "NOT BUILT", and no
+    variable named — because a remedy nobody could act on was what produced two
+    rounds of contradictory guidance. The send path now exists (#4421), so the
+    honest remedy is an action again, and naming it is the property.
 
-    BOTH ARMS, because this surface has drifted three times in this PR alone:
-      - it must NAME the unreachable devices (silence would make an Android
-        registration indistinguishable from a delivery bug), and
-      - it must NOT hand the operator a variable to set, because none exists and a
-        remedy nobody can act on is what produced the contradiction rounds.
+    BOTH ARMS still: the Android rows must be NAMED, and the APNs remedy must not
+    fire on an island whose APNs transport is healthy.
     """
     await _user_with_android(session, 2)
     with caplog.at_level("WARNING"):
         await push_service.warn_if_unreachable(session)
     text = caplog.text
     assert "platform=fcm" in text, f"the Android rows were not named: {text}"
-    assert "NOT BUILT" in text, f"the warning must state the capability fact: {text}"
-    assert "FCM_SERVICE_ACCOUNT_JSON" not in text, (
-        "the warning offers a credential to set; there is no send path, so that "
-        f"instruction cannot be acted on. Text: {text}")
+    assert "FCM_SERVICE_ACCOUNT_JSON" in text, (
+        f"the warning must name the credential that fixes it: {text}")
+    assert "NOT BUILT" not in text, (
+        f"the warning still claims a send path that now exists is missing: {text}")
     assert "APNS_KEY_ID" not in text, (
         "the APNs arm fired on an island whose APNs transport is healthy")

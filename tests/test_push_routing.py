@@ -25,13 +25,10 @@ from aiko_gateway.domain.models import (
     ApnsEnvironment, DeviceToken, Platform, TokenKind,
 )
 from aiko_gateway.domain.push_service import (
-    ApnsDelivery, WakeKind, plan_deliveries,
+    ApnsDelivery, FcmDelivery, WakeKind, plan_deliveries,
 )
 
-# NAME KEPT, MEANING NARROWED: `Platform` still has two members (both islands
-# hold Android rows) but only APNs has a send path, so 'both configured' now
-# means 'every transport that CAN be configured'. The FCM member is skipped as
-# NOT BUILT before the configured check ever runs — design 14 temper.
+# Both transports have a send path since claude-tasks#4421, so BOTH means both.
 BOTH = frozenset(Platform)
 NOW = dt.datetime(2026, 9, 9, 12, 0, tzinfo=dt.UTC)
 
@@ -66,26 +63,43 @@ def _row(row_id: str, platform: str, token_kind: str = TokenKind.ALERT.value,
 # TABLE: every cell is stated, including the one that is a skip. A member added
 # without a row here fails with a KeyError naming the missing cell, which is the
 # decision being forced rather than inherited.
-_EXPECTED: dict[tuple[TokenKind, WakeKind, bool], str | None] = {
+_EXPECTED: dict[tuple[Platform, TokenKind, WakeKind, bool], str | None] = {
     # (token_kind, wake, end_wake_gate_open) -> None means delivered, else the
     # named skip reason. THE GATE IS AN AXIS OF THE TABLE, not a special case
     # tested elsewhere: an interlock whose closed state is not swept is an
     # interlock nobody proves is closed.
-    (TokenKind.ALERT, WakeKind.CALL_INVITE, False): None,
-    (TokenKind.ALERT, WakeKind.CALL_INVITE, True): None,
-    (TokenKind.VOIP, WakeKind.CALL_INVITE, False): None,
-    (TokenKind.VOIP, WakeKind.CALL_INVITE, True): None,
+    # ---- APNs ----
+    (Platform.APNS, TokenKind.ALERT, WakeKind.CALL_INVITE, False): None,
+    (Platform.APNS, TokenKind.ALERT, WakeKind.CALL_INVITE, True): None,
+    (Platform.APNS, TokenKind.VOIP, WakeKind.CALL_INVITE, False): None,
+    (Platform.APNS, TokenKind.VOIP, WakeKind.CALL_INVITE, True): None,
     # THE INTERLOCK (consolidation retro 2026-09-11). Closed by default until
     # claude-tasks#4278 answers whether report-then-immediately-end satisfies
     # Apple's must-report rule. Open, the end wake delivers as designed.
-    (TokenKind.VOIP, WakeKind.CALL_END, False): "end_wake_gated_pending_4278",
-    (TokenKind.VOIP, WakeKind.CALL_END, True): None,
+    (Platform.APNS, TokenKind.VOIP, WakeKind.CALL_END, False): "end_wake_gated_pending_4278",
+    (Platform.APNS, TokenKind.VOIP, WakeKind.CALL_END, True): None,
     # A DECISION, not an omission (claude-tasks#4254), and INDEPENDENT of the
     # gate: an alert push runs no app code, so it cannot end a CallKit ring and
     # would render the invite's "Incoming call" copy for a hangup. Opening the
     # interlock must NOT start routing ends to alert rows.
-    (TokenKind.ALERT, WakeKind.CALL_END, False): "end_wake_needs_voip",
-    (TokenKind.ALERT, WakeKind.CALL_END, True): "end_wake_needs_voip",
+    (Platform.APNS, TokenKind.ALERT, WakeKind.CALL_END, False): "end_wake_needs_voip",
+    (Platform.APNS, TokenKind.ALERT, WakeKind.CALL_END, True): "end_wake_needs_voip",
+    # ---- FCM (claude-tasks#4421, the app tab's contract) ----
+    # ONE token kind on Android, and ring-ness is a property of the MESSAGE. Both
+    # wakes go to the alert row, and NEITHER APNs rule carries over: a data-only
+    # push runs app code, so it CAN stop a ring (`end_wake_needs_voip` would leave
+    # the other phone ringing after a hangup), and Android has no must-report
+    # obligation for the #4278 interlock to protect. Hence the gate is inert here
+    # — both of its values deliver.
+    (Platform.FCM, TokenKind.ALERT, WakeKind.CALL_INVITE, False): None,
+    (Platform.FCM, TokenKind.ALERT, WakeKind.CALL_INVITE, True): None,
+    (Platform.FCM, TokenKind.ALERT, WakeKind.CALL_END, False): None,
+    (Platform.FCM, TokenKind.ALERT, WakeKind.CALL_END, True): None,
+    # Not a state the app can produce. A row claiming it is corrupt or forged.
+    (Platform.FCM, TokenKind.VOIP, WakeKind.CALL_INVITE, False): "fcm_has_no_voip_kind",
+    (Platform.FCM, TokenKind.VOIP, WakeKind.CALL_INVITE, True): "fcm_has_no_voip_kind",
+    (Platform.FCM, TokenKind.VOIP, WakeKind.CALL_END, False): "fcm_has_no_voip_kind",
+    (Platform.FCM, TokenKind.VOIP, WakeKind.CALL_END, True): "fcm_has_no_voip_kind",
 }
 
 
@@ -95,7 +109,8 @@ def test_the_expectation_table_covers_every_cell():
     count drops, everything stays green, and the new member is routed by
     `case _`. Asserted as a set difference so the failure NAMES the missing
     cells."""
-    every_cell = set(itertools.product(TokenKind, WakeKind, [False, True]))
+    every_cell = set(itertools.product(Platform, TokenKind, WakeKind,
+                                       [False, True]))
     assert every_cell - set(_EXPECTED) == set(), (
         "a (TokenKind, WakeKind) cell has no stated expectation — decide what it "
         "does before the router decides for you")
@@ -103,7 +118,7 @@ def test_the_expectation_table_covers_every_cell():
 
 @pytest.mark.parametrize(
     "platform,kind,wake,gate",
-    list(itertools.product([Platform.APNS], TokenKind, WakeKind, [False, True])))
+    list(itertools.product(Platform, TokenKind, WakeKind, [False, True])))
 def test_every_platform_token_kind_wake_kind_combination_is_routed(
         platform, kind, wake, gate):
     """TOTALITY OVER THE ENUMS, so a member added without teaching the router
@@ -126,7 +141,7 @@ def test_every_platform_token_kind_wake_kind_combination_is_routed(
     rows = [_row("01ROW", platform.value, kind.value)]
     deliveries, skips = plan_deliveries(rows, wake=wake, configured=BOTH,
                                         end_wake_gate_open=gate)
-    expected_skip = _EXPECTED[(kind, wake, gate)]
+    expected_skip = _EXPECTED[(platform, kind, wake, gate)]
 
     if expected_skip is not None:
         assert deliveries == [], (
@@ -141,6 +156,9 @@ def test_every_platform_token_kind_wake_kind_combination_is_routed(
     assert len(deliveries) == 1
     delivered = deliveries[0]
     assert delivered.row_id == "01ROW"
+    if platform is Platform.FCM:
+        assert isinstance(delivered, FcmDelivery)
+        return
     assert isinstance(delivered, ApnsDelivery)
     assert delivered.token_kind is kind, (
         "an APNs delivery lost the row's kind — the header fork reads it")
@@ -173,7 +191,10 @@ def test_a_new_wake_kind_must_be_routed_explicitly():
         # has genuinely never seen.
         CALL_TRANSFER = "call_transfer"
 
-    for platform in [Platform.APNS]:   # the only platform with a send path
+    # EVERY platform. This loop was `[Platform.APNS]` while FCM had no send path,
+    # which made it a true statement about a frame that excluded the transport
+    # it most needed to cover the moment one existed.
+    for platform in Platform:
         rows = [_row("01ROW", platform.value, TokenKind.ALERT.value)]
         deliveries, skips = plan_deliveries(
             rows, wake=_FutureWake.CALL_TRANSFER, configured=BOTH,
@@ -220,9 +241,9 @@ def test_a_row_whose_transport_is_unconfigured_is_skipped_not_sent():
         rows, wake=WakeKind.CALL_INVITE, configured=frozenset({Platform.APNS}),
         end_wake_gate_open=True)
     assert [d.row_id for d in deliveries] == ["01APNS"]
-    assert skips == [("01FCM", "transport_not_built")], (
-        "an Android row must name NOT BUILT — `transport_not_configured` implies\n"
-        "an operator setting that would fix it, and none exists (design 14 temper)")
+    assert skips == [("01FCM", "transport_not_configured")], (
+        "an Android row on an APNs-only island must name the OPERATOR-FIXABLE "
+        "reason now that FCM_SERVICE_ACCOUNT_JSON exists to set")
 
 
 def test_nothing_is_planned_when_no_transport_is_configured():
@@ -234,7 +255,7 @@ def test_nothing_is_planned_when_no_transport_is_configured():
         end_wake_gate_open=True)
     assert deliveries == []
     assert sorted(skips) == [("01APNS", "transport_not_configured"),
-                             ("01FCM", "transport_not_built")]
+                             ("01FCM", "transport_not_configured")]
 
 
 @pytest.mark.parametrize("bad", [
@@ -282,26 +303,33 @@ def test_the_probe_registry_is_never_the_send_path():
     assert "_CONFIG_PROBES" not in source
 
 
-@pytest.mark.parametrize("kind", list(TokenKind))
-def test_an_android_row_is_skipped_as_NOT_BUILT_whatever_kind_it_carries(kind):
-    """Android rows exist on both live islands and there is no send path for them.
+def test_an_android_hangup_reaches_the_android_alert_row():
+    """THE ROUTING DIFFERENCE THE APP TAB FLAGGED, pinned on its own (#4421).
 
-    The reason must be `transport_not_built`, NOT `transport_not_configured`: the
-    latter names an operator setting that would fix it, and none exists — design
-    14's temper dissolved shipping an FCM send path ahead of the client's receive
-    half, so there is no credential to set. A remedy an operator cannot act on is
-    how two rounds of contradictory guidance happened.
-
-    THE ARM THAT DISCRIMINATES: `configured=BOTH` — the not-built skip must fire
-    even when the island is maximally configured, because it is a fact about what
-    is BUILT, not about what is set.
-    """
+    Copying the APNs `end_wake_needs_voip` skip across would mean an Android
+    hangup never stops the other phone ringing. The sweep above covers this cell;
+    this names it, so a regression reads as the bug it is."""
     deliveries, skips = plan_deliveries(
-        [_row("01ROW", Platform.FCM.value, kind.value)],
-        wake=WakeKind.CALL_INVITE, configured=BOTH, end_wake_gate_open=True)
-    assert deliveries == [], "an Android row produced a delivery with no send path"
-    assert skips == [("01ROW", "transport_not_built")], (
-        f"an Android row must be named NOT BUILT, got {skips}")
+        [_row("01ANDROID", Platform.FCM.value, TokenKind.ALERT.value)],
+        wake=WakeKind.CALL_END, configured=BOTH, end_wake_gate_open=False)
+    assert skips == [], f"an Android call_end was skipped: {skips}"
+    assert [type(d) for d in deliveries] == [FcmDelivery]
+
+
+def test_a_mixed_fanout_routes_each_row_to_its_own_transport():
+    """One recipient, an iPhone (alert + voip) and an Android. An invite reaches all
+    three rows; an end reaches the iPhone's voip row and the Android's alert row,
+    and skips only the iPhone's alert row with its named reason."""
+    rows = [_row("01IOS_A", Platform.APNS.value, TokenKind.ALERT.value),
+            _row("01IOS_V", Platform.APNS.value, TokenKind.VOIP.value),
+            _row("01DROID", Platform.FCM.value, TokenKind.ALERT.value)]
+    d, s = plan_deliveries(rows, wake=WakeKind.CALL_INVITE, configured=BOTH,
+                           end_wake_gate_open=True)
+    assert s == [] and [x.row_id for x in d] == ["01IOS_A", "01IOS_V", "01DROID"]
+    d, s = plan_deliveries(rows, wake=WakeKind.CALL_END, configured=BOTH,
+                           end_wake_gate_open=True)
+    assert [x.row_id for x in d] == ["01IOS_V", "01DROID"]
+    assert s == [("01IOS_A", "end_wake_needs_voip")]
 
 
 # ---------------------------------------------------- install_id is INERT here
@@ -319,27 +347,28 @@ def test_an_android_row_is_skipped_as_NOT_BUILT_whatever_kind_it_carries(kind):
 # are the guard against someone restoring the preference without reading
 # `plan_deliveries`' docstring.
 
-def _install_rows(*specs: tuple[str, str, str | None]) -> list[DeviceToken]:
-    """(row_id, token_kind, install_id) triples as APNs rows."""
-    return [_row(rid, Platform.APNS.value, kind, install_id=install)
+def _install_rows(*specs: tuple[str, str, str | None],
+                  platform: Platform = Platform.APNS) -> list[DeviceToken]:
+    """(row_id, token_kind, install_id) triples as rows on `platform`."""
+    return [_row(rid, platform.value, kind, install_id=install)
             for rid, kind, install in specs]
 
 
 @pytest.mark.parametrize(
-    "kind,wake,gate,install",
-    [(k, w, g, i)
-     for (k, w, g) in _EXPECTED
+    "platform,kind,wake,gate,install",
+    [(p, k, w, g, i)
+     for (p, k, w, g) in _EXPECTED
      for i in (None, "install-1")])
-def test_install_id_is_inert_for_a_lone_row(kind, wake, gate, install):
+def test_install_id_is_inert_for_a_lone_row(platform, kind, wake, gate, install):
     """THE WHOLE TABLE, CROSSED WITH THE NEW AXIS. A single row has no group to
     prefer within, so every cell of `_EXPECTED` must read identically whether the
     row carries an install identity or not. Without this sweep the new dimension
     is only ever exercised on the two cells the feature is about, and a member
     added later inherits whatever the grouping pass happens to do to it."""
-    rows = _install_rows(("01ROW", kind.value, install))
+    rows = _install_rows(("01ROW", kind.value, install), platform=platform)
     deliveries, skips = plan_deliveries(rows, wake=wake, configured=BOTH,
                                         end_wake_gate_open=gate)
-    expected_skip = _EXPECTED[(kind, wake, gate)]
+    expected_skip = _EXPECTED[(platform, kind, wake, gate)]
     if expected_skip is None:
         assert skips == []
         assert [d.row_id for d in deliveries] == ["01ROW"]
