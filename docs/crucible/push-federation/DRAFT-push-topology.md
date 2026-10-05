@@ -1,4 +1,10 @@
-# ADR-0008: Push topology — who is allowed to ring a handset
+# DRAFT ADR (unnumbered): Push topology — who is allowed to ring a handset
+
+> **Unnumbered on purpose (2026-10-06).** This draft was titled "ADR-0008" when written
+> (2026-08-23), but the app repo's ADR-0008 is the merged *island self-description and
+> operator attestation* decision (aiko_chat_app PR #195). A citation of "ADR-0008" for
+> push topology would resolve to the wrong decision, so the number is retired here and a
+> real one is assigned when this is filed. **Status: draft, not ruled on by Nick.**
 
 > **DRAFT, NOT FILED.** Destined for `aiko_chat/docs/adr/` via PR, per Nick's
 > 2026-08-23 homing ruling (app+island decisions live in `aiko_chat`). Held here
