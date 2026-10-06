@@ -440,12 +440,23 @@ async def test_payload_never_names_the_caller(session, dm, configured, fake_apns
     # So the guard is now "these exact fields, and nothing else". A new field
     # still fails it, which is the whole point: adding one must be a deliberate
     # act with this test's docstring read, not a quiet append.
-    assert [f.name for f in dataclasses.fields(payload)] == ["channel_id", "kind"]
+    assert [f.name for f in dataclasses.fields(payload)] == [
+        "channel_id", "kind", "call_id"]
     # AND `kind` CANNOT CARRY AN IDENTITY, which is why its arrival does not
     # weaken this test. It ranges over a closed enum defined in this repo — there
     # is no free-form string in it for a display name to hide in, and a
     # `WakeKind("alice")` is a ValueError at construction.
     assert payload.kind in set(push_service.WakeKind)
+    # `call_id` IS WEAKER THAN `kind`, AND THIS SAYS SO (design 12 Decision 1,
+    # claude-tasks#4421). It is not a closed enum: it is 128 bits the CALLER
+    # chooses, copied from the signed body. The island never puts an identity in
+    # it — it carries the caller's bytes or None — but a caller who wanted to could
+    # encode 128 bits of anything there and Apple/Google would see them. That is a
+    # caller leaking about ITSELF through its own message, not the island leaking
+    # about anyone; the island's guarantee is the shape (`parse_call_body`'s
+    # fullmatch), and the shape is what is asserted.
+    assert payload.call_id is None or push_service.parse_call_body(
+        f"aiko:call/2 {payload.call_id} · 📞 started a call") is not None
 
 
 # --------------------------------------------------------------------------
@@ -534,6 +545,41 @@ async def test_an_android_hangup_reaches_fcm_with_the_gate_closed(
     await _wake(push_service.CALL_INVITE_BODY, sender_id=alice.id)
     assert [(t, p.kind) for t, p, _ in fake_fcm] == [
         ("android-token-1", push_service.WakeKind.CALL_INVITE)]
+
+
+@pytest.mark.asyncio
+async def test_a_v2_call_carries_its_id_to_both_transports_end_to_end(
+    session, dm, configured, fake_apns, fake_fcm, end_wake_gate_open
+):
+    """`m` is copied from the body the island persisted, on BOTH kinds and BOTH
+    transports — the invite and its end name the same call, which is the whole
+    point of design 12 Decision 1."""
+    alice, bob = dm
+    session.add_all([
+        DeviceToken(user_id=bob.id, platform="fcm", token="android-token-1",
+                    token_kind=TokenKind.ALERT.value),
+        DeviceToken(user_id=bob.id, platform="apns", token="v" * 64,
+                    token_kind=TokenKind.VOIP.value),
+    ])
+    await session.commit()
+    call_id = "01JABCDEFGHJKMNPQRSTVWXYZ0"
+
+    await _wake(f"aiko:call/2 {call_id} · 📞 started a call", sender_id=alice.id)
+    await _wake(f"aiko:call/2 {call_id} · 📞 ended the call", sender_id=alice.id)
+
+    assert [(p.kind, p.call_id) for _, p, _ in fake_fcm] == [
+        (push_service.WakeKind.CALL_INVITE, call_id),
+        (push_service.WakeKind.CALL_END, call_id)]
+    assert {(p.kind, p.call_id) for _, p, _ in fake_apns.sent} >= {
+        (push_service.WakeKind.CALL_INVITE, call_id),
+        (push_service.WakeKind.CALL_END, call_id)}
+
+
+@pytest.mark.asyncio
+async def test_a_v1_call_wakes_with_no_id(session, dm, configured, fake_apns):
+    alice, _ = dm
+    await _wake(push_service.CALL_INVITE_BODY, sender_id=alice.id)
+    assert [p.call_id for _, p, _ in fake_apns.sent] == [None]
 
 
 @pytest.mark.asyncio

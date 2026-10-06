@@ -59,7 +59,7 @@ def configured(monkeypatch):
 
 
 def _invite() -> WakePayload:
-    return WakePayload(channel_id=CHANNEL, kind=WakeKind.CALL_INVITE)
+    return WakePayload(channel_id=CHANNEL, kind=WakeKind.CALL_INVITE, call_id=None)
 
 
 def _message(payload: WakePayload | None = None, **kw) -> dict:
@@ -86,7 +86,7 @@ def test_every_data_value_is_a_string(configured):
     object is a hard 400 INVALID_ARGUMENT — which fires for EVERY device on the
     island, not for one bad token."""
     for kind in WakeKind:
-        data = _message(WakePayload(channel_id=CHANNEL, kind=kind))["message"]["data"]
+        data = _message(WakePayload(channel_id=CHANNEL, kind=kind, call_id=None))["message"]["data"]
         assert all(isinstance(v, str) for v in data.values())
 
 
@@ -101,7 +101,7 @@ def test_the_data_is_exactly_the_app_contract(configured, kind):
     """`{"c", "k"}` and nothing else. The receiver ignores a missing or unknown
     `k` and NEVER rings — so the stranded first draft's `{"c"}` alone would have
     been a 200 from Google, a `delivered` log line here, and a silent handset."""
-    data = _message(WakePayload(channel_id=CHANNEL, kind=kind))["message"]["data"]
+    data = _message(WakePayload(channel_id=CHANNEL, kind=kind, call_id=None))["message"]["data"]
     assert data == {"c": CHANNEL, "k": _CONTRACT[kind]}
 
 

@@ -176,6 +176,7 @@ import asyncio
 import dataclasses
 import datetime as dt
 import logging
+import re
 from collections.abc import Callable, Sequence
 from typing import Literal, assert_never
 
@@ -360,6 +361,55 @@ def is_call_end(body: str) -> bool:
     return body == CALL_END_BODY
 
 
+# CALL WIRE v2 — the call id IS in the signed body (design 12 Decision 1; bytes
+# pinned with the app tab 2026-10-06, claude-tasks#4421). The caller mints a ULID,
+# the island carries it into the wake as `m`, and the island owns no call object.
+#
+# A FIXED FRAME AROUND A CONSTRAINED ID, so v1's exactness property survives: the
+# only variable span is 26 characters of canonical uppercase Crockford base32, and
+# `fullmatch` admits nothing before or after it. That is NOT a wake primitive with
+# arbitrary content — it is v1's exact match with a slot in it that can only hold a
+# call id. The tail is v1's, byte for byte, so a build that predates v2 renders a
+# readable message rather than a bare token.
+#
+# `[0-7]` LEADS because a 26-char Crockford string encodes 130 bits and a ULID is
+# 128: a first character above 7 overflows, and could not map losslessly onto the
+# UUID CallKit and ConnectionService both require. The regex is therefore also
+# the "is this convertible" check. Lowercase is REJECTED, not normalised — the app
+# mints uppercase, and accepting two spellings of one id is two ids.
+#
+# v1 IS RECOGNISED FOREVER. Its sentinels are inside signed history on both live
+# islands; a v1 wake simply carries no `m`, which the receiver reads as "v1 call",
+# never as an island fault.
+_CALL_V2 = re.compile(
+    r"aiko:call/2 (?P<id>[0-7][0-9A-HJKMNP-TV-Z]{25}) \u00b7 \U0001F4DE "
+    r"(?P<verb>started a call|ended the call)")
+
+
+def parse_call_body(body: str) -> tuple[WakeKind, str | None] | None:
+    """THE ONE PLACE a call sentinel is recognised: `(kind, call_id)` or None.
+
+    `call_id` is None exactly for v1. `should_wake` and `wake_for_message` both
+    read THIS, so the gate that decides whether to wake and the field that names
+    the call cannot disagree about what a body means.
+
+    The id is COPIED from the body the island persisted — the bytes the caller
+    signed. The island cannot verify that signature (it never could; the push is
+    trusted for nothing beyond "ring/end call m on channel c"), but it never
+    invents, rewrites or normalises the id either.
+    """
+    if is_call_invite(body):
+        return WakeKind.CALL_INVITE, None
+    if is_call_end(body):
+        return WakeKind.CALL_END, None
+    match = _CALL_V2.fullmatch(body)
+    if match is None:
+        return None
+    kind = (WakeKind.CALL_INVITE if match["verb"] == "started a call"
+            else WakeKind.CALL_END)
+    return kind, match["id"]
+
+
 def should_wake(channel_kind: ChannelKindStr, body: str) -> WakeKind | None:
     """The shared domain predicate for "does this message wake a handset, and as
     what?". `None` means it does not.
@@ -385,11 +435,8 @@ def should_wake(channel_kind: ChannelKindStr, body: str) -> WakeKind | None:
     """
     if channel_kind != ChannelKind.DM.value:
         return None
-    if is_call_invite(body):
-        return WakeKind.CALL_INVITE
-    if is_call_end(body):
-        return WakeKind.CALL_END
-    return None
+    parsed = parse_call_body(body)
+    return None if parsed is None else parsed[0]
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -1249,7 +1296,10 @@ async def wake_for_message(*, channel_id: str, channel_kind: ChannelKindStr, sen
             # decision someone makes rather than one they inherit.
             recipients = await _spoken_here(
                 session, channel_id=channel_id, user_ids=recipients)
-            payload = WakePayload(channel_id=channel_id, kind=wake)
+            # The call id comes from the SAME parser the gate just used; `wake` is
+            # not None here, so the body parsed.
+            payload = WakePayload(channel_id=channel_id, kind=wake,
+                                  call_id=parse_call_body(body)[1])
             for user_id in recipients:
                 # The per-recipient budget is charged inside _wake_user, once the
                 # recipient is known to have a device worth waking.

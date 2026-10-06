@@ -326,7 +326,7 @@ def build_message(device_token: str, payload: WakePayload, *,
     stopped being true when `aiko_chat_app` `feat/android-ring` landed a receiver.
     The contract it consumes, verbatim from #4421:
 
-        data = {"c": <channel_id>, "k": "call_invite" | "call_end"}
+        data = {"c": <channel_id>, "k": "call_invite" | "call_end", "m"?: <call ulid>}
         data-only, NO `notification` block, android.priority "HIGH", short TTL.
 
     It was proven on a Pixel 4 (Android 13) with this exact envelope: process
@@ -341,6 +341,11 @@ def build_message(device_token: str, payload: WakePayload, *,
     answers 200 to, `push_service` logs as delivered, and the handset drops on the
     floor: the exact structurally-invisible failure this paragraph used to warn
     about, one key over. Same "explicit on both values" rule as `apns._render`.
+
+    `"m"` IS THE CALL ID, PRESENT EXACTLY FOR A v2 CALL (design 12 Decision 1, bytes
+    agreed 2026-10-06). It is what lets the receiver tell the same invite delivered
+    twice from a new call on the same channel. Absent means a v1 call, which the
+    receiver keys by channel as before.
 
     THE CREDENTIAL GATE IS NOW THE APP'S MERGE, NOT THIS CODE. The app tab asked
     that `FCM_SERVICE_ACCOUNT_JSON` stay unprovisioned until `feat/android-ring`
@@ -389,7 +394,10 @@ def build_message(device_token: str, payload: WakePayload, *,
             # Legacy `to` / `registration_ids` do not exist in v1.
             "token": device_token,
             # `k` on EVERY wake, both values explicit — see the contract above.
-            "data": {"c": payload.channel_id, "k": payload.kind.value},
+            "data": {"c": payload.channel_id, "k": payload.kind.value,
+                     # `m` only for a v2 call; absent means v1 (see apns._render).
+                     **({"m": payload.call_id}
+                        if payload.call_id is not None else {})},
             "android": android,
         }
     }

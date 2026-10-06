@@ -262,3 +262,21 @@ class WakePayload:
     # prevent, reintroduced as a silent fallback. The type makes forgetting a
     # TypeError instead.
     kind: WakeKind
+    # THE CALL ID — design 12 Decision 1's client-minted ULID, copied out of a v2
+    # body; None for a v1 call, which has none. REQUIRED, NO DEFAULT, for the same
+    # reason as `kind`: a default of None would let a caller that forgets it ship
+    # every v2 call as v1-shaped — the receiver would fall back to channel keying
+    # and the duplicate-vs-redial bug (app design 21) would return silently.
+    #
+    # THE ISLAND PUTS NO IDENTITY HERE — but this field is weaker than `kind`, and
+    # the difference is stated rather than hidden. `kind` is a closed enum; this is
+    # 128 bits the CALLER chooses, copied verbatim. A well-behaved client mints a
+    # random ULID; a caller who wanted to could encode anything about ITSELF in it,
+    # and the provider would see it. The island's guarantee is the shape (the
+    # fullmatch in `push_service.parse_call_body`), not the content.
+    #
+    # Other costs: the provider can now link an invite to its end EXACTLY (it
+    # could already guess from `c` and timing), and a ULID's first 48 bits are its
+    # mint time in ms — which the provider already knows to within network
+    # latency, because it is the send time.
+    call_id: str | None

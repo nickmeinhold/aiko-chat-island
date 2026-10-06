@@ -79,7 +79,7 @@ async def captured(monkeypatch):
 async def _send(kind: TokenKind, *, collapse_id: str | None = CHANNEL,
                 wake: WakeKind = WakeKind.CALL_INVITE):
     return await apns.send(
-        "b" * 64, WakePayload(channel_id=CHANNEL, kind=wake),
+        "b" * 64, WakePayload(channel_id=CHANNEL, kind=wake, call_id=None),
         apns_environment=ApnsEnvironment.PRODUCTION,
         token_kind=kind, collapse_id=collapse_id)
 
@@ -360,7 +360,7 @@ async def test_the_voip_body_is_pinned_even_though_its_shape_is_an_open_question
     So: if someone changes the VoIP body, this reddens and forces the conversation.
     That is the entire point — the previous state was a wire nobody was watching.
     """
-    await apns.send("v" * 64, WakePayload(channel_id=CHANNEL, kind=WakeKind.CALL_INVITE),
+    await apns.send("v" * 64, WakePayload(channel_id=CHANNEL, kind=WakeKind.CALL_INVITE, call_id=None),
                     apns_environment=ApnsEnvironment.PRODUCTION,
                     token_kind=TokenKind.VOIP)
     import json as _json
