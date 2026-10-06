@@ -311,9 +311,10 @@ class WakePayload:
     # fullmatch in `push_service.parse_call_body`), not the content.
     #
     # Other costs: the provider can now link an invite to its end EXACTLY (it
-    # could already guess from `c` and timing), and a ULID's first 48 bits are its
-    # mint time in ms — which the provider already knows to within network
-    # latency, because it is the send time.
+    # could already guess from `c` and timing). NO MINT TIME rides in it: the app
+    # fills all 128 bits from a CSPRNG (app PR #210), so do not read a ULID's
+    # usual 48-bit timestamp out of `m` — the format is ULID-shaped, the content
+    # is not (Tesla, cage-match PR#192 r3: this line used to say otherwise).
     call_id: str | None
 
     def __post_init__(self) -> None:

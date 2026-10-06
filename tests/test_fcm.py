@@ -247,6 +247,34 @@ def test_an_absolute_epoch_ttl_would_be_rejected():
         _assert_ttl_is_a_relative_duration(f"{int(time.time())}s")
 
 
+def test_a_v2_wake_collapses_on_its_call_not_its_channel(configured):
+    """Call B's invite must not overwrite call A's undelivered end (Tesla, PR#192
+    r3): the queue slot is the call, matching the receiver's `m` keying."""
+    a = "01JABCDEFGHJKMNPQRSTVWXYZ0"
+    end_a = _message(WakePayload(channel_id=CHANNEL, kind=WakeKind.CALL_END,
+                                 call_id=a), collapse_key=CHANNEL)
+    assert end_a["message"]["android"]["collapse_key"] == a
+    assert _message(collapse_key=CHANNEL)["message"]["android"]["collapse_key"] == CHANNEL
+
+
+@pytest.mark.asyncio
+async def test_a_late_401_does_not_clear_a_newer_token(configured, monkeypatch):
+    """Compare-and-clear (Tesla, PR#192 r3): a 401 for an OLD bearer must not
+    wipe a token another wave has since minted."""
+    fcm._cached_access_token = ("old", float("inf"))
+
+    async def _post(url, **kw):
+        fcm._cached_access_token = ("new", float("inf"))   # wave B minted meanwhile
+        return httpx.Response(401, json={}, request=httpx.Request("POST", url))
+
+    class _C:
+        post = staticmethod(_post)
+
+    monkeypatch.setattr(fcm, "_client", lambda: _C())
+    await fcm.send(TOKEN, _invite())
+    assert fcm._cached_access_token == ("new", float("inf"))
+
+
 def test_a_collapse_key_rides_under_android_when_asked(configured):
     """Nesting is the whole difference from the legacy API, where `collapse_key`
     sat at the top level. Paired with the arm below, which asserts absence."""

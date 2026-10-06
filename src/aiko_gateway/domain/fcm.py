@@ -421,8 +421,18 @@ def build_message(device_token: str, payload: WakePayload, *,
     # boundary and logged — loud, never a guessed TTL. The test sweep below makes
     # it unreachable for every member that exists.
     android: dict = {"priority": "HIGH", "ttl": f"{_TTL_SECONDS[payload.kind]}s"}
-    if collapse_key is not None:
-        android["collapse_key"] = collapse_key
+    # ONE QUEUE SLOT PER CALL, not per channel (Tesla, cage-match PR#192 r3).
+    # FCM keeps only the LAST undelivered message per key. Under v1 the receiver
+    # and the queue both keyed on the channel, so "latest wins" was the truth.
+    # v2 split them: the receiver keys on `m`, so a channel-keyed slot let call
+    # B's 30s invite overwrite call A's 300s end while the handset was offline,
+    # and when B's invite expired A's stop was gone for good. Keyed on the call
+    # id, A's invite and end still coalesce (an offline call collapses to its
+    # end) and B can never erase A's stop. v1 (no id) stays on the caller's key.
+    # One key per in-flight call stays well inside FCM's four-key ceiling.
+    key = payload.call_id if payload.call_id is not None else collapse_key
+    if key is not None:
+        android["collapse_key"] = key
     return {
         "message": {
             # The target is a `oneof`: exactly one of token/topic/condition.
@@ -590,7 +600,15 @@ async def send(device_token: str, payload: WakePayload, *,
         # refused while a fresh mint might have worked immediately. No retry
         # here: the per-recipient fanout already sends again on the next wake,
         # and a credential that is truly bad is caught by the mint's own backoff.
-        _cached_access_token = None
+        # COMPARE-AND-CLEAR (Tesla, cage-match PR#192 r3): only if the slot still
+        # holds the bearer that was refused. Two waves in flight during a
+        # revocation would otherwise race — wave B mints and caches a live token,
+        # then wave A's late 401 nulls it and the next devices stampede the token
+        # endpoint. Matching the observed value makes the stale clear a no-op,
+        # with no lock (which would be a second guard on the same slot).
+        if (_cached_access_token is not None
+                and _cached_access_token[0] == token):
+            _cached_access_token = None
     # NEVER the device token: it rides in the request body, so nothing else in
     # this path can leak it and this line must not be the exception. ERROR for
     # REJECTED because that is the quietest failure mode here and the one where a
