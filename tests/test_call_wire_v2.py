@@ -103,3 +103,13 @@ def test_call_id_has_no_default():
     not every v2 call silently shipped v1-shaped."""
     with pytest.raises(TypeError):
         WakePayload(channel_id="01CHAN", kind=WakeKind.CALL_INVITE)  # type: ignore[call-arg]
+
+
+@pytest.mark.parametrize("bad", ["alice", "01jabcdefghjkmnpqrstvwxyz0",
+                                 "81JABCDEFGHJKMNPQRSTVWXYZ0", ""])
+def test_a_payload_refuses_a_malformed_call_id(bad):
+    """The shape is enforced at CONSTRUCTION (Carnot, PR#192 r1), so no future
+    caller can hand Apple/Google an arbitrary `m` by building the payload
+    directly instead of going through `parse_call_body`."""
+    with pytest.raises(ValueError):
+        WakePayload(channel_id="01CHAN", kind=WakeKind.CALL_INVITE, call_id=bad)

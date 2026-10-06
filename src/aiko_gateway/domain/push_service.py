@@ -188,8 +188,8 @@ from ..db import SessionLocal
 from . import apns, fcm, moderation_service
 from .models import (Channel, ChannelKind, DeviceToken, Membership, Message,
                      Platform, ApnsEnvironment, TokenKind, User)
-from .push_result import (ReapOrder, SendResult, Verdict, WakeKind,
-                          WakePayload)
+from .push_result import (CALL_ID_PATTERN, ReapOrder, SendResult, Verdict,
+                          WakeKind, WakePayload)
 from .rate_limit import limiter
 
 log = logging.getLogger("aiko_gateway.push")
@@ -381,10 +381,9 @@ def is_call_end(body: str) -> bool:
 # v1 IS RECOGNISED FOREVER. Its sentinels are inside signed history on both live
 # islands; a v1 wake simply carries no `m`, which the receiver reads as "v1 call",
 # never as an island fault.
-# The id's character class, alone, so the cross-repo test can pin it against the
-# app's `_callIdPattern` literal (`call_wire.dart`) — the app pins the same string
-# across Dart, Kotlin and Swift.
-CALL_ID_PATTERN = r"[0-7][0-9A-HJKMNP-TV-Z]{25}"
+# The id's character class lives in `push_result` (CALL_ID_PATTERN), where
+# `WakePayload` enforces it at construction; the parser and the payload share ONE
+# definition, pinned against the app's `_callIdPattern` by a cross-repo test.
 _CALL_V2 = re.compile(
     r"aiko:call/2 (?P<id>" + CALL_ID_PATTERN + r") \u00b7 \U0001F4DE "
     r"(?P<verb>started a call|ended the call)")

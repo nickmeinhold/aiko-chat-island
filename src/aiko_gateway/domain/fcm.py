@@ -525,6 +525,7 @@ async def send(device_token: str, payload: WakePayload, *,
     Raises [FcmNotConfigured] only if called on an island with no credential,
     which is a caller bug: `push_service` gates on `is_configured()` first.
     """
+    global _cached_access_token
     if not is_configured():
         raise FcmNotConfigured("FCM credentials are not set on this island")
 
@@ -556,6 +557,15 @@ async def send(device_token: str, payload: WakePayload, *,
     except ValueError:
         error_code = ""
     verdict = _verdict(response.status_code, error_code)
+    if response.status_code == 401:
+        # OUR access token was refused — revoked early, or the key behind it was
+        # rotated or disabled. Drop it so the NEXT send mints fresh (Carnot,
+        # cage-match PR#192 r1). Without this the cache kept presenting a dead
+        # token until its own expiry, up to ~55 minutes of every Android ring
+        # refused while a fresh mint might have worked immediately. No retry
+        # here: the per-recipient fanout already sends again on the next wake,
+        # and a credential that is truly bad is caught by the mint's own backoff.
+        _cached_access_token = None
     # NEVER the device token: it rides in the request body, so nothing else in
     # this path can leak it and this line must not be the exception. ERROR for
     # REJECTED because that is the quietest failure mode here and the one where a

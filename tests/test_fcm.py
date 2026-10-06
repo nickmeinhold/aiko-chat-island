@@ -174,6 +174,25 @@ def test_the_end_outlives_the_invite(configured):
     assert int(end[:-1]) > int(invite[:-1])
 
 
+@pytest.mark.asyncio
+async def test_a_401_on_send_drops_the_cached_access_token(configured, monkeypatch):
+    """A refused access token must not be replayed until its own expiry (Carnot,
+    PR#192 r1): the next send mints fresh."""
+    fcm._cached_access_token = ("stale-token", float("inf"))
+
+    async def _post(url, **kw):
+        return httpx.Response(401, json={"error": {"status": "UNAUTHENTICATED"}},
+                              request=httpx.Request("POST", url))
+
+    class _C:
+        post = staticmethod(_post)
+
+    monkeypatch.setattr(fcm, "_client", lambda: _C())
+    result = await fcm.send(TOKEN, _invite())
+    assert result.reap is None
+    assert fcm._cached_access_token is None
+
+
 def test_an_absolute_epoch_ttl_would_be_rejected():
     """THE MUST-FAIL ARM. Built BEFORE the assertion was trusted: a harness
     examined for whether it CAN fail tends to look like it can."""

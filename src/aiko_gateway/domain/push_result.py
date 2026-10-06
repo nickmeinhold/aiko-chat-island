@@ -16,6 +16,7 @@ from __future__ import annotations
 import dataclasses
 import datetime as dt
 import enum
+import re
 
 
 class Verdict(enum.Enum):
@@ -201,6 +202,22 @@ class WakeKind(enum.Enum):
     # can silently stop honouring.
 
 
+# THE CALL ID'S SHAPE, enforced where the value is CONSTRUCTED, not only where it
+# is parsed (Carnot, cage-match PR#192 r1). `push_service.parse_call_body` is the
+# only producer today, but a field typed `str | None` admits `call_id="alice"`
+# from any future caller, and both transports would render it to Apple/Google
+# as `m`. Validating in `WakePayload.__post_init__` makes the impossible `m`
+# impossible rather than conventional.
+#
+# 26 CHARACTERS OF CANONICAL CROCKFORD BASE32 — called a "ULID" in design 12 for
+# its encoding and its 128-bit width, NOT for timestamp semantics. The app fills
+# all 128 bits from a CSPRNG with no time component (app PR #210), so do not
+# decode a time out of it. Shared with the app's `_callIdPattern` literal, which a
+# cross-repo test pins.
+CALL_ID_PATTERN = r"[0-7][0-9A-HJKMNP-TV-Z]{25}"
+_CALL_ID = re.compile(CALL_ID_PATTERN)
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class WakePayload:
     """The wake, as POLICY states it — DELIBERATELY OPAQUE, and the opacity is
@@ -298,3 +315,7 @@ class WakePayload:
     # mint time in ms — which the provider already knows to within network
     # latency, because it is the send time.
     call_id: str | None
+
+    def __post_init__(self) -> None:
+        if self.call_id is not None and not _CALL_ID.fullmatch(self.call_id):
+            raise ValueError("call_id is not a canonical 26-char call id")
