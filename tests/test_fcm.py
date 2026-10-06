@@ -59,7 +59,7 @@ def configured(monkeypatch):
 
 
 def _invite() -> WakePayload:
-    return WakePayload(channel_id=CHANNEL, kind=WakeKind.CALL_INVITE, call_id=None)
+    return WakePayload(channel_id=CHANNEL, kind=WakeKind.CALL_INVITE, call_id="01JABCDEFGHJKMNPQRSTVWXYZ0")
 
 
 def _message(payload: WakePayload | None = None, **kw) -> dict:
@@ -86,7 +86,7 @@ def test_every_data_value_is_a_string(configured):
     object is a hard 400 INVALID_ARGUMENT — which fires for EVERY device on the
     island, not for one bad token."""
     for kind in WakeKind:
-        data = _message(WakePayload(channel_id=CHANNEL, kind=kind, call_id=None))["message"]["data"]
+        data = _message(WakePayload(channel_id=CHANNEL, kind=kind, call_id="01JABCDEFGHJKMNPQRSTVWXYZ0"))["message"]["data"]
         assert all(isinstance(v, str) for v in data.values())
 
 
@@ -98,11 +98,12 @@ _CONTRACT = {WakeKind.CALL_INVITE: "call_invite", WakeKind.CALL_END: "call_end"}
 
 @pytest.mark.parametrize("kind", list(WakeKind))
 def test_the_data_is_exactly_the_app_contract(configured, kind):
-    """`{"c", "k"}` and nothing else. The receiver ignores a missing or unknown
-    `k` and NEVER rings — so the stranded first draft's `{"c"}` alone would have
-    been a 200 from Google, a `delivered` log line here, and a silent handset."""
-    data = _message(WakePayload(channel_id=CHANNEL, kind=kind, call_id=None))["message"]["data"]
-    assert data == {"c": CHANNEL, "k": _CONTRACT[kind]}
+    """`{"c", "k", "m"}` and nothing else. The receiver ignores a missing or
+    unknown `k` and NEVER rings — so the stranded first draft's `{"c"}` alone
+    would have been a 200 from Google, a `delivered` log line here, and a silent
+    handset. `m` is on every wake since calling went v2-only (app design 22)."""
+    data = _message(WakePayload(channel_id=CHANNEL, kind=kind, call_id="01JABCDEFGHJKMNPQRSTVWXYZ0"))["message"]["data"]
+    assert data == {"c": CHANNEL, "k": _CONTRACT[kind], "m": "01JABCDEFGHJKMNPQRSTVWXYZ0"}
 
 
 def test_the_contract_covers_every_wake_kind():
@@ -150,7 +151,7 @@ def test_the_ttl_is_a_relative_duration_string_within_one_day(configured):
 def test_every_wake_kind_has_a_ttl(configured, kind):
     """`_TTL_SECONDS` is per kind; a member without one would raise inside the
     send. This sweep makes that unreachable for every member that exists."""
-    ttl = _message(WakePayload(channel_id=CHANNEL, kind=kind, call_id=None))[
+    ttl = _message(WakePayload(channel_id=CHANNEL, kind=kind, call_id="01JABCDEFGHJKMNPQRSTVWXYZ0"))[
         "message"]["android"]["ttl"]
     _assert_ttl_is_a_relative_duration(ttl)
 
@@ -170,7 +171,7 @@ def test_the_end_outlives_the_invite(configured):
     """A late end is harmless; an expired one leaves a ring running."""
     invite = _message()["message"]["android"]["ttl"]
     end = _message(WakePayload(channel_id=CHANNEL, kind=WakeKind.CALL_END,
-                               call_id=None))["message"]["android"]["ttl"]
+                               call_id="01JABCDEFGHJKMNPQRSTVWXYZ0"))["message"]["android"]["ttl"]
     assert int(end[:-1]) > int(invite[:-1])
 
 
@@ -247,14 +248,16 @@ def test_an_absolute_epoch_ttl_would_be_rejected():
         _assert_ttl_is_a_relative_duration(f"{int(time.time())}s")
 
 
-def test_a_v2_wake_collapses_on_its_call_not_its_channel(configured):
+def test_a_wake_collapses_on_its_call_not_its_channel(configured):
     """Call B's invite must not overwrite call A's undelivered end (Tesla, PR#192
-    r3): the queue slot is the call, matching the receiver's `m` keying."""
-    a = "01JABCDEFGHJKMNPQRSTVWXYZ0"
-    end_a = _message(WakePayload(channel_id=CHANNEL, kind=WakeKind.CALL_END,
-                                 call_id=a), collapse_key=CHANNEL)
-    assert end_a["message"]["android"]["collapse_key"] == a
-    assert _message(collapse_key=CHANNEL)["message"]["android"]["collapse_key"] == CHANNEL
+    r3): the queue slot is the CALL, matching the receiver's `m` keying. Two calls
+    on one channel get two slots; one call's invite and end share one."""
+    a, b = "01JABCDEFGHJKMNPQRSTVWXYZ0", "01JABCDEFGHJKMNPQRSTVWXYZ1"
+    def key(kind, call):
+        return _message(WakePayload(channel_id=CHANNEL, kind=kind, call_id=call))[
+            "message"]["android"]["collapse_key"]
+    assert key(WakeKind.CALL_INVITE, a) == key(WakeKind.CALL_END, a) == a
+    assert key(WakeKind.CALL_INVITE, b) == b != a
 
 
 @pytest.mark.asyncio
@@ -275,11 +278,12 @@ async def test_a_late_401_does_not_clear_a_newer_token(configured, monkeypatch):
     assert fcm._cached_access_token == ("new", float("inf"))
 
 
-def test_a_collapse_key_rides_under_android_when_asked(configured):
+def test_the_collapse_key_rides_under_android(configured):
     """Nesting is the whole difference from the legacy API, where `collapse_key`
-    sat at the top level. Paired with the arm below, which asserts absence."""
-    assert _message(collapse_key=CHANNEL)["message"]["android"]["collapse_key"] == CHANNEL
-    assert "collapse_key" not in _message()["message"]["android"]
+    sat at the top level."""
+    msg = _message()["message"]
+    assert msg["android"]["collapse_key"] == msg["data"]["m"]
+    assert "collapse_key" not in msg
 
 
 # ------------------------------------------------------------------ the URL
@@ -403,19 +407,20 @@ async def _drive(monkeypatch, seen: list, response, coro_factory):
         await client.aclose()
 
 
-async def test_a_200_is_delivered_and_the_body_is_the_v1_envelope(
+async def test_a_200_is_delivered_and_the_body_is_the_v1_api_envelope(
     configured, monkeypatch
 ):
     seen: list[httpx.Request] = []
     result = await _drive(
         monkeypatch, seen,
         httpx.Response(200, json={"name": "projects/aiko-island-test/messages/1"}),
-        lambda: fcm.send(TOKEN, _invite(), collapse_key=CHANNEL))
+        lambda: fcm.send(TOKEN, _invite()))
     assert result.verdict is Verdict.DELIVERED and result.reap is None
     body = json.loads(seen[0].content)
     assert set(body) == {"message"}
     assert body["message"]["android"] == {
-        "priority": "HIGH", "ttl": "30s", "collapse_key": CHANNEL}
+        "priority": "HIGH", "ttl": "30s",
+        "collapse_key": "01JABCDEFGHJKMNPQRSTVWXYZ0"}
     assert seen[0].headers["authorization"] == "Bearer stub-access-token"
 
 

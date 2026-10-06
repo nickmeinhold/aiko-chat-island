@@ -441,11 +441,15 @@ ULID:   fullmatch [0-7][0-9A-HJKMNP-TV-Z]{25}   (canonical uppercase Crockford)
   ConnectionService need, so the regex doubles as the convertibility check.
 - **Lowercase is rejected, not normalised.** The app mints uppercase, and two spellings
   of one id would be two ids.
-- **v1 is recognised forever** (it is in signed history) and wakes with no `m`.
+- ~~**v1 is recognised forever** (it is in signed history) and wakes with no `m`.~~
+  **Superseded the same day (2026-10-06): calling is v2-only** (app design 22 §v2.0, Nick
+  confirmed). v1 bodies are still stored and served forever, and "recognised forever" is
+  honoured as client-side RENDERING. They never wake: no store build ever placed a v1
+  call, and waking for one only made iOS report-and-end a VoIP push.
 
-**The wake** is `{c, k, m}`, with `m` present exactly for v2 on both FCM and APNs.
-Absent (never null, never empty) means a v1 call, which the receiver keys by channel as
-before. The island copies `m` from the body it persisted and never invents, rewrites or
+**The wake** is `{c, k, m}` on both FCM and APNs, with `m` on every wake, since only v2
+calls wake. FCM's `collapse_key` is `m`, so one call's invite and end share a queue slot
+and a different call can never evict them. The island copies `m` from the body it persisted and never invents, rewrites or
 normalises it. The push stays trusted only for "ring or end call `m` on channel `c`".
 Joining still requires a signature-verified, admitted v2 invite whose body ULID equals
 `m`.

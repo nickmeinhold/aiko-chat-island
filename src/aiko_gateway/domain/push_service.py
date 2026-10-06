@@ -308,14 +308,6 @@ _in_flight: set[asyncio.Task] = set()
 ChannelKindStr = Literal["standard", "llm", "robot", "dm"]
 
 
-def is_call_invite(body: str) -> bool:
-    """Exact match, never `startswith`/`in`. A prefix test would let any message
-    beginning with the sentinel wake a device, which hands an attacker a wake
-    primitive with arbitrary trailing content. Mirrors the app's
-    `isCallInviteBody`, which is exact for the same reason."""
-    return body == CALL_INVITE_BODY
-
-
 # THE END-WAKE INTERLOCK — CLOSED BY DEFAULT, and it is a CONSTANT rather than a
 # Settings field on purpose (consolidation retro 2026-09-11, Kelvin + Carnot
 # converging independently).
@@ -351,16 +343,6 @@ def is_call_invite(body: str) -> bool:
 END_WAKE_VOIP_GATE_OPEN = False
 
 
-def is_call_end(body: str) -> bool:
-    """Exact match, for the identical reason `is_call_invite` is exact — and the
-    reason is NOT weaker here just because the privilege is smaller. Forging a
-    stop only suppresses a ring, which a hostile island could do by dropping the
-    invite anyway; but a `startswith` test would still hand any sender a VoIP
-    wake primitive with arbitrary trailing content, and the budget it spends is
-    the recipient's. Mirrors the app's `isCallEndBody`."""
-    return body == CALL_END_BODY
-
-
 # CALL WIRE v2 — the call id IS in the signed body (design 12 Decision 1; bytes
 # pinned with the app tab 2026-10-06, claude-tasks#4421). The caller mints a ULID,
 # the island carries it into the wake as `m`, and the island owns no call object.
@@ -378,9 +360,13 @@ def is_call_end(body: str) -> bool:
 # the "is this convertible" check. Lowercase is REJECTED, not normalised — the app
 # mints uppercase, and accepting two spellings of one id is two ids.
 #
-# v1 IS RECOGNISED FOREVER. Its sentinels are inside signed history on both live
-# islands; a v1 wake simply carries no `m`, which the receiver reads as "v1 call",
-# never as an island fault.
+# v1 NEVER WAKES (app design 22 §v2.0; Nick, 2026-10-06: calling is v2-only).
+# `CALL_INVITE_BODY` / `CALL_END_BODY` stay pinned above as HISTORY — they are
+# inside signed messages on both live islands, are stored and served forever, and
+# design 12's "recognised forever" is honoured as RENDERING, client-side. They are
+# never a call: no store build ever placed one, and a wake for one only made iOS
+# report-and-end a VoIP push (a buzz per invite from an old dev build). So every
+# wake now carries `m`, and "no `m`" is no longer a state the wire can be in.
 # The id's character class lives in `push_result` (CALL_ID_PATTERN), where
 # `WakePayload` enforces it at construction; the parser and the payload share ONE
 # definition, pinned against the app's `_callIdPattern` by a cross-repo test.
@@ -389,22 +375,19 @@ _CALL_V2 = re.compile(
     r"(?P<verb>started a call|ended the call)")
 
 
-def parse_call_body(body: str) -> tuple[WakeKind, str | None] | None:
+def parse_call_body(body: str) -> tuple[WakeKind, str] | None:
     """THE ONE PLACE a call sentinel is recognised: `(kind, call_id)` or None.
 
-    `call_id` is None exactly for v1. `should_wake` and `wake_for_message` both
-    read THIS, so the gate that decides whether to wake and the field that names
-    the call cannot disagree about what a body means.
+    v2 ONLY. A v1 body is an ordinary message here — stored, served, never a
+    wake. `should_wake` and `wake_for_message` both read THIS, so the gate that
+    decides whether to wake and the field that names the call cannot disagree
+    about what a body means.
 
     The id is COPIED from the body the island persisted — the bytes the caller
     signed. The island cannot verify that signature (it never could; the push is
     trusted for nothing beyond "ring/end call m on channel c"), but it never
     invents, rewrites or normalises the id either.
     """
-    if is_call_invite(body):
-        return WakeKind.CALL_INVITE, None
-    if is_call_end(body):
-        return WakeKind.CALL_END, None
     match = _CALL_V2.fullmatch(body)
     if match is None:
         return None
@@ -1046,8 +1029,9 @@ async def _wake_user(session: AsyncSession, user_id: str, *, wake: WakeKind,
                              delivery.row_id, delivery.apns_environment.value,
                              delivery.token_kind.value, result.verdict.value)
                 case FcmDelivery():
-                    result = await fcm.send(delivery.token, payload,
-                                            collapse_key=collapse_id)
+                    # No collapse key passed: FCM collapses on the call id the
+                    # payload already carries (see `fcm.build_message`).
+                    result = await fcm.send(delivery.token, payload)
                     # Same semantic record as the APNs line above: the row's ULID,
                     # never the token.
                     log.info("fcm sent device=%s verdict=%s",

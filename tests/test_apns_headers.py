@@ -79,7 +79,7 @@ async def captured(monkeypatch):
 async def _send(kind: TokenKind, *, collapse_id: str | None = CHANNEL,
                 wake: WakeKind = WakeKind.CALL_INVITE):
     return await apns.send(
-        "b" * 64, WakePayload(channel_id=CHANNEL, kind=wake, call_id=None),
+        "b" * 64, WakePayload(channel_id=CHANNEL, kind=wake, call_id="01JABCDEFGHJKMNPQRSTVWXYZ0"),
         apns_environment=ApnsEnvironment.PRODUCTION,
         token_kind=kind, collapse_id=collapse_id)
 
@@ -131,7 +131,16 @@ async def test_the_alert_payload_is_byte_identical_to_the_pre_refactor_wire(
 
     `"k"` is `"call_invite"` here and that is not incidental: an ALERT row can
     never receive a `CALL_END` (`push_service.plan_deliveries` skips it with
-    `end_wake_needs_voip`), so this is the only value this wire can carry."""
+    `end_wake_needs_voip`), so this is the only value this wire can carry.
+
+    CHANGED TWICE, DELIBERATELY, 2026-10-06 (claude-tasks#4421): `"m"` was added,
+    and it is now on EVERY wake because v1 bodies no longer wake at all (app
+    design 22 §v2.0; Nick confirmed calling is v2-only the same day). Safe on the
+    live alert wire for the identical reason `"k"` was: the shipped AppDelegate
+    reads one known key (`userInfo["c"]`), so an unknown key is ignored by every
+    build already on a handset. What DID change for those builds is upstream of
+    this dict: their v1 invites no longer produce a wake, so they get no banner.
+    No store build has calling on, so that reaches only old dev builds."""
     import json
 
     await _send(TokenKind.ALERT)
@@ -142,6 +151,7 @@ async def test_the_alert_payload_is_byte_identical_to_the_pre_refactor_wire(
         },
         "c": CHANNEL,
         "k": "call_invite",
+        "m": "01JABCDEFGHJKMNPQRSTVWXYZ0",
     }
 
 
@@ -360,7 +370,7 @@ async def test_the_voip_body_is_pinned_even_though_its_shape_is_an_open_question
     So: if someone changes the VoIP body, this reddens and forces the conversation.
     That is the entire point — the previous state was a wire nobody was watching.
     """
-    await apns.send("v" * 64, WakePayload(channel_id=CHANNEL, kind=WakeKind.CALL_INVITE, call_id=None),
+    await apns.send("v" * 64, WakePayload(channel_id=CHANNEL, kind=WakeKind.CALL_INVITE, call_id="01JABCDEFGHJKMNPQRSTVWXYZ0"),
                     apns_environment=ApnsEnvironment.PRODUCTION,
                     token_kind=TokenKind.VOIP)
     import json as _json

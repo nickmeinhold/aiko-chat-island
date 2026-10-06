@@ -57,13 +57,12 @@ def test_reject_vectors_are_ordinary_messages(name):
     assert push_service.should_wake("dm", body) is None, name
 
 
-def test_v1_parses_with_no_call_id():
-    """v1 is recognised FOREVER (it is in signed history) and has no id. `None`
-    is how the receiver learns it is a v1 call — never an island fault."""
-    assert push_service.parse_call_body(push_service.CALL_INVITE_BODY) == (
-        WakeKind.CALL_INVITE, None)
-    assert push_service.parse_call_body(push_service.CALL_END_BODY) == (
-        WakeKind.CALL_END, None)
+def test_v1_is_history_not_a_call():
+    """Calling is v2-only (app design 22 §v2.0; Nick, 2026-10-06). The v1 bodies
+    are signed history — stored and served forever — but parse as ordinary
+    messages and never wake."""
+    assert push_service.parse_call_body(push_service.CALL_INVITE_BODY) is None
+    assert push_service.parse_call_body(push_service.CALL_END_BODY) is None
 
 
 @pytest.mark.parametrize("kind", ["standard", "public", "private", "llm", "robot"])
@@ -77,25 +76,21 @@ def test_v2_does_not_wake_outside_a_dm(kind, body):
 
 # -------------------------------------------------------------- the wire, both sides
 
-def _payload(kind: WakeKind, call_id: str | None) -> WakePayload:
-    return WakePayload(channel_id="01CHAN", kind=kind, call_id=call_id)
+def _payload(kind: WakeKind) -> WakePayload:
+    return WakePayload(channel_id="01CHAN", kind=kind, call_id=CALL_ID)
 
 
 @pytest.mark.parametrize("kind", list(WakeKind))
-def test_fcm_carries_m_for_v2_and_omits_it_for_v1(kind):
-    v2 = fcm.build_message("t", _payload(kind, CALL_ID))["message"]["data"]
-    v1 = fcm.build_message("t", _payload(kind, None))["message"]["data"]
-    assert v2 == {"c": "01CHAN", "k": kind.value, "m": CALL_ID}
-    assert v1 == {"c": "01CHAN", "k": kind.value}, (
-        "a v1 wake must carry NO `m` — not null, not empty; absence is the signal")
+def test_fcm_carries_m_on_every_wake(kind):
+    msg = fcm.build_message("t", _payload(kind))["message"]
+    assert msg["data"] == {"c": "01CHAN", "k": kind.value, "m": CALL_ID}
+    assert msg["android"]["collapse_key"] == CALL_ID
 
 
 @pytest.mark.parametrize("kind", list(WakeKind))
-def test_apns_carries_m_for_v2_and_omits_it_for_v1(kind):
-    v2 = apns._render(_payload(kind, CALL_ID))
-    v1 = apns._render(_payload(kind, None))
-    assert v2["m"] == CALL_ID and v2["c"] == "01CHAN" and v2["k"] == kind.value
-    assert "m" not in v1
+def test_apns_carries_m_on_every_wake(kind):
+    body = apns._render(_payload(kind))
+    assert body["m"] == CALL_ID and body["c"] == "01CHAN" and body["k"] == kind.value
 
 
 def test_call_id_has_no_default():
@@ -106,7 +101,7 @@ def test_call_id_has_no_default():
 
 
 @pytest.mark.parametrize("bad", ["alice", "01jabcdefghjkmnpqrstvwxyz0",
-                                 "81JABCDEFGHJKMNPQRSTVWXYZ0", ""])
+                                 "81JABCDEFGHJKMNPQRSTVWXYZ0", "", None])
 def test_a_payload_refuses_a_malformed_call_id(bad):
     """The shape is enforced at CONSTRUCTION (Carnot, PR#192 r1), so no future
     caller can hand Apple/Google an arbitrary `m` by building the payload

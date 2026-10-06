@@ -434,10 +434,9 @@ def _render(payload: WakePayload) -> dict:
         },
         "c": payload.channel_id,
         "k": payload.kind.value,
-        # `m` ONLY for a v2 call. Absent — never null, never "" — is how a v1 call
-        # reads on the receiver, and iOS decodes permissively (design 16 v2 §7c),
-        # so an older build ignores it.
-        **({"m": payload.call_id} if payload.call_id is not None else {}),
+        # `m` on EVERY wake — the call id (v1 never wakes; app design 22 §v2.0).
+        # iOS decodes permissively (design 16 v2 §7c), so an older build ignores it.
+        "m": payload.call_id,
     }
 
 

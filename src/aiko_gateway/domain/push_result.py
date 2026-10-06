@@ -298,7 +298,8 @@ class WakePayload:
     # TypeError instead.
     kind: WakeKind
     # THE CALL ID — design 12 Decision 1's client-minted ULID, copied out of a v2
-    # body; None for a v1 call, which has none. REQUIRED, NO DEFAULT, for the same
+    # body. ALWAYS PRESENT: v1 bodies never wake (app design 22 §v2.0, Nick
+    # 2026-10-06), so the old `None`-means-v1 state is gone from the type. REQUIRED, NO DEFAULT, for the same
     # reason as `kind`: a default of None would let a caller that forgets it ship
     # every v2 call as v1-shaped — the receiver would fall back to channel keying
     # and the duplicate-vs-redial bug (app design 21) would return silently.
@@ -315,8 +316,8 @@ class WakePayload:
     # fills all 128 bits from a CSPRNG (app PR #210), so do not read a ULID's
     # usual 48-bit timestamp out of `m` — the format is ULID-shaped, the content
     # is not (Tesla, cage-match PR#192 r3: this line used to say otherwise).
-    call_id: str | None
+    call_id: str
 
     def __post_init__(self) -> None:
-        if self.call_id is not None and not _CALL_ID.fullmatch(self.call_id):
+        if not isinstance(self.call_id, str) or not _CALL_ID.fullmatch(self.call_id):
             raise ValueError("call_id is not a canonical 26-char call id")

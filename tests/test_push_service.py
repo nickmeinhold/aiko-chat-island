@@ -46,6 +46,14 @@ from aiko_gateway.domain.push_result import ReapOrder, SendResult, Verdict
 CHANNEL = "01JDMCHANNELDM000000000000"
 OTHER_CHANNEL = "01OTHERCHANNEL0000000000"
 
+# THE BODIES THAT RING. Calling is v2-only (app design 22 §v2.0, Nick 2026-10-06):
+# a v1 body is history and never wakes, so every ring test below speaks v2. The v1
+# constants are still pinned (byte-for-byte and against the app) because they are
+# signed history — just not calls.
+CALL_ID = "01JABCDEFGHJKMNPQRSTVWXYZ0"
+V2_INVITE = f"aiko:call/2 {CALL_ID} · 📞 started a call"
+V2_END = f"aiko:call/2 {CALL_ID} · 📞 ended the call"
+
 # A synthetic FCM service-account blob. No key material: every FCM test here
 # replaces `apns.send` wholesale, so nothing ever signs anything.
 FCM_CREDENTIAL = (
@@ -204,7 +212,7 @@ async def dm(session, monkeypatch):
     return alice, bob
 
 
-async def _wake(body: str = push_service.CALL_INVITE_BODY, *, sender_id: str,
+async def _wake(body: str = V2_INVITE, *, sender_id: str,
                 kind: str = "dm", exclude: set[str] | None = None):
     await push_service.wake_for_message(
         channel_id=CHANNEL, channel_kind=kind, sender_id=sender_id,
@@ -318,8 +326,11 @@ def test_the_v2_call_id_pattern_matches_the_app_repo_when_present():
 
 
 @pytest.mark.parametrize("body,expected", [
-    (push_service.CALL_INVITE_BODY, "CALL_INVITE"),
-    (push_service.CALL_END_BODY, "CALL_END"),
+    (V2_INVITE, "CALL_INVITE"),
+    (V2_END, "CALL_END"),
+    # v1 is HISTORY, not a call (app design 22 §v2.0): stored, served, never a wake.
+    (push_service.CALL_INVITE_BODY, None),
+    (push_service.CALL_END_BODY, None),
     ("aiko:call/1 \u00b7 \U0001f4de started a call and then some", None),
     ("aiko:call/1 \u00b7 \U0001f4de ended the call, honest", None),
     ("hello", None),
@@ -344,7 +355,7 @@ def test_the_end_sentinel_does_not_wake_outside_a_dm():
     one. A per-arm copy that forgot `channel_kind` would be a wake primitive
     aimed at every member of a public room."""
     for kind in ("standard", "llm", "robot"):
-        assert push_service.should_wake(kind, push_service.CALL_END_BODY) is None
+        assert push_service.should_wake(kind, V2_END) is None
 
 
 def test_channel_kind_literal_matches_the_enum():
@@ -368,15 +379,15 @@ def test_channel_kind_literal_matches_the_enum():
 @pytest.mark.parametrize(
     "kind,body,expected",
     [
-        ("dm", push_service.CALL_INVITE_BODY, push_service.WakeKind.CALL_INVITE),
+        ("dm", V2_INVITE, push_service.WakeKind.CALL_INVITE),
         # A prefix match would hand an attacker a wake primitive with arbitrary
         # trailing content — the app's `isCallInviteBody` is exact for the same reason.
-        ("dm", push_service.CALL_INVITE_BODY + " and now you ring", None),
-        ("dm", "look: " + push_service.CALL_INVITE_BODY, None),
+        ("dm", V2_INVITE + " and now you ring", None),
+        ("dm", "look: " + V2_INVITE, None),
         ("dm", "hello", None),
         # Video is DM-only, so a call invitation in a public room is not a call.
-        ("public", push_service.CALL_INVITE_BODY, None),
-        ("private", push_service.CALL_INVITE_BODY, None),
+        ("public", V2_INVITE, None),
+        ("private", V2_INVITE, None),
         ("dm", "", None),
     ],
 )
@@ -512,7 +523,7 @@ async def test_an_end_wake_reaches_the_voip_row_and_skips_the_alert_row(
     await session.commit()
 
     with caplog.at_level(logging.INFO, logger="aiko_gateway.push"):
-        await _wake(push_service.CALL_END_BODY, sender_id=alice.id)
+        await _wake(V2_END, sender_id=alice.id)
 
     assert fake_apns.kinds == [TokenKind.VOIP], (
         "the hangup must reach the VoIP row and ONLY the VoIP row; "
@@ -525,14 +536,14 @@ async def test_an_end_wake_reaches_the_voip_row_and_skips_the_alert_row(
 @pytest.fixture
 def fake_fcm(monkeypatch):
     """An island holding an FCM credential, with Google replaced by a recorder.
-    Returns the list of (token, payload, collapse_key) sends."""
+    Returns the list of (token, payload, None) sends."""
     monkeypatch.setattr(settings, "fcm_service_account_json", FCM_CREDENTIAL,
                         raising=False)
     fcm.reset_for_tests()
     sent: list = []
 
-    async def _send(device_token, payload, *, collapse_key=None):
-        sent.append((device_token, payload, collapse_key))
+    async def _send(device_token, payload):
+        sent.append((device_token, payload, None))
         return SendResult(Verdict.DELIVERED)
 
     monkeypatch.setattr(fcm, "send", _send)
@@ -562,14 +573,14 @@ async def test_an_android_hangup_reaches_fcm_with_the_gate_closed(
     ])
     await session.commit()
 
-    await _wake(push_service.CALL_END_BODY, sender_id=alice.id)
+    await _wake(V2_END, sender_id=alice.id)
     assert [(t, p.kind) for t, p, _ in fake_fcm] == [
         ("android-token-1", push_service.WakeKind.CALL_END)]
     assert fake_apns.sent == [], (
         "the APNs VoIP end went out with the #4278 interlock closed")
 
     fake_fcm.clear()
-    await _wake(push_service.CALL_INVITE_BODY, sender_id=alice.id)
+    await _wake(V2_INVITE, sender_id=alice.id)
     assert [(t, p.kind) for t, p, _ in fake_fcm] == [
         ("android-token-1", push_service.WakeKind.CALL_INVITE)]
 
@@ -603,10 +614,19 @@ async def test_a_v2_call_carries_its_id_to_both_transports_end_to_end(
 
 
 @pytest.mark.asyncio
-async def test_a_v1_call_wakes_with_no_id(session, dm, configured, fake_apns):
-    alice, _ = dm
-    await _wake(push_service.CALL_INVITE_BODY, sender_id=alice.id)
-    assert [p.call_id for _, p, _ in fake_apns.sent] == [None]
+async def test_a_v1_call_body_never_wakes(session, dm, configured, fake_apns, fake_fcm,
+                                          end_wake_gate_open):
+    """Calling is v2-only (app design 22 §v2.0; Nick, 2026-10-06). A v1 body from
+    an old dev build is still a stored, served message — but waking for it only
+    made iOS report-and-end a VoIP push: a buzz per invite. Both kinds, both
+    transports, gate OPEN so the silence cannot be the interlock's."""
+    alice, bob = dm
+    session.add(DeviceToken(user_id=bob.id, platform="fcm", token="android-token-1",
+                            token_kind=TokenKind.ALERT.value))
+    await session.commit()
+    for body in (push_service.CALL_INVITE_BODY, push_service.CALL_END_BODY):
+        await _wake(body, sender_id=alice.id)
+    assert fake_apns.sent == [] and fake_fcm == []
 
 
 @pytest.mark.asyncio
@@ -630,7 +650,7 @@ async def test_an_end_wake_carries_the_end_kind_in_the_payload(
                             token_kind=TokenKind.VOIP.value))
     await session.commit()
 
-    await _wake(push_service.CALL_END_BODY, sender_id=alice.id)
+    await _wake(V2_END, sender_id=alice.id)
     assert fake_apns.sent, "no push at all — the end wake never fired"
     _, payload, _ = fake_apns.sent[0]
     assert payload.kind is push_service.WakeKind.CALL_END
@@ -640,7 +660,7 @@ async def test_an_end_wake_carries_the_end_kind_in_the_payload(
     # constant — both of which break the invite in exactly the way this field
     # exists to prevent.
     fake_apns.sent.clear()
-    await _wake(push_service.CALL_INVITE_BODY, sender_id=alice.id)
+    await _wake(V2_INVITE, sender_id=alice.id)
     _, invite_payload, _ = fake_apns.sent[0]
     assert invite_payload.kind is push_service.WakeKind.CALL_INVITE
 
@@ -683,7 +703,7 @@ async def test_a_closed_interlock_refuses_the_end_wake_and_says_so(
     await session.commit()
 
     with caplog.at_level(logging.INFO, logger="aiko_gateway.push"):
-        await _wake(push_service.CALL_END_BODY, sender_id=alice.id)
+        await _wake(V2_END, sender_id=alice.id)
 
     assert fake_apns.sent == [], (
         "the interlock is closed — an end wake must not reach a VoIP handset")
@@ -717,7 +737,7 @@ async def test_the_conduct_gate_runs_on_an_end_wake_too(
     await session.commit()
 
     with caplog.at_level(logging.INFO, logger="aiko_gateway.push"):
-        await _wake(push_service.CALL_END_BODY, sender_id=alice.id)
+        await _wake(V2_END, sender_id=alice.id)
 
     assert fake_apns.sent == [], (
         "an end wake bypassed the conduct gate — the gate must run on EVERY wake "
@@ -1339,7 +1359,7 @@ def test_schedule_wake_never_raises_without_a_loop(configured):
     context, which is exactly the no-running-loop case."""
     push_service.schedule_wake(
         channel_id=CHANNEL, channel_kind="dm",
-        body=push_service.CALL_INVITE_BODY,
+        body=V2_INVITE,
         sender_id="someone", exclude_user_ids=set(),
     )  # must not raise
 
@@ -1540,7 +1560,7 @@ async def test_a_first_contact_call_invite_does_not_wake(
         # wake is scheduled, so a "the channel has any row" predicate must fail.
         Message(id="01ALICEINVITE00000000000", channel_id=CHANNEL,
                 sender_user_id=alice.id, sender_kind="human",
-                body=push_service.CALL_INVITE_BODY),
+                body=V2_INVITE),
         # AND Bob has spoken SOMEWHERE ELSE (Tesla, cage-match PR#173 r2). The
         # predicate is TWO conjuncts — this channel AND this recipient — and the
         # previous arm could only falsify one of them. With Bob mute everywhere,

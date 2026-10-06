@@ -346,8 +346,7 @@ async def aclose() -> None:
         _client_singleton = None
 
 
-def build_message(device_token: str, payload: WakePayload, *,
-                  collapse_key: str | None = None) -> dict:
+def build_message(device_token: str, payload: WakePayload) -> dict:
     """The FCM v1 envelope for a wake. Module-level and pure, so the invariants
     below are testable with no network.
 
@@ -358,7 +357,7 @@ def build_message(device_token: str, payload: WakePayload, *,
     stopped being true when `aiko_chat_app` `feat/android-ring` landed a receiver.
     The contract it consumes, verbatim from #4421:
 
-        data = {"c": <channel_id>, "k": "call_invite" | "call_end", "m"?: <call ulid>}
+        data = {"c": <channel_id>, "k": "call_invite" | "call_end", "m": <call id>}
         data-only, NO `notification` block, android.priority "HIGH", short TTL.
 
     It was proven on a Pixel 4 (Android 13) with this exact envelope: process
@@ -374,10 +373,10 @@ def build_message(device_token: str, payload: WakePayload, *,
     floor: the exact structurally-invisible failure this paragraph used to warn
     about, one key over. Same "explicit on both values" rule as `apns._render`.
 
-    `"m"` IS THE CALL ID, PRESENT EXACTLY FOR A v2 CALL (design 12 Decision 1, bytes
-    agreed 2026-10-06). It is what lets the receiver tell the same invite delivered
-    twice from a new call on the same channel. Absent means a v1 call, which the
-    receiver keys by channel as before.
+    `"m"` IS THE CALL ID, ON EVERY WAKE (design 12 Decision 1, bytes agreed
+    2026-10-06). It is what lets the receiver tell the same invite delivered
+    twice from a new call on the same channel. v1 bodies never wake (app design
+    22 §v2.0, Nick 2026-10-06), so there is no `m`-less wake to decode.
 
     THE CREDENTIAL GATE IS NOW THE APP'S MERGE, NOT THIS CODE. The app tab asked
     that `FCM_SERVICE_ACCOUNT_JSON` stay unprovisioned until `feat/android-ring`
@@ -428,21 +427,18 @@ def build_message(device_token: str, payload: WakePayload, *,
     # B's 30s invite overwrite call A's 300s end while the handset was offline,
     # and when B's invite expired A's stop was gone for good. Keyed on the call
     # id, A's invite and end still coalesce (an offline call collapses to its
-    # end) and B can never erase A's stop. v1 (no id) stays on the caller's key.
+    # end) and B can never erase A's stop.
     # One key per in-flight call stays well inside FCM's four-key ceiling.
-    key = payload.call_id if payload.call_id is not None else collapse_key
-    if key is not None:
-        android["collapse_key"] = key
+    android["collapse_key"] = payload.call_id
     return {
         "message": {
             # The target is a `oneof`: exactly one of token/topic/condition.
             # Legacy `to` / `registration_ids` do not exist in v1.
             "token": device_token,
             # `k` on EVERY wake, both values explicit — see the contract above.
+            # `m` on EVERY wake: v1 never wakes (app design 22 §v2.0).
             "data": {"c": payload.channel_id, "k": payload.kind.value,
-                     # `m` only for a v2 call; absent means v1 (see apns._render).
-                     **({"m": payload.call_id}
-                        if payload.call_id is not None else {})},
+                     "m": payload.call_id},
             "android": android,
         }
     }
@@ -545,8 +541,7 @@ def _reap_order_for(verdict: Verdict) -> ReapOrder | None:
     return ReapOrder(None) if verdict is Verdict.DEAD_TOKEN else None
 
 
-async def send(device_token: str, payload: WakePayload, *,
-               collapse_key: str | None = None) -> SendResult:
+async def send(device_token: str, payload: WakePayload) -> SendResult:
     """Push one wake to one Android device. Returns a [SendResult]; never raises
     for a protocol-level refusal, a transport error, or an auth failure.
 
@@ -573,8 +568,7 @@ async def send(device_token: str, payload: WakePayload, *,
     url = f"{_FCM_HOST}/v1/projects/{_project_id()}/messages:send"
     try:
         response = await _client().post(
-            url, json=build_message(device_token, payload,
-                                    collapse_key=collapse_key),
+            url, json=build_message(device_token, payload),
             headers={"authorization": f"Bearer {token}"})
     except httpx.HTTPError as ex:
         # The device is not implicated by OUR network failing.
