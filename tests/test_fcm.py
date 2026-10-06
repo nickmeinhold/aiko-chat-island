@@ -193,6 +193,52 @@ async def test_a_401_on_send_drops_the_cached_access_token(configured, monkeypat
     assert fcm._cached_access_token is None
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [429, 500, 502, 503])
+async def test_a_token_endpoint_blip_is_not_negative_cached(configured, monkeypatch,
+                                                            status):
+    """5xx/429 at the token endpoint is Google blinking, not our key — the same
+    event the transport-error arm refuses to cache (Tesla, PR#192 r2). Backing
+    off would silence every Android ring for a minute."""
+    async def _post(url, **kw):
+        return httpx.Response(status, request=httpx.Request("POST", url))
+
+    class _C:
+        post = staticmethod(_post)
+
+    monkeypatch.setattr(fcm, "_client", lambda: _C())
+    monkeypatch.setattr(fcm, "_sign_assertion", lambda cred: "assertion")
+    assert await fcm._access_token() is None
+    assert fcm._oauth_backoff_until is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", [None, "", 7])
+async def test_a_non_string_access_token_is_never_cached(configured, monkeypatch, bad):
+    """A 200 with `access_token: null` used to be cached and replayed as "no
+    token" for ~55 minutes (Tesla, PR#192 r2)."""
+    async def _post(url, **kw):
+        return httpx.Response(200, json={"access_token": bad, "expires_in": 3600},
+                              request=httpx.Request("POST", url))
+
+    class _C:
+        post = staticmethod(_post)
+
+    monkeypatch.setattr(fcm, "_client", lambda: _C())
+    monkeypatch.setattr(fcm, "_sign_assertion", lambda cred: "assertion")
+    assert await fcm._access_token() is None
+    assert fcm._cached_access_token is None
+    assert fcm._oauth_backoff_until is not None
+
+
+@pytest.mark.parametrize("body", [{"error": "invalid_grant"}, {"error": None},
+                                  {"error": ["x"]}])
+def test_a_non_object_error_field_reads_as_no_code(body):
+    """`error` is checked by type, so a string-shaped error cannot raise out of
+    `send`'s never-raise contract (Tesla, PR#192 r2)."""
+    assert fcm._fcm_error_code(body) == ""
+
+
 def test_an_absolute_epoch_ttl_would_be_rejected():
     """THE MUST-FAIL ARM. Built BEFORE the assertion was trusted: a harness
     examined for whether it CAN fail tends to look like it can."""

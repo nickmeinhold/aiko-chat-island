@@ -276,6 +276,17 @@ async def _access_token() -> str | None:
         log.warning("fcm oauth failed transport=%s", type(ex).__name__)
         return None
 
+    if response.status_code == 429 or response.status_code >= 500:
+        # GOOGLE BLINKED, NOT OUR KEY (Tesla, cage-match PR#192 r2). Treated like
+        # the transport error above and NOT negative-cached: one backoff bit used
+        # to mean both "this key will never sign" and "the token endpoint had a
+        # bad second", so a single 503 silenced every Android ring on the island
+        # for a minute while /health stayed green. `_verdict` already calls the
+        # same statuses TRANSIENT on the send path; the mint path now agrees.
+        log.warning("fcm oauth unavailable status=%s — not backing off",
+                    response.status_code)
+        return None
+
     if response.status_code != 200:
         _oauth_backoff_until = now + _OAUTH_FAILURE_BACKOFF_SECONDS
         # ERROR because this is an island CONFIGURATION fault that silently costs
@@ -292,6 +303,13 @@ async def _access_token() -> str | None:
         body = response.json()
         token = body["access_token"]
         expires_in = int(body.get("expires_in", _ASSERTION_TTL_SECONDS))
+        # A 200 carrying `"access_token": null` (or "", or a number) raised nothing
+        # and was CACHED, then returned as None for ~55 minutes: `send` reads None
+        # as "no token" and never POSTs, so the 401 clearer below never ran either
+        # (Tesla, cage-match PR#192 r2). Only a non-empty string may enter the
+        # cache; anything else takes the unreadable-response path.
+        if not isinstance(token, str) or not token:
+            raise ValueError("access_token is not a non-empty string")
     except (ValueError, KeyError, TypeError):
         _oauth_backoff_until = now + _OAUTH_FAILURE_BACKOFF_SECONDS
         log.error("fcm oauth returned an unreadable token response")
@@ -434,7 +452,14 @@ def _fcm_error_code(body: dict) -> str:
     """
     if not isinstance(body, dict):
         return ""
-    details = body.get("error", {}).get("details")
+    # `error` CHECKED BY TYPE, like `details` below (Tesla, cage-match PR#192 r2):
+    # an RFC 6749-shaped `{"error": "invalid_grant"}`, or a front end that never
+    # reached FCM, put a STRING here, and `.get` on it raised AttributeError
+    # straight out of `send`'s never-raise contract.
+    error = body.get("error")
+    if not isinstance(error, dict):
+        return ""
+    details = error.get("details")
     if not isinstance(details, list):
         return ""
     for detail in details:

@@ -860,10 +860,17 @@ _UNREACHABLE_REMEDY = {
     # A REAL CREDENTIAL AGAIN, since the send path exists (claude-tasks#4421). The
     # NOT-BUILT wording this replaced was correct only while there was no send path;
     # left in place it would now tell an operator something false about the island.
+    #
+    # ONE IMPERATIVE (Tesla, cage-match PR#192 r2). This also said "Hold until the
+    # app's Android receive half is merged" — a second, opposite instruction in a
+    # string printed on every boot of an island with Android rows, and one with an
+    # expiry date baked into permanent operator text. The hold is a DEPLOY-ORDER
+    # fact (this ships after the app half; claude-tasks#4421 records it), not a
+    # property of the island, so it belongs in the release, not in the remedy.
     Platform.FCM.value: ("Set FCM_SERVICE_ACCOUNT_JSON (single-line service-account "
                          "JSON, `jq -c .`), and check this box's docker-compose.yml "
-                         "actually forwards it (#2301). Hold until the app's Android "
-                         "receive half is merged — see claude-tasks#4421"),
+                         "actually forwards it (#2301: update.sh pulls the image, "
+                         "it does NOT sync compose)"),
 }
 
 

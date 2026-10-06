@@ -359,6 +359,8 @@ async def test_an_apns_island_with_android_rows_names_the_fcm_credential(
     assert "platform=fcm" in text, f"the Android rows were not named: {text}"
     assert "FCM_SERVICE_ACCOUNT_JSON" in text, (
         f"the warning must name the credential that fixes it: {text}")
+    assert "Hold" not in text, (
+        f"the remedy must carry ONE imperative, not set-and-hold: {text}")
     assert "NOT BUILT" not in text, (
         f"the warning still claims a send path that now exists is missing: {text}")
     assert "APNS_KEY_ID" not in text, (
