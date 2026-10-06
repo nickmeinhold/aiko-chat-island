@@ -278,16 +278,43 @@ def test_both_sentinels_match_the_app_repo_source_when_it_is_present():
     drift introduced by either half surfaces the moment anyone runs the suite,
     instead of at a handset.
     """
-    dart = (pathlib.Path(__file__).resolve().parents[2] / "aiko_chat_app"
-            / "lib/features/call/domain/call_invite.dart").read_text()
+    # BOTH LAYOUTS. call/2 (app PR #210) moved the v1 literals into
+    # `call_wire.dart` as `kCall*BodyV1`, leaving `kCall*Body` as ALIASES in
+    # `call_invite.dart` — which a literal-matching regex cannot follow. Reading
+    # only the old file turned this test red the moment the app branch moved, and
+    # would have on app main the day #210 merged. Read whichever holds a literal.
+    domain = (pathlib.Path(__file__).resolve().parents[2] / "aiko_chat_app"
+              / "lib/features/call/domain")
+    dart = "".join(f.read_text() for f in (domain / "call_wire.dart",
+                                           domain / "call_invite.dart")
+                   if f.exists())
+    if not dart:
+        pytest.skip("no aiko_chat_app checkout beside this repo")
     for const, ours in (("kCallInviteBody", push_service.CALL_INVITE_BODY),
                         ("kCallEndBody", push_service.CALL_END_BODY)):
-        m = re.search(r"const String " + const + r" = '([^']*)';", dart)
+        m = re.search(r"const String " + const + r"(?:V1)? = '([^']*)';", dart)
         assert m, f"{const} not found in the app source — it moved or was renamed"
         assert m.group(1) == ours, (
             f"{const} has DRIFTED between the repos: app has {m.group(1)!r}, "
             f"island has {ours!r}. One of the two halves stopped working and "
             f"neither would have logged anything.")
+
+
+def test_the_v2_call_id_pattern_matches_the_app_repo_when_present():
+    """The call/2 id class, pinned against the app's own literal — the same
+    second-instrument argument as the sentinel test above. The shared golden
+    vectors (`test_call_wire_v2.py`) prove behaviour on eight strings; this proves
+    the two regexes are the SAME regex. Skipped without an app checkout or before
+    the app has call/2."""
+    wire = (pathlib.Path(__file__).resolve().parents[2] / "aiko_chat_app"
+            / "lib/features/call/domain/call_wire.dart")
+    if not wire.exists():
+        pytest.skip("no call/2 app source beside this repo")
+    m = re.search(r"_callIdPattern = RegExp\(r'\^([^']*)\$'\)", wire.read_text())
+    assert m, "_callIdPattern not found in call_wire.dart — it moved or was renamed"
+    assert m.group(1) == push_service.CALL_ID_PATTERN, (
+        f"the call-id pattern has DRIFTED: app {m.group(1)!r}, island "
+        f"{push_service.CALL_ID_PATTERN!r}")
 
 
 @pytest.mark.parametrize("body,expected", [

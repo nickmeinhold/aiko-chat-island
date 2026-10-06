@@ -146,6 +146,34 @@ def test_the_ttl_is_a_relative_duration_string_within_one_day(configured):
     _assert_ttl_is_a_relative_duration(_message()["message"]["android"]["ttl"])
 
 
+@pytest.mark.parametrize("kind", list(WakeKind))
+def test_every_wake_kind_has_a_ttl(configured, kind):
+    """`_TTL_SECONDS` is per kind; a member without one would raise inside the
+    send. This sweep makes that unreachable for every member that exists."""
+    ttl = _message(WakePayload(channel_id=CHANNEL, kind=kind, call_id=None))[
+        "message"]["android"]["ttl"]
+    _assert_ttl_is_a_relative_duration(ttl)
+
+
+def test_the_invite_ttl_is_the_ring_ceiling(configured):
+    """The 30s ring ceiling (Nick, 2026-09-09) on Android too. The receiver rings
+    at +100ms, before any code can judge the invite's age, so a longer TTL is a
+    ring for a call that is already over. Pinned to the SHARED constant, and to
+    the APNs lease, so the two transports cannot drift apart."""
+    from aiko_gateway.domain import apns
+    from aiko_gateway.domain.push_result import RING_CEILING_SECONDS
+    ttl = _message()["message"]["android"]["ttl"]
+    assert ttl == f"{RING_CEILING_SECONDS}s" == f"{apns._VOIP_LEASE_SECONDS}s"
+
+
+def test_the_end_outlives_the_invite(configured):
+    """A late end is harmless; an expired one leaves a ring running."""
+    invite = _message()["message"]["android"]["ttl"]
+    end = _message(WakePayload(channel_id=CHANNEL, kind=WakeKind.CALL_END,
+                               call_id=None))["message"]["android"]["ttl"]
+    assert int(end[:-1]) > int(invite[:-1])
+
+
 def test_an_absolute_epoch_ttl_would_be_rejected():
     """THE MUST-FAIL ARM. Built BEFORE the assertion was trusted: a harness
     examined for whether it CAN fail tends to look like it can."""
@@ -294,7 +322,7 @@ async def test_a_200_is_delivered_and_the_body_is_the_v1_envelope(
     body = json.loads(seen[0].content)
     assert set(body) == {"message"}
     assert body["message"]["android"] == {
-        "priority": "HIGH", "ttl": "60s", "collapse_key": CHANNEL}
+        "priority": "HIGH", "ttl": "30s", "collapse_key": CHANNEL}
     assert seen[0].headers["authorization"] == "Bearer stub-access-token"
 
 

@@ -381,8 +381,12 @@ def is_call_end(body: str) -> bool:
 # v1 IS RECOGNISED FOREVER. Its sentinels are inside signed history on both live
 # islands; a v1 wake simply carries no `m`, which the receiver reads as "v1 call",
 # never as an island fault.
+# The id's character class, alone, so the cross-repo test can pin it against the
+# app's `_callIdPattern` literal (`call_wire.dart`) — the app pins the same string
+# across Dart, Kotlin and Swift.
+CALL_ID_PATTERN = r"[0-7][0-9A-HJKMNP-TV-Z]{25}"
 _CALL_V2 = re.compile(
-    r"aiko:call/2 (?P<id>[0-7][0-9A-HJKMNP-TV-Z]{25}) \u00b7 \U0001F4DE "
+    r"aiko:call/2 (?P<id>" + CALL_ID_PATTERN + r") \u00b7 \U0001F4DE "
     r"(?P<verb>started a call|ended the call)")
 
 
@@ -640,20 +644,19 @@ def plan_deliveries(
                     # that cannot handle a VoIP end push (#4278). Android has no
                     # must-report rule: a lone `call_end` is a no-op on the
                     # receiver, so there is nothing for the gate to protect.
-                    match (kind, wake):
-                        case (TokenKind.ALERT, WakeKind.CALL_INVITE):
+                    #
+                    # THE ROW'S KIND IS INERT HERE — matched on `wake` only. This
+                    # once skipped a `voip`-kind FCM row by name, which contradicted
+                    # the decision recorded at `rest/devices.py` (inert for 'fcm',
+                    # deliberately not rejected) and this function's own arm (B):
+                    # a mislabelled row still holds a valid FCM token, sending to it
+                    # costs nothing, and dropping it is a missed call whose only
+                    # trace is a log line (cage-match PR#192 r1).
+                    match wake:
+                        case WakeKind.CALL_INVITE | WakeKind.CALL_END:
                             pass
-                        case (TokenKind.ALERT, WakeKind.CALL_END):
-                            pass
-                        case (TokenKind.VOIP, _):
-                            # Not a state the app can produce — Android has no VoIP
-                            # token. A row claiming one is corrupt or forged, and
-                            # it gets a NAMED reason rather than a guessed send.
-                            skips.append((row.id, "fcm_has_no_voip_kind"))
-                            continue
                         case _:
-                            raise ValueError(
-                                f"unrouted fcm wake kind={kind} wake={wake}")
+                            raise ValueError(f"unrouted fcm wake={wake}")
                     deliveries.append(
                         FcmDelivery(row.id, row.token, row.updated_at))
                 case _:

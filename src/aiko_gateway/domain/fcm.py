@@ -51,7 +51,9 @@ import httpx
 import jwt
 
 from ..config import settings
-from .push_result import ReapOrder, SendResult, Verdict, WakePayload
+from .push_result import (END_WAKE_EXPIRY_SECONDS, RING_CEILING_SECONDS,
+                          ReapOrder, SendResult, Verdict, WakeKind,
+                          WakePayload)
 
 log = logging.getLogger("aiko_gateway.fcm")
 
@@ -83,11 +85,23 @@ _OAUTH_FAILURE_BACKOFF_SECONDS = 60
 # duration, clamped to FCM's four-week ceiling — and the result is a wake that can
 # ring a handset weeks after the call ended, with no error anywhere.
 #
-# 60 AND NOT THE VoIP LEASE'S 30, deliberately. An Android data push gives the app
-# CODE EXECUTION BEFORE anything rings, so a late delivery can be declined
-# on-device; a VoIP push cannot be, which is the whole reason the iOS lease is the
-# ring ceiling. The two numbers answer different questions and are not a drift.
-_TTL_SECONDS = 60
+# PER WAKE KIND, and the invite's is THE RING CEILING (cage-match PR#192 r1).
+# This was a flat 60, defended as "an Android data push gives the app code
+# execution before anything rings, so a late delivery can be declined on-device".
+# The receiver that was actually built (claude-tasks#4421) falsifies that premise:
+# its native layer rings at +100ms and Dart warms at +3.3s, so the ring starts
+# before any code can judge the invite's age — and the payload carries no send
+# time to judge it by. A 60s TTL therefore rang a handset up to 30s after the
+# island's ring ceiling, for a call already over. The collapse key does not save
+# it: a call that simply times out may send no end to coalesce with.
+#
+# The end keeps a longer life for the opposite reason: a late end is harmless, an
+# expired one leaves a ring running. Both values come from `push_result`, so they
+# cannot drift from the APNs side.
+_TTL_SECONDS: dict[WakeKind, int] = {
+    WakeKind.CALL_INVITE: RING_CEILING_SECONDS,
+    WakeKind.CALL_END: END_WAKE_EXPIRY_SECONDS,
+}
 _TIMEOUT_SECONDS = 10.0
 
 # The parsed credential, the OAuth access token as (token, expiry_monotonic), and
@@ -385,7 +399,10 @@ def build_message(device_token: str, payload: WakePayload, *,
     i.e. exactly the thing a call wake must not be. Under data-only, lock-screen
     de-duplication is app-side work.
     """
-    android: dict = {"priority": "HIGH", "ttl": f"{_TTL_SECONDS}s"}
+    # A KeyError for an unmapped kind is caught by `push_service`'s per-device
+    # boundary and logged — loud, never a guessed TTL. The test sweep below makes
+    # it unreachable for every member that exists.
+    android: dict = {"priority": "HIGH", "ttl": f"{_TTL_SECONDS[payload.kind]}s"}
     if collapse_key is not None:
         android["collapse_key"] = collapse_key
     return {

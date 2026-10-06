@@ -128,6 +128,24 @@ class SendResult:
     reap: ReapOrder | None = None
 
 
+# THE RING CEILING, SHARED BY BOTH TRANSPORTS (Nick, 2026-09-09; claude-tasks#3744).
+# The island owns a 30s ring, and the mechanism is the push's own expiry: a ring
+# push that outlives the ring stores a push that reports a call already over. It
+# lives HERE, in the vocabulary both transports already import, because the two
+# transports are siblings that may not import each other — so before this, iOS
+# had the ruling as `apns._VOIP_LEASE_SECONDS` and Android had a different number
+# (60) justified by a premise the Android receiver falsified (it rings at +100ms,
+# before any code can judge the invite's age). One constant, two consumers.
+RING_CEILING_SECONDS = 30
+
+# How long an END wake may wait for delivery. Longer than the ring on purpose: a
+# late end is harmless (it stops nothing, or a ring that should already be over),
+# while an end that expires before a reconnecting handset sees it leaves a phantom
+# ring. The value is apns' existing end expiry, hoisted unchanged; reconciling the
+# four call clocks is claude-tasks#4233, and this is not that answer.
+END_WAKE_EXPIRY_SECONDS = 300
+
+
 class WakeKind(enum.Enum):
     """WHAT KIND OF WAKE this is — the thing `push_service.should_wake` decides,
     carried as a value instead of re-derived four hundred lines away.

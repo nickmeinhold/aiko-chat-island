@@ -95,11 +95,13 @@ _EXPECTED: dict[tuple[Platform, TokenKind, WakeKind, bool], str | None] = {
     (Platform.FCM, TokenKind.ALERT, WakeKind.CALL_INVITE, True): None,
     (Platform.FCM, TokenKind.ALERT, WakeKind.CALL_END, False): None,
     (Platform.FCM, TokenKind.ALERT, WakeKind.CALL_END, True): None,
-    # Not a state the app can produce. A row claiming it is corrupt or forged.
-    (Platform.FCM, TokenKind.VOIP, WakeKind.CALL_INVITE, False): "fcm_has_no_voip_kind",
-    (Platform.FCM, TokenKind.VOIP, WakeKind.CALL_INVITE, True): "fcm_has_no_voip_kind",
-    (Platform.FCM, TokenKind.VOIP, WakeKind.CALL_END, False): "fcm_has_no_voip_kind",
-    (Platform.FCM, TokenKind.VOIP, WakeKind.CALL_END, True): "fcm_has_no_voip_kind",
+    # INERT KIND: a `voip`-labelled FCM row delivers like any other (see the
+    # router and `rest/devices.py`). Not something the app should produce — but a
+    # mislabel must cost nothing, never a missed call.
+    (Platform.FCM, TokenKind.VOIP, WakeKind.CALL_INVITE, False): None,
+    (Platform.FCM, TokenKind.VOIP, WakeKind.CALL_INVITE, True): None,
+    (Platform.FCM, TokenKind.VOIP, WakeKind.CALL_END, False): None,
+    (Platform.FCM, TokenKind.VOIP, WakeKind.CALL_END, True): None,
 }
 
 
