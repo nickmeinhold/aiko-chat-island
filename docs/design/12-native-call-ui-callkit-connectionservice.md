@@ -465,5 +465,7 @@ did not consider this at the time; it was weighed on 2026-10-06.
 
 **Stated cost.** `m` is 128 caller-chosen bits that Apple and Google can read. The
 island puts no identity in it, but its guarantee is the shape, not the content. A
-caller could encode something about itself there. The provider can also now link an
+caller could encode something about itself there. The app's answer (app PR #210): it fills all 128 bits from
+`Random.secure()` and uses no timestamp, so a well-behaved client's `m` carries neither
+an identity nor a mint time. The island can verify the shape but not the randomness. The provider can also now link an
 invite to its end exactly; it could already approximate that from `c` and timing.
