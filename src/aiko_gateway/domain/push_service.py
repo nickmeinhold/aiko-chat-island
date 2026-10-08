@@ -617,15 +617,16 @@ def plan_deliveries(
                     # is that an APNs alert push runs no app code and so cannot end
                     # a ring. A data-only FCM push DOES run app code — that is how
                     # it rings in the first place — and the receiver dismisses on a
-                    # matching `c` (measured: 1ms after delivery). Applying the APNs
+                    # matching `m` (measured: 1ms after delivery). Applying the APNs
                     # skip here would mean an Android hangup never stops the other
                     # phone ringing.
                     #
                     # NOR does `end_wake_gate_open`. That interlock defends iOS's
                     # must-report-to-CallKit obligation against a handset build
                     # that cannot handle a VoIP end push (#4278). Android has no
-                    # must-report rule: a lone `call_end` is a no-op on the
-                    # receiver, so there is nothing for the gate to protect.
+                    # must-report rule: a lone `call_end` is harmless on the
+                    # receiver (it tombstones `m`, so a late invite never rings),
+                    # so there is nothing for the gate to protect.
                     #
                     # THE ROW'S KIND IS INERT HERE — matched on `wake` only. This
                     # once skipped a `voip`-kind FCM row by name, which contradicted
@@ -1038,8 +1039,7 @@ async def _wake_user(session: AsyncSession, user_id: str, *, wake: WakeKind,
                              delivery.row_id, delivery.apns_environment.value,
                              delivery.token_kind.value, result.verdict.value)
                 case FcmDelivery():
-                    # No collapse key passed: FCM collapses on the call id the
-                    # payload already carries (see `fcm.build_message`).
+                    # No collapse key, deliberately: see `fcm.build_message`.
                     result = await fcm.send(delivery.token, payload)
                     # Same semantic record as the APNs line above: the row's ULID,
                     # never the token.

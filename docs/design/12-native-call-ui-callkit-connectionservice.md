@@ -448,8 +448,14 @@ ULID:   fullmatch [0-7][0-9A-HJKMNP-TV-Z]{25}   (canonical uppercase Crockford)
   call, and waking for one only made iOS report-and-end a VoIP push.
 
 **The wake** is `{c, k, m}` on both FCM and APNs, with `m` on every wake, since only v2
-calls wake. FCM's `collapse_key` is `m`, so one call's invite and end share a queue slot
-and a different call can never evict them. The island copies `m` from the body it persisted and never invents, rewrites or
+calls wake. ~~FCM's `collapse_key` is `m`, so one call's invite and end share a queue slot
+and a different call can never evict them.~~ **Superseded 2026-10-08 (cage-match PR#192): FCM
+wakes carry NO `collapse_key`.** A collapse key puts a message in FCM's collapsible class,
+which keeps at most four keys per device and throttles, so per-call keys could lose a call's
+end. Without one, each wake is stored separately and no call can displace another's stop. An
+end that arrives BEFORE its invite (FCM does not order delivery) is still safe: the receiver
+tombstones `m` for 120s (`CallRing.TOMBSTONE_TTL_MS`), and the invite's TTL is 30s, so a late
+invite never rings. The island copies `m` from the body it persisted and never invents, rewrites or
 normalises it. The push stays trusted only for "ring or end call `m` on channel `c`".
 Joining still requires a signature-verified, admitted v2 invite whose body ULID equals
 `m`.

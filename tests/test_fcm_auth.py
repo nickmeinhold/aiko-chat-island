@@ -324,6 +324,11 @@ async def test_a_revocation_ring_is_one_strike_and_silences_the_next(
     async def handler(request):
         if _oauth(request):
             return httpx.Response(200, json={"access_token": "ya29", "expires_in": 3599})
+        # Hold every send open, as a real network does, so all twenty are in
+        # flight before the first 403 returns. Without this the mock resolves
+        # synchronously and the first 403 silences the rest before they send,
+        # which is correct behaviour but no longer tests COALESCING.
+        await asyncio.sleep(0.01)
         return httpx.Response(403, json=_fcm_error(403, "PERMISSION_DENIED", None))
 
     client, seen = _pin(monkeypatch, handler)
@@ -483,3 +488,22 @@ async def test_a_flight_from_a_dead_loop_is_not_reused(configured, monkeypatch):
         assert await fcm._access_token() == "ya29"
     finally:
         await client.aclose()
+
+
+async def test_a_denial_that_opens_mid_mint_withholds_the_fresh_token(
+    configured, monkeypatch
+):
+    """`SendDenied` keeps a `Minted`. The waiters must read the STATE after the
+    flight, not the mint's return value, or a token the table refused still sends
+    (Tesla, PR#192 r2)."""
+    async def handler(request):
+        fcm._state = fcm.AuthState(fcm.SendDenied(until=float("inf")), strikes=1,
+                                   since=0.0)   # a denial lands while minting
+        return httpx.Response(200, json={"access_token": "ya29", "expires_in": 3599})
+
+    client, _ = _pin(monkeypatch, handler)
+    try:
+        assert await fcm._access_token() is None
+    finally:
+        await client.aclose()
+    assert isinstance(fcm._state.phase, fcm.SendDenied)

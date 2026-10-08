@@ -617,12 +617,17 @@ async def _access_token() -> str | None:
             or _mint_flight.get_loop() is not asyncio.get_running_loop()):
         _mint_flight = asyncio.ensure_future(_mint_once())
     try:
-        return await asyncio.shield(_mint_flight)
+        await asyncio.shield(_mint_flight)
     except asyncio.CancelledError:
         raise
     except Exception:  # never-raise contract; _mint_once catches its own
         log.exception("fcm mint task failed unexpectedly")
         return None
+    # ONE READING OF THE RESULT: the state, not the mint's return value (Tesla,
+    # cage-match PR#192 r2). A `Minted` the table KEEPS (a denial opened while the
+    # mint was in flight) must not hand its token to every waiter.
+    after = get(_state)
+    return after.token if isinstance(after, Have) else None
 
 
 def auth_status() -> dict:
@@ -699,9 +704,10 @@ def build_message(device_token: str, payload: WakePayload) -> dict:
 
     `"k"` IS REQUIRED, AND ITS ABSENCE NEVER RINGS. The stranded first draft of
     this function sent only `{"c"}` — it predates `WakeKind`. The receiver runs the
-    same total function as iOS's `CallKitRinger.handle`: `call_invite` with a
-    non-empty `c` rings, `call_end` stops a ring on the same `c`, and ANYTHING
-    ELSE — a missing `k` included — is ignored. So `{"c"}` alone is a send FCM
+    same total function as iOS's `CallKitRinger.handle`: `call_invite` rings
+    call `m` unless `m` is tombstoned, `call_end` stops call `m` if it is ringing
+    and TOMBSTONES `m` either way (so an end delivered before its invite still
+    wins), and ANYTHING ELSE — a missing `k` included — is ignored. So `{"c"}` alone is a send FCM
     answers 200 to, `push_service` logs as delivered, and the handset drops on the
     floor: the exact structurally-invisible failure this paragraph used to warn
     about, one key over. Same "explicit on both values" rule as `apns._render`.
