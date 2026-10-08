@@ -274,17 +274,36 @@ where possession is authority and there is nowhere for a bad ring to be caught.
    repo family creates the drift it exists to prevent. One read-through of Design
    07 §"Wire shapes" against the Proposal here settles it.
 
-7. *(2026-10-08)* **What the Apple relay learns.** It is content-blind, but not metadata-blind:
-   it sees "an island asked to ring endpoint E at time T", which amounts to a per-device timing log
-   of rings. That cuts against Nick's 2026-08-25 ruling that sender-anonymity is in scope (the
-   island learns neither who's friends nor who's calling), now at a new observer. The mitigating
-   fact is that Apple already sees the same metadata on every APNs push, so the relay is a
-   *second* observer, not a first. Whether that is acceptable, and whether the relay should be
-   forbidden from logging it (by policy, which is weaker than by construction), is a ruling, not
-   a derivation.
-8. *(2026-10-08)* **Can an FCM ring account be scoped below "the whole app"?** Believed no (the
-   permission is project-level, with no per-token condition). If it could, the Android trust
-   problem would vanish too. Cheap to check before filing.
+7. *(2026-10-08)* **What the Apple relay learns. RULED by Nick 2026-10-08: acceptable.** It is
+   content-blind, but not metadata-blind: it sees "an island asked to ring endpoint E at time T",
+   which amounts to a per-device timing log of rings. Nick's ruling: that is OK, **because the relay
+   is operated by a foundation, not an individual** (Proposal 6). So the foundation is no longer
+   only a continuity measure for the Apple account. It is also what makes the relay's metadata
+   view acceptable. If the relay ever ends up run by a person, this ruling does not carry over.
+   (Apple sees the same metadata on every APNs push regardless.)
+8. *(2026-10-08)* **Can an FCM ring account be scoped below "the whole app"? Checked:**
+   - **Not by IAM.** `cloudmessaging.messages.create` is granted on the PROJECT. The device token
+     rides in the request body, and IAM never sees it, so no condition can say "only these
+     users". (A `request.time` condition, i.e. a ring right that expires, is the one kind of
+     narrowing IAM might offer here. Untested.)
+   - **Yes, by giving each island its own Firebase project.** A registration token belongs to the
+     project that issued it. Sending to it from another project's account fails with
+     `SENDER_ID_MISMATCH` (the island already classifies this as a per-device config fact). So if
+     each island, or each operator, owns its own Firebase project, its ring account can reach
+     ONLY the devices that registered with that island. The scope comes from token issuance, not
+     from IAM. That is Apple's bundle-id isolation recovered on Android without publishing a
+     second app.
+   - **The cost is client-side, and so is the app tab's call.** The app would hold one FCM token
+     per island it has joined: a secondary `FirebaseApp` initialised from that island's
+     (public) Firebase config, published, for example, in the island manifest. The API exists
+     and is used in production ([firebase-android-sdk#4053](https://github.com/firebase/firebase-android-sdk/issues/4053)
+     shows `FirebaseApp.getInstance(name).get(FirebaseMessaging::class.java).token`). But
+     multi-project receive is **not documented** for FirebaseMessaging v22+, and that issue
+     reports `SERVICE_NOT_AVAILABLE` on some Samsung and Nokia devices with no maintainer answer.
+     Also unverified: whether a third party can register the app's package name in their own
+     Firebase project (believed yes, since FCM does not verify package ownership).
+   - **Consequence if it holds:** Android needs neither a relay NOR a shared project. The only
+     shared credential left in the whole design is Apple's.
 
 ## Rejected ideas
 
