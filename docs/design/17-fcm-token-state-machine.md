@@ -1,7 +1,10 @@
 # Design 17: FCM's OAuth token is a state machine, so make it one
 
-**Status:** DRAFT, for `/design-temper`. Written 2026-10-06 because PR#192's cage-match reached its
-three-round cap, and one finding class surfaced in every round.
+**Status:** RECAST round 1 (2026-10-08), awaiting a ≥2-family re-strike. Written 2026-10-06 because
+PR#192's cage-match reached its three-round cap, and one finding class surfaced in every round. The first
+temper ([`17-TEMPER.md`](17-TEMPER.md)) seated only Claude and Grok, so it is **UN-TEMPERED
+(provisional)**. Both said RECAST, and v1's proposal is kept below, struck, because what it lacked is
+the content.
 
 ## Why this exists
 
@@ -36,34 +39,104 @@ review round finds the next pair nobody wrote down.
 This is the same shape `plan_deliveries` had before it became a pure function swept against
 `itertools.product(...)`. Its fix was to turn the routing table into data and test the whole table.
 
-## Proposal (to be tempered, not built)
+## Proposal v2 (recast after temper round 1)
 
-A small `_TokenCell` that owns all three fields and exposes **events**, not field writes:
+**The name `_TokenCell` is retired.** It named the bearer cache, which left send-side authorization
+with no home, and that is exactly how the biggest gap below hid. The unit is a **pure function**,
+`transition(state, event) -> state`, in the `plan_deliveries` shape. A thin holder around one state
+value is optional sugar.
 
-- `get(now) -> str | None`
-- `minted(token, expires_in, now)`
-- `mint_failed(kind, now)`, where `kind ∈ {credential, refused, blinked, unreadable}`
-- `refused(bearer)`, which is compare-and-clear by construction
+### What the temper measured that v1 did not know
 
-Its transitions are a literal table:
+- **IAM is checked at SEND, never at mint.** Measured 2026-10-08: a service account with no role
+  minted a token fine, then got 403 on send. Revocation is now an intended operator move (one ring
+  account per island, `ring-<island>`, role `islandRinger` = `cloudmessaging.messages.create`),
+  and it shows up ONLY on the send path.
+- **The island-wide 403 is bare:** gRPC status `PERMISSION_DENIED` with no FcmError `errorCode`.
+  `SENDER_ID_MISMATCH` is the 403 that carries an FcmError code, and it is per-device.
+- **The fanout is concurrent** (`asyncio.gather` in `push_service`), so a cold cache under a ring to
+  N Android devices is N concurrent mints, not "one wasted exchange".
+- **A seconds-old key 400s at mint** (propagation lag), and so do a deleted key and a skewed clock.
+  All three are OAuth 400 `invalid_grant`, with three different remedies.
 
-| state × event | `minted` | `mint_failed: credential/refused/unreadable` | `mint_failed: blinked` | `refused(b)` |
-|---|---|---|---|---|
-| empty | cache | backoff | — | — |
-| cached(t) | replace | backoff | — | clear iff b == t |
-| backoff | cache, end backoff | extend | — | — |
+### States, carrying their clocks
 
-The suite then sweeps `product(states, events)` against the table, exactly as `test_push_routing.py`
-sweeps the router. A new event or state then fails the sweep instead of waiting for a reviewer.
+`empty` · `cached(token, expires_at)` · `mint_backoff(kind, until)` · `send_denied(until)`
 
-## Questions for the temper
+### Events: the codomain of ONE total classifier
 
-1. Is the cell worth it for ~40 lines of logic, or is the table alone (as a test, over the current
-   functions) enough to close the class?
-2. Should `blinked` back off at all? It currently doesn't, and a concurrent-mint burst can hit 429
-   repeatedly. A short jittered backoff might be right where a 60s one was wrong.
-3. Does APNs' provider-token cache have the same shape? It signs locally, so it has fewer writers, but
-   it is checked against the same table.
+The events are not a list someone writes down. They are the outputs of a total classifier over
+`(endpoint ∈ {mint, send}) × status × error code`, and the sweep runs over that codomain. A
+response nobody anticipated lands in **`unclassified`**, which logs loudly and is tested to be
+non-silent, never silently in REJECTED.
+
+| event | from |
+|---|---|
+| `minted(token, expires_in)` | mint 200 with a non-empty `str` token and a non-negative lifetime. Any other 200 is `mint_failed(unreadable)` **inside the classifier**, not after it |
+| `mint_failed(credential)` | parse/sign failure, before any network |
+| `mint_failed(grant)` | OAuth 400 `invalid_grant` (propagation, deleted key, skew), read from the fixed `error` field. The body never reaches the log |
+| `mint_failed(unreadable)` | 200 with a bad body, or a non-200 that is not `grant` |
+| `blinked` | mint or send transport error, 429, 5xx |
+| `refused(bearer)` | send 401 |
+| `denied` | send 403 + `PERMISSION_DENIED` + no FcmError code |
+| `tick(now)` | time passing: cache expiry, backoff lapse |
+| `unclassified` | anything else |
+
+### `get` is tri-state, and the mint is single-flight
+
+`get(state, now) -> Have(token) | Mint | Silent`. Only `Mint` may POST the token endpoint, and the
+POST is **single-flight**: one in-flight future that every concurrent caller awaits. That removes the
+self-inflicted 429 burst (old question 2), and with it most of the reason a blink would need a
+backoff.
+
+### The table
+
+| state × event | `minted` | `mint_failed(credential\|unreadable)` | `mint_failed(grant)` | `blinked` | `refused(b)` | `denied` | `tick` past deadline |
+|---|---|---|---|---|---|---|---|
+| empty | cached | mint_backoff(long) | mint_backoff(short) | — | — | send_denied | — |
+| cached(t, e) | replace | mint_backoff(long) | mint_backoff(short) | — | empty iff b == t | send_denied | empty |
+| mint_backoff | cached | extend | extend(short) | — | — | send_denied | empty |
+| send_denied | **stays send_denied** | stays | stays | — | — | extend | empty |
+
+The bold cell is the one v1 could not express: a fresh token from an account that lost its role
+403s again, so minting must not end the denial. Only time (or a config reload) does.
+
+`get` from `send_denied` or `mint_backoff` returns `Silent`: no per-device POST and no re-mint. From
+`empty`, or from a `cached` past expiry, it returns `Mint`. A device under any island-wide state gets
+TRANSIENT, never REJECTED: the device is not implicated.
+
+### Operator messages, one per layer
+
+- `mint_failed(grant)`: "the key was refused: it may be minutes old (propagation), deleted or
+  disabled, or this box's clock may be off". Not the role.
+- `denied`: "this island's ring account may not send: check its role (`islandRinger`) and that the
+  Cloud Messaging API is enabled". This is the one place the role belongs.
+
+### Owed before build (measurements, not claims)
+
+1. **Revocation latency:** time from disabling `ring-<island>` (and separately, deleting its key) to
+   the first refused send, and which event it arrives as (`refused` or `denied`). This tells us
+   whether the ~55 min cache outlives a revocation, and it doubles as the runbook for ejecting an
+   island's ringer.
+2. **Short vs long backoff values**, justified against the measured propagation time (≤30s on
+   2026-10-08).
+
+### v1 (struck, kept for the record)
+
+v1 proposed a mutable `_TokenCell` with `get / minted / mint_failed(credential|refused|blinked|
+unreadable) / refused(bearer)` over `{empty, cached, backoff}`, swept with `product(states, events)`.
+It had no send-side authorization state, no time, a `None` that meant three things, and an enum that
+the sweep could only certify, not complete. See `17-TEMPER.md`.
+
+## Questions for the re-strike
+
+1. Is `send_denied` exited by time alone correct, or should a config reload (new credential) be an
+   explicit event?
+2. Does single-flight need a timeout of its own, so that one hung mint cannot silence every waiter
+   past the client's 10s?
+3. Old Q3, answered: APNs is NOT this table. It shares the event algebra (Apple's
+   `ExpiredProviderToken` is the `refused(bearer)` analogue), and gets its own one-writer grid only if
+   a finding asks for one.
 
 ## Not in scope
 
