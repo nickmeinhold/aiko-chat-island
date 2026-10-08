@@ -105,7 +105,7 @@ outage pays one fanout. That is stated, and accepted.
 
 | phase × event | `minted` | `mint_failed(credential\|unreadable)` | `mint_failed(grant)` | `blinked` | `refused(b)` | `denied(s)` | `delivered` | `device_local` | `tick` past deadline | `unclassified` |
 |---|---|---|---|---|---|---|---|---|---|---|
-| empty | cached | mint_backoff(long), strikes+1 | mint_backoff(grow), strikes+1 | keep | keep | send_denied(grow), strikes+1 | keep, strikes=0 | keep | — (no deadline) | keep, loud |
+| empty | cached | mint_backoff(long), strikes+1 | mint_backoff(grow), strikes+1 | keep | keep | send_denied(grow), strikes+1 | keep, strikes=0 | keep | keep (no deadline) | keep, loud |
 | cached(t, e) | replace | mint_backoff(long), strikes+1 | mint_backoff(grow), strikes+1 | keep | empty iff b == t, else keep | send_denied(grow), strikes+1 | keep, strikes=0 | keep | empty | keep, loud |
 | mint_backoff(u) | cached | extend(long) | extend(grow) | keep | keep | send_denied(grow), strikes+1 | keep | keep | empty | keep, loud |
 | send_denied(u, o) | **keep** | keep | keep | keep | keep | **keep iff s < o + window (coalesce)** | keep (stale 200) | keep | empty | keep, loud |
