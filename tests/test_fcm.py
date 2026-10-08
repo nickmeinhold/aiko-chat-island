@@ -247,16 +247,15 @@ def test_an_absolute_epoch_ttl_would_be_rejected():
         _assert_ttl_is_a_relative_duration(f"{int(time.time())}s")
 
 
-def test_a_wake_collapses_on_its_call_not_its_channel(configured):
-    """Call B's invite must not overwrite call A's undelivered end (Tesla, PR#192
-    r3): the queue slot is the CALL, matching the receiver's `m` keying. Two calls
-    on one channel get two slots; one call's invite and end share one."""
-    a, b = "01JABCDEFGHJKMNPQRSTVWXYZ0", "01JABCDEFGHJKMNPQRSTVWXYZ1"
-    def key(kind, call):
-        return _message(WakePayload(channel_id=CHANNEL, kind=kind, call_id=call))[
-            "message"]["android"]["collapse_key"]
-    assert key(WakeKind.CALL_INVITE, a) == key(WakeKind.CALL_END, a) == a
-    assert key(WakeKind.CALL_INVITE, b) == b != a
+@pytest.mark.parametrize("kind", list(WakeKind))
+def test_no_wake_carries_a_collapse_key(configured, kind):
+    """A collapse key moves a call wake into FCM's collapsible class: at most four
+    keys per device (past that, "no guarantees about which" survive) and a
+    per-device throttle. Five calls to an offline handset could then lose a call's
+    END. The invite's 30s TTL already gives what the key bought (Tesla, PR#192).
+    Asserted on the serialised message so a key nested anywhere fails."""
+    msg = _message(WakePayload(channel_id=CHANNEL, kind=kind, call_id="01JABCDEFGHJKMNPQRSTVWXYZ0"))
+    assert "collapse_key" not in json.dumps(msg)
 
 
 @pytest.mark.asyncio
@@ -275,14 +274,6 @@ async def test_a_late_401_does_not_clear_a_newer_token(configured, monkeypatch):
     monkeypatch.setattr(fcm, "_client", lambda: _C())
     await fcm.send(TOKEN, _invite())
     assert fcm._state.phase == fcm.Cached("new", float("inf"))
-
-
-def test_the_collapse_key_rides_under_android(configured):
-    """Nesting is the whole difference from the legacy API, where `collapse_key`
-    sat at the top level."""
-    msg = _message()["message"]
-    assert msg["android"]["collapse_key"] == msg["data"]["m"]
-    assert "collapse_key" not in msg
 
 
 # ------------------------------------------------------------------ the URL
@@ -417,9 +408,7 @@ async def test_a_200_is_delivered_and_the_body_is_the_v1_api_envelope(
     assert result.verdict is Verdict.DELIVERED and result.reap is None
     body = json.loads(seen[0].content)
     assert set(body) == {"message"}
-    assert body["message"]["android"] == {
-        "priority": "HIGH", "ttl": "30s",
-        "collapse_key": "01JABCDEFGHJKMNPQRSTVWXYZ0"}
+    assert body["message"]["android"] == {"priority": "HIGH", "ttl": "30s"}
     assert seen[0].headers["authorization"] == "Bearer stub-access-token"
 
 

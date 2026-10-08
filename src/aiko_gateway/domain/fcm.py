@@ -106,8 +106,7 @@ _BACKOFF_CAP_SECONDS = 900
 # its native layer rings at +100ms and Dart warms at +3.3s, so the ring starts
 # before any code can judge the invite's age — and the payload carries no send
 # time to judge it by. A 60s TTL therefore rang a handset up to 30s after the
-# island's ring ceiling, for a call already over. The collapse key does not save
-# it: a call that simply times out may send no end to coalesce with.
+# island's ring ceiling, for a call already over.
 #
 # The end keeps a longer life for the opposite reason: a late end is harmless, an
 # expired one leaves a ring running. Both values come from `push_result`, so they
@@ -238,7 +237,9 @@ Event = Union[Minted, MintFailed, Blinked, Refused, Denied, Delivered,
 
 
 def _grow(base: int, strikes: int) -> float:
-    return float(min(base * 2 ** max(strikes - 1, 0), _BACKOFF_CAP_SECONDS))
+    # The exponent is capped before the power: strikes only reset on a delivered
+    # send, so a role that stays gone for months walks it without bound.
+    return float(min(base * 2 ** min(max(strikes - 1, 0), 16), _BACKOFF_CAP_SECONDS))
 
 
 def transition(state: AuthState, event: Event, now: float) -> AuthState:
@@ -607,7 +608,13 @@ async def _access_token() -> str | None:
         return action.token
     if isinstance(action, Silent):
         return None
-    if _mint_flight is None or _mint_flight.done():
+    # THE LOOP CHECK IS NOT DECORATION. A flight left pending on a loop that has
+    # since closed is never `done()`, and awaiting it from another loop raises on
+    # every call — Android silent forever, one traceback per send (Maxwell,
+    # cage-match PR#192). One loop runs in production; tests and any future host
+    # need not.
+    if (_mint_flight is None or _mint_flight.done()
+            or _mint_flight.get_loop() is not asyncio.get_running_loop()):
         _mint_flight = asyncio.ensure_future(_mint_once())
     try:
         return await asyncio.shield(_mint_flight)
@@ -632,7 +639,18 @@ def auth_status() -> dict:
     phase = state.phase
     names = {Empty: "empty", Cached: "cached", MintBackoff: "mint_backoff",
              SendDenied: "send_denied"}
-    return {"ready": isinstance(phase, (Empty, Cached)),
+    # TRI-STATE, because `Empty` is not evidence (Maxwell, cage-match PR#192).
+    # Every restart and every idle hour (the token expires) lands in `Empty`;
+    # reporting it as ready made "never tried" read exactly like "works", so a
+    # ring account deleted overnight showed ready until the first real call.
+    # True = a mint succeeded and nothing has refused us since. None = unknown.
+    if isinstance(phase, Cached):
+        ready: bool | None = True
+    elif isinstance(phase, Empty):
+        ready = None
+    else:
+        ready = False
+    return {"ready": ready,
             "phase": names[type(phase)],
             "strikes": state.strikes}
 
@@ -723,28 +741,31 @@ def build_message(device_token: str, payload: WakePayload) -> dict:
     NO `fcm_options.analytics_label`: it is optional and ships analytics metadata
     to Google, which `WakePayload`'s refusal covers verbatim.
 
-    `collapse_key` IS NOT `apns-collapse-id`, AND THE GAP IS REAL. Apple's header
-    coalesces DISPLAYED notifications; this coalesces UNDELIVERED messages while
-    the device is offline, and is effectively inert for a high-priority message
-    delivered immediately. Android's replace-the-visible-one field is
-    `android.notification.tag`, which only exists on a `notification` message —
-    i.e. exactly the thing a call wake must not be. Under data-only, lock-screen
-    de-duplication is app-side work.
+    NO `collapse_key`, AND THE ABSENCE IS THE FIX (Tesla, cage-match PR#192, the
+    round after design 17). A collapse key moves a message into FCM's COLLAPSIBLE
+    class, which has two limits a call wake cannot live inside:
+      * FCM keeps at most FOUR collapse keys per device; past that it keeps four
+        "with no guarantees about which". Keyed per call, an offline handset
+        receiving five calls inside the end's 300s life can lose a call's END,
+        and the payload carries no send time for the receiver to judge an orphan
+        invite by. A channel key was worse: B's invite overwrote A's end.
+      * Collapsible messages are throttled per device (a burst, then a slow
+        refill), and the delay runs against the TTL.
+    What the key bought was "an offline call collapses to its end". The invite's
+    30s TTL already buys that: an invite that cannot be delivered within the ring
+    ceiling expires, and the end (300s) still arrives. Non-collapsible messages are
+    each stored (up to FCM's per-device offline limit), so no call can displace
+    another call's stop. Not part of the app tab's contract (claude-tasks#4421 is
+    `data` + priority + TTL), so nothing on the receiver changes.
+
+    Android's replace-the-visible-one field, `android.notification.tag`, exists only
+    on a `notification` message, which a call wake must never be. Under data-only,
+    lock-screen de-duplication is app-side work (it keys on `m`).
     """
     # A KeyError for an unmapped kind is caught by `push_service`'s per-device
     # boundary and logged — loud, never a guessed TTL. The test sweep below makes
     # it unreachable for every member that exists.
     android: dict = {"priority": "HIGH", "ttl": f"{_TTL_SECONDS[payload.kind]}s"}
-    # ONE QUEUE SLOT PER CALL, not per channel (Tesla, cage-match PR#192 r3).
-    # FCM keeps only the LAST undelivered message per key. Under v1 the receiver
-    # and the queue both keyed on the channel, so "latest wins" was the truth.
-    # v2 split them: the receiver keys on `m`, so a channel-keyed slot let call
-    # B's 30s invite overwrite call A's 300s end while the handset was offline,
-    # and when B's invite expired A's stop was gone for good. Keyed on the call
-    # id, A's invite and end still coalesce (an offline call collapses to its
-    # end) and B can never erase A's stop.
-    # One key per in-flight call stays well inside FCM's four-key ceiling.
-    android["collapse_key"] = payload.call_id
     return {
         "message": {
             # The target is a `oneof`: exactly one of token/topic/condition.
@@ -900,12 +921,22 @@ async def send(device_token: str, payload: WakePayload) -> SendResult:
     # means for this one device's row (`_verdict`, which owns the reaping rule).
     # A 401 compare-and-clears the bearer it was sent with (Tesla, PR#192 r3);
     # a bare PERMISSION_DENIED closes the island's sending until its window lapses.
-    _apply(classify_send(response.status_code, body, token, sent_at))
+    event = classify_send(response.status_code, body, token, sent_at)
+    _apply(event)
     if response.status_code == 200:
         # 200 means ACCEPTED, not delivered — the same posture as an APNs 200.
         return SendResult(Verdict.DELIVERED)
     error_code = _fcm_error_code(body) if isinstance(body, dict) else ""
-    verdict = _verdict(response.status_code, error_code)
+    # AN AUTH-WIDE ANSWER IS NOT A VERDICT ON THE DEVICE (Carnot + Tesla,
+    # cage-match PR#192). A 401 refuses OUR bearer and a bare PERMISSION_DENIED
+    # refuses OUR account; `_verdict` reading the raw status called both REJECTED,
+    # so a revocation logged as a fleet of bad tokens. The device is not
+    # implicated, which is what TRANSIENT means here (and what a `Silent` phase
+    # already returns). Neither verdict reaps.
+    if isinstance(event, (Denied, Refused)):
+        verdict = Verdict.TRANSIENT
+    else:
+        verdict = _verdict(response.status_code, error_code)
     # NEVER the device token: it rides in the request body, so nothing else in
     # this path can leak it and this line must not be the exception.
     log.log(logging.ERROR if verdict is Verdict.REJECTED else logging.WARNING,

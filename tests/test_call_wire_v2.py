@@ -84,7 +84,10 @@ def _payload(kind: WakeKind) -> WakePayload:
 def test_fcm_carries_m_on_every_wake(kind):
     msg = fcm.build_message("t", _payload(kind))["message"]
     assert msg["data"] == {"c": "01CHAN", "k": kind.value, "m": CALL_ID}
-    assert msg["android"]["collapse_key"] == CALL_ID
+    # No collapse key: the collapsible class caps a device at four keys and
+    # throttles, which can lose a call's end (cage-match PR#192). Unused by the
+    # app's receiver, which keys on `m` (checked on main and android-ring).
+    assert "collapse_key" not in msg["android"]
 
 
 @pytest.mark.parametrize("kind", list(WakeKind))

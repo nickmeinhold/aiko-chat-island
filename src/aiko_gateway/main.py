@@ -401,6 +401,9 @@ async def _reachability(session) -> dict:
     # name and strike count stay in the boot log and `reachability()`, per the
     # booleans-only rule above. It rides in the BODY: the healthcheck reads the
     # status code, and an IAM outage must not become a restart loop.
+    # TRI-STATE: true / false / null (unknown: no mint attempted since boot or
+    # since the token last expired). A boolean here made "never tried" read as
+    # "works".
     if "fcm_auth" in report:
         push["android_ready"] = report["fcm_auth"]["ready"]
     return push

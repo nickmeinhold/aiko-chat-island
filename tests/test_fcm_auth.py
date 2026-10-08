@@ -336,6 +336,8 @@ async def test_a_revocation_ring_is_one_strike_and_silences_the_next(
     finally:
         await client.aclose()
     assert sends_before == 20
+    assert all(r.verdict is Verdict.TRANSIENT for r in first), (
+        "a revocation is the ACCOUNT refused, not twenty bad devices")
     assert len([r for r in seen if not _oauth(r)]) == 20, "a send went out while denied"
     assert second.verdict is Verdict.TRANSIENT and second.reap is None
     assert all(r.reap is None for r in first)
@@ -427,6 +429,9 @@ def test_auth_status_is_not_ready_while_denied(configured):
     fcm._state = fcm.AuthState(fcm.SendDenied(until=float("inf")), strikes=1)
     assert fcm.auth_status() == {"ready": False, "phase": "send_denied", "strikes": 1}
     fcm._state = fcm.INITIAL
+    assert fcm.auth_status()["ready"] is None, (
+        "Empty is not evidence: never-tried must not read as working")
+    fcm._state = fcm.AuthState(fcm.Cached("t", float("inf")))
     assert fcm.auth_status()["ready"] is True
 
 
@@ -456,3 +461,25 @@ async def test_health_says_android_not_ready_and_still_answers_200(
     assert response.json()["push"]["android_ready"] is False
     assert "strikes" not in json.dumps(response.json()["push"]), (
         "/health is public and booleans-only; the strike count stays internal")
+
+
+def test_a_huge_strike_count_still_caps():
+    assert fcm._grow(fcm._DENIED_BACKOFF_BASE_SECONDS, 10**6) == fcm._BACKOFF_CAP_SECONDS
+
+
+async def test_a_flight_from_a_dead_loop_is_not_reused(configured, monkeypatch):
+    """A pending task from a closed loop is never done(); reusing it would make
+    every later mint raise (Maxwell, PR#192)."""
+    other = asyncio.new_event_loop()
+    stale = other.create_future()          # pending forever, wrong loop
+    other.close()
+    fcm._mint_flight = stale
+
+    async def handler(request):
+        return httpx.Response(200, json={"access_token": "ya29", "expires_in": 3599})
+
+    client, _ = _pin(monkeypatch, handler)
+    try:
+        assert await fcm._access_token() == "ya29"
+    finally:
+        await client.aclose()
