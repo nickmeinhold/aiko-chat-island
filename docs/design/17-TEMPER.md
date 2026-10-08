@@ -1,6 +1,8 @@
 # 17-TEMPER.md: FCM token state machine
 
-**Overall verdict:** UN-TEMPERED (provisional). Both seated families say RECAST, but only ONE
+**Overall verdict (after round 3): RECAST → v4, round cap reached.** Round 3 is the real temper (Gemini + Grok on v3). The verdict line below is round 1's.
+
+**Round 1 verdict:** UN-TEMPERED (provisional). Both seated families say RECAST, but only ONE
 adversary family struck, so this cannot stamp SOUND or certify the recast. A real ≥2-family
 re-strike is owed before build.
 **Struck:** dt-17-1791455736 (2026-10-08). Seated: Maxwell (Claude) + Tesla (Grok).
@@ -237,3 +239,134 @@ Ripgrep is not available. Falling back to GrepTool.
 - Name the single-flight bound: the shared future fails when the client's 10s timeout fires, and every waiter gets `blinked`. Test a hung mint.
 - Expose the auth state (normal / mint_backoff / send_denied / half_open, no secrets) on the island's health or capabilities surface.
 - State the one-process assumption.
+
+
+---
+
+# Round 3 (strike of v3): the first real temper, and the round cap
+
+**Round verdict: RECAST** (Kelvin RECAST, Tesla RECAST, Maxwell RECAST). This is the first round with
+two outside families on the same version, so unlike rounds 1-2 it is a real temper. It is also round
+3 of ≤3. The skill and Nick's round-cap rule both say stop here, not strike a v4.
+
+**What the round found, deduped:**
+1. **v3's table omitted `half_open`** (Kelvin + Tesla). The author's fold put a transition in the
+   prose but not in the table: the defect class this design exists to kill. → Moot, see 2.
+2. **`half_open` is the wrong unit** (Tesla; Maxwell concurs, retracting his own round-2 finding).
+   One whole ring per window is the cheap side; a one-device probe is the expensive side. →
+   **DELETED in v4.** Tesla's heavier replacement (`armed`, `cached_unconfirmed`, a Holder with
+   two flights) is NOT adopted: once a fanout per window is accepted as the cost, v2's
+   `tick → empty` plus coalescing does the same job with no new state.
+3. **`config_reloaded` has no trigger** (Kelvin). → **DISSOLVED**: settings are env-at-boot, so a
+   restart IS the reload. The same fact dissolves Tesla's generation counter (the account cannot
+   change within one process).
+4. **One revocation ring counts as N strikes; a late 403 can re-close a fresh window** (Tesla). →
+   **Folded**: coalesce while in `send_denied`, and a `denied` whose `sent_at` predates the
+   phase's open time is a no-op.
+5. **Dashes are live cells; `unclassified` has no column** (Tesla). → **Folded**: a total table,
+   "keep" is explicit and tested, and `unclassified` never routes to `denied`.
+6. **`grant` on a short backoff loops forever for a deleted key** (Kelvin, who wants long by
+   default). → **Named tradeoff, partly folded**: `grant` GROWS from 10s to a 15-min cap, so a fresh
+   key recovers fast and a dead one decays to one POST per 15 min. Long-by-default is rejected
+   because it would make every newly provisioned island's Android dark for the long window.
+   Owner: whoever builds #192's recast.
+7. **Window growth, cap and initial `n` unstated; restart forgets `n`** (Tesla). → **Folded**:
+   `grow = min(base × 2^(strikes−1), cap)`, and restart = `(empty, 0)`, stated and accepted.
+8. **Health: a name next to a green check is still silence** (Tesla). → **Folded, with a guard**:
+   Android not-ready on the capabilities/health output, but NOT the container healthcheck, or an
+   IAM outage under `restart: always` becomes a restart loop that takes APNs down (design 14).
+
+**Disposition:** v4 folds all eight. The cap is reached, so v4 is **not re-struck**. The table
+becomes an exhaustive `product()` test in the PR#192 recast, and the PR's fresh cage-match is the
+next adversarial pass. That is Nick's call, not the author's.
+
+## Round 3 strikes (arrival order)
+
+
+**Struck:** dt-17r3-1791460723 (2026-10-08). Seated: Maxwell + **Kelvin (Gemini)** + **Tesla (Grok, 15-min cap, finished)**. Dark: Carnot (`gpt-5.5` usage limit). Arrival order: Kelvin, Tesla, Maxwell.
+
+## KelvinBitBrawler's Design Strike
+
+**Verdict:** RECAST
+
+**Summary:** This design correctly identifies the problem's shape but freezes on the details; its formal table contradicts its own recovery logic, creating a cold fault where the system fails to cool down.
+
+`Ash: "I can't lie to you about your chances, but... you have my sympathies."`
+
+**Fatal flaws:**
+- **The `half_open` state is a ghost in the machine.** (Design flaw: INCOMPLETE SPECIFICATION / INTERNAL CONTRADICTION). The prose correctly introduces a `half_open` circuit-breaker state as the only sane way to probe for recovery from a `send_denied` condition. The state table—the supposed source of truth—not only omits this state entirely, it specifies a transition from `send_denied` to `empty` on timeout. This is a critical flaw. A transition to `empty` doesn't probe; it floods. It guarantees a thundering herd of `send` attempts that will all fail `denied` again, moving the system from one failed state to the same failed state, but with more heat and noise. The most elegant circuit breaker is useless if the blueprint shows a dead short.
+
+- **The `mint_failed(grant)` event is thermally unresolved.** (Design flaw: UNHANDLED FAILURE MODE). The design correctly notes that a 400 `invalid_grant` can mean transient propagation lag, a permanently deleted key, or persistent clock skew. It then maps all three to a single event with a single "short" backoff. This is wrong. A short backoff is for transient heat flicker. Applying it to a permanent failure (deleted key) or a persistent one (clock skew) is like trying to cool a reactor core by flapping a fan at it. It ensures the system will enter a tight, useless loop of mint attempts that can never succeed, radiating errors until an operator intervenes. You have failed to distinguish between states of different entropy.
+
+- **The `config_reloaded` event is an action without a cause.** (Design flaw: UNSTATED ASSUMPTION). The design introduces a `config_reloaded` event to escape terminal states like `send_denied` when an operator fixes the underlying credential. This is correct. However, it fails to specify *what mechanism fires this event*. If it relies on the current code's behavior of re-reading the config on every mint attempt, then the system will remain in `send_denied` until the backoff timer expires, delaying recovery. If it assumes a new, active trigger like a file watcher, that mechanism is part of the design and has been completely omitted. You've designed a reset button but forgotten to draw the button.
+
+**What holds:**
+- The fundamental move to an explicit state machine (`transition(state, event)`) is the correct abstraction. It brings order to chaos.
+- The single-flight mint with a bounded timeout is a robust solution to the concurrent fanout problem.
+- Separating `refused` (token invalid) from `denied` (permissions revoked) is the central insight that dissolves the previous bug classes.
+- The use of a total classifier for events with an `unclassified` fallback provides the necessary guard against the unknown.
+
+**If RECAST, what to fold back:**
+1.  **Materialize the `half_open` state.** Add `half_open(n)` to the list of states and to the state table.
+2.  **Correct the `send_denied` transition.** In the table, the `tick` transition for `send_denied` must lead to `half_open(n)`, not `empty`.
+3.  **Define transitions for `half_open`.** The table must show the outcomes for a probe from `half_open`:
+    - `half_open(n)` × `send_succeeded` → `cached`.
+    - `half_open(n)` × `denied` → `send_denied(until', n+1)` with an exponentially longer `until'`.
+    - `half_open(n)` × `any other event` → `send_denied(until', n+1)` (fail closed).
+4.  **Resolve the `mint_failed(grant)` event.** The classifier must attempt to distinguish the causes. If the `error_description` is reliable, use it. If not, the design must state this limitation and choose a safer default: treat `invalid_grant` as a *long* backoff unless there is positive evidence of transient failure. The default state should be cold, not oscillating.
+5.  **Specify the `config_reloaded` trigger.** The design must explicitly state whether this is a passive pull (and accept the recovery delay) or an active push, and if the latter, must outline the triggering mechanism (e.g., "a file-watcher on `FCM_SERVICE_ACCOUNT_JSON` will dispatch `config_reloaded` to the state machine").
+
+
+Tesla: "If you want the secrets of the universe, think in energy, frequency and vibration."
+
+## Tesla, the Arc-Prophet's Design Strike
+
+**Verdict:** RECAST
+
+**Summary:** The recovery path is tuned to one device while the fault is the whole island, and the table still sings the old cliff, so the ring that should come back is the note that shatters the glass.
+
+**Fatal flaws:**
+
+- **The table is the old machine, and the sweep will bless it** (states list; "The table"; half-open paragraph). v3 names `half_open(n)` and says a lapsed `send_denied` becomes that state: one probe, 200 → `cached`, `denied` → `send_denied(until', n+1)`. The tick cell still says `send_denied` → `empty`, which is the full-fanout cliff this round claims to have retired. `half_open`, `config_reloaded`, `unclassified`, and a send-200 are not in the grid. This document's own law is that a transition living in prose, outside `product(states, events)`, is the defect generator. The recovery path is that prose. Three writers started this. The ninth writer — the probe — never made the table.
+
+- **`transition(state, event) -> state` does not close on the probe, and single-flight fights it** ("carrying their clocks"; "`get` is tri-state"). `send_denied` and `half_open` carry no bearer. A send needs one. The bold cell says `minted` stays denied, so the mint must not publish into `cached`. A send 200 is not an event and carries neither the token nor the expiry the mint just learned, so there is no next state in which the probed bearer becomes `cached(token, expires_at)`. That token will ride in a closure beside the table: a module-global with no row, the same shape as `_cached_access_token`. Worse, the two single-winner rules share one future. Single-flight wakes every waiter with the mint result. Half-open needs exactly one sender. `half_open(n)` is stable until the probe returns, and under `asyncio.gather` the other coroutines call `get` in the same turn, before any await. Nothing in the enum means "probe already taken." The claim has to happen with no await between read and write. That invariant is the whole correctness condition on one loop, and it is unnamed. v1 was struck for a `None` that meant three things. v3's `denied` means three things too: enter, extend, and fail the probe.
+
+- **The probe samples a device; the mode it sets is the island; this fanout does not retry** (half-open paragraph; `_verdict`; the fanout comment that a late ring is a missed call). The winner is whichever delivery the loop schedules first, and the fleet contains dead tokens — the reaper exists because of them. Specified probe answers are two: 200 and `denied`. The rest of the send codomain is implied: `UNREGISTERED`, `SENDER_ID_MISMATCH`, `INVALID_ARGUMENT`, a transport blink, a 401 on a bearer that aged out across the denial window. `_verdict` already states the asymmetry: a wasted request is cheap, and destroying a wake is not. The one-device probe spends the expensive side. `get` → `Silent` → `TRANSIENT`, and `gather` runs once, so the rest of the ring is dropped, not parked. The recovery ring — the first human call after the role is restored — wakes one device by construction. If that device is dead, it wakes none, and the window grows before another device is tried. One stale token holds the island dark through the calls the outage was forgiven for.
+
+- **One revocation ring counts as N failures, and `denied` still has no bearer** (table cells `cached + denied → send_denied` and `send_denied + denied → extend`; round-3 row; `config_reloaded`). The first ring after revocation has already passed `get` with `Have(token)` before the first 403 returns. That is N `denied` events for one fact. The entry cell does not say what `n` starts at. Each later event hits `extend`. If extend does `n+1` and resets `until`, one fanout of twenty devices sets the growth counter to twenty and pushes the window out to the slowest tail. `refused(b)` learned compare-and-clear. `denied` carries no bearer and no generation, and it is the louder transition: it replaces whatever is cached with island-wide silence. The 3am sequence is a restored account (`config_reloaded` → `empty` → `T_new` in flight) crossed with a 403 still on the wire from the old account. That stale `denied` re-enters `send_denied` and throws away the new bearer. Same race inside `half_open`: a late 403 from the previous wave is indistinguishable from the probe's answer.
+
+- **Dashes are live cells, and `/health` stays green** ("The table"; "Visibility and scope"). A dash is not a no-op and not `unclassified`. It is an implied transition, which is the ore this design was dug out of. Live one: `get` returns `Mint` for a `cached` past expiry without a tick through `empty` first, so a mint 503 lands on `cached + blinked`, and that cell is `—`. The round-2 bug was negative-caching that blink. A dash is how it comes home. `unclassified` is promised to be loud and has no column, so a garbled 403 — the string-versus-dict shape from round 2, one parse away from "no FcmError code" — has nowhere to sit except, by gravity, `denied`. One misread per-device 403 then silences every Android ring. Visibility exposes the state name beside a green check. The failure already written in `_access_token`'s log, Android dead while `/health` is green, survives as a field no existing alert watches. A name beside a green light is the old silence with a new label.
+
+- **The window's two ends are both unstated, and the role restore has no event** (half-open paragraph; questions §1; "One process"). Growth function, cap, and initial `n` are not in the design. Restoring `islandRinger`, or re-enabling the API, fires nothing on the island. `config_reloaded` watches the JSON, not the role. Discovery is the probe alone, so an uncapped `n` after a long 403 weekend means the fix waits out the longest window, and every non-200 probe answer an implementer files under "failure" lengthens it. The other end: restart wakes module-global state as `empty` and forgets `n`, so every boot during an IAM outage pays a full 403 fanout. Both will be discovered at 3am, because neither is a row.
+
+**What holds:**
+
+- The diagnosis holds. Three writers on implied transitions produced one new pair per round, and a list written from memory missed the concurrent clear. A total `(state, event) → state`, swept as a product, is the right instrument. That ore is not slag.
+- The codomain split holds under the measurement. `mint_failed(credential)` is local and long. `mint_failed(grant)` is OAuth 400 `invalid_grant`, body never logged, short, and its sentence names propagation, deletion, and skew. `blinked` is transport, 429, and 5xx, and it must not negative-cache. `refused(bearer)` is the 401 compare-and-clear. `denied` is bare send-side `PERMISSION_DENIED`, and it is the only place `islandRinger` belongs. IAM is checked at send. A fresh mint must not pardon a missing role.
+- A bad 200 is `mint_failed(unreadable)` inside the classifier. An island-wide state returns TRANSIENT and does not reap. Single-flight bounded by the existing 10s timeout, with waiters receiving `blinked`, kills the self-inflicted stampede. APNs stays off this grid. One process is an honest scope. The owed measurements — revocation latency, which event it arrives as, backoff against the ≤30s propagation — are the right falsifiers.
+
+**If RECAST, what to fold back:**
+
+- Dissolve `half_open` as a one-device election. Fold recovery in as the ring, which is the unit `push_service` already fans out and the unit a call actually is. On lapse, `send_denied` becomes `armed(n, gen)`. `armed` may mint once, single-flight, into `cached_unconfirmed(token, expires_at, gen)`, and `get` returns `Have` to every caller in that ring. The first fresh `denied` re-closes the breaker. A send 200 confirms `cached`. The cost while the role stays gone is one fanout of 403s per window. That is the cheap side of the asymmetry `_verdict` already states. Write this cost down so nobody "optimizes" it back into a single-device sample.
+- If that one fanout is ever measured as too loud, the only acceptable optimization is a parked probe, specified as holder state, not as a sentence: `Holder { state, mint_flight, probe_flight }`. The claim is synchronous, before any await. Other callers in the same ring await `probe_flight`. They do not get `Silent`. `denied` closes the breaker and wakes them TRANSIENT. `delivered` confirms `cached` and wakes them with `Have`. `device_local`, `blinked`, and `refused` do not increment `n`. A per-device failure hands the claim to one waiter, once, then fails open and releases the ring. Serializing the dead fleet inside a 30s lease is how the probe eats the call.
+- Add the events that let the function close: `delivered(bearer, gen)`, `device_local(gen)`, `unclassified(gen)`, `config_reloaded`. `denied` carries bearer and generation. Stamp `gen` on `config_reloaded` and at send start. A mismatched generation or bearer is a no-op, one writer applies it, and waiters do not each call `transition`. Coalesce: concurrent `denied` events in one ring count as one increment of `n`.
+- Rebuild the table as a total function. Every cell is a next state or an explicit no-op. The product includes `armed`, `cached_unconfirmed`, `delivered`, `device_local`, `unclassified`, `config_reloaded`. `cached` past expiry plus `blinked` drops the expired bearer and stays quiet. Unreachable cells log and stay put. They do not enter `send_denied`.
+- Write the growth function, the initial `n`, and a cap beside the short and long backoffs. `n` resets on `delivered` and on `config_reloaded`. State that a restart wakes as `empty` and the first ring pays one fanout. Clock `until` and `expires_at` with `time.monotonic()`, as the code does now. Wall-clock skew stays inside `mint_failed(grant)`.
+- Add one owed measurement: disable the Cloud Messaging API alone, and record whether it arrives as a mint non-200 or as send `denied`. Give `mint_failed(credential)` and `mint_failed(unreadable)` their own sentences so a token-endpoint failure cannot wear the role message.
+- On the health surface, Android is not-ready while the state is `mint_backoff`, `send_denied`, or `armed`. A readable name next to a green check leaves the silence in place.
+
+
+## MaxwellMergeSlam's Design Strike (round 3)
+
+**Verdict:** RECAST, toward LESS machinery
+
+**Summary:** v3 is my fold, and it failed its own law: `half_open` was written into the prose and never into the table. And Tesla is right that `half_open` should not exist at all. My round-2 "flood" finding was wrong about which side is cheap.
+
+**Fatal flaws:**
+- **The fold was incomplete (the defect class this design exists to kill, committed by its author).** `half_open` sits in the states list and in a paragraph. The table still says `send_denied × tick → empty`. Both seats caught it.
+- **My round-2 finding was wrong, so retract `half_open`.** I called "window lapses → next ring fans out → N 403s" a flood. It costs one fanout of refused POSTs per window, which is exactly the cheap side of the asymmetry `_verdict` already states (a wasted request is cheap; a destroyed wake is not). A one-device probe spends the expensive side instead: if the probe lands on a dead token, the island stays dark through the first real call after the fix. v2's `tick → empty` was right. It was missing coalescing and a growth cap, not a probe.
+- **`config_reloaded` dissolves (Kelvin asked what fires it; the answer is nothing).** Settings are read from the environment at boot. Changing the credential means restarting the container, and a restart wakes the module state as `empty`. A restart IS the reload. Delete the event, don't build a watcher.
+
+**What holds:** Tesla's coalescing / generation finding (one revocation ring must count as ONE `denied`, and a late 403 from an old bearer must not close a fresh one). No dashes in the table. A growth function with a cap. Health shows Android not-ready, not a name next to a green check.
+
+**If RECAST, what to fold back:** v4 = v2's shape plus four things: `denied` carries its bearer (compare, like `refused`), concurrent `denied` in one ring coalesce into one increment, a written growth + cap, and a total table. `half_open` and `config_reloaded` both deleted.
