@@ -1,6 +1,6 @@
 # Design 17: FCM's OAuth token is a state machine, so make it one
 
-**Status:** v4 (2026-10-08), after three temper rounds; the round cap is reached. Round 3 was the first with two outside families on one version (Gemini + Grok, both RECAST). v4 is SMALLER than v3. See `17-TEMPER.md`. Written 2026-10-06 because
+**Status:** v4, BUILT 2026-10-08 on `feat/fcm-ring-sender` (`fcm.transition`, swept by `tests/test_fcm_auth.py`), after three temper rounds; the round cap is reached. Round 3 was the first with two outside families on one version (Gemini + Grok, both RECAST). v4 is SMALLER than v3. See `17-TEMPER.md`. Written 2026-10-06 because
 PR#192's cage-match reached its three-round cap, and one finding class surfaced in every round. The first
 temper ([`17-TEMPER.md`](17-TEMPER.md)) seated only Claude and Grok, so it is **UN-TEMPERED
 (provisional)**. Both said RECAST, and v1's proposal is kept below, struck, because what it lacked is
@@ -108,13 +108,15 @@ outage pays one fanout. That is stated, and accepted.
 | empty | cached | mint_backoff(long), strikes+1 | mint_backoff(grow), strikes+1 | keep | keep | send_denied(grow), strikes+1 | keep, strikes=0 | keep | keep (no deadline) | keep, loud |
 | cached(t, e) | replace | mint_backoff(long), strikes+1 | mint_backoff(grow), strikes+1 | keep | empty iff b == t, else keep | send_denied(grow), strikes+1 | keep, strikes=0 | keep | empty | keep, loud |
 | mint_backoff(u) | cached | extend(long) | extend(grow) | keep | keep | send_denied(grow), strikes+1 | keep | keep | empty | keep, loud |
-| send_denied(u, o) | **keep** | keep | keep | keep | keep | **keep iff s < o + window (coalesce)** | keep (stale 200) | keep | empty | keep, loud |
+| send_denied(u, o) | **keep** | keep | keep | keep | keep | **keep (coalesce)** | keep (stale 200) | keep | empty | keep, loud |
 
 The two bold cells carry the whole fix:
 - **`minted` does not end a denial.** A fresh token from an account that lost its role 403s again.
 - **Coalescing.** The first ring after a revocation has N sends in flight, and they return N
   `denied`. The first one opens `send_denied`, and the other N−1 land on `keep`. One fact, one
-  strike. A `denied` whose `sent_at` predates the current phase's open time (a late 403 from a
+  strike. *(Built 2026-10-08: inside `send_denied` EVERY `denied` is a no-op. The earlier "keep iff
+  s < o + window" left its else-branch unstated, and nothing needs one. A denial is the same fact
+  restated until time ends it.)* A `denied` whose `sent_at` predates the current phase's open time (a late 403 from a
   ring before the window lapsed) is stale, and it is a no-op in every phase. It must not re-close a
   window that just reopened.
 

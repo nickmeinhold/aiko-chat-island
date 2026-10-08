@@ -814,7 +814,7 @@ async def reachability(session: AsyncSession) -> dict:
             reachable = False
         if not reachable:
             unreachable_by_platform[platform_value] = count
-    return {
+    report = {
         "configured": bool(configured),
         "registered_devices": sum(count for _, count in counts),
         # Kept as its own field rather than left for the reader to derive: this is
@@ -823,6 +823,15 @@ async def reachability(session: AsyncSession) -> dict:
         "unreachable_devices": sum(unreachable_by_platform.values()),
         "unreachable_by_platform": unreachable_by_platform,
     }
+    # CONFIGURED IS NOT REACHABLE, for Android (design 17 v4). A credential can be
+    # present and every ring still silent: its account lost its role (send-side
+    # PERMISSION_DENIED), or its key is refused at mint. Present only when FCM is
+    # configured, so an island without Android reports exactly what it always did.
+    # Body-only by design: the container healthcheck reads the status code, and an
+    # IAM outage must not become a restart loop (see `fcm.auth_status`).
+    if Platform.FCM in configured:
+        report["fcm_auth"] = fcm.auth_status()
+    return report
 
 
 # What an operator must set to make each transport reachable. Keyed by the STORED

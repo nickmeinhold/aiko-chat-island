@@ -391,10 +391,19 @@ async def _reachability(session) -> dict:
         # missing one on a field that is advisory.
         log.warning("/health could not read push reachability", exc_info=True)
         return {"status": "unknown"}
-    return {
+    push = {
         "configured": report["configured"],
         "devices_unreachable": bool(report["unreachable_devices"]),
     }
+    # ONE BOOLEAN, and only on an island with Android configured (design 17 v4):
+    # "configured" is not "reachable" for FCM, because a credential can be present
+    # while its account is denied at send or its key refused at mint. The phase
+    # name and strike count stay in the boot log and `reachability()`, per the
+    # booleans-only rule above. It rides in the BODY: the healthcheck reads the
+    # status code, and an IAM outage must not become a restart loop.
+    if "fcm_auth" in report:
+        push["android_ready"] = report["fcm_auth"]["ready"]
+    return push
 
 
 @app.get("/health")

@@ -179,7 +179,7 @@ def test_the_end_outlives_the_invite(configured):
 async def test_a_401_on_send_drops_the_cached_access_token(configured, monkeypatch):
     """A refused access token must not be replayed until its own expiry (Carnot,
     PR#192 r1): the next send mints fresh."""
-    fcm._cached_access_token = ("stale-token", float("inf"))
+    fcm._state = fcm.AuthState(fcm.Cached("stale-token", float("inf")))
 
     async def _post(url, **kw):
         return httpx.Response(401, json={"error": {"status": "UNAUTHENTICATED"}},
@@ -191,7 +191,7 @@ async def test_a_401_on_send_drops_the_cached_access_token(configured, monkeypat
     monkeypatch.setattr(fcm, "_client", lambda: _C())
     result = await fcm.send(TOKEN, _invite())
     assert result.reap is None
-    assert fcm._cached_access_token is None
+    assert isinstance(fcm._state.phase, fcm.Empty)
 
 
 @pytest.mark.asyncio
@@ -210,7 +210,7 @@ async def test_a_token_endpoint_blip_is_not_negative_cached(configured, monkeypa
     monkeypatch.setattr(fcm, "_client", lambda: _C())
     monkeypatch.setattr(fcm, "_sign_assertion", lambda cred: "assertion")
     assert await fcm._access_token() is None
-    assert fcm._oauth_backoff_until is None
+    assert isinstance(fcm._state.phase, fcm.Empty)
 
 
 @pytest.mark.asyncio
@@ -228,8 +228,7 @@ async def test_a_non_string_access_token_is_never_cached(configured, monkeypatch
     monkeypatch.setattr(fcm, "_client", lambda: _C())
     monkeypatch.setattr(fcm, "_sign_assertion", lambda cred: "assertion")
     assert await fcm._access_token() is None
-    assert fcm._cached_access_token is None
-    assert fcm._oauth_backoff_until is not None
+    assert isinstance(fcm._state.phase, fcm.MintBackoff)
 
 
 @pytest.mark.parametrize("body", [{"error": "invalid_grant"}, {"error": None},
@@ -264,10 +263,10 @@ def test_a_wake_collapses_on_its_call_not_its_channel(configured):
 async def test_a_late_401_does_not_clear_a_newer_token(configured, monkeypatch):
     """Compare-and-clear (Tesla, PR#192 r3): a 401 for an OLD bearer must not
     wipe a token another wave has since minted."""
-    fcm._cached_access_token = ("old", float("inf"))
+    fcm._state = fcm.AuthState(fcm.Cached("old", float("inf")))
 
     async def _post(url, **kw):
-        fcm._cached_access_token = ("new", float("inf"))   # wave B minted meanwhile
+        fcm._state = fcm.AuthState(fcm.Cached("new", float("inf")))  # wave B minted meanwhile
         return httpx.Response(401, json={}, request=httpx.Request("POST", url))
 
     class _C:
@@ -275,7 +274,7 @@ async def test_a_late_401_does_not_clear_a_newer_token(configured, monkeypatch):
 
     monkeypatch.setattr(fcm, "_client", lambda: _C())
     await fcm.send(TOKEN, _invite())
-    assert fcm._cached_access_token == ("new", float("inf"))
+    assert fcm._state.phase == fcm.Cached("new", float("inf"))
 
 
 def test_the_collapse_key_rides_under_android(configured):
@@ -626,7 +625,7 @@ async def test_an_unusable_credential_is_negative_cached(monkeypatch):
                         raising=False)
     fcm.reset_for_tests()
     await fcm.send("f" * 100, _invite())
-    assert fcm._oauth_backoff_until is not None, (
+    assert isinstance(fcm._state.phase, fcm.MintBackoff), (
         "the negative cache must be reachable from the credential path, not only "
         "from the HTTP-status path"
     )

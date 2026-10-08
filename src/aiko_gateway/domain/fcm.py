@@ -43,9 +43,12 @@ logs no identifier of its own.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
+from dataclasses import dataclass, replace
+from typing import Literal, Union
 
 import httpx
 import jwt
@@ -72,11 +75,22 @@ _ASSERTION_TTL_SECONDS = 3600
 # TooManyProviderTokenUpdates equivalent, so `apns._TOKEN_REFRESH_SECONDS`'s
 # two-sided reasoning does NOT transfer and must not be copied here.
 _ACCESS_TOKEN_SKEW_SECONDS = 300
-# How long a HARD auth rejection suppresses further token minting. Without it one
-# bad credential is one POST to Google's rate-limited token endpoint PER DEVICE
-# PER RING, plus an ERROR line each — a misconfiguration that generates its own
-# rate-limit incident.
+# THE BACKOFF CLOCKS (design 17 v4). Without them one bad credential is one POST
+# to Google's rate-limited token endpoint PER DEVICE PER RING, plus an ERROR line
+# each, which is a misconfiguration that generates its own rate-limit incident.
+#
+# Flat for a credential that cannot be parsed or signed, or a token endpoint that
+# answered in a shape we cannot read: neither changes with retrying.
 _OAUTH_FAILURE_BACKOFF_SECONDS = 60
+# GROWING for `invalid_grant` and for send-side PERMISSION_DENIED, from a base up to
+# one cap: `min(base * 2**(strikes-1), cap)`. `invalid_grant` covers a key minted
+# seconds ago (propagation, measured at <=30s on 2026-10-08), a deleted or disabled
+# key, and a skewed clock. The short base lets a fresh key recover fast; the
+# growth decays a dead one to one POST per cap, rather than one every 10s forever
+# (Kelvin, design 17 temper r3).
+_GRANT_BACKOFF_BASE_SECONDS = 10
+_DENIED_BACKOFF_BASE_SECONDS = 60
+_BACKOFF_CAP_SECONDS = 900
 # How long FCM may keep trying to deliver, as a protobuf Duration STRING.
 #
 # THE TRAP THIS CONSTANT EXISTS TO NAME: `apns-expiration` is an ABSOLUTE unix
@@ -104,11 +118,220 @@ _TTL_SECONDS: dict[WakeKind, int] = {
 }
 _TIMEOUT_SECONDS = 10.0
 
-# The parsed credential, the OAuth access token as (token, expiry_monotonic), and
-# the negative cache's expiry.
+# ---------------------------------------------------------------------------
+# THE AUTH STATE MACHINE (docs/design/17-fcm-token-state-machine.md, v4).
+#
+# WHY IT IS A TABLE. PR#192's cage-match found one defect in this area in every
+# round for three rounds, each a (state, event) pair nobody had written down: a
+# 401 that never cleared the cache, a 503 negative-cached as a refusal, a 200 with
+# `access_token: null` cached for an hour, a late 401 wiping a newer token. Three
+# module globals with three writers, coordinated by comments, cannot be swept. So
+# the state is ONE immutable value, every change goes through ONE pure function,
+# and `tests/test_fcm_auth.py` sweeps that function over the product of every
+# phase and every event, against a table written as data.
+#
+# THE DECISIVE MEASUREMENT (2026-10-08): IAM is checked at SEND, never at mint. A
+# service account with no role mints a token fine and gets 403 PERMISSION_DENIED
+# (no FcmError code) on send. Each island now has its own ring account, so revoking
+# one is an intended operator move, and it arrives ONLY on the send path. That is
+# `SendDenied`, and minting a fresh token must not end it.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Empty:
+    """No token, and no reason to stay quiet: the next caller mints."""
+
+
+@dataclass(frozen=True)
+class Cached:
+    token: str
+    expires_at: float  # monotonic
+
+
+@dataclass(frozen=True)
+class MintBackoff:
+    """The token endpoint refused us in a way retrying will not fix soon."""
+    until: float
+
+
+@dataclass(frozen=True)
+class SendDenied:
+    """FCM said this ACCOUNT may not send. Island-wide; time alone ends it."""
+    until: float
+
+
+Phase = Union[Empty, Cached, MintBackoff, SendDenied]
+
+
+@dataclass(frozen=True)
+class AuthState:
+    phase: Phase
+    # Survives phase changes; reset ONLY by a delivered send. It is what makes
+    # repeated failures back off further.
+    strikes: int = 0
+    # When the current phase was entered (monotonic). A `Denied` whose send began
+    # before this is stale evidence from an earlier phase, and is a no-op.
+    since: float = float("-inf")
+
+
+# A RESTART WAKES HERE. There is no other reload: settings are read from the
+# environment at boot, so a new credential means a new process. That is why no
+# `config_reloaded` event exists (design 17 v4: nothing could fire one).
+INITIAL = AuthState(Empty())
+
+
+@dataclass(frozen=True)
+class Minted:
+    token: str
+    expires_at: float
+
+
+@dataclass(frozen=True)
+class MintFailed:
+    kind: Literal["credential", "unreadable", "grant"]
+
+
+@dataclass(frozen=True)
+class Blinked:
+    """Transport error, 429 or 5xx, on either endpoint. Says nothing about us."""
+
+
+@dataclass(frozen=True)
+class Refused:
+    """Send 401: this BEARER was refused. Compare-and-clear on it."""
+    bearer: str
+
+
+@dataclass(frozen=True)
+class Denied:
+    """Send 403 + PERMISSION_DENIED + no FcmError code: the ACCOUNT may not send."""
+    sent_at: float
+
+
+@dataclass(frozen=True)
+class Delivered:
+    pass
+
+
+@dataclass(frozen=True)
+class DeviceLocal:
+    """A verdict about ONE device (UNREGISTERED, SENDER_ID_MISMATCH,
+    INVALID_ARGUMENT). Never island-wide state."""
+
+
+@dataclass(frozen=True)
+class Tick:
+    """Time passing. Applied before every read, so expiry is a transition too."""
+
+
+@dataclass(frozen=True)
+class Unclassified:
+    """A response nobody anticipated. Logged loudly; NEVER routed to `Denied`, so
+    one garbled per-device 403 cannot silence every Android ring."""
+    status: int
+    error_code: str
+
+
+Event = Union[Minted, MintFailed, Blinked, Refused, Denied, Delivered,
+              DeviceLocal, Tick, Unclassified]
+
+
+def _grow(base: int, strikes: int) -> float:
+    return float(min(base * 2 ** max(strikes - 1, 0), _BACKOFF_CAP_SECONDS))
+
+
+def transition(state: AuthState, event: Event, now: float) -> AuthState:
+    """THE ONLY WRITER. Pure: no I/O, no clock read, no logging.
+
+    Every (phase, event) pair has an explicit answer; "keep" is a real answer and
+    is tested as one. The table it implements is in design 17 v4, and the same
+    table lives as data in `tests/test_fcm_auth.py`.
+    """
+    phase = state.phase
+
+    def enter(new: Phase, strikes: int) -> AuthState:
+        return AuthState(new, strikes, now)
+
+    # Time first: a deadline that has passed is a transition whatever arrived.
+    if isinstance(event, Tick):
+        if isinstance(phase, Cached) and now >= phase.expires_at:
+            return enter(Empty(), state.strikes)
+        if isinstance(phase, (MintBackoff, SendDenied)) and now >= phase.until:
+            return enter(Empty(), state.strikes)
+        return state
+
+    # A DENIAL IS ENDED BY TIME ONLY. A fresh token from an account that lost its
+    # role 403s again, and every other event while closed is the same fact
+    # restated or stale (concurrent 403s from one ring COALESCE here: one fact,
+    # one strike).
+    if isinstance(phase, SendDenied):
+        return state
+
+    if isinstance(event, Minted):
+        return enter(Cached(event.token, event.expires_at), state.strikes)
+    if isinstance(event, MintFailed):
+        strikes = state.strikes + 1
+        if event.kind == "grant":
+            until = now + _grow(_GRANT_BACKOFF_BASE_SECONDS, strikes)
+        else:
+            until = now + _OAUTH_FAILURE_BACKOFF_SECONDS
+        return enter(MintBackoff(until), strikes)
+    if isinstance(event, Denied):
+        if event.sent_at < state.since:
+            return state  # stale: the send began before this phase did
+        strikes = state.strikes + 1
+        return enter(SendDenied(now + _grow(_DENIED_BACKOFF_BASE_SECONDS, strikes)),
+                     strikes)
+    if isinstance(event, Refused):
+        if isinstance(phase, Cached) and phase.token == event.bearer:
+            return enter(Empty(), state.strikes)
+        return state
+    if isinstance(event, Delivered):
+        if isinstance(phase, (Empty, Cached)):
+            return replace(state, strikes=0)
+        return state
+    # Blinked, DeviceLocal, Unclassified: keep. (Unclassified's loudness is the
+    # orchestrator's job; this function does not log.)
+    return state
+
+
+@dataclass(frozen=True)
+class Have:
+    token: str
+
+
+@dataclass(frozen=True)
+class Mint:
+    pass
+
+
+@dataclass(frozen=True)
+class Silent:
+    pass
+
+
+def get(state: AuthState) -> Have | Mint | Silent:
+    """What a caller may do NOW. Apply `Tick` first; this does not read a clock.
+
+    `Silent` means: send nothing and mint nothing. The device gets TRANSIENT,
+    because it is not implicated by our auth. The fanout does not retry, so a ring
+    during `Silent` is dropped, not parked. That is the stated cost of a window.
+    """
+    if isinstance(state.phase, Cached):
+        return Have(state.phase.token)
+    if isinstance(state.phase, Empty):
+        return Mint()
+    return Silent()
+
+
 _cached_credential: dict | None = None
-_cached_access_token: tuple[str, float] | None = None
-_oauth_backoff_until: float | None = None
+_state: AuthState = INITIAL
+# SINGLE-FLIGHT. The fanout is a concurrent `asyncio.gather`, so a cold cache
+# under a ring to N Android devices was N concurrent mints, not the "one wasted
+# exchange" this module used to claim. Now there is one in-flight mint, awaited by
+# every caller through `shield` (one cancelled waiter must not cancel the rest).
+_mint_flight: asyncio.Task | None = None
 _client_singleton: httpx.AsyncClient | None = None
 
 
@@ -136,7 +359,7 @@ def is_configured() -> bool:
 
 
 def reset_for_tests() -> None:
-    """Drop the cached credential, access token and auth backoff. Tests mutate
+    """Return the auth state to INITIAL and drop the cached credential. Tests mutate
     settings between cases, and a token minted for the previous credential would
     outlive them.
 
@@ -146,10 +369,10 @@ def reset_for_tests() -> None:
     in the client depends on the credential anyway — the host is in the URL and
     the auth is in a per-send header.
     """
-    global _cached_credential, _cached_access_token, _oauth_backoff_until
+    global _cached_credential, _state, _mint_flight
     _cached_credential = None
-    _cached_access_token = None
-    _oauth_backoff_until = None
+    _state = INITIAL
+    _mint_flight = None
 
 
 def _credential() -> dict:
@@ -218,108 +441,200 @@ def _assertion_headers(credential: dict) -> dict | None:
     return {"kid": kid} if isinstance(kid, str) and kid else None
 
 
-async def _access_token() -> str | None:
-    """The cached OAuth access token, or None if we could not get one.
+def _apply(event: Event) -> None:
+    """Feed one event to the one writer, and say so when the island's Android
+    reach changes. Logging lives HERE, never in `transition`, so the table stays
+    pure and the operator hears each change once rather than once per device."""
+    global _state
+    before = _state
+    _state = transition(_state, event, time.monotonic())
+    after = _state.phase
+    if isinstance(event, Unclassified):
+        # LOUD BY CONTRACT (design 17 v4): an unanticipated response must never
+        # become a quiet REJECTED. The status and the FcmError code are fixed
+        # vocabularies; the body is never logged.
+        log.error("fcm unclassified response status=%s error_code=%s — the auth "
+                  "table has no row for this; it changed nothing, report it",
+                  event.status, event.error_code or "-")
+    if type(after) is type(before.phase):
+        return
+    window = int(after.until - time.monotonic()) if isinstance(
+        after, (MintBackoff, SendDenied)) else 0
+    if isinstance(after, SendDenied):
+        log.error("fcm send denied (PERMISSION_DENIED): this island's ring account "
+                  "may not send. Check its role (islandRinger) and that the Cloud "
+                  "Messaging API is enabled. Android is silent for %ds (strike %d)",
+                  window, _state.strikes)
+    elif isinstance(after, MintBackoff) and isinstance(event, MintFailed):
+        log.error(_MINT_FAILURE_MESSAGE[event.kind] + " Android is silent for %ds "
+                  "(strike %d)", window, _state.strikes)
+    elif isinstance(after, Empty) and isinstance(before.phase,
+                                                 (MintBackoff, SendDenied)):
+        log.warning("fcm auth window lapsed — the next ring will try again")
 
-    RETURNS None RATHER THAN RAISING — the first of this module's three
-    divergences from `apns.py`. APNs auth is LOCAL signing that can only fail on a
-    broken key the boot guard already caught; this is a NETWORK EXCHANGE that
-    fails whenever Google is briefly unreachable. If that escaped as an exception,
-    `push_service`'s per-device `except Exception` would become the normal path
-    and a Google blip would read as "wake failed for one device" forever.
 
-    NO LOCK AROUND THE MINT. A concurrent double-mint costs one wasted exchange,
-    and the reason APNs' cache is load-bearing — Apple's 20-minute minimum mint
-    interval — has no counterpart here.
+# One sentence per LAYER (design 17 v4). The old single message told an operator
+# to "check the service account's role" on a MINT failure, but minting never
+# consults IAM: the role is checked at send. So the role belongs to `SendDenied`
+# and appears nowhere here.
+_MINT_FAILURE_MESSAGE = {
+    "credential": ("fcm credential is unusable: FCM_SERVICE_ACCOUNT_JSON cannot be "
+                   "parsed or signed with. The boot ladder accepts a blob this "
+                   "signing step cannot use, so a green /health does not mean "
+                   "Android can be reached."),
+    "grant": ("fcm key refused (invalid_grant): it may be minutes old (key "
+              "propagation), deleted or disabled, or this box's clock may be off."),
+    "unreadable": ("fcm token endpoint answered in a shape this island cannot "
+                   "read."),
+}
+
+
+def classify_mint(status: int, body: object, now: float) -> Event:
+    """TOTAL over the token endpoint's responses. Pure."""
+    if status == 429 or status >= 500:
+        # GOOGLE BLINKED, NOT OUR KEY (Tesla, cage-match PR#192 r2). One backoff
+        # bit used to mean both "this key will never sign" and "the endpoint had a
+        # bad second", so a single 503 silenced Android for a minute.
+        return Blinked()
+    if status == 200:
+        if not isinstance(body, dict):
+            return MintFailed("unreadable")
+        token = body.get("access_token")
+        # A 200 carrying `"access_token": null` (or "", or a number) used to be
+        # CACHED and replayed as "no token" for ~55 minutes (Tesla, PR#192 r2).
+        # Only a non-empty string may become `Minted`.
+        if not isinstance(token, str) or not token:
+            return MintFailed("unreadable")
+        try:
+            expires_in = int(body.get("expires_in", _ASSERTION_TTL_SECONDS))
+        except (TypeError, ValueError):
+            return MintFailed("unreadable")
+        # Never cache a token for longer than it lives; a skew larger than the
+        # lifetime would otherwise produce a cache entry already in the past.
+        return Minted(token, now + max(expires_in - _ACCESS_TOKEN_SKEW_SECONDS, 0))
+    # RFC 6749 puts a fixed vocabulary in `error`; reading it is safe, unlike the
+    # body, which can echo request material and is never logged.
+    if (status == 400 and isinstance(body, dict)
+            and body.get("error") == "invalid_grant"):
+        return MintFailed("grant")
+    return MintFailed("unreadable")
+
+
+# The FcmError codes that are facts about ONE device. Anything not here and not
+# matched below is `Unclassified`, never island-wide.
+_DEVICE_LOCAL_CODES = frozenset({"UNREGISTERED", "SENDER_ID_MISMATCH",
+                                 "INVALID_ARGUMENT"})
+
+
+def classify_send(status: int, body: object, bearer: str, sent_at: float) -> Event:
+    """TOTAL over the send endpoint's responses. Pure.
+
+    THE ISLAND-WIDE 403 IS BARE, measured 2026-10-08: gRPC status
+    `PERMISSION_DENIED` and NO FcmError detail. `SENDER_ID_MISMATCH` is the 403
+    that DOES carry an FcmError code, and it is per-device. So `Denied` requires
+    all three facts, and anything garbled falls to `Unclassified`, not to
+    `Denied`: one misread per-device 403 must not silence every Android ring.
     """
-    global _cached_access_token, _oauth_backoff_until
-    now = time.monotonic()
-    if _cached_access_token is not None and now < _cached_access_token[1]:
-        return _cached_access_token[0]
-    if _oauth_backoff_until is not None and now < _oauth_backoff_until:
-        # A credential already known bad. Refusing here is what stops one
-        # misconfiguration becoming one token-endpoint POST per device per ring.
-        return None
+    if status == 200:
+        return Delivered()
+    if status == 429 or status >= 500:
+        return Blinked()
+    if status == 401:
+        return Refused(bearer)
+    code = _fcm_error_code(body) if isinstance(body, dict) else ""
+    if code in _DEVICE_LOCAL_CODES:
+        return DeviceLocal()
+    error = body.get("error") if isinstance(body, dict) else None
+    rpc_status = error.get("status") if isinstance(error, dict) else None
+    if status == 403 and rpc_status == "PERMISSION_DENIED" and code == "":
+        return Denied(sent_at)
+    return Unclassified(status, code)
 
-    # THE SIGNING IS INSIDE THE GUARD, not above it. This function's docstring
-    # promises it "returns None rather than raising", and until this change that
-    # promise covered only the network POST — `_credential()` parsing and
-    # `_sign_assertion()` sat outside every handler, so a credential defect became
-    # a traceback per device per ring, forever, with the negative cache unreachable
-    # because it lives on the return path. A stated contract that the code does not
-    # keep is worse than no contract: `push_service` is written against this one.
+
+async def _mint_once() -> str | None:
+    """One exchange at the token endpoint. Runs as the single in-flight task;
+    its event is applied exactly once, here, whatever the number of waiters.
+
+    THE SIGNING IS INSIDE THE GUARD. `_access_token` promises it returns None
+    rather than raising, and a credential defect that escaped as an exception
+    would be a traceback per device per ring with the backoff unreachable.
+    """
     try:
         credential = _credential()
         assertion = _sign_assertion(credential)
-    except Exception as ex:
-        # Negative-cached, UNLIKE a transport failure: a credential that cannot be
-        # parsed or signed with will not fix itself, and retrying it once per device
-        # per ring is the shape this backoff exists to stop.
-        _oauth_backoff_until = now + _OAUTH_FAILURE_BACKOFF_SECONDS
-        log.error(
-            "fcm credential is unusable (%s) — every Android ring will be dropped "
-            "until FCM_SERVICE_ACCOUNT_JSON is fixed. The boot ladder accepts a "
-            "blob this signing step cannot use, so a green /health does not mean "
-            "Android can be reached.", type(ex).__name__)
+    except Exception:
+        _apply(MintFailed("credential"))
         return None
-
     try:
-        response = await _client().post(
-            credential.get("token_uri") or _TOKEN_URI_FALLBACK,
-            data={"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-                  "assertion": assertion},
-        )
-    except httpx.HTTPError as ex:
-        # NOT negative-cached: a transport failure says nothing about the
-        # credential, and suppressing the next attempt for a minute would turn a
-        # one-second blip into a minute of silence.
+        # BOUNDED HERE, NOT ONLY BY THE CLIENT. Every concurrent caller is waiting
+        # on this one task, so a hung mint would silence the island for as long as
+        # it hangs. The client's timeout already covers a real socket; this makes
+        # the bound a property of the single-flight itself (Kelvin, temper r2).
+        response = await asyncio.wait_for(
+            _client().post(
+                credential.get("token_uri") or _TOKEN_URI_FALLBACK,
+                data={"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                      "assertion": assertion}),
+            _TIMEOUT_SECONDS)
+    except (httpx.HTTPError, asyncio.TimeoutError) as ex:
+        # NOT negative-cached: a transport failure says nothing about the key.
         log.warning("fcm oauth failed transport=%s", type(ex).__name__)
+        _apply(Blinked())
         return None
-
-    if response.status_code == 429 or response.status_code >= 500:
-        # GOOGLE BLINKED, NOT OUR KEY (Tesla, cage-match PR#192 r2). Treated like
-        # the transport error above and NOT negative-cached: one backoff bit used
-        # to mean both "this key will never sign" and "the token endpoint had a
-        # bad second", so a single 503 silenced every Android ring on the island
-        # for a minute while /health stayed green. `_verdict` already calls the
-        # same statuses TRANSIENT on the send path; the mint path now agrees.
+    try:
+        body: object = response.json()
+    except ValueError:
+        body = None
+    event = classify_mint(response.status_code, body, time.monotonic())
+    if isinstance(event, Blinked):
         log.warning("fcm oauth unavailable status=%s — not backing off",
                     response.status_code)
-        return None
+    _apply(event)
+    return event.token if isinstance(event, Minted) else None
 
-    if response.status_code != 200:
-        _oauth_backoff_until = now + _OAUTH_FAILURE_BACKOFF_SECONDS
-        # ERROR because this is an island CONFIGURATION fault that silently costs
-        # every Android ring: the service account may lack the role, or the Cloud
-        # Messaging API may not be enabled on the project. Never log the response
-        # body — a token endpoint's error can echo request material.
-        log.error("fcm oauth refused status=%s — Android push is OFF for the next "
-                  "%ds; check the service account's role and that the Cloud "
-                  "Messaging API is enabled",
-                  response.status_code, _OAUTH_FAILURE_BACKOFF_SECONDS)
-        return None
 
+async def _access_token() -> str | None:
+    """A usable bearer, or None if this island must stay quiet right now.
+
+    RETURNS None RATHER THAN RAISING: auth here is a NETWORK EXCHANGE that fails
+    whenever Google is briefly unreachable, and `push_service`'s per-device
+    `except Exception` must stay the exceptional path.
+    """
+    global _mint_flight
+    _apply(Tick())
+    action = get(_state)
+    if isinstance(action, Have):
+        return action.token
+    if isinstance(action, Silent):
+        return None
+    if _mint_flight is None or _mint_flight.done():
+        _mint_flight = asyncio.ensure_future(_mint_once())
     try:
-        body = response.json()
-        token = body["access_token"]
-        expires_in = int(body.get("expires_in", _ASSERTION_TTL_SECONDS))
-        # A 200 carrying `"access_token": null` (or "", or a number) raised nothing
-        # and was CACHED, then returned as None for ~55 minutes: `send` reads None
-        # as "no token" and never POSTs, so the 401 clearer below never ran either
-        # (Tesla, cage-match PR#192 r2). Only a non-empty string may enter the
-        # cache; anything else takes the unreadable-response path.
-        if not isinstance(token, str) or not token:
-            raise ValueError("access_token is not a non-empty string")
-    except (ValueError, KeyError, TypeError):
-        _oauth_backoff_until = now + _OAUTH_FAILURE_BACKOFF_SECONDS
-        log.error("fcm oauth returned an unreadable token response")
+        return await asyncio.shield(_mint_flight)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # never-raise contract; _mint_once catches its own
+        log.exception("fcm mint task failed unexpectedly")
         return None
 
-    # Never cache a token for longer than it lives; a skew larger than the
-    # lifetime would otherwise produce a cache entry already in the past.
-    lifetime = max(expires_in - _ACCESS_TOKEN_SKEW_SECONDS, 0)
-    _cached_access_token = (token, now + lifetime)
-    return token
+
+def auth_status() -> dict:
+    """Android's auth phase for `/health`: a readiness fact, not a name beside a
+    green check (Tesla, temper r3).
+
+    It must NOT fail the container healthcheck, which is `curl -f` on /health and
+    so reads only the HTTP status. Under `restart: always`, an IAM outage that
+    failed the healthcheck would become a restart loop taking the working APNs
+    transport down with it, the failure design 14's temper recorded for the boot
+    guard. So this is body-only, and the status code never depends on it.
+    """
+    state = transition(_state, Tick(), time.monotonic())
+    phase = state.phase
+    names = {Empty: "empty", Cached: "cached", MintBackoff: "mint_backoff",
+             SendDenied: "send_denied"}
+    return {"ready": isinstance(phase, (Empty, Cached)),
+            "phase": names[type(phase)],
+            "strikes": state.strikes}
 
 
 def _client() -> httpx.AsyncClient:
@@ -555,17 +870,17 @@ async def send(device_token: str, payload: WakePayload) -> SendResult:
     Raises [FcmNotConfigured] only if called on an island with no credential,
     which is a caller bug: `push_service` gates on `is_configured()` first.
     """
-    global _cached_access_token
     if not is_configured():
         raise FcmNotConfigured("FCM credentials are not set on this island")
 
     token = await _access_token()
     if token is None:
-        # Already logged with its cause by `_access_token`. TRANSIENT rather than
-        # REJECTED: the DEVICE is not implicated by our auth failing.
+        # Already logged with its cause, once, by `_apply`. TRANSIENT rather than
+        # REJECTED: the DEVICE is not implicated by our auth.
         return SendResult(Verdict.TRANSIENT)
 
     url = f"{_FCM_HOST}/v1/projects/{_project_id()}/messages:send"
+    sent_at = time.monotonic()
     try:
         response = await _client().post(
             url, json=build_message(device_token, payload),
@@ -573,40 +888,26 @@ async def send(device_token: str, payload: WakePayload) -> SendResult:
     except httpx.HTTPError as ex:
         # The device is not implicated by OUR network failing.
         log.warning("fcm send failed transport=%s", type(ex).__name__)
+        _apply(Blinked())
         return SendResult(Verdict.TRANSIENT)
 
+    try:
+        body: object = response.json()
+    except ValueError:
+        body = None
+    # TWO READINGS OF ONE RESPONSE, kept apart on purpose: the EVENT is what it
+    # means for the island's auth (one writer, `_apply`); the VERDICT is what it
+    # means for this one device's row (`_verdict`, which owns the reaping rule).
+    # A 401 compare-and-clears the bearer it was sent with (Tesla, PR#192 r3);
+    # a bare PERMISSION_DENIED closes the island's sending until its window lapses.
+    _apply(classify_send(response.status_code, body, token, sent_at))
     if response.status_code == 200:
         # 200 means ACCEPTED, not delivered — the same posture as an APNs 200.
-        # There is no delivery receipt in the response; delivery data exists only
-        # in the BigQuery export.
         return SendResult(Verdict.DELIVERED)
-
-    try:
-        error_code = _fcm_error_code(response.json())
-    except ValueError:
-        error_code = ""
+    error_code = _fcm_error_code(body) if isinstance(body, dict) else ""
     verdict = _verdict(response.status_code, error_code)
-    if response.status_code == 401:
-        # OUR access token was refused — revoked early, or the key behind it was
-        # rotated or disabled. Drop it so the NEXT send mints fresh (Carnot,
-        # cage-match PR#192 r1). Without this the cache kept presenting a dead
-        # token until its own expiry, up to ~55 minutes of every Android ring
-        # refused while a fresh mint might have worked immediately. No retry
-        # here: the per-recipient fanout already sends again on the next wake,
-        # and a credential that is truly bad is caught by the mint's own backoff.
-        # COMPARE-AND-CLEAR (Tesla, cage-match PR#192 r3): only if the slot still
-        # holds the bearer that was refused. Two waves in flight during a
-        # revocation would otherwise race — wave B mints and caches a live token,
-        # then wave A's late 401 nulls it and the next devices stampede the token
-        # endpoint. Matching the observed value makes the stale clear a no-op,
-        # with no lock (which would be a second guard on the same slot).
-        if (_cached_access_token is not None
-                and _cached_access_token[0] == token):
-            _cached_access_token = None
     # NEVER the device token: it rides in the request body, so nothing else in
-    # this path can leak it and this line must not be the exception. ERROR for
-    # REJECTED because that is the quietest failure mode here and the one where a
-    # wrong project id or a malformed message hides.
+    # this path can leak it and this line must not be the exception.
     log.log(logging.ERROR if verdict is Verdict.REJECTED else logging.WARNING,
             "fcm refused status=%s error_code=%s verdict=%s",
             response.status_code, error_code or "-", verdict.value)
