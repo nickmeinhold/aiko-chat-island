@@ -149,3 +149,91 @@ Tesla: "If you want the secrets of the universe, think in energy, frequency and 
 - **Caller contract of `refused`:** a send 401 is our bearer, same family as mint `None` — `Verdict.TRANSIENT` for the device, then compare-and-clear, then the next `get` may `Mint`. `REJECTED` stays for message-shape and project-shape faults.
 - **Question 1:** a table bolted onto the current functions still tests an implied machine; extract `transition` first. Question 3: APNs gets its own one-writer grid, or none. This table is FCM's.
 - **Invariant inside `minted`:** only a non-empty `str` bearer with a non-negative remaining lifetime enters `cached`; any other payload is `mint_failed(unreadable)` in the transition itself, so the 200-with-`access_token: null` frequency cannot bypass the orchestrator again.
+
+
+---
+
+# Round 2 (re-strike of the v2 recast)
+
+**Round verdict:** UN-TEMPERED (provisional). Both seated families say RECAST. Seated: Maxwell
+(Claude) + **Kelvin (Gemini)**. Dark: **Tesla** (grok hung for the full 40-minute launcher budget,
+zero bytes on stdout and stderr), **Carnot** (`gpt-5.5` usage limit, still). Across the two rounds,
+two outside families have struck this design (Grok on v1, Gemini on v2), but never two on the
+same version, so neither version is tempered.
+
+**Convergence signal:** round 1 found a missing STATE (`send_denied`). Round 2's findings are all
+edges of v2's own open questions (how `send_denied` exits, how single-flight fails). Smaller, and
+inside the frame. That is what convergence looks like, and it is also what a panel primed by the
+design's own questions looks like. Weigh it as both.
+
+## Round 2 fatal flaws (deduped) and dispositions
+
+1. **`send_denied` exits by timer into a full fanout.** Maxwell. If the role is still missing, that
+   is N 403s every interval. DISPOSITION: fold. A `half_open` state lets ONE send probe. 200 →
+   normal; `denied` → back, with a growing window.
+2. **No reset when the operator fixes things.** Kelvin (`config_reloaded`). Maxwell narrows it: an
+   IAM fix happens at Google, so no island event fires, and only a probe (flaw 1) discovers it. A
+   CREDENTIAL change is a real island event. DISPOSITION: fold both. `config_reloaded` → `empty`
+   from every state, and `half_open` for remote fixes.
+3. **A hung single-flight mint silences every waiter.** Kelvin. DISPOSITION: fold. The shared
+   future is bounded by the client's existing 10s timeout, and every waiter gets `blinked` when it
+   fires. Test with a hung mint.
+4. **Island-wide silence is invisible.** Maxwell. DISPOSITION: fold. The auth state (no secrets)
+   is exposed on the island's health/capabilities surface.
+5. **Per-process state, unstated.** Maxwell. DISPOSITION: fold as a stated assumption (one
+   gateway worker today). Single-flight's guarantee is per-process too.
+
+## Disposition
+
+Fold into v3. A further strike on v3 needs two outside families seated on the SAME version: Gemini
+(available now), plus either Grok (retry with a shorter timeout) or Codex (quota). Recast round 2
+of ≤3.
+
+
+**Struck:** dt-17r2-1791456432 (2026-10-08). Bundle: design 17 v2, plus the current `fcm.py` and the `push_service` fanout. Sections below are in arrival order.
+
+Ripgrep is not available. Falling back to GrepTool.
+## KelvinBitBrawler's Design Strike
+
+**Verdict:** RECAST
+
+**Summary:** This design approaches absolute zero, but two thermal leaks prevent it from reaching a stable, superconducting state.
+
+**Fatal flaws:**
+- **`send_denied` is a cryo-prison exited only by time.** An operator who fixes the underlying IAM role is still locked out, waiting for the backoff to decay. The design lacks an event for `config_reloaded`, a phase change it must recognize. A system that cannot acknowledge its own correction is fundamentally flawed. `Ash: "I can't lie to you about your chances, but... you have my sympathies."`
+- **The `single-flight` mint is a single point of failure with an unbounded blast radius.** The design specifies the happy path but is silent on the failure mode of a hung mint. A single request frozen in flight will cause all subsequent Android pushes to sublimate into nothing, a cascading failure born of silence. This is a cold fault waiting to happen.
+
+**What holds:**
+- The core thermodynamics are sound: modeling the token as a state machine with a pure `transition(state, event)` function is the correct way to lower the system's entropy.
+- The discovery of the `send_denied` state and its corresponding `denied` event is a critical measurement, correctly identifying a failure mode invisible at the mint endpoint.
+- The principle of a total classifier over the event space is the only way to prevent unhandled responses from being silently dropped into the void.
+- The single-flight concept for minting and the compare-and-clear logic for send-side refusals are the correct primitives, even if their edges are not yet polished to a mirror sheen.
+
+**If RECAST, what to fold back:**
+- **Add a `config_reloaded` event.** This event MUST transition both `send_denied` and `mint_backoff` states to `empty`. This allows an operator's fix to take effect immediately, rather than being ignored until a timer expires.
+- **Specify the thermodynamics of the single-flight.** The single-flight implementation MUST have its own internal, short timeout (e.g., <10s). If this timeout is exceeded, the in-flight future must be failed and the underlying request cancelled. This contains the blast radius of a single hung network request, preventing it from freezing the entire subsystem.
+
+
+## MaxwellMergeSlam's Design Strike (round 2)
+
+**Verdict:** RECAST
+
+**Summary:** v2 has the right states, but its exit from `send_denied` is a timer that opens the floodgates, when it should be a single probe that tests the water.
+
+**Fatal flaws:**
+- **`send_denied` → `tick` → `empty` re-opens the full fanout (MISSING FAILURE MODE, the table's last column).** When the denial window lapses, the next ring sends to EVERY Android device again. If the role is still missing, that is N 403s per interval forever, the exact flood the state exists to stop, merely rate-limited. This is the circuit-breaker problem, and its known answer is a **half-open** state: after the window, let ONE send through. 200 → normal. `denied` → back to `send_denied` with a growing window.
+- **Kelvin's `config_reloaded` is the right instinct with the wrong trigger (WRONG OPTION-FRAME).** The operator's fix for `denied` happens at GOOGLE (restoring the role, or re-enabling the API), not in the island's config. No island event fires when it does. A reload event only covers the case where the CREDENTIAL changed. So recovery from a remote fix must be discovered by probing, which is the half-open state again. Keep `config_reloaded` too (a new credential should reset both backoffs), but it is not the answer for `denied`.
+- **Island-wide silence is invisible from outside (UNDER-COUNTED BLAST RADIUS).** In `send_denied` and `mint_backoff`, every Android ring is dropped while `/health` stays green. The only signal is a log line. A state that silences a whole platform should be readable from the island's health/capabilities surface, the same lesson as the boot-guard notes in `fcm.py` ("a green /health does not mean Android can be reached").
+- **The state is per-process, and that is unstated (UNSTATED ASSUMPTION).** The module-global cell lives in one Python process. It is correct only if the gateway runs one worker. If it ever runs several, each learns `send_denied` separately. Fine, but write it down, because single-flight's guarantee is also per-process.
+
+**What holds:**
+- `send_denied` as a state that `minted` does not leave. That is the measured fact, correctly encoded.
+- The total classifier with a loud `unclassified` arm.
+- Tri-state `get`, and single-flight (with Kelvin's timeout made explicit; the existing 10s httpx timeout already bounds it, so the design should say so and test it).
+
+**If RECAST, what to fold back:**
+- Add `half_open` between `send_denied` and normal. Exit on the probe's result, with a growing window on repeated `denied`.
+- Add `config_reloaded` (a credential change) → `empty` from every state.
+- Name the single-flight bound: the shared future fails when the client's 10s timeout fires, and every waiter gets `blinked`. Test a hung mint.
+- Expose the auth state (normal / mint_backoff / send_denied / half_open, no secrets) on the island's health or capabilities surface.
+- State the one-process assumption.

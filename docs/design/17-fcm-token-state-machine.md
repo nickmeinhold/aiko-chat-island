@@ -1,6 +1,6 @@
 # Design 17: FCM's OAuth token is a state machine, so make it one
 
-**Status:** RECAST round 1 (2026-10-08), awaiting a ≥2-family re-strike. Written 2026-10-06 because
+**Status:** RECAST round 2 → v3 (2026-10-08), awaiting a strike with two outside families on the same version. Written 2026-10-06 because
 PR#192's cage-match reached its three-round cap, and one finding class surfaced in every round. The first
 temper ([`17-TEMPER.md`](17-TEMPER.md)) seated only Claude and Grok, so it is **UN-TEMPERED
 (provisional)**. Both said RECAST, and v1's proposal is kept below, struck, because what it lacked is
@@ -61,7 +61,14 @@ value is optional sugar.
 
 ### States, carrying their clocks
 
-`empty` · `cached(token, expires_at)` · `mint_backoff(kind, until)` · `send_denied(until)`
+`empty` · `cached(token, expires_at)` · `mint_backoff(kind, until)` · `send_denied(until, n)` · `half_open(n)` *(v3)*
+
+*(v3, temper round 2)* `send_denied` no longer times out into the full fanout. When its window
+lapses, it becomes `half_open`: exactly ONE send goes through as a probe, and every other caller
+stays `Silent`. The probe's 200 → normal (`cached`). Its `denied` → `send_denied(until', n+1)` with
+a growing window. This is a circuit breaker's half-open state. It is also the ONLY way the island
+can discover an operator's fix, because restoring a role or re-enabling the API happens at Google
+and fires no island event.
 
 ### Events: the codomain of ONE total classifier
 
@@ -80,12 +87,15 @@ non-silent, never silently in REJECTED.
 | `refused(bearer)` | send 401 |
 | `denied` | send 403 + `PERMISSION_DENIED` + no FcmError code |
 | `tick(now)` | time passing: cache expiry, backoff lapse |
+| `config_reloaded` *(v3)* | the credential changed: → `empty` from every state, both backoffs reset |
 | `unclassified` | anything else |
 
 ### `get` is tri-state, and the mint is single-flight
 
 `get(state, now) -> Have(token) | Mint | Silent`. Only `Mint` may POST the token endpoint, and the
-POST is **single-flight**: one in-flight future that every concurrent caller awaits. That removes the
+POST is **single-flight**: one in-flight future that every concurrent caller awaits. *(v3)* The
+future is bounded by the client's existing 10s timeout. When that fires, every waiter receives
+`blinked`, so one hung mint cannot silence the island past one timeout. A hung mint is a test case. That removes the
 self-inflicted 429 burst (old question 2), and with it most of the reason a blink would need a
 backoff.
 
@@ -112,6 +122,15 @@ TRANSIENT, never REJECTED: the device is not implicated.
 - `denied`: "this island's ring account may not send: check its role (`islandRinger`) and that the
   Cloud Messaging API is enabled". This is the one place the role belongs.
 
+### Visibility and scope *(v3)*
+
+- **Readable from outside.** `mint_backoff`, `send_denied` and `half_open` each silence every Android
+  ring while `/health` is green. The current auth state (a name, no secrets) is exposed on the
+  island's health/capabilities surface.
+- **One process.** The state is module-global, so it is per-process, and so is single-flight's
+  guarantee. Correct for today's one gateway worker. Several workers would each learn
+  `send_denied` separately, which is safe but not shared.
+
 ### Owed before build (measurements, not claims)
 
 1. **Revocation latency:** time from disabling `ring-<island>` (and separately, deleting its key) to
@@ -130,10 +149,10 @@ the sweep could only certify, not complete. See `17-TEMPER.md`.
 
 ## Questions for the re-strike
 
-1. Is `send_denied` exited by time alone correct, or should a config reload (new credential) be an
-   explicit event?
-2. Does single-flight need a timeout of its own, so that one hung mint cannot silence every waiter
-   past the client's 10s?
+1. ~~Is `send_denied` exited by time alone correct?~~ No: `half_open` probe plus `config_reloaded`
+   (round 2).
+2. ~~Does single-flight need a timeout?~~ Yes: bounded by the client's 10s, and waiters get
+   `blinked` (round 2).
 3. Old Q3, answered: APNs is NOT this table. It shares the event algebra (Apple's
    `ExpiredProviderToken` is the `refused(bearer)` analogue), and gets its own one-writer grid only if
    a finding asks for one.
