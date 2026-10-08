@@ -5,6 +5,12 @@
 > operator attestation* decision (aiko_chat_app PR #195). A citation of "ADR-0008" for
 > push topology would resolve to the wrong decision, so the number is retired here and a
 > real one is assigned when this is filed. **Status: draft, not ruled on by Nick.**
+>
+> **Corrected 2026-10-08, before ruling.** The original treated Android as if it had Apple's
+> problem. It doesn't. The draft's binding table listed UnifiedPush for Android, but the island
+> ships **FCM** (PR#192), and FCM lets one project hold any number of separately revocable
+> sending credentials. So the revocation argument, which is this draft's main reason for a
+> relay, applies to **Apple only**. The changes are marked *(2026-10-08)* below.
 
 > **DRAFT, NOT FILED.** Destined for `aiko_chat/docs/adr/` via PR, per Nick's
 > 2026-08-23 homing ruling (app+island decisions live in `aiko_chat`). Held here
@@ -38,6 +44,10 @@ is that the entity should be a **foundation**, not a person.
 
 **Decision today: change nothing.** Islands keep talking to APNs directly. The
 trigger for building the above is the first island operator who is not Nick.
+
+*(2026-10-08)* **Narrowed:** that trigger now concerns **iPhone ringing only**. Android federates
+without a relay, through one FCM ring account per operator (built 2026-10-08 for Nick's two
+islands; see Proposal 1).
 
 ## Motivation
 
@@ -79,7 +89,8 @@ and no reason to expect one. So handing the key to operators is not a *degree* o
 trust — it is: any operator can ring any user of the app, with any alert text, at
 any hour.
 
-**The discriminator is revocation.** With N key-holders, ejecting one means
+**The discriminator is revocation** *(on Apple; see the 2026-10-08 FCM row below for why Android
+escapes it)*. With N key-holders, ejecting one means
 rotating the key, which invalidates it for everyone; every island must redeploy in
 a coordinated window, and until they do, nobody's phone rings. You cannot remove
 one bad operator without an outage for every good one — and you only ever rotate
@@ -107,9 +118,28 @@ is held by a foundation, not an individual.
    | APNs (iOS, macOS) | the **app** (bundle id) | **impossible** |
    | Web Push / VAPID | the **server** | native to the design |
    | UnifiedPush (Android) | the **user's chosen distributor** | native to the design |
+   | FCM (Android, what we ship) *(2026-10-08)* | the **Firebase project** (≈ the app) | **yes**: unlimited service accounts per project, each separately revocable |
+
+   *(2026-10-08)* **FCM is APNs's scope but not its revocation.** Any service account holding
+   `cloudmessaging.messages.create` in the project can ring *any* Android user of the app. There is
+   no "only users of island X", so the trust problem is the same as APNs. But each operator gets
+   their **own** account, and ejecting one is deleting that account. Nobody else rotates, and there
+   is no outage. That is exactly what was built for Nick's islands: `ring-imagineering` and
+   `ring-enspyr` in project `aiko-chat-push`, each bound to a custom role `islandRinger` whose ONLY
+   permission is the send. Measured the same day: IAM is checked at **send**, not at token mint (a
+   role-less account mints fine and gets 403 `PERMISSION_DENIED` on send). So "eject an operator"
+   is observable as that 403. How long an already-minted ~1h token outlives a revocation is
+   **unmeasured** (island design 17 owes it).
+
+   *(2026-10-08)* **Why APNs can't do the same:** Apple allows **two** `.p8` APNs keys per
+   developer team. Those two slots exist for rotation, not for distribution. This is sourced to
+   third-party docs and an Apple developer-forum thread, not to Apple's own documentation, so
+   re-check it before filing. Even with two, a per-operator key cannot scale past one outside
+   operator.
 
    A single client app is therefore fine. The contradiction bites only on Apple
-   platforms — and macOS inherits it, it is not "just an iPhone thing".
+   platforms *(2026-10-08: on Android, FCM narrows it from "can't revoke" to "can't scope", see
+   below)* — and macOS inherits it, it is not "just an iPhone thing".
 
 2. **Web Push is the island's egress contract** (RFC 8030; payload encryption
    RFC 8291). One protocol for every platform. Islands hold no APNs code.
@@ -243,6 +273,18 @@ where possession is authority and there is nowhere for a bad ring to be caught.
    the decision of record while silently diverging from a design doc in the same
    repo family creates the drift it exists to prevent. One read-through of Design
    07 §"Wire shapes" against the Proposal here settles it.
+
+7. *(2026-10-08)* **What the Apple relay learns.** It is content-blind, but not metadata-blind:
+   it sees "an island asked to ring endpoint E at time T", which amounts to a per-device timing log
+   of rings. That cuts against Nick's 2026-08-25 ruling that sender-anonymity is in scope (the
+   island learns neither who's friends nor who's calling), now at a new observer. The mitigating
+   fact is that Apple already sees the same metadata on every APNs push, so the relay is a
+   *second* observer, not a first. Whether that is acceptable, and whether the relay should be
+   forbidden from logging it (by policy, which is weaker than by construction), is a ruling, not
+   a derivation.
+8. *(2026-10-08)* **Can an FCM ring account be scoped below "the whole app"?** Believed no (the
+   permission is project-level, with no per-token condition). If it could, the Android trust
+   problem would vanish too. Cheap to check before filing.
 
 ## Rejected ideas
 
