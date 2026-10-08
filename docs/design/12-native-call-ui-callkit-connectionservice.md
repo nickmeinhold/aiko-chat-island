@@ -404,3 +404,78 @@ the app tab's, attributed as such. The `reportCall(with:updated:)` and
 `includesCallsInRecents` declarations are verified; `includesCallsInRecents`'s **default is
 NOT verified because Apple does not publish it**, and no behaviour beyond the quoted
 abstract should be inferred from this note.
+
+---
+
+## Addendum (2026-10-06) — Decision 1's bytes, pinned across both repos
+
+Decision 1 sketched `aiko:call/2 <ulid>` and said the end "references the same id", but
+never pinned the bytes. They were agreed between the island and app tabs on
+claude-tasks#4421, and are built in the island's FCM sender PR (#192).
+
+**How it got here.** The app tab's design 21 (the Android ring) went through
+/design-temper, and all three families converged on one fix: the call id has to be on
+the wire. They proposed `m` = the invite's *server* message id. That was withdrawn once
+this Decision was surfaced. Design 21 had never read it, which is the #2634 cross-tab
+failure again: a design-blind temper agreed the id must exist without knowing which one
+the record had already chosen. The server id also had a real hole. The island checks
+that an end's `reply_to` exists and is in the same channel. It does not check that the
+target is a call invite, and it does not require `reply_to` on an end. So `m` on an end
+would have been a sender-chosen pointer to any message in the channel.
+
+**Bytes:**
+
+```
+invite: "aiko:call/2 " + ULID + " · 📞 started a call"
+end:    "aiko:call/2 " + ULID + " · 📞 ended the call"
+ULID:   fullmatch [0-7][0-9A-HJKMNP-TV-Z]{25}   (canonical uppercase Crockford)
+```
+
+- **The tail is v1's, byte for byte** (U+00B7, U+1F4DE). A build that predates v2
+  renders a readable message, not a bare token.
+- **A fixed frame around a constrained id** keeps v1's exact-match property: the only
+  variable span is 26 characters of an alphabet that holds a call id and nothing else.
+  It is not a wake primitive with arbitrary content.
+- **`[0-7]` leads** because 26 Crockford characters encode 130 bits and a ULID is 128.
+  A higher first character could not map losslessly onto the UUID that CallKit and
+  ConnectionService need, so the regex doubles as the convertibility check.
+- **Lowercase is rejected, not normalised.** The app mints uppercase, and two spellings
+  of one id would be two ids.
+- ~~**v1 is recognised forever** (it is in signed history) and wakes with no `m`.~~
+  **Superseded the same day (2026-10-06): calling is v2-only** (app design 22 §v2.0, Nick
+  confirmed). v1 bodies are still stored and served forever, and "recognised forever" is
+  honoured as client-side RENDERING. They never wake: no store build ever placed a v1
+  call, and waking for one only made iOS report-and-end a VoIP push.
+
+**The wake** is `{c, k, m}` on both FCM and APNs, with `m` on every wake, since only v2
+calls wake. ~~FCM's `collapse_key` is `m`, so one call's invite and end share a queue slot
+and a different call can never evict them.~~ **Superseded 2026-10-08 (cage-match PR#192): FCM
+wakes carry NO `collapse_key`.** A collapse key puts a message in FCM's collapsible class,
+which keeps at most four keys per device and throttles, so per-call keys could lose a call's
+end. Without one, each wake is stored separately and no call can displace another's stop. An
+end that arrives BEFORE its invite (FCM does not order delivery) is still safe: the receiver
+tombstones `m` for 120s (`CallRing.TOMBSTONE_TTL_MS`), and the invite's TTL is 30s, so a late
+invite never rings. The island copies `m` from the body it persisted and never invents, rewrites or
+normalises it. The push stays trusted only for "ring or end call `m` on channel `c`".
+Joining still requires a signature-verified, admitted v2 invite whose body ULID equals
+`m`.
+
+**Shared golden vectors.** `tests/test_call_wire_v2.py` here and the app's tests pin
+the same strings: 2 valid, 6 rejects (lowercase, a leading `8`, 25 characters, an
+excluded `I`, trailing content, a missing space). Change them only together.
+
+**Weighed and rejected: reusing the invite's `clientMsgId` as the call id.** Decision 1
+did not consider this at the time; it was weighed on 2026-10-06.
+- Its format is unpinned (the probe sends `probe-…`), so it has no lossless UUID mapping.
+- It saves nothing on the end, which is its own message with its own `clientMsgId` and
+  still needs a body naming the call.
+- It is the island's idempotency key: a resend reuses it, and it is how the ack
+  reconciles. Making it the call identity would give one id two jobs, which is design
+  21's whole lesson.
+
+**Stated cost.** `m` is 128 caller-chosen bits that Apple and Google can read. The
+island puts no identity in it, but its guarantee is the shape, not the content. A
+caller could encode something about itself there. The app's answer (app PR #210): it fills all 128 bits from
+`Random.secure()` and uses no timestamp, so a well-behaved client's `m` carries neither
+an identity nor a mint time. The island can verify the shape but not the randomness. The provider can also now link an
+invite to its end exactly; it could already approximate that from `c` and timing.

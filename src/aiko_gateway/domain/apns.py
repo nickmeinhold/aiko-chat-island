@@ -44,7 +44,8 @@ from .models import ApnsEnvironment, TokenKind
 # and test is untouched by the move (`is` comparisons hold). The types themselves
 # moved to `push_result` when FCM arrived — a shared vocabulary living inside one
 # of its two speakers is not shared.
-from .push_result import (ReapOrder, SendResult, Verdict, WakeKind,
+from .push_result import (END_WAKE_EXPIRY_SECONDS, RING_CEILING_SECONDS,
+                          ReapOrder, SendResult, Verdict, WakeKind,
                           WakePayload)
 
 log = logging.getLogger("aiko_gateway.apns")
@@ -195,7 +196,7 @@ _ALERT_EXPIRATION_SECONDS = 60
 # a report-and-end, which is the ratio Apple polices. The three clocks (this lease,
 # the 30s ring, the 10s freshness) still have no stated relationship, which the
 # ruling explicitly left open.
-_VOIP_LEASE_SECONDS = 30
+_VOIP_LEASE_SECONDS = RING_CEILING_SECONDS
 
 # THE END WAKE DOES NOT GET THE RING LEASE, and the asymmetry is the point
 # (claude-tasks#4254, cage-match PR#176 r1). Every sentence of the comment above is
@@ -263,7 +264,7 @@ _VOIP_LEASE_SECONDS = 30
 # ruling explicitly left open" — that is claude-tasks#4233, and it is where the
 # four of them get reconciled. This constant is chosen to FAIL IN THE SAFE
 # DIRECTION until then, not to be the answer.
-_VOIP_END_EXPIRATION_SECONDS = 300
+_VOIP_END_EXPIRATION_SECONDS = END_WAKE_EXPIRY_SECONDS
 
 # The provider token, cached across sends: (jwt, issued_at_monotonic).
 _cached_token: tuple[str, float] | None = None
@@ -433,6 +434,9 @@ def _render(payload: WakePayload) -> dict:
         },
         "c": payload.channel_id,
         "k": payload.kind.value,
+        # `m` on EVERY wake — the call id (v1 never wakes; app design 22 §v2.0).
+        # iOS decodes permissively (design 16 v2 §7c), so an older build ignores it.
+        "m": payload.call_id,
     }
 
 

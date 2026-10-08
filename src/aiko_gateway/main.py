@@ -296,9 +296,12 @@ async def lifespan(app: FastAPI):
             # it. All three are no-ops on an island with push unconfigured.
             # Imported here rather than at module scope to keep the import graph of
             # `main` unchanged for the clean-checkout route-table tests.
-            from .domain import apns, push_service
+            from .domain import apns, fcm, push_service
             await push_service.aclose()
+            # Every transport closes AFTER the drain, for the reason above — the
+            # FCM client is the same hazard as the APNs one, one provider over.
             await apns.aclose()
+            await fcm.aclose()
     finally:
         # Outermost: runs whether startup raised before yield or cleanup raised.
         release_single_worker_lock()
@@ -388,10 +391,22 @@ async def _reachability(session) -> dict:
         # missing one on a field that is advisory.
         log.warning("/health could not read push reachability", exc_info=True)
         return {"status": "unknown"}
-    return {
+    push = {
         "configured": report["configured"],
         "devices_unreachable": bool(report["unreachable_devices"]),
     }
+    # ONE BOOLEAN, and only on an island with Android configured (design 17 v4):
+    # "configured" is not "reachable" for FCM, because a credential can be present
+    # while its account is denied at send or its key refused at mint. The phase
+    # name and strike count stay in the boot log and `reachability()`, per the
+    # booleans-only rule above. It rides in the BODY: the healthcheck reads the
+    # status code, and an IAM outage must not become a restart loop.
+    # TRI-STATE: true / false / null (unknown: no mint attempted since boot or
+    # since the token last expired). A boolean here made "never tried" read as
+    # "works".
+    if "fcm_auth" in report:
+        push["android_ready"] = report["fcm_auth"]["ready"]
+    return push
 
 
 @app.get("/health")

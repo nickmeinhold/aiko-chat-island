@@ -1,0 +1,620 @@
+"""FCM HTTP v1 — the Android transport, at exactly `apns.py`'s layer.
+
+THREE SEMANTIC TRAPS, none of which a schema check catches, all of which pass
+FCM's validator and then fail silently:
+
+  1. a `notification` block makes the phone UNABLE TO RING (the system tray
+     renders it and the app gets no code execution, so no foreground service, no
+     full-screen intent, no Telecom);
+  2. `android.ttl` is a RELATIVE protobuf Duration string while `apns-expiration`
+     is an ABSOLUTE unix timestamp — reusing the APNs value emits a LEGAL
+     ~56,000-year duration, clamped to FCM's four-week ceiling, with no error;
+  3. reaping keyed on HTTP status deletes the whole device table the first time
+     someone typos `PROJECT_ID`, because a wrong project is a 404 for EVERY
+     device on the island.
+
+Each gets a test AND a must-fail arm, because a guard whose outcome does not
+depend on the thing it guards is not a guard.
+
+THE LEGACY HAZARD: `fcm/send` + `Authorization: key=` + `to` + `time_to_live` +
+lowercase `"high"` was decommissioned 2024-06-20. Most circulating FCM material
+is legacy-shaped and none of it works, so the shape is asserted rather than
+assumed.
+"""
+from __future__ import annotations
+
+import json
+import re
+
+import httpx
+import pytest
+import pytest_asyncio
+
+from aiko_gateway.config import settings
+from aiko_gateway.domain import fcm
+from aiko_gateway.domain.push_result import Verdict, WakeKind, WakePayload
+
+CHANNEL = "01JDMCHANNELDM000000000000"
+TOKEN = "cX9:APA91b" + "Z" * 140
+
+# A syntactically real service-account blob. The private key is NEVER used here —
+# `_access_token` is stubbed in every send test — so this carries no key material.
+CREDENTIAL = json.dumps({
+    "type": "service_account",
+    "project_id": "aiko-island-test",
+    "private_key_id": "0123456789abcdef",
+    "private_key": "-----BEGIN PRIVATE KEY-----\nnot-a-real-key\n-----END PRIVATE KEY-----\n",
+    "client_email": "island@aiko-island-test.iam.gserviceaccount.com",
+    "token_uri": "https://oauth2.googleapis.com/token",
+})
+
+
+@pytest.fixture
+def configured(monkeypatch):
+    monkeypatch.setattr(settings, "fcm_service_account_json", CREDENTIAL,
+                        raising=False)
+    fcm.reset_for_tests()
+    yield
+    fcm.reset_for_tests()
+
+
+def _invite() -> WakePayload:
+    return WakePayload(channel_id=CHANNEL, kind=WakeKind.CALL_INVITE, call_id="01JABCDEFGHJKMNPQRSTVWXYZ0")
+
+
+def _message(payload: WakePayload | None = None, **kw) -> dict:
+    return fcm.build_message(TOKEN, payload or _invite(), **kw)
+
+
+# ------------------------------------------------------- the message shape
+
+def test_a_call_message_carries_no_notification_block_anywhere(configured):
+    """PROVES THE PHONE CAN RING, and it is a correctness property rather than a
+    style choice. A message carrying `notification` is a DISPLAY message: a
+    backgrounded or killed app gets NO code execution at all. Data-only at HIGH
+    priority invokes `onMessageReceived` even out of Doze and earns Android 12+'s
+    background foreground-service-start exemption.
+
+    Asserted on the SERIALISED message, not on a key of the top-level dict, so a
+    `notification` nested under `android` cannot slip past.
+    """
+    assert "notification" not in json.dumps(_message())
+
+
+def test_every_data_value_is_a_string(configured):
+    """`message.data` is `map<string,string>`. A non-string value or a nested
+    object is a hard 400 INVALID_ARGUMENT — which fires for EVERY device on the
+    island, not for one bad token."""
+    for kind in WakeKind:
+        data = _message(WakePayload(channel_id=CHANNEL, kind=kind, call_id="01JABCDEFGHJKMNPQRSTVWXYZ0"))["message"]["data"]
+        assert all(isinstance(v, str) for v in data.values())
+
+
+# THE APP TAB'S CONTRACT, AS LITERALS (claude-tasks#4421). Spelled out rather than
+# derived from `WakeKind` on purpose: the receiver matches these exact strings, so a
+# rename of the enum's values must FAIL here instead of silently re-spelling the wire.
+_CONTRACT = {WakeKind.CALL_INVITE: "call_invite", WakeKind.CALL_END: "call_end"}
+
+
+@pytest.mark.parametrize("kind", list(WakeKind))
+def test_the_data_is_exactly_the_app_contract(configured, kind):
+    """`{"c", "k", "m"}` and nothing else. The receiver ignores a missing or
+    unknown `k` and NEVER rings — so the stranded first draft's `{"c"}` alone
+    would have been a 200 from Google, a `delivered` log line here, and a silent
+    handset. `m` is on every wake since calling went v2-only (app design 22)."""
+    data = _message(WakePayload(channel_id=CHANNEL, kind=kind, call_id="01JABCDEFGHJKMNPQRSTVWXYZ0"))["message"]["data"]
+    assert data == {"c": CHANNEL, "k": _CONTRACT[kind], "m": "01JABCDEFGHJKMNPQRSTVWXYZ0"}
+
+
+def test_the_contract_covers_every_wake_kind():
+    """A new `WakeKind` member must be agreed with the app tab before it reaches
+    the wire — this fails until `_CONTRACT` names it, which is the prompt to ask."""
+    assert set(_CONTRACT) == set(WakeKind)
+
+
+def test_the_android_priority_is_uppercase_high(configured):
+    """Protobuf JSON enum parsing is case-sensitive. Lowercase `"high"` is the
+    DECOMMISSIONED legacy API's spelling and is rejected here."""
+    assert _message()["message"]["android"]["priority"] == "HIGH"
+
+
+def test_the_target_is_message_token_not_a_legacy_field(configured):
+    """v1's target is a `oneof` — exactly one of token/topic/condition, INSIDE
+    `message`. Legacy `to` / `registration_ids` do not exist."""
+    message = _message()["message"]
+    assert message["token"] == TOKEN
+    assert "to" not in message and "registration_ids" not in message
+
+
+_TTL = re.compile(r"^\d+(\.\d+)?s$")
+
+
+def _assert_ttl_is_a_relative_duration(ttl: str) -> None:
+    """The guard both TTL tests share, so the must-fail arm exercises THE SAME
+    assertion the real one does rather than a lookalike."""
+    assert _TTL.match(ttl), f"{ttl!r} is not a protobuf Duration string"
+    assert int(float(ttl[:-1])) <= 86400, (
+        f"{ttl!r} is a legal duration but not a RELATIVE one — an absolute unix "
+        "timestamp reused from apns-expiration matches the regex and clamps to "
+        "FCM's four-week ceiling"
+    )
+
+
+def test_the_ttl_is_a_relative_duration_string_within_one_day(configured):
+    """THE BOUND IS THE POINT, not the regex. `"1789000000s"` — an absolute epoch
+    reused from `apns-expiration` — matches `^\\d+(\\.\\d+)?s$` perfectly, so a
+    regex-only guard passes the exact value it exists to catch."""
+    _assert_ttl_is_a_relative_duration(_message()["message"]["android"]["ttl"])
+
+
+@pytest.mark.parametrize("kind", list(WakeKind))
+def test_every_wake_kind_has_a_ttl(configured, kind):
+    """`_TTL_SECONDS` is per kind; a member without one would raise inside the
+    send. This sweep makes that unreachable for every member that exists."""
+    ttl = _message(WakePayload(channel_id=CHANNEL, kind=kind, call_id="01JABCDEFGHJKMNPQRSTVWXYZ0"))[
+        "message"]["android"]["ttl"]
+    _assert_ttl_is_a_relative_duration(ttl)
+
+
+def test_the_invite_ttl_is_the_ring_ceiling(configured):
+    """The 30s ring ceiling (Nick, 2026-09-09) on Android too. The receiver rings
+    at +100ms, before any code can judge the invite's age, so a longer TTL is a
+    ring for a call that is already over. Pinned to the SHARED constant, and to
+    the APNs lease, so the two transports cannot drift apart."""
+    from aiko_gateway.domain import apns
+    from aiko_gateway.domain.push_result import RING_CEILING_SECONDS
+    ttl = _message()["message"]["android"]["ttl"]
+    assert ttl == f"{RING_CEILING_SECONDS}s" == f"{apns._VOIP_LEASE_SECONDS}s"
+
+
+def test_the_end_outlives_the_invite(configured):
+    """A late end is harmless; an expired one leaves a ring running."""
+    invite = _message()["message"]["android"]["ttl"]
+    end = _message(WakePayload(channel_id=CHANNEL, kind=WakeKind.CALL_END,
+                               call_id="01JABCDEFGHJKMNPQRSTVWXYZ0"))["message"]["android"]["ttl"]
+    assert int(end[:-1]) > int(invite[:-1])
+
+
+@pytest.mark.asyncio
+async def test_a_401_on_send_drops_the_cached_access_token(configured, monkeypatch):
+    """A refused access token must not be replayed until its own expiry (Carnot,
+    PR#192 r1): the next send mints fresh."""
+    fcm._state = fcm.AuthState(fcm.Cached("stale-token", float("inf")))
+
+    async def _post(url, **kw):
+        return httpx.Response(401, json={"error": {"status": "UNAUTHENTICATED"}},
+                              request=httpx.Request("POST", url))
+
+    class _C:
+        post = staticmethod(_post)
+
+    monkeypatch.setattr(fcm, "_client", lambda: _C())
+    result = await fcm.send(TOKEN, _invite())
+    assert result.reap is None
+    assert isinstance(fcm._state.phase, fcm.Empty)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [429, 500, 502, 503])
+async def test_a_token_endpoint_blip_is_not_negative_cached(configured, monkeypatch,
+                                                            status):
+    """5xx/429 at the token endpoint is Google blinking, not our key — the same
+    event the transport-error arm refuses to cache (Tesla, PR#192 r2). Backing
+    off would silence every Android ring for a minute."""
+    async def _post(url, **kw):
+        return httpx.Response(status, request=httpx.Request("POST", url))
+
+    class _C:
+        post = staticmethod(_post)
+
+    monkeypatch.setattr(fcm, "_client", lambda: _C())
+    monkeypatch.setattr(fcm, "_sign_assertion", lambda cred: "assertion")
+    assert await fcm._access_token() is None
+    assert isinstance(fcm._state.phase, fcm.Empty)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", [None, "", 7])
+async def test_a_non_string_access_token_is_never_cached(configured, monkeypatch, bad):
+    """A 200 with `access_token: null` used to be cached and replayed as "no
+    token" for ~55 minutes (Tesla, PR#192 r2)."""
+    async def _post(url, **kw):
+        return httpx.Response(200, json={"access_token": bad, "expires_in": 3600},
+                              request=httpx.Request("POST", url))
+
+    class _C:
+        post = staticmethod(_post)
+
+    monkeypatch.setattr(fcm, "_client", lambda: _C())
+    monkeypatch.setattr(fcm, "_sign_assertion", lambda cred: "assertion")
+    assert await fcm._access_token() is None
+    assert isinstance(fcm._state.phase, fcm.MintBackoff)
+
+
+@pytest.mark.parametrize("body", [{"error": "invalid_grant"}, {"error": None},
+                                  {"error": ["x"]}])
+def test_a_non_object_error_field_reads_as_no_code(body):
+    """`error` is checked by type, so a string-shaped error cannot raise out of
+    `send`'s never-raise contract (Tesla, PR#192 r2)."""
+    assert fcm._fcm_error_code(body) == ""
+
+
+def test_an_absolute_epoch_ttl_would_be_rejected():
+    """THE MUST-FAIL ARM. Built BEFORE the assertion was trusted: a harness
+    examined for whether it CAN fail tends to look like it can."""
+    import time
+    with pytest.raises(AssertionError):
+        _assert_ttl_is_a_relative_duration(f"{int(time.time())}s")
+
+
+@pytest.mark.parametrize("kind", list(WakeKind))
+def test_no_wake_carries_a_collapse_key(configured, kind):
+    """A collapse key moves a call wake into FCM's collapsible class: at most four
+    keys per device (past that, "no guarantees about which" survive) and a
+    per-device throttle. Five calls to an offline handset could then lose a call's
+    END. The invite's 30s TTL already gives what the key bought (Tesla, PR#192).
+    Asserted on the serialised message so a key nested anywhere fails."""
+    msg = _message(WakePayload(channel_id=CHANNEL, kind=kind, call_id="01JABCDEFGHJKMNPQRSTVWXYZ0"))
+    assert "collapse_key" not in json.dumps(msg)
+
+
+@pytest.mark.asyncio
+async def test_a_late_401_does_not_clear_a_newer_token(configured, monkeypatch):
+    """Compare-and-clear (Tesla, PR#192 r3): a 401 for an OLD bearer must not
+    wipe a token another wave has since minted."""
+    fcm._state = fcm.AuthState(fcm.Cached("old", float("inf")))
+
+    async def _post(url, **kw):
+        fcm._state = fcm.AuthState(fcm.Cached("new", float("inf")))  # wave B minted meanwhile
+        return httpx.Response(401, json={}, request=httpx.Request("POST", url))
+
+    class _C:
+        post = staticmethod(_post)
+
+    monkeypatch.setattr(fcm, "_client", lambda: _C())
+    await fcm.send(TOKEN, _invite())
+    assert fcm._state.phase == fcm.Cached("new", float("inf"))
+
+
+# ------------------------------------------------------------------ the URL
+
+async def test_the_send_url_carries_the_project_id_from_the_credential_blob(
+    configured, monkeypatch
+):
+    """DERIVED, never a second setting. A `fcm_project_id` field creates a class
+    where the key and the project disagree, and that class's symptom is a 404 for
+    every device on the island."""
+    seen: list[httpx.Request] = []
+
+    async def _run():
+        return await fcm.send(TOKEN, _invite())
+
+    await _drive(monkeypatch, seen, httpx.Response(200, json={"name": "projects/x/messages/1"}), _run)
+    assert str(seen[0].url) == (
+        "https://fcm.googleapis.com/v1/projects/aiko-island-test/messages:send")
+
+
+# ------------------------------------------------------------ verdict mapping
+
+def _error(status: int, code: str | None, *, extra_details: list | None = None) -> dict:
+    details = list(extra_details or [])
+    if code is not None:
+        details.append({
+            "@type": "type.googleapis.com/google.firebase.fcm.v1.FcmError",
+            "errorCode": code,
+        })
+    return {"error": {"code": status, "status": "X", "message": "m",
+                      "details": details}}
+
+
+def test_unregistered_is_the_only_reaping_verdict():
+    """Apple's 410 analogue: FCM making a positive claim about the DEVICE."""
+    body = _error(404, "UNREGISTERED")
+    assert fcm._verdict(404, fcm._fcm_error_code(body)) is Verdict.DEAD_TOKEN
+
+
+def test_a_404_without_an_fcm_error_detail_does_not_reap():
+    """THE MUST-FAIL ARM FOR THE TEST ABOVE, and the single reason the reap key
+    is the FcmError detail rather than the HTTP status. A wrong `PROJECT_ID` in
+    the URL is a bare 404 NOT_FOUND for EVERY device on the island; a
+    status-keyed reaper would empty the device table on the first ring, and the
+    recovery is every user reopening the app."""
+    body = _error(404, None)
+    assert fcm._fcm_error_code(body) == ""
+    assert fcm._verdict(404, fcm._fcm_error_code(body)) is Verdict.REJECTED
+
+
+def test_the_error_code_is_read_by_type_not_by_position():
+    """`details` is an array that can carry `google.rpc.RetryInfo` alongside the
+    `FcmError`. A `details[0]` reader goes red here."""
+    body = _error(404, "UNREGISTERED", extra_details=[
+        {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "10s"},
+    ])
+    assert body["error"]["details"][0]["@type"].endswith("RetryInfo")
+    assert fcm._fcm_error_code(body) == "UNREGISTERED"
+
+
+def test_invalid_argument_never_reaps():
+    """THE BRIEF'S TAXONOMY, CORRECTED. `INVALID_ARGUMENT` is overwhelmingly OUR
+    bug — a bad ttl string, a non-string data value, a lowercase "high", an
+    unknown field — and therefore fires IDENTICALLY FOR EVERY DEVICE. It can also
+    mean "this token string is unparseable" and the response gives no way to tell
+    them apart. One direction costs a wasted request per send; the other destroys
+    state nothing can rebuild."""
+    body = _error(400, "INVALID_ARGUMENT")
+    assert fcm._verdict(400, fcm._fcm_error_code(body)) is Verdict.REJECTED
+
+
+def test_sender_id_mismatch_never_reaps():
+    """A LIVE token minted against a different Firebase project — an island
+    CONFIG fact, the structural twin of BadDeviceToken-from-the-wrong-environment,
+    arriving as a 403. A second independent reason never to reap on a generic 4xx."""
+    body = _error(403, "SENDER_ID_MISMATCH")
+    assert fcm._verdict(403, fcm._fcm_error_code(body)) is Verdict.REJECTED
+
+
+def test_transients_are_transient_and_nothing_else_reaps():
+    assert fcm._verdict(200, "") is Verdict.DELIVERED
+    assert fcm._verdict(429, "QUOTA_EXCEEDED") is Verdict.TRANSIENT
+    assert fcm._verdict(503, "UNAVAILABLE") is Verdict.TRANSIENT
+    assert fcm._verdict(500, "INTERNAL") is Verdict.TRANSIENT
+    assert fcm._verdict(401, "") is Verdict.REJECTED
+
+
+def test_only_unregistered_carries_a_reap_order():
+    """The shared `SendResult` has a genuinely WEAKER arm on this side: FCM's
+    UNREGISTERED response carries no timestamp, so `not_reregistered_since` is
+    None and the compare-and-delete carries the reversibility alone."""
+    order = fcm._reap_order_for(Verdict.DEAD_TOKEN)
+    assert order is not None and order.not_reregistered_since is None
+    assert fcm._reap_order_for(Verdict.REJECTED) is None
+    assert fcm._reap_order_for(Verdict.TRANSIENT) is None
+    assert fcm._reap_order_for(Verdict.DELIVERED) is None
+
+
+# ------------------------------------------------------------------ the send
+
+async def _drive(monkeypatch, seen: list, response, coro_factory):
+    """Run `coro_factory()` against a MockTransport pinned as fcm's pooled client.
+
+    `_access_token` is stubbed: these arms are about the MESSAGE endpoint, and
+    the OAuth arms below drive the real exchange instead.
+    """
+    def _handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return response(request) if callable(response) else response
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(_handler))
+    monkeypatch.setattr(fcm, "_client_singleton", client, raising=False)
+
+    async def _token():
+        return "stub-access-token"
+
+    monkeypatch.setattr(fcm, "_access_token", _token)
+    try:
+        return await coro_factory()
+    finally:
+        await client.aclose()
+
+
+async def test_a_200_is_delivered_and_the_body_is_the_v1_api_envelope(
+    configured, monkeypatch
+):
+    seen: list[httpx.Request] = []
+    result = await _drive(
+        monkeypatch, seen,
+        httpx.Response(200, json={"name": "projects/aiko-island-test/messages/1"}),
+        lambda: fcm.send(TOKEN, _invite()))
+    assert result.verdict is Verdict.DELIVERED and result.reap is None
+    body = json.loads(seen[0].content)
+    assert set(body) == {"message"}
+    assert body["message"]["android"] == {"priority": "HIGH", "ttl": "30s"}
+    assert seen[0].headers["authorization"] == "Bearer stub-access-token"
+
+
+async def test_an_unregistered_response_returns_a_reap_order(configured, monkeypatch):
+    result = await _drive(
+        monkeypatch, [],
+        httpx.Response(404, json=_error(404, "UNREGISTERED")),
+        lambda: fcm.send(TOKEN, _invite()))
+    assert result.verdict is Verdict.DEAD_TOKEN
+    assert result.reap is not None and result.reap.not_reregistered_since is None
+
+
+async def test_a_transport_error_is_transient_and_never_raises(configured, monkeypatch):
+    """`push_service`'s per-device `except Exception` must stay the EXCEPTIONAL
+    path. If a transport raises for an ordinary network failure, Google being
+    briefly unreachable reads as our bug forever."""
+    def _boom(request):
+        raise httpx.ConnectError("no route to host")
+
+    result = await _drive(monkeypatch, [], _boom,
+                          lambda: fcm.send(TOKEN, _invite()))
+    assert result.verdict is Verdict.TRANSIENT
+
+
+async def test_send_raises_only_when_unconfigured(monkeypatch):
+    """The same raise contract `apns.send` states: `FcmNotConfigured` is a CALLER
+    bug, because `push_service` gates on `is_configured()` first."""
+    monkeypatch.setattr(settings, "fcm_service_account_json", "", raising=False)
+    fcm.reset_for_tests()
+    with pytest.raises(fcm.FcmNotConfigured):
+        await fcm.send(TOKEN, _invite())
+
+
+# ------------------------------------------------------------------- oauth
+
+def _oauth(monkeypatch, seen: list, token_response):
+    """A MockTransport that answers the Google token endpoint and the FCM send
+    endpoint differently, with `_access_token` NOT stubbed."""
+    def _handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if "oauth2.googleapis.com" in str(request.url):
+            return token_response
+        return httpx.Response(200, json={"name": "projects/x/messages/1"})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(_handler))
+    monkeypatch.setattr(fcm, "_client_singleton", client, raising=False)
+    monkeypatch.setattr(fcm, "_sign_assertion", lambda cred: "stub-assertion")
+    return client
+
+
+async def test_an_oauth_failure_returns_transient_and_never_raises(
+    configured, monkeypatch
+):
+    """FCM auth is a NETWORK EXCHANGE that can fail independently of the send —
+    the sharpest divergence from APNs, whose auth is local signing that can only
+    fail on a broken key the boot guard already caught."""
+    seen: list[httpx.Request] = []
+    client = _oauth(monkeypatch, seen, httpx.Response(401, json={"error": "x"}))
+    try:
+        result = await fcm.send(TOKEN, _invite())
+    finally:
+        await client.aclose()
+    assert result.verdict is Verdict.TRANSIENT
+    assert all("oauth2" in str(r.url) for r in seen), (
+        "a send went out on an unauthenticated request")
+
+
+async def test_a_hard_oauth_rejection_is_negative_cached(configured, monkeypatch):
+    """Without the negative cache one bad credential is one POST to Google's
+    rate-limited token endpoint PER DEVICE PER RING, plus an ERROR line each."""
+    seen: list[httpx.Request] = []
+    client = _oauth(monkeypatch, seen, httpx.Response(401, json={"error": "x"}))
+    try:
+        await fcm.send(TOKEN, _invite())
+        await fcm.send(TOKEN, _invite())
+    finally:
+        await client.aclose()
+    assert len([r for r in seen if "oauth2" in str(r.url)]) == 1, (
+        "the second send re-minted against a credential already known bad")
+
+
+async def test_a_good_oauth_token_is_cached_across_sends(configured, monkeypatch):
+    """THE POSITIVE CONTROL for the negative cache: a working credential must
+    also mint once — otherwise "exactly one token request" above would be
+    satisfied by a transport that never mints at all."""
+    seen: list[httpx.Request] = []
+    client = _oauth(monkeypatch, seen,
+                    httpx.Response(200, json={"access_token": "ya29.stub",
+                                              "expires_in": 3599}))
+    try:
+        first = await fcm.send(TOKEN, _invite())
+        second = await fcm.send(TOKEN, _invite())
+    finally:
+        await client.aclose()
+    assert first.verdict is Verdict.DELIVERED and second.verdict is Verdict.DELIVERED
+    assert len([r for r in seen if "oauth2" in str(r.url)]) == 1
+    assert len([r for r in seen if "fcm.googleapis.com" in str(r.url)]) == 2
+
+
+async def test_the_assertion_requests_the_narrow_messaging_scope(configured, monkeypatch):
+    """`firebase.messaging`, not `cloud-platform` — which also works and is far
+    broader."""
+    seen: list[httpx.Request] = []
+    client = _oauth(monkeypatch, seen,
+                    httpx.Response(200, json={"access_token": "ya29.stub",
+                                              "expires_in": 3599}))
+    try:
+        await fcm.send(TOKEN, _invite())
+    finally:
+        await client.aclose()
+    token_request = [r for r in seen if "oauth2" in str(r.url)][0]
+    body = token_request.content.decode()
+    assert "grant-type%3Ajwt-bearer" in body or "grant-type:jwt-bearer" in body
+    assert fcm._SCOPE == "https://www.googleapis.com/auth/firebase.messaging"
+
+
+# ------------------------------------------------------------------ configured
+
+def test_is_configured_is_a_single_field(monkeypatch):
+    """ONE field means no half-configured state exists — which is why this is
+    `bool(...)` rather than the written-out `all()` `apns.is_configured` uses.
+    Honest ONLY because the boot guard rejects an unparseable blob."""
+    monkeypatch.setattr(settings, "fcm_service_account_json", "", raising=False)
+    assert fcm.is_configured() is False
+    monkeypatch.setattr(settings, "fcm_service_account_json", CREDENTIAL,
+                        raising=False)
+    assert fcm.is_configured() is True
+
+
+# ---------------------------------------------------------------------------
+# THE CREDENTIAL THE BOOT LADDER BLESSES AND THE SIGNER CANNOT USE.
+#
+# config.py's ladder requires only ("project_id", "client_email", "private_key").
+# A real service-account blob normally also carries "private_key_id", and the
+# signer passed it straight into PyJWT's `kid` header — where a None is a hard
+# rejection, not a shrug. So a credential that BOOTS FINE made every send raise:
+# Android totally deaf, /health green, one traceback per device per ring, and the
+# negative cache unreachable because it lives on the return path.
+#
+# `kid` is optional on a JWT-bearer assertion (Google identifies the key from
+# `iss`), so the fix is to omit it rather than to widen the ladder.
+# ---------------------------------------------------------------------------
+
+
+def _credential_without_kid() -> str:
+    """Exactly what the boot ladder accepts, and nothing more."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    pem = rsa.generate_private_key(public_exponent=65537, key_size=2048).private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode()
+    return json.dumps({
+        "project_id": "test-project",
+        "client_email": "svc@test-project.iam.gserviceaccount.com",
+        "private_key": pem,
+    })
+
+
+def test_a_credential_with_no_private_key_id_still_signs():
+    """THE MUST-FAIL ARM. Against the pre-fix signer this raises
+    `InvalidTokenError: Key ID header parameter must be a string`."""
+    cred = json.loads(_credential_without_kid())
+    token = fcm._sign_assertion(cred)
+    assert isinstance(token, str) and token.count(".") == 2
+    import jwt as _jwt
+    assert "kid" not in _jwt.get_unverified_header(token), (
+        "an absent private_key_id must OMIT the kid header, never send a null one"
+    )
+
+
+def test_a_real_private_key_id_is_still_carried():
+    """The positive control. Without it the test above would pass just as well if
+    the signer dropped `kid` unconditionally — which would be a different bug."""
+    cred = json.loads(_credential_without_kid())
+    cred["private_key_id"] = "abc123"
+    import jwt as _jwt
+    assert _jwt.get_unverified_header(fcm._sign_assertion(cred))["kid"] == "abc123"
+
+
+@pytest.mark.asyncio
+async def test_an_unusable_credential_returns_transient_and_never_raises(monkeypatch):
+    """The stated raise contract, enforced. `fcm.send`'s docstring promises it
+    never raises for an auth failure; before this change `_credential()` and
+    `_sign_assertion()` sat OUTSIDE every handler, so the promise held only for
+    the network POST."""
+    monkeypatch.setattr(settings, "fcm_service_account_json",
+                        '{"project_id":"p","client_email":"e","private_key":"not-a-pem"}',
+                        raising=False)
+    fcm.reset_for_tests()
+    result = await fcm.send("f" * 100, _invite())
+    assert result.verdict is Verdict.TRANSIENT
+    assert result.reap is None, "an unusable credential must never reap a token"
+
+
+@pytest.mark.asyncio
+async def test_an_unusable_credential_is_negative_cached(monkeypatch):
+    """Unlike a transport blip, a credential defect will not fix itself — so it is
+    backed off rather than retried once per device per ring."""
+    monkeypatch.setattr(settings, "fcm_service_account_json",
+                        '{"project_id":"p","client_email":"e","private_key":"not-a-pem"}',
+                        raising=False)
+    fcm.reset_for_tests()
+    await fcm.send("f" * 100, _invite())
+    assert isinstance(fcm._state.phase, fcm.MintBackoff), (
+        "the negative cache must be reachable from the credential path, not only "
+        "from the HTTP-status path"
+    )

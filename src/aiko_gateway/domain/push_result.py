@@ -16,6 +16,7 @@ from __future__ import annotations
 import dataclasses
 import datetime as dt
 import enum
+import re
 
 
 class Verdict(enum.Enum):
@@ -128,6 +129,24 @@ class SendResult:
     reap: ReapOrder | None = None
 
 
+# THE RING CEILING, SHARED BY BOTH TRANSPORTS (Nick, 2026-09-09; claude-tasks#3744).
+# The island owns a 30s ring, and the mechanism is the push's own expiry: a ring
+# push that outlives the ring stores a push that reports a call already over. It
+# lives HERE, in the vocabulary both transports already import, because the two
+# transports are siblings that may not import each other — so before this, iOS
+# had the ruling as `apns._VOIP_LEASE_SECONDS` and Android had a different number
+# (60) justified by a premise the Android receiver falsified (it rings at +100ms,
+# before any code can judge the invite's age). One constant, two consumers.
+RING_CEILING_SECONDS = 30
+
+# How long an END wake may wait for delivery. Longer than the ring on purpose: a
+# late end is harmless (it stops nothing, or a ring that should already be over),
+# while an end that expires before a reconnecting handset sees it leaves a phantom
+# ring. The value is apns' existing end expiry, hoisted unchanged; reconciling the
+# four call clocks is claude-tasks#4233, and this is not that answer.
+END_WAKE_EXPIRY_SECONDS = 300
+
+
 class WakeKind(enum.Enum):
     """WHAT KIND OF WAKE this is — the thing `push_service.should_wake` decides,
     carried as a value instead of re-derived four hundred lines away.
@@ -181,6 +200,22 @@ class WakeKind(enum.Enum):
     # It lives HERE, at the definition of the values it ranges over, because a
     # rule recorded only in the repo that implements it is a rule the other repo
     # can silently stop honouring.
+
+
+# THE CALL ID'S SHAPE, enforced where the value is CONSTRUCTED, not only where it
+# is parsed (Carnot, cage-match PR#192 r1). `push_service.parse_call_body` is the
+# only producer today, but a field typed `str | None` admits `call_id="alice"`
+# from any future caller, and both transports would render it to Apple/Google
+# as `m`. Validating in `WakePayload.__post_init__` makes the impossible `m`
+# impossible rather than conventional.
+#
+# 26 CHARACTERS OF CANONICAL CROCKFORD BASE32 — called a "ULID" in design 12 for
+# its encoding and its 128-bit width, NOT for timestamp semantics. The app fills
+# all 128 bits from a CSPRNG with no time component (app PR #210), so do not
+# decode a time out of it. Shared with the app's `_callIdPattern` literal, which a
+# cross-repo test pins.
+CALL_ID_PATTERN = r"[0-7][0-9A-HJKMNP-TV-Z]{25}"
+_CALL_ID = re.compile(CALL_ID_PATTERN)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -262,3 +297,27 @@ class WakePayload:
     # prevent, reintroduced as a silent fallback. The type makes forgetting a
     # TypeError instead.
     kind: WakeKind
+    # THE CALL ID — design 12 Decision 1's client-minted ULID, copied out of a v2
+    # body. ALWAYS PRESENT: v1 bodies never wake (app design 22 §v2.0, Nick
+    # 2026-10-06), so the old `None`-means-v1 state is gone from the type. REQUIRED, NO DEFAULT, for the same
+    # reason as `kind`: a default of None would let a caller that forgets it ship
+    # every v2 call as v1-shaped — the receiver would fall back to channel keying
+    # and the duplicate-vs-redial bug (app design 21) would return silently.
+    #
+    # THE ISLAND PUTS NO IDENTITY HERE — but this field is weaker than `kind`, and
+    # the difference is stated rather than hidden. `kind` is a closed enum; this is
+    # 128 bits the CALLER chooses, copied verbatim. A well-behaved client mints a
+    # random ULID; a caller who wanted to could encode anything about ITSELF in it,
+    # and the provider would see it. The island's guarantee is the shape (the
+    # fullmatch in `push_service.parse_call_body`), not the content.
+    #
+    # Other costs: the provider can now link an invite to its end EXACTLY (it
+    # could already guess from `c` and timing). NO MINT TIME rides in it: the app
+    # fills all 128 bits from a CSPRNG (app PR #210), so do not read a ULID's
+    # usual 48-bit timestamp out of `m` — the format is ULID-shaped, the content
+    # is not (Tesla, cage-match PR#192 r3: this line used to say otherwise).
+    call_id: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.call_id, str) or not _CALL_ID.fullmatch(self.call_id):
+            raise ValueError("call_id is not a canonical 26-char call id")

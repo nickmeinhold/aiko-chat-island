@@ -176,6 +176,7 @@ import asyncio
 import dataclasses
 import datetime as dt
 import logging
+import re
 from collections.abc import Callable, Sequence
 from typing import Literal, assert_never
 
@@ -184,11 +185,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import settings
 from ..db import SessionLocal
-from . import apns, moderation_service
+from . import apns, fcm, moderation_service
 from .models import (Channel, ChannelKind, DeviceToken, Membership, Message,
                      Platform, ApnsEnvironment, TokenKind, User)
-from .push_result import (ReapOrder, SendResult, Verdict, WakeKind,
-                          WakePayload)
+from .push_result import (CALL_ID_PATTERN, ReapOrder, SendResult, Verdict,
+                          WakeKind, WakePayload)
 from .rate_limit import limiter
 
 log = logging.getLogger("aiko_gateway.push")
@@ -245,23 +246,14 @@ CALL_END_BODY = "aiko:call/1 · 📞 ended the call"
 # Iterating a registry to dispatch would be a second door wearing a dict — sending
 # goes through the single `match` on the Delivery union in `_wake_user` and
 # nowhere else.
-def _fcm_not_built() -> bool:
-    """Android is NOT BUILT — never configured, by construction, not by config.
-
-    The totality guard below demands an answer for every `Platform` member, and
-    this is the honest one. It is a FUNCTION rather than a bare `False` so the
-    reason has somewhere to live: design 14's temper dissolved shipping an FCM
-    send path ahead of the client's receive half, so there is no credential an
-    operator could set that would make this True. When Android ships end-to-end,
-    this is replaced by a real `fcm.is_configured` — and the closed-set guard is
-    what will make sure every other address gets updated in the same change.
-    """
-    return False
-
-
 _CONFIG_PROBES: dict[Platform, Callable[[], bool]] = {
     Platform.APNS: apns.is_configured,
-    Platform.FCM: _fcm_not_built,
+    # A REAL PROBE since claude-tasks#4421 (2026-10-05). Until then this was
+    # `_fcm_not_built`, a constant False, because design 14's temper dissolved
+    # shipping a send path ahead of the client's receive half. The receive half
+    # is now built and hardware-verified app-side, so the credential IS the switch,
+    # the same as APNs and LiveKit.
+    Platform.FCM: fcm.is_configured,
 }
 
 # TOTALITY AT IMPORT, not at first ring. A `Platform` member added without a probe
@@ -316,14 +308,6 @@ _in_flight: set[asyncio.Task] = set()
 ChannelKindStr = Literal["standard", "llm", "robot", "dm"]
 
 
-def is_call_invite(body: str) -> bool:
-    """Exact match, never `startswith`/`in`. A prefix test would let any message
-    beginning with the sentinel wake a device, which hands an attacker a wake
-    primitive with arbitrary trailing content. Mirrors the app's
-    `isCallInviteBody`, which is exact for the same reason."""
-    return body == CALL_INVITE_BODY
-
-
 # THE END-WAKE INTERLOCK — CLOSED BY DEFAULT, and it is a CONSTANT rather than a
 # Settings field on purpose (consolidation retro 2026-09-11, Kelvin + Carnot
 # converging independently).
@@ -359,14 +343,57 @@ def is_call_invite(body: str) -> bool:
 END_WAKE_VOIP_GATE_OPEN = False
 
 
-def is_call_end(body: str) -> bool:
-    """Exact match, for the identical reason `is_call_invite` is exact — and the
-    reason is NOT weaker here just because the privilege is smaller. Forging a
-    stop only suppresses a ring, which a hostile island could do by dropping the
-    invite anyway; but a `startswith` test would still hand any sender a VoIP
-    wake primitive with arbitrary trailing content, and the budget it spends is
-    the recipient's. Mirrors the app's `isCallEndBody`."""
-    return body == CALL_END_BODY
+# CALL WIRE v2 — the call id IS in the signed body (design 12 Decision 1; bytes
+# pinned with the app tab 2026-10-06, claude-tasks#4421). The caller mints a ULID,
+# the island carries it into the wake as `m`, and the island owns no call object.
+#
+# A FIXED FRAME AROUND A CONSTRAINED ID, so v1's exactness property survives: the
+# only variable span is 26 characters of canonical uppercase Crockford base32, and
+# `fullmatch` admits nothing before or after it. That is NOT a wake primitive with
+# arbitrary content — it is v1's exact match with a slot in it that can only hold a
+# call id. The tail is v1's, byte for byte, so a build that predates v2 renders a
+# readable message rather than a bare token.
+#
+# `[0-7]` LEADS because a 26-char Crockford string encodes 130 bits and a ULID is
+# 128: a first character above 7 overflows, and could not map losslessly onto the
+# UUID CallKit and ConnectionService both require. The regex is therefore also
+# the "is this convertible" check. Lowercase is REJECTED, not normalised — the app
+# mints uppercase, and accepting two spellings of one id is two ids.
+#
+# v1 NEVER WAKES (app design 22 §v2.0; Nick, 2026-10-06: calling is v2-only).
+# `CALL_INVITE_BODY` / `CALL_END_BODY` stay pinned above as HISTORY — they are
+# inside signed messages on both live islands, are stored and served forever, and
+# design 12's "recognised forever" is honoured as RENDERING, client-side. They are
+# never a call: no store build ever placed one, and a wake for one only made iOS
+# report-and-end a VoIP push (a buzz per invite from an old dev build). So every
+# wake now carries `m`, and "no `m`" is no longer a state the wire can be in.
+# The id's character class lives in `push_result` (CALL_ID_PATTERN), where
+# `WakePayload` enforces it at construction; the parser and the payload share ONE
+# definition, pinned against the app's `_callIdPattern` by a cross-repo test.
+_CALL_V2 = re.compile(
+    r"aiko:call/2 (?P<id>" + CALL_ID_PATTERN + r") \u00b7 \U0001F4DE "
+    r"(?P<verb>started a call|ended the call)")
+
+
+def parse_call_body(body: str) -> tuple[WakeKind, str] | None:
+    """THE ONE PLACE a call sentinel is recognised: `(kind, call_id)` or None.
+
+    v2 ONLY. A v1 body is an ordinary message here — stored, served, never a
+    wake. `should_wake` and `wake_for_message` both read THIS, so the gate that
+    decides whether to wake and the field that names the call cannot disagree
+    about what a body means.
+
+    The id is COPIED from the body the island persisted — the bytes the caller
+    signed. The island cannot verify that signature (it never could; the push is
+    trusted for nothing beyond "ring/end call m on channel c"), but it never
+    invents, rewrites or normalises the id either.
+    """
+    match = _CALL_V2.fullmatch(body)
+    if match is None:
+        return None
+    kind = (WakeKind.CALL_INVITE if match["verb"] == "started a call"
+            else WakeKind.CALL_END)
+    return kind, match["id"]
 
 
 def should_wake(channel_kind: ChannelKindStr, body: str) -> WakeKind | None:
@@ -394,11 +421,8 @@ def should_wake(channel_kind: ChannelKindStr, body: str) -> WakeKind | None:
     """
     if channel_kind != ChannelKind.DM.value:
         return None
-    if is_call_invite(body):
-        return WakeKind.CALL_INVITE
-    if is_call_end(body):
-        return WakeKind.CALL_END
-    return None
+    parsed = parse_call_body(body)
+    return None if parsed is None else parsed[0]
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -420,12 +444,21 @@ class ApnsDelivery:
 
 
 
-# ONE MEMBER TODAY. Kept as an alias rather than collapsed to ApnsDelivery:
-# `Platform` is still a closed set with a live FCM member (both islands hold
-# Android rows), so the router's exhaustiveness is a real property, not a
-# formality — and design 14's temper was explicit that a second transport
-# must EARN the shared shape rather than have it predicted for it.
-Delivery = ApnsDelivery
+@dataclasses.dataclass(frozen=True, slots=True)
+class FcmDelivery:
+    """One push to send to Google. NO environment and NO token kind: FCM has one
+    registry and one endpoint per project, and carrying a field the transport
+    cannot honour would read as a routing decision nothing downstream makes."""
+
+    row_id: str
+    token: str
+    updated_at: dt.datetime
+
+
+# TWO MEMBERS since claude-tasks#4421. Design 14's temper said a second transport
+# must EARN the shared shape rather than have it predicted for it; the shape it
+# earned is a SEPARATE member, not a widened ApnsDelivery with optional fields.
+Delivery = ApnsDelivery | FcmDelivery
 
 
 def plan_deliveries(
@@ -507,13 +540,6 @@ def plan_deliveries(
             # reason instead of raising into a fanout.
             platform = Platform(row.platform)
             kind = TokenKind(row.token_kind)
-            # NOT-BUILT IS CHECKED FIRST, and the order is the point: a transport
-            # this island cannot speak at all must not be reported as
-            # `transport_not_configured`, which names something the operator could
-            # fix. There is nothing to fix — Android has no send path here yet.
-            if platform is Platform.FCM:
-                skips.append((row.id, "transport_not_built"))
-                continue
             if platform not in configured:
                 # OPERATOR-FIXABLE, and loud enough to be findable without being
                 # the alarm. The property it preserves: an Android device that
@@ -580,6 +606,42 @@ def plan_deliveries(
                     deliveries.append(ApnsDelivery(
                         row.id, row.token, row.updated_at,
                         ApnsEnvironment(row.apns_environment), kind))
+                case Platform.FCM:
+                    # THE ONE REAL ROUTING DIFFERENCE FROM APNs (claude-tasks#4421,
+                    # the app tab's contract). Android has ONE token kind: FCM rows
+                    # register as `alert`, and ring-ness is a property of the
+                    # MESSAGE (data-only + HIGH), not of the token. So BOTH wakes go
+                    # to the alert row.
+                    #
+                    # `end_wake_needs_voip` MUST NOT CARRY OVER. Its whole argument
+                    # is that an APNs alert push runs no app code and so cannot end
+                    # a ring. A data-only FCM push DOES run app code — that is how
+                    # it rings in the first place — and the receiver dismisses on a
+                    # matching `m` (measured: 1ms after delivery). Applying the APNs
+                    # skip here would mean an Android hangup never stops the other
+                    # phone ringing.
+                    #
+                    # NOR does `end_wake_gate_open`. That interlock defends iOS's
+                    # must-report-to-CallKit obligation against a handset build
+                    # that cannot handle a VoIP end push (#4278). Android has no
+                    # must-report rule: a lone `call_end` is harmless on the
+                    # receiver (it tombstones `m`, so a late invite never rings),
+                    # so there is nothing for the gate to protect.
+                    #
+                    # THE ROW'S KIND IS INERT HERE — matched on `wake` only. This
+                    # once skipped a `voip`-kind FCM row by name, which contradicted
+                    # the decision recorded at `rest/devices.py` (inert for 'fcm',
+                    # deliberately not rejected) and this function's own arm (B):
+                    # a mislabelled row still holds a valid FCM token, sending to it
+                    # costs nothing, and dropping it is a missed call whose only
+                    # trace is a log line (cage-match PR#192 r1).
+                    match wake:
+                        case WakeKind.CALL_INVITE | WakeKind.CALL_END:
+                            pass
+                        case _:
+                            raise ValueError(f"unrouted fcm wake={wake}")
+                    deliveries.append(
+                        FcmDelivery(row.id, row.token, row.updated_at))
                 case _:
                     assert_never(platform)
         except ValueError:
@@ -753,7 +815,7 @@ async def reachability(session: AsyncSession) -> dict:
             reachable = False
         if not reachable:
             unreachable_by_platform[platform_value] = count
-    return {
+    report = {
         "configured": bool(configured),
         "registered_devices": sum(count for _, count in counts),
         # Kept as its own field rather than left for the reader to derive: this is
@@ -762,6 +824,15 @@ async def reachability(session: AsyncSession) -> dict:
         "unreachable_devices": sum(unreachable_by_platform.values()),
         "unreachable_by_platform": unreachable_by_platform,
     }
+    # CONFIGURED IS NOT REACHABLE, for Android (design 17 v4). A credential can be
+    # present and every ring still silent: its account lost its role (send-side
+    # PERMISSION_DENIED), or its key is refused at mint. Present only when FCM is
+    # configured, so an island without Android reports exactly what it always did.
+    # Body-only by design: the container healthcheck reads the status code, and an
+    # IAM outage must not become a restart loop (see `fcm.auth_status`).
+    if Platform.FCM in configured:
+        report["fcm_auth"] = fcm.auth_status()
+    return report
 
 
 # What an operator must set to make each transport reachable. Keyed by the STORED
@@ -779,15 +850,20 @@ _UNREACHABLE_REMEDY = {
                           "box's docker-compose.yml actually forwards them "
                           "(#2301: update.sh pulls the image, it does NOT sync "
                           "compose)"),
-    # NOT BUILT, so there is NOTHING an operator can set (design 14 temper). The
-    # earlier wording told them to set a credential, then a later round told them
-    # NOT to set it while a boot guard refused it — two rounds of findings were
-    # that contradiction leaking across surfaces. With no FCM send path there is no
-    # credential, no guard and no contradiction: the remedy states a fact about the
-    # island's capabilities rather than an action the operator cannot usefully take.
-    Platform.FCM.value: ("Android push is NOT BUILT on this island — there is no "
-                         "credential to set. These devices are unreachable until "
-                         "the Android transport ships with its client receive half"),
+    # A REAL CREDENTIAL AGAIN, since the send path exists (claude-tasks#4421). The
+    # NOT-BUILT wording this replaced was correct only while there was no send path;
+    # left in place it would now tell an operator something false about the island.
+    #
+    # ONE IMPERATIVE (Tesla, cage-match PR#192 r2). This also said "Hold until the
+    # app's Android receive half is merged" — a second, opposite instruction in a
+    # string printed on every boot of an island with Android rows, and one with an
+    # expiry date baked into permanent operator text. The hold is a DEPLOY-ORDER
+    # fact (this ships after the app half; claude-tasks#4421 records it), not a
+    # property of the island, so it belongs in the release, not in the remedy.
+    Platform.FCM.value: ("Set FCM_SERVICE_ACCOUNT_JSON (single-line service-account "
+                         "JSON, `jq -c .`), and check this box's docker-compose.yml "
+                         "actually forwards it (#2301: update.sh pulls the image, "
+                         "it does NOT sync compose)"),
 }
 
 
@@ -962,6 +1038,13 @@ async def _wake_user(session: AsyncSession, user_id: str, *, wake: WakeKind,
                     log.info("apns sent device=%s env=%s kind=%s verdict=%s",
                              delivery.row_id, delivery.apns_environment.value,
                              delivery.token_kind.value, result.verdict.value)
+                case FcmDelivery():
+                    # No collapse key, deliberately: see `fcm.build_message`.
+                    result = await fcm.send(delivery.token, payload)
+                    # Same semantic record as the APNs line above: the row's ULID,
+                    # never the token.
+                    log.info("fcm sent device=%s verdict=%s",
+                             delivery.row_id, result.verdict.value)
                 case _:
                     assert_never(delivery)
         except Exception:
@@ -1215,7 +1298,10 @@ async def wake_for_message(*, channel_id: str, channel_kind: ChannelKindStr, sen
             # decision someone makes rather than one they inherit.
             recipients = await _spoken_here(
                 session, channel_id=channel_id, user_ids=recipients)
-            payload = WakePayload(channel_id=channel_id, kind=wake)
+            # The call id comes from the SAME parser the gate just used; `wake` is
+            # not None here, so the body parsed.
+            payload = WakePayload(channel_id=channel_id, kind=wake,
+                                  call_id=parse_call_body(body)[1])
             for user_id in recipients:
                 # The per-recipient budget is charged inside _wake_user, once the
                 # recipient is known to have a device worth waking.
