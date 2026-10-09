@@ -44,6 +44,29 @@ _MODEL_TABLES = {
 }
 
 
+def _norm_check_clause(x: str) -> str:
+    """Normalise a CHECK clause for comparison WITHOUT folding the literals' case.
+
+    Whitespace and quote style differ between SQLAlchemy's rendering and the
+    migrated DDL; letter case INSIDE the literals does not, and must not be
+    erased. SQLite compares `IN (...)` strings under BINARY collation, so a
+    migration that wrote 'Taken_Down' against an enum value 'taken_down' refuses
+    every legitimate write. These gates once lowercased the whole clause, which
+    made exactly that drift compare equal (Carnot, PR #191). Only the keyword is
+    case-folded, and it is folded BEFORE whitespace is removed, while the word
+    boundary in front of it still exists.
+    """
+    s = re.sub(r"(?i)\s+in\s*\(", " IN (", str(x))
+    return "".join(s.split()).replace('"', "'")
+
+
+def test_check_clause_norm_keeps_literal_case() -> None:
+    """Must-fail control for `_norm_check_clause`: a case-only drift in a
+    literal must NOT compare equal, while keyword case and spacing may."""
+    assert _norm_check_clause("k IN ('Taken_Down')") != _norm_check_clause("k IN ('taken_down')")
+    assert _norm_check_clause('k in ( "a",  "b" )') == _norm_check_clause("k IN ('a','b')")
+
+
 def _point_app_at(tmp_path, monkeypatch) -> tuple[str, str]:
     """Point the app+alembic at a throwaway file DB. Returns (async_url, sync_url).
     monkeypatch on the settings singleton is what both migrate._existing_tables AND
@@ -686,10 +709,7 @@ def test_the_migrated_ddl_actually_carries_the_check(tmp_path, monkeypatch) -> N
     # `'alert' IN ('alert','voip')` — every literal is present and the constraint
     # constrains the wrong thing, or nothing. Compare against what _in_check renders
     # so the column being constrained is part of the assertion.
-    def _norm2(x: str) -> str:
-        return "".join(str(x).lower().split()).replace('"', "'")
-
-    assert _norm2(clause) == _norm2(_in_check("token_kind", TokenKind)), (
+    assert _norm_check_clause(clause) == _norm_check_clause(_in_check("token_kind", TokenKind)), (
         f"the migrated CHECK clause is {clause!r}, which is not what _in_check "
         f"renders ({_in_check('token_kind', TokenKind)!r}). Matching member literals "
         "is not enough — a constraint on the wrong column contains them all.")
@@ -944,13 +964,10 @@ def test_sender_kind_check_literal_matches_the_enum(tmp_path, monkeypatch) -> No
     clause = _check_clause(ddl, "ck_messages_sender_kind")
     assert clause, f"could not extract the sender_kind CHECK clause from: {ddl!r}"
 
-    def _norm(x: str) -> str:
-        return "".join(str(x).lower().split()).replace('"', "'")
-
     # Compare the TARGET EXPRESSION, not just the member literals: scanning for
     # 'human'/'agent'/'unknown' is satisfied by a CHECK on the wrong column that
     # happens to contain them.
-    assert _norm(clause) == _norm(_in_check("sender_kind", SenderKind)), (
+    assert _norm_check_clause(clause) == _norm_check_clause(_in_check("sender_kind", SenderKind)), (
         f"the migrated CHECK clause is {clause!r}, which is not what _in_check "
         f"renders ({_in_check('sender_kind', SenderKind)!r})")
 
@@ -1166,9 +1183,6 @@ def test_every_in_check_constraint_reached_the_db_and_matches_its_enum(
                         return ddl_text[i:j]
             return None
 
-        def _norm(x: str) -> str:
-            return "".join(str(x).lower().split()).replace('"', "'")
-
         expected: list[tuple[str, str, str]] = []
         for table in Base.metadata.tables.values():
             for c in table.constraints:
@@ -1195,7 +1209,7 @@ def test_every_in_check_constraint_reached_the_db_and_matches_its_enum(
                     f"{table_name}.{cname}: declared in models but NOT in the "
                     "migrated DDL — its migration never reached the DB")
                 continue
-            if _norm(got) != _norm(sqltext):
+            if _norm_check_clause(got) != _norm_check_clause(sqltext):
                 problems.append(
                     f"{table_name}.{cname}: migrated clause {got!r} != "
                     f"_in_check rendering {sqltext!r}")
