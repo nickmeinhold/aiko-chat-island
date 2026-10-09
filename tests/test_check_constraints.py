@@ -868,9 +868,21 @@ def test_0028_folds_an_out_of_set_row_rather_than_aborting(tmp_path, monkeypatch
             assert c.execute(text(
                 "SELECT reason FROM message_reports WHERE id='rep0'")).scalar_one() \
                 == "other"
-            # And the constraint is live afterwards — the fold must not have been
+            # The UNIQUE on (message_id, reporter_user_id) must survive the
+            # batch_alter_table rebuild too — 0027 asserted the same for its
+            # table. Witnessed with a VALID reason, so only the unique can fire.
+            with pytest.raises(IntegrityError, match="UNIQUE constraint failed"):
+                with c.begin_nested():
+                    c.execute(text(_INSERT_REPORT), {"rid": "rep1", "reason": "spam"})
+            # And the CHECK is live afterwards — the fold must not have been
             # achieved by skipping the constraint it exists to make room for.
-            with pytest.raises(IntegrityError):
+            # rep0 is deleted FIRST: it holds the same (m0, u1) pair that
+            # _INSERT_REPORT hardcodes, so without the delete the UNIQUE rejects
+            # 'vibes' whether or not the CHECK exists — a green that cannot see
+            # the thing it names (Tesla, PR #191 r1). The match names the
+            # constraint, so no other refusal can stand in for it.
+            c.execute(text("DELETE FROM message_reports WHERE id='rep0'"))
+            with pytest.raises(IntegrityError, match="ck_message_reports_reason"):
                 c.execute(text(_INSERT_REPORT), {"rid": "rep9", "reason": "vibes"})
     finally:
         engine.dispose()

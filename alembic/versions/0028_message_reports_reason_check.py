@@ -95,10 +95,17 @@ down_revision: Union[str, None] = "0027"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
+# The members, ONCE. Both the CHECK and the repair arm's NOT IN are rendered from
+# this tuple, so the two statements cannot disagree about what is legal (Kelvin +
+# Tesla, PR #191 r1: two hand-typed copies, and the parity gate reads only the
+# CHECK). Frozen here as literals rather than imported from the enum: a migration
+# is history, and must keep meaning what it meant when it ran.
+_REASONS = ("spam", "harassment", "hate", "violence", "sexual", "other")
+_REASON_LIST = ", ".join(f"'{r}'" for r in _REASONS)
+
 # Must match _in_check("reason", ReportReason) in domain/models.py exactly
 # (parity gate). Member ORDER follows the enum's declaration order, not alphabetical.
-_REASON_CHECK = (
-    "reason IN ('spam', 'harassment', 'hate', 'violence', 'sexual', 'other')")
+_REASON_CHECK = f"reason IN ({_REASON_LIST})"
 
 # The catch-all member, and the only value the repair arm may write.
 _CATCH_ALL = "other"
@@ -111,8 +118,7 @@ def upgrade() -> None:
     op.execute(
         sa.text(
             "UPDATE message_reports SET reason = :catch_all "
-            "WHERE reason NOT IN "
-            "('spam', 'harassment', 'hate', 'violence', 'sexual', 'other')"
+            f"WHERE reason NOT IN ({_REASON_LIST})"
         ).bindparams(catch_all=_CATCH_ALL))
     with op.batch_alter_table("message_reports", schema=None) as batch_op:
         batch_op.create_check_constraint("ck_message_reports_reason", _REASON_CHECK)
