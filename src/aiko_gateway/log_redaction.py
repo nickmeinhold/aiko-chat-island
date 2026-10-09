@@ -43,8 +43,10 @@ LONG_HEX = re.compile(r"\b([0-9a-fA-F]{12})[0-9a-fA-F]{20,}\b")
 # (rest/auth.py). The `*_token` names have no reader today and are listed so that a
 # new endpoint is covered by default. The value runs to the next `&`, whitespace, a
 # quote, or the end, which are the delimiters uvicorn and httpx log a URL inside.
+SECRET_PARAMS = frozenset({"token", "access_token", "refresh_token", "id_token",
+                           "code", "state"})
 SECRET_QUERY = re.compile(
-    r"([?&](?:token|access_token|refresh_token|id_token|code|state)=)[^&\s\"']+")
+    r"([?&](?:" + "|".join(sorted(map(re.escape, SECRET_PARAMS))) + r")=)[^&\s\"']+")
 
 
 def redact(text: str) -> str:
@@ -99,9 +101,13 @@ def install() -> int:
     what reaches uvicorn's non-propagating loggers. Idempotent, so it is safe to call
     at import AND again at startup, after a server that configures logging late.
     """
-    loggers = [logging.getLogger()] + [
-        lg for lg in logging.Logger.manager.loggerDict.values()
-        if isinstance(lg, logging.Logger)]
+    # SNAPSHOT FIRST. `list(dict.values())` copies in C without releasing the GIL;
+    # a Python-level comprehension over the live dict can raise "dictionary
+    # changed size during iteration" if a thread creates a logger mid-walk, and
+    # the lifespan call runs while startup work is under way (Maxwell, PR#195).
+    registered = list(logging.Logger.manager.loggerDict.values())
+    loggers = [logging.getLogger()] + [lg for lg in registered
+                                       if isinstance(lg, logging.Logger)]
     added = 0
     for lg in loggers:
         for handler in lg.handlers:
