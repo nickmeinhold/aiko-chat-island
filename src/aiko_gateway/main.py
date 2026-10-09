@@ -31,7 +31,7 @@ from .aiko.payload import InboundMessage
 
 if TYPE_CHECKING:
     from .aiko.client import AikoBusClient
-from . import build_info
+from . import build_info, log_redaction
 from .config import settings
 from .db import SessionLocal, verify_schema
 from .worker_guard import acquire_single_worker_lock, release_single_worker_lock
@@ -40,11 +40,12 @@ from .domain import (apns, channels_service, echo, messages_service,
 from .realtime.hub import Hub
 
 logging.basicConfig(level=logging.INFO)
-# Redact credential-shaped hex from EVERY emitted record, not just httpx's
-# (claude-tasks#3586). Must run after basicConfig — it attaches to the root
-# HANDLERS, which do not exist until then, and a handler filter is the only kind
-# that sees records from loggers nobody anticipated. Idempotent.
-apns.install_log_redaction()
+# Redact credentials from EVERY handler that exists, root's AND uvicorn's own
+# non-propagating ones (claude-tasks#3586 for hex; 2026-10-09 for `?token=` on the
+# WebSocket handshake, which uvicorn logged through handlers the root filter never
+# saw). Must run after basicConfig, so root's handler exists. Idempotent, and
+# re-run at startup in `lifespan` for a server that configures logging late.
+log_redaction.install()
 log = logging.getLogger("aiko_gateway")
 
 settings.export_aiko_env()  # aiko_services reads AIKO_MQTT_* from os.environ
@@ -207,6 +208,9 @@ async def _update_nudge_loop(interval: int, level) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     state.loop = asyncio.get_running_loop()
+    # Second pass: a server that set up its handlers after importing this module
+    # (anything but the uvicorn CLI) gets them covered here. Idempotent.
+    log_redaction.install()
     # Enforce single-worker serving BEFORE any serving side-effect: the realtime Hub
     # is per-process, so a ban/disconnect can't reach sockets on another worker until
     # the #46 cross-worker sweep lands. A second worker fails to take the lock and
