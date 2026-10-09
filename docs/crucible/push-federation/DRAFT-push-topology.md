@@ -1,4 +1,16 @@
-# ADR-0008: Push topology — who is allowed to ring a handset
+# DRAFT ADR (unnumbered): Push topology — who is allowed to ring a handset
+
+> **Unnumbered on purpose (2026-10-06).** This draft was titled "ADR-0008" when written
+> (2026-08-23), but the app repo's ADR-0008 is the merged *island self-description and
+> operator attestation* decision (aiko_chat_app PR #195). A citation of "ADR-0008" for
+> push topology would resolve to the wrong decision, so the number is retired here and a
+> real one is assigned when this is filed. **Status: draft, not ruled on by Nick.**
+>
+> **Corrected 2026-10-08, before ruling.** The original treated Android as if it had Apple's
+> problem. It doesn't. The draft's binding table listed UnifiedPush for Android, but the island
+> ships **FCM** (PR#192), and FCM lets one project hold any number of separately revocable
+> sending credentials. So the revocation argument, which is this draft's main reason for a
+> relay, applies to **Apple only**. The changes are marked *(2026-10-08)* below.
 
 > **DRAFT, NOT FILED.** Destined for `aiko_chat/docs/adr/` via PR, per Nick's
 > 2026-08-23 homing ruling (app+island decisions live in `aiko_chat`). Held here
@@ -32,6 +44,10 @@ is that the entity should be a **foundation**, not a person.
 
 **Decision today: change nothing.** Islands keep talking to APNs directly. The
 trigger for building the above is the first island operator who is not Nick.
+
+*(2026-10-08)* **Narrowed:** that trigger now concerns **iPhone ringing only**. Android federates
+without a relay, through one FCM ring account per operator (built 2026-10-08 for Nick's two
+islands; see Proposal 1).
 
 ## Motivation
 
@@ -73,7 +89,8 @@ and no reason to expect one. So handing the key to operators is not a *degree* o
 trust — it is: any operator can ring any user of the app, with any alert text, at
 any hour.
 
-**The discriminator is revocation.** With N key-holders, ejecting one means
+**The discriminator is revocation** *(on Apple; see the 2026-10-08 FCM row below for why Android
+escapes it)*. With N key-holders, ejecting one means
 rotating the key, which invalidates it for everyone; every island must redeploy in
 a coordinated window, and until they do, nobody's phone rings. You cannot remove
 one bad operator without an outage for every good one — and you only ever rotate
@@ -101,9 +118,28 @@ is held by a foundation, not an individual.
    | APNs (iOS, macOS) | the **app** (bundle id) | **impossible** |
    | Web Push / VAPID | the **server** | native to the design |
    | UnifiedPush (Android) | the **user's chosen distributor** | native to the design |
+   | FCM (Android, what we ship) *(2026-10-08)* | the **Firebase project** (≈ the app) | **yes**: unlimited service accounts per project, each separately revocable |
+
+   *(2026-10-08)* **FCM is APNs's scope but not its revocation.** Any service account holding
+   `cloudmessaging.messages.create` in the project can ring *any* Android user of the app. There is
+   no "only users of island X", so the trust problem is the same as APNs. But each operator gets
+   their **own** account, and ejecting one is deleting that account. Nobody else rotates, and there
+   is no outage. That is exactly what was built for Nick's islands: `ring-imagineering` and
+   `ring-enspyr` in project `aiko-chat-push`, each bound to a custom role `islandRinger` whose ONLY
+   permission is the send. Measured the same day: IAM is checked at **send**, not at token mint (a
+   role-less account mints fine and gets 403 `PERMISSION_DENIED` on send). So "eject an operator"
+   is observable as that 403. How long an already-minted ~1h token outlives a revocation is
+   **unmeasured** (island design 17 owes it).
+
+   *(2026-10-08)* **Why APNs can't do the same:** Apple allows **two** `.p8` APNs keys per
+   developer team. Those two slots exist for rotation, not for distribution. This is sourced to
+   third-party docs and an Apple developer-forum thread, not to Apple's own documentation, so
+   re-check it before filing. Even with two, a per-operator key cannot scale past one outside
+   operator.
 
    A single client app is therefore fine. The contradiction bites only on Apple
-   platforms — and macOS inherits it, it is not "just an iPhone thing".
+   platforms *(2026-10-08: on Android, FCM narrows it from "can't revoke" to "can't scope", see
+   below)* — and macOS inherits it, it is not "just an iPhone thing".
 
 2. **Web Push is the island's egress contract** (RFC 8030; payload encryption
    RFC 8291). One protocol for every platform. Islands hold no APNs code.
@@ -237,6 +273,37 @@ where possession is authority and there is nowhere for a bad ring to be caught.
    the decision of record while silently diverging from a design doc in the same
    repo family creates the drift it exists to prevent. One read-through of Design
    07 §"Wire shapes" against the Proposal here settles it.
+
+7. *(2026-10-08)* **What the Apple relay learns. RULED by Nick 2026-10-08: acceptable.** It is
+   content-blind, but not metadata-blind: it sees "an island asked to ring endpoint E at time T",
+   which amounts to a per-device timing log of rings. Nick's ruling: that is OK, **because the relay
+   is operated by a foundation, not an individual** (Proposal 6). So the foundation is no longer
+   only a continuity measure for the Apple account. It is also what makes the relay's metadata
+   view acceptable. If the relay ever ends up run by a person, this ruling does not carry over.
+   (Apple sees the same metadata on every APNs push regardless.)
+8. *(2026-10-08)* **Can an FCM ring account be scoped below "the whole app"? Checked:**
+   - **Not by IAM.** `cloudmessaging.messages.create` is granted on the PROJECT. The device token
+     rides in the request body, and IAM never sees it, so no condition can say "only these
+     users". (A `request.time` condition, i.e. a ring right that expires, is the one kind of
+     narrowing IAM might offer here. Untested.)
+   - **Yes, by giving each island its own Firebase project.** A registration token belongs to the
+     project that issued it. Sending to it from another project's account fails with
+     `SENDER_ID_MISMATCH` (the island already classifies this as a per-device config fact). So if
+     each island, or each operator, owns its own Firebase project, its ring account can reach
+     ONLY the devices that registered with that island. The scope comes from token issuance, not
+     from IAM. That is Apple's bundle-id isolation recovered on Android without publishing a
+     second app.
+   - **The cost is client-side, and so is the app tab's call.** The app would hold one FCM token
+     per island it has joined: a secondary `FirebaseApp` initialised from that island's
+     (public) Firebase config, published, for example, in the island manifest. The API exists
+     and is used in production ([firebase-android-sdk#4053](https://github.com/firebase/firebase-android-sdk/issues/4053)
+     shows `FirebaseApp.getInstance(name).get(FirebaseMessaging::class.java).token`). But
+     multi-project receive is **not documented** for FirebaseMessaging v22+, and that issue
+     reports `SERVICE_NOT_AVAILABLE` on some Samsung and Nokia devices with no maintainer answer.
+     Also unverified: whether a third party can register the app's package name in their own
+     Firebase project (believed yes, since FCM does not verify package ownership).
+   - **Consequence if it holds:** Android needs neither a relay NOR a shared project. The only
+     shared credential left in the whole design is Apple's.
 
 ## Rejected ideas
 
