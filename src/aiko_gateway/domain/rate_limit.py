@@ -1,4 +1,19 @@
-"""Per-client rate limiting for the public auth endpoints (#28).
+"""Per-client rate limiting (#28) — originally for the public auth endpoints, and
+since #3159 for one AUTHENTICATED read as well.
+
+TWO KEYING FLAVOURS, IN TWO LAYERS. This module keys on the client IP, which is the
+only identity an UNAUTHENTICATED ceremony has. The authenticated sibling
+``rest.deps.rate_limit_user`` keys on ``user.id`` instead, and it lives in ``rest``
+rather than here because resolving the current user is an HTTP concern and ``domain``
+must not import ``rest``. Read its docstring for why an authenticated read wants the
+user key: a shared NAT makes the IP key a COUPLING between two callers, which is what
+forced the occupancy budget wide in the first place.
+
+SCOPE NOTE, because the threat model below is about unauthenticated ceremonies and no
+longer describes every consumer: the call-occupancy endpoint uses this limiter as a
+blast-radius cap on a POLLED read (it is authenticated, so credential-stuffing is not
+the concern) and passes an explicit wider ``limit``. The mechanism is unchanged; what
+follows is the ORIGINAL motivating threat model, not an exhaustive list of callers.
 
 The gateway is a SINGLE uvicorn worker over file-backed SQLite, so an in-process
 fixed-window counter is sufficient and needs no Redis. The asyncio event loop is
@@ -111,13 +126,24 @@ class RateLimiter:
 limiter = RateLimiter()
 
 
-def rate_limit(bucket: str):
+def rate_limit(bucket: str, *, limit: int | None = None, window: int | None = None):
     """Build a FastAPI dependency that rate-limits the route by client IP.
 
-    Usage: ``@router.post(..., dependencies=[Depends(rate_limit("passkey"))])``.
+    Usage: ``@router.post(..., dependencies=[rate_limit("passkey")])`` — this function
+    ALREADY returns a ``Depends``, so wrapping the result in another ``Depends`` (as an
+    earlier version of this line showed) is a double-wrap. Every real call site in the
+    repo has always been correct; only the example was wrong.
     Routes sharing a ``bucket`` share one per-IP budget (e.g. all four passkey
     ceremony endpoints share "passkey", so an attacker can't get 4x the budget by
     rotating endpoints). Disabled wholesale by ``settings.rate_limit_enabled``.
+
+    ``limit``/``window`` override the auth defaults for a bucket whose traffic shape is
+    not an auth ceremony. Added for the call-occupancy read (#3159): the ring polls it
+    about once a second for the length of a ring, and BOTH parties to a call can sit
+    behind one NAT, so the 20-per-60s auth budget would 429 a legitimate ring partway
+    through. An override is stated at the call site with its arithmetic, so a reader can
+    see WHY a route has a wider budget instead of finding a magic number in settings.
+    Omitting both preserves the historical behaviour exactly.
     """
     async def _dependency(request: Request) -> None:
         if not settings.rate_limit_enabled:
@@ -125,8 +151,8 @@ def rate_limit(bucket: str):
         allowed, retry_after = limiter.hit(
             bucket,
             client_ip(request),
-            settings.auth_rate_limit,
-            settings.auth_rate_limit_window_seconds,
+            settings.auth_rate_limit if limit is None else limit,
+            settings.auth_rate_limit_window_seconds if window is None else window,
         )
         if not allowed:
             raise HTTPException(

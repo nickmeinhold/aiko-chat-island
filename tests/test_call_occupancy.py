@@ -1,0 +1,1055 @@
+"""Call occupancy — `GET /v1/channels/{id}/call` (#3159), the ring's liveness gate.
+
+A signed call invitation is a permanent claim about the PAST; whether the call is still
+happening is a fact about the PRESENT. This endpoint is the present-tense half, and the
+tests below are organised around the three things that can go wrong with it:
+
+  * **The admin door is wider than the join door**, so it is tested for exactly the
+    powers it should have and the ones it must never acquire.
+  * **Unknown must not read as empty.** The one behaviour whose inversion silently
+    breaks the feature it exists to provide: an unreachable SFU reporting `live: false`
+    would cancel a call that is genuinely happening. There is a dedicated must-fail arm
+    for it — delete the `except` branch's 503 and that test goes red.
+  * **The gate must not drift from video-token's.** Two endpoints about one object; if
+    their gates diverge the weaker becomes an oracle for what the stronger hides. That
+    is asserted by running both endpoints through the same scenarios and comparing.
+
+App-under-test is built from JUST the needed routers (never `main`) to keep the suite's
+"never import aiko_services" isolation invariant.
+"""
+from __future__ import annotations
+
+import datetime as dt
+
+import httpx
+import jwt
+import pytest
+import pytest_asyncio
+from fastapi import FastAPI
+from httpx import ASGITransport, AsyncClient
+from sqlalchemy import null
+
+from aiko_gateway.config import settings
+from aiko_gateway.domain import (
+    livekit_rooms, livekit_tokens, moderation_service, security, users_service,
+)
+from aiko_gateway.domain import rate_limit as rate_limit_module
+from aiko_gateway.domain.models import Channel, Membership
+from aiko_gateway.rest import livekit as livekit_routes
+from aiko_gateway.rest.deps import get_session
+
+_LK_KEY = "APItestkey000000"
+_LK_SECRET = "livekit-test-secret-at-least-32-bytes!!"
+
+
+@pytest.fixture
+def livekit_configured(monkeypatch):
+    monkeypatch.setattr(settings, "livekit_api_key", _LK_KEY)
+    monkeypatch.setattr(settings, "livekit_api_secret", _LK_SECRET)
+    monkeypatch.setattr(settings, "island_id", "")
+    monkeypatch.setattr(settings, "livekit_url", "wss://sfu.example.test")
+    return settings
+
+
+def _ulid(n: int) -> str:
+    return f"{n:026d}"
+
+
+def _decode(token: str) -> dict:
+    return jwt.decode(token, _LK_SECRET, algorithms=["HS256"])
+
+
+def _fake_sfu(monkeypatch, handler):
+    """Point livekit_rooms at a MockTransport instead of the network.
+
+    Patches ``httpx.AsyncClient`` in the MODULE's namespace rather than adding a
+    production injection seam — the code under test stays exactly what ships.
+
+    The module pools ONE client (see its ``_client``/``aclose``, mirroring
+    ``domain/apns.py``), so the singleton is also reset here: without it the first
+    test to run would build the pooled client and every later test would silently
+    reuse THAT one, making its own handler dead code and its assertions vacuous —
+    a whole file of tests grading one stale mock. ``monkeypatch.setattr`` restores
+    the previous value afterwards, so the reset is symmetric.
+    """
+    real = httpx.AsyncClient
+
+    def _factory(*args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(livekit_rooms, "_client_singleton", None)
+    monkeypatch.setattr(livekit_rooms.httpx, "AsyncClient", _factory)
+
+
+def _responds(payload, status_code=200):
+    def handler(request: httpx.Request) -> httpx.Response:
+        handler.last_request = request
+        if isinstance(payload, str):
+            return httpx.Response(status_code, text=payload)
+        return httpx.Response(status_code, json=payload)
+    handler.last_request = None
+    return handler
+
+
+# =========================================================================
+# DOMAIN — the admin door
+# =========================================================================
+
+def test_admin_token_is_scoped_to_one_room_and_cannot_join(livekit_configured):
+    grant = _decode(livekit_tokens.mint_room_admin_token(room="chan-abc"))["video"]
+    assert grant["roomAdmin"] is True
+    assert grant["room"] == "chan-abc"    # SFU-enforced scope: this room, no other
+    assert grant["roomJoin"] is False     # an admin token can never enter a room
+    # The powers a JOIN token carries must never appear on this one, and vice versa.
+    for participant_power in ("canPublish", "canSubscribe", "canPublishData",
+                              "canPublishSources"):
+        assert participant_power not in grant
+    # Nor the broad ones. roomList in particular would let one token enumerate every
+    # room on a SHARED SFU, including other islands'.
+    for broad in ("roomList", "roomCreate", "roomRecord"):
+        assert broad not in grant
+
+
+def test_admin_token_is_namespaced_like_a_join_token(monkeypatch, livekit_configured):
+    monkeypatch.setattr(settings, "island_id", "island-a")
+    grant = _decode(livekit_tokens.mint_room_admin_token(room="chan-abc"))["video"]
+    # An admin token can no more escape the island's namespace than a join token can.
+    assert grant["room"] == "island-a:chan-abc"
+
+
+def test_admin_token_ttl_is_much_shorter_than_a_join_token(livekit_configured):
+    before = dt.datetime.now(dt.timezone.utc)
+    claims = _decode(livekit_tokens.mint_room_admin_token(room="r"))
+    delta = (dt.datetime.fromtimestamp(claims["exp"], dt.timezone.utc) - before).total_seconds()
+    assert 0 < delta <= 70
+    # The point of the short TTL: this grant permits mutations we never make, so a
+    # leaked admin token must expire far sooner than a leaked join token.
+    assert delta < settings.livekit_token_ttl_seconds
+
+
+def test_admin_token_refuses_when_unconfigured_or_roomless(monkeypatch):
+    monkeypatch.setattr(settings, "livekit_api_key", "")
+    monkeypatch.setattr(settings, "livekit_api_secret", "")
+    with pytest.raises(livekit_tokens.LiveKitNotConfigured):
+        livekit_tokens.mint_room_admin_token(room="r")
+    monkeypatch.setattr(settings, "livekit_api_key", _LK_KEY)
+    monkeypatch.setattr(settings, "livekit_api_secret", _LK_SECRET)
+    with pytest.raises(ValueError, match="room"):
+        livekit_tokens.mint_room_admin_token(room="   ")
+
+
+# =========================================================================
+# DOMAIN — reading occupancy
+# =========================================================================
+
+async def test_empty_room_is_not_live_and_has_no_since(monkeypatch, livekit_configured):
+    _fake_sfu(monkeypatch, _responds({"participants": []}))
+    occ = await livekit_rooms.occupancy(room="chan-abc")
+    assert occ.live is False
+    assert occ.participants == 0
+    assert occ.since is None
+
+
+async def test_occupied_room_reports_count_and_earliest_join(monkeypatch, livekit_configured):
+    _fake_sfu(monkeypatch, _responds({"participants": [
+        {"identity": "a", "joinedAt": "1788700000"},
+        {"identity": "b", "joinedAt": "1788700042"},
+    ]}))
+    occ = await livekit_rooms.occupancy(room="chan-abc")
+    assert occ.live is True
+    assert occ.participants == 2
+    # EARLIEST current join, not the later one: "since" answers when this occupancy
+    # began, so a callee can tell "still the call I was rung for" from a newer one.
+    assert occ.since == "2026-09-06T13:06:40Z"   # rendered INSIDE the 503 boundary
+
+
+async def test_absent_or_zero_joined_at_never_backdates_since(monkeypatch, livekit_configured):
+    # An unstamped participant must not make the call look like it started in 1970 —
+    # which is what a naive min() over int(p.get("joinedAt", 0)) would produce, and it
+    # would defeat the app's "is this the same call" comparison rather than just being
+    # untidy.
+    _fake_sfu(monkeypatch, _responds({"participants": [
+        {"identity": "a"},                       # absent  -> protobuf "no value"
+        {"identity": "b", "joinedAt": 0},        # zero    -> protobuf "no value"
+        {"identity": "c", "joinedAt": "1788700500"},
+    ]}))
+    occ = await livekit_rooms.occupancy(room="chan-abc")
+    assert occ.participants == 3          # all three ARE present
+    assert occ.since == "2026-09-06T13:15:00Z"
+
+
+async def test_every_participant_unstamped_is_live_with_no_since(
+    monkeypatch, livekit_configured
+):
+    """Unstamped is ORDINARY, not broken: the room is occupied and we simply cannot say
+    since when. This is the arm that keeps the r3 strictness from over-reaching — if
+    absent/zero were treated as malformed, a legitimately unstamped room would 503."""
+    _fake_sfu(monkeypatch, _responds({"participants": [{"identity": "a"}, {"identity": "b"}]}))
+    occ = await livekit_rooms.occupancy(room="chan-abc")
+    assert occ.live is True and occ.participants == 2 and occ.since is None
+
+
+async def test_request_carries_the_namespaced_room_and_a_bearer(
+    monkeypatch, livekit_configured
+):
+    monkeypatch.setattr(settings, "island_id", "island-a")
+    handler = _responds({"participants": []})
+    _fake_sfu(monkeypatch, handler)
+    await livekit_rooms.occupancy(room="chan-abc")
+    req = handler.last_request
+    # wss:// client URL -> https:// API origin, same host, no second setting to drift.
+    assert str(req.url) == "https://sfu.example.test/twirp/livekit.RoomService/ListParticipants"
+    assert b'"island-a:chan-abc"' in req.content
+    # The body's room and the TOKEN's room must name the same thing, or the SFU rejects
+    # the pair — assert they agree rather than trusting they do.
+    token = req.headers["Authorization"].removeprefix("Bearer ")
+    assert _decode(token)["video"]["room"] == "island-a:chan-abc"
+
+
+@pytest.mark.parametrize("arm,handler", [
+    ("http 500", _responds({"error": "boom"}, status_code=500)),
+    ("http 401", _responds({"msg": "permissions denied"}, status_code=401)),
+    ("non-JSON body", _responds("<html>gateway</html>")),
+])
+async def test_sfu_failures_raise_rather_than_reporting_empty(
+    monkeypatch, livekit_configured, arm, handler
+):
+    _fake_sfu(monkeypatch, handler)
+    with pytest.raises(livekit_rooms.LiveKitUnreachable):
+        await livekit_rooms.occupancy(room="chan-abc")
+
+
+async def test_network_error_raises_rather_than_reporting_empty(
+    monkeypatch, livekit_configured
+):
+    def boom(request):
+        raise httpx.ConnectTimeout("no route", request=request)
+    _fake_sfu(monkeypatch, boom)
+    with pytest.raises(livekit_rooms.LiveKitUnreachable):
+        await livekit_rooms.occupancy(room="chan-abc")
+
+
+# =========================================================================
+# ROUTE — gates, and the one inversion that breaks the feature
+# =========================================================================
+
+@pytest_asyncio.fixture
+async def client(session):
+    async def _override_session():
+        yield session
+
+    app = FastAPI()
+    app.include_router(livekit_routes.router)
+    app.dependency_overrides[get_session] = _override_session
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        yield c
+    app.dependency_overrides.clear()
+
+
+async def _user(session, username: str):
+    return await users_service.create_user(
+        session, username=username, display_name=username.title(), password="pw")
+
+
+async def _dm(session, *, cid: int = 10) -> Channel:
+    ch = Channel(id=_ulid(cid), name="dm", kind="dm", aiko_channel=f"dm:{cid}",
+                 is_private=True, community_id=null())
+    session.add(ch)
+    await session.commit()
+    return ch
+
+
+async def _public(session, *, cid: int = 20) -> Channel:
+    ch = Channel(id=_ulid(cid), name="general", kind="standard",
+                 aiko_channel="general", is_private=False)
+    session.add(ch)
+    await session.commit()
+    return ch
+
+
+async def _join(session, channel: Channel, user, *, can_post: bool = True) -> None:
+    session.add(Membership(channel_id=channel.id, user_id=user.id, can_post=can_post))
+    await session.commit()
+
+
+def _headers(user) -> dict:
+    return {"Authorization": f"Bearer {security.issue_access(user.id)}"}
+
+
+async def test_member_sees_live_call_with_count_only(
+    client, session, monkeypatch, livekit_configured
+):
+    alice, peer = await _user(session, "alice"), await _user(session, "peer")
+    ch = await _dm(session)
+    await _join(session, ch, alice)
+    await _join(session, ch, peer)
+    _fake_sfu(monkeypatch, _responds({"participants": [
+        {"identity": peer.id, "joinedAt": "1788700000"},
+    ]}))
+
+    resp = await client.get(f"/v1/channels/{ch.id}/call", headers=_headers(alice))
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["live"] is True
+    assert body["participants"] == 1
+    assert body["since"] == "2026-09-06T13:06:40Z"   # 1788700000 epoch seconds, computed not guessed
+    # COUNT ONLY: no identity may reach the wire, or this becomes a presence probe.
+    assert peer.id not in resp.text
+    # A ring polls this; a cached answer is a stale answer, which is the bug itself.
+    assert resp.headers.get("cache-control") == "no-store"
+
+
+async def test_unreachable_sfu_is_503_NEVER_live_false(
+    client, session, monkeypatch, livekit_configured
+):
+    """THE must-fail arm. Collapsing "cannot tell" into "nobody is here" would tell a
+    ringing handset the call had ended and cancel a call that is genuinely happening —
+    the exact failure this endpoint exists to prevent, inverted. Delete the 503 in the
+    route's except branch and this goes red."""
+    alice, peer = await _user(session, "alice"), await _user(session, "peer")
+    ch = await _dm(session)
+    await _join(session, ch, alice)
+    await _join(session, ch, peer)
+
+    def boom(request):
+        raise httpx.ConnectTimeout("no route", request=request)
+    _fake_sfu(monkeypatch, boom)
+
+    resp = await client.get(f"/v1/channels/{ch.id}/call", headers=_headers(alice))
+    assert resp.status_code == 503
+    assert "live" not in resp.json()      # no fabricated verdict rides along
+
+
+async def test_unconfigured_island_is_503(client, session, monkeypatch):
+    monkeypatch.setattr(settings, "livekit_api_key", "")
+    monkeypatch.setattr(settings, "livekit_api_secret", "")
+    alice = await _user(session, "alice")
+    ch = await _dm(session)
+    await _join(session, ch, alice)
+    resp = await client.get(f"/v1/channels/{ch.id}/call", headers=_headers(alice))
+    assert resp.status_code == 503
+
+
+async def test_unauthenticated_is_rejected(client, session, livekit_configured):
+    ch = await _dm(session)
+    assert (await client.get(f"/v1/channels/{ch.id}/call")).status_code in (401, 403)
+
+
+# ---- gate parity with video-token: the property, not a list of cases ----
+
+async def _both(client, user, channel_id):
+    """Hit both endpoints as the same caller and return their status codes."""
+    occ = await client.get(f"/v1/channels/{channel_id}/call", headers=_headers(user))
+    tok = await client.post(f"/v1/channels/{channel_id}/video-token",
+                            headers=_headers(user))
+    return occ.status_code, tok.status_code
+
+
+async def test_gates_agree_missing_channel(client, session, monkeypatch, livekit_configured):
+    _fake_sfu(monkeypatch, _responds({"participants": []}))
+    alice = await _user(session, "alice")
+    occ, tok = await _both(client, alice, _ulid(999))
+    assert occ == tok == 404
+
+
+async def test_gates_agree_non_member_of_private_channel(
+    client, session, monkeypatch, livekit_configured
+):
+    _fake_sfu(monkeypatch, _responds({"participants": []}))
+    outsider = await _user(session, "outsider")
+    a, b = await _user(session, "a"), await _user(session, "b")
+    ch = await _dm(session)
+    await _join(session, ch, a)
+    await _join(session, ch, b)
+    occ, tok = await _both(client, outsider, ch.id)
+    # Existence-hiding: identical to "no such channel" above, on BOTH endpoints.
+    assert occ == tok == 404
+
+
+async def test_gates_agree_public_channel_is_dm_only(
+    client, session, monkeypatch, livekit_configured
+):
+    _fake_sfu(monkeypatch, _responds({"participants": []}))
+    alice = await _user(session, "alice")
+    ch = await _public(session)
+    await _join(session, ch, alice)
+    occ, tok = await _both(client, alice, ch.id)
+    assert occ == tok == 403
+
+
+async def test_gates_agree_blocked_peer_cannot_observe_the_call(
+    client, session, monkeypatch, livekit_configured
+):
+    """A block must traverse the OCCUPANCY path exactly as it traverses the token path.
+    If it did not, a blocked user could poll this endpoint and learn precisely when the
+    person who blocked them is on a call — a live presence feed built out of the safety
+    boundary that was supposed to close."""
+    alice, blocked = await _user(session, "alice"), await _user(session, "blocked")
+    ch = await _dm(session)
+    await _join(session, ch, alice)
+    await _join(session, ch, blocked)
+    await moderation_service.block_user(session, blocker_id=alice.id,
+                                        blocked_id=blocked.id)
+    # The SFU says a call IS happening — so a leak here would be a real disclosure,
+    # not a vacuous pass against an empty room.
+    _fake_sfu(monkeypatch, _responds({"participants": [
+        {"identity": alice.id, "joinedAt": "1788700000"}]}))
+    occ, tok = await _both(client, blocked, ch.id)
+    assert occ == tok == 404
+
+
+async def test_gates_agree_three_party_dm_fails_closed(
+    client, session, monkeypatch, livekit_configured
+):
+    _fake_sfu(monkeypatch, _responds({"participants": []}))
+    a, b, c = (await _user(session, "a"), await _user(session, "b"),
+               await _user(session, "c"))
+    ch = await _dm(session)
+    for u in (a, b, c):
+        await _join(session, ch, u)
+    occ, tok = await _both(client, a, ch.id)
+    assert occ == tok == 403
+
+
+# ---- the vendor boundary: shapes we do not understand are UNKNOWN, not EMPTY ----
+# Found by Carnot in the cage-match on PR #167, confirmed executably before the fix.
+# The first parser read `resp.json().get("participants") or []`, which turned a
+# missing/null field into an empty room and therefore into `live: false` on a
+# ringing handset — the module's own stated principle, violated by its own parser.
+
+@pytest.mark.parametrize("arm,body", [
+    ("participants key MISSING",   {}),
+    ("participants is null",       {"participants": None}),
+    ("participants is an object",  {"participants": {"a": {"joinedAt": "1"}}}),
+    ("participants is a string",   {"participants": "alice"}),
+    ("participants holds strings", {"participants": ["alice"]}),
+    ("participants holds ints",    {"participants": [42]}),
+    ("body is a list",             ["nope"]),
+    ("body is a string",           "nope"),
+])
+async def test_unrecognised_payload_is_unknown_not_empty(
+    monkeypatch, livekit_configured, arm, body
+):
+    """Every one of these previously returned live=False (or raised AttributeError
+    and escaped as a 500). All must now be the same 'cannot determine' as a network
+    failure: there is ONE meaning for 'the answer did not arrive', regardless of
+    which way it failed to."""
+    _fake_sfu(monkeypatch, _responds(body))
+    with pytest.raises(livekit_rooms.LiveKitUnreachable):
+        await livekit_rooms.occupancy(room="chan-abc")
+
+
+async def test_the_empty_ARRAY_is_still_a_real_empty_room(
+    monkeypatch, livekit_configured
+):
+    """THE NULL CONTROL for the test above, and it is load-bearing rather than
+    decorative. Requiring the `participants` key is only safe because LiveKit emits
+    it even when empty — protobuf-JSON often OMITS empty repeated fields, and if it
+    did here, the strictness above would 503 every empty room and break the feature
+    outright. Verified at the byte level against both live islands 2026-09-07:
+    an empty room returns literally {"participants":[]}. This test pins the
+    distinction the fix rests on — empty array is data, absent key is ignorance."""
+    _fake_sfu(monkeypatch, _responds({"participants": []}))
+    occ = await livekit_rooms.occupancy(room="chan-abc")
+    assert occ.live is False and occ.participants == 0 and occ.since is None
+
+
+async def test_malformed_payload_reaches_the_route_as_503_not_500(
+    client, session, monkeypatch, livekit_configured
+):
+    """The route promises 503 for 'cannot tell'. A malformed-but-valid-JSON body used
+    to raise AttributeError past the route's `except` and surface as a 500 — a
+    different code, a different client code path, and an alarm that reads as a
+    gateway bug rather than an SFU one."""
+    alice, peer = await _user(session, "alice"), await _user(session, "peer")
+    ch = await _dm(session)
+    await _join(session, ch, alice)
+    await _join(session, ch, peer)
+    _fake_sfu(monkeypatch, _responds({"participants": ["alice"]}))
+
+    resp = await client.get(f"/v1/channels/{ch.id}/call", headers=_headers(alice))
+    assert resp.status_code == 503
+    assert "live" not in resp.json()
+
+
+async def test_aclose_releases_the_pooled_client(monkeypatch, livekit_configured):
+    """The pooled client is closed by the app lifespan. If aclose() failed to drop the
+    reference, a second lifespan (a test harness, an embedded server) would hand out a
+    CLOSED client forever."""
+    _fake_sfu(monkeypatch, _responds({"participants": []}))
+    await livekit_rooms.occupancy(room="chan-abc")
+    assert livekit_rooms._client_singleton is not None      # pooled after first use
+    await livekit_rooms.aclose()
+    assert livekit_rooms._client_singleton is None          # and released on shutdown
+
+
+# ---- the CLASS round 3 closed: no SFU-derived value is computed after the boundary ----
+# Round 1's instance was SHAPE (a malformed body raised AttributeError -> 500). Round 3's
+# was RANGE: the route called datetime.fromtimestamp on the SFU's joinedAt OUTSIDE the try
+# that maps SFU failure to 503, so an absurd stamp raised OverflowError and escaped as a
+# gateway 500. Same class both times -- SFU data being computed past the boundary meant to
+# contain it. Rendering now happens in the domain, so there is nothing left outside to break.
+
+@pytest.mark.parametrize("arm,stamp", [
+    ("past platform time_t", "999999999999999999999"),
+    ("negative",             "-1788700000"),
+    ("unparseable",          "1e400"),
+    ("not a number at all",  "yesterday"),
+])
+async def test_unrenderable_joined_at_is_503_not_a_gateway_500(
+    monkeypatch, livekit_configured, arm, stamp
+):
+    _fake_sfu(monkeypatch, _responds({"participants": [{"joinedAt": stamp}]}))
+    with pytest.raises(livekit_rooms.LiveKitUnreachable):
+        await livekit_rooms.occupancy(room="chan-abc")
+
+
+async def test_unrenderable_joined_at_reaches_the_route_as_503(
+    client, session, monkeypatch, livekit_configured
+):
+    """The route-level proof. Before the fix this was an uncaught OverflowError -> 500,
+    which is a different status, a different client path, and an alarm that reads as a
+    gateway bug rather than an SFU one."""
+    alice, peer = await _user(session, "alice"), await _user(session, "peer")
+    ch = await _dm(session)
+    await _join(session, ch, alice)
+    await _join(session, ch, peer)
+    _fake_sfu(monkeypatch, _responds({"participants": [
+        {"identity": peer.id, "joinedAt": "999999999999999999999"}]}))
+
+    resp = await client.get(f"/v1/channels/{ch.id}/call", headers=_headers(alice))
+    assert resp.status_code == 503
+    assert "live" not in resp.json()
+
+
+async def test_a_sane_stamp_still_renders(monkeypatch, livekit_configured):
+    """NULL CONTROL for the three arms above. A range check that rejects everything
+    would pass them all while breaking the feature — this pins that ordinary
+    timestamps are still accepted and rendered."""
+    _fake_sfu(monkeypatch, _responds({"participants": [{"joinedAt": "1788700000"}]}))
+    occ = await livekit_rooms.occupancy(room="chan-abc")
+    assert occ.since == "2026-09-06T13:06:40Z"
+
+
+# =========================================================================
+# PART A (cage-match #167 round 2, Tesla; partitioned on claude-tasks#4023)
+#
+# Six findings that are NOT consequences of the 1Hz polling model, and therefore
+# had to be fixed whichever way the poll-vs-push design question lands. Nick's
+# 2026-09-09 disposition: "it stays open, and part A gets fixed."
+#
+# Each arm below names the mutation that turns it red, so a later reader can check
+# the test discriminates rather than merely passes.
+# =========================================================================
+
+# ---- item 6: the timeout was a scalar pretending to be a deadline ----
+
+def test_timeout_is_per_phase_and_the_stated_bound_is_its_arithmetic():
+    """`httpx.Timeout(2.0)` sets FOUR phase timeouts to 2.0s each — worst case 8s, not
+    2s. The module now names the phases; this pins that the documented worst case is
+    really the sum of what is configured, so the comment cannot drift from the code.
+
+    MUTATION: restore `httpx.Timeout(2.0)` -> connect becomes 2.0 and the sum is 8.0,
+    both assertions red.
+    """
+    t = livekit_rooms._TIMEOUT
+    phases = {"connect": t.connect, "read": t.read, "write": t.write, "pool": t.pool}
+    assert all(v is not None for v in phases.values()), phases
+    # Distinct per phase — the whole point. A single scalar would make these all equal.
+    assert len(set(phases.values())) > 1, f"all phases identical, still a scalar: {phases}"
+    assert sum(phases.values()) == livekit_rooms._TIMEOUT_WORST_CASE_SECONDS
+
+
+def test_the_pooled_client_actually_uses_that_timeout(monkeypatch, livekit_configured):
+    """NULL CONTROL for the test above: the constant could be perfect and unused.
+
+    MUTATION: build the client with `timeout=None` -> red.
+    """
+    monkeypatch.setattr(livekit_rooms, "_client_singleton", None)
+    assert livekit_rooms._client().timeout == livekit_rooms._TIMEOUT
+
+
+# ---- item 3: _api_base() dropped any path component ----
+
+@pytest.mark.parametrize("configured,expected", [
+    ("wss://sfu.example.test",           "https://sfu.example.test"),
+    ("wss://sfu.example.test/livekit",   "https://sfu.example.test/livekit"),
+    ("wss://sfu.example.test/livekit/",  "https://sfu.example.test/livekit"),
+    ("ws://localhost:7880/sfu",          "http://localhost:7880/sfu"),
+])
+def test_api_base_carries_the_path_prefix(monkeypatch, livekit_configured,
+                                          configured, expected):
+    """A reverse-proxied SFU at `wss://host/livekit` must not have its prefix dropped.
+
+    The bare-host arm is the NULL CONTROL: a fix that always appended something would
+    pass the three path arms and break every island in production today.
+
+    MUTATION: restore `urlunparse((scheme, parts.netloc, "", "", "", ""))` -> the three
+    path arms go red, the bare-host arm stays green (which is exactly why the bare-host
+    arm alone could never have caught this).
+    """
+    monkeypatch.setattr(settings, "livekit_url", configured)
+    assert livekit_rooms._api_base() == expected
+
+
+async def test_a_path_prefixed_sfu_is_called_at_the_right_root(
+    monkeypatch, livekit_configured
+):
+    """The failure this prevents is quiet: every poll 503s "correctly" while
+    video-token keeps working, because tokens never touch this base.
+
+    MUTATION: drop the path in `_api_base` -> the asserted URL loses `/livekit`.
+    """
+    monkeypatch.setattr(settings, "livekit_url", "wss://sfu.example.test/livekit")
+    handler = _responds({"participants": []})
+    _fake_sfu(monkeypatch, handler)
+
+    await livekit_rooms.occupancy(room="chan-abc")
+
+    assert str(handler.last_request.url) == (
+        "https://sfu.example.test/livekit/twirp/livekit.RoomService/ListParticipants")
+
+
+# ---- item 4: {} counted as a participant ----
+
+async def test_a_fieldless_participant_entry_is_unknown_not_an_occupant(
+    monkeypatch, livekit_configured
+):
+    """`{}` passes an isinstance check and then inflates the count — a phantom occupant
+    holding `live` true on a payload we do not understand. Same break direction as a
+    missing `participants` key: 503 "cannot tell" is loud, a phantom is silent.
+
+    MUTATION: delete the `if not p:` branch -> this returns live=True/participants=1.
+    """
+    _fake_sfu(monkeypatch, _responds({"participants": [{}]}))
+    with pytest.raises(livekit_rooms.LiveKitUnreachable):
+        await livekit_rooms.occupancy(room="chan-abc")
+
+
+async def test_a_fieldless_entry_alongside_a_real_one_still_refuses(
+    monkeypatch, livekit_configured
+):
+    """The count is wrong even when only ONE entry is junk, so the refusal cannot be
+    conditional on the whole list being junk.
+
+    MUTATION: refuse only when EVERY entry is empty -> red.
+    """
+    _fake_sfu(monkeypatch, _responds({"participants": [
+        {"identity": "real", "joinedAt": "1788700000"}, {},
+    ]}))
+    with pytest.raises(livekit_rooms.LiveKitUnreachable):
+        await livekit_rooms.occupancy(room="chan-abc")
+
+
+async def test_a_participant_with_fields_is_still_an_occupant(
+    monkeypatch, livekit_configured
+):
+    """NULL CONTROL. A refusal that rejected every participant would pass both arms
+    above while making `live: true` unreachable — i.e. breaking the entire feature.
+
+    MUTATION: `if not p` -> `if True` -> red.
+    """
+    _fake_sfu(monkeypatch, _responds({"participants": [{"identity": "real"}]}))
+    occ = await livekit_rooms.occupancy(room="chan-abc")
+    assert (occ.live, occ.participants, occ.since) == (True, 1, None)
+
+
+async def test_fieldless_participant_reaches_the_route_as_503_not_500(
+    client, session, monkeypatch, livekit_configured
+):
+    alice, peer = await _user(session, "alice"), await _user(session, "peer")
+    ch = await _dm(session)
+    await _join(session, ch, alice)
+    await _join(session, ch, peer)
+    _fake_sfu(monkeypatch, _responds({"participants": [{}]}))
+
+    resp = await client.get(f"/v1/channels/{ch.id}/call", headers=_headers(alice))
+    assert resp.status_code == 503
+    assert "live" not in resp.json()
+
+
+# ---- item 5: a client closed underneath an in-flight poll escaped as a 500 ----
+
+async def test_a_client_closed_mid_flight_is_cannot_tell_not_a_gateway_error(
+    monkeypatch, livekit_configured
+):
+    """`aclose()` nulls the singleton at shutdown, but a request that already grabbed
+    the reference holds a CLOSED client. httpx answers that with a bare RuntimeError,
+    which is not an `httpx.HTTPError` — so before this fix a poll racing shutdown
+    escaped as a 500, blaming the gateway for the SFU.
+
+    NOT SIMULATED: the client is genuinely closed and the real httpx raises. A mock
+    raising RuntimeError would prove only that the except clause matches the exception
+    the test itself chose.
+
+    MUTATION: narrow the except back to `httpx.HTTPError` -> RuntimeError propagates
+    and `pytest.raises(LiveKitUnreachable)` goes red on an unexpected RuntimeError.
+    """
+    _fake_sfu(monkeypatch, _responds({"participants": []}))
+    await livekit_rooms.occupancy(room="chan-abc")          # pool a real client
+    closed = livekit_rooms._client_singleton
+    await closed.aclose()
+    monkeypatch.setattr(livekit_rooms, "_client_singleton", closed)  # the racing handle
+
+    with pytest.raises(livekit_rooms.LiveKitUnreachable):
+        await livekit_rooms.occupancy(room="chan-abc")
+
+
+async def test_a_shape_refusal_keeps_its_own_message(monkeypatch, livekit_configured):
+    """Guard on the widened except: catching RuntimeError must never become a catch-all
+    that re-wraps the module's OWN LiveKitUnreachable and destroys its message.
+
+    THIS TEST'S FIRST VERSION WAS A LIE, and the mutation harness is what said so. It
+    was written as the null control for an `except LiveKitUnreachable: raise` arm added
+    alongside the RuntimeError catch — but deleting that arm did not turn this red,
+    because the shape and stamp refusals happen BELOW the try, so the arm was guarding a
+    state that cannot occur. The arm was deleted rather than kept with a comment
+    asserting a mechanism that never fires.
+
+    What remains is a real pin on a real future mistake, with the mutation to match.
+
+    MUTATION: move `_participants_from(body)` INSIDE the try -> the RuntimeError arm
+    now catches it, the message becomes "SFU request failed: LiveKitUnreachable", red.
+    """
+    _fake_sfu(monkeypatch, _responds({"participants": "not-a-list"}))
+    with pytest.raises(livekit_rooms.LiveKitUnreachable) as caught:
+        await livekit_rooms.occupancy(room="chan-abc")
+    assert "not a list" in str(caught.value)
+
+
+# ---- item 1: the DB session was held open across the vendor hop ----
+
+async def test_the_db_session_is_released_before_the_sfu_is_asked(
+    client, session, monkeypatch, livekit_configured
+):
+    """A scarce resource must not be pinned for the duration of a third party's
+    latency. This gateway is one uvicorn worker over file-backed SQLite, so N slow
+    polls holding N sessions turns a LiveKit blip into island-wide contention.
+
+    The probe runs INSIDE the fake SFU handler — i.e. at the exact moment the vendor
+    call is in flight, which is the only moment the claim is about.
+
+    MUTATION: delete `await session.close()` from the route -> `in_transaction()` is
+    True while the SFU is being asked, and this goes red.
+    """
+    alice, peer = await _user(session, "alice"), await _user(session, "peer")
+    ch = await _dm(session)
+    await _join(session, ch, alice)
+    await _join(session, ch, peer)
+
+    observed = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        observed["in_transaction"] = session.in_transaction()
+        return httpx.Response(200, json={"participants": []})
+
+    _fake_sfu(monkeypatch, handler)
+    resp = await client.get(f"/v1/channels/{ch.id}/call", headers=_headers(alice))
+
+    assert resp.status_code == 200
+    assert observed["in_transaction"] is False, (
+        "the DB session was still in a transaction while the SFU was being asked")
+
+
+async def test_the_gates_still_ran_before_that_release(
+    client, session, monkeypatch, livekit_configured
+):
+    """NULL CONTROL for the release: satisfying "no transaction is open during the SFU
+    call" by simply not gating would pass the test above while stripping every ACL check
+    off the endpoint. This pins that an outsider is still refused.
+
+    MEASURED WHILE WRITING THIS, and it corrects the control's first draft: moving the
+    `close()` ABOVE the gate does NOT break anything, because SQLAlchemy reopens a
+    transaction on the session's next use. So "the release moved too early" is not a
+    reachable failure and cannot be the control — the reachable one is the gate being
+    weakened or dropped, which is what this arm actually mutates.
+
+    MUTATION: replace `_gated_dm_channel` with a bare `acl.readable_channel` (the
+    weakest plausible "simplification") -> the outsider is no longer refused and this
+    goes red.
+    """
+    outsider = await _user(session, "outsider")
+    a, b = await _user(session, "a"), await _user(session, "b")
+    ch = await _dm(session)
+    await _join(session, ch, a)
+    await _join(session, ch, b)
+    _fake_sfu(monkeypatch, _responds({"participants": []}))
+
+    resp = await client.get(f"/v1/channels/{ch.id}/call", headers=_headers(outsider))
+    assert resp.status_code == 404
+
+
+# ---- item 2: the poll's budget was keyed on something two callers SHARE ----
+#
+# Decided with Nick 2026-09-12. The finding was "a rate-limited poll returns 429, a
+# different client code path from the 503 that means the same thing operationally".
+# The fix is not to relabel the 429 — that would throw away Retry-After and make an
+# abuse signal indistinguishable from an SFU outage. It is to notice that the only
+# reason a REAL ring could ever reach the limit was a key two callers share.
+
+@pytest.fixture
+def limiting(monkeypatch):
+    """Turn the limiter on for this test.
+
+    NO reset() here, deliberately: `tests/conftest.py` already has an autouse
+    `_reset_rate_limiter` that clears the global limiter around every test. An earlier
+    version of this fixture reset it too, which was not merely redundant — it made the
+    fixture LOOK like the thing providing isolation, so a reader would trust the wrong
+    mechanism and a change to conftest would silently stop being noticed here
+    (cage-match #167 r4, Maxwell).
+    """
+    monkeypatch.setattr(settings, "rate_limit_enabled", True)
+
+
+async def _poll(client, user, channel_id, ip):
+    return await client.get(
+        f"/v1/channels/{channel_id}/call",
+        headers={**_headers(user), "x-forwarded-for": ip})
+
+
+async def test_two_callers_behind_one_nat_no_longer_share_a_budget(
+    client, session, monkeypatch, livekit_configured, limiting
+):
+    """THE POINT OF THE WHOLE CHANGE. Caller and callee in one house polled at each
+    other through a single public IP and spent one budget between them, so the budget
+    had to be widened until a legitimate ring fitted underneath it.
+
+    80 polls each is 160 through one address — comfortably past the old single per-IP
+    bound of 150, and comfortably inside both new bounds (80 < 90 per user, 160 < 600
+    per IP). Nobody is throttled, because nobody is sharing.
+
+    MUTATION: restore the single `rate_limit("call_occupancy", limit=150)` dependency
+    -> the 150th request through this address 429s and this goes red.
+    """
+    alice, peer = await _user(session, "alice"), await _user(session, "peer")
+    ch = await _dm(session)
+    await _join(session, ch, alice)
+    await _join(session, ch, peer)
+    _fake_sfu(monkeypatch, _responds({"participants": []}))
+
+    for _ in range(80):
+        assert (await _poll(client, alice, ch.id, "203.0.113.7")).status_code == 200
+        assert (await _poll(client, peer, ch.id, "203.0.113.7")).status_code == 200
+
+
+async def test_one_caller_past_their_own_budget_is_still_throttled(
+    client, session, monkeypatch, livekit_configured, limiting
+):
+    """POSITIVE CONTROL for the per-user bound: removing a coupling must not remove the
+    limit. 90 carries three full 30s rings in a minute; the 91st is refused, and with a
+    Retry-After the caller can act on rather than a relabelled 503.
+
+    MUTATION: delete the `rate_limit_user` dependency -> no 429 ever arrives, red.
+    """
+    alice, peer = await _user(session, "alice"), await _user(session, "peer")
+    ch = await _dm(session)
+    await _join(session, ch, alice)
+    await _join(session, ch, peer)
+    _fake_sfu(monkeypatch, _responds({"participants": []}))
+
+    for _ in range(90):
+        assert (await _poll(client, alice, ch.id, "203.0.113.8")).status_code == 200
+    refused = await _poll(client, alice, ch.id, "203.0.113.8")
+    assert refused.status_code == 429
+    assert int(refused.headers["retry-after"]) >= 1
+
+
+async def test_the_same_caller_from_a_new_address_is_still_throttled(
+    client, session, monkeypatch, livekit_configured, limiting
+):
+    """The user bound must not be escapable by moving networks — otherwise "keyed on
+    the user" would be decoration and the real key would still be the address.
+
+    MUTATION: key `rate_limit_user` on client_ip instead of user.id -> rotating the
+    address mints a fresh budget and this goes red.
+    """
+    alice, peer = await _user(session, "alice"), await _user(session, "peer")
+    ch = await _dm(session)
+    await _join(session, ch, alice)
+    await _join(session, ch, peer)
+    _fake_sfu(monkeypatch, _responds({"participants": []}))
+
+    for _ in range(90):
+        assert (await _poll(client, alice, ch.id, "203.0.113.9")).status_code == 200
+    assert (await _poll(client, alice, ch.id, "198.51.100.4")).status_code == 429
+
+
+async def test_both_bounds_are_actually_consulted(
+    client, session, monkeypatch, livekit_configured, limiting
+):
+    """The per-IP ceiling exists because per-user keying WIDENS the per-address blast
+    radius — one IP holding N accounts now holds N budgets. Exercising 600 requests to
+    prove it fires would be a slow test of an arithmetic constant; what actually needs
+    pinning is that the second bound is WIRED, since a dropped dependency is silent and
+    looks exactly like a passing suite.
+
+    So this reads the limiter's own state after ONE request and asserts both keys were
+    touched — the user key and the address key.
+
+    MUTATION: delete either dependency from the route -> its key is absent, red.
+    """
+    alice, peer = await _user(session, "alice"), await _user(session, "peer")
+    ch = await _dm(session)
+    await _join(session, ch, alice)
+    await _join(session, ch, peer)
+    _fake_sfu(monkeypatch, _responds({"participants": []}))
+
+    assert (await _poll(client, alice, ch.id, "203.0.113.10")).status_code == 200
+
+    keys = set(rate_limit_module.limiter._windows)
+    assert ("call_occupancy_user", f"u:{alice.id}") in keys, keys
+    assert ("call_occupancy", "203.0.113.10") in keys, keys
+
+
+async def test_an_unauthenticated_poll_spends_nobody_s_user_budget(
+    client, session, monkeypatch, livekit_configured, limiting
+):
+    """NULL CONTROL on ordering. `rate_limit_user` depends on `get_current_user`, so a
+    request with no valid token is rejected as 401 and never reaches the limiter with
+    some fabricated key.
+
+    MUTATION: key the user bound on a nullable user -> a 401 request writes a window
+    and this goes red.
+    """
+    ch = await _dm(session)
+    resp = await client.get(f"/v1/channels/{ch.id}/call",
+                            headers={"x-forwarded-for": "203.0.113.11"})
+    assert resp.status_code == 401
+    assert not any(b == "call_occupancy_user"
+                   for b, _ in rate_limit_module.limiter._windows), \
+        rate_limit_module.limiter._windows
+
+
+async def test_the_limiter_switch_still_disables_both_bounds(
+    client, session, monkeypatch, livekit_configured
+):
+    """NULL CONTROL for the fixture: `rate_limit_enabled=False` must silence the new
+    user-keyed bound too, or the suite's own switch would be lying.
+
+    MUTATION: drop the `rate_limit_enabled` check from `rate_limit_user` -> red.
+    """
+    monkeypatch.setattr(settings, "rate_limit_enabled", False)
+    alice, peer = await _user(session, "alice"), await _user(session, "peer")
+    ch = await _dm(session)
+    await _join(session, ch, alice)
+    await _join(session, ch, peer)
+    _fake_sfu(monkeypatch, _responds({"participants": []}))
+
+    for _ in range(95):                      # past the per-user bound of 90
+        assert (await _poll(client, alice, ch.id, "203.0.113.12")).status_code == 200
+
+
+# ---- cage-match #167 round 4: int() is a coercer, not a validator ----
+
+@pytest.mark.parametrize("arm,value", [
+    ("bool true — int(True) == 1 == 1970", True),
+    ("bool false — hidden by `False == 0` in the old skip test", False),
+    ("float", 1788700000.9),
+    ("list", [1788700000]),
+    ("object", {"seconds": 1788700000}),
+    ("non-ASCII numeral — str.isdigit() alone says True", "١٢٣"),
+])
+async def test_a_wrong_typed_joined_at_is_cannot_tell_not_an_invented_time(
+    monkeypatch, livekit_configured, arm, value
+):
+    """Carnot's round-4 finding, and the bool arm is the one that mattered.
+
+    `int(raw)` does not VALIDATE, it COERCES. `{"joinedAt": true}` became `int(True)`
+    == 1 and rendered as `since: "1970-01-01T00:00:01Z"` — a fabricated present-tense
+    timestamp emitted by the one module whose stated invariant is that an unreadable
+    payload yields "cannot determine" and never an invented time.
+
+    The `false` arm is the other half and it failed in the opposite direction: because
+    `False == 0` in Python, the old skip test classed it as an ordinary unstamped
+    participant. One wrong type, swallowed two different ways, neither of them a 503.
+
+    MUTATION: restore the bare `try: stamp = int(raw)` -> the bool arms and the float
+    arm go red (list/object/non-ASCII already raised).
+    """
+    _fake_sfu(monkeypatch, _responds({"participants": [{"joinedAt": value}]}))
+    with pytest.raises(livekit_rooms.LiveKitUnreachable):
+        await livekit_rooms.occupancy(room="chan-abc")
+
+
+@pytest.mark.parametrize("arm,value,expected", [
+    ("int64 as a JSON number", 1788700000, "2026-09-06T13:06:40Z"),
+    ("int64 as a decimal string", "1788700000", "2026-09-06T13:06:40Z"),
+])
+async def test_both_legitimate_int64_encodings_still_render(
+    monkeypatch, livekit_configured, arm, value, expected
+):
+    """NULL CONTROL. protobuf-JSON marshals an int64 as EITHER a number OR a decimal
+    string, so a type check that admitted only one would break the feature against a
+    real SFU while passing every arm above.
+
+    MUTATION: accept only `str` (or only `int`) -> one of these goes red.
+    """
+    _fake_sfu(monkeypatch, _responds({"participants": [{"joinedAt": value}]}))
+    occ = await livekit_rooms.occupancy(room="chan-abc")
+    assert occ.since == expected
+
+
+@pytest.mark.parametrize("arm,value", [("absent", None), ("zero int", 0), ("zero string", "0")])
+async def test_unstamped_is_still_ordinary_not_an_error(
+    monkeypatch, livekit_configured, arm, value
+):
+    """NULL CONTROL for the other direction: protobuf omits or zeroes a field with no
+    value, and an unstamped participant is ORDINARY. A type check strict enough to
+    reject those would 503 rooms that are merely young.
+
+    MUTATION: treat 0 as malformed -> red.
+    """
+    entry = {"identity": "real"} if value is None else {"identity": "real", "joinedAt": value}
+    _fake_sfu(monkeypatch, _responds({"participants": [entry]}))
+    occ = await livekit_rooms.occupancy(room="chan-abc")
+    assert (occ.live, occ.participants, occ.since) == (True, 1, None)
+
+
+async def test_an_unauthenticated_poll_charges_NEITHER_bucket(
+    client, session, monkeypatch, livekit_configured, limiting
+):
+    """The round-4 reordering (IP bound first) is reverted, and this is what pins it.
+
+    Round 4 moved the IP bound in front of the user bound on the argument that
+    user-first made every request pay a session query before any limiter spoke. That
+    premise was never measured, and it is false: `HTTPBearer(auto_error=True)` raises
+    before `get_session` is resolved, so an unauthenticated request costs nothing under
+    either ordering. What the reordering actually did was let unauthenticated traffic
+    spend the authenticated ring's budget — 600 junk requests from one address would
+    429 the real users behind that NAT (cage-match #167 r5, Carnot).
+
+    MUTATION: put `rate_limit("call_occupancy", ...)` first again -> the IP window
+    appears and this goes red.
+    """
+    ch = await _dm(session)
+    resp = await client.get(f"/v1/channels/{ch.id}/call",
+                            headers={"x-forwarded-for": "203.0.113.13"})  # no Authorization
+    assert resp.status_code == 401
+    assert not rate_limit_module.limiter._windows, (
+        "an unauthenticated request charged a rate-limit bucket — junk traffic can now "
+        f"spend a real ring's budget: {rate_limit_module.limiter._windows}")
+
+
+@pytest.mark.parametrize("arm,value", [
+    ("negative JSON number — the round-4 rewrite dropped `stamp <= 0`", -1788700000),
+    ("negative decimal string — isdigit() already refused this one", "-1788700000"),
+])
+async def test_a_negative_joined_at_is_cannot_tell_in_BOTH_encodings(
+    monkeypatch, livekit_configured, arm, value
+):
+    """The two encodings must agree about the same value, and for one round they did not.
+
+    Round 4 moved the type check in front of the conversion and dropped the old
+    `stamp <= 0` guard. The string arm still refused `"-1788700000"` (isdigit() is
+    False), but the NUMBER arm sailed through and rendered
+    `since: "1913-04-27T10:53:20Z"` — fabricated history, produced by the fix for
+    fabricated 1970s. Round 4's negative arms were all strings, which is exactly why
+    its own tests could not see it.
+
+    MUTATION: delete the `stamp < 0` branch -> the number arm goes red, the string arm
+    stays green. That asymmetry IS the bug, and a string-only test can never show it.
+    """
+    _fake_sfu(monkeypatch, _responds({"participants": [{"joinedAt": value}]}))
+    with pytest.raises(livekit_rooms.LiveKitUnreachable):
+        await livekit_rooms.occupancy(room="chan-abc")
