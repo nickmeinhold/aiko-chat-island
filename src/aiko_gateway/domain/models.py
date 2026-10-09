@@ -239,6 +239,62 @@ class PasskeyOperation(enum.StrEnum):
     RECOVER = "recover"
 
 
+# ReportReason — the long-form record is a COMMENT, not a docstring, and that is
+# deliberate: this enum is the type of `rest.moderation.ReportReq.reason`, so its
+# __doc__ is published verbatim into /openapi.json as the schema description. The
+# prose below is internal archaeology about a defect (including when the door was
+# open), which belongs in the source a contributor reads, not on a public endpoint
+# an app fetches. Its siblings here keep docstrings because no pydantic model
+# takes them as a field type — check that before converting one back.
+#
+# Closed set of why a user reported a message (#7). Drives the DB CHECK on
+# message_reports.reason via _in_check, same single-source pattern as
+# ReportResolution/SenderKind.
+#
+# THIS COLUMN WAS THE SECOND `sender_kind`, found by the structural tripwire in
+# test_closed_set_guard.py rather than by anyone remembering it. The set was
+# declared — `moderation_service.REPORT_REASONS`, a bare tuple — but enforced
+# ONLY at the HTTP boundary, where rest/moderation.py built a pydantic enum out
+# of that tuple. `report_message(reason: str)` took a bare string, so the
+# service door was open and MEASURED open: an out-of-set value written through
+# it persisted, while `sender_kind` refused the same shape of write with an
+# IntegrityError.
+#
+# THAT IS THE SINGLE-DOOR FALLACY (v0.13.1's registration hole, where
+# `open_registration` gated /register but never the passkey pair), and note the
+# asymmetry INSIDE this one table: `resolution` — written only by ops — was
+# enum'd and CHECK'd from the start, while `reason` — written by any user over
+# the wire — was not. The gate was on the trusted writer.
+#
+# NO EXTERNAL CALLER COULD REACH IT. The 422 at the boundary held, and both
+# islands measured ZERO rows in this column (2026-09-26), so nothing bad was
+# stored. The exposure was the SECOND caller — an in-process writer such as the
+# moderator agent (#19) or the takedown-forward path (#7) — which is exactly
+# the caller this repo keeps growing. Sealing the mutator is the convention
+# (CLAUDE.md: "enforce at the backend, through one door").
+#
+# THE SET IS NOT NEW AND IS NOT A CROSS-TAB DECISION. aiko_chat_app's own
+# `ReportReason` (moderation_models.dart:37, measured 2026-09-26) holds these
+# six members with these exact spellings, and its docstring already names
+# `moderation_service.REPORT_REASONS` as the authority it must match. This
+# codifies that agreement rather than changing it.
+#
+# ADDING A MEMBER IS a cross-tab event, for the same reason SenderKind's is:
+# their `fromWire` returns null on an unknown value and `reasonLabel` renders
+# the raw wire slug instead. A seventh reason shipped from here shows up in
+# their moderator queue as a bare slug, silently, with nothing reporting it.
+#
+class ReportReason(enum.StrEnum):
+    """Closed set of report reasons for a message (#7)."""
+
+    SPAM = "spam"
+    HARASSMENT = "harassment"
+    HATE = "hate"
+    VIOLENCE = "violence"
+    SEXUAL = "sexual"
+    OTHER = "other"
+
+
 class ReportResolution(enum.StrEnum):
     """Closed set of moderator outcomes for a message report (Piece B, #7). Same
     single-source-of-truth pattern as Role/Platform: drives the DB CHECK on
@@ -261,8 +317,18 @@ class SenderKind(enum.StrEnum):
     EMERGENT from `messages_service._kind_for`'s control flow — two members
     borrowed from UserKind, two from ChannelKind, and one bare literal declared
     nowhere at all. A reader had to trace three branches to learn what the column
-    could hold, and nothing enforced the answer: this was the only closed-set-
-    shaped column in the schema absent from all 13 _in_check call sites.
+    could hold, and nothing enforced the answer: this was a closed-set-shaped
+    column absent from every _in_check call site.
+
+    CORRECTED 2026-09-26 — this paragraph and 0027's docstring both said "the
+    ONLY" such column, and that was FALSE when written. `message_reports.reason`
+    was in exactly the same state (set declared as a bare tuple, enforced only at
+    the route, no CHECK) and 0028 closed it. The claim was not careless: it came
+    from a manual sweep of the 13 call sites, which is an instrument that can
+    confirm what IS guarded and cannot enumerate what is missing. A
+    metadata-iterating tripwire (tests/test_closed_set_guard.py) found `reason`
+    in its first run. The original wording is left in 0027 as shipped history;
+    this is the live copy, so the correction belongs here.
 
     THREE MEMBERS, NOT FIVE, and the two that are missing are the argument. The
     set is pinned to what a writer can actually produce. `llm` and `robot` were
@@ -824,6 +890,12 @@ class MessageReport(Base):
         CheckConstraint(
             _in_check("resolution", ReportResolution),
             name="ck_message_reports_resolution"),
+        # Closed set for the REPORTER's stated reason (0028). NOT NULL, unlike
+        # `resolution` above, so there is no NULL-passes-the-check subtlety here:
+        # every row must name a member.
+        CheckConstraint(
+            _in_check("reason", ReportReason),
+            name="ck_message_reports_reason"),
     )
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=new_ulid)
     message_id: Mapped[str] = mapped_column(

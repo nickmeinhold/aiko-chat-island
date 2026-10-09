@@ -44,6 +44,29 @@ _MODEL_TABLES = {
 }
 
 
+def _norm_check_clause(x: str) -> str:
+    """Normalise a CHECK clause for comparison WITHOUT folding the literals' case.
+
+    Whitespace and quote style differ between SQLAlchemy's rendering and the
+    migrated DDL; letter case INSIDE the literals does not, and must not be
+    erased. SQLite compares `IN (...)` strings under BINARY collation, so a
+    migration that wrote 'Taken_Down' against an enum value 'taken_down' refuses
+    every legitimate write. These gates once lowercased the whole clause, which
+    made exactly that drift compare equal (Carnot, PR #191). Only the keyword is
+    case-folded, and it is folded BEFORE whitespace is removed, while the word
+    boundary in front of it still exists.
+    """
+    s = re.sub(r"(?i)\s+in\s*\(", " IN (", str(x))
+    return "".join(s.split()).replace('"', "'")
+
+
+def test_check_clause_norm_keeps_literal_case() -> None:
+    """Must-fail control for `_norm_check_clause`: a case-only drift in a
+    literal must NOT compare equal, while keyword case and spacing may."""
+    assert _norm_check_clause("k IN ('Taken_Down')") != _norm_check_clause("k IN ('taken_down')")
+    assert _norm_check_clause('k in ( "a",  "b" )') == _norm_check_clause("k IN ('a','b')")
+
+
 def _point_app_at(tmp_path, monkeypatch) -> tuple[str, str]:
     """Point the app+alembic at a throwaway file DB. Returns (async_url, sync_url).
     monkeypatch on the settings singleton is what both migrate._existing_tables AND
@@ -686,10 +709,7 @@ def test_the_migrated_ddl_actually_carries_the_check(tmp_path, monkeypatch) -> N
     # `'alert' IN ('alert','voip')` — every literal is present and the constraint
     # constrains the wrong thing, or nothing. Compare against what _in_check renders
     # so the column being constrained is part of the assertion.
-    def _norm2(x: str) -> str:
-        return "".join(str(x).lower().split()).replace('"', "'")
-
-    assert _norm2(clause) == _norm2(_in_check("token_kind", TokenKind)), (
+    assert _norm_check_clause(clause) == _norm_check_clause(_in_check("token_kind", TokenKind)), (
         f"the migrated CHECK clause is {clause!r}, which is not what _in_check "
         f"renders ({_in_check('token_kind', TokenKind)!r}). Matching member literals "
         "is not enough — a constraint on the wrong column contains them all.")
@@ -944,13 +964,10 @@ def test_sender_kind_check_literal_matches_the_enum(tmp_path, monkeypatch) -> No
     clause = _check_clause(ddl, "ck_messages_sender_kind")
     assert clause, f"could not extract the sender_kind CHECK clause from: {ddl!r}"
 
-    def _norm(x: str) -> str:
-        return "".join(str(x).lower().split()).replace('"', "'")
-
     # Compare the TARGET EXPRESSION, not just the member literals: scanning for
     # 'human'/'agent'/'unknown' is satisfied by a CHECK on the wrong column that
     # happens to contain them.
-    assert _norm(clause) == _norm(_in_check("sender_kind", SenderKind)), (
+    assert _norm_check_clause(clause) == _norm_check_clause(_in_check("sender_kind", SenderKind)), (
         f"the migrated CHECK clause is {clause!r}, which is not what _in_check "
         f"renders ({_in_check('sender_kind', SenderKind)!r})")
 
@@ -1107,3 +1124,95 @@ def test_0027_renames_actor_rows_and_then_closes_the_set(tmp_path, monkeypatch) 
             f"the downgrade did not restore the old value: {back}")
     finally:
         engine.dispose()
+
+
+def test_every_in_check_constraint_reached_the_db_and_matches_its_enum(
+        tmp_path, monkeypatch) -> None:
+    """GENERIC parity gate: every `_in_check` constraint, migrated DDL vs enum.
+
+    The per-constraint gates above (token_kind, sender_kind) assert more than this
+    one does — data-migration order, specific witnesses — and are not replaced by
+    it. What they cannot do is speak about a constraint nobody wrote a gate for,
+    and that enumerative shape is the same one that let `messages.sender_kind`
+    into the schema unobserved and `message_reports.reason` sit unconstrained
+    behind a route-only pydantic enum (0028).
+
+    So this iterates `Base.metadata` instead of a list: EVERY `x IN (...)` CHECK
+    the models declare must be present in the migrated DDL, on the right table,
+    with a clause that matches what `_in_check` renders today. A hand-written
+    migration literal that drifts from its enum goes red here without anyone
+    remembering to add a gate for it. Companion to
+    tests/test_closed_set_guard.py, which catches the column that has no
+    constraint at all; this catches the constraint that has drifted or never
+    landed.
+
+    alembic's compare_metadata is CHECK-blind on SQLite (ISL-0001), so the parity
+    test in this file is otherwise structurally unable to see any of this.
+    """
+    import re as _re
+    import sqlite3
+    from alembic import command
+    from aiko_gateway import migrate
+    from aiko_gateway.domain.models import Base
+    from sqlalchemy import CheckConstraint
+
+    _async_url, sync_url = _point_app_at(tmp_path, monkeypatch)
+    command.upgrade(migrate._alembic_config(), "head")
+    con = sqlite3.connect(sync_url.replace("sqlite:///", ""))
+    try:
+        ddl_by_table = {
+            name: sql for name, sql in con.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type='table'")
+            if sql
+        }
+
+        def _clause(ddl_text: str, name: str) -> str | None:
+            # Balanced extraction: a naive `\(([^)]*)\)` stops at the close paren
+            # inside `IN ('a', 'b')` and compares a truncated clause that can
+            # never match. Same helper the per-constraint gates use.
+            anchor = _re.search(rf"{name}\s+CHECK\s*\(", ddl_text, _re.I)
+            if not anchor:
+                return None
+            depth, i = 1, anchor.end()
+            for j in range(i, len(ddl_text)):
+                if ddl_text[j] == "(":
+                    depth += 1
+                elif ddl_text[j] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        return ddl_text[i:j]
+            return None
+
+        expected: list[tuple[str, str, str]] = []
+        for table in Base.metadata.tables.values():
+            for c in table.constraints:
+                if isinstance(c, CheckConstraint) and _re.match(
+                        r"^\w+ IN \(.+\)$", str(c.sqltext)):
+                    expected.append((table.name, c.name, str(c.sqltext)))
+
+        # Guard against the whole gate passing vacuously if the introspection
+        # above ever stops finding anything — a green empty loop is the exact
+        # failure this file keeps re-learning.
+        assert len(expected) >= 14, (
+            f"only {len(expected)} IN-checks found in Base.metadata; this gate "
+            "has stopped observing the thing it exists to observe")
+
+        problems: list[str] = []
+        for table_name, cname, sqltext in sorted(expected):
+            ddl = ddl_by_table.get(table_name)
+            if ddl is None:
+                problems.append(f"{table_name}: table absent from migrated DDL")
+                continue
+            got = _clause(ddl, cname)
+            if got is None:
+                problems.append(
+                    f"{table_name}.{cname}: declared in models but NOT in the "
+                    "migrated DDL — its migration never reached the DB")
+                continue
+            if _norm_check_clause(got) != _norm_check_clause(sqltext):
+                problems.append(
+                    f"{table_name}.{cname}: migrated clause {got!r} != "
+                    f"_in_check rendering {sqltext!r}")
+        assert not problems, "\n".join(problems)
+    finally:
+        con.close()

@@ -38,15 +38,21 @@ from ..config import settings
 from . import acl
 from .ids import new_ulid
 from .models import (
-    Message, MessageReport, ReportResolution, Retraction, User, UserBlock)
+    Message, MessageReport, ReportReason, ReportResolution, Retraction, User,
+    UserBlock)
 
 
 def _utcnow() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
 
-# The closed set of report reasons. Validated at the API boundary (pydantic enum)
-# so an unknown reason is a 422, never a silently-stored free-text blob.
-REPORT_REASONS = ("spam", "harassment", "hate", "violence", "sexual", "other")
+# The closed set of report reasons, DERIVED from the enum that also drives the DB
+# CHECK (0028) — one source, so the boundary, the service and the schema cannot
+# disagree. This was a hand-written tuple until 2026-09-26, and the tuple was the
+# whole declaration: the column had no CHECK and `report_message` took a bare
+# str, so an out-of-set value written through the service persisted (measured).
+# The name is kept because aiko_chat_app's own ReportReason docstring cites it by
+# name as the authority it must match.
+REPORT_REASONS = tuple(r.value for r in ReportReason)
 
 
 class CannotBlockSelf(Exception):
@@ -63,6 +69,16 @@ class MessageNotFound(Exception):
 
 class ReportNotFound(Exception):
     """The report id a moderator tried to act on does not exist."""
+
+
+class UnknownReportReason(Exception):
+    """A reason outside `ReportReason` reached `report_message`.
+
+    The route cannot raise this — its pydantic enum 422s first — and that is
+    exactly why it exists: the gate used to live ONLY on that door, so any
+    second caller (the moderator agent #19, the takedown-forward path #7, a
+    test fixture) wrote straight past it into a column with no CHECK. Mirrors
+    `oauth.UnknownProvider`, the repo's existing fail-closed coercion idiom."""
 
 
 class CannotBanSelf(Exception):
@@ -256,16 +272,36 @@ async def get_reportable_message(
     return msg
 
 
+def _as_reason(reason: ReportReason | str) -> ReportReason:
+    """Coerce a caller-supplied reason to the enum, failing CLOSED.
+
+    Idempotent on a value that is already a `ReportReason`. Raises
+    `UnknownReportReason` rather than letting `ReportReason(x)`'s bare ValueError
+    surface as a 500 — the same shape as `oauth._as_provider`."""
+    if isinstance(reason, ReportReason):
+        return reason
+    try:
+        return ReportReason(reason)
+    except ValueError as e:
+        raise UnknownReportReason(str(reason)) from e
+
+
 async def report_message(
-    session: AsyncSession, *, reporter_id: str, message_id: str, reason: str,
+    session: AsyncSession, *, reporter_id: str, message_id: str,
+    reason: ReportReason | str,
 ) -> MessageReport:
     """Record a report of `message_id` by `reporter_id`. Idempotent on
     (message, reporter): a re-report returns the existing row rather than
-    stacking duplicates. Raises `MessageNotFound` if the message does not exist.
+    stacking duplicates. Raises `MessageNotFound` if the message does not exist,
+    or `UnknownReportReason` if `reason` is outside the closed set.
 
     Visibility of the reported message is the CALLER's responsibility (the route
     resolves it through the channel ACL first) — this service only guards
-    existence so a bogus id is a controlled 404, not an FK 500 at commit."""
+    existence so a bogus id is a controlled 404, not an FK 500 at commit.
+
+    The reason is coerced FIRST, before the existence lookup: a bad reason is a
+    caller bug and should not depend on whether the message happens to exist."""
+    reason = _as_reason(reason)
     msg = await session.get(Message, message_id)
     if msg is None:
         raise MessageNotFound()
@@ -281,7 +317,11 @@ async def report_message(
         id=new_ulid(),
         message_id=message_id,
         reporter_user_id=reporter_id,
-        reason=reason,
+        # `.value` explicitly: a StrEnum would bind correctly anyway, but the
+        # column is a plain VARCHAR by design (models.py) and the read path hands
+        # this straight to the wire — so what is stored should be unambiguous at
+        # the write site, not a fact about StrEnum's str inheritance.
+        reason=reason.value,
     )
     session.add(row)
     await session.commit()

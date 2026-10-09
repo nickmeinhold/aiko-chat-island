@@ -26,7 +26,7 @@ from aiko_gateway.domain import (
     accounts_service, messages_service, moderation_service, security, users_service,
 )
 from aiko_gateway.domain.models import (
-    Channel, Message, MessageReport, Retraction, UserBlock)
+    Channel, Message, MessageReport, ReportReason, Retraction, UserBlock)
 from aiko_gateway.realtime.ws import _handle_send
 from aiko_gateway.rest import moderation as moderation_routes
 from aiko_gateway.rest.deps import get_session
@@ -723,3 +723,48 @@ async def test_deliver_alert_swallows_failure(monkeypatch):
     # Must complete without raising.
     await moderation_routes._deliver_moderation_alert(
         "https://hook.example/ops", {"report_id": "x"})
+
+
+async def test_report_reason_is_sealed_at_the_service_not_just_the_route(session):
+    """The SERVICE refuses an out-of-set reason, not only the HTTP boundary.
+
+    This is the regression test for the hole itself. Until 2026-09-26 the closed
+    set was enforced only by `rest/moderation.py`'s pydantic enum; the service
+    took a bare str, and this exact call PERSISTED 'NOT_A_REASON' into a column
+    with no CHECK. No external caller could reach it — the 422 held — so the
+    exposure was the second caller: the moderator agent (#19), the takedown
+    forward path (#7), or a fixture. Sealing the shared mutator is the
+    convention (CLAUDE.md: "enforce at the backend, through one door").
+
+    Asserting the TYPED exception, not any raise: an IntegrityError from the DB
+    CHECK would also stop the write, but it would mean the service let a bad
+    value through to the database and the row was refused a layer too late.
+    """
+    ch = await _public_channel(session)
+    a = await _user(session, "alice")
+    b = await _user(session, "bob")
+    m = await _msg(session, mid=1, channel=ch, sender=b)
+    with pytest.raises(moderation_service.UnknownReportReason):
+        await moderation_service.report_message(
+            session, reporter_id=a.id, message_id=m.id, reason="NOT_A_REASON")
+    # Nothing was written — the refusal is before the insert, not a rollback of it.
+    assert (await session.execute(
+        select(MessageReport).where(MessageReport.message_id == m.id)
+    )).scalars().all() == []
+
+
+async def test_report_reason_coercion_is_idempotent_on_the_enum(session):
+    """A caller holding the enum works as well as one holding its string.
+
+    The route passes `req.reason.value` (a str); an in-process caller will more
+    naturally hold a `ReportReason`. `_as_reason` must accept both, or sealing
+    the door would have broken the very callers it exists to protect.
+    """
+    ch = await _public_channel(session)
+    a = await _user(session, "alice")
+    b = await _user(session, "bob")
+    m = await _msg(session, mid=1, channel=ch, sender=b)
+    rep = await moderation_service.report_message(
+        session, reporter_id=a.id, message_id=m.id, reason=ReportReason.HATE)
+    assert rep.reason == "hate"
+    assert type(rep.reason) is str  # stored as the plain value, not an enum repr

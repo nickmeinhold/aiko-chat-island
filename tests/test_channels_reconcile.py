@@ -125,7 +125,14 @@ async def test_hard_delete_cascades_retractions_and_reports(session):
     session.add_all([
         Message(id="M1", channel_id="C1", sender_kind="human", body="bad"),
         Retraction(id="R1", target_msg_id="M1", channel_id="C1"),
-        MessageReport(id="RP1", message_id="M1", reporter_user_id="U1", reason="x"),
+        # A real member, not a placeholder: `reason="x"` here until 2026-09-26,
+        # when 0028 closed the set and this insert started failing. The literal
+        # was declared in no enum and survived only because nothing could object
+        # — the same shape as the `sender_kind="user"` fixtures 0027 uncovered.
+        # This test is about the cascade, so the value is incidental; that is
+        # exactly why it was never chosen.
+        MessageReport(id="RP1", message_id="M1", reporter_user_id="U1",
+                      reason="spam"),
     ])
     await session.commit()
 
