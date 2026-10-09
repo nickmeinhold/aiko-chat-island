@@ -26,6 +26,8 @@ from uvicorn.config import LOGGING_CONFIG
 
 from aiko_gateway import log_redaction
 
+_BASELINE_ROOT_FILTERS = {id(h): h.filters[:] for h in logging.getLogger().handlers}
+
 JWT = ("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIwMU0wMlkzSzJNVEhSNFlaQ0hQR0JaNkhLVCJ9"
        ".-LKoC-OT94xGfakeSignature_abc123")
 
@@ -37,7 +39,11 @@ def uvicorn_logging():
              for name, lg in logging.Logger.manager.loggerDict.items()
              if isinstance(lg, logging.Logger)}
     root = logging.getLogger()
-    saved_root = (root.handlers[:], root.level)
+    # Each root handler's FILTERS too, not just the list (Carnot, PR#195 r2): the
+    # root-only control and install() both add filters to these shared handler
+    # objects, and restoring only the list leaked them into later tests.
+    saved_root = (root.handlers[:], root.level,
+                  {id(h): h.filters[:] for h in root.handlers})
     buf = io.StringIO()
     cfg = copy.deepcopy(LOGGING_CONFIG)
     cfg["handlers"]["default"]["stream"] = buf
@@ -47,7 +53,9 @@ def uvicorn_logging():
     for name, (handlers, propagate, level, filters) in saved.items():
         lg = logging.getLogger(name)
         lg.handlers[:], lg.propagate, lg.level, lg.filters[:] = handlers, propagate, level, filters
-    root.handlers[:], root.level = saved_root
+    root.handlers[:], root.level = saved_root[0], saved_root[1]
+    for h in root.handlers:
+        h.filters[:] = saved_root[2].get(id(h), h.filters)
 
 
 def _ws_handshake_line():
@@ -129,3 +137,28 @@ def test_install_is_idempotent(uvicorn_logging):
         for handler in logging.getLogger(name).handlers:
             assert sum(isinstance(f, log_redaction.RedactCredentials)
                        for f in handler.filters) == 1
+
+
+@pytest.mark.parametrize("name", ["Token", "CODE", "State", "Access_Token"])
+def test_a_secret_name_in_any_case_is_redacted(name):
+    assert log_redaction.redact(f"/x?{name}=s3cr3t&after=1") == f"/x?{name}=<redacted>&after=1"
+
+
+def test_a_redaction_failure_withholds_the_record_rather_than_passing_it():
+    """Fail closed: a record whose redaction raised is not proven clean."""
+    class Boom:
+        def __str__(self):
+            raise RuntimeError("no")
+    record = logging.LogRecord("x", logging.INFO, __file__, 1, "%s %s %s",
+                               ("?token=SECRET", Boom()), None)   # 3 slots, 2 args
+    log_redaction.RedactCredentials().filter(record)
+    message = record.getMessage()
+    assert "SECRET" not in message and "withheld" in message
+
+
+def test_the_fixture_leaves_no_filter_behind_on_root():
+    """Run after the root-only control in file order: root's handlers must be clean."""
+    for handler in logging.getLogger().handlers:
+        assert not any(isinstance(f, log_redaction.RedactCredentials)
+                       and f not in _BASELINE_ROOT_FILTERS.get(id(handler), [])
+                       for f in handler.filters)

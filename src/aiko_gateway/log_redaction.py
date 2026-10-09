@@ -46,7 +46,11 @@ LONG_HEX = re.compile(r"\b([0-9a-fA-F]{12})[0-9a-fA-F]{20,}\b")
 SECRET_PARAMS = frozenset({"token", "access_token", "refresh_token", "id_token",
                            "code", "state"})
 SECRET_QUERY = re.compile(
-    r"([?&](?:" + "|".join(sorted(map(re.escape, SECRET_PARAMS))) + r")=)[^&\s\"']+")
+    r"([?&](?:" + "|".join(sorted(map(re.escape, SECRET_PARAMS))) + r")=)[^&\s\"']+",
+    # CASE-INSENSITIVE (Carnot, PR#195 r2). The server reads only the lowercase
+    # names, but the invariant is "credential-named values never reach a log",
+    # not "today's clients happen to spell them in lowercase".
+    re.IGNORECASE)
 
 
 def redact(text: str) -> str:
@@ -85,8 +89,14 @@ class RedactCredentials(logging.Filter):
             cleaned = redact(message)
             if cleaned != message:
                 record.msg, record.args = cleaned, ()
-        except Exception:  # pragma: no cover - never let redaction drop a record
-            pass
+        except Exception as ex:
+            # FAIL CLOSED (Kelvin, PR#195 r2). A redaction that raised part-way has
+            # not proven the record clean, so the record keeps its logger, level and
+            # timestamp and loses its content. It is never dropped silently, and
+            # never passed on unproven.
+            record.msg, record.args = (
+                "<log record withheld: credential redaction failed (%s)>"
+                % type(ex).__name__), ()
         return True  # this filter only rewrites; it never drops
 
 
