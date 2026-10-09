@@ -1,73 +1,131 @@
-"""A device token is a credential and it was going into the log in full.
+"""Credentials stay out of the logs, through uvicorn's OWN handlers too.
 
-APNs puts the token in the URL PATH, so httpx's own request logging wrote all 64
-hex characters at INFO on every send (claude-tasks#3586). These tests pin the
-redaction AND the thing the redaction must not break: the log line is the only
-direct evidence of which Apple host a row was sent to, so a filter that ate the
-line would remove the observability along with the leak.
+THE LEAK (2026-10-09, enspyr): every WebSocket handshake logged
+`"WebSocket /v1/ws?token=<access JWT>" [accepted]`. The #3586 redaction could not
+catch it, for two independent reasons, and each test below pins one:
+
+  * it matched only hex, and a JWT is base64url;
+  * it sat on the ROOT handlers, and uvicorn's CLI gives `uvicorn` and
+    `uvicorn.access` their own handlers with `propagate=False`. The record never
+    reached the filter.
+
+So these tests run under UVICORN'S REAL `LOGGING_CONFIG`. A hand-built logger would
+propagate to root and pass for the wrong reason, which is exactly the frame that
+hid the leak in the first place.
 """
 from __future__ import annotations
 
+import copy
+import io
 import logging
+import logging.config
 
-from aiko_gateway.domain import apns  # noqa: F401  (import installs the filter)
+import httpx
+import pytest
+from uvicorn.config import LOGGING_CONFIG
 
-# A real 64-hex APNs device token (synthetic — not a production value).
-TOKEN = "d309f150ddd0b42453a756f697febf5660c11d1b9a0ae94cfa485af65679effe"
-HTTPX_MSG = 'HTTP Request: POST %s "%s"'
+from aiko_gateway import log_redaction
 
-
-def _emit(caplog, url: str, status: str = "HTTP/2 200 OK") -> str:
-    """Log through the REAL "httpx" logger, the way httpx does — with %-args
-    rather than a pre-formatted string, because that difference is the bug the
-    filter has to survive."""
-    with caplog.at_level(logging.INFO, logger="httpx"):
-        logging.getLogger("httpx").info(HTTPX_MSG, url, status)
-    return caplog.records[-1].getMessage()
+JWT = ("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIwMU0wMlkzSzJNVEhSNFlaQ0hQR0JaNkhLVCJ9"
+       ".-LKoC-OT94xGfakeSignature_abc123")
 
 
-def test_a_device_token_is_trimmed_to_a_twelve_char_prefix(caplog) -> None:
-    """The leak itself. 12 hex = 48 bits: useless for reconstructing a 256-bit
-    token, sufficient to correlate a line with a row (`substr(token,1,12)`
-    disambiguated instantly against the live table while debugging #3386)."""
-    out = _emit(caplog, f"https://api.push.apple.com/3/device/{TOKEN}")
-    assert TOKEN not in out, f"the full token survived redaction:\n{out}"
-    assert "d309f150ddd0..." in out, out
+@pytest.fixture
+def uvicorn_logging():
+    """uvicorn's own config, writing into a buffer; logging state restored after."""
+    saved = {name: (lg.handlers[:], lg.propagate, lg.level, lg.filters[:])
+             for name, lg in logging.Logger.manager.loggerDict.items()
+             if isinstance(lg, logging.Logger)}
+    root = logging.getLogger()
+    saved_root = (root.handlers[:], root.level)
+    buf = io.StringIO()
+    cfg = copy.deepcopy(LOGGING_CONFIG)
+    cfg["handlers"]["default"]["stream"] = buf
+    cfg["handlers"]["access"]["stream"] = buf
+    logging.config.dictConfig(cfg)
+    yield buf
+    for name, (handlers, propagate, level, filters) in saved.items():
+        lg = logging.getLogger(name)
+        lg.handlers[:], lg.propagate, lg.level, lg.filters[:] = handlers, propagate, level, filters
+    root.handlers[:], root.level = saved_root
 
 
-def test_redaction_preserves_the_host_and_the_status(caplog) -> None:
-    """THE CONTROL THAT MATTERS. A filter that suppressed or mangled the line
-    would delete the only production evidence that `_host()` routes per row — the
-    thing that witnessed #3386's central claim on 2026-08-29. Redacting must cost
-    the token and nothing else."""
-    out = _emit(caplog, f"https://api.sandbox.push.apple.com/3/device/{TOKEN}")
-    assert "api.sandbox.push.apple.com" in out, out
-    assert "HTTP/2 200 OK" in out, out
-    assert "/3/device/" in out, out
+def _ws_handshake_line():
+    # uvicorn's exact call: protocols/websockets logs via "uvicorn.error".
+    logging.getLogger("uvicorn.error").info(
+        '%s - "WebSocket %s" [accepted]', "172.19.0.1:36974", f"/v1/ws?token={JWT}")
 
 
-def test_the_token_does_not_survive_in_record_args(caplog) -> None:
-    """httpx logs with %-args, so redacting `record.msg` alone would leave the
-    full token sitting in `record.args` for any OTHER handler to format back out —
-    a redaction that only works for one handler is not a redaction."""
-    _emit(caplog, f"https://api.push.apple.com/3/device/{TOKEN}")
-    record = caplog.records[-1]
-    assert TOKEN not in str(record.args), f"token survived in args: {record.args!r}"
-    assert TOKEN not in str(record.msg), f"token survived in msg: {record.msg!r}"
+def test_the_websocket_token_is_redacted_on_uvicorns_own_handler(uvicorn_logging):
+    log_redaction.install()
+    _ws_handshake_line()
+    out = uvicorn_logging.getvalue()
+    assert JWT not in out and "eyJhbGci" not in out
+    assert '"WebSocket /v1/ws?token=<redacted>" [accepted]' in out, out
 
 
-def test_a_short_hex_run_is_left_alone(caplog) -> None:
-    """NULL ARM — the filter must not fire on everything with hex in it. A check
-    that redacts unconditionally would pass the tests above while quietly
-    shredding unrelated log lines."""
-    out = _emit(caplog, "https://api.push.apple.com/3/device/deadbeefcafe")
-    assert "deadbeefcafe" in out, out
-    assert "..." not in out, out
+def test_must_fail_without_install_the_token_leaks(uvicorn_logging):
+    """THE CONTROL: the harness above can observe the leak it claims to stop."""
+    _ws_handshake_line()
+    assert JWT in uvicorn_logging.getvalue()
 
 
-def test_a_ulid_row_id_is_not_redacted(caplog) -> None:
-    """The replacement identifier must survive. push_service now logs the ROW ID
-    instead of the token; a ULID is 26 chars of Crockford base32, so it must not
-    trip a rule aimed at 32+ char hex runs."""
-    out = _emit(caplog, "https://example.test/x/01M16A4T4QSTC7YB6G675VG3VF")
-    assert "01M16A4T4QSTC7YB6G675VG3VF" in out, out
+def test_must_fail_a_root_only_filter_still_leaks(uvicorn_logging):
+    """The shape of the previous installation: root handlers only. Under uvicorn's
+    config the record never reaches them, so it leaks however good the pattern."""
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(log_redaction.RedactCredentials())
+    _ws_handshake_line()
+    assert JWT in uvicorn_logging.getvalue()
+
+
+def test_the_access_log_keeps_its_shape_and_loses_the_oauth_code(uvicorn_logging, capsys):
+    """uvicorn's AccessFormatter UNPACKS record.args as a 5-tuple. Clearing args (the
+    old filter's move) would turn every request line into a logging error."""
+    log_redaction.install()
+    logging.getLogger("uvicorn.access").info(
+        '%s - "%s %s HTTP/%s" %d', "172.19.0.1:1", "GET",
+        "/v1/auth/oauth/github/callback?code=gho_SECRETcode123&state=st4te-SECRET",
+        "1.1", 302)
+    out = uvicorn_logging.getvalue()
+    assert "Logging error" not in capsys.readouterr().err
+    assert "gho_SECRETcode123" not in out and "st4te-SECRET" not in out
+    assert "/v1/auth/oauth/github/callback?code=<redacted>&state=<redacted>" in out
+    assert "302" in out
+
+
+def test_non_secret_parameters_are_left_alone(uvicorn_logging):
+    log_redaction.install()
+    logging.getLogger("uvicorn.access").info(
+        '%s - "%s %s HTTP/%s" %d', "172.19.0.1:1", "GET",
+        "/v1/channels/01M46EANYZ253Z04Y9XR8K4PAV/messages?after=01M4DHDM211XX34HBYQ10V2MR0&limit=50",
+        "1.1", 200)
+    assert "?after=01M4DHDM211XX34HBYQ10V2MR0&limit=50" in uvicorn_logging.getvalue()
+
+
+@pytest.mark.parametrize("text", ["/x?codec=vp8", "/x?statement=1", "/x?tokens=3",
+                                  "/x?mytoken=1"])
+def test_a_parameter_that_merely_contains_a_secret_name_is_not_redacted(text):
+    assert log_redaction.redact(text) == text
+
+
+def test_the_hex_device_token_is_still_redacted_in_an_httpx_url_object():
+    """claude-tasks#3586, now through the shape-preserving path: httpx logs a URL
+    OBJECT, not a str, so the arg must be rewritten via its str()."""
+    record = logging.LogRecord("httpx", logging.INFO, __file__, 1,
+                               'HTTP Request: %s %s "%s %d %s"',
+                               ("POST", httpx.URL("https://api.push.apple.com/3/device/" + "ab" * 32),
+                                "HTTP/2", 200, "OK"), None)
+    log_redaction.RedactCredentials().filter(record)
+    message = record.getMessage()
+    assert "ab" * 32 not in message and "/3/device/abababababab..." in message
+    assert record.args[3] == 200, "an int arg must stay an int"
+
+
+def test_install_is_idempotent(uvicorn_logging):
+    log_redaction.install()
+    assert log_redaction.install() == 0
+    for name in ("uvicorn", "uvicorn.access"):
+        for handler in logging.getLogger(name).handlers:
+            assert sum(isinstance(f, log_redaction.RedactCredentials)
+                       for f in handler.filters) == 1

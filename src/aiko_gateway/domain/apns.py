@@ -70,70 +70,24 @@ _SANDBOX_HOST = "https://api.sandbox.push.apple.com"
 # generic form also covers any other secret-shaped hex a future httpx call might
 # carry. Over-redaction risk is accepted: a >=32-char hex run in a URL is a token
 # far more often than it is anything a reader needs whole.
-_LONG_HEX = re.compile(r"\b([0-9a-fA-F]{12})[0-9a-fA-F]{20,}\b")
-
-
-class _RedactLongHex(logging.Filter):
-    """Trim any >=32-char hex run in a log record to its first 12 chars + '...'.
-
-    12 hex is 48 bits — nowhere near enough to reconstruct a 256-bit device token,
-    and empirically plenty to correlate a log line with a DB row (`substr(token,1,12)`
-    disambiguated instantly against the live table while debugging #3386).
-
-    Works on the FORMATTED message and then clears `args`, because httpx logs with
-    %-args rather than a pre-built string; redacting `record.msg` alone would leave
-    the token sitting in `record.args` for any other handler to format back out.
-    """
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        try:
-            message = record.getMessage()
-        except Exception:  # pragma: no cover - a broken record must not kill a send
-            return True
-        redacted = _LONG_HEX.sub(r"\1...", message)
-        if redacted != message:
-            record.msg = redacted
-            record.args = ()
-        return True  # never drop the record; this filter only rewrites
-
-
-def _already_filtered(target) -> bool:
-    """Idempotence (cage-match PR#148, Carnot LOW). `addFilter` is called at import
-    and again from `install_log_redaction`; a module reload in a test would stack
-    duplicates. Harmless in effect — the first pass shortens the token below the
-    threshold — but a function that mutates GLOBAL logger state should be safe to
-    call twice, not merely survivable."""
-    return any(isinstance(f, _RedactLongHex) for f in target.filters)
+# THE FILTER NOW LIVES IN `log_redaction` (2026-10-09), because the second leak it
+# had to cover was not an APNs leak at all: uvicorn wrote the WebSocket access token
+# (`/v1/ws?token=<JWT>`) through its own non-propagating handlers, which a root-handler
+# filter could never see. These names stay as aliases because `fcm.py`,
+# `push_service.py` and the record above cite them.
+from ..log_redaction import LONG_HEX as _LONG_HEX  # noqa: E402
+from ..log_redaction import RedactCredentials as _RedactLongHex  # noqa: E402
+from ..log_redaction import install as _install  # noqa: E402
 
 
 def install_log_redaction() -> None:
-    """Attach the redaction to the ROOT HANDLERS, which is the version that holds.
-
-    A filter on a LOGGER only runs for records logged DIRECTLY to it — verified, not
-    assumed: a filter on "demo" does not see "demo.child". httpx today logs under
-    exactly `getLogger("httpx")` (one call site, `_client.py`), so the import-time
-    attachment below works — but it guards THE LEAK WE FOUND rather than the class,
-    which is precisely the shape of the bug it exists to fix. This one leaked in
-    through a dependency's logger nobody had thought about; the next one will too.
-
-    A filter on a HANDLER sees every record that reaches it, whatever logger emitted
-    it (also verified). So this covers a future `httpx.client` submodule logger, and
-    any other library that ever puts a credential in a URL.
-
-    Called from main.py AFTER `logging.basicConfig`, because the root handler does
-    not exist before then. The import-time attachment stays as well: it costs nothing
-    and keeps any entrypoint that imports this module without going through main.py
-    (a script, a worker, the test suite) covered.
-    """
-    for handler in logging.getLogger().handlers:
-        if not _already_filtered(handler):
-            handler.addFilter(_RedactLongHex())
+    """Kept for callers of the old name; see `log_redaction.install`."""
+    _install()
 
 
-# Installed at IMPORT rather than at client construction: the filter has to be in
-# place before anything can log, and `_client()` is built lazily inside the first
-# send. See `install_log_redaction` for why this is the narrower of the two layers.
-if not _already_filtered(logging.getLogger("httpx")):
+# Installed at IMPORT as well: the filter has to be in place before anything can
+# log, and `_client()` is built lazily inside the first send.
+if not any(isinstance(f, _RedactLongHex) for f in logging.getLogger("httpx").filters):
     logging.getLogger("httpx").addFilter(_RedactLongHex())
 
 # Apple rejects a provider JWT older than 1 hour, AND rejects a provider that mints
