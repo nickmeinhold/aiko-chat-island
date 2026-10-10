@@ -281,7 +281,7 @@ in `verify_schema()` with advice that could not work). So:
 
 **Two deploy topologies, two backup paths; don't mix them.** This runbook records the
 June build-on-host procedure (rsync + `--build`; step 1's backup is
-`~/aiko-db-backups/aiko.db.predeploy-$TS`). Since #2301 / ISL-0003 the fleet deploys
+`~/aiko-db-backups/aiko.db.predeploy-$TS`). Since ISL-0003 the fleet deploys
 pull-based: `ISLAND_VERSION` + `deploy/update.sh`, whose backup is
 `backups/aiko.db.preupdate-*` in the deploy dir. Use the backup the deploy you're
 undoing actually took.

@@ -263,13 +263,13 @@ def _stamp_ahead(sync_url: str, *, keep_known_head: bool) -> set[str]:
 @pytest.mark.parametrize("keep_known_head", [False, True],
                          ids=["ahead", "mixed-known-and-unknown"])
 def test_unknown_revision_refuses_to_start(tmp_path, monkeypatch, keep_known_head) -> None:
-    """Compat guard (design 18 §1, tempered 3/3 rounds): an image that meets a DB
-    stamped at a revision it doesn't know REFUSES TO START. It used to serve anyway
-    (PR#116), which was "safe ONLY if N-1 compatible", a property nothing enforced:
-    an old image serving on a schema a newer one rebuilt is a silent-corruption
-    path. Now it's a loud non-zero exit, and the entrypoint's ``set -e`` never
-    reaches uvicorn. Both shapes refuse: a table that is simply ahead, and one
-    carrying a known head beside the unknown row. Neither is mutated on the way out.
+    """Compat guard (design 18 §1): an image that meets a DB stamped at a revision it
+    doesn't know REFUSES TO START, in the migrator, before uvicorn, with the right
+    diagnosis (image older than schema) and a fix that works (stop the stack, restore
+    the pre-update backup). PR#116's migrator skipped instead, and lifespan's
+    ``_assert_at_head`` then refused with advice that could not work; nothing ever
+    served. Both shapes refuse: a table that is simply ahead, and one carrying a known
+    head beside the unknown row. Neither is mutated on the way out.
     """
     _, sync_url = _point_app_at(tmp_path, monkeypatch)
     migrate.run()  # managed DB at head
@@ -312,15 +312,42 @@ def test_both_boot_layers_refuse_a_forward_migrated_db(
     assert "restore the database backup" in str(refused.value)
     assert "upgrade head" not in str(refused.value)
 
+    # Lifespan reaches the SAME verdict through the SAME predicate
+    # (migrate.schema_status), so it raises the same refusal for both shapes. Before
+    # the shared predicate, the mixed shape died inside alembic's single-revision
+    # lookup with an unrelated error (Carnot, Tesla, PR#392 r3).
     engine = create_async_engine(async_url)
     monkeypatch.setattr(db, "engine", engine)
     try:
-        # "ahead": _assert_at_head's own refusal. "mixed": alembic refuses to name a
-        # single current revision for a two-row version table. Either way: no serve.
-        with pytest.raises(Exception) as lifespan_refused:
+        with pytest.raises(RuntimeError, match="MIGRATE_REFUSE_UNKNOWN_REVISION") as lifespan:
             asyncio.run(db.verify_schema())
-        if not keep_known_head:
-            assert "Refusing to serve" in str(lifespan_refused.value)
+        assert "lifespan check" in str(lifespan.value)
+    finally:
+        asyncio.run(engine.dispose())
+
+
+def test_lifespan_refuses_a_db_left_behind_head(tmp_path, monkeypatch) -> None:
+    """The other branch of the shared predicate: a DB whose stamp is KNOWN but not
+    head (uvicorn started directly, bypassing the entrypoint) is BEHIND, and lifespan
+    refuses with the upgrade advice that is right for that case and only that case.
+    Previously untested; PR#392 rewrote this branch onto ``schema_status``."""
+    import asyncio
+
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from aiko_gateway import db
+
+    async_url, _ = _point_app_at(tmp_path, monkeypatch)
+    command.upgrade(migrate._alembic_config(), "0027")  # one short of head
+    assert migrate.asyncio.run(migrate._schema_status()).state is migrate.SchemaState.BEHIND
+
+    engine = create_async_engine(async_url)
+    monkeypatch.setattr(db, "engine", engine)
+    try:
+        with pytest.raises(RuntimeError, match="Refusing to serve a stale schema") as behind:
+            asyncio.run(db.verify_schema())
+        assert "alembic upgrade head" in str(behind.value)
+        assert "MIGRATE_REFUSE_UNKNOWN_REVISION" not in str(behind.value)
     finally:
         asyncio.run(engine.dispose())
 

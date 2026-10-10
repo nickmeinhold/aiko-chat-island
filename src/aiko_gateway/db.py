@@ -133,25 +133,25 @@ def _assert_schema_current(conn) -> None:
 
 
 def _assert_at_head(conn) -> None:
-    """Fail LOUD if the DB's alembic revision is not the script head (Carnot
-    cage-match, PR#23). ``_assert_schema_current`` only checks that the DB is
-    *managed* (alembic_version present); this checks it is *current*. Without it, a
-    DB left at 0001 after a later 0002 ships — e.g. uvicorn started directly,
-    bypassing the entrypoint migration — would boot and serve a stale schema."""
-    from alembic.runtime.migration import MigrationContext
-    from alembic.script import ScriptDirectory
+    """Fail LOUD unless the DB is at exactly the script head (Carnot cage-match,
+    PR#23). ``_assert_schema_current`` only checks that the DB is *managed*; this
+    checks it is *current*. Decided by ``migrate.schema_status``, the same predicate
+    the entrypoint migrator uses, so the two boot layers cannot disagree (PR#392):
+    an image OLDER than the schema gets the migrator's refusal and its working fix,
+    and a DB left BEHIND (uvicorn started directly, bypassing the entrypoint) gets
+    told to upgrade."""
+    from .migrate import SchemaState, refuse_unknown_message, schema_status  # lazy: migrate imports db.Base (cycle)
 
-    from .migrate import _alembic_config  # lazy: migrate imports db.Base (cycle)
-
-    head = ScriptDirectory.from_config(_alembic_config()).get_current_head()
-    current = MigrationContext.configure(conn).get_current_revision()
-    if current != head:
+    status = schema_status(conn)
+    if status.state is SchemaState.UNKNOWN:
+        raise RuntimeError(refuse_unknown_message(status) + " (lifespan check)")
+    if status.state is not SchemaState.HEAD:
         raise RuntimeError(
-            f"DB is at alembic revision {current!r} but the code's head is "
-            f"{head!r}. The entrypoint runs `python -m aiko_gateway.migrate` "
-            "before serving; if running uvicorn directly (dev), run "
-            "`alembic upgrade head` first. Refusing to serve a stale schema."
-        )
+            f"DB is at alembic revision(s) {sorted(status.stamped)} but the code's "
+            f"head is {status.head!r}. The entrypoint runs `python -m "
+            "aiko_gateway.migrate` before serving; if running uvicorn directly "
+            "(dev), run `alembic upgrade head` first. Refusing to serve a stale "
+            "schema.")
 
 
 async def verify_schema() -> None:

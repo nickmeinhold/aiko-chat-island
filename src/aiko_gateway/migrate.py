@@ -68,6 +68,8 @@ import asyncio
 import logging
 import os
 import tempfile
+from dataclasses import dataclass
+from enum import Enum
 
 from alembic import command
 from alembic.autogenerate import compare_metadata
@@ -178,27 +180,80 @@ async def _diff_against(target: MetaData) -> list:
         await engine.dispose()
 
 
-async def _unknown_db_heads(cfg: Config) -> set[str]:
-    """Revision(s) the DB is stamped at that this image's migration scripts do NOT
-    contain. A non-empty result USUALLY means an image rollback onto a volume a newer
-    image already migrated forward — but "unknown" also covers a squashed/removed past
-    revision or a corrupt stamp, which this comparison cannot tell apart (see the
-    module docstring's compat guard).
+class SchemaState(Enum):
+    """Where a database's ``alembic_version`` stands relative to THIS image's
+    migration scripts. A closed set, so both boot layers branch on the same four
+    answers instead of re-deriving their own."""
+    HEAD = "head"            # stamped at exactly this image's head
+    BEHIND = "behind"        # every stamped revision is known; not (only) head
+    UNKNOWN = "unknown"      # some stamped revision is absent from this image
+    UNMANAGED = "unmanaged"  # no alembic_version table at all
 
-    ``get_current_heads()`` returns the raw ``alembic_version`` rows without
-    resolving them against the script directory, so an unknown revision id survives to
-    be compared here (an empty tuple on a DB with no version table — a fresh or
-    pre-alembic DB — which correctly yields no unknowns). Read over the async driver
-    (the deploy has only aiosqlite)."""
-    known = {rev.revision for rev in ScriptDirectory.from_config(cfg).walk_revisions()}
+
+@dataclass(frozen=True)
+class SchemaStatus:
+    state: SchemaState
+    stamped: frozenset[str]
+    unknown: frozenset[str]
+    head: str
+
+
+def schema_status(conn) -> SchemaStatus:
+    """THE single predicate for "may this image's code run on this database?",
+    shared by the entrypoint migrator (``run()``) and lifespan
+    (``db._assert_at_head``). PR#116 relaxed only one of two separately-written
+    checks and shipped a serve-anyway that the other check made unreachable;
+    deciding in one place is what keeps the two layers from disagreeing again
+    (Carnot, PR#392 r3).
+
+    ``get_current_heads()`` returns the raw ``alembic_version`` rows WITHOUT
+    resolving them against the script directory, so an unknown id survives to be
+    compared, and a two-row (known + unknown) table is classified here instead of
+    dying inside alembic's single-revision lookup. "Unknown" covers an image
+    rollback onto a forward-migrated volume (the usual cause), a squashed/removed
+    past revision, and a corrupt stamp; this comparison cannot tell them apart,
+    and all three must not serve. Sync, so either layer can call it via
+    ``run_sync``."""
+    script = ScriptDirectory.from_config(_alembic_config())
+    head = script.get_current_head()
+    if "alembic_version" not in inspect(conn).get_table_names():
+        return SchemaStatus(SchemaState.UNMANAGED, frozenset(), frozenset(), head)
+    known = {rev.revision for rev in script.walk_revisions()}
+    stamped = frozenset(MigrationContext.configure(conn).get_current_heads())
+    unknown = stamped - known
+    if unknown:
+        state = SchemaState.UNKNOWN
+    elif stamped == {head}:
+        state = SchemaState.HEAD
+    else:
+        state = SchemaState.BEHIND
+    return SchemaStatus(state, stamped, frozenset(unknown), head)
+
+
+def refuse_unknown_message(status: SchemaStatus) -> str:
+    """The one refusal text for an image older than its schema. Both layers raise
+    it, so the operator gets the same diagnosis and the same (working) fix whichever
+    layer trips first."""
+    return (
+        "MIGRATE_REFUSE_UNKNOWN_REVISION: database is stamped at revision(s) "
+        f"{sorted(status.unknown)} not present in this image's migration scripts, so "
+        "this image is OLDER than the schema (or the stamp is from a squashed "
+        "history, or corrupt). Refusing to start. To roll back across a migration: "
+        "stop the stack (`docker compose stop`, so restart: always isn't reopening "
+        "the file), restore the database backup taken before the newer image "
+        "migrated it, then start this image. If this fired after a "
+        "migration-history squash/rebase, stamp this volume to the new baseline "
+        "instead.")
+
+
+async def _schema_status() -> SchemaStatus:
+    """``schema_status`` over the async driver (the deploy has only aiosqlite)."""
     engine = create_async_engine(settings.db_url, poolclass=NullPool)
     try:
         async with engine.connect() as conn:
-            heads = await conn.run_sync(
-                lambda c: MigrationContext.configure(c).get_current_heads())
+            return await conn.run_sync(schema_status)
     finally:
         await engine.dispose()
-    return set(heads) - known
 
 
 def run() -> None:
@@ -228,18 +283,9 @@ def run() -> None:
     # volume a newer image migrated forward, and this code may not be able to read
     # what that migration wrote. REFUSE to start, loudly, rather than serve and hope.
     # Do NOT stamp down, do NOT mutate, either way.
-    unknown = asyncio.run(_unknown_db_heads(cfg))
-    if unknown:
-        raise RuntimeError(
-            "MIGRATE_REFUSE_UNKNOWN_REVISION: database is stamped at revision(s) "
-            f"{sorted(unknown)} not present in this image's migration scripts, so "
-            "this image is OLDER than the schema (or the stamp is from a squashed "
-            "history, or corrupt). Refusing to start. To roll back across a "
-            "migration: stop the stack (`docker compose stop`, so restart: always "
-            "isn't reopening the file), restore the database backup taken before "
-            "the newer image migrated it, then start this image. If this fired "
-            "after a migration-history squash/rebase, stamp this volume to the new "
-            "baseline instead.")
+    status = asyncio.run(_schema_status())
+    if status.state is SchemaState.UNKNOWN:
+        raise RuntimeError(refuse_unknown_message(status))
 
     command.upgrade(cfg, "head")
     log.info("Database is at head.")
