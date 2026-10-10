@@ -204,7 +204,7 @@ Carnot's verdict artifact plus smoke suite is the design-16 ratchet if taken who
 smallest promotion signal that removes the self-report, and name healthy-but-wrong detection as
 a tradeoff owned by the canary's operator (Nick), not a mechanism. If v3 can't fold 1–7 within
 ~1.5× v1 by SUBTRACTING Phase B, stop: ship the compat guard alone and leave auto-update parked.
-**Round 3 is GATED on a Qwen seat** (Nick, 2026-10-10: "let's wait till we add qwen"). Gemini was evaluated the same day and is being dropped: on design tempers it yielded 0.34 unique-folded flaws per strike against Carnot's ~1.0, and it vouched for 35+ flaws that others folded (claude-skills `docs/crucible/kelvin-yield/design-temper/`).
+**Round 3 runs without Kelvin** (Nick, 2026-10-10 16:26: "qwen is going to take a while, just roll without kelvin"; a Qwen seat is planned). Gemini was evaluated the same day and is being dropped: on design tempers it yielded 0.34 unique-folded flaws per strike against Carnot's ~1.0, and it vouched for 35+ flaws that others folded (claude-skills `docs/crucible/kelvin-yield/design-temper/`).
 
 ## MaxwellMergeSlam's Design Strike
 
@@ -300,4 +300,127 @@ Tesla: "If you want the secrets of the universe, think in energy, frequency and 
 - In §2, the CI job keeps an external memory: the first hourly sample whose reported digest equals the newest release and whose health is green, promote only after `SOAK_HOURS` of consecutive green samples, reset on any miss. A `started_at` in the future or a missing digest fails closed. Store and promote that digest. A later canary miss before the fleet has pulled moves `:stable` back or holds it. The latch has to be able to open.
 - The watcher pets the off-box dead-man before Phase C stops anything, with a lease longer than the cutover budget plus rollback. The page fires when the lease expires and `deploy/.auto-update/state` is still host-failed. A successful cutover must not be the same silence as a dead island.
 - Default `OnCalendar` to the low-entropy window already named for enspyr (`03:00..05:00`). Every 15 minutes remains an explicit operator edit.
+
+
+
+---
+---
+
+# Round 3: design 18 v3 (the LAST)
+
+**Overall verdict: RECAST, 3/3** (Maxwell, Carnot and Tesla all RECAST; zero DISSOLVE). **Round cap reached.**
+**Struck:** dt-1791624402, 2026-10-10. Panel: Maxwell + Carnot + Tesla (Kelvin dropped on evidence; Qwen not yet seated). 64 KB bundle. Maxwell's strike was written first; Carnot and Tesla landed together.
+
+## Per-family verdicts
+| Family | Verdict | One line |
+|---|---|---|
+| Maxwell (Claude) | RECAST | The lease measures the watcher's pulse, not the island's: a release that dies after being recorded current never pages |
+| Carnot (GPT) | RECAST | The `.served` boundary is gateway-only while three services start; the manifest is prose |
+| Tesla (Grok) | RECAST | A global `last_red_at` is struck by the cutover itself, so `:stable` freezes; deleting the marker before the backup lets a failed backup delete the live db |
+
+## Fatal flaws (deduped, most severe first)
+1. **Phase B can delete the only good database (Tesla).** v3's step 1 deletes `.served` *before* `.backup` + `integrity_check`. A backup that fails (disk filled after the Phase A check) then falls into the marker-absent arm, which deletes `aiko.db` and copies in the failed backup. **Introduced by v3.** → Reorder: a checked `pre-<digest>.db` must exist before `.served` is deleted or any failure arm touches the live set. A backup failure starts previous on the untouched db, retries, and doesn't quarantine.
+2. **Container-id matching reintroduces round 1's silent rewind (Tesla).** Under `restart: always`, container C1 writes the marker, serves, and dies; the watcher reads after stop and sees C2. A strict id match reads as absent, so the restore runs and C1's acks are lost. **Introduced by v3** (added to fix round 2's stale marker). → Marker-present = a marker for this DIGEST exists; containers append; an id mismatch is never absence. Clearing it before cutover already handles staleness.
+3. **Promotion freezes (Tesla; Carnot names the policy gap).** One global `last_red_at` is moved by the nightly cutover window itself (the sampler hits the 600 s outage), by the night syd and melb disagree during rollout, and by any single probe flake. So no release's first-seen ever postdates the last red. **Introduced by v3's 7-day change.** → Reds are per digest, counted only while an island is SERVING that digest, and a sample taken during a planned cutover lease isn't a sample.
+4. **Watcher health omits `aiko_connected`, and the lease isn't conditional (Tesla, Maxwell).** A bus-deaf release on the canary records current, renews the lease, and never pages. A release that dies after "current" also keeps the lease fed. → The watcher's healthy predicate includes `aiko_connected`, and the lease is pinged only when that predicate passes, on every run.
+5. **"Nothing served by construction" overclaims (Carnot, Tesla).** Registrar and chat start on the same `up -d` and can emit off-box effects before the gateway marker exists. → Shrink the claim to "no gateway data-volume write was admitted"; registrar/chat off-box effects are named accepted loss (as on every manual deploy). Don't build a three-service gate.
+6. **Smaller (all narrow):** syd shares melb's window, so it can't refuse a digest melb quarantined (stagger syd later, Tesla); name the variables-write credential and add `concurrency:` (Maxwell); probe exclusion from the island mark needs a flag the count honours (Maxwell); the manifest becomes a checked file (Carnot); marker timestamp + per-service diagnostics for the terminal runbook (Carnot).
+
+## The pattern across three rounds (named as a class, not three instances)
+Every round found its most severe flaw in the **failure arms of Phase B's prose step list**:
+- **Round 1:** the step order contradicted the quarantine rule.
+- **Round 2:** the rehearsal relocated a failure, and the 120 s knife misjudged slow migrations.
+- **Round 3:** the marker was deleted before the backup, and a container-id mismatch was read as absence.
+
+And the round-3 severe flaws (1–3) were each **created by a round-2 fold**. **The size bar held (v3 is 1.38× v1); the "remove, don't relocate" bar did not**, for three of v3's new pieces. Severity did not decline across rounds, so this is not converging the way a clean final round would.
+The mechanism the class calls for is not another prose fix. **Phase B should be written as a state table**: every step × {success, failure} → the next state, plus the invariant that must hold in each state (e.g. "a checked backup exists" before any live-set mutation). A reviewer, or a test, can then check every cell instead of reading a narrative for the one missing arm.
+
+## Disposition
+**The round cap (3) is reached, and the core is TEMPERED:** the compat guard (unknown revision ⇒ refuse, no floors) held all three rounds, unanimously, and is **ready to build**. So is record-don't-rewind as a principle, and the `.backup` set restore.
+**The watcher and promotion layer is NOT tempered.** Each round's fixes produced the next round's severe flaw. Folding round 3 as prose and shipping would ship a fourth generation nobody struck. **Recommended:** build the compat guard now; rewrite Phase B as a state table (v4), fold flaws 1–6 into it, and strike v4 as a NEW round series once the Qwen seat lands, rather than as round 4 of this one. That's Nick's call: it overrides the cap.
+
+## MaxwellMergeSlam's Design Strike
+
+**Verdict:** RECAST
+
+**Summary:** v3's spine holds, and its marker placement is checked against the code. But the dead-man lease measures the WATCHER's pulse, not the island's, so the one failure v3 hands to a human, a release that goes bad AFTER it was recorded current, never pages anyone.
+
+**Fatal flaws:**
+- **§3 Paging: the lease is pinged by the watcher, so a crash-looping island that the watcher has already called healthy keeps renewing it (missing failure mode, under-counted blast radius).** Step 3 records the digest as current once all three containers are healthy within the budget. If the gateway starts crash-looping ten minutes later (a healthy-but-wrong release that turned into a down release), every later watcher run sees "channel digest == running digest", has nothing to do, and pings the lease. `restart: always` keeps the container technically up between crashes. So the island is down and the page is silent, on exactly the canary (enspyr-melb) whose real use v3 relies on to catch the tail. John McClane: "Welcome to the party, pal." **Fix:** the ping is CONDITIONAL. The watcher pings only if, at that moment, all three containers are healthy and `/health` returns 200. It's the same predicate as step 3, so it adds no new mechanism: just "ping if healthy" instead of "ping on run". Host-failed and post-cutover death then page the same way.
+- **§2: the promotion job's memory needs a credential v3 doesn't name (unstated assumption).** "Repo variables" written by a scheduled workflow: the default `GITHUB_TOKEN` can't write Actions variables, so this needs a fine-grained token or an App with variables:write, plus `concurrency:` so two hourly runs can't interleave read-modify-write on the streak. v3 already names the probe password as a credential CI holds, so it should name this one too, or keep the state somewhere `GITHUB_TOKEN` can already write (an orphan-branch JSON file, committed).
+- **§2: excluding the probe from the island-mark counts is code, not a sentence.** The activity aggregate has no notion of a probe account today. Either add an explicit, operator-visible flag on the probe user (and the count query honours it), or accept that enspyr-syd's mark shows activity from a robot and say so. Otherwise the k-anonymity ruling's public numbers include CI.
+
+**What holds:**
+- **Marker placement, checked against `main.py`:** before `state.bus.start()` (line 250) lifespan only runs `verify_schema()` and the push-reachability read. The channel worker consumes a queue that only bus events fill, and gossip and nudge start after `bus.start()`. So "written immediately before the bus subscribe" really is the first point at which this generation can consume or serve. The port binds after `yield`. Record-don't-gate is now true of the code, not just the design.
+- **Deleting the on-host rehearsal** removed a relocated failure instead of guarding it, and v3 shrank (1.38× v1) while closing round 2. That's the opposite of design 16's ratchet.
+- **First-seen + last-red promotion** makes "stable" mean something at this release cadence without a reset-on-new-release stall. Not moving `:stable` backwards is correctly argued: a channel downgrade would cross migrations the guard refuses.
+- **The terminal runbook forbids the serve-anyway override**, and the diagnostics record the window between the marker and the failure, so a human restore is an informed loss rather than a silent one.
+
+**If RECAST, what to fold back:**
+- The lease ping is conditional on the step-3 health predicate, evaluated on every run.
+- Name the variables-write credential and add `concurrency:` (or move the streak state to a file `GITHUB_TOKEN` can commit).
+- Make the probe-exclusion an explicit flag the activity query honours, or name the robot activity as accepted.
+
+
+---
+
+## CarnotCodeCarver's Design Strike
+
+**Verdict:** RECAST
+
+**Summary:** No real engine matches the Carnot cycle; a reviewer's job is to say how far short we are. v3 closes the round-2 wounds honestly in the main line: deleting on-host rehearsal is the right subtraction, one long budget removes the migration knife, the marker is now keyed to the digest/container and placed late enough to mean something, and the watcher-owned env file avoids poisoning SOPS drift. But the proof still has two hot leaks: the `.served` boundary is gateway-only while three services are started, and promotion still treats two health probes plus one synthetic path as enough evidence to advance a whole fleet. Dijkstra: "Simplicity is prerequisite for reliability." The fold-back is small, but it must be explicit before this ships.
+
+**Fatal flaws:**
+- The rollback proof says marker absent means "nothing was served or consumed," but only the gateway writes the marker. The watcher starts gateway, registrar, and chat together; registrar and chat mount no volume, but they can still accept connections, subscribe, ack, emit webhooks, register presence, or produce other off-box effects before the gateway marker exists. The doc later says those off-box effects are accepted, but that contradicts the stronger safety claim. This is entropy sneaking through an unmeasured boundary: either all externally serving/consuming processes are held behind the same admission event, or the guarantee must shrink to "no gateway data-volume writes were admitted."
+- The app-side marker placement is still underspecified at the exact thermodynamic event horizon. It says "after migration, immediately before the bus subscribe and the port bind," relying on uvicorn binding only after lifespan. That is a fragile coupling to framework startup order and service-specific code paths. If any route, socket, background task, or bus consumer can start outside that ordering, the marker-absent restore can lose acknowledged work. Feynman: "The first principle is that you must not fool yourself." This needs an implementation invariant: no client port bind, no WS accept, no MQTT subscribe/ack, and no externally visible side effect before the marker write succeeds.
+- The state manifest is prose, not yet a checked artifact. v3 says every volume in compose must be classified, which is good, but the classifications themselves are semantic assertions: `mosquitto_data` is disposable because gateway uses a clean session; registrar/chat have no volume; worker-guard lock is disposable. That can rot the first time someone adds a retained topic, durable subscription, upload path, generated file, cache that becomes authoritative, or new mount. The design must make this a machine-checked manifest with service/path/classification/reason, and fail preflight on any unclassified writable mount. Otherwise the second law wins quietly: state only increases.
+- Promotion still undercounts healthy-but-wrong while owning the mechanism that spreads it. v3 improves v2 by using CI memory, two islands, digest matching, and a synthetic round trip. But `:stable` advances on one scripted gateway login/post/read plus `/health` from the busy canary. That does not cover registrar/chat behavior except container health, Aiko phone-ring semantics, worker paths, auth edge cases, or migrations that damage rare data. The doc names this tradeoff, but because stable auto-promotes fleet-wide, this cannot be merely "out of scope"; it must be a named acceptance criterion owned by the operator: stable means exactly this smoke suite and no more.
+- The `last_red_at` rule is conservative but can deadlock promotion for the wrong release. A red sample from a newer `:latest` digest after an older digest has already soaked clean makes the older digest ineligible because its first-green time is not after `last_red_at`. That converts "new bad release" into "no stable promotion of prior good release" until a human hotfix override. This may be acceptable, but it is not named. Hamming: "The purpose of computing is insight, not numbers." The insight needed here is whether stable should promote the newest clean digest before the red, or whether any red freezes the channel by policy.
+- The terminal runbook still asks the operator to choose between fix-forward and restoring `pre-<digest>.db` while accepting lost writes since marker time, but the design does not prove the diagnostics contain enough to identify that window across all services. The marker has digest/container, but not necessarily timestamp, schema before/after, service readiness sequence, bus subscription timing, or registrar/chat effects. v3 lists many diagnostics, which is good; make marker time and per-service admission/consume state explicit, or the operator is doing archaeology under pager pressure.
+
+**What holds:**
+- The biggest round-2 flaw was actually dissolved: on-host rehearsal is gone. That removes the second engine on the same disk/memory reservoir instead of armoring it with more ritual.
+- One `AUTO_UPDATE_BUDGET` covering migration and startup is the right thermodynamic accounting. A running migration is heat in the system, not yet a verdict.
+- Unknown Alembic revision refusing by default, with no compat floors, remains the strongest part of the design. It converts irreversible schema advance into an honest stop rather than a pretend rollback.
+- The watcher-owned second `--env-file` is the correct low-coupling home for `ISLAND_IMAGE`; it preserves the SOPS drift alarm instead of teaching operators to ignore it.
+- Digest plus container id for `.served`, deletion before cutover, and reading only after `compose stop` are materially better than v2's build-ref scar.
+- The off-box lease is the right pager shape. A planned outage renews the lease; a dead or host-failed box stops renewing it.
+- Default `AUTO_UPDATE=off`, explicit `stable`/`latest`, shared `flock`, pull-before-stop, all-three health, previous pinned by digest/id, and refusing auto-restore to pre-guard images all hold.
+
+**If RECAST, what to fold back:**
+- Keep v3, but weaken or complete the core invariant. Preferred fold: all three services must share an admission gate, and no service may bind a client port, accept WS, subscribe/ack MQTT, or emit off-box effects before the gateway marker/admission point. Smaller fold: explicitly reduce the restore guarantee to gateway database state and name registrar/chat pre-marker effects as accepted loss.
+- Turn the state manifest into a checked file consumed by preflight: every compose volume and writable mount classified as restored, disposable, externally durable, or forbidden, with future unclassified paths failing Phase A.
+- Make promotion semantics explicit: `:stable` means health plus the named synthetic round trip plus real-use canary observation, not general correctness. Add registrar/chat smoke only if those services have user-visible release risk; otherwise state the residual risk in the operator-facing setting.
+- Decide and document the `last_red_at` policy: either global freeze on any red is intentional, or promotion may select the newest digest whose own clean window predates a later bad `:latest`. Right now the policy is hidden in the variables.
+- Persist marker timestamp and per-service startup/admission diagnostics. In terminal state the operator should know exactly whether any service crossed the irreversible boundary before choosing fix-forward versus data restore.
+- Verdict target: RECAST, but narrow. Do not add rehearsal back. Do not build a giant smoke cathedral. Fold the admission boundary across all serving processes, make the manifest executable, and ship the remaining healthy-but-wrong risk as an explicit operator tradeoff.
+
+
+---
+
+## Tesla, the Arc-Prophet's Design Strike
+
+**Verdict:** RECAST
+
+**Summary:** v3 took the second engine off the live box, then coupled every release to one global red that the 3am cutover itself strikes, so `:stable` goes still, and a failed backup after the marker is wiped can delete the only database still singing.
+
+Tesla: "If you want the secrets of the universe, think in energy, frequency and vibration."
+
+**Fatal flaws:**
+- **§2's promotion predicate contradicts the cadence sentence it was written to save.** The prose says a newer release must not reset the soak, because a reset streak never promotes at this cadence. The machine is one global `last_red_at`: the last red sample from either island, missing field included, fail closed. A sample is green only when both `:latest` islands match the release. `:stable` moves only to a digest whose immutable first-seen is at least `SOAK_DAYS` (7) ago and still after that global red. A newer digest landing makes syd and melb disagree for a night, and that disagreement is red, so `last_red_at` jumps past the previous release's first-seen. That release never qualifies again. The same clock is struck by the ritual §2 and §3 schedule together: the sampler is hourly, the default window is `03:00..05:00`, and cutover stops the stack inside a 600s budget. A sample in that window is a failed `/health`, which is red, which moves the same variable. One flake of the enspyr-syd probe (CI password, one post, one WS read, 168 hourly chances in seven days) does it too. Round 2's rehearsal let one small box freeze the fleet. v3 deleted the rehearsal and gave that authority to a single sample. After promotion, a red only stops further promotion and opens an issue. `:stable` stays on the bad digest. The issue does not conduct. Islands that already migrated cannot take a backward tag, because the guard would refuse them. Islands that have not pulled are the ones a hold could still save, and they still resolve the condemned digest.
+- **§3 Phase B step 1 destroys the proof, and the absent-marker arm then destroys the live set.** The order is stop, delete `.served`, then `.backup` into `pre-<digest>.db`, then `integrity_check`. The failure arm is any error after step 1: `compose stop`, read the marker, and if it is absent, delete `aiko.db`, `-wal`, and `-shm` and copy `pre-<digest>.db`. Backup failure, a disk that fills after the Phase A "free space ≥ 2× the db" check (the last two backups already sit on that disk), or a failed `integrity_check` happens with the stack already stopped and the marker already gone. That exit is either undrawn, or it falls into the absent arm and deletes the live database to copy a file that just failed. Phase A said a disk fault retries and does not quarantine. After the stop, Phase B forgets. The container-id conjunction is the same wire. The marker counts only when digest and container id match, and `restart: always` stays armed during the budget. Container C1 can write the marker, bind, ack writes, and die. The watcher, reading after `compose stop`, sees C2. A strict match looks absent, the restore runs, and the acks C1 already gave are gone. Round 1's silent rewind comes back through the identity added to prevent a stale file.
+- **The canary's green is a different note from the phones, and the other `:latest` island cannot hear a death.** The core move says a missing marker means nothing was served or consumed, so the restore loses nothing by construction. Registrar and chat start on the same `up -d`, mount no volume, and can emit off-box while the gateway is still migrating and `.served` is still unwritten. A failure then rewinds the database and leaves those effects standing. The watcher's healthy is three running containers plus `/health` 200. Promotion, on enspyr-melb, also demands `aiko_connected`. A bus-deaf release on the island where the phones ring still renews the lease, records current, and does not quarantine. The dead-man stays fed. CI withholds `:stable`, so the fleet is spared and the canary sits in the bad state with no page. Quarantine is local. enspyr-syd follows the same `:latest` tag and the same `03:00..05:00` local window, in the same timezone, so it neither leads melb nor reads melb's quarantine. A digest the canary has already condemned is still the tag the test island pulls that night.
+
+**What holds:**
+- Unknown revision refuses, the watcher never sets `MIGRATE_ALLOW_UNKNOWN_REVISION`, and the floor table stayed deleted. That guard has held three rounds and can ship alone.
+- Deleting on-host rehearsal is a real subtraction. The live box is no longer a second engine with quarantine authority.
+- One 600s budget, a migration still inside it treated as a wait, the marker written at the end of lifespan immediately before the bus subscribe and the bind, cleared before cutover, and read only after `compose stop`. That placement is the right place on the waveform.
+- `.backup` plus deleting the `aiko.db` / `-wal` / `-shm` set. Watcher-owned `image.env`, off the SOPS byte-for-byte file. The lease renewed before the stop, with grace longer than the budget plus a rollback. Five ordered bootstrap steps. An unclassified volume fails Phase A. Host-failed stays stopped, with a runbook that forbids the serve-anyway override. `AUTO_UPDATE=off` by default. The island pulls. `flock -n` is shared with `update.sh`.
+- Refusing to walk `:stable` backward is the right fear. A downgrade would march every migrated follower into the guard. What is missing is a hold that conducts forward.
+
+**If RECAST, what to fold back:**
+- Rewrite the §2 predicate until the cadence sentence is the mechanism. Per digest: first-seen, and reds only while an island is actually serving that digest, probe failure included. A newer digest's rollout, a sample taken while the lease is held across a planned cutover, and "not on it yet" must not move an older candidate's clock. A red pauses that digest's soak. It must not erase first-seen. Keep the ban on a backward tag. Add a digest hold the watcher reads before it pulls, so a post-promotion red stops islands that have not adopted it.
+- In §3, a `pre-<digest>.db` that has passed `integrity_check` exists before `.served` is deleted and before any failure arm may touch the live set. Backup failure, short disk, or a bad check starts the previous image on the untouched database, retries next poll, and does not quarantine. Marker-present means a marker file for this digest exists. A restarted container id appends to it. A container-id mismatch is not absence.
+- The watcher's healthy on a `:latest` island includes the same `aiko_connected` the promoter already requires, so a bus-deaf canary rolls back or the lease pages. Leave melb as the canary. Give syd a later window so it can refuse a digest melb has quarantined.
+- If those folds start growing a smoke suite or a verdict artifact, stop. Ship the compat guard. Leave auto-update parked. This is round 3 of 3.
 
