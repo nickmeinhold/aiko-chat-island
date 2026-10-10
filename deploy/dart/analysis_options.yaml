@@ -1,0 +1,13 @@
+include: package:lints/recommended.yaml
+
+analyzer:
+  language:
+    strict-casts: true
+    strict-inference: true
+    strict-raw-types: true
+  errors:
+    # The whole reason this package is Dart: a non-exhaustive switch over the
+    # outcome sum type is the bug class the tool exists to avoid, so it is an
+    # ERROR here rather than a warning someone scrolls past.
+    non_exhaustive_switch_expression: error
+    non_exhaustive_switch_statement: error
