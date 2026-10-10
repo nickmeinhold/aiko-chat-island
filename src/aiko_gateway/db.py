@@ -143,6 +143,8 @@ def _assert_at_head(conn) -> None:
     from .migrate import SchemaState, refuse_unknown_message, schema_status  # lazy: migrate imports db.Base (cycle)
 
     status = schema_status(conn)
+    if status.state is SchemaState.UNMANAGED:
+        return  # _assert_schema_current owns the "not migrated at all" message
     if status.state is SchemaState.UNKNOWN:
         raise RuntimeError(refuse_unknown_message(status) + " (lifespan check)")
     if status.state is not SchemaState.HEAD:
@@ -159,6 +161,10 @@ async def verify_schema() -> None:
     owns creation/evolution via the entrypoint (`aiko_gateway.migrate`); this only
     VERIFIES — it never creates tables. See module docstring for the source-of-
     truth rationale."""
+    # Revision FIRST, then column shape. A newer image's migration may change the
+    # columns _assert_schema_current inspects, and on that schema the shape check
+    # would misdiagnose "behind the code, run upgrade head". The revision check knows
+    # the schema is AHEAD and gives the working fix (Tesla, PR#392 r4).
     async with engine.connect() as conn:
-        await conn.run_sync(_assert_schema_current)
         await conn.run_sync(_assert_at_head)
+        await conn.run_sync(_assert_schema_current)

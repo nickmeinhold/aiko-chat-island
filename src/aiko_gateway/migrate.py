@@ -35,8 +35,12 @@ PR#116).** Image rollback is the usual cause, but the same detector fires on a
 squashed/removed past revision (routine alembic history hygiene) and on a corrupt
 ``version_num``. In those the volume is behind or garbage, not ahead. Refusing is the
 right answer for all three: under serve-anyway they pinned the volume below head
-*silently and permanently*. **If you squash or rebase migration history, stamp every
-live volume to the new baseline**, or those volumes will refuse to boot.
+*silently and permanently*. **If you ever squash or rebase migration history, stamp
+every live volume to the new baseline FROM THE NEW IMAGE, after its ``compare_metadata``
+shows the volume's schema equals that baseline** (the adopt path's discipline), or those
+volumes will refuse to boot. Never stamp from a refusing image: stamping its head onto a
+newer schema makes ``schema_status`` read HEAD and the guard never fires again (Tesla,
+PR#392 r4). The refusal message deliberately does not suggest stamping.
 (This cannot co-occur with the adopt path: adopting means there is no
 ``alembic_version`` at all, hence no unknown revision to find.)
 
@@ -239,11 +243,12 @@ def refuse_unknown_message(status: SchemaStatus) -> str:
         f"{sorted(status.unknown)} not present in this image's migration scripts, so "
         "this image is OLDER than the schema (or the stamp is from a squashed "
         "history, or corrupt). Refusing to start. To roll back across a migration: "
-        "stop the stack (`docker compose stop`, so restart: always isn't reopening "
-        "the file), restore the database backup taken before the newer image "
-        "migrated it, then start this image. If this fired after a "
-        "migration-history squash/rebase, stamp this volume to the new baseline "
-        "instead.")
+        "take the stack down (`docker compose down`; a merely stopped restart: "
+        "always container comes back when the Docker daemon restarts), restore the "
+        "database backup taken before the newer image migrated it, then start this "
+        "image. Do NOT `alembic stamp` this volume to make the error go away: a "
+        "stamp claims the schema matches a revision, and stamping this image's "
+        "head onto a newer schema silences this guard for good.")
 
 
 async def _schema_status() -> SchemaStatus:

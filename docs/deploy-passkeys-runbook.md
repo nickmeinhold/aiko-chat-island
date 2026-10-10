@@ -289,9 +289,9 @@ undoing actually took.
 - **The release ran no migration:** go back to the old code (pull-based: re-pin
   `ISLAND_VERSION` and run `update.sh`; build-on-host: rsync the prior tree and
   `up -d --build`). That's all.
-- **The release ran a migration:** put the database back FIRST, with the stack stopped
-  (`docker compose stop`, so `restart: always` isn't reopening the file), then go back
-  to the old code. **Restore that deploy's backup** (see the restore drill, #17). It is
+- **The release ran a migration:** put the database back FIRST, with the stack DOWN
+  (`docker compose down`: a merely stopped `restart: always` container comes back if
+  the Docker daemon restarts mid-restore), then go back to the old code. **Restore that deploy's backup** (see the restore drill, #17). It is
   exact, but it loses writes made since the update.
 
 There is deliberately no serve-anyway override and no generic downgrade recipe here.

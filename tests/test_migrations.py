@@ -308,9 +308,12 @@ def test_both_boot_layers_refuse_a_forward_migrated_db(
         migrate.run()
     # The advice is the load, not the marker (Tesla, PR#392 r2): the message must
     # send the operator to a stopped-stack restore, never to `alembic upgrade head`.
-    assert "docker compose stop" in str(refused.value)
+    assert "docker compose down" in str(refused.value)
     assert "restore the database backup" in str(refused.value)
     assert "upgrade head" not in str(refused.value)
+    # Stamping would silence the guard for good (Tesla, PR#392 r4): the message may
+    # warn against it, never suggest it.
+    assert "Do NOT `alembic stamp`" in str(refused.value)
 
     # Lifespan reaches the SAME verdict through the SAME predicate
     # (migrate.schema_status), so it raises the same refusal for both shapes. Before
@@ -322,6 +325,37 @@ def test_both_boot_layers_refuse_a_forward_migrated_db(
         with pytest.raises(RuntimeError, match="MIGRATE_REFUSE_UNKNOWN_REVISION") as lifespan:
             asyncio.run(db.verify_schema())
         assert "lifespan check" in str(lifespan.value)
+    finally:
+        asyncio.run(engine.dispose())
+
+
+def test_lifespan_names_a_forward_schema_even_when_its_columns_changed(
+        tmp_path, monkeypatch) -> None:
+    """A newer image's migration may change the very columns ``_assert_schema_current``
+    inspects. Lifespan must still say "image older than schema", not "behind the
+    code, run upgrade head": the revision check runs FIRST (Tesla, PR#392 r4)."""
+    import asyncio
+
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from aiko_gateway import db
+
+    async_url, sync_url = _point_app_at(tmp_path, monkeypatch)
+    migrate.run()
+    _stamp_ahead(sync_url, keep_known_head=False)
+    seed = create_engine(sync_url)
+    try:
+        with seed.begin() as conn:
+            conn.execute(text("ALTER TABLE users DROP COLUMN email"))
+    finally:
+        seed.dispose()
+
+    engine = create_async_engine(async_url)
+    monkeypatch.setattr(db, "engine", engine)
+    try:
+        with pytest.raises(RuntimeError, match="MIGRATE_REFUSE_UNKNOWN_REVISION"):
+            asyncio.run(db.verify_schema())
     finally:
         asyncio.run(engine.dispose())
 
@@ -338,8 +372,13 @@ def test_lifespan_refuses_a_db_left_behind_head(tmp_path, monkeypatch) -> None:
     from aiko_gateway import db
 
     async_url, _ = _point_app_at(tmp_path, monkeypatch)
-    command.upgrade(migrate._alembic_config(), "0027")  # one short of head
-    assert migrate.asyncio.run(migrate._schema_status()).state is migrate.SchemaState.BEHIND
+    from alembic.script import ScriptDirectory
+
+    cfg = migrate._alembic_config()
+    script = ScriptDirectory.from_config(cfg)
+    one_short = script.get_revision(script.get_current_head()).down_revision
+    command.upgrade(cfg, one_short)  # derived, so the next migration can't age it
+    assert asyncio.run(migrate._schema_status()).state is migrate.SchemaState.BEHIND
 
     engine = create_async_engine(async_url)
     monkeypatch.setattr(db, "engine", engine)
