@@ -705,9 +705,9 @@ def build_message(device_token: str, payload: WakePayload) -> dict:
     `"k"` IS REQUIRED, AND ITS ABSENCE NEVER RINGS. The stranded first draft of
     this function sent only `{"c"}` — it predates `WakeKind`. The receiver runs the
     same total function as iOS's `CallKitRinger.handle`: `call_invite` rings
-    call `m` unless `m` is tombstoned, `call_end` stops call `m` if it is ringing
-    and TOMBSTONES `m` either way (so an end delivered before its invite still
-    wins), and ANYTHING ELSE — a missing `k` included — is ignored. So `{"c"}` alone is a send FCM
+    call `m` unless `m` is spent, `call_end` stops call `m` if it is ringing
+    and marks `m` SPENT either way (so an end delivered before its invite still
+    wins; "spent" is the app's term since its #211 rename, formerly "tombstone"), and ANYTHING ELSE — a missing `k` included — is ignored. So `{"c"}` alone is a send FCM
     answers 200 to, `push_service` logs as delivered, and the handset drops on the
     floor: the exact structurally-invisible failure this paragraph used to warn
     about, one key over. Same "explicit on both values" rule as `apns._render`.

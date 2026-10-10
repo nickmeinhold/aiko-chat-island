@@ -625,7 +625,7 @@ def plan_deliveries(
                     # must-report-to-CallKit obligation against a handset build
                     # that cannot handle a VoIP end push (#4278). Android has no
                     # must-report rule: a lone `call_end` is harmless on the
-                    # receiver (it tombstones `m`, so a late invite never rings),
+                    # receiver (it marks `m` spent, so a late invite never rings),
                     # so there is nothing for the gate to protect.
                     #
                     # THE ROW'S KIND IS INERT HERE — matched on `wake` only. This
