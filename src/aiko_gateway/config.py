@@ -190,6 +190,13 @@ class Settings(BaseSettings):
     # ondelete=CASCADE, so the deploy dialect's behavior must be what dev exercises).
     # A relative path → an ./aiko_dev.db file in the working dir (gitignored).
     db_url: str = "sqlite+aiosqlite:///./aiko_dev.db"
+    # Compat guard escape hatch (design 18 §1). An image that meets a DB stamped at a
+    # revision it doesn't know REFUSES to start (MIGRATE_REFUSE_UNKNOWN_REVISION):
+    # an old binary serving on a schema a newer one rebuilt is silent corruption.
+    # True restores PR#116's serve-anyway for a human's DELIBERATE manual rollback
+    # onto a forward-migrated volume, and only for one boot's worth of judgement.
+    # The auto-update watcher never sets it. Prefer restoring the pre-update backup.
+    migrate_allow_unknown_revision: bool = False
 
     # --- auth (JWT) ---  dev default; deploy supplies via SOPS.
     jwt_secret: str = _DEV_JWT_SECRET

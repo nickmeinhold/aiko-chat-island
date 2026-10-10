@@ -61,6 +61,12 @@ services:
       # File-backed SQLite on the persistent volume below (4 slashes = absolute
       # path /data/aiko.db). aiosqlite dialect ships in the image (prod dep).
       DB_URL: sqlite+aiosqlite:////data/aiko.db
+      # Compat guard override (design 18 §1). An image older than the DB's schema
+      # REFUSES to start (MIGRATE_REFUSE_UNKNOWN_REVISION). To roll back, restore the
+      # pre-update db backup instead. Only for a deliberate manual rollback judged
+      # safe: `MIGRATE_ALLOW_UNKNOWN_REVISION=true docker compose up -d` (shell env
+      # beats .env, so the SOPS-rendered .env stays untouched). Unset afterwards.
+      MIGRATE_ALLOW_UNKNOWN_REVISION: ${MIGRATE_ALLOW_UNKNOWN_REVISION:-false}
       # aiko bus — OUR own broker, by service name on this project's network.
       AIKO_MQTT_HOST: mosquitto
       AIKO_MQTT_PORT: "1883"

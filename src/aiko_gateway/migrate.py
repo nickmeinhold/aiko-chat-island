@@ -12,34 +12,31 @@ already has it and abort. The fix is **stamp-or-upgrade**:
         ``upgrade head`` applies anything after it
   * already-managed DB (``alembic_version`` present)     → ``upgrade head`` only
   * DB stamped at a revision UNKNOWN to this image (``alembic_version`` names a
-        revision this image's ``alembic/versions/`` does not contain) → SERVE, do
-        not upgrade
+        revision this image's ``alembic/versions/`` does not contain) → REFUSE to
+        start, unless ``MIGRATE_ALLOW_UNKNOWN_REVISION`` (then serve, not upgrade)
 
-**Forward-revision tolerance (task #11 Temper — the boot-half of rollback safety).**
-The islands roll back by re-pinning an OLDER container IMAGE onto the SAME persistent
-volume; the volume keeps whatever revision the newer image migrated it to. Because
-this runner fails closed, a plain ``upgrade head`` on that forward-migrated volume
-would die with "Can't locate revision …" (the old image's script directory has no
-such revision) and the entrypoint would refuse to serve — crash-looping the
-rolled-back island even though its schema is backward- (N-1) compatible. So when the
-DB is stamped at a revision this image doesn't know, we SERVE on the existing schema:
-no upgrade, no stamp-down, no mutation. The schema ratchets forward and stays.
+**Compat guard: an unknown revision refuses to start (design 18 §1).** The islands
+roll back by re-pinning an OLDER image onto the SAME volume, and the volume keeps
+whatever revision the newer image migrated it to. From PR#116 until design 18, this
+runner SERVED on that schema (``MIGRATE_SKIP_UNKNOWN_REVISION``) so a rollback would
+not crash-loop. Its own warning said that was "safe ONLY if the schema is backward-
+(N-1) compatible", a property the expand/contract CI gate (task #11, #237) was to
+enforce and never did. So serve-anyway was a silent-corruption path: old code reading
+and writing tables a newer migration rebuilt. It now raises
+``MIGRATE_REFUSE_UNKNOWN_REVISION`` and the entrypoint's ``set -e`` never reaches
+uvicorn. The safe rollback is: restore the pre-update database backup, then start the
+old image. ``MIGRATE_ALLOW_UNKNOWN_REVISION=true`` restores serve-anyway for a human's
+deliberate manual rollback; the design-18 watcher never sets it. Declared backward-
+compat floors (letting a compatible migration admit an older image) are deferred to
+their own design, with CI that proves each one.
 
 **"Unknown to this image" is NOT the same set as "ahead of head" (Wu cage-match,
-PR#116).** An image rollback is the *intended and usual* cause, but the same detector
-fires on two others we CANNOT distinguish from the script directory alone: a
-squashed/removed past revision (routine alembic history hygiene → a volume stamped at
-the now-deleted revision), and a corrupt ``version_num``. In those two the volume is
-NOT ahead — it is behind or garbage — and serving-without-upgrading pins it below head
-*silently and permanently* (every boot re-takes this skip; ``upgrade head`` is never
-reached again), where the pre-fix code crash-looped *loudly*. We accept that cost
-because (a) rollback is the overwhelmingly common trigger, (b) distinguishing the
-cases needs information not in the script graph, and (c) the skip is emitted under a
-distinct, alertable log marker (``MIGRATE_SKIP_UNKNOWN_REVISION``) so an operator — and
-the reactive-deploy watcher (#10) — can catch a frozen volume. **If you squash or
-rebase migration history, stamp every live volume to the new baseline**, or those
-volumes will silently stop migrating. Safety of the served schema is guaranteed by the
-expand/contract CI gate — which is NOT yet built (task #11) — NOT by this function.
+PR#116).** Image rollback is the usual cause, but the same detector fires on a
+squashed/removed past revision (routine alembic history hygiene) and on a corrupt
+``version_num``. In those the volume is behind or garbage, not ahead. Refusing is the
+right answer for all three: under serve-anyway they pinned the volume below head
+*silently and permanently*. **If you squash or rebase migration history, stamp every
+live volume to the new baseline**, or those volumes will refuse to boot.
 (This cannot co-occur with the adopt path: adopting means there is no
 ``alembic_version`` at all, hence no unknown revision to find.)
 
@@ -186,7 +183,7 @@ async def _unknown_db_heads(cfg: Config) -> set[str]:
     contain. A non-empty result USUALLY means an image rollback onto a volume a newer
     image already migrated forward — but "unknown" also covers a squashed/removed past
     revision or a corrupt stamp, which this comparison cannot tell apart (see the
-    module docstring's forward-revision tolerance).
+    module docstring's compat guard).
 
     ``get_current_heads()`` returns the raw ``alembic_version`` rows without
     resolving them against the script directory, so an unknown revision id survives to
@@ -226,28 +223,33 @@ def run() -> None:
             "alembic_version) — stamping baseline.", BASELINE_REVISION)
         command.stamp(cfg, BASELINE_REVISION)
 
-    # Forward-revision tolerance (task #11 Temper — see module docstring). If the DB
-    # is stamped at a revision this image doesn't know, the USUAL cause is an image
-    # rollback onto a forward-migrated volume and we are the rollback target: SERVE on
-    # the existing schema rather than dying fail-closed in `upgrade head`. Do NOT stamp
-    # down, do NOT mutate. NB "unknown" is not PROVABLY "ahead" (a squash/removed
-    # revision or corrupt stamp looks identical) — hence the distinct, alertable marker
-    # and the honest warning below (Wu cage-match, PR#116).
+    # Compat guard (design 18 §1 — see module docstring). If the DB is stamped at a
+    # revision this image doesn't know, the usual cause is an image rollback onto a
+    # volume a newer image migrated forward, and this code may not be able to read
+    # what that migration wrote. REFUSE to start, loudly, rather than serve and hope.
+    # Do NOT stamp down, do NOT mutate, either way.
     unknown = asyncio.run(_unknown_db_heads(cfg))
+    if unknown and not settings.migrate_allow_unknown_revision:
+        raise RuntimeError(
+            "MIGRATE_REFUSE_UNKNOWN_REVISION: database is stamped at revision(s) "
+            f"{sorted(unknown)} not present in this image's migration scripts, so "
+            "this image is OLDER than the schema (or the stamp is from a squashed "
+            "history, or corrupt). Refusing to start: old code serving on a schema it "
+            "never saw is a silent-corruption path. To roll back, restore the "
+            "database backup taken before the newer image migrated it, then start "
+            "this image. Only for a deliberate manual rollback you have judged "
+            "safe: set MIGRATE_ALLOW_UNKNOWN_REVISION=true to serve on the existing "
+            "schema anyway. If this fired after a migration-history squash/rebase, "
+            "stamp this volume to the new baseline instead.")
     if unknown:
         log.warning(
             "MIGRATE_SKIP_UNKNOWN_REVISION: database is stamped at revision(s) %s not "
-            "present in this image's migration scripts. Usually an image rollback onto "
-            "a volume a newer image migrated forward (the DB is ahead of this code) — "
-            "then serving on the existing schema is correct. But an unknown revision "
-            "is NOT provably ahead: a squashed/removed past revision, or a corrupt "
-            "version stamp, is indistinguishable here and would leave this volume "
-            "silently pinned BELOW head (this skip re-fires every boot). Serving "
-            "WITHOUT upgrading; not stamping down, not mutating. Safe ONLY if the "
-            "schema is backward- (N-1) compatible — a property the expand/contract CI "
-            "gate WILL enforce once built (task #11); it is NOT yet enforced. If this "
-            "fired after a migration-history squash/rebase, stamp this volume to the "
-            "new baseline.",
+            "present in this image's migration scripts, and "
+            "MIGRATE_ALLOW_UNKNOWN_REVISION is set, so serving on the existing schema "
+            "WITHOUT upgrading (not stamping down, not mutating). This is safe ONLY if "
+            "the schema is backward-compatible with this code, which nothing "
+            "enforces. Unset the override once the rollback is resolved: this skip "
+            "re-fires on every boot.",
             sorted(unknown))
         return
 
