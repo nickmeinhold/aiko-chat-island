@@ -14,8 +14,14 @@ release first. That's deliberate; don't "fix" it.
 ## The flaw this must answer
 
 Rolling back the image doesn't roll back the database. An image that migrated forward and then
-failed leaves the old image on a newer schema, and `migrate.py` serves anyway
-(`MIGRATE_SKIP_UNKNOWN_REVISION`).
+failed leaves the old image on a newer schema.
+
+> **CORRECTED 2026-10-10 (found building §1, PR#392).** Rounds 1–3 accepted "and `migrate.py`
+> serves anyway", which is false: `db._assert_at_head` (PR#23, in `verify_schema()` at lifespan)
+> refuses any non-head revision, so PR#116's skip was followed by a startup refusal. The old
+> image has always **crash-looped**, never corrupted. The design's watcher logic is unaffected,
+> since "previous refused ⇒ terminal" was already handled, but two claims change:
+> §1's override is gone, and finding 9's pre-guard limit dissolves (§1).
 
 ## The core move: record the start of serving, never rewind past it
 
@@ -31,15 +37,18 @@ effects during any stop are accepted, exactly as with a manual deploy today.
 
 ## 1. Compat guard (`migrate.py`): build first, needed regardless
 
-- **Unknown revision ⇒ refuse** (`MIGRATE_REFUSE_UNKNOWN_REVISION`, non-zero exit). This
-  reverses PR#116's serve-anyway, whose own comment says it was "safe ONLY if N-1…
-  NOT yet enforced".
-- `MIGRATE_ALLOW_UNKNOWN_REVISION=1` is for a human's deliberate manual rollback. The watcher
-  never sets it, and the terminal-state runbook forbids it (§3).
+- **Unknown revision ⇒ refuse** (`MIGRATE_REFUSE_UNKNOWN_REVISION`, non-zero exit), in the
+  migrator, before uvicorn, with a true diagnosis. Built as **PR#392**. (It replaces a skip
+  that only *looked* like serve-anyway; `_assert_at_head` refused one step later with advice
+  that couldn't work.)
+- **No override.** PR#392's first cut had one and it was dead on arrival behind
+  `_assert_at_head`. A real one needs ONE predicate shared by both layers, which is the
+  floors design below.
 - **No floors, no table.** Backward-compat floors come later as their own design, with CI
   that boots the old image and writes to every rebuilt table.
-- **Limit:** the guard protects only rollbacks *to* guarded images. The watcher refuses to
-  auto-restore to an image whose version label predates the guard.
+- ~~**Limit:** the guard protects only rollbacks *to* guarded images.~~ **Dissolved:** every
+  image since PR#23 refuses a non-head schema via `_assert_at_head`, so no version-label check
+  is needed for any image the watcher could plausibly restore.
 
 ## 2. Channels and promotion
 
@@ -103,8 +112,8 @@ next poll and never quarantines.**
    diagnostics (phase, both digests, schema head before and after, marker contents, exit
    codes, `/health` bodies, guard refusal), and don't quarantine. **Runbook:** fix forward with
    a newer release, or restore `pre-<digest>.db` and *accept losing the writes since the
-   marker's time* (the diagnostics show that window). **Never**
-   `MIGRATE_ALLOW_UNKNOWN_REVISION` here.
+   marker's time* (the diagnostics show that window). There is no serve-anyway override to
+   reach for.
 
 **Paging, a lease rather than silence.** `AUTO_UPDATE` refuses to turn on without
 `AUTO_UPDATE_PAGE_URL`, an off-box dead-man (a healthchecks-style service). The watcher pings
