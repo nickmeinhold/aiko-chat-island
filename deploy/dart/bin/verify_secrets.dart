@@ -22,6 +22,8 @@
 /// exited 0. "Did not verify" is not "verified nothing wrong".
 library;
 
+import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:island_deploy/secrets_check.dart';
@@ -32,6 +34,10 @@ const _policy = '.sops.yaml';
 Future<void> main(List<String> argv) async {
   final deep = argv.contains('--deep');
   final repoRoot = _repoRootFrom(argv);
+  // GitHub Actions sets CI=true. In CI the checks that can only SKIP locally
+  // (continuity needs origin/main; the rotation path needs sops) are REQUIRED:
+  // a skip there is the gate not running, not an inconvenience.
+  final inCi = Platform.environment['CI'] == 'true';
   final results = <CheckResult>[];
 
   // --- policy ------------------------------------------------------------
@@ -56,6 +62,7 @@ Future<void> main(List<String> argv) async {
       here: want,
       onMain: await _policyOnMain(repoRoot),
       rotationAllowed: Platform.environment['ALLOW_RECIPIENT_CHANGE'] == '1',
+      inCi: inCi,
     ),
   );
 
@@ -87,7 +94,10 @@ Future<void> main(List<String> argv) async {
 
   if (files.isEmpty) {
     results.addAll(checkNoFilesIsLegitimate(manifestIslands));
-    _report(results, expectedChecks: results.length);
+    // Recipient count + directory contents + the no-files verdict, plus
+    // continuity in CI. NOT `results.length`: an expectation read off the
+    // results it judges can never be unmet (PR #320 cage-match).
+    _report(results, expectedChecks: 3 + (inCi ? 1 : 0));
     return;
   }
 
@@ -159,11 +169,22 @@ Future<void> main(List<String> argv) async {
           ),
   );
 
-  // EXPECTED COUNT, derived from what the repo actually contains rather than a
-  // constant. Four fixed checks (recipient count, continuity, rotation, deep) plus
-  // directory + manifest coverage, plus four per file. A run that produces fewer
-  // has not examined the tree, whatever it found.
-  _report(results, expectedChecks: 4 + 2 + files.length * 4);
+  // EXPECTED EXECUTED CHECKS, from a witness INDEPENDENT of the listing the
+  // checks walked. An earlier revision used `files.length`, the same listing
+  // that produced the results, so the expectation could never be unmet and exit
+  // 2 was unreachable from this binary (PR #320 cage-match). The islands are
+  // now the UNION of secrets files and MANIFEST sections: an island the
+  // manifest names is owed four checks whether or not its file is there.
+  //
+  // Counted over EXECUTED checks only (`ranAtLeast` excludes Skipped): recipient
+  // count + directory contents + manifest coverage, four per island, and in CI
+  // the two checks that may only skip locally — continuity and the rotation
+  // path. So a CI runner without sops now ends DID NOT VERIFY rather than OK.
+  final islands = {
+    for (final f in files) f.substring(0, f.length - '.env.sops'.length),
+    ...manifestIslands,
+  };
+  _report(results, expectedChecks: 3 + islands.length * 4 + (inCi ? 2 : 0));
 }
 
 void _report(List<CheckResult> results, {required int expectedChecks}) {
@@ -185,7 +206,7 @@ void _report(List<CheckResult> results, {required int expectedChecks}) {
   switch (verdict) {
     case Verdict.ok:
       stdout.writeln(
-        'OK — ${results.length} checks ran; every committed secret carries '
+        'OK — ${v.executed} checks ran (${v.skips.length} skipped); every committed secret carries '
         'every required recipient, with no plaintext.',
       );
     case Verdict.failed:
@@ -195,7 +216,7 @@ void _report(List<CheckResult> results, {required int expectedChecks}) {
       );
     case Verdict.didNotVerify:
       stdout.writeln(
-        'DID NOT VERIFY — only ${results.length} checks ran, '
+        'DID NOT VERIFY — only ${v.executed} checks ran (${v.skips.length} skipped), '
         'expected at least $expectedChecks. Nothing failed, and that is not '
         'the same as passing.',
       );
@@ -229,7 +250,8 @@ Future<CheckResult> _checkRotationPath(
 ) async {
   const label = 'rotation path (sops updatekeys) parses every file';
   for (final name in files) {
-    final ProcessResult r;
+    final int code;
+    final String err;
     try {
       // `n` on stdin declines any change; a PARSE error still fails, which is the
       // point of running it at all.
@@ -237,20 +259,34 @@ Future<CheckResult> _checkRotationPath(
         'updatekeys',
         '$_secretsDir/$name',
       ], workingDirectory: repoRoot);
+      // DRAIN BOTH STREAMS, concurrently with the wait (Carnot + Maxwell, PR
+      // #320). The earlier revision never read them: the reason sops gave was
+      // thrown away, and output past a pipe buffer would have blocked the child
+      // forever with nothing bounding the wait.
+      final outDone = p.stdout.drain<void>();
+      final errText = p.stderr.transform(utf8.decoder).join();
       p.stdin.writeln('n');
       await p.stdin.close();
-      final code = await p.exitCode;
-      r = ProcessResult(p.pid, code, '', '');
+      try {
+        code = await p.exitCode.timeout(const Duration(seconds: 60));
+      } on TimeoutException {
+        p.kill();
+        return Fail(label, 'sops updatekeys on $name did not finish in 60s');
+      }
+      await outDone;
+      err = await errText;
     } on ProcessException {
       return const Skipped(
         label,
         'sops not installed — metadata checks above still ran',
       );
     }
-    if (r.exitCode != 0) {
+    if (code != 0) {
+      final excerpt = err.trim().split('\n').take(5).join('\n              ');
       return Fail(
         label,
-        'sops updatekeys cannot read $name — the documented rotation path is broken',
+        'sops updatekeys cannot read $name — the documented rotation path is '
+        'broken (exit $code)${excerpt.isEmpty ? "" : ":\n              $excerpt"}',
       );
     }
   }
@@ -344,7 +380,14 @@ List<String> _manifestSection(String manifest, String island) {
 /// thing it protects.
 String _repoRootFrom(List<String> argv) {
   final i = argv.indexOf('--root');
-  if (i >= 0 && i + 1 < argv.length) {
+  if (i >= 0) {
+    // A `--root` with no value used to fall through to the script-relative
+    // default: the REAL repo, silently — the exact false green this flag was
+    // created to end (Carnot, PR #320).
+    if (i + 1 >= argv.length || argv[i + 1].startsWith('--')) {
+      stderr.writeln('verify_secrets: --root needs a directory');
+      exit(2);
+    }
     return Directory(argv[i + 1]).absolute.path;
   }
   // .../deploy/dart/bin/verify_secrets.dart -> up three

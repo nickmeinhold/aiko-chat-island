@@ -86,13 +86,23 @@ class Verification {
   Iterable<Fail> get failures => results.whereType<Fail>();
   Iterable<Skipped> get skips => results.whereType<Skipped>();
 
-  /// Did at least [n] checks actually execute?
+  /// Did at least [n] checks actually EXECUTE?
   ///
   /// THE AFFIRMING INSTRUMENT. Every silence bug in the shell script passed a
   /// "no failures found" test while having examined nothing. A run that produced
   /// three results when the repo holds two islands has not verified them — it has
   /// failed to find a violation in a set it never enumerated.
-  bool ranAtLeast(int n) => results.length >= n;
+  ///
+  /// SKIPS DO NOT COUNT (PR #320 cage-match). An earlier revision counted every
+  /// result, so a Skipped arm satisfied the very instrument that exists to tell
+  /// "checked" from "did not check" — the class this file was written to end,
+  /// reintroduced by the counter. A skip is still REPORTED; it is just not
+  /// evidence that verification happened.
+  bool ranAtLeast(int n) => executed >= n;
+
+  /// Checks that actually ran — the ONE count both the verdict and the report
+  /// use, so the message can never describe a different number than the gate.
+  int get executed => results.where((r) => r is! Skipped).length;
 
   /// `didNotVerify` outranks `ok`: too few checks is not a pass.
   Verdict verdictFor({required int expectedChecks}) {
@@ -145,14 +155,33 @@ CheckResult checkRecipientCount(List<String> want) {
 /// SCOPE, stated exactly as the shell states it: this is a CONTINUITY check, not
 /// authentication. The recipient field is a plain string, so without a key nothing
 /// proves the DEK is really wrapped to those keys. It catches the careless case.
+///
+/// IN CI, AN UNAVAILABLE `origin/main` IS A FAILURE, NOT A SKIP (PR #320
+/// cage-match, measured on that PR's own run). `actions/checkout` on a
+/// `pull_request` fetches only the merge ref, so this check SKIPPED on every PR —
+/// the one place it matters — while on a push to main it compared main with
+/// itself. A PR adding a recipient to `.sops.yaml` and re-wrapping every file to
+/// match passed [checkRecipientSetExact] (it compares against the PR's OWN policy)
+/// and sailed through green. The job now fetches main; this makes forgetting to
+/// fetch loud instead of silent.
 CheckResult checkRecipientContinuity({
   required List<String> here,
   required List<String>? onMain,
   required bool rotationAllowed,
+  bool inCi = false,
 }) {
   const label = 'recipient set matches origin/main';
   if (onMain == null) {
-    return const Skipped(label, 'origin/main not available (local run)');
+    if (inCi) {
+      return const Fail(
+        label,
+        'origin/main is not available in CI, so recipient continuity could not '
+        'be checked — and on a pull request that is the ONLY check that sees a '
+        'recipient added to .sops.yaml and every file re-wrapped to match. '
+        'Fetch main before running this (ci.yml does).',
+      );
+    }
+    return const Skipped(label, 'origin/main not available (no CI env)');
   }
   final a = [...onMain]..sort();
   final b = [...here]..sort();
@@ -283,10 +312,23 @@ Envelope parseEnvelope(String content) {
       'sops.age is empty — no recipient can decrypt this file',
     );
   }
-  final recipients = <String>[
-    for (final a in age)
-      if (a is Map && a['recipient'] is String) a['recipient'] as String,
-  ];
+  // EVERY stanza must name its recipient, or the envelope is invalid (Carnot,
+  // PR #320). Dropping a stanza whose `recipient` is missing or non-string made
+  // a file wrapped to the two real keys PLUS an unnamed third read as exactly
+  // [A, B] — the "silent third wrap" checkRecipientSetExact exists to catch,
+  // hidden one level down in the parser instead.
+  final recipients = <String>[];
+  for (final a in age) {
+    final r = a is Map ? a['recipient'] : null;
+    if (r is! String || r.isEmpty) {
+      return const InvalidEnvelope(
+        'a sops.age stanza has no string recipient — an unnamed wrap cannot be '
+        'checked against policy, so this file is refused rather than read as '
+        'the stanzas that do name themselves',
+      );
+    }
+    recipients.add(r);
+  }
 
   final data = doc['data'];
   return ValidEnvelope(

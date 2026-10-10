@@ -82,6 +82,14 @@ jobs:
           sdk: '3.13.0' # pinned; see the deploy-dart job for why
       - run: dart pub get
         working-directory: deploy/dart
+      - name: Fetch main for the recipient-continuity check
+        # LOAD-BEARING, not housekeeping (PR #320 cage-match, measured on that
+        # PR's own run). On a pull_request, actions/checkout fetches only the
+        # merge ref, so origin/main did not exist and continuity SKIPPED on every
+        # PR — the one place it matters. A PR that added a recipient to .sops.yaml
+        # and re-wrapped every file passed green. The verifier now FAILS in CI
+        # when main is missing, so deleting this step is loud, not silent.
+        run: git fetch --no-tags --depth=1 origin +refs/heads/main:refs/remotes/origin/main
       - name: Verify committed secrets
         # DART, not deploy/verify-secrets.sh (#4824 Stage 1). This is the ONE
         # script under deploy/ that does not run on a sovereign box, so ISL-0003's

@@ -45,23 +45,27 @@ void main() {
       expect(v.verdictFor(expectedChecks: 99), Verdict.failed);
     });
 
-    test('OK needs BOTH no failures and enough checks', () {
+    test('OK needs BOTH no failures and enough EXECUTED checks', () {
       final v = Verification([
         const Pass('a'),
         const Pass('b'),
         const Skipped('c', 'no key'),
       ]);
-      expect(v.verdictFor(expectedChecks: 3), Verdict.ok);
-      expect(v.verdictFor(expectedChecks: 4), Verdict.didNotVerify);
+      expect(v.verdictFor(expectedChecks: 2), Verdict.ok);
+      // Three results, but only two RAN. This used to be `ok` — the skip
+      // satisfied the instrument that exists to tell checked from not (PR #320).
+      expect(v.verdictFor(expectedChecks: 3), Verdict.didNotVerify);
     });
 
-    test('a SKIP is not a failure and not invisible', () {
+    test('a SKIP is not a failure, not invisible, and not verification', () {
       // The shell prints skips as notes, which is right but unenforced. Here a
-      // skip is an arm of the sum type, so it reaches the verdict and the report.
+      // skip is an arm of the sum type, so it reaches the verdict and the report
+      // — and it is never counted as a check that happened.
       final v = Verification([const Skipped('deep', 'no key')]);
       expect(v.failures, isEmpty);
       expect(v.skips, hasLength(1));
-      expect(v.verdictFor(expectedChecks: 1), Verdict.ok);
+      expect(v.verdictFor(expectedChecks: 0), Verdict.ok);
+      expect(v.verdictFor(expectedChecks: 1), Verdict.didNotVerify);
     });
   });
 
@@ -121,13 +125,27 @@ creation_rules:
   });
 
   group('continuity against origin/main', () {
-    test('unavailable main is SKIPPED, never passed', () {
+    test('unavailable main is SKIPPED locally, never passed', () {
       final r = checkRecipientContinuity(
         here: [_r1],
         onMain: null,
         rotationAllowed: false,
       );
       expect(r, isA<Skipped>());
+    });
+
+    test('unavailable main FAILS in CI — the PR #320 hole', () {
+      // On a pull_request, actions/checkout fetches only the merge ref, so this
+      // skipped on every PR while a recipient added to .sops.yaml (and every file
+      // re-wrapped to match) passed the exact-set check against the PR's own
+      // policy. In CI a missing main is the gate not running.
+      final r = checkRecipientContinuity(
+        here: [_r1, _r2, _r3],
+        onMain: null,
+        rotationAllowed: false,
+        inCi: true,
+      );
+      expect(r, isA<Fail>());
     });
 
     test('a differing set fails unless rotation is declared', () {
@@ -208,6 +226,21 @@ creation_rules:
 
     test('an empty age list is refused', () {
       expect(parseEnvelope(_envelope(recipients: [])), isA<InvalidEnvelope>());
+    });
+
+    test('a stanza with NO string recipient refuses the envelope', () {
+      // The parser used to drop it, so a file wrapped to the two real keys plus
+      // an unnamed third read as exactly [r1, r2] and passed the exact-set check —
+      // the silent third wrap, hidden in the parser (Carnot, PR #320).
+      for (final bad in [
+        '{"enc":"x"}',
+        '{"recipient":7,"enc":"x"}',
+        '{"recipient":"","enc":"x"}',
+        '"not-a-map"',
+      ]) {
+        final doc = _envelope().replaceFirst('"enc":"x"}]', '"enc":"x"},$bad]');
+        expect(parseEnvelope(doc), isA<InvalidEnvelope>(), reason: bad);
+      }
     });
 
     test('CLEARTEXT data with a valid envelope is detected', () {
