@@ -12,34 +12,35 @@ already has it and abort. The fix is **stamp-or-upgrade**:
         ``upgrade head`` applies anything after it
   * already-managed DB (``alembic_version`` present)     → ``upgrade head`` only
   * DB stamped at a revision UNKNOWN to this image (``alembic_version`` names a
-        revision this image's ``alembic/versions/`` does not contain) → SERVE, do
-        not upgrade
+        revision this image's ``alembic/versions/`` does not contain) → REFUSE to
+        start
 
-**Forward-revision tolerance (task #11 Temper — the boot-half of rollback safety).**
-The islands roll back by re-pinning an OLDER container IMAGE onto the SAME persistent
-volume; the volume keeps whatever revision the newer image migrated it to. Because
-this runner fails closed, a plain ``upgrade head`` on that forward-migrated volume
-would die with "Can't locate revision …" (the old image's script directory has no
-such revision) and the entrypoint would refuse to serve — crash-looping the
-rolled-back island even though its schema is backward- (N-1) compatible. So when the
-DB is stamped at a revision this image doesn't know, we SERVE on the existing schema:
-no upgrade, no stamp-down, no mutation. The schema ratchets forward and stays.
+**Compat guard: an unknown revision refuses to start (design 18 §1).** The islands
+roll back by re-pinning an OLDER image onto the SAME volume, and the volume keeps
+whatever revision the newer image migrated it to. PR#116 made this runner skip and
+"serve" on that schema (``MIGRATE_SKIP_UNKNOWN_REVISION``), but it never actually
+served: ``db._assert_at_head`` (PR#23, run by ``verify_schema()`` in lifespan) refuses
+any revision that is not this code's head, so a rolled-back image crash-looped at
+startup with advice that could not work ("run ``alembic upgrade head``", which dies on
+"Can't locate revision"). Measured 2026-10-10 (PR#392 review). The refusal now happens
+HERE, before uvicorn, with the right diagnosis and the right fix: restore the
+pre-update database backup, then start the old image. There is deliberately no
+serve-anyway override: the one PR#116 added was unreachable, so removing it changes
+nothing that ran, and a real one would need ONE predicate shared with
+``_assert_at_head`` plus CI proof that the schema is backward-compatible (design 18's
+deferred backward floors).
 
 **"Unknown to this image" is NOT the same set as "ahead of head" (Wu cage-match,
-PR#116).** An image rollback is the *intended and usual* cause, but the same detector
-fires on two others we CANNOT distinguish from the script directory alone: a
-squashed/removed past revision (routine alembic history hygiene → a volume stamped at
-the now-deleted revision), and a corrupt ``version_num``. In those two the volume is
-NOT ahead — it is behind or garbage — and serving-without-upgrading pins it below head
-*silently and permanently* (every boot re-takes this skip; ``upgrade head`` is never
-reached again), where the pre-fix code crash-looped *loudly*. We accept that cost
-because (a) rollback is the overwhelmingly common trigger, (b) distinguishing the
-cases needs information not in the script graph, and (c) the skip is emitted under a
-distinct, alertable log marker (``MIGRATE_SKIP_UNKNOWN_REVISION``) so an operator — and
-the reactive-deploy watcher (#10) — can catch a frozen volume. **If you squash or
-rebase migration history, stamp every live volume to the new baseline**, or those
-volumes will silently stop migrating. Safety of the served schema is guaranteed by the
-expand/contract CI gate — which is NOT yet built (task #11) — NOT by this function.
+PR#116).** Image rollback is the usual cause, but the same detector fires on a
+squashed/removed past revision (routine alembic history hygiene) and on a corrupt
+``version_num``. In those the volume is behind or garbage, not ahead. Refusing is the
+right answer for all three: under serve-anyway they pinned the volume below head
+*silently and permanently*. **If you ever squash or rebase migration history, stamp
+every live volume to the new baseline FROM THE NEW IMAGE, after its ``compare_metadata``
+shows the volume's schema equals that baseline** (the adopt path's discipline), or those
+volumes will refuse to boot. Never stamp from a refusing image: stamping its head onto a
+newer schema makes ``schema_status`` read HEAD and the guard never fires again (Tesla,
+PR#392 r4). The refusal message deliberately does not suggest stamping.
 (This cannot co-occur with the adopt path: adopting means there is no
 ``alembic_version`` at all, hence no unknown revision to find.)
 
@@ -71,6 +72,8 @@ import asyncio
 import logging
 import os
 import tempfile
+from dataclasses import dataclass
+from enum import Enum
 
 from alembic import command
 from alembic.autogenerate import compare_metadata
@@ -181,27 +184,81 @@ async def _diff_against(target: MetaData) -> list:
         await engine.dispose()
 
 
-async def _unknown_db_heads(cfg: Config) -> set[str]:
-    """Revision(s) the DB is stamped at that this image's migration scripts do NOT
-    contain. A non-empty result USUALLY means an image rollback onto a volume a newer
-    image already migrated forward — but "unknown" also covers a squashed/removed past
-    revision or a corrupt stamp, which this comparison cannot tell apart (see the
-    module docstring's forward-revision tolerance).
+class SchemaState(Enum):
+    """Where a database's ``alembic_version`` stands relative to THIS image's
+    migration scripts. A closed set, so both boot layers branch on the same four
+    answers instead of re-deriving their own."""
+    HEAD = "head"            # stamped at exactly this image's head
+    BEHIND = "behind"        # every stamped revision is known; not (only) head
+    UNKNOWN = "unknown"      # some stamped revision is absent from this image
+    UNMANAGED = "unmanaged"  # no alembic_version table at all
 
-    ``get_current_heads()`` returns the raw ``alembic_version`` rows without
-    resolving them against the script directory, so an unknown revision id survives to
-    be compared here (an empty tuple on a DB with no version table — a fresh or
-    pre-alembic DB — which correctly yields no unknowns). Read over the async driver
-    (the deploy has only aiosqlite)."""
-    known = {rev.revision for rev in ScriptDirectory.from_config(cfg).walk_revisions()}
+
+@dataclass(frozen=True)
+class SchemaStatus:
+    state: SchemaState
+    stamped: frozenset[str]
+    unknown: frozenset[str]
+    head: str
+
+
+def schema_status(conn) -> SchemaStatus:
+    """THE single predicate for "may this image's code run on this database?",
+    shared by the entrypoint migrator (``run()``) and lifespan
+    (``db._assert_at_head``). PR#116 relaxed only one of two separately-written
+    checks and shipped a serve-anyway that the other check made unreachable;
+    deciding in one place is what keeps the two layers from disagreeing again
+    (Carnot, PR#392 r3).
+
+    ``get_current_heads()`` returns the raw ``alembic_version`` rows WITHOUT
+    resolving them against the script directory, so an unknown id survives to be
+    compared, and a two-row (known + unknown) table is classified here instead of
+    dying inside alembic's single-revision lookup. "Unknown" covers an image
+    rollback onto a forward-migrated volume (the usual cause), a squashed/removed
+    past revision, and a corrupt stamp; this comparison cannot tell them apart,
+    and all three must not serve. Sync, so either layer can call it via
+    ``run_sync``."""
+    script = ScriptDirectory.from_config(_alembic_config())
+    head = script.get_current_head()
+    if "alembic_version" not in inspect(conn).get_table_names():
+        return SchemaStatus(SchemaState.UNMANAGED, frozenset(), frozenset(), head)
+    known = {rev.revision for rev in script.walk_revisions()}
+    stamped = frozenset(MigrationContext.configure(conn).get_current_heads())
+    unknown = stamped - known
+    if unknown:
+        state = SchemaState.UNKNOWN
+    elif stamped == {head}:
+        state = SchemaState.HEAD
+    else:
+        state = SchemaState.BEHIND
+    return SchemaStatus(state, stamped, frozenset(unknown), head)
+
+
+def refuse_unknown_message(status: SchemaStatus) -> str:
+    """The one refusal text for an image older than its schema. Both layers raise
+    it, so the operator gets the same diagnosis and the same (working) fix whichever
+    layer trips first."""
+    return (
+        "MIGRATE_REFUSE_UNKNOWN_REVISION: database is stamped at revision(s) "
+        f"{sorted(status.unknown)} not present in this image's migration scripts, so "
+        "this image is OLDER than the schema (or the stamp is from a squashed "
+        "history, or corrupt). Refusing to start. To roll back across a migration: "
+        "take the stack down (`docker compose down`; a merely stopped restart: "
+        "always container comes back when the Docker daemon restarts), restore the "
+        "database backup taken before the newer image migrated it, then start this "
+        "image. Do NOT `alembic stamp` this volume to make the error go away: a "
+        "stamp claims the schema matches a revision, and stamping this image's "
+        "head onto a newer schema silences this guard for good.")
+
+
+async def _schema_status() -> SchemaStatus:
+    """``schema_status`` over the async driver (the deploy has only aiosqlite)."""
     engine = create_async_engine(settings.db_url, poolclass=NullPool)
     try:
         async with engine.connect() as conn:
-            heads = await conn.run_sync(
-                lambda c: MigrationContext.configure(c).get_current_heads())
+            return await conn.run_sync(schema_status)
     finally:
         await engine.dispose()
-    return set(heads) - known
 
 
 def run() -> None:
@@ -226,30 +283,14 @@ def run() -> None:
             "alembic_version) — stamping baseline.", BASELINE_REVISION)
         command.stamp(cfg, BASELINE_REVISION)
 
-    # Forward-revision tolerance (task #11 Temper — see module docstring). If the DB
-    # is stamped at a revision this image doesn't know, the USUAL cause is an image
-    # rollback onto a forward-migrated volume and we are the rollback target: SERVE on
-    # the existing schema rather than dying fail-closed in `upgrade head`. Do NOT stamp
-    # down, do NOT mutate. NB "unknown" is not PROVABLY "ahead" (a squash/removed
-    # revision or corrupt stamp looks identical) — hence the distinct, alertable marker
-    # and the honest warning below (Wu cage-match, PR#116).
-    unknown = asyncio.run(_unknown_db_heads(cfg))
-    if unknown:
-        log.warning(
-            "MIGRATE_SKIP_UNKNOWN_REVISION: database is stamped at revision(s) %s not "
-            "present in this image's migration scripts. Usually an image rollback onto "
-            "a volume a newer image migrated forward (the DB is ahead of this code) — "
-            "then serving on the existing schema is correct. But an unknown revision "
-            "is NOT provably ahead: a squashed/removed past revision, or a corrupt "
-            "version stamp, is indistinguishable here and would leave this volume "
-            "silently pinned BELOW head (this skip re-fires every boot). Serving "
-            "WITHOUT upgrading; not stamping down, not mutating. Safe ONLY if the "
-            "schema is backward- (N-1) compatible — a property the expand/contract CI "
-            "gate WILL enforce once built (task #11); it is NOT yet enforced. If this "
-            "fired after a migration-history squash/rebase, stamp this volume to the "
-            "new baseline.",
-            sorted(unknown))
-        return
+    # Compat guard (design 18 §1 — see module docstring). If the DB is stamped at a
+    # revision this image doesn't know, the usual cause is an image rollback onto a
+    # volume a newer image migrated forward, and this code may not be able to read
+    # what that migration wrote. REFUSE to start, loudly, rather than serve and hope.
+    # Do NOT stamp down, do NOT mutate, either way.
+    status = asyncio.run(_schema_status())
+    if status.state is SchemaState.UNKNOWN:
+        raise RuntimeError(refuse_unknown_message(status))
 
     command.upgrade(cfg, "head")
     log.info("Database is at head.")

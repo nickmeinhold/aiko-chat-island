@@ -228,98 +228,167 @@ def test_adopt_pre_alembic_db_stamps_baseline(tmp_path, monkeypatch) -> None:
     assert channels_sql.count("ck_channels_join_policy") == 1
 
 
-def test_forward_migrated_db_is_served_not_upgraded(tmp_path, monkeypatch) -> None:
-    """Image ROLLBACK onto a forward-migrated volume (task #11 Temper — the
-    CONVERGENT FATAL). The persistent volume was migrated by a NEWER image, so
-    ``alembic_version`` names a revision THIS image's ``alembic/versions/`` does not
-    contain. The old entrypoint migrator must recognise "the DB is ahead of me",
-    SKIP the upgrade, and serve on the existing schema — NOT die fail-closed on
-    alembic's "Can't locate revision" (which crash-loops the rolled-back island even
-    though the schema is N-1 compatible). It must not stamp down or otherwise mutate.
+FUTURE_REV = "9999_from_a_newer_image"
 
-    Schema N-1 compatibility (the expand/contract discipline) is useless if the boot
-    migrator refuses to start against a future ``alembic_version`` — this is the
-    boot-half of rollback safety, the flaw the cross-family Temper caught.
-    """
-    from sqlalchemy import text
 
-    _, sync_url = _point_app_at(tmp_path, monkeypatch)
-
-    # 1. Build a normal managed DB at head.
-    migrate.run()
-
-    # 2. Simulate a NEWER image having migrated the volume forward: stamp
-    #    alembic_version at a revision this image's scripts don't know.
-    future_rev = "9999_from_a_newer_image"
-    seed = create_engine(sync_url)
-    try:
-        with seed.begin() as conn:
-            conn.execute(
-                text("UPDATE alembic_version SET version_num = :r"),
-                {"r": future_rev},
-            )
-    finally:
-        seed.dispose()
-
-    # 3. The rolled-back image boots. This MUST NOT raise (the pre-fix behaviour is
-    #    `command.upgrade(head)` dying on the unknown current revision).
-    migrate.run()
-
-    # 4. Skipped, not mutated: the future revision is left exactly as-is (no
-    #    downgrade, no stamp).
+def _versions(sync_url: str) -> set[str]:
     engine = create_engine(sync_url)
     try:
         with engine.connect() as conn:
-            version = conn.exec_driver_sql(
-                "SELECT version_num FROM alembic_version").scalar()
+            return {r[0] for r in conn.exec_driver_sql(
+                "SELECT version_num FROM alembic_version").fetchall()}
     finally:
         engine.dispose()
-    assert version == future_rev, (
-        "forward-migrated DB was mutated — the boot migrator must leave a "
-        f"future alembic_version untouched, got {version!r}")
 
 
-def test_mixed_known_and_unknown_heads_skips(tmp_path, monkeypatch) -> None:
-    """A branched/merged version table carrying BOTH a known head and an unknown
-    revision must take the skip path (Wu cage-match, PR#116). This makes
-    "freeze on ANY unknown head" a deliberate decision, not accidental behaviour:
-    `command.upgrade(head)` would try to resolve the unknown row and die anyway, so
-    skipping is the safe posture — but assert it so a future topology change to
-    multi-head can't silently flip it. (The repo's single-head invariant means this
-    shouldn't arise in practice; the test pins the semantics regardless.)
-    """
+def _stamp_ahead(sync_url: str, *, keep_known_head: bool) -> set[str]:
+    """Simulate a NEWER image having migrated the volume: the version table names a
+    revision this image's scripts don't contain. ``keep_known_head`` adds the
+    unknown row BESIDE the real head (a branched/merged table, Wu cage-match PR#116)
+    instead of replacing it. Returns the version rows as seeded."""
     from sqlalchemy import text
 
-    _, sync_url = _point_app_at(tmp_path, monkeypatch)
-    migrate.run()  # managed DB at head — alembic_version has the one real head row
-
-    # Add a SECOND version row naming a revision this image doesn't know, so the
-    # version table now carries {known_head, unknown}.
     seed = create_engine(sync_url)
     try:
         with seed.begin() as conn:
-            conn.execute(
-                text("INSERT INTO alembic_version (version_num) VALUES (:r)"),
-                {"r": "9999_from_a_newer_image"},
-            )
-            rows_before = {r[0] for r in conn.exec_driver_sql(
-                "SELECT version_num FROM alembic_version").fetchall()}
+            sql = ("INSERT INTO alembic_version (version_num) VALUES (:r)"
+                   if keep_known_head else
+                   "UPDATE alembic_version SET version_num = :r")
+            conn.execute(text(sql), {"r": FUTURE_REV})
+    finally:
+        seed.dispose()
+    return _versions(sync_url)
+
+
+@pytest.mark.parametrize("keep_known_head", [False, True],
+                         ids=["ahead", "mixed-known-and-unknown"])
+def test_unknown_revision_refuses_to_start(tmp_path, monkeypatch, keep_known_head) -> None:
+    """Compat guard (design 18 §1): an image that meets a DB stamped at a revision it
+    doesn't know REFUSES TO START, in the migrator, before uvicorn, with the right
+    diagnosis (image older than schema) and a fix that works (stop the stack, restore
+    the pre-update backup). PR#116's migrator skipped instead, and lifespan's
+    ``_assert_at_head`` then refused with advice that could not work; nothing ever
+    served. Both shapes refuse: a table that is simply ahead, and one carrying a known
+    head beside the unknown row. Neither is mutated on the way out.
+    """
+    _, sync_url = _point_app_at(tmp_path, monkeypatch)
+    migrate.run()  # managed DB at head
+    before = _stamp_ahead(sync_url, keep_known_head=keep_known_head)
+
+    with pytest.raises(RuntimeError, match="MIGRATE_REFUSE_UNKNOWN_REVISION"):
+        migrate.run()
+
+    assert _versions(sync_url) == before, (
+        "a refusing boot mutated the version table; refusal must leave the volume "
+        "exactly as the newer image left it")
+
+
+@pytest.mark.parametrize("keep_known_head", [False, True],
+                         ids=["ahead", "mixed-known-and-unknown"])
+def test_both_boot_layers_refuse_a_forward_migrated_db(
+        tmp_path, monkeypatch, keep_known_head) -> None:
+    """The migrator and lifespan's ``verify_schema()`` must AGREE that an image older
+    than the schema does not serve. PR#116 relaxed only the migrator (skip and
+    "serve"), while ``db._assert_at_head`` kept refusing, so its serve-anyway was
+    unreachable for two months and its tests, which never booted past
+    ``migrate.run()``, could not see that. A serve-anyway reintroduced in ONE layer
+    goes red here instead of shipping as a dead switch (PR#392 review).
+    """
+    import asyncio
+
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from aiko_gateway import db
+
+    async_url, sync_url = _point_app_at(tmp_path, monkeypatch)
+    migrate.run()
+    _stamp_ahead(sync_url, keep_known_head=keep_known_head)
+
+    with pytest.raises(RuntimeError, match="MIGRATE_REFUSE_UNKNOWN_REVISION") as refused:
+        migrate.run()
+    # The advice is the load, not the marker (Tesla, PR#392 r2): the message must
+    # send the operator to a stopped-stack restore, never to `alembic upgrade head`.
+    assert "docker compose down" in str(refused.value)
+    assert "restore the database backup" in str(refused.value)
+    assert "upgrade head" not in str(refused.value)
+    # Stamping would silence the guard for good (Tesla, PR#392 r4): the message may
+    # warn against it, never suggest it.
+    assert "Do NOT `alembic stamp`" in str(refused.value)
+
+    # Lifespan reaches the SAME verdict through the SAME predicate
+    # (migrate.schema_status), so it raises the same refusal for both shapes. Before
+    # the shared predicate, the mixed shape died inside alembic's single-revision
+    # lookup with an unrelated error (Carnot, Tesla, PR#392 r3).
+    engine = create_async_engine(async_url)
+    monkeypatch.setattr(db, "engine", engine)
+    try:
+        with pytest.raises(RuntimeError, match="MIGRATE_REFUSE_UNKNOWN_REVISION") as lifespan:
+            asyncio.run(db.verify_schema())
+        assert "lifespan check" in str(lifespan.value)
+    finally:
+        asyncio.run(engine.dispose())
+
+
+def test_lifespan_names_a_forward_schema_even_when_its_columns_changed(
+        tmp_path, monkeypatch) -> None:
+    """A newer image's migration may change the very columns ``_assert_schema_current``
+    inspects. Lifespan must still say "image older than schema", not "behind the
+    code, run upgrade head": the revision check runs FIRST (Tesla, PR#392 r4)."""
+    import asyncio
+
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from aiko_gateway import db
+
+    async_url, sync_url = _point_app_at(tmp_path, monkeypatch)
+    migrate.run()
+    _stamp_ahead(sync_url, keep_known_head=False)
+    seed = create_engine(sync_url)
+    try:
+        with seed.begin() as conn:
+            conn.execute(text("ALTER TABLE users DROP COLUMN email"))
     finally:
         seed.dispose()
 
-    migrate.run()  # must NOT raise, must NOT mutate the version table
-
-    engine = create_engine(sync_url)
+    engine = create_async_engine(async_url)
+    monkeypatch.setattr(db, "engine", engine)
     try:
-        with engine.connect() as conn:
-            rows_after = {r[0] for r in conn.exec_driver_sql(
-                "SELECT version_num FROM alembic_version").fetchall()}
+        with pytest.raises(RuntimeError, match="MIGRATE_REFUSE_UNKNOWN_REVISION"):
+            asyncio.run(db.verify_schema())
     finally:
-        engine.dispose()
-    assert "9999_from_a_newer_image" in rows_before
-    assert rows_after == rows_before, (
-        "mixed known/unknown heads must skip untouched, got "
-        f"{rows_after!r} (was {rows_before!r})")
+        asyncio.run(engine.dispose())
+
+
+def test_lifespan_refuses_a_db_left_behind_head(tmp_path, monkeypatch) -> None:
+    """The other branch of the shared predicate: a DB whose stamp is KNOWN but not
+    head (uvicorn started directly, bypassing the entrypoint) is BEHIND, and lifespan
+    refuses with the upgrade advice that is right for that case and only that case.
+    Previously untested; PR#392 rewrote this branch onto ``schema_status``."""
+    import asyncio
+
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from aiko_gateway import db
+
+    async_url, _ = _point_app_at(tmp_path, monkeypatch)
+    from alembic.script import ScriptDirectory
+
+    cfg = migrate._alembic_config()
+    script = ScriptDirectory.from_config(cfg)
+    one_short = script.get_revision(script.get_current_head()).down_revision
+    command.upgrade(cfg, one_short)  # derived, so the next migration can't age it
+    assert asyncio.run(migrate._schema_status()).state is migrate.SchemaState.BEHIND
+
+    engine = create_async_engine(async_url)
+    monkeypatch.setattr(db, "engine", engine)
+    try:
+        with pytest.raises(RuntimeError, match="Refusing to serve a stale schema") as behind:
+            asyncio.run(db.verify_schema())
+        assert "alembic upgrade head" in str(behind.value)
+        assert "MIGRATE_REFUSE_UNKNOWN_REVISION" not in str(behind.value)
+    finally:
+        asyncio.run(engine.dispose())
 
 
 def test_adopt_refuses_to_stamp_a_mismatched_db(tmp_path, monkeypatch) -> None:
