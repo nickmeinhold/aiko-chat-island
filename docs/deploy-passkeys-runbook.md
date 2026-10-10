@@ -254,12 +254,10 @@ unauthenticated; a flag flip is the moment they start getting real traffic.
 ssh imagineering "grep -q '^PASSKEY_ENABLED=' ~/apps/aiko-chat-gateway/.env \
   || echo 'PASSKEY_ENABLED=true' >> ~/apps/aiko-chat-gateway/.env"
 ```
-> NOTE: `passkey_enabled` is a plain pydantic-settings bool — confirm the compose
-> file passes `PASSKEY_ENABLED` into the container env (it does NOT today; the
-> dark-deploy needs no env, so this var isn't wired yet). **Before flipping, add**
-> `PASSKEY_ENABLED: ${PASSKEY_ENABLED:-false}` to the `environment:` block in
-> `docker-compose.yml` (commit it to the repo first, then rsync), OR flip the
-> default in `config.py`. Don't hand-edit only the host copy — that's config drift.
+> NOTE: `docker-compose.yml` forwards `PASSKEY_ENABLED: ${PASSKEY_ENABLED:-false}`
+> into the container, so the host `.env` line above is the whole flip. Don't
+> hand-edit the host's compose copy: that's config drift (and
+> `preflight-compose-drift.sh` will refuse the next deploy).
 
 Then redeploy and confirm advertisement:
 ```bash
@@ -277,27 +275,18 @@ gate — don't say "done".
 ## Rollback
 
 The deploy is reversible at the image layer (recreate from the prior image) and the
-data layer (the step-1 backup). **ORDER MATTERS since the compat guard (design 18
-§1):** an image older than the database's schema **refuses to start**
-(`MIGRATE_REFUSE_UNKNOWN_REVISION`). So if the release you're backing out ran a
-migration, put the schema back FIRST, then re-pin the old image:
+data layer (the step-1 backup). **An image older than the database's schema refuses to
+start** (`MIGRATE_REFUSE_UNKNOWN_REVISION`, design 18 §1; before that it crash-looped
+in `verify_schema()` with advice that could not work). So:
 
-1. **Restore the step-1 backup** (`backups/aiko.db.preupdate-*`). This is preferred:
-   it is exact, but it loses writes made since the update.
-2. **Or downgrade** the schema using the **new** image (the old one doesn't have the
-   downgrade script), while it is still the running one.
-3. Then re-pin the old image (`ISLAND_VERSION`) and `update.sh`.
+- **The release ran no migration:** re-pin the old image (`ISLAND_VERSION`) and run
+  `update.sh`. That's all.
+- **The release ran a migration:** put the database back FIRST, then re-pin. **Restore
+  the step-1 backup** (`backups/aiko.db.preupdate-*`, see the restore drill, #17) with
+  the stack stopped. It is exact, but it loses writes made since the update.
 
-`MIGRATE_ALLOW_UNKNOWN_REVISION=true docker compose up -d` makes the old image serve
-on the newer schema anyway. Use it only when you have judged that schema
-backward-compatible, and unset it afterwards. A release that ran no migration rolls
-back by re-pinning alone.
-
-```bash
-# revert schema (only if needed), from the NEW image, before re-pinning:
-ssh imagineering "docker exec aiko-chat-island-1 \
-  python -c \"from alembic.config import Config; from alembic import command; \
-  c=Config('alembic.ini'); c.set_main_option('script_location','alembic'); \
-  command.downgrade(c,'0007')\""
-# worst case: restore the step-1 backup (see the restore drill, #17).
-```
+There is deliberately no serve-anyway override and no generic downgrade recipe here.
+A downgrade has to run from the NEWER image (only it has the downgrade scripts), with
+the stack stopped (never `docker exec` alembic DDL beside a live writer), and to the
+OLD image's own head, which is a different revision on every release. Alembic
+downgrades of table rebuilds are not guaranteed lossless. Restore the backup.

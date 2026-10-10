@@ -21,7 +21,6 @@ shipped code path, not a reimplementation.
 """
 from __future__ import annotations
 
-import logging
 import re
 
 import pytest
@@ -273,7 +272,6 @@ def test_unknown_revision_refuses_to_start(tmp_path, monkeypatch, keep_known_hea
     carrying a known head beside the unknown row. Neither is mutated on the way out.
     """
     _, sync_url = _point_app_at(tmp_path, monkeypatch)
-    monkeypatch.setattr(settings, "migrate_allow_unknown_revision", False)
     migrate.run()  # managed DB at head
     before = _stamp_ahead(sync_url, keep_known_head=keep_known_head)
 
@@ -285,38 +283,34 @@ def test_unknown_revision_refuses_to_start(tmp_path, monkeypatch, keep_known_hea
         "exactly as the newer image left it")
 
 
-@pytest.mark.parametrize("keep_known_head", [False, True],
-                         ids=["ahead", "mixed-known-and-unknown"])
-def test_operator_override_serves_without_mutating(
-        tmp_path, monkeypatch, caplog, keep_known_head) -> None:
-    """``MIGRATE_ALLOW_UNKNOWN_REVISION=true`` is a human's deliberate manual
-    rollback: it restores PR#116's serve-anyway, unchanged. It skips the upgrade
-    (``command.upgrade(head)`` would die on "Can't locate revision"), does not stamp
-    down or mutate, and logs the alertable ``MIGRATE_SKIP_UNKNOWN_REVISION`` marker.
-    The auto-update watcher never sets it (design 18 §1/§3).
+def test_both_boot_layers_refuse_a_forward_migrated_db(tmp_path, monkeypatch) -> None:
+    """The migrator and lifespan's ``verify_schema()`` must AGREE that an image older
+    than the schema does not serve. PR#116 relaxed only the migrator (skip and
+    "serve"), while ``db._assert_at_head`` kept refusing, so its serve-anyway was
+    unreachable for two months and its tests, which never booted past
+    ``migrate.run()``, could not see that. A serve-anyway reintroduced in ONE layer
+    goes red here instead of shipping as a dead switch (PR#392 review).
     """
-    _, sync_url = _point_app_at(tmp_path, monkeypatch)
-    monkeypatch.setattr(settings, "migrate_allow_unknown_revision", True)
+    import asyncio
+
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from aiko_gateway import db
+
+    async_url, sync_url = _point_app_at(tmp_path, monkeypatch)
     migrate.run()
-    before = _stamp_ahead(sync_url, keep_known_head=keep_known_head)
+    _stamp_ahead(sync_url, keep_known_head=False)
 
-    # alembic's env.py runs fileConfig() on every command, which REPLACES the root
-    # logger's handlers (caplog's included), so after the first run() nothing would
-    # reach caplog via root. Attach its handler to the migrate logger directly.
-    mlog = logging.getLogger("aiko_gateway.migrate")
-    mlog.addHandler(caplog.handler)
+    with pytest.raises(RuntimeError, match="MIGRATE_REFUSE_UNKNOWN_REVISION"):
+        migrate.run()
+
+    engine = create_async_engine(async_url)
+    monkeypatch.setattr(db, "engine", engine)
     try:
-        with caplog.at_level(logging.WARNING, logger="aiko_gateway.migrate"):
-            migrate.run()  # must NOT raise
+        with pytest.raises(RuntimeError, match="Refusing to serve"):
+            asyncio.run(db.verify_schema())
     finally:
-        mlog.removeHandler(caplog.handler)
-
-    assert _versions(sync_url) == before, (
-        f"the override mutated the version table: {_versions(sync_url)!r} "
-        f"(was {before!r})")
-    assert "MIGRATE_SKIP_UNKNOWN_REVISION" in caplog.text, (
-        "the override served without its alertable marker; an operator must be "
-        "able to see that this island is running on a schema newer than its code")
+        asyncio.run(engine.dispose())
 
 
 def test_adopt_refuses_to_stamp_a_mismatched_db(tmp_path, monkeypatch) -> None:
