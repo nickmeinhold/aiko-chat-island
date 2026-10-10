@@ -51,12 +51,18 @@ effects during any stop are accepted, exactly as with a manual deploy today.
     password is a CI secret), posts to a probe channel, and reads the message back over WS.
     The probe account is excluded from the island-mark activity counts.
   - **enspyr-melb:** `/health` 200 with `aiko_connected`, and the same ref + sha.
-- **Memory, not a timestamp:** the streak `<digest>:<count>` lives in a repo variable. A
-  red sample, a change in `:latest`'s digest, or a missing field resets it (fail closed).
-  At 24 consecutive greens CI runs `imagetools create -t :stable <that digest>`.
-  `PROMOTION_HOLD` vetoes; `PROMOTE_NOW=<digest>` is the hotfix override (a human's act,
-  logged).
-- **After promotion:** a red sample within 24 h stops further promotion and opens an issue.
+- **Memory, not a timestamp: "the newest release old enough, and clean ever since."** CI
+  keeps two facts in repo variables: when each release was **first seen green on both
+  islands** (keyed by its `:latest` digest), and `last_red_at` (the last red sample from
+  either island, including a missing field, which fails closed). `:stable` moves to the
+  newest release `R` whose first-seen time is at least **`SOAK_DAYS` (default 7, Nick
+  2026-10-10: "we really want stable to be... stable")** ago **and** after `last_red_at`.
+  Newer releases landing on top **don't reset** the soak; they ride along (a reset-on-new-release
+  streak would never promote at this release cadence). Promotion is
+  `imagetools create -t :stable <R's digest>`. `PROMOTION_HOLD` vetoes; `PROMOTE_NOW=<digest>`
+  is the hotfix override (a human's act, logged). A stable island may jump several
+  releases at once; migrations chain.
+- **After promotion:** a red sample within `SOAK_DAYS` stops further promotion and opens an issue.
   `:stable` is NOT moved back. A channel downgrade would make every follower roll back across
   migrations, which the guard would refuse. Islands that already pulled are protected only by
   their own watcher. **Named limit.**
@@ -137,7 +143,7 @@ until someone classifies it.
 | 1 | Phase B relocated a failure (shared disk/mem, quarantine authority, bus-blind) | **Removed**: no on-host rehearsal; the test island + canary are the rehearsal |
 | 2 | 120 s knife at cutover | One budget (600 s); migrating = waiting |
 | 3 | Marker keyed by ref, written too early | Digest + container id, end of lifespan, cleared before cutover, read after stop |
-| 4 | Self-reported one-shot latch, idle canary | CI streak memory, two islands, synthetic probe + real-use canary; no un-promote (named) |
+| 4 | Self-reported one-shot latch, idle canary | CI memory (first-seen + last-red, 7-day soak), two islands, synthetic probe + real-use canary; no un-promote (named) |
 | 5 | Pin collides with SOPS `.env` | Watcher-owned `image.env`; ct#5165 prerequisite |
 | 6 | Terminal state has no recovery | Diagnostics + runbook; override forbidden |
 | 7 | Dead-man rings on the living | Lease pinged every run |
