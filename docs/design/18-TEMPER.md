@@ -204,7 +204,7 @@ Carnot's verdict artifact plus smoke suite is the design-16 ratchet if taken who
 smallest promotion signal that removes the self-report, and name healthy-but-wrong detection as
 a tradeoff owned by the canary's operator (Nick), not a mechanism. If v3 can't fold 1–7 within
 ~1.5× v1 by SUBTRACTING Phase B, stop: ship the compat guard alone and leave auto-update parked.
-**Kelvin before round 3:** only if Gemini is kept (an evaluation is in progress, 2026-10-10). If it's dropped, a 3-way final round is the full roster.
+**Round 3 is GATED on a Qwen seat** (Nick, 2026-10-10: "let's wait till we add qwen"). Gemini was evaluated the same day and is being dropped: on design tempers it yielded 0.34 unique-folded flaws per strike against Carnot's ~1.0, and it vouched for 35+ flaws that others folded (claude-skills `docs/crucible/kelvin-yield/design-temper/`).
 
 ## MaxwellMergeSlam's Design Strike
 
