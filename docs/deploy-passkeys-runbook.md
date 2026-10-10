@@ -279,11 +279,20 @@ data layer (the step-1 backup). **An image older than the database's schema refu
 start** (`MIGRATE_REFUSE_UNKNOWN_REVISION`, design 18 §1; before that it crash-looped
 in `verify_schema()` with advice that could not work). So:
 
-- **The release ran no migration:** re-pin the old image (`ISLAND_VERSION`) and run
-  `update.sh`. That's all.
-- **The release ran a migration:** put the database back FIRST, then re-pin. **Restore
-  the step-1 backup** (`backups/aiko.db.preupdate-*`, see the restore drill, #17) with
-  the stack stopped. It is exact, but it loses writes made since the update.
+**Two deploy topologies, two backup paths; don't mix them.** This runbook records the
+June build-on-host procedure (rsync + `--build`; step 1's backup is
+`~/aiko-db-backups/aiko.db.predeploy-$TS`). Since #2301 / ISL-0003 the fleet deploys
+pull-based: `ISLAND_VERSION` + `deploy/update.sh`, whose backup is
+`backups/aiko.db.preupdate-*` in the deploy dir. Use the backup the deploy you're
+undoing actually took.
+
+- **The release ran no migration:** go back to the old code (pull-based: re-pin
+  `ISLAND_VERSION` and run `update.sh`; build-on-host: rsync the prior tree and
+  `up -d --build`). That's all.
+- **The release ran a migration:** put the database back FIRST, with the stack stopped
+  (`docker compose stop`, so `restart: always` isn't reopening the file), then go back
+  to the old code. **Restore that deploy's backup** (see the restore drill, #17). It is
+  exact, but it loses writes made since the update.
 
 There is deliberately no serve-anyway override and no generic downgrade recipe here.
 A downgrade has to run from the NEWER image (only it has the downgrade scripts), with

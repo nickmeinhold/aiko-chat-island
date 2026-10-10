@@ -283,7 +283,10 @@ def test_unknown_revision_refuses_to_start(tmp_path, monkeypatch, keep_known_hea
         "exactly as the newer image left it")
 
 
-def test_both_boot_layers_refuse_a_forward_migrated_db(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize("keep_known_head", [False, True],
+                         ids=["ahead", "mixed-known-and-unknown"])
+def test_both_boot_layers_refuse_a_forward_migrated_db(
+        tmp_path, monkeypatch, keep_known_head) -> None:
     """The migrator and lifespan's ``verify_schema()`` must AGREE that an image older
     than the schema does not serve. PR#116 relaxed only the migrator (skip and
     "serve"), while ``db._assert_at_head`` kept refusing, so its serve-anyway was
@@ -299,16 +302,25 @@ def test_both_boot_layers_refuse_a_forward_migrated_db(tmp_path, monkeypatch) ->
 
     async_url, sync_url = _point_app_at(tmp_path, monkeypatch)
     migrate.run()
-    _stamp_ahead(sync_url, keep_known_head=False)
+    _stamp_ahead(sync_url, keep_known_head=keep_known_head)
 
-    with pytest.raises(RuntimeError, match="MIGRATE_REFUSE_UNKNOWN_REVISION"):
+    with pytest.raises(RuntimeError, match="MIGRATE_REFUSE_UNKNOWN_REVISION") as refused:
         migrate.run()
+    # The advice is the load, not the marker (Tesla, PR#392 r2): the message must
+    # send the operator to a stopped-stack restore, never to `alembic upgrade head`.
+    assert "docker compose stop" in str(refused.value)
+    assert "restore the database backup" in str(refused.value)
+    assert "upgrade head" not in str(refused.value)
 
     engine = create_async_engine(async_url)
     monkeypatch.setattr(db, "engine", engine)
     try:
-        with pytest.raises(RuntimeError, match="Refusing to serve"):
+        # "ahead": _assert_at_head's own refusal. "mixed": alembic refuses to name a
+        # single current revision for a two-row version table. Either way: no serve.
+        with pytest.raises(Exception) as lifespan_refused:
             asyncio.run(db.verify_schema())
+        if not keep_known_head:
+            assert "Refusing to serve" in str(lifespan_refused.value)
     finally:
         asyncio.run(engine.dispose())
 

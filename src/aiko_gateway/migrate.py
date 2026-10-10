@@ -235,9 +235,10 @@ def run() -> None:
             f"{sorted(unknown)} not present in this image's migration scripts, so "
             "this image is OLDER than the schema (or the stamp is from a squashed "
             "history, or corrupt). Refusing to start. To roll back across a "
-            "migration, restore the database backup taken before the newer image "
-            "migrated it, then start this image. If this fired after a "
-            "migration-history squash/rebase, stamp this volume to the new "
+            "migration: stop the stack (`docker compose stop`, so restart: always "
+            "isn't reopening the file), restore the database backup taken before "
+            "the newer image migrated it, then start this image. If this fired "
+            "after a migration-history squash/rebase, stamp this volume to the new "
             "baseline instead.")
 
     command.upgrade(cfg, "head")
