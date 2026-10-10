@@ -165,8 +165,11 @@ Tesla: "If you want the secrets of the universe, think in energy, frequency and 
 
 **Overall verdict: RECAST, 3/3 seated** (Maxwell, Carnot and Tesla all RECAST; zero DISSOLVE)
 **Struck:** dt-1791616026, 2026-10-10. Families seated: Maxwell + Carnot + Tesla. **Kelvin DARK:**
-Gemini auth error "no valid license" (#3501), NOT quota; it needs a fresh `gemini` login. This
-is a 3-way strike, so it's a coverage gap, not a SOUND vote.
+Gemini "no valid license" (#3501). **Cause (claude-skills tab, verified 14:35): Nick cancelled
+Code Assist and unassigned its licence today**, so the `gemini` CLI is dark everywhere and a
+login won't fix it. Kelvin is being moved to a direct API call (claude-skills
+`fix/kelvin-stderr-separate`). This is a 3-way strike, so it's a coverage gap, not a SOUND vote,
+and NOT evidence about Gemini's quality.
 **Bundle:** v2 + this file's round 1 (38 KB). Maxwell's strike was written first; Carnot and Tesla
 landed together when the collector returned.
 
@@ -201,7 +204,7 @@ Carnot's verdict artifact plus smoke suite is the design-16 ratchet if taken who
 smallest promotion signal that removes the self-report, and name healthy-but-wrong detection as
 a tradeoff owned by the canary's operator (Nick), not a mechanism. If v3 can't fold 1–7 within
 ~1.5× v1 by SUBTRACTING Phase B, stop: ship the compat guard alone and leave auto-update parked.
-**Kelvin's seat should be restored before round 3**; a final round shouldn't run short a family.
+**Kelvin before round 3:** only if Gemini is kept (an evaluation is in progress, 2026-10-10). If it's dropped, a 3-way final round is the full roster.
 
 ## MaxwellMergeSlam's Design Strike
 
