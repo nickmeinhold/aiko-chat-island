@@ -1,113 +1,166 @@
 # Design 18: Operator opt-in auto-update (channel, restore-on-failure, compat guard)
 
-**Status:** CANDIDATE, for one `/design-temper` round. Nothing is built.
-**Answers:** Nick, 2026-08-16 and again 2026-10-10: *"each island operator should have
-the option to have the server automatically pull the latest image… it's what I want."*
-**Supersedes** the parked shape in `docs/crucible/reactive-deploy/` (#236), whose temper
-was FATAL on one flaw. This design exists to answer that flaw without the migration
-lint (#248) it was parked behind.
+**Status:** v2, CANDIDATE for `/design-temper` round 2 (of ≤ 3). Nothing is built.
+v1 was RECAST 4/4 (zero DISSOLVE); [`18-TEMPER.md`](18-TEMPER.md) holds the nine findings
+and the round-2 bar: **≤ ~1.5× v1, and every new piece removes a failure mode.**
+**Answers:** Nick, 2026-08-16 and 2026-10-10: *"each island operator should have the
+option to have the server automatically pull the latest image… it's what I want."*
+**Channel policy (finding 4):** Nick, 2026-10-10, option (b): a promoted channel is the
+default; raw `:latest` is an explicit opt-in.
 
 ## The flaw this must answer
 
-Rolling back the **image** does not roll back the **database**. v2 migrates the volume
-from schema N to N+1 on boot, fails `/health`, and v1 restarted on N+1 either
-crash-loops or corrupts data (reactive-deploy TEMPER, 3/3 families). And today
-`migrate.py`'s forward-revision tolerance makes the second outcome the default: an image
-that meets an unknown revision **serves anyway**, and its own log line admits this is
-*"Safe ONLY if the schema is backward- (N-1) compatible… it is NOT yet enforced."*
+Rolling back the **image** does not roll back the **database**. A new image migrates
+the volume forward, fails, and the old image restarted on the newer schema either
+crash-loops or corrupts. Today `migrate.py` makes corruption the default: on an unknown
+revision it **serves anyway** (`MIGRATE_SKIP_UNKNOWN_REVISION`).
 
-## Prior art (each piece is borrowed, not invented)
+## The move that shrinks v2: record admission, don't gate it
 
-- **Channels:** Fedora CoreOS update streams + Zincati; snap channels. The box follows a
-  moving tag, and a small agent applies what arrives.
-- **Restore data on failed update:** snapd snapshots revision-specific data on refresh
-  and restores it on revert.
-- **Compat guard:** Synapse stores the oldest code version that can read the database
-  (`schema_compat_version`) and **refuses to start** when the code is older.
+v1's restore was justified by *"the new version never passed `/health`, so it never
+served"*. All four families showed that's false: uvicorn serves, and the gateway's
+lifespan joins the bus, before any health check sees it. The temper's fix was a HELD
+boot mode (migrate, then answer only `/health` until the watcher admits it). That is
+new code on every route, plus a chaos test to prove the gate holds.
 
-## The design (three parts, each useful alone)
+v2 doesn't build a gate. It **records the moment the gate would have opened** and
+**never rewinds data past it**:
 
-### 1. Compat guard in `migrate.py`, built first and needed regardless
+- `entrypoint.sh` writes `/data/.served-<build ref>` **after** `migrate` succeeds and
+  **before** `exec uvicorn`. One `touch`. From that line on, this generation may have
+  accepted a write or consumed the bus.
+- The watcher's rule: **data is restored only if the marker for the candidate is
+  absent.** Absent means no process of this generation got past migration, so nothing
+  was served, and restoring loses nothing *by construction*, not by a timing argument.
+- With the marker present, the watcher may roll back the **image** only. The compat
+  guard (§1) then decides whether that is safe, and refuses loudly if it isn't.
 
-- Each alembic revision may declare `compat_floor = "<revision id>"`: the oldest
-  revision whose CODE can safely run against this schema. If it declares none, the floor
-  is the revision itself, i.e. not backward-compatible. **Safe by default:** an author who
-  forgets gets a refusal, never a corruption.
-- `migrate.py` records the effective floor (the max over applied revisions) in a
-  one-row table `schema_compat`.
-- On boot, the unknown-revision branch changes from *serve anyway* to: **serve only if
-  `schema_compat.floor` is a revision present in this image's script directory;
-  otherwise exit non-zero** with `MIGRATE_REFUSE_TOO_OLD`. "Present in my scripts" is
-  exactly "I am new enough". Alembic's graph does the version comparison, with no
-  version arithmetic.
-- Effect: the FATAL scenario becomes a loud refusal to start. This also protects a
-  *manual* rollback, which today can corrupt silently.
-- **A declared floor can be wrong.** CI checks it: for each release, boot the previous
-  release's image against the new head's schema and run its smoke suite. That's the
-  runtime-compat test from task #11, which finally has a precise job: verifying a
-  declaration, not inferring safety.
+This removes finding 1 instead of guarding it: there is no admission window to
+test, because no rewind ever crosses one. Kelvin's chaos test has nothing left to prove.
+The cost is honest: a candidate that dies *after* starting uvicorn on a release that
+migrated cannot be auto-healed, so it stops and pages (§3, terminal state). Rehearsal
+(phase B) exists to make that case rare.
 
-### 2. Channel
+## 1. Compat guard in `migrate.py` (buildable now, needed regardless)
 
-- `release.yml` already publishes `:latest`, which tracks semver releases, never `main`.
-  **That is the channel**; nothing new is needed in CI for v1.
-- The operator's setting: `AUTO_UPDATE=off` (the **default**) or `AUTO_UPDATE=latest`.
-  With `off` the island behaves exactly as today, and `update_nudge` still tells the
-  operator when they're behind.
-- **Stagger:** `AUTO_UPDATE_DELAY_HOURS` (default 24) means a release is applied only
-  once it has been on the channel that long. Nick's two islands get different delays
-  (imagineering 0, enspyr 24), so a bad release hits one island, not both. This answers
-  the TEMPER's "simultaneous dual-prod = global outage". Third-party operators inherit
-  the 24 h soak behind everyone with a shorter one.
+- **Unknown revision ⇒ refuse**, exit non-zero with `MIGRATE_REFUSE_UNKNOWN_REVISION`.
+  This reverses PR#116's serve-anyway, on purpose. That tolerance existed so a manual
+  image rollback onto a forward-migrated volume wouldn't crash-loop. It was "safe ONLY
+  if N-1 compatible… NOT yet enforced", and the enforcement never came.
+- **Override for a deliberate manual rollback:** `MIGRATE_ALLOW_UNKNOWN_REVISION=1`
+  restores today's behaviour, with today's warning. The watcher **never** sets it.
+- **Declared backward floors are deferred.** v1 proposed a `schema_compat` table with
+  per-revision `compat_floor`s so compatible migrations could still allow an image-only
+  rollback. The temper showed the floor is a graph walk, not a max (finding 5), and is
+  only trustworthy once CI has booted the oldest admitted image and *written* to every
+  rebuilt table. Every v1 floor would have been the revision itself anyway, and
+  "floor = self everywhere" is exactly "unknown ⇒ refuse". So v2 ships the guard with
+  **no table, no floors, no graph**. Finding 5 goes away until backward floors are wanted,
+  and they come back as their own design together with the CI proof they need.
+- **Named limit (finding 9):** the guard protects only rollbacks *to* images that
+  contain it. The watcher reads the target image's `org.opencontainers.image.version`
+  label and refuses to auto-restore to anything older than the first guarded release.
 
-### 3. The watcher: a systemd timer on the box, shell only (ISL-0003 holds)
+## 2. Channels: `:latest` is the canary's, `:stable` is everyone else's
 
-- Every 15 min it resolves the channel's **index digest** (anonymous; GHCR is public)
-  and compares it with the running image's index digest, so there's no per-arch loop.
-- On a new digest older than the delay, it runs `update.sh --auto`. **`update.sh` takes
-  no lock today** (checked 2026-10-10; an older memory said it did). So this design ADDS
-  one: `flock -n` on a file in the deploy dir, taken by every `update.sh` run, manual
-  or timer. A second run exits "deploy already in progress" rather than queueing, and
-  the timer runs as the same user that runs manual deploys, or the lock is decorative.
-  The run:
-  1. **pin the current digest** as a local tag `aiko-island:previous` (registry GC and
-     `prune` can't reap it; nothing on a timer ever prunes);
-  2. **stop** gateway, registrar and chat, so no process can write;
-  3. back up `aiko.db` by **file copy** (consistent, because nothing is running) and
-     run `integrity_check`;
-  4. pull the new digest, `up -d`, and wait for `/health`;
-  5. **healthy:** record the digest as current. Done.
-  6. **never healthy within 120 s:** stop, **restore `aiko.db` from step 3**, start
-     `aiko-island:previous`, verify `/health`, record the digest as **quarantined**, and
-     notify the operator.
-- **Why the restore loses nothing:** the new version never served (it never passed
-  `/health`), and the old one was stopped before the backup. Between steps 2 and 6 no
-  process accepted a write. The cost is downtime of about the pull time plus 120 s
-  worst case, which an auto-updating operator accepts.
-- **Quarantine:** a quarantined digest is never retried *automatically*, but the next
-  release supersedes it. A transient fault (pull error, GHCR 5xx, no disk) **aborts
-  before step 2** and simply retries next poll, so it is never quarantined. Only a
-  release that *started and failed health* is.
+- `release.yml` already publishes `:latest` (semver releases only, never `main`).
+- **New: `:stable`**, advanced by a scheduled CI job (hourly) that reads the canary's
+  **public** `/health`. It promotes release `vX` when **all** of these hold:
+  1. `build.ref == vX`, `vX` is the newest release, and `/health` returns 200 with
+     `aiko_connected: true`;
+  2. **new field** `started_at` (process start, added to `/health`) is ≥ `SOAK_HOURS`
+     (default 24) ago. A restart resets the soak, which is the conservative direction;
+  3. repo variable `PROMOTION_HOLD` is unset (Nick's manual veto for a
+     healthy-but-wrong release spotted by eye).
+  Promotion is `docker buildx imagetools create -t :stable <vX index digest>`, which CI
+  can already do. **No box holds registry credentials**; CI reads a public URL.
+- **Canary quarantine withholds promotion for free:** a canary that rolled `vX` back
+  reports `ref ≠ vX`, so condition 1 fails. There's no second signal to build.
+- **Operator setting:** `AUTO_UPDATE=off` (**default**; today's behaviour, and
+  `update_nudge` still nags), `stable`, or `latest`. Only the canary should run
+  `latest`; third-party operators who would rather not depend on Nick's canary may
+  choose it knowingly.
+- **Window (Kelvin):** the systemd timer's own `OnCalendar=` *is* the operator's window.
+  It needs no new setting. Default: every 15 min; Nick's enspyr might use `03:00..05:00`.
+- The old `AUTO_UPDATE_DELAY_HOURS` clock is **deleted**: the soak now lives in promotion,
+  where a failure on the canary can cancel it.
+
+## 3. The watcher: systemd timer, shell, three phases (ISL-0003 holds)
+
+Every run takes `flock -n` on a file in the deploy dir, shared with manual `update.sh`
+under the same user; busy ⇒ exit, never queue. It resolves the channel's **index
+digest** anonymously (GHCR is public) and compares it with the running one.
+
+**Phase A: prepare, everything still up.** Pull the candidate **by digest**; pin the
+running image by **id and digest** (record both in `deploy/.auto-update/previous`; if the
+local image was pruned, rollback re-pulls the digest); run `preflight-compose-drift.sh`.
+Any failure here (GHCR 5xx, disk, drift) **retries next poll and never quarantines**.
+
+**Phase B: rehearsal, everything still up.** Python's `sqlite3.Connection.backup` of the
+live db into a scratch volume (online and consistent, and it carries no WAL). Run the
+candidate against that copy with `--network none`: migrate, start, require `/health` 200
+from inside the container within 300 s. A slow table rebuild gets its time here, off
+the outage clock. **Rehearsal failure ⇒ quarantine the digest** (it failed on a copy of
+real data, so the release is at fault, not the host), page, and leave prod untouched.
+
+**Phase C: cutover, only if B passed.**
+1. Stop gateway, registrar, chat. Back up the db with `.backup` into
+   `deploy/.auto-update/pre-<digest>.db` and check `integrity_check`.
+2. Set `ISLAND_IMAGE=<registry>@<candidate digest>` and `up -d`.
+3. **Healthy** = all three containers running/healthy **and** gateway `/health` 200
+   within 120 s (finding 8). Record the digest as current. Done.
+4. **Unhealthy, or any exit after step 1:**
+   - **marker absent** ⇒ restore: delete `aiko.db`, `aiko.db-wal` and `aiko.db-shm`,
+     copy the `.backup` file in as `aiko.db` (a backup carries no WAL, so this is the
+     whole set; finding 2), start previous;
+   - **marker present** ⇒ start previous on the current data. The guard lets it
+     serve if the release didn't migrate, and refuses if it did.
+5. **Previous healthy** ⇒ quarantine the candidate, notify. **Previous unhealthy or
+   refused** ⇒ the **terminal state** (finding 7): stay stopped, mark the **host**
+   failed in `deploy/.auto-update/state` (which suspends auto-update until an operator
+   clears it), do not quarantine, and page through an **off-box** path: a healthcheck
+   ping whose *silence* alerts, so a dead island still pages.
+
+**State manifest (finding 2):** `aiko_data` holds the db (restored as above) plus the
+worker-guard lockfile and markers (both disposable). `mosquitto_data` is **not**
+restored, and doesn't need to be: the gateway's paho client uses a clean session, so the
+broker holds no backlog for it. Bus traffic while the gateway is down is dropped
+exactly as on every manual deploy today (v1's open question 1, answered).
+
+**Bootstrap (finding 6):** compose's `image:` becomes `${ISLAND_IMAGE:?}` for all three
+aiko services. That kills `:-edge`, design 16's empty-pin trap. `update.sh` writes
+`ISLAND_IMAGE` from `ISLAND_VERSION` for manual deploys. The release that carries this
+is the **named one-time compose hand-sync** on each box, done by the operator, which
+`preflight-compose-drift.sh` enforces.
 
 ## Deliberately out of scope
 
-- **Healthy-but-wrong releases** (pass `/health`, broken in use). Auto-rollback can't
-  see them; nothing unwatched can. The stagger bounds their blast radius to one island,
-  and the compat guard makes the operator's manual rollback safe.
-- **Push-CD** (CI holding SSH keys to prod boxes): rejected 2026-08-16; still rejected.
-  The island pulls; nobody pushes into it.
-- **Config/compose delivery** (#2301): a release that also needs a compose change is
-  refused by `preflight-compose-drift.sh` before step 2. That's a clean abort, and the
-  operator syncs by hand as today.
+- **Healthy-but-wrong** releases: the canary soak plus `PROMOTION_HOLD` bound them;
+  nothing unwatched can detect them.
+- **Push-CD** (CI with SSH to boxes): still rejected. The island pulls.
+- **Backward compat floors**: deferred (see §1) together with the CI proof they require.
 
-## Open questions for the temper
+## Findings ledger (round 1 → v2)
 
-1. **Bus traffic during the window.** Gateway, registrar and chat stop together. Does
-   anything published to MQTT while they are down need to survive, or is that already
-   the behaviour of every manual deploy today?
-2. **Is 120 s of `/health` enough evidence of "never served"?** `/health` passing is
-   liveness. Could a version accept writes *before* it first passes `/health`? (The
-   entrypoint migrates before uvicorn starts, so a write needs uvicorn, but check.)
-3. **Should `compat_floor` default to "not compatible"** (refuse, the safe default) given
-   that most of the last six migrations were CHECK-adding table rebuilds that old code
-   would very likely survive?
+| # | Finding | v2 |
+|---|---|---|
+| 1 | Health ≠ admission | **Removed**: record-don't-gate; no rewind past `.served` |
+| 2 | WAL is three files; no inventory | Folded: `.backup` (no WAL) + manifest |
+| 3 | Step order contradicts quarantine | Folded: phases A/B/C; quarantine only on B, or on C with previous healthy |
+| 4 | Delay ≠ canary | Folded: `:stable` promoted from the canary's public `/health` |
+| 5 | Floor is a graph | **Removed**: no floors in v2 |
+| 6 | Compose can't take a digest | Folded: `${ISLAND_IMAGE:?}` + named hand-sync |
+| 7 | Double failure undefined | Folded: host-failed terminal state + off-box dead-man page |
+| 8 | Health = one of three | Folded |
+| 9 | Pre-guard images | Named + enforced by label |
+
+## Open questions for round 2
+
+1. Does the `.served` marker hold under `restart: always`? A crash-looping candidate
+   re-runs the entrypoint, but the marker only proves "got past migrate once". Is any
+   path to a served write missing from it? (Checked: registrar and chat mount no
+   volume, so the gateway is the only durable writer.)
+2. Is `started_at` on public `/health` an acceptable disclosure under the island-mark
+   activity ruling? It reveals restart times, nothing about users.
+3. Should Phase B also require `aiko_connected`? `--network none` makes it false by
+   design. Is a bus-less boot enough evidence?
