@@ -564,9 +564,37 @@ Tesla: "If you want the secrets of the universe, think in energy, frequency and 
 
 
 
-# v4 series, round 2 (striking v5)  ⏳ STRIKE IN PROGRESS
+# v4 series, round 2 (striking v5)
 
-**Overall verdict:** _pending: 2 of 3 returned (Noether still running)_
+**Overall verdict: RECAST, 3/3** (zero DISSOLVE). Continue: flaws name missing cells (B5 resume, an exit from T). One round left in the series (cap 3).
+
+## Per-family verdicts (v4 r2)
+| Family | Verdict | One line |
+|---|---|---|
+| Noether (DeepSeek) | RECAST | No exit from T (it livelocks back into the same N); the restore point's storage is never named |
+| Carnot (GPT) | RECAST | R's "idempotent restore" rewinds writes once P has served; B5 has no resume arm |
+| Tesla (Grok) | RECAST | A reboot during the health wait is the ordinary input, and R tunes recovery to the wrong frequency |
+
+## Fatal flaws (deduped, most severe first)
+1. **R mutates data after an image may have served (Carnot, Tesla). CREATED BY FOLD 3.** "Redo B5a" from phase B6 overwrites writes P admitted during its health wait, and from a non-migrating B6 it destroys N's preserved writes. B4 resumed via B5 quarantines a release that reached Healthy. B5 has no resume arm. → **v6: R observes, never mutates.** It reads the world: Healthy(N) ⇒ CURRENT, Healthy(P) after phase B6 ⇒ QUARANTINE, anything else ⇒ T with reason `interrupted@<phase>`. Data moves only inside one uninterrupted run. A subtraction: R's dispatch map goes.
+2. **No exit from T (Noether, Tesla).** T doesn't quarantine and records no reason. Clearing `host_failed` leaves `txn` and the channel on N, so the next poll replays the same N. → T records its reason. The one clearing command (`auto-update clear`) quarantines N by default (`--retry` to opt out) and clears `txn` with it.
+3. **The empty-island hazard is guarded in five cells, not removed (Tesla, Noether, converging independently).** And B5a's failure → T leaves an unlinked db beside the backup, where a hand `docker compose up` serves an empty island. → **A volume sentinel in the image:** the first migration of a fresh volume writes `/data/.initialized`; `migrate.run()` refuses to create a db when the sentinel exists and `aiko.db` is missing. One door, every actuator (watcher, `update.sh`, a 3am hand command). Five checks go.
+4. **The restore point's storage is unnamed (Noether, Tesla).** E1/E5 use a host mount (`/bk`); `compose run --rm` keeps nothing; "disk ≥ 2× db" implies the volume. → `pre-<txn>.db` lives on the HOST under `deploy/.auto-update/`, bind-mounted into the one-shot. The harness already does exactly this, so the cell names the path it tested.
+5. **The actuator has a writer and no reader (Noether, Tesla).** `update.sh` runs `compose -f docker-compose.yml` with no `--env-file image.env`, and three services interpolate the image key. → One `COMPOSE` invocation, `--env-file .env --env-file image.env`, shared by the watcher and `update.sh` (bootstrap 3). The compose change covers all three services. [A] until built.
+6. **The lease deadline is an unstated number (Noether).** Nothing pings while the stack is down. → Grace = 2 × budget + restore + 10 min, stated. B1 renews; a stuck update pages after grace.
+7. **E6 overclaimed (Tesla).** `build-info.json` has `git_sha`/`ref`, NO alembic head, yet A2 cited E6 for `head(N)`, the bit that picks rewind vs B4′. → **E7:** read `head(N)` from N's own script directory in a one-shot; add it to the harness.
+8. **Rebuild ≠ release (Carnot).** apt/pip resolve at build time, so two digests of one sha can differ. → Install decisions and quarantine key on **digest**. `sha` only checks that `/health` is running the digest the watcher installed.
+9. **The marker sits after other lifespan work (Tesla).** `warn_if_unreachable` and the channel worker start between `verify_schema()` and `bus.start()`. → Write the marker immediately after `verify_schema()`.
+10. **A GC'd rollback target (Noether).** A2 can't fetch P ⇒ "retry forever", silently. → No rollback target ⇒ refuse to update AND notify. Tie the `ghcr-retention` workflow to keep every digest some island has as `current` or `previous`.
+
+**Not folded:** "the production island is the canary" (Noether) restates Nick's ruling of 2026-10-10, already marked deliberate in the design.
+
+## Trend and the evidence check
+- r1's worst flaw: a dropped steady state (every poll a cutover). r2's worst: the recovery cell rewinds served writes, **created by r1's fold 3**. Severity is not falling, but its LOCATION has converged: both rounds' worst live in recovery/re-entry, and r2's two best remedies are subtractions (R observes; a sentinel replaces five guards). That is the shape of convergence the old series never showed.
+- [A]-cell share: 13 of 16 tagged findings = **81%** (r1: 71%). All three [E] strikes found an [E] cell citing evidence for something the harness doesn't do (E6 → head; E1/E5 → storage). **Mechanism:** each [E] tag must name the harness LINE that proves it, not just the step.
+
+## Disposition
+v6 folds 1–10. It is the last round of this series. If r3 still finds a missing cell, stop, and build in this order: (a) the image-side sentinel and the marker (useful with or without a watcher), (b) the journal and R, then strike as code.
 **Struck:** dt-1792407464, 2026-10-19, against v5 `44b2eba`. Bundle 113 KB, code from `origin/main` (bundler asserted `def schema_status`).
 
 ## CarnotCodeCarver's Design Strike
@@ -622,6 +650,47 @@ The strike brief is truncated at the drift preflight. I'll read the remainder of
 - Bootstrap: one `deploy/compose.sh` that pins `-f docker-compose.yml --env-file .env --env-file image.env`, called by `update.sh`, the watcher, and the runbook. All three service image keys become `${ISLAND_IMAGE:?}`.
 - A2: `head(image)` is `ScriptDirectory.get_current_head()` through `docker run --entrypoint`, migrator not invoked, and that string is what the txn stores as `stamp`. Take E6's name off `head`. Check disk before the pull.
 
+
+---
+
+
+
+## NoetherNullPointer's Design Strike
+
+**Verdict:** RECAST
+
+**Summary:** The design conserves two things it never proves — that the *restore point* survives to the moment T needs it, and that there is a *path out of T* — and both laws break on paths the table itself schedules (B5a's delete, and the clear-host_failed re-entry).
+
+**Fatal flaws:**
+
+- **Missing cell: no exit from `host_failed` — T [A] + A0 [A] + T-runbook.** T latches `host_failed` and records *no reason*; A0 on the next run reads it and exits without pinging. Nothing in the table defines the transition out. The runbook's two options both route back into the same transaction: "fix forward with a newer release" silently assumes the channel has already moved (never stated as a precondition), and "restore `pre-<txn>.db` … Then clear `host_failed`" leaves the channel pointing at the *same* N — because T deliberately does **not** quarantine (T's own action column: "no quarantine"). So A0→A1→A2→…→T repeats. That is a livelock, not a recovery: the only escape is a human who knows to edit the channel, which no cell or runbook line tells them to do. The design's own stop-condition ("continue while one names a missing cell") is met here.
+
+- **T's entry invariant "nothing deleted after B2" is false — B5a [E5], T [A].** B5a *deletes* `aiko.db` ("one-shot: delete `aiko.db` and any stray sidecars… copy `pre-<txn>.db`"). On the B5a-failure path to T, the live DB is gone and the only restore point is `pre-<txn>.db`. The design never says *where* that file lives: A2's "disk ≥ 2× db" implies the same disk as the DB (the volume), while the E5 harness restores from `/bk` (a host mount). So E5 proves the restore *mechanism* and not the design's *storage*: if the backup is on `aiko_data`, the very "silently reborn empty" scenario the empty-island invariant exists to prevent also takes the backup. T's "restore `pre-<txn>.db`" is an [A] guarantee resting on an [E]-tested mechanism that does not exercise the state T actually reaches.
+
+- **The lease is not conserved across the down-window — B1 [A], §4 lease, A0 [A].** "ping iff Healthy(current), on every run" means B2–B6 (stack deliberately down, `Healthy` false by construction) never ping. B1's single "renew lease" must cover B4's ≤600 s wait **plus** B4′'s second budget **plus** B5a **plus** B6. No cell fixes the deadline, so the conservation of "alive" depends on an unstated number: too short and every update trips the deadman's switch, too long and a genuinely stuck update never pages. The symmetry "down ⇒ no ping" has no compensating conserved quantity.
+
+- **The actuator has a writer but no specified reader — B4 [A], bootstrap 2–3, update.sh [C].** Fold 7 named the socket (`image.env`: `ISLAND_IMAGE=<repo>@<digest>`, compose `image: ${ISLAND_IMAGE:?}`) but not the wire. The shipped `update.sh` builds `COMPOSE="$DOCKER compose -f docker-compose.yml"` — **no `--env-file image.env`** — and the watcher's own `up -d` is never specified to pass it either. So the two writers that share the A0 flock either die on `:?` (ISLAND_IMAGE unset in shell/.env) or render a *different* image than the one they wrote. The lock conserves mutual exclusion of the writers while the deployed image can diverge from both.
+
+- **The rollback target's availability is assumed — A2 [A].** A2 "re-pull[s] P by digest if pruned", but there is no arm for "the registry no longer serves P's digest" (GHCR GC, deleted tag). A2's failure arm is "retry next poll, never quarantine", so a GC'd rollback target makes the island silently stop updating *forever*. The design conserves "never quarantine a pull failure" but not "always have a rollback target".
+
+- **Secondary — the empty-island coupling is guarded, not removed — B1-fail/B2-fail/B4/B4′/B6 [A].** The entrypoint creates a fresh DB on a missing `aiko.db`; the design guards this in *five* `up -d` cells. A volume sentinel (`.initialized`) that the entrypoint refuses to bypass when `aiko.db` is absent removes the coupling instead of re-checking it five times.
+
+- **Secondary — blast radius: the production island is the canary — header/§3 [A].** "enspyr-melb (where phones ring) is the canary" and "syd follows melb, not the tag". The island that matters takes the release *first*; the test island follows. Either the prose is inverted or the blast radius is under-counted for the one island whose availability is the point.
+
+**What holds:**
+- §1's compat guard: one predicate (`schema_status`) shared by both boot layers, no override — the symmetry is real and the refusal is exercised at the container boundary (E3′, E4).
+- Identity by `sha`, pull by digest (§2, E6): fold 2 holds; `/health` never needs to report a digest.
+- The journal discipline: tmp + fsync + rename, read first at A0, phase rewritten on every B entry — the durable-transaction fold holds, and R's named resumes (B1–B3, B4/B4′, B5a/B6) are idempotent.
+- A1's steady-state arm: every poll no longer cuts over (fold 1 holds).
+- B5a's restore mechanism itself: the must-fail arm (no-op RESTORE ⇒ E5 red) shows the harness can fail, which is the right property even though it does not exercise the design's storage.
+
+**If RECAST, what to fold back:**
+- **Add the missing cell.** A `T`-exit cell: on human clear, A0 must (a) re-read the failing sha/phase from T's record and (b) either quarantine N (if T was reached from B4′/B5-present) or require the channel to have moved. Record the failing sha and phase *in T*, so the runbook's "restore … then clear" cannot re-enter the same N. Change T's invariant from "nothing deleted after B2" to "a verified restore point exists" and state *where* `pre-<txn>.db` lives (host bind mount, not the data volume).
+- **Conserve the lease explicitly.** Either state the deadline bound that covers B4+B4′+B5a+B6 and renew in B2/B4/B4′/B6, or drop the pre-renewal fiction and make the page threshold a named constant.
+- **Complete the actuator wire.** State `--env-file image.env` on *every* compose invocation in both the watcher and `update.sh`, and make `image.env`'s write atomic (tmp + fsync + rename) like the journal.
+- **Add an A2 arm** for "P not obtainable from the registry": fail-closed with a page, not an infinite retry.
+- **Remove the empty-island coupling** with a volume sentinel rather than guarding it in five cells.
+- **Fix the promotion order** (or the prose): the expendable island goes first, or the header must say why the production island is the canary.
 
 ---
 
