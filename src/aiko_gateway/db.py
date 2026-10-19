@@ -79,6 +79,17 @@ engine = make_engine(settings.db_url)
 SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 
+# One owner for the "not migrated at all" refusal, raised by whichever layer sees it
+# first, so the order of the two checks in verify_schema() cannot change what an
+# unmanaged DB is told (Noether, PR#392 r6). The fix it names is the one that works:
+# ``python -m aiko_gateway.migrate`` builds a fresh DB AND adopts a pre-alembic one,
+# where a bare ``alembic upgrade head`` dies on CREATE TABLE users.
+NOT_MIGRATED_MESSAGE = (
+    "DB is not migrated: no alembic_version table. The container entrypoint runs "
+    "`python -m aiko_gateway.migrate` before serving; if you are running uvicorn "
+    "directly (dev), run that first. Refusing to serve an unmanaged schema.")
+
+
 def _assert_schema_current(conn) -> None:
     """Fail LOUD if the live schema is not migrated to head (#14, evolved from the
     PR#15 drift guard).
@@ -101,12 +112,7 @@ def _assert_schema_current(conn) -> None:
     insp = inspect(conn)
     tables = set(insp.get_table_names())
     if "alembic_version" not in tables:
-        raise RuntimeError(
-            "DB is not migrated: no alembic_version table. The container "
-            "entrypoint runs `python -m aiko_gateway.migrate` before serving; "
-            "if you are running uvicorn directly (dev), run "
-            "`alembic upgrade head` first. Refusing to serve an unmanaged schema."
-        )
+        raise RuntimeError(NOT_MIGRATED_MESSAGE)
     if "users" not in tables:
         # alembic_version exists but users doesn't — a partially-applied/empty
         # migration state. Still unsafe to serve.
@@ -128,11 +134,16 @@ def _assert_schema_current(conn) -> None:
         problems.append("users.password_hash is still NOT NULL "
                         "(social-only accounts require it nullable)")
     if problems:
+        # verify_schema() runs this only AFTER _assert_at_head has accepted the stamp
+        # as this code's head, so "run the migrations" would be a no-op here: the
+        # schema was hand-edited or partially applied under a head stamp (Noether,
+        # Tesla, PR#392 r6). Say so, and name the fix that works.
         raise RuntimeError(
-            "DB schema is behind the code: " + "; ".join(problems) + ". "
-            "Run the migrations (`alembic upgrade head`) before booting social "
-            "sign-in (#13). Refusing to serve a schema that would 500 on user "
-            "loads."
+            "DB schema does not match the code: " + "; ".join(problems) + ". The "
+            "alembic stamp already claims this code's head, so `alembic upgrade "
+            "head` cannot repair it: the schema was hand-edited or a migration was "
+            "partially applied. Restore a known-good backup. Refusing to serve a "
+            "schema that would 500 on user loads."
         )
 
 
@@ -148,7 +159,7 @@ def _assert_at_head(conn) -> None:
 
     status = schema_status(conn)
     if status.state is SchemaState.UNMANAGED:
-        return  # _assert_schema_current owns the "not migrated at all" message
+        raise RuntimeError(NOT_MIGRATED_MESSAGE)
     if status.state is SchemaState.UNKNOWN:
         raise RuntimeError(refuse_unknown_message(status) + " (lifespan check)")
     if status.state is not SchemaState.HEAD:
@@ -156,8 +167,7 @@ def _assert_at_head(conn) -> None:
             f"DB is at alembic revision(s) {sorted(status.stamped)} but the code's "
             f"head is {status.head!r}. The entrypoint runs `python -m "
             "aiko_gateway.migrate` before serving; if running uvicorn directly "
-            "(dev), run `alembic upgrade head` first. Refusing to serve a stale "
-            "schema.")
+            "(dev), run that first. Refusing to serve a stale schema.")
 
 
 async def verify_schema() -> None:

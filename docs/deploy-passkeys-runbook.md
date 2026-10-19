@@ -1,5 +1,11 @@
 # Passkeys (#1471) — deploy runbook
 
+> **HISTORICAL — DO NOT EXECUTE the deploy steps below.** This records the June 2026
+> build-on-host procedure (rsync + `--build`, alembic 0007→0008, a one-time project
+> cutover). Its revision numbers, commit hashes and step-by-step commands are fossils.
+> The fleet deploys pull-based since ISL-0003 (`ISLAND_VERSION` + `deploy/update.sh`).
+> The **Rollback** section near the end is current and applies to both topologies.
+
 **Status as of 2026-06-30:** **Gate 1 CROSSED** — endpoints deployed DARK to prod
 (alembic at `0008`, AASA serving via Caddy, `/providers` still hides passkey). Gate 2
 (`passkey_enabled` flip) and gate 3 (device e2e) remain. This runbook records the
@@ -255,7 +261,9 @@ ssh imagineering "grep -q '^PASSKEY_ENABLED=' ~/apps/aiko-chat-gateway/.env \
   || echo 'PASSKEY_ENABLED=true' >> ~/apps/aiko-chat-gateway/.env"
 ```
 > NOTE: `docker-compose.yml` forwards `PASSKEY_ENABLED: ${PASSKEY_ENABLED:-false}`
-> into the container, so the host `.env` line above is the whole flip. Don't
+> into the container, so setting `PASSKEY_ENABLED=true` in the host `.env` is the whole
+> flip. The `grep -q … || echo` line above only APPENDS: an existing
+> `PASSKEY_ENABLED=false` must be changed to `true`, not left in place. Don't
 > hand-edit the host's compose copy: that's config drift (and
 > `preflight-compose-drift.sh` will refuse the next deploy).
 

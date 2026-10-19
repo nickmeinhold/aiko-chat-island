@@ -352,6 +352,45 @@ def test_a_migrated_db_reads_head_and_lifespan_admits_it(tmp_path, monkeypatch) 
         asyncio.run(engine.dispose())
 
 
+def test_migrator_reboot_at_head_is_a_quiet_no_op(tmp_path, monkeypatch) -> None:
+    """POSITIVE CONTROL for the layer the container runs FIRST. A DB already at head is
+    the steady state on every restart, so run() must leave it at head without raising.
+    Every other run() call here starts UNMANAGED, BEHIND or UNKNOWN, so a refusal
+    widened to include HEAD would have crash-looped every island with this suite
+    green (Noether, PR#392 r6)."""
+    import asyncio
+
+    _, sync_url = _point_app_at(tmp_path, monkeypatch)
+    migrate.run()
+    before = _versions(sync_url)
+    migrate.run()  # the reboot: must NOT raise
+    assert _versions(sync_url) == before
+    assert asyncio.run(migrate._schema_status()).state is migrate.SchemaState.HEAD
+
+
+def test_lifespan_refuses_an_unmanaged_db_whichever_check_runs_first(
+        tmp_path, monkeypatch) -> None:
+    """``_assert_at_head`` refuses an UNMANAGED DB ITSELF, with the shared
+    NOT_MIGRATED_MESSAGE, instead of returning and relying on the next check in
+    verify_schema(). So no reordering of those two calls can serve a DB with no
+    alembic_version (Noether, PR#392 r6)."""
+    from sqlalchemy import create_engine as sync_engine
+
+    from aiko_gateway import db
+
+    _, sync_url = _point_app_at(tmp_path, monkeypatch)
+    eng = sync_engine(sync_url)
+    try:
+        with eng.connect() as conn:
+            with pytest.raises(RuntimeError, match="not migrated") as unmanaged:
+                db._assert_at_head(conn)
+            assert "python -m aiko_gateway.migrate" in str(unmanaged.value)
+            with pytest.raises(RuntimeError, match="not migrated"):
+                db._assert_schema_current(conn)
+    finally:
+        eng.dispose()
+
+
 def test_lifespan_refuses_a_users_table_missing_password_hash(tmp_path, monkeypatch) -> None:
     """``_assert_schema_current`` must report an ABSENT ``password_hash``, not only a
     NOT NULL one; absence 500s every user load too (Noether, PR#392 r5)."""
@@ -374,8 +413,12 @@ def test_lifespan_refuses_a_users_table_missing_password_hash(tmp_path, monkeypa
     engine = create_async_engine(async_url)
     monkeypatch.setattr(db, "engine", engine)
     try:
-        with pytest.raises(RuntimeError, match="users.password_hash column is missing"):
+        with pytest.raises(RuntimeError, match="users.password_hash column is missing") as damaged:
             asyncio.run(db.verify_schema())
+        # Reached only at a HEAD stamp, so "run the migrations" would be a no-op: the
+        # advice must say upgrade CANNOT repair it (Noether, Tesla, PR#392 r6).
+        assert "cannot repair" in str(damaged.value)
+        assert "Run the migrations" not in str(damaged.value)
     finally:
         asyncio.run(engine.dispose())
 
@@ -436,7 +479,9 @@ def test_lifespan_refuses_a_db_left_behind_head(tmp_path, monkeypatch) -> None:
     try:
         with pytest.raises(RuntimeError, match="Refusing to serve a stale schema") as behind:
             asyncio.run(db.verify_schema())
-        assert "alembic upgrade head" in str(behind.value)
+        # One advice everywhere: the module that builds AND adopts, not a bare
+        # `alembic upgrade head` (PR#392 r6 advice-class sweep).
+        assert "python -m aiko_gateway.migrate" in str(behind.value)
         assert "MIGRATE_REFUSE_UNKNOWN_REVISION" not in str(behind.value)
     finally:
         asyncio.run(engine.dispose())

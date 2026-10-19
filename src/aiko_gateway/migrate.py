@@ -245,8 +245,8 @@ def refuse_unknown_message(status: SchemaStatus) -> str:
         "history, or corrupt). Refusing to start. To roll back across a migration: "
         "take the stack down (`docker compose down`; a merely stopped `restart: "
         "always` container comes back when the Docker daemon restarts), restore the "
-        "database backup taken before the newer image migrated it, then start this "
-        "image. Do NOT `alembic stamp` this volume to make the error go away: a "
+        "database backup taken before the newer image migrated it (this LOSES every "
+        "write made since that backup), then start this image. Do NOT `alembic stamp` this volume to make the error go away: a "
         "stamp claims the schema matches a revision, and stamping this image's "
         "head onto a newer schema silences this guard for good.")
 
