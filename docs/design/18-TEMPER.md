@@ -424,3 +424,113 @@ Tesla: "If you want the secrets of the universe, think in energy, frequency and 
 - The watcher's healthy on a `:latest` island includes the same `aiko_connected` the promoter already requires, so a bus-deaf canary rolls back or the lease pages. Leave melb as the canary. Give syd a later window so it can refuse a digest melb has quarantined.
 - If those folds start growing a smoke suite or a verdict artifact, stop. Ship the compat guard. Leave auto-update parked. This is round 3 of 3.
 
+
+
+# v4 series, round 1  ⏳ STRIKE IN PROGRESS
+
+**Overall verdict:** _pending: 3 of 3 adversary families returned, synthesis not yet written_
+**Struck:** dt-1792406278, 2026-10-19, against v4 `57c08ce`. Panel: Noether + Carnot + Tesla (Maxwell is the author and did not strike). Bundle 108 KB, 13 files, including the code the cells cite.
+
+## NoetherNullPointer's Design Strike
+
+**Verdict:** RECAST
+
+**Summary:** The table conserves the backup *file* but not the backup's *provenance*, and it conserves the running image but not the *identity of P* — so the retry, which the design itself schedules ("retry next poll"), silently breaks the two invariants every failure arm leans on.
+
+**Fatal flaws:**
+
+- **A2 [A] + A0 [A] (missing cell: no state read) — "P" is not a conserved quantity, and T is not absorbing.** A2 says `record P` and never says *from where*; the two available sources are both wrong in exactly the state a rollback is needed. `image.env` is written to **N** by B4 and again by B6; `/health` is unavailable because the stack is down. So after B5's `present ∧ migrates → T`, the next hourly poll records **P = N**, computes `migrates := head(N) ≠ stamp` = **false** (the DB is already at head(N)) — which means the `present ∧ migrates → T` guard cannot fire again — and re-runs B2/B3/B4 on the release T declared host-failed. T's action is "stay down"; nothing enforces it. The table writes a state and no cell reads it. Class: written-but-never-read state + an identity mutated by the failure arms.
+
+- **B2 [E1] / T [A] — the rollback artifact's provenance is not conserved across runs.** The artifact is keyed only by digest (`pre-N.db`), so the retry above overwrites the pre-migration snapshot with a snapshot of the already-migrated DB. The cell's invariant reads "a checked `pre-N.db` exists" — `checked` means `integrity_check` passed, not that it is *pre-N*. T's invariant "nothing deleted after B2" is a per-run claim used as a system-wide one. The E1 arm proves the backup mechanism works; it never proves the artifact survives a second attempt. (And it coexists with `update.sh`'s host-side, timestamped, never-overwritten `backups/aiko.db.preupdate-<ts>` — two artifacts, two locations, two provenance stories, and the runbook names one.)
+
+- **B6 [E5] — the [E] cell does not exercise the state that triggers it: P is never validated against the DB.** `migrates := head(N) ≠ stamp` silently presumes `stamp == head(P)`. Reachable counterexample: B6's own failure arm leaves `image.env = P` while the DB sits at head(N); the next poll's B6 boots P against a schema P refuses, and B5a restores a snapshot that is already at head(N). The harness restores a *genuinely* pre-N db, so "previous image ADMITTED after restore" is a witness for a state the design can no longer guarantee it is in. Missing A2 check: `stamp == head(P)`, else there is no rollback target at all.
+
+- **A0 [A] — the mutual-exclusion invariant is unenforced, by the design's own admission.** The cell's note concedes `update.sh` takes no lock today; the lock arrives only via a one-time manual bootstrap on a box whose `deploy/` does not sync itself (#2301), and the runbook's own fix-forward step ("fix forward with a newer release") is a hand `compose up -d` that never takes it. Failure: B5a's `rm aiko.db* && cp pre-N.db` interleaves with a concurrent operator deploy — the gateway writes into a DB being replaced, on the sole-copy store. The interlock rests on vigilance, the exact class this repo has spent eight cage-match rounds refusing to rest on.
+
+- **§3 marker [C] / B5 [E3] — "Present(N) absent ⇒ no gateway write was admitted" is not conserved by construction.** The append happens after `verify_schema()` and before `bus.start()`, but nothing makes the append *fail-closed*. A full or read-only `/data` (A2's disk check runs before the pull, before the backup, and long before N's run) lets the append fail while the gateway serves; B5 then reads absence, B5a restores, and N's writes are silently rewound. Round 3 fixed one cause of false absence (container-id mismatch) and left the class.
+
+- **§2 [A] + B4 [C] — the quantity that attributes health to a release is not the quantity that identifies the release.** The sampler attributes each sample to "the digest the island reports (`/health` `build`)"; `build` is build provenance written by the Dockerfile (`git_sha`/`ref`/`built_at`/`aiko_*_ref`) — there is no digest in it. B4's Healthy requires `build = X` where X is a resolved channel **digest**. So either B4's success predicate is unsatisfiable, or per-digest memory, `Eligible(R)` and `holds.json` are keyed on a value that cannot distinguish a rebuild of the same commit from the release it replaces. Two identifiers used as one. Related missing cell: the unreachable-sample rule ("counts red only if the next sample is also unreachable") never says *which* digest an island that reports nothing is red against — so a T or a 20-minute cutover holds the wrong release, or none.
+
+- **§1 [E3]/[E4] — the harness does not exercise the boot the cells lean on, and the bundled code contradicts the stated predicate.** E3/E4 run `python -m aiko_gateway.migrate` and `verify_schema` as two *separate* `docker run` one-shots: never `entrypoint.sh`, never uvicorn, never the lifespan. "The previous image REFUSES the forward db" is proven for two functions in isolation, not for "a container of P cannot serve" — which is what B5's "refusal is certain" and B6 rely on. And the bundled `migrate.py` emits `MIGRATE_SKIP_UNKNOWN_REVISION` and **serves** on unknown revisions; the refusal lives in `db._assert_at_head`. §1's "one predicate decides both boot layers" is not in the bundle, and "an older image NEVER accepts a newer schema [E3]" is a universal claim with a one-pair witness riding on an unnamed second mechanism. (A2's drift cell is likewise [A]; the script backing it is header-only here.)
+
+**What holds:**
+
+- The compat guard's *effect*: with `db.py` finally in the bundle, E3 + E4 + E5 and the must-fail arm do establish that a forward-migrated volume cannot be served by 0.16.1 and that restoring the set recovers admission. The must-fail arm is a real positive control, not decoration.
+- The state-table frame itself. Every step × {success, failure} with an entry invariant is the right instrument; it is the only reason these flaws are nameable at all. Keep it.
+- The round-3 folds that are genuinely conserved: backup before any live-set mutation (B2 before B3), append-don't-match on the marker, per-digest reds, `aiko_connected` in Healthy, lease conditional on Healthy (the lease now measures the island, not the watcher), `holds.json` fail-closed, syd's staggered window, `concurrency:` on the CI writer, the manifest as a checked file.
+- The one-shot route's premise is real: the image has no `ENTRYPOINT`, only `CMD ["./entrypoint.sh"]`, so a command override skips migration ([E1] and the Dockerfile agree), and `worker_guard` keeps the single-writer premise true.
+- Scoping honesty: `:stable`/`:latest` split, `AUTO_UPDATE=off` default, push-CD rejected, promotion is a human act, healthy-but-wrong named as a tradeoff.
+
+**If RECAST, what to fold back:**
+
+- Make T absorbing: A0 reads the persisted state; `host-failed`/`quarantine` ⇒ exit without touching the stack, the DB, or any artifact. Clearing is an explicit human act. Add the cell.
+- Name the artifact by provenance, not by digest: `pre-<P>-<N>-<utc>.db`, never overwritten, or reuse `update.sh`'s host-side timestamped snapshot as the single rollback artifact. State the system-wide invariant as "a snapshot whose stamp is head(P) exists", and check it on entry to B2.
+- Add A2's validation: `stamp == head(P)` (read head(P) from the running image's scripts). If it fails, there is no P — go straight to T rather than to a B6 that cannot succeed.
+- Make the marker append fail-closed: any error before `bus.start()` aborts the boot. Then absence ⇒ no admitted write is conserved by construction.
+- Make the lock real: the watcher refuses to run unless the box's `update.sh` is the version that takes the lock (fail-closed, like the drift guard's "absent ⇒ die"), and route the runbook's fix-forward step through it.
+- Name one release identity and put it everywhere: report it at `/health`, key the sampler, `holds.json`, `Eligible(R)` and B4's predicate on that same value.
+- Define the no-reported-digest attribution rule.
+- Add a container-boot arm to the harness (`entrypoint.sh` + lifespan), and write the real predicate (`db._assert_at_head`) into §1 instead of a `schema_status()` the bundle does not contain.
+
+---
+
+## CarnotCodeCarver's Design Strike
+
+**Verdict:** RECAST
+
+**Summary:** The schema evidence holds, but the watcher lacks a recovery protocol for interrupted execution and a usable definition of digest identity. Fold back to a durable deployment transaction with explicit admission and recovery boundaries. No real engine matches the Carnot cycle; a reviewer's job is to say how far short we are. Here, the wasted work is a growing state table whose state disappears when its shell dies. Dijkstra: "Simplicity is prerequisite for reliability."
+
+**Fatal flaws:**
+- [missing cell] [A] — There is no recovery entry for watcher death, reboot, or timeout between cells. After B3, an interruption can leave the stack down; after B4, N may have migrated and served while image.env already names N. The next timer starts at A0, with no specified way to recover the original P, checked backup, or transaction phase. Likewise, nothing on A0–A1 consults the terminal host-failed state before attempting another deployment. A shell lock serializes surviving processes; it does not preserve deployment history. Persist the transaction before destructive transitions and make recovery the first entry point, including an explicit terminal-state latch.
+- [B3–B5] [A] — Present(N) treats an absent marker as proof that no gateway write was admitted, but the design specifies APPEND without durability ordering or a failure policy. A marker write that fails must prevent bus.start(); a marker that remains only in filesystem cache can disappear after a host failure while later database commits survive. That makes B5a silently rewind acknowledged writes. The second law does not grant reversibility merely because a log line disappeared. Specify a durable marker before admitting writes, durable clearing before starting N, and treat unreadable or uncertain marker state as terminal. The supplied harness never starts the gateway or exercises this boundary.
+- [missing cell] [A] — Registry digest identity is not connected to the identity the application actually reports. Healthy(X), per-digest sampling, and Present(N) require a digest, but the bundled Dockerfile bakes git_sha, ref, build time, and dependency refs; it does not bake a registry digest. The lifespan excerpt also has no proposed marker implementation. Comparing build directly with N therefore has no defined successful outcome. A healthy migrating release could serve, fail the identity test, and enter T. Define the mapping among channel manifest digest, platform image, running container, application provenance, and marker identity. Use Docker's inspected image identity for artifact verification and explicitly map health provenance to it.
+- [A1/B6] [A] — QUARANTINE(N) has no specified enforcement path. A1 reads shared holds, but never reads a local quarantine; shared holds record melb rejection and post-promotion reds, rather than every follower's failed installation. A stable follower that restores P successfully can therefore attempt the same N every poll, repeatedly stopping service and restoring its database. The off-box lease can remain satisfied between these planned outages. Persist local rejection before finishing B6 and exclude that digest in A1 until an explicit clearance or a different candidate arrives.
+
+**What holds:**
+- E1–E5 substantiate the published-image experiment: command override avoids migration, the new image admits its migrated database, the previous image refuses it, and restoration enables the previous image again. The no-op restore control meaningfully detects a missing restore.
+- Backup before marker deletion removes the previous round's direct data-loss path.
+- Refusing automatic rewind after a migrating release has admitted gateway writes is sound. The terminal arm honestly acknowledges an irreversible transition.
+- Conditional lease renewal and checking aiko_connected address concrete failures omitted by a simple HTTP health check.
+- Human promotion until an exercise signal exists is an honest limit on what elapsed soak time proves.
+
+**If RECAST, what to fold back:**
+- Keep the compatibility guard and restore primitive. Implement one durable deployment record containing phase, N, P, backup identity, admission status, and local rejection; consult it before resolving another channel candidate.
+- Make admission evidence durable and fail closed. Exercise marker failure and interruption before and after admission, checking preservation of actual database writes.
+- Resolve artifact identity once through Docker inspection and carry that identity through health validation, markers, sampling, and holds.
+- Execute interruption and quarantine scenarios against the resulting watcher. The drift-preflight body is omitted from this bundle, so its digest-to-source binding remains unassessed.
+
+
+---
+
+The brief was cut before the rest of the state table and the code it cites. I'll read only that remainder, then strike the design.## Tesla, the Arc-Prophet's Design Strike
+
+Tesla: "If you want the secrets of the universe, think in energy, frequency and vibration."
+
+**Verdict:** RECAST
+
+**Summary:** The table has no rest note, and it tunes the watcher to a digest while the image only sings a git sha, so the second tick of the timer — and every "successful" boot after it — shakes the canary down.
+
+**Fatal flaws:**
+- missing cell [A] — The steady state is not in the table. A1 success falls through to A2, and A2 success falls through to B1 `compose down`, with no arm for "the running image is already N and Healthy." The timer's own period is therefore a cutover. Once `AUTO_UPDATE` is on, every poll downs `chat.enspyr.co` (mosquitto, registrar, chat, and the gateway together), waits out `AUTO_UPDATE_BUDGET`, and only then discovers it had nothing to do. The lease renewed at B1 hides the cut from the dead-man for exactly one grace, so the page arrives after the phones have already been quiet. §3's table is the whole mechanism; this arm is the one the table does not contain.
+- B4 [A] — Two names are being asked to be one frequency. N is a registry digest (`PROMOTE_NOW=<digest>`, holds keyed by digest, `Eligible(R)` a digest). The only identity the process can actually report is `/health`'s `build`, and the Dockerfile writes that file as `git_sha`, `ref`, `built_at`, and the two aiko refs — no digest — and says an env-fed value would be the host's belief, the #2301 failure. `Healthy(X)` requires `build` = X. A digest never equals that JSON, so B4's success arm is unreachable on the artifacts in this bundle. The marker is told to append `<digest>` from inside the gateway, which does not know its digest unless the watcher injects one. Injected, `.served` repeats the host's belief: B4 then fails the body check, B5 sees `present ∧ migrates`, and the canary goes to **T** while the volume may still be a schema P could serve. Not injected, `Present(N)` is absence, B5a restores a good boot, and every release false-quarantines. E2 only prints `ADMITTED` from `verify_schema()`; the evidence file contains no `/health` body, so the "body observed live" half of B4 was never what the harness exercised.
+- B4 / bootstrap 2 [A] — The actuator socket is still a tag. Bootstrap 2 writes `image: ${ISLAND_IMAGE:?}`, which expands through a colon into a tag. A digest pin is a different socket, `repo@sha256:…`. Writing `sha256:…` into the tag slot makes compose ask the registry for a tag of that name. `image.env` is never named as a file compose loads (compose interpolates `.env`, or `--env-file`); `update.sh` today pulls `${ISLAND_VERSION:-edge}` and does not read `image.env`. A2's drift preflight, as `update.sh` calls it, rewrites a numeric version into a `v`-tag and dies on exit 2 when the ref cannot be fetched. A digest is not that shape. The preflight body is header-only in this bundle; the caller visible in `update.sh` is enough. Net: either every candidate fails closed in A2 and never updates, or a "fix" skips the drift check and a migrating image crash-loops into B5 → **T**. The 2026-09-11 outage was this same seam, one line wide.
+- B5 [A] — `present ∧ migrates → T` uses E3 for a fact E3 does prove (0.16.1 prints `Refusing` on a db at `0028` and will not admit) and then takes a step E3 does not license. The marker is written after `verify_schema()` and before `bus.start()` (`main.py` lifespan, as specified). So `Present(N)` becomes true while `aiko_connected` is still false, with mosquitto freshly created by a `depends_on` that does not wait for health. Any miss of `Healthy` after that line — bus slow, broker not up, a single probe gap — on a release whose head differed from the stamp at A2, skips B6 and stays down. There is no "start N again" cell. The runbook offers only a newer release, or restore `pre-N.db` and drop writes since the first `.served` line for N. At 3am the operator follows the runbook and lengthens an outage whose schema change already succeeded. E3 shows P will refuse; it does not show N will.
+- §2 [A] — Syd's two-hour lag is a sentence, not a cell. Both islands "follow `:latest`" and each watcher resolves the digest on its own tick; `holds.json` is written only once melb has failed to be on R after the window closes, which is after syd has already had a chance to pull the same digest. A release that drives melb into **T** is still eligible on syd's clock for that overlap. Unreachable-twice is declared red and then has no digest to hang on: `/health` never came back, so the "red counts only against the digest the island reports" rule attaches the red to nothing, or — if an implementer hangs it on the last known name — to P, and the known-good digest takes the stain. That is round 3's freeze, transposed up a harmonic.
+- B5a [E] — The cell says restore `aiko.db`, `-wal`, and `-shm` from `pre-N.db`. The harness does not do that. `BACKUP` writes one file; `RESTORE` is `rm -f` of the three live paths and `cp` of that one file; `db.py` leaves WAL off on purpose, so the sidecars are usually absent. A literal reading of the cell (`cp` the sidecars, `set -e`) fails after the `rm` has already unlinked the live db, and the failure arm is **T**. E5's must-fail arm proves that a no-op restore leaves the old image refusing; it never proves a three-file restore exists to succeed. The checked backup saves the data. It does not save the night.
+
+**What holds:**
+- The shipped guard, as measured, holds for this one hop. E3: 0.16.1 exits on `Refusing` against head `0028`. E4: 0.17.0 exits on `MIGRATE_REFUSE_UNKNOWN_REVISION` for a stamp it has never seen. E5: putting the pre-migration file back makes 0.16.1 print `ADMITTED`. The must-fail arm goes red when restore is a no-op. That consequence — do not boot P onto a db N has migrated — is real, and the bundled `db.py` `_assert_at_head` is the refusal the old "serves anyway" premise missed. (The bundled `migrate.py` still skip-serves under `MIGRATE_SKIP_UNKNOWN_REVISION` and returns; the refuse string lives in the 0.17.0 image, not in that source. Trust the evidence file for the image, not the docstring.)
+- B2 before B3 keeps the round-3 data-loss order out of the table: a checked `pre-N.db` exists before `.served` is truncated, and a failed backup returns to P on the untouched set.
+- `Present` is "a line for this digest," so a new container id is not absence. E1 shows a CMD override on this image does not migrate, which matches `Dockerfile` (`CMD`, no `ENTRYPOINT`). `compose down` rather than `stop` is the right call under `restart: always`. The lease pinging only while `Healthy`, and going silent in **T**, is the pulse that actually tracks the island.
+- Pull, not push. Per-digest reds, aimed at a digest the island is serving, are the right shape — once something on the box can say that digest.
+
+**If RECAST, what to fold back:**
+- Add the rest cell, in front of A2: if `docker inspect` says the running island image is already N and `Healthy(N)` holds, renew the lease and exit. B1 is unreachable from that cell. The common hour must not be a cutover.
+- Pick one identity and thread it through every socket. Host-side digest from `docker inspect` is the one the registry and the holds already use. Compose becomes `image: ghcr.io/nickmeinhold/aiko-chat-island@sha256:…` (an `@` pin, full ref in the env file compose actually loads). The marker stays a confession the process can make without knowing a digest: after `verify_schema()`, append a nonce the watcher wrote onto the volume before `up`, plus container id and time. `Healthy` compares inspect's digest to N, and the body to `aiko_connected`. Stop asking `build` to be a digest; today it is a git sha, and it should stay the artifact's own name.
+- Split B5. `present ∧ migrates ∧ the process admitted ∧ the miss was only the bus` → one retry of N, same image, lease already held, before anyone is allowed to enter **T**. **T** remains the arm where N itself will not stay up and P is known to refuse. The runbook's first line becomes "start N again when the stamp is already N's head"; restore stays the arm that throws away writes.
+- Make syd's lag a cell: syd does not resolve a digest until the holds fetch says melb has been serving it for two hours. A double-unreachable sample is attributed to N only while the watcher is inside B4–B6; otherwise it is not a red. A red with no digest is not a red.
+- Rewrite the B5a cell to the procedure E5 actually ran: delete `aiko.db`, `-wal`, and `-shm`, then copy the single `pre-N.db` into place. Do not name sidecar files the backup never creates.
+
+
+---
+
