@@ -1,5 +1,11 @@
 # Passkeys (#1471) — deploy runbook
 
+> **HISTORICAL — DO NOT EXECUTE the deploy steps below.** This records the June 2026
+> build-on-host procedure (rsync + `--build`, alembic 0007→0008, a one-time project
+> cutover). Its revision numbers, commit hashes and step-by-step commands are fossils.
+> The fleet deploys pull-based since ISL-0003 (`ISLAND_VERSION` + `deploy/update.sh`).
+> The **Rollback** section near the end is current and applies to both topologies.
+
 **Status as of 2026-06-30:** **Gate 1 CROSSED** — endpoints deployed DARK to prod
 (alembic at `0008`, AASA serving via Caddy, `/providers` still hides passkey). Gate 2
 (`passkey_enabled` flip) and gate 3 (device e2e) remain. This runbook records the
@@ -254,12 +260,12 @@ unauthenticated; a flag flip is the moment they start getting real traffic.
 ssh imagineering "grep -q '^PASSKEY_ENABLED=' ~/apps/aiko-chat-gateway/.env \
   || echo 'PASSKEY_ENABLED=true' >> ~/apps/aiko-chat-gateway/.env"
 ```
-> NOTE: `passkey_enabled` is a plain pydantic-settings bool — confirm the compose
-> file passes `PASSKEY_ENABLED` into the container env (it does NOT today; the
-> dark-deploy needs no env, so this var isn't wired yet). **Before flipping, add**
-> `PASSKEY_ENABLED: ${PASSKEY_ENABLED:-false}` to the `environment:` block in
-> `docker-compose.yml` (commit it to the repo first, then rsync), OR flip the
-> default in `config.py`. Don't hand-edit only the host copy — that's config drift.
+> NOTE: `docker-compose.yml` forwards `PASSKEY_ENABLED: ${PASSKEY_ENABLED:-false}`
+> into the container, so setting `PASSKEY_ENABLED=true` in the host `.env` is the whole
+> flip. The `grep -q … || echo` line above only APPENDS: an existing
+> `PASSKEY_ENABLED=false` must be changed to `true`, not left in place. Don't
+> hand-edit the host's compose copy: that's config drift (and
+> `preflight-compose-drift.sh` will refuse the next deploy).
 
 Then redeploy and confirm advertisement:
 ```bash
@@ -277,16 +283,27 @@ gate — don't say "done".
 ## Rollback
 
 The deploy is reversible at the image layer (recreate from the prior image) and the
-data layer (the step-1 backup). Migration `0008` is additive (two new tables, no
-column drops), so a forward deploy can't corrupt existing rows; but if you must
-revert the schema:
+data layer (the step-1 backup). **An image older than the database's schema refuses to
+start** (`MIGRATE_REFUSE_UNKNOWN_REVISION`, design 18 §1; before that it crash-looped
+in `verify_schema()` with advice that could not work). So:
 
-```bash
-# revert code: rsync the prior commit's tree and rebuild, OR re-tag the old image.
-# revert schema (only if needed): downgrade one revision
-ssh imagineering "docker exec aiko-chat-island-1 \
-  python -c \"from alembic.config import Config; from alembic import command; \
-  c=Config('alembic.ini'); c.set_main_option('script_location','alembic'); \
-  command.downgrade(c,'0007')\""
-# worst case: restore the step-1 backup (see the restore drill, #17).
-```
+**Two deploy topologies, two backup paths; don't mix them.** This runbook records the
+June build-on-host procedure (rsync + `--build`; step 1's backup is
+`~/aiko-db-backups/aiko.db.predeploy-$TS`). Since ISL-0003 the fleet deploys
+pull-based: `ISLAND_VERSION` + `deploy/update.sh`, whose backup is
+`backups/aiko.db.preupdate-*` in the deploy dir. Use the backup the deploy you're
+undoing actually took.
+
+- **The release ran no migration:** go back to the old code (pull-based: re-pin
+  `ISLAND_VERSION` and run `update.sh`; build-on-host: rsync the prior tree and
+  `up -d --build`). That's all.
+- **The release ran a migration:** put the database back FIRST, with the stack DOWN
+  (`docker compose down`: a merely stopped `restart: always` container comes back if
+  the Docker daemon restarts mid-restore), then go back to the old code. **Restore that deploy's backup** (see the restore drill, #17). It is
+  exact, but it loses writes made since the update.
+
+There is deliberately no serve-anyway override and no generic downgrade recipe here.
+A downgrade has to run from the NEWER image (only it has the downgrade scripts), with
+the stack stopped (never `docker exec` alembic DDL beside a live writer), and to the
+OLD image's own head, which is a different revision on every release. Alembic
+downgrades of table rebuilds are not guaranteed lossless. Restore the backup.
