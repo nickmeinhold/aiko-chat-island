@@ -9,6 +9,11 @@
 #       "marker present => previous refused => terminal" arm is reachable)
 #   E4  refusal, new guard: the new image refuses a stamp it has never seen
 #   E5  recovery exercised from the state that triggers it: restore the set, previous admitted
+#   E3' the previous image's REAL CMD (entrypoint.sh -> uvicorn) on the forward db exits
+#       non-zero and never binds: the container boundary, not two functions
+#   E6  identity: the digest the watcher pulls maps to the git_sha + ref /health reports,
+#       read from the image's own build-info.json without starting the app; ref is the tag
+#       the drift preflight takes
 #
 # ENVIRONMENT=development only skips config.py's prod boot-secret guards (JWT, signing
 # seed). migrate.py and db.py never read `environment`, so the guard under test runs
@@ -67,10 +72,20 @@ expect "E2 new image migrates forward"                  0 "STAMP"    -- migrate_
 echo "     new head: $(run "$NEW" "$V" "${STAMP[@]}" | sed 's/^STAMP //')"
 expect "E2 positive control: new image ADMITS its head" 0 "ADMITTED" -- run "$NEW" "$V" "${VERIFY[@]}"
 expect "E3 previous image REFUSES the forward db"       1 "Refusing" -- migrate_verify "$OLD" "$V"
+real_cmd() { # the image's own CMD, no override, no restart policy; must exit by itself
+  docker run --rm -e ENVIRONMENT=development -e JWT_SECRET="$JWT" \
+    -e DB_URL=sqlite+aiosqlite:////data/aiko.db -v "$1:/data" "$2"; }
+no_bind() { local out rc=0; out="$(real_cmd "$1" "$2" 2>&1)" || rc=$?
+  echo "$out"; [ $rc -ne 0 ] && ! grep -q "Uvicorn running" <<<"$out"; }
+expect "E3' previous image's REAL CMD exits, never binds" 0 "Refusing" -- no_bind "$V" "$OLD"
 # E4 on a copy, so E5 still starts from E3's state.
 run "$NEW" "$V" cp /data/aiko.db /bk/fwd.db
 run "$NEW" "$V2" "${FUTURE[@]}"
 expect "E4 new guard REFUSES an unknown stamp"          1 "MIGRATE_REFUSE_UNKNOWN_REVISION" -- run "$NEW" "$V2" "${MIGRATE[@]}"
 expect "E5 recovery: restore the set (db, -wal, -shm)"  0 "RESTORED" -- run "$NEW" "$V" "${RESTORE[@]}"
 expect "E5 ...previous image ADMITTED after restore"    0 "ADMITTED" -- migrate_verify "$OLD" "$V"
+DIGEST="$(docker inspect --format '{{index .RepoDigests 0}}' "$NEW")"
+ident() { docker run --rm --entrypoint cat "$DIGEST" /app/build-info.json; }
+expect "E6 digest -> build-info.json (no app start)"   0 '"ref":"v'"${NEW##*:}"'"' -- ident
+echo "     $DIGEST -> $(ident)"
 echo "ALL EVIDENCE HELD"
