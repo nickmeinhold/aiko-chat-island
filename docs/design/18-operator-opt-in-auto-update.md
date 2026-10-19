@@ -1,127 +1,120 @@
 # Design 18: Operator opt-in auto-update (channel, restore-on-failure, compat guard)
 
-**Status:** v5, for round 2 of the v4 series (r1 RECAST 3/3; see [`18-TEMPER.md`](18-TEMPER.md)).
-§1 is SHIPPED (v0.17.0, both islands, 2026-10-19). §2–§3 are not built. **Bar:** ≤ ~1.5× v1
-(1,058 words), every piece removes a failure mode, **every cell names its evidence**, and
-**every v3 branch is accounted for** (§ ledger).
+**Status:** v6, for round 3 (the LAST) of the v4 series (r1, r2 RECAST 3/3; see
+[`18-TEMPER.md`](18-TEMPER.md)). §1 SHIPPED (v0.17.0, both islands, 2026-10-19). §2–§4 not
+built. **Bar:** ≤ ~1.5× v1 (1,058 words); every piece removes a failure mode; every [E] tag
+cites the harness LINE that proves it; every v3 branch accounted for (§ ledger).
 **Answers:** Nick, 2026-08-16 and 2026-10-10: *"the option to have the server automatically
-pull the latest image… it's what I want."* Promoted channel by default, raw `:latest` opt-in.
-**enspyr-melb** (where phones ring) is the canary, **enspyr-syd** the test island. Deliberate.
+pull the latest image… it's what I want."* **enspyr-melb** (where phones ring) is the canary,
+**enspyr-syd** the test island: Nick's ruling, deliberate.
 
-## Evidence tags
+## Evidence
 
-**[E*n*]** executed: [`18-evidence/phase-b-evidence.sh`](18-evidence/phase-b-evidence.sh) runs the
-REAL published images (0.16.1 → 0.17.0) on a throwaway volume; output and a must-fail arm are in
-[`phase-b-evidence.out`](18-evidence/phase-b-evidence.out). **[C]** code cited. **[A]** argued:
-strike these hardest. The bundle is built from `origin/main` (r1's was stale; see 18-TEMPER).
+**[E:*line*]** = a line of [`18-evidence/phase-b-evidence.sh`](18-evidence/phase-b-evidence.sh),
+run against the REAL published images (0.16.1 → 0.17.0); output and a must-fail arm are in
+[`phase-b-evidence.out`](18-evidence/phase-b-evidence.out). Backups live on a HOST bind mount
+(line 39), as the design's do. **[C]** = code cited. **[A]** = argued: strike hardest.
 
-## 1. Compat guard (SHIPPED, PR#392 → v0.17.0)
+## 1. Compat guard (SHIPPED, PR#392)
 
-`migrate.schema_status()` decides for both boot layers: HEAD admits [E2], UNKNOWN refuses
-[E4], no override, no floors. So an older image never accepts a newer schema, and its real
-`CMD` exits without binding [E3, E3′]. **The table uses this:** once a migrating release has
-served, starting the previous image has a known answer.
+`migrate.schema_status()` decides for both boot layers: HEAD admits [E:75], UNKNOWN refuses
+[E:86], no floors. So the previous image refuses a migrated db, and its real `CMD` exits
+without binding [E:76, E:82]. Once a migrating release has served, rollback has a known answer.
 
-## 2. Identity: pull by digest, compare by commit
+## 2. The volume sentinel (image-side, buildable now, needed regardless)
 
-The registry names an image by **digest**; the running app reports **`build.git_sha`** (baked in
-`/app/build-info.json`, served at `/health`). The watcher pulls and pins by digest, and reads
-the pulled image's `build-info.json` without starting it, giving `sha` and `ref` [E6]. Every
-comparison (Healthy, marker, CI memory, quarantine, holds) uses `sha`. `ref` is the tag the
-drift preflight already takes (`update.sh:246`). A rebuild of one commit is one release; the
-base image is digest-pinned (`Dockerfile:14-22`) [C].
+`migrate.run()` writes `/data/.initialized` when it creates a db on an empty volume, and
+**refuses to create a db when the sentinel exists and `aiko.db` doesn't** (`MIGRATE_REFUSE_
+MISSING_DB`, no override). Today an empty volume is silently reborn as an empty island (the
+harness setup does exactly that, [E:69]). The sentinel closes that for every actuator at once:
+the watcher, `update.sh`, a 3am hand command. One door, so the table needs no "db exists?"
+guards. [A until built; its tests need a refusal AND an admission of a genuinely fresh volume.]
 
-## 3. Channels and promotion
+## 3. Identity
 
-- **`:latest`**: syd and melb. **`:stable`**: everyone else. `AUTO_UPDATE=off` (default;
-  `update_nudge` still nags) | `stable` | `latest`. It refuses to turn on without
-  `AUTO_UPDATE_PAGE_URL`.
-- **Per-release memory, keyed by `sha`.** An hourly CI sampler attributes each sample to the
-  `sha` the island reports. An island unreachable on two consecutive samples **pauses all
-  promotion** until it answers. It's island-scoped and fail-closed, and needs no guess at
-  which release to blame. "Not on it yet" is no sample.
-- **Eligible(R)** = first seen green on both ≥ `SOAK_DAYS` (7) ago, no red on R, syd's
-  probe green. Newer releases don't reset it. **Promotion is a human act** (`PROMOTE_NOW`)
-  until #4147 provides an attributable-use signal. Followers still update automatically.
-- **Holds conduct forward.** CI commits `holds.json` (orphan branch, `GITHUB_TOKEN`,
-  `concurrency:`) with post-promotion reds and canary rejections. Every A1 reads it. A false
-  hold is fail-closed. **syd follows melb, not the tag:** syd's A1 requires melb to report
-  Healthy on N's `sha`. `:stable` never moves backward [E3].
+The **digest** is the release. Install, quarantine and holds key on it (a rebuild of one commit
+resolves apt/pip anew, so it's a different release). The pulled image's own
+`/app/build-info.json` gives `sha` and `ref` without starting it [E:91]; `head` comes from its
+own scripts [E:94-95]. `/health` `build.git_sha` = the digest's `sha` proves the island runs
+what was installed. `ref` is the tag the drift preflight already takes (`update.sh:246`) [C].
 
-## 4. The watcher: timer, shell, lock, journal
+## 4. Channels and promotion
 
-**Journal** `deploy/.auto-update/journal.json`, written tmp + fsync + rename: `current`
-{digest, sha, head}; `txn` {id, N, P, stamp, backup, phase} or null; `quarantine` [sha];
-`host_failed` bool. `phase` is rewritten on entry to every B cell. **Every run reads it first.**
-It is the only memory, so the watcher can die anywhere.
+- **`:latest`**: syd and melb. **`:stable`**: everyone else. `AUTO_UPDATE=off` (default) |
+  `stable` | `latest`; it refuses to turn on without `AUTO_UPDATE_PAGE_URL`.
+- **Memory per digest.** An hourly CI sampler attributes each sample to the digest whose `sha`
+  the island reports. An island unreachable on two consecutive samples **pauses all promotion**.
+- **Eligible(R)**: first seen green on both islands ≥ 7 days ago (`SOAK_DAYS`), no red, syd's
+  probe green; newer releases don't reset it. **Promotion is a human act** (`PROMOTE_NOW`)
+  until #4147 gives an attributable-use signal.
+- **Holds conduct forward:** `holds.json` (orphan branch, `GITHUB_TOKEN`, `concurrency:`), read
+  by every A1. **syd follows melb:** syd's A1 requires melb Healthy on N. `:stable` never moves
+  backward. `ghcr-retention` keeps every digest that is any island's `current` or `previous`.
 
-**The empty-island invariant.** No `up -d` of any image unless `aiko.db` exists and passes
-`integrity_check`. The entrypoint migrates an EMPTY volume into a fresh database and serves it
-(the harness's setup step does exactly this [E-setup]), so a missing db is an island silently
-reborn empty. Every `up -d` cell (B1-fail, B2-fail, B4, B4′, B6) checks this first; failure ⇒ T [A].
+## 5. The watcher
 
-**Marker.** At the end of lifespan, after `verify_schema()` and before `bus.start()`
-(`main.py:229-250`) [C], the gateway appends `<sha> <container-id> <utc>` to `/data/.served`
-and fsyncs. **A failed write raises, so the container never serves** [A, needs code]. Present(N)
-= any line for N's `sha`. A container-id mismatch is never absence. An unreadable marker ⇒ T.
-The claim is only "no gateway data-volume write was admitted"; registrar/chat off-box effects
-are accepted loss, as in a manual deploy.
+**One actuator:** `COMPOSE="docker compose -f docker-compose.yml --env-file .env --env-file
+image.env"`, shared by the watcher and `update.sh`; `image.env` holds `ISLAND_IMAGE=<repo>@<digest>`,
+interpolated by all three aiko services. **Journal** `deploy/.auto-update/journal.json`
+(tmp + fsync + rename): `current`, `previous`, `txn` {id, N, P, migrates, phase}, `quarantine`,
+`host_failed` {reason, N} | null. **Marker:** immediately after `verify_schema()`
+(`main.py:229`) [C], the gateway appends `<sha> <container> <utc>` to `/data/.served` and
+fsyncs; a failed write raises, so the container never serves [A]. **Healthy(X)** = three
+containers up ∧ `/health` 200 ∧ `aiko_connected` ∧ `git_sha` = X's (`HEALTHCHECK` can't see
+the bus, `Dockerfile:76`) [C]. **Lease:** ping iff Healthy(current); grace = 2 × budget +
+restore + 10 min, so a stuck update pages.
 
-**Healthy(X)** = three containers running ∧ `/health` 200 ∧ `aiko_connected` ∧ `build.git_sha`
-= X.sha. The image `HEALTHCHECK` can't see the bus (`Dockerfile:76`) [C]. **Lease:** ping iff
-Healthy(current), on every run.
+| State | Action | Success → | Failure → | Evidence |
+|---|---|---|---|---|
+| **A0** | `flock -n`; read journal | `host_failed` ⇒ exit, no ping · `txn` ⇒ **R** · else A1 | busy ⇒ exit | [A] |
+| **A1** | resolve channel → N | N = current, quarantined, held, or (syd) melb not Healthy on N ⇒ **steady**: lease iff Healthy · else A2 | exit | [E:91] |
+| **A2** | pull N; read N's sha/ref/head; P := current, re-pull if pruned; `stamp = head(P)`; preflight(N.ref); disk; manifest | `txn` := {N, P, migrates := head(N) ≠ stamp, B1} → B1 | retry, never quarantine · P unfetchable or `stamp ≠ head(P)` ⇒ refuse update + notify | [E:94-95, E:91] |
+| **B1** | renew lease; `compose down` (`stop` revives on daemon restart) | B2 | `up -d` P; clear `txn` | [A] |
+| **B2** | one-shot `.backup` → host `pre-<txn>.db`; `integrity_check`; keep last 2 | B3 | `up -d` P; clear `txn`; never quarantine | [E:71-72] |
+| **B3** | truncate `.served` | B4 | as B2 | [A] |
+| **B4** | `ISLAND_IMAGE` := N; `up -d`; wait ≤ 600 s | **CURRENT(N)**: previous := P, clear `txn` | B5 | [E:73-75] |
+| **B5** | `compose down`; read marker | absent ⇒ B5a · present ∧ ¬migrates ⇒ B6 · present ∧ migrates ⇒ B4′ | unreadable ⇒ T | [E:76, E:82] |
+| **B4′** | N again, second budget (slow broker ≠ bad release) | **CURRENT(N)** | T | [A] |
+| **B5a** | one-shot: replace `aiko.db` from `pre-<txn>.db` (WAL off, `db.py:48`) | B6 | T | [E:87-88] |
+| **B6** | `ISLAND_IMAGE` := P; `up -d`; wait | **QUARANTINE(N)**, clear `txn`, notify | T | [E:88, E:82] |
+| **R** | after watcher death: **observe only**. Healthy(N) ⇒ CURRENT(N) · Healthy(P) ∧ phase ≥ B5 ⇒ QUARANTINE(N) · phase ≤ B3 (db untouched) ⇒ `up -d` P, clear `txn`, as B2's failure arm · else T(`interrupted@phase`) | as named | T | [A] |
+| **T** | `host_failed` := {reason, N}; `compose down`; no ping (pages) | human | n/a | [A] |
 
-**One-shot route:** backup/restore/identity run as `compose run --rm --no-deps chat-island
-<cmd>`. `CMD` isn't `ENTRYPOINT`, so nothing migrates [E1].
+**R never moves data.** It may start P only where B2's failure arm would (the db is untouched
+before B3). Data moves only inside one uninterrupted run. An interrupted
+rollback is a human's call, because only a human can see what P served while booting.
 
-| State | Action | Success → | Failure → | Invariant on entry | Evidence |
-|---|---|---|---|---|---|
-| **A0** | `flock -n` (with `update.sh`); read journal | `host_failed` ⇒ exit, **no ping** (pages until a human clears) · `txn` ≠ null ⇒ **R** · else A1 | busy ⇒ exit | none | [A]; `update.sh` has no lock today (bootstrap 3) |
-| **A1** | resolve channel digest → N | N.sha = current.sha, or N in `quarantine`/holds, or (syd) melb not Healthy on N ⇒ **steady**: lease iff Healthy, exit · else A2 | exit; lease iff Healthy | stack untouched | identity [E6] |
-| **A2** | pull N; read N's sha/ref/head; verify running = current, re-pull P by digest if pruned; `stamp = head(P)`; preflight(N.ref); disk ≥ 2× db; manifest; `migrates := head(N) ≠ stamp` | write `txn` (phase B1) → B1 | retry next poll, **never quarantine** · `stamp ≠ head(P)` ⇒ T (no rollback target) | stack untouched | [E6], [E1]; preflight measured live 2026-10-19 |
-| **B1** | renew lease; `compose down` (not `stop`: `restart: always` returns on daemon restart) | B2 | `up -d` P; clear `txn` | `txn` durable | [A] |
-| **B2** | one-shot `.backup` → `pre-<txn>.db`; `integrity_check`; keep the last 2 txns | B3 | `up -d` P on the untouched db; clear `txn`; **never quarantine** | `.served` intact | [E1] |
-| **B3** | truncate `.served` | B4 | as B2's failure | **checked `pre-<txn>.db` exists** | [A] |
-| **B4** | `image.env`: `ISLAND_IMAGE=<repo>@<digest>`; `up -d`; wait ≤ 600 s | **CURRENT(N)**: `current := N`, clear `txn`, lease | B5 | migrating = waiting | admit [E2]; identity [E6] |
-| **B5** | `compose down`; read marker | absent ⇒ B5a · present ∧ ¬migrates ⇒ B6 · present ∧ migrates ⇒ **B4′** | unreadable ⇒ T | stack down | P's refusal certain [E3, E3′] |
-| **B4′** | N again: `up -d` N, second budget (a slow broker isn't a bad release) | **CURRENT(N)** | T | data at head(N) | [A] |
-| **B5a** | one-shot: delete `aiko.db` and any stray sidecars (WAL is off, `db.py:48`), copy `pre-<txn>.db` | B6 | T | backup checked | [E5]; must-fail arm |
-| **B6** | `image.env` = P; `up -d`; wait budget | **QUARANTINE**: `quarantine += N.sha` (only a newer release supersedes), clear `txn`, notify | `compose down` → T | data at head(P) | admit [E5]; refuse [E3′] |
-| **R** | recovery after watcher death: `compose down`; resume by `txn.phase`: B1–B3 ⇒ B2's failure arm · B4, B4′ ⇒ B5 · B5a, B6 ⇒ redo B5a (idempotent: the backup is the source), then B6 | per resumed cell | T | `txn` durable; empty-island invariant | [A] |
-| **T** | `host_failed := true` (fsync); stay down; no quarantine | human | n/a | nothing deleted after B2 | [A] |
+**Leaving T: one command.** `auto-update clear` quarantines N, clears `txn` and `host_failed`.
+`--retry` keeps N eligible. **Runbook:** read the diagnostics (`txn`, shas, stamps, `.served`
+lines, exits, `/health` bodies). Fix forward, or restore host `pre-<txn>.db` (losing writes
+since N's first `.served` line). The sentinel stops a hand `up` from serving an empty island
+mid-repair. Don't quote the old image's advice: 0.16.1 says *"run `alembic upgrade head`"*,
+which can't work (#393).
 
-**T runbook:** diagnostics (`txn`, both shas, stamp before/after, `.served` lines, per-service
-exits, `/health` bodies). Fix forward with a newer release, or restore `pre-<txn>.db` and
-accept losing writes since the first `.served` line for N. Then clear `host_failed`. Don't quote
-the image's refusal text: 0.16.1 says *"run `alembic upgrade head`"*, which can't work (E3; #393).
+**Manifest** `deploy/state-manifest.txt` (`service path class reason`): A2 fails on any unlisted
+mount. `aiko_data` restored; `mosquitto_data` disposable (clean session).
 
-**State manifest:** `deploy/state-manifest.txt`, `service path class reason`, class ∈ {restored,
-disposable, external, forbidden}. A2 fails on any unlisted mount. `aiko_data` restored
-(`.served` and the worker lock disposable); `mosquitto_data` disposable (clean session).
+**Bootstrap:** (1) `ISLAND_VERSION` out of SOPS (**ct#5165**: today every release costs a Touch ID
+re-lift PR, #397); (2) compose `image: ${ISLAND_IMAGE:?}` on all three services; (3) `update.sh`
+uses the shared `COMPOSE`, takes the lock, writes `image.env` + `current`; (4) page URL;
+(5) `AUTO_UPDATE`. A hand `docker compose` bypasses the lock (the operator's tradeoff), but not
+the sentinel.
 
-**Bootstrap:** (1) `ISLAND_VERSION` out of SOPS, **ct#5165** (today each release costs a Touch ID
-re-lift PR, #397); (2) compose `image: ${ISLAND_IMAGE:?}` with a second `--env-file image.env`;
-(3) `update.sh` takes the lock and writes `image.env` + journal `current`; (4) page URL;
-(5) `AUTO_UPDATE`. A hand `docker compose` bypasses the lock: the operator's tradeoff.
+## Ledger: v3 → v6
 
-## Ledger: v3's branches, accounted for
-
-v4 lost four branches, and two of them were r1's headline flaws. Each v3 branch → its v5 cell:
-compare with running → A1 steady · re-pull P if pruned → A2 · Phase A never quarantines → A2 ·
-backup failure → B2 · absent ⇒ restore → B5a · present ⇒ previous → B5/B6 · quarantine,
-superseded only by newer → B6 · host-failed suspends until cleared → A0 + T · keep last 2 → B2
-· page URL required → §3 · lease every run → §4.
+compare with running → A1 · re-pull P → A2 · Phase A never quarantines → A2 · backup failure → B2
+· absent ⇒ restore → B5a · present ⇒ previous → B5/B6 · quarantine superseded only by newer → A1
+(quarantine is per digest) · host-failed suspends until cleared → A0 + T + `clear` · keep last 2 →
+B2 · page URL required → §4 · lease → §5. **Dropped deliberately:** v5's five "db exists?" guards
+(→ §2 sentinel) and R's data dispatch (→ observe only).
 
 ## Named tradeoffs
 
 Healthy-but-wrong past one probe and the canary is the canary operator's (Nick's). There's no
-smoke suite. Promotion waits on #4147. The probe account needs an exclusion flag that #4147's
-count honours. CI holds a probe password and writes only with `GITHUB_TOKEN`. Push-CD stays
-rejected.
+smoke suite. Promotion waits on #4147. CI writes only with `GITHUB_TOKEN`. Push-CD stays rejected.
 
-## Round policy (v4 series)
+## Round 3 policy (last)
 
-Panel: Noether, Carnot, Tesla. Cap 3. **Stop** when every fatal flaw is a narrow fix inside an
-existing cell; **continue** while one names a missing cell. Before each strike: run the harness
-from `origin/main`, and re-run the ledger diff. r1's check (≥ 70% of flaws in [A] cells) held
-at 12/17. r2 tests whether R, B4′ and T, the new [A] cells, draw the fire.
+Panel: Noether, Carnot, Tesla. If r3 names a missing cell, **stop designing and build**: (a) the
+sentinel and the marker (§2, §5, useful without a watcher), then (b) the journal and the watcher,
+struck as code. The bundle comes from `origin/main`, with the harness re-run first.

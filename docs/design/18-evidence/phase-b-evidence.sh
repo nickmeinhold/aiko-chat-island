@@ -14,6 +14,8 @@
 #   E6  identity: the digest the watcher pulls maps to the git_sha + ref /health reports,
 #       read from the image's own build-info.json without starting the app; ref is the tag
 #       the drift preflight takes
+#   E7  migrates := head(N) != stamp is computable before cutover: each image's own script
+#       head, read one-shot (no app start, no migration), equals the stamp its migrator writes
 #
 # ENVIRONMENT=development only skips config.py's prod boot-secret guards (JWT, signing
 # seed). migrate.py and db.py never read `environment`, so the guard under test runs
@@ -88,4 +90,7 @@ DIGEST="$(docker inspect --format '{{index .RepoDigests 0}}' "$NEW")"
 ident() { docker run --rm --entrypoint cat "$DIGEST" /app/build-info.json; }
 expect "E6 digest -> build-info.json (no app start)"   0 '"ref":"v'"${NEW##*:}"'"' -- ident
 echo "     $DIGEST -> $(ident)"
+HEAD=(python -c 'from alembic.script import ScriptDirectory; from aiko_gateway.migrate import _alembic_config; print("HEAD", ScriptDirectory.from_config(_alembic_config()).get_current_head())')
+expect "E7 head(OLD) read one-shot = OLD's stamp"       0 "HEAD $(grep -oE '[0-9]{4}[a-z0-9_]*' <<<"$OLDHEAD")" -- run "$OLD" "$V2" "${HEAD[@]}"
+expect "E7 head(NEW) read one-shot = NEW's stamp"       0 "HEAD 0028" -- run "$NEW" "$V2" "${HEAD[@]}"
 echo "ALL EVIDENCE HELD"
