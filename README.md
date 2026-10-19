@@ -199,7 +199,7 @@ Load-bearing facts (still true, grounded against the live hosts):
 
 - **Back up first** — `update.sh` does this fail-closed. The slim image has no
   `sqlite3` CLI; backups use Python's online `.backup()`
-  (see [`docs/deploy-passkeys-runbook.md`](docs/deploy-passkeys-runbook.md)).
+  (see [`docs/runbooks/backup-and-rollback.md`](docs/runbooks/backup-and-rollback.md)).
 - The entrypoint migrates before serving; a failed migration fails the container.
 - Pin a version with `ISLAND_VERSION` (default `edge` tracks `main`); `:latest`
   tracks the newest `v*` release tag.

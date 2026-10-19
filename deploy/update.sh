@@ -349,4 +349,4 @@ for _ in $(seq 1 30); do
   sleep 2
 done
 die "gateway did not answer /health within ~60s after update. Inspect: docker compose logs chat-island
-     (restore path: the pre-update backup is in backups/ — see docs/deploy-passkeys-runbook.md)"
+     (restore path: the pre-update backup is in backups/ — see docs/runbooks/backup-and-rollback.md)"

@@ -190,9 +190,8 @@ device end-to-end procedure and the Android Play-signing details.
 The island's SQLite store (message history, auth, ACLs, communities) is the **only
 copy** of that data, living in the `aiko_data` volume. **Set up a backup before real
 users arrive.** The container is slim and has no `sqlite3` CLI, so use Python's
-online `.backup()` — the exact hot-copy procedure (and a project-cutover checklist)
-is in [`deploy-passkeys-runbook.md`](deploy-passkeys-runbook.md) § "Back up the
-sole-copy prod DB".
+online `.backup()`. `deploy/update.sh` takes one before every update; the procedure
+and the restore path are in [`runbooks/backup-and-rollback.md`](runbooks/backup-and-rollback.md).
 
 ---
 
@@ -373,6 +372,6 @@ piece it makes sense to reuse; it lives *outside* the sealed island for exactly
 that reason. Everything else (gateway, broker, registrar, ChatServer) is the
 island's own and isn't shared.
 
-For the deep operational details (deploy invariants, DB backup/restore, passkey
-device e2e), see [`deploy-passkeys-runbook.md`](deploy-passkeys-runbook.md) and the
-[README](../README.md).
+For the deep operational details, see [`runbooks/backup-and-rollback.md`](runbooks/backup-and-rollback.md)
+(DB backup/restore), [`deploy-passkeys-runbook.md`](deploy-passkeys-runbook.md) (passkey
+device e2e) and the [README](../README.md).
