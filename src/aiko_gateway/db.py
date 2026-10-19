@@ -120,7 +120,11 @@ def _assert_schema_current(conn) -> None:
     if "email" not in cols:
         problems.append("users.email column is missing")
     ph = cols.get("password_hash")
-    if ph is not None and ph.get("nullable") is False:
+    if ph is None:
+        # Presence-aware like the email check above: an ABSENT column 500s every
+        # user load just as surely as a NOT NULL one (Noether, PR#392 r5).
+        problems.append("users.password_hash column is missing")
+    elif ph.get("nullable") is False:
         problems.append("users.password_hash is still NOT NULL "
                         "(social-only accounts require it nullable)")
     if problems:

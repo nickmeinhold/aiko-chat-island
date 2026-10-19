@@ -329,6 +329,57 @@ def test_both_boot_layers_refuse_a_forward_migrated_db(
         asyncio.run(engine.dispose())
 
 
+def test_a_migrated_db_reads_head_and_lifespan_admits_it(tmp_path, monkeypatch) -> None:
+    """POSITIVE CONTROL for the shared predicate. Every other guard test here asserts
+    a REFUSAL, so deleting ``schema_status``'s HEAD branch left the whole suite green
+    while every healthy island would refuse to boot (measured, Noether PR#392 r5:
+    1773 passed with the branch removed). This is the test that goes red then."""
+    import asyncio
+
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from aiko_gateway import db
+
+    async_url, _ = _point_app_at(tmp_path, monkeypatch)
+    migrate.run()
+    assert asyncio.run(migrate._schema_status()).state is migrate.SchemaState.HEAD
+
+    engine = create_async_engine(async_url)
+    monkeypatch.setattr(db, "engine", engine)
+    try:
+        asyncio.run(db.verify_schema())  # must NOT raise on a healthy DB
+    finally:
+        asyncio.run(engine.dispose())
+
+
+def test_lifespan_refuses_a_users_table_missing_password_hash(tmp_path, monkeypatch) -> None:
+    """``_assert_schema_current`` must report an ABSENT ``password_hash``, not only a
+    NOT NULL one; absence 500s every user load too (Noether, PR#392 r5)."""
+    import asyncio
+
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from aiko_gateway import db
+
+    async_url, sync_url = _point_app_at(tmp_path, monkeypatch)
+    migrate.run()
+    seed = create_engine(sync_url)
+    try:
+        with seed.begin() as conn:
+            conn.execute(text("ALTER TABLE users DROP COLUMN password_hash"))
+    finally:
+        seed.dispose()
+
+    engine = create_async_engine(async_url)
+    monkeypatch.setattr(db, "engine", engine)
+    try:
+        with pytest.raises(RuntimeError, match="users.password_hash column is missing"):
+            asyncio.run(db.verify_schema())
+    finally:
+        asyncio.run(engine.dispose())
+
+
 def test_lifespan_names_a_forward_schema_even_when_its_columns_changed(
         tmp_path, monkeypatch) -> None:
     """A newer image's migration may change the very columns ``_assert_schema_current``
