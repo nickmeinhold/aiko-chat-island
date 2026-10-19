@@ -1,7 +1,8 @@
 # Design 18: Operator opt-in auto-update (channel, restore-on-failure, compat guard)
 
-**Status:** v6, for round 3 (the LAST) of the v4 series (r1, r2 RECAST 3/3; see
-[`18-TEMPER.md`](18-TEMPER.md)). §1 SHIPPED (v0.17.0, both islands, 2026-10-19). §2–§4 not
+**Status:** v6. **The v4 temper series is CLOSED** (r1, r2, r3 RECAST 3/3; see
+[`18-TEMPER.md`](18-TEMPER.md)). Per the round policy below, the next move is to BUILD: §2 + the
+marker first, then the watcher as code. r3's findings are its acceptance tests. §1 SHIPPED (v0.17.0, both islands, 2026-10-19). §2–§4 not
 built. **Bar:** ≤ ~1.5× v1 (1,058 words); every piece removes a failure mode; every [E] tag
 cites the harness LINE that proves it; every v3 branch accounted for (§ ledger).
 **Answers:** Nick, 2026-08-16 and 2026-10-10: *"the option to have the server automatically

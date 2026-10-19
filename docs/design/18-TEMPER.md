@@ -696,9 +696,45 @@ The strike brief is truncated at the drift preflight. I'll read the remainder of
 
 
 
-# v4 series, round 3 (striking v6, the LAST)  ⏳ STRIKE IN PROGRESS
+# v4 series, round 3 (striking v6, the LAST)
 
-**Overall verdict:** _pending: 2 of 3 returned (Noether still running)_
+**Overall verdict: RECAST, 3/3** (zero DISSOLVE). **Series CLOSED at its cap.** Per the round policy written into v6 before this strike: a missing cell was named, so **stop designing and build**.
+
+## Per-family verdicts (v4 r3)
+| Family | Verdict | One line |
+|---|---|---|
+| Noether (DeepSeek) | RECAST | Release identity isn't conserved: the sentinel is a birth certificate, R lost its resume, and the channel can move backward |
+| Carnot (GPT) | RECAST | The sentinel loses two branches, and observation by sha can't establish digest identity |
+| Tesla (Grok) | RECAST | The observer is still tuned to `git_sha`, and the sentinel is silent on every island that already holds a life |
+
+## Converged findings (all three, independently)
+1. **Decide by digest, observe by digest.** v6 keys installs on the digest but checks Healthy by `git_sha`. Two builds of one commit share a sha, so R can record CURRENT(N) while `restart: always` has P running. → Healthy and R read the running container's image (`docker inspect` → image id → the pulled digest) for all three services. `/health`'s sha is a cross-check only.
+2. **The sentinel misses the volumes that matter.** It's written only when a db is CREATED, so melb and syd never get one. And a check placed after `run()`'s first connect sees a file SQLite just created. (Carnot: B2's `sqlite3.connect('/data/aiko.db')` creates a missing source too; `update.sh` survives only because of its size check, which B2 dropped.) → **Adopt** the sentinel whenever the migrator opens an existing managed db. Check before ANY connect (`os.path.exists`). Open backups `mode=ro`. Older images (P) don't honour the sentinel, so it is a floor: keep an actuator-side "db exists" check until every permitted image carries it.
+
+## Further findings
+3. **R lost its in-flight resume (Noether).** With no budget, a reboot mid-health-wait goes to T, whose `compose down` kills a stack that was about to be healthy. → R re-observes the in-flight phase for the remaining budget, still never moving data.
+4. **The channel isn't monotonic at the island (Noether).** A re-pushed tag, a mistyped `PROMOTE_NOW`, or a revert used as a "fix forward" gets installed, or burned by quarantine. → A1 refuses N whose head is behind the stamp unless an explicit operator rollback is recorded.
+5. **B5's discriminator (Noether).** No marker also means "N never started" (a Docker error). That shouldn't quarantine. B4′'s rationale (a slow bus) doesn't depend on `migrates`.
+6. **`clear` leaves the island down (Tesla).** It quarantines, but steady never runs `up`. → `clear` starts `previous`.
+7. **Actuator seams (Tesla).** The shell environment beats `--env-file`, so the watcher must `env -u` the drift-preflight seams as `update.sh` does. The `ISLAND_IMAGE` write must be journaled before `up`.
+8. **`holds.json` unreadable (Tesla, Noether).** Fail-closed for that run: steady, no install.
+9. **[E] overclaims persist, now VISIBLE (Noether, Tesla).** E:73-75 doesn't exercise the 600 s wait; E:76/82 don't exercise B5's branching. Line citations didn't stop overclaiming. They made every overclaim checkable, and reviewers checked.
+
+## What held across the series
+`schema_status` as one predicate (shipped, E-proven). The cold one-shot backup doesn't migrate. Backups on the host bind. `compose down`, not `stop`. **R never moves data** (Carnot: "eliminates the write-rewind flaw; keep that boundary"). Digest-keyed quarantine, a single `COMPOSE`, human promotion, a stated lease grace. The two subtractions are right in direction (Noether: "restore their lost branches, don't revert the folds").
+
+## Series trend (v4 → v6)
+| Round | Worst flaw | Origin | [A] share |
+|---|---|---|---|
+| r1 (v4) | every poll a cutover | rewrite dropped a v3 branch | 71% |
+| r2 (v5) | R rewinds served writes | created by r1's fold | 81% |
+| r3 (v6) | R blesses a release that isn't running; sentinel absent on live volumes | r2's folds **incomplete**, not destructive | ~67% |
+Severity fell, from data loss (r2) to an identity lie plus a hazard still open (r3). And all three seats converged on the same two findings, which the old series never produced. The remaining flaws are about what the CODE observes, so prose can't settle them.
+
+## Disposition: build, in this order
+**(a) Image-side, useful without any watcher:** the volume sentinel with adoption and a pre-connect check; read-only backup opens; the `.served` marker (append + fsync after `verify_schema()`, fail-closed). One island PR, cage-matched (state-lifecycle). Its tests need the three arms: fresh volume admitted, existing db adopts, sentinel + missing db refused.
+**(b) The watcher, as code**, observing container digests, with findings 3-8 as its acceptance tests, struck by `/cage-match`, not `/design-temper`.
+**(c) Prerequisite for (b):** ct#5165, `ISLAND_VERSION` out of SOPS.
 **Struck:** dt-1792412123, 2026-10-19, against v6 `4725818`. Bundle 113 KB, code from `origin/main`, harness line-numbered.
 
 ## CarnotCodeCarver's Design Strike
@@ -753,6 +789,40 @@ Tesla: "If you want the secrets of the universe, think in energy, frequency and 
 - Split A2's badge. Identity reads keep [E:94-95, E:91]. Preflight, on-disk stamp, disk, and manifest go back to [A] until a harness line runs them. `stamp` is the on-disk `version_num`; refuse the update when it differs from script `head(P)`; `migrates` is `head(N) ≠` that stamp; B5 re-reads the on-disk stamp after the down and dispatches on the read. The watcher invokes preflight with the same `env -u` strip `update.sh` uses. A1: holds unreadable, melb unreadable, channel unreadable ⇒ the existing failure arm, exit. An empty hold set is a value only a successful read may return.
 - These four sentences are missing cells. The sentinel and the marker are worth building once the §2 sentences are in the doc; they are useful without a watcher. The journal and R want to be struck as code only after the digest-ear and the single publication are in the doc. Building R on `git_sha`, or the sentinel as currently sentence'd, ships this round's fold-created holes.
 
+
+---
+
+
+
+## NoetherNullPointer's Design Strike
+
+**Verdict:** RECAST
+
+**Summary:** The conserved quantity here is *release identity* — one digest per install, one stamp per volume, one served-marker per cutover — and v6's two subtractions each fail to conserve it on a path they were added to close: the sentinel is written only where a db is *born*, and R was stripped of its resume as well as its data dispatch.
+
+**Fatal flaws:**
+
+- **§2 volume sentinel [A] — the fold is not a conservation law, it is a birth certificate.** `migrate.run()` writes `/data/.initialized` "when it creates a db on an empty volume." Every volume that already holds a db — *both live islands, enspyr-melb and enspyr-syd* — therefore never gets one, so the guard "refuses to create a db when the sentinel exists and `aiko.db` doesn't" cannot fire there. The five subtracted "db exists?" guards ran on exactly those volumes. Net: the r2 hazard (B5a's interrupted `rm`+`cp` leaves no `aiko.db`; a hand `up` builds a fresh schema, `schema_status` reads HEAD, the island serves empty) is *less* covered after the fold than before it. Compounding: no image published before the sentinel ships reads it, and §1's rollback path explicitly runs older images — so "one door" is a per-image door, i.e. a *floor*, in a design that prides itself on "no floors." Tests named are refusal + genuine-fresh-volume; the missing third arm is *existing db, no sentinel*. **Class: fold-created flaw.**
+- **§5 Healthy(X) / §3 [A][C] — the probe keys on `sha` while every decision keys on `digest`.** Fold 8 established that a rebuild of one commit is a different release, so `sha → digest` is one-to-many. Healthy(X) is `git_sha` = X's, so it is satisfied by *any* digest with that sha: R's "Healthy(N) ⇒ CURRENT(N)" can record CURRENT(N) while P is the running image (and clobber `previous`); syd's "melb Healthy on N" gate can be satisfied by melb running a quarantined rebuild; B4's success arm can be satisfied by a container that is not N. The journal's `current` then names a digest the island is not running, and `ghcr-retention` keeps digests on that claim. **Class: proxy for the invariant.** Fix: verify the *running container's* image digest (`docker inspect` the container the txn created — the marker already records a container id, the txn does not), keep `/health`'s sha as a cross-check only.
+- **§5 R [A] — the subtraction removed the resume, not just the data dispatch.** R evaluates one probe with no budget. A reboot during B4 or B6 revives the containers via `restart: always`, but the host-side watcher can start first; R then sees no Healthy X at phase ≥ B4 → **T**, whose action is `compose down` — killing the stack that was about to be healthy — and whose exit is not the claimed "one command" (`auto-update clear` clears the journal; A1's steady arm leases and starts nothing; the island stays down). The design already accepts R-resumes for phase ≤ B3; the lost branch is R re-observing the *in-flight* phase (B4's health wait, B5's marker read) for the same budget, never executing B5a/B6's data path. **Class: missing cell, created by the fold.**
+- **§5 A1 [A] — the channel's monotonicity is a policy, not a guard, and the blast radius is every island.** Nothing in A1/A2 orders N against `current`. §4's "`:stable` never moves backward" is a promotion-side sentence; the island itself is defenseless. Paths: a re-pushed tag, a fat-fingered `PROMOTE_NOW` (a human is the actuator), and — worst — a *revert*, which is the runbook's own "fix forward." When head(N) ≠ the volume's stamp, §1 correctly refuses, and the table's only response is B5a restore + B6 **quarantine(N)**: the digest that was the fix is burned, and the island stays on the bad release. When head(N) == stamp, it silently downgrades to a different digest with no notification. One registry-side mistake → every island runs a backup/restore cycle. **Class: under-counted blast radius / missing ordering invariant.** Fix: A1 refuses any N whose migration head is not ahead of the island's stamp unless an explicit operator rollback is recorded, and the table names that arm (restore, then install N).
+- **§5 B5 [A][E:76,E:82] and B4 [E:73-75] — the discriminator measures the wrong thing, and the [E] tags overclaim.** B5 branches on marker-presence and `migrates`, but the question it must answer is "did N ever run / serve?" So: marker-absent because N *never started* (docker error, disk full) still routes to restore + **quarantine a release that never ran**; marker-present ∧ ¬migrates gets one attempt and quarantines a good release on a slow bus, though B4′'s stated rationale ("slow broker ≠ bad release") is orthogonal to `migrates`. Same class one cell over: A2's `stamp = head(P)` is an image read, while the invariant `migrates` needs is the *volume's* stamp — the quantity E7 actually measures (E:70/74 read it from the db), and the two differ in exactly the rolled-back state §1 calls routine. And the tags: E:76/E:82 prove "the previous image refuses a forward db," not "read the marker and branch"; E:73-75 prove migrate-and-admit, not the 600 s health wait — the harness never starts the app (E6/E7 say so). **Class: wrong discriminator + evidence overclaim (the r2 class, re-armed).**
+- **§4 promotion memory [A] — the sampler inherits the same sha/digest hole, and the brake's failure mode is unnamed.** "Attributes each sample to the digest whose `sha` the island reports" cannot identify a digest; a rebuild inherits another digest's 7-day soak, so the canary never tests the binary it promotes. And an unreadable `holds.json` (GitHub blip) has no stated disposition: fail-open silently disengages the operator's emergency brake; fail-closed freezes every island. **Class: unstated failure mode.**
+
+**What holds:**
+- The marker's placement — immediately after `verify_schema()`, before `bus.start()` and before uvicorn serves — is the right instrument: it is the one signal that separates "never past the schema check" (restore is lossless) from "may have served" (restore loses writes). B5a's restore being conditional on that is correct.
+- §1's single predicate (`schema_status`), shared by both boot layers, with a refusal message naming the working fix, is the strongest thing in the bundle: "the previous image refuses a migrated db" is a fact (E:76, E:82), not a hope.
+- Fold 4 (host-side `pre-<txn>.db`) and fold 5 (one `COMPOSE` with `--env-file image.env`, shared by watcher and `update.sh`) close real writer/reader gaps.
+- Both subtractions are right in *direction*; they need their lost branches restored, not the folds reverted.
+
+**If RECAST, what to fold back:**
+- §2: write the sentinel idempotently on **every** `migrate.run()` where `aiko.db` exists (backfill), and add the third test arm (existing db, no sentinel → sentinel written). Name the sentinel as a floor and have the watcher/`update.sh` refuse to pin an image below it.
+- §5: define `Healthy(X)` to include "the running container's image digest == X," and record the created container id in `txn`. `/health`'s sha stays a cross-check.
+- §5 R: add a bounded re-observation arm — R re-enters the in-flight phase's *wait* (B4 health, B5 marker read) for the same budget, then applies the phase's arm; it still never executes B5a/B6. State that `clear` leaves the stack down, or make `clear` end with the phase's own `up -d`.
+- §5 A1: refuse a resolved N whose migration head is not ahead of the island's stamp unless `auto-update rollback <digest>` is recorded; add the authorized-rollback arm (B5a restore → `up -d N` → CURRENT(N)).
+- §5 B5: branch on "did N run/serve" (container exit state + marker), not on `migrates`; retry once regardless of `migrates`; let `migrates` decide only the post-second-failure action. Re-tag B5/B4 honestly ([A] for the marker read and the health wait; keep E:76/E:82 for the refusal premise).
+- §4: key the sampler on the digest the island reports (needs the Healthy fix); name the unreadable-`holds.json` disposition (fail-closed to steady + page).
+- §4 named tradeoffs: state that A2's drift preflight makes auto-update refuse on every release that touches `compose`/`deploy/`, since nothing syncs the box's tree (#2301) — the automation's steady state there is "refuse + notify," not "update."
 
 ---
 
