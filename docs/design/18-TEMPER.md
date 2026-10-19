@@ -694,3 +694,65 @@ The strike brief is truncated at the drift preflight. I'll read the remainder of
 
 ---
 
+
+
+# v4 series, round 3 (striking v6, the LAST)  ⏳ STRIKE IN PROGRESS
+
+**Overall verdict:** _pending: 2 of 3 returned (Noether still running)_
+**Struck:** dt-1792412123, 2026-10-19, against v6 `4725818`. Bundle 113 KB, code from `origin/main`, harness line-numbered.
+
+## CarnotCodeCarver's Design Strike
+
+**Verdict:** RECAST
+
+**Summary:** The subtractions are promising, but the sentinel loses two branches and SHA-based observation cannot establish digest identity. Fold back at database creation and artifact observation, then follow the last-round policy: build and strike the implementation. No real engine matches the Carnot cycle; a reviewer's job is to say how far short we are.
+
+**Fatal flaws:**
+- [B2] [E] — E:71 proves backup of an existing database, not refusal when the source is missing. The exercised BACKUP uses sqlite3.connect('/data/aiko.db'), which creates a missing source. Its empty backup passes integrity_check. With the five existence guards removed, B2 can recreate the missing file before the sentinel checks it; B4 then sees an existing empty database and can initialize an empty island. The sentinel has moved the guard downstream of another creator. Open the backup source with mode=ro, require the expected managed schema, and exercise missing-source refusal through the actual B2→B4 path.
+- [§2 sentinel] [A] — The sentinel is written only when creating a fresh database, but both deployed islands already have databases. No adoption step establishes the sentinel on those volumes. Furthermore, rollback image P may predate the sentinel entirely: 0.17.0's bundled migrate.run() creates databases without consulting it. Thus 'every actuator' and the runbook's hand-up protection do not hold during rollout or rollback. Backfill the sentinel durably before enabling automation, and define the minimum rollback-image capability. Until every permitted image enforces it, retain protection at the shared actuator boundary.
+- [R / §3 / §4] [A] — Digest identity was adopted for decisions but discarded for observation. Two different digests may share git_sha—the design explicitly admits rebuilds—and therefore Healthy(N) can be true while P is running. If the watcher dies after recording txn but before replacing P, R's first branch can commit CURRENT(N) without ever installing N. The sampler can likewise credit soak to the wrong digest, and syd can follow a melb release that melb never ran. E:91 only reads one image's metadata; it establishes no unique inverse from SHA to digest. Observe the actual container image identities for all three roles, reconcile them with the pinned artifact, and attribute samples only to that verified digest.
+
+**What holds:**
+- The published-image harness supports HEAD admission, unknown-revision refusal, and restoration across the tested migration. The no-op restore negative control is useful evidence.
+- Removing automatic data restoration from interrupted recovery eliminates the previous write-rewind flaw. Keep that irreversibility boundary.
+- Digest-keyed quarantine, host-held backups, explicit terminal clearing, and one Compose invocation are sound directions.
+- Dijkstra: "Simplicity is prerequisite for reliability." A shared creation refusal can deliver that simplicity once every database opener and permitted image respects it.
+
+**If RECAST, what to fold back:**
+- Close B2's accidental database-creation path with a read-only source open and semantic validation. Prove that a missing source cannot become a valid empty island.
+- Build the sentinel with an explicit existing-volume adoption path and tests covering legacy rollback images. Remove the five guards only after their replacement covers those branches.
+- Separate release identity from descriptive build metadata: verify running container artifacts against N or P before recovery commits, follower admission, or soak attribution.
+- Follow the stated round-three disposition: implement sentinel and marker first, then journal and watcher. Inject interruption around each durable transition. Another prose round would generate entropy without establishing reversibility.
+
+
+---
+
+The brief is truncated at the drift preflight. I'll read the rest of the bundle and strike from that, nothing else.## Tesla, the Arc-Prophet's Design Strike
+
+**Verdict:** RECAST
+
+**Summary:** The observer you pared down to is still tuned to `git_sha`, a harmonic a rebuild does not share with its digest, and at 3am it will consecrate the wrong release while the sentinel you bought by deleting five guards stays silent on every island that already holds a life.
+
+Tesla: "If you want the secrets of the universe, think in energy, frequency and vibration."
+
+**Fatal flaws:**
+- §3 [E:91], §5 Healthy [A], R [A] — Line 91 cats one digest's `build-info.json` and greps `ref`. One note, one image. §3 then says a rebuild of one commit is a different release because apt/pip resolve anew, and in the next breath lets `/health`'s `git_sha` prove "the island runs what was installed." Fold 8 keyed quarantine on the digest and left the ear on the sha. R, now observe-only, listens to Healthy first: Healthy(N) ⇒ CURRENT(N), and Healthy compares `git_sha`. Two digests of one commit — the CVE rebuild, the ordinary future input, the reason the digest exists — sing the same sha, so Healthy(N) is true while `restart: always` has brought P back. R writes CURRENT(N). The journal's release and the process's bits diverge, and every later steady decision is conducted off that lie. Syd's "melb Healthy on N" and the sampler that attributes a sample to "the digest whose sha" inherit the sibling build's green. B4's success cell still says only "wait ≤ 600 s"; the predicate that would catch this lives in the paragraph above the table, where a builder will not look at 3am.
+- §2 [A] — E:69 is `migrate_stamp` on an empty volume printing STAMP: the fresh-volume admission. It is cited as the empty-island hazard. The refusal has no line. The five "db exists?" guards are gone with the ledger. The birth certificate is written only "when it creates a db on an empty volume," so melb and syd — the only volumes that hold a life — never receive one. A missing `aiko.db` there is a fresh create, the empty island, the door those guards used to shut. Shipped `run()` reaches `_table_names()` → `create_async_engine` → connect before any new check, and SQLite creates the file on that connect, so a sentinel test placed in `run()` after the connect watches a file the check just conjured and admits the void. A daemon restart in that window starts the new emptiness under `restart: always`, R hears Healthy, and CURRENT blesses a blank island. The subtraction lost the branch it was invented to close.
+- §5 `COMPOSE` [A], R [A], T [A] — Three clocks, and the one that starts the container is the one recovery never reads. The journal says who the release is; `image.env` says who boots; the shell beats both. The bundled `update.sh` records the measurement: an exported variable wins over `--env-file`. Fold 5's shared `COMPOSE` line adds the file and leaves the louder clock in the room. R's "phase ≤ B3 ⇒ `up -d` P" starts whatever `image.env` and the shell resolve. B4 writes `ISLAND_IMAGE := N` as its own commit, and the design never binds that write to the journal rename, so a death in the gap has phase still claiming "db untouched" while the actuator brings up N on a half-applied schema (the migrator docstring: SQLite DDL is not fully transactional). `auto-update clear`, fold 2's exit from T, quarantines N in the journal and drops the latch. It does not republish a digest and it does not start P. A1 then sees the quarantine and sits in steady, and steady does not `up`. The one command leaves the phone island down. The hand `docker compose up` that muscle memory reaches for bypasses the lock, reads `image.env`, and starts the quarantined digest — the sentinel is silent whenever `aiko.db` is present, so the bypass the design calls the operator's tradeoff un-quarantines N.
+- A2 [E:94-95, E:91], B5 [E:76, E:82], A1 [E:91] — Lines 91 and 94–95 cat `build-info` and print script heads. They never run the drift preflight, never read an on-disk `version_num`, never meet a pruned P. The cell assigns `stamp = head(P)` and then refuses when `stamp ≠ head(P)`: either a tautology or a live-volume read the harness does not perform. That predicted `migrates` bit is still what B5 dispatches on (present ∧ migrates ⇒ B4′, absent ⇒ B5a). E:76 and E:82 show the old image's real CMD refusing a fully migrated db. A half-applied stamp is a different animal, and the arm that picks restore versus a second budget never observes it. The new caller of `preflight-compose-drift.sh` also skips the `env -u` of `ISLAND_REF_TREE`, `ISLAND_REPO_SLUG`, and `ISLAND_CODELOAD_BASE` that `update.sh` does before the same script. The guard, by that caller's own comment, only announces those seams for every other caller. The watcher is the other caller, and it is the long-running unit where a leaked slug lives: a clean comparison against a stranger's tree, then the digest installs. A1 wears this same [E:91] for channel, quarantine, holds, and melb. A `holds.json` fetch that fails into an empty set is unstated, and line 91 does not go near it. Fail-open there, and a held digest walks onto the canary during a GitHub blip.
+
+**What holds:**
+- `schema_status` is one predicate for both boot layers. E:75 admits HEAD, E:82 the previous image's real `CMD` exits without binding, E:87–88 restore then admit. Rollback of a fully migrated db has a known answer, and §1 is already on the islands.
+- The cold one-shot backup does not migrate (E:71–72), and `pre-<txn>.db` lives on the host bind the harness already uses. `compose down`, not `stop`, so a daemon restart does not revive a removed container. Inside one uninterrupted run the backup-then-restore arm is the right shape, and R leaves the database bytes where that run put them.
+- Promotion stays a human act, the canary ruling is Nick's, the lease grace covers two 600 s budgets plus restore plus 10 minutes, and `:stable` does not walk backward.
+
+**If RECAST, what to fold back:**
+- In §5 and R: Healthy(X) is the running container's image digest (`docker inspect` RepoDigests), and `git_sha` is only a witness that this digest's own `build-info.json` matches `/health`. Write that predicate in the B4 and B6 cells. Same ear for syd's melb probe and for soak memory: key the sample on the digest. A shared sha grants nothing.
+- In §2: plant `.initialized` on every successful open of a real db, including the upgrade path, so the volumes that exist today receive it in the same image that enforces the refusal. The existence check happens before any engine connect. Tests are a refusal (sentinel present, `aiko.db` absent, file still absent after the refuse) and an admission of a genuinely fresh volume. E:69 stays the admission citation. The refusal gets its own line or stays [A] until it has one.
+- One publication of the digest: the journal rename and `image.env` move as one commit. `COMPOSE` runs under `env -u ISLAND_IMAGE -u ISLAND_VERSION` and the three drift seams. R's start-P arm publishes P's digest before `up`. `auto-update clear` publishes P (N only with `--retry`) and the cell states whether the stack is started. Quarantine has to be true of the file the hand `up` will read, or the hand path remains a second actuator.
+- Split A2's badge. Identity reads keep [E:94-95, E:91]. Preflight, on-disk stamp, disk, and manifest go back to [A] until a harness line runs them. `stamp` is the on-disk `version_num`; refuse the update when it differs from script `head(P)`; `migrates` is `head(N) ≠` that stamp; B5 re-reads the on-disk stamp after the down and dispatches on the read. The watcher invokes preflight with the same `env -u` strip `update.sh` uses. A1: holds unreadable, melb unreadable, channel unreadable ⇒ the existing failure arm, exit. An empty hold set is a value only a successful read may return.
+- These four sentences are missing cells. The sentinel and the marker are worth building once the §2 sentences are in the doc; they are useful without a watcher. The journal and R want to be struck as code only after the digest-ear and the single publication are in the doc. Building R on `git_sha`, or the sentinel as currently sentence'd, ships this round's fold-created holes.
+
+
+---
+
