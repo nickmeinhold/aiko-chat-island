@@ -426,9 +426,37 @@ Tesla: "If you want the secrets of the universe, think in energy, frequency and 
 
 
 
-# v4 series, round 1  ⏳ STRIKE IN PROGRESS
+# v4 series, round 1
 
-**Overall verdict:** _pending: 3 of 3 adversary families returned, synthesis not yet written_
+**Overall verdict: RECAST, 3/3** (Noether, Carnot, Tesla; zero DISSOLVE). Continue: flaws name MISSING cells, so the series' stop condition is not met.
+
+## Per-family verdicts (v4 r1)
+| Family | Verdict | One line |
+|---|---|---|
+| Noether (DeepSeek) | RECAST | P's identity and the backup's provenance aren't conserved across the retries the table itself schedules; T is written and never read |
+| Carnot (GPT) | RECAST | No recovery entry for a watcher that dies mid-transaction; digest identity is never connected to what the app reports |
+| Tesla (Grok) | RECAST | No steady-state cell, so every poll is a cutover; the watcher is tuned to a digest while the image only reports a git sha |
+
+## Author's bundle error (recorded first because it is the series' own failure class)
+The design branch was based on `d76e983`, BEFORE #392 merged, and the bundle was built from that working tree. Every seat therefore saw the **pre-#392** `migrate.py` / `db.py` (`MIGRATE_SKIP_UNKNOWN_REVISION`, no `schema_status`). Noether struck §1 for contradicting its bundled code, correctly. The [E] cells are unaffected (the harness ran the published 0.17.0 image), but the bundle disagreed with them. Series 1 lacked `db.py`; series 2 bundled a stale one. **Mechanism for v5:** build the bundle from `git show origin/main:<path>`, and assert in the bundler that `def schema_status` is present.
+
+## Fatal flaws (deduped, most severe first)
+1. **No steady state (Tesla).** A1 → A2 → B1 with no "running is already N and Healthy" arm, so every poll downs the stack. **Created by v4**: v3's A1 "compares it with the running one" was lost in the rewrite. → A1: running = N ⇒ lease iff Healthy, exit.
+2. **Identity: digest vs git sha (all three).** `/health` `build` carries `git_sha`/`ref`, never a digest, so B4's `build = X` can't succeed. The gateway can't write a digest it doesn't know, and CI memory is keyed on a value nothing reports. → Compare by `git_sha`, pull by digest. A2 maps digest → `git_sha` from the pulled image's own metadata; the marker and CI key on `git_sha`.
+3. **No durable transaction (Noether, Carnot).** `P` is recomputed from state the failure arms mutated. T is written but never read, so the next poll redeploys the host-failed release. A watcher dying mid-B leaves no recovery entry. A retry overwrites `pre-N.db` with an already-migrated copy. → A journal written before B1 (N, P, `head(P)`, stamp, backup path keyed by transaction, phase), read FIRST at A0: the T latch ⇒ exit without pinging; mid-transaction ⇒ a recovery entry. A2 checks `stamp == head(P)`. Backups are never overwritten.
+4. **Local quarantine has no enforcement (Carnot).** A follower restores P and then retries N every poll. → The journal's quarantine set is read in A1.
+5. **Marker not fail-closed or durable (Noether, Carnot).** A failed or unsynced append lets the gateway serve while B5 later reads absence and rewinds. → Append + fsync, or abort lifespan before `bus.start()`. An unreadable marker ⇒ T.
+6. **B5 present ∧ migrates → T is too eager (Tesla).** The marker lands before `bus.start()`, so a slow broker after it reaches T on a release that may be fine. → One "N again" cell (restart N within a second budget) before T.
+7. **The actuator socket (Tesla).** `image.env = N` is ambiguous, `update.sh` doesn't read `image.env`, and the drift preflight takes a tag (`update.sh:246`). → `ISLAND_IMAGE=<repo>@sha256:…`, a full reference. The preflight is fed the `ref` from the image's metadata. [A] until built.
+8. **Promotion attribution gaps (Tesla, Noether).** An unreachable-twice red has no identity to hang on, and syd's 2 h lag is a sentence, not a cell. → Unreachable pauses ALL promotion (fail-closed, island-scoped). syd's A1 requires melb to report `git_sha(N)` Healthy before pulling N, so syd follows melb, not the tag.
+9. **The lock is unenforced (Noether).** Manual operator commands bypass it. → `update.sh` takes the lock (bootstrap 3). A hand `docker compose` is a named tradeoff, owned by the operator.
+10. **[E] cells exercise functions, not containers (Noether, Tesla).** E3/E4 call the migrator and `verify_schema` one-shot, never the real `CMD`. B5a's three-file wording vs WAL-off. → E3′: run the real `entrypoint.sh` container and assert it exits non-zero without binding. B5a: restore one file and delete any stray sidecars.
+
+## The evidence-column check (pre-registered in v4: ≥ 70% of flaws in [A] cells)
+17 tagged findings: **12 [A], 4 [E], 1 [C] = 71%.** The prediction held, narrowly. The [E] strikes were all real but of one kind: the harness proves a MECHANISM in one run, not the STATE a retry reaches (Noether B2/B6) or the container boundary (E3). So the tags did steer review, and they also told reviewers exactly where an [E] claim overreached. v5 should execute the retry state, not only label it.
+
+## Disposition
+Folds 1–10 are v5. Flaw 1 shows the class is not dead: a table rewrite can still drop an arm the prose had. **v5 check:** diff the v3 prose's arms against the v5 table's cells before striking. Round 2 of the v4 series follows on a bundle built from `origin/main`.
 **Struck:** dt-1792406278, 2026-10-19, against v4 `57c08ce`. Panel: Noether + Carnot + Tesla (Maxwell is the author and did not strike). Bundle 108 KB, 13 files, including the code the cells cite.
 
 ## NoetherNullPointer's Design Strike
