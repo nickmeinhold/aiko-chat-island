@@ -562,3 +562,66 @@ Tesla: "If you want the secrets of the universe, think in energy, frequency and 
 
 ---
 
+
+
+# v4 series, round 2 (striking v5)  ⏳ STRIKE IN PROGRESS
+
+**Overall verdict:** _pending: 2 of 3 returned (Noether still running)_
+**Struck:** dt-1792407464, 2026-10-19, against v5 `44b2eba`. Bundle 113 KB, code from `origin/main` (bundler asserted `def schema_status`).
+
+## CarnotCodeCarver's Design Strike
+
+**Verdict:** RECAST
+
+**Summary:** The new recovery cell can erase admitted writes: rollback is not reversible once either image serves. Three folds remain necessary. No real engine matches the Carnot cycle; a reviewer's job is to say how far short we are. Dijkstra: "Simplicity is prerequisite for reliability."
+
+**Fatal flaws:**
+- [R] [A] — Recovery from B6 unconditionally restores the pre-update backup. But B6 is also reached when N served without migrating, where the normal path deliberately preserves N's writes. A watcher death during B6 therefore converts a preserving rollback into destructive restoration. Even the absent-marker path is unsafe: P can begin serving during B6's health wait; restarting the watcher then restores again and deletes P's newly admitted writes. Idempotent copying is not idempotent recovery once serving resumes.
+- [R] [A] — There is no dispatch for txn.phase = B5, although every B cell records its phase on entry. Death after entering B5, including after stopping N but before reading its marker, leaves a durable transaction R cannot resume. Treating this as T turns an ordinary watcher interruption into an operator-required outage. The new recovery fold still omits a reachable state.
+- [§2] [A] — 'A rebuild of one commit is one release' assumes artifact equivalence that the supplied Dockerfile contradicts: apt-get and pip resolve external dependencies during rebuilding. Pinning the base digest does not freeze those inputs. Two digests with the same git_sha can behave differently, yet share promotion evidence, quarantine, holds and Healthy identity. A follower can install an untested rebuild under a previously approved SHA, while A1 can also suppress installation of a corrected rebuild. E6 proves metadata extraction for one artifact; it does not prove this equivalence.
+
+**What holds:**
+- The supplied evidence supports stopped-stack backup, forward migration, old-image refusal at the real CMD boundary, and restoration for the tested image pair.
+- The steady-state arm, enforced update.sh lock, terminal latch and transaction-specific backup address substantial round-one failures.
+- Conservative marker presence and refusal to start an older image on an unknown schema are sound safety choices.
+- The workspace contains no harness or repository checkout, so I could not perform the required origin/main rerun or independently verify the ledger diff. This strike uses the supplied bundle.
+
+**If RECAST, what to fold back:**
+- Split restoration from starting P. Persist a restore-complete state before any P startup, then recover that startup by preserving the live database. Never infer permission to restore merely from phase B6; preserve the distinction between rollback with and without restoration.
+- Make R exhaustive over every durable phase, including B5. Exercise watcher death before and after each destructive action and after both N and P begin accepting writes; assert that admitted writes survive every preserving path.
+- Use digest as release identity throughout promotion, holds and quarantine. Keep git_sha as provenance. Connect Healthy and marker identity to the selected artifact through container inspection or an immutable artifact identifier, removing the need to pretend rebuilds are equivalent.
+
+
+---
+
+The strike brief is truncated at the drift preflight. I'll read the remainder of the bundle before I hunt the resonant frequency.## Tesla, the Arc-Prophet's Design Strike
+
+**Verdict:** RECAST
+
+**Summary:** Tesla: "If you want the secrets of the universe, think in energy, frequency and vibration." The journal stores the cutover's energy and then tunes recovery to the wrong frequency: a reboot during the health-wait, the one input a timer actually receives, rewinds a good release and, on the rollback arm, copies the backup over a database that has already served.
+
+**Fatal flaws:**
+- **R** [A], missing resume for phase **B5** and for a serving sub-phase of **B4** / **B6** — Phase is stamped on entry, and CURRENT / QUARANTINE are written only after the ≤600 s wait (§4 table). Watcher death inside that window is the ordinary vibration (reboot, OOM, the page itself). R maps B4 and B4′ onto B5. On a code-only release the marker is already present and `migrates` is false, so B5 falls into B6 and quarantines a sha that had reached Healthy. R maps B5a and B6 onto "redo B5a, the backup is the source" while P is already serving, so the copy replaces writes admitted after the stack came back. Phase B5 has no arm. B4′ reaches T only on the in-process failure arrow, so a migrating release flutters B5→B4′ on every boot and the latch never sets. Fold 3 built this map; "idempotent" is true only while the phase has not served.
+- **A0** [A] / **T** [A] — A0 honours `host_failed` and returns before it looks at `txn`. The §4 runbook clears `host_failed` and leaves `txn` on disk, so the next poll drops into R and plays the same N again. B4′ fails into T with no quarantine row, and A1 therefore has nothing to steady against. The lease is silent for the whole 600 s plus the second budget (§4 Lease); the page is that silence. At 3 am the reflex is to clear the latch, and that blow is what strikes the oscillator again.
+- **B5a** [E] / **T** [A] / **missing cell** (entrypoint, beside §1) — B5a unlinks `aiko.db` and then copies. The failure arrow enters T, whose entry invariant says nothing was deleted after B2, and A0's latch then refuses the redo, so the backup sits unused beside a hole. The shipped entrypoint (`entrypoint.sh` then `migrate.py`'s fresh-db path) builds a database on an empty volume and serves it. The harness's setup calls `python -m aiko_gateway.migrate`; E5's must-fail arm prints `RESTORED` and never unlinks. Fold 9 sized a hand `docker compose` as a lock tradeoff. After this unlink, that same command is a silent empty island, and the phones ring there. The refusal has to live in the image: a tombstone written at B2, and `migrate.run()` raises when the tombstone is present and `aiko.db` is missing or fails `integrity_check`.
+- **Marker** [A], against **main.py lifespan** [C] — The append is specified after `verify_schema()` and before `bus.start()`. The shipped lifespan already opens `warn_if_unreachable`'s session and starts `_channel_worker` between those two calls (`main.py` excerpt, the block above `state.bus.start()`). A write on that span, or any write a later edit drops there, is admitted while `.served` still reads absent, and B5a treats absence as "restore the backup."
+- **B4** [A] / bootstrap (2) [A] — `ISLAND_IMAGE` sits in a second env file. Shipped `update.sh` is the scar of this class: the shell environment beats `.env`, a stray compose file wins, and the 2026-09-11 outage was one line the container never received. Compose auto-loads `.env` and will not see `image.env` unless every actuator passes the same `--env-file` pair. The image key is interpolated on three services (`chat-island`, `registrar`, `chat`); one of them left on `${ISLAND_VERSION:-edge}` splits the mesh from the gateway. Fold 7 named the pin and left the file-set open.
+- **A2** [E] / **B2** [E] — A2's evidence cell claims sha, ref, and head via E6. E6 cats `/app/build-info.json`, and the captured file carries `git_sha` and `ref` and no alembic head (`phase-b-evidence.out`). `migrates := head(N) ≠ stamp` is the bit B5 uses to choose rewind or B4′. E1's backup lands on the harness mount `-v "$BK:/bk"`. The design's one-shot is `compose run --rm`, which drops the container layer on exit, and the host path of `pre-<txn>.db` is never named, so R's "backup is the source" has no substrate.
+
+**What holds:**
+- §1's single predicate, `schema_status`, shared by both boot layers, with no serve-anyway. E2 admits HEAD, E3 / E3′ / E4 refuse, E5 puts back a database the previous image admits, and the must-fail arm goes red when the copy is a no-op. E3′ runs the real `CMD` and it exits without binding.
+- A1's steady arm on sha equality, quarantine, and holds. A poll of the running release stays a poll. Digests pin, shas compare, and E6 binds a real published digest to `build-info.json` without booting the app.
+- B1's `compose down` matches `restart: always` in the shipped compose. P is kept off a forward-migrated schema. Unreachable-twice pauses all promotion, and syd's A1 waits until melb reports Healthy on that sha.
+- The marker's own rule: a failed append raises, and the process never reaches `bus.start()`.
+
+**If RECAST, what to fold back:**
+- R, in the §4 table: the first time Healthy(X) is true, fsync the commit (`current := X`, or the quarantine row) before the rest of the budget. Resume arms: B4/B4′ and Healthy(N) → CURRENT(N); B6 and Healthy(P) → write the quarantine and clear `txn`, leaving the db bytes alone; phase B5 → re-read the marker and branch; a phase whose container never started → B2's failure arm. A crash is a resume, and quarantine stays on the in-process failure arrow.
+- T and A0: one journal word, cleared only by a rename that nulls `txn` in the same write. The runbook gains that sentence and loses the bare "clear `host_failed`." Page TTL sits longer than two full budgets, so a healthy wait cannot train the reflex.
+- B5a: `pre-<id>.db` lives on the host at `deploy/.auto-update/`, restored by temp file, fsync, rename. New entrypoint cell: tombstone present and `aiko.db` missing or dirty → `migrate.run()` raises and uvicorn is not exec'd. Hand compose stays a named tradeoff only as "refuses to boot."
+- Marker sentence: the append is the next statement after `verify_schema()` returns, above `warn_if_unreachable` and the channel worker.
+- Bootstrap: one `deploy/compose.sh` that pins `-f docker-compose.yml --env-file .env --env-file image.env`, called by `update.sh`, the watcher, and the runbook. All three service image keys become `${ISLAND_IMAGE:?}`.
+- A2: `head(image)` is `ScriptDirectory.get_current_head()` through `docker run --entrypoint`, migrator not invoked, and that string is what the txn stores as `stamp`. Take E6's name off `head`. Check disk before the pull.
+
+
+---
+
