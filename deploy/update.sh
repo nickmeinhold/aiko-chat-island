@@ -289,13 +289,20 @@ if [ "$DO_BACKUP" = "true" ]; then
   # copy the artifact out and remove the in-container temp. integrity_check gates.
   $COMPOSE exec -T chat-island python -c "
 import sqlite3, sys
-src = sqlite3.connect('/data/aiko.db')
+# mode=rw: the file must exist, so a missing db fails here instead of being CREATED
+# and backed up as an empty file that passes integrity_check (design 18 v4 r3).
+# Not mode=ro: a read-only opener cannot checkpoint a WAL db (Tesla, PR#399 r1).
+try:
+    src = sqlite3.connect('file:/data/aiko.db?mode=rw', uri=True)
+except sqlite3.OperationalError as e:
+    print('backup source /data/aiko.db is MISSING or unopenable:', e)
+    sys.exit(2)
 dst = sqlite3.connect('/data/_update-$ts.db')
 with dst: src.backup(dst)
 res = dst.execute('PRAGMA integrity_check').fetchone()[0]
 print('integrity_check:', res)
 sys.exit(0 if res == 'ok' else 1)
-" || die "backup integrity_check failed — ABORTING before touching the stack"
+" || die "backup failed (the database is missing, or integrity_check failed: see above) — ABORTING before touching the stack"
   $COMPOSE cp "chat-island:/data/_update-$ts.db" "$backup_dir/aiko.db.preupdate-$ts" \
     || die "could not copy the backup out of the container — ABORTING"
   $COMPOSE exec -T chat-island rm -f "/data/_update-$ts.db" || true
