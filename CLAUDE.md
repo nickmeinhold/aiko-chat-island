@@ -57,8 +57,9 @@ file is the working-context that isn't obvious from the code.
 ## Working conventions
 
 - **Conventional Commits.** Branch off `main`; commit + push proactively.
-- **Work is staged by VERSION, on `claude-tasks` milestones named `aiko-chat-island vX.Y.Z`**
-  (prefixed because that repo is shared across projects — a bare `v0.10.0` collides with the
+- **Work is staged by VERSION, on tracker milestones named `aiko-chat-island vX.Y.Z`**
+  (the private tracker is where this public repo's tasks are filed — see Tasks below;
+  prefixed because that repo is shared across projects — a bare `v0.10.0` collides with the
   app's). Nick's rule, 2026-08-29: *far off gets higher version numbers.* The ladder, and the
   test for each rung:
   - **`v0.9.1` (patch)** — no schema change, no wire change. Ships on any quiet day, needs no
@@ -99,7 +100,7 @@ file is the working-context that isn't obvious from the code.
   intent, the other tab's design is the other half of the binding contract. Read:
   `../aiko_chat_app/docs/adr/` (numbered ADR **outcomes** — decisions of record,
   these win), then `docs/design/`, `docs/crucible/`, the `HANDOFF-from-app-tab-*`
-  answers, the matching `nickmeinhold/claude-tasks` issue comments, and (for wire
+  answers, the matching task-issue comments, and (for wire
   specifically) the published `/openapi.json`. This is the **#2634 lesson**: that
   build came off the ticket + a narrow app answer, never checked against the
   recorded design, and the cage-match then hardened the wrong premise for 7
@@ -118,6 +119,8 @@ file is the working-context that isn't obvious from the code.
 - Design docs: `docs/design/0{1,2,3}-*.html` (topology, bus-decouple, auth-on-bus).
 - Memory dir (this project's recall):
   `~/.claude/projects/-Users-nick-git-orgs-aiko-aiko-chat-island/memory/`.
-- Tasks: `nickmeinhold/claude-tasks`, label `project:aiko-chat-island`.
+- Tasks: file with `~/.claude/scripts/file-task --dir .`. This repo is public, so
+  task notes land on the private tracker, labelled `project:aiko-chat-island` +
+  `needs-scrub`, and reach this repo's issues only after a scrub.
 - Sibling repos (editable installs): `../aiko_services`, `../aiko_chat`; the
   client is `aiko_chat_app`.
