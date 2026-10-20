@@ -148,7 +148,7 @@ def test_creating_a_fresh_db_says_so(tmp_path, monkeypatch, caplog) -> None:
     _point_app_at(tmp_path, monkeypatch)
     with caplog.at_level(logging.WARNING, logger="aiko_gateway.migrate"):
         migrate.run()
-    assert "creating a NEW, empty database" in caplog.text
+    assert "creating a NEW, empty island" in caplog.text
 
 
 def test_another_dbs_record_neither_counts_nor_blocks_this_dbs_own(
@@ -280,3 +280,58 @@ def test_fix_delete_the_evidence_starts_a_deliberately_new_island(
         (tmp_path / name).unlink()  # the fix, as the message states it
     migrate.run()
     assert db.exists() and _sentinel(db).exists()
+
+
+# --- round 3 (PR#399): the cap round's four narrow fixes --------------------------
+
+def test_the_delete_remedy_takes_the_stack_down_BEFORE_deleting(tmp_path, monkeypatch) -> None:
+    """Deleting a lock a live gateway still holds lets a second gateway start beside
+    it, so the instruction order is the safety (Noether r3)."""
+    db = _point_app_at(tmp_path, monkeypatch)
+    (tmp_path / LOCK_FILENAME).touch()
+    with pytest.raises(RuntimeError, match="MIGRATE_REFUSE_MISSING_DB") as refused:
+        migrate.run()
+    msg = str(refused.value)
+    assert msg.index("docker compose down") < msg.index("then delete")
+
+
+def test_an_existing_islandless_db_with_no_evidence_is_named_in_the_log(
+        tmp_path, monkeypatch, caplog) -> None:
+    """No evidence + a db file with no island: indistinguishable from a fresh volume
+    (the named limit), so it is built, but never silently (Noether r3)."""
+    import logging
+    db = _point_app_at(tmp_path, monkeypatch)
+    db.touch()
+    with caplog.at_level(logging.WARNING, logger="aiko_gateway.migrate"):
+        migrate.run()
+    assert "creating a NEW, empty island" in caplog.text
+
+
+def test_a_dir_fsync_failure_after_the_rename_is_not_a_refusal(tmp_path, monkeypatch) -> None:
+    """The record is on disk; only its directory fsync failed. A first-witness volume
+    must not be refused for a write that happened (Noether r3)."""
+    db = _point_app_at(tmp_path, monkeypatch)
+
+    def eio(_path):
+        raise OSError(5, "Input/output error")
+    monkeypatch.setattr(migrate, "_fsync_dir", eio)
+    migrate.run()  # fresh volume, no other evidence: must still serve
+    assert _sentinel(db).exists()
+
+
+def test_a_uri_form_db_url_finds_its_real_directory(tmp_path, monkeypatch) -> None:
+    """`DB_URL` written as an SQLite URI: migrate and worker_guard derive the same
+    directory through one parser (Carnot r3), and the volume is protected."""
+    from aiko_gateway import worker_guard
+    monkeypatch.delenv("GATEWAY_WORKER_LOCK", raising=False)
+    db = tmp_path / "aiko.db"
+    monkeypatch.setattr(settings, "db_url", f"sqlite+aiosqlite:///file:{db}?uri=true")
+    assert migrate._db_file() == db.resolve()
+    assert worker_guard._lock_path() == db.resolve().parent / LOCK_FILENAME
+    migrate.run()
+    assert db.exists() and _sentinel(db.resolve()).exists()
+    db.unlink()
+    with pytest.raises(RuntimeError, match="MIGRATE_REFUSE_MISSING_DB"):
+        migrate.run()
+    monkeypatch.setattr(settings, "db_url", "sqlite+aiosqlite:///file:x?mode=memory&uri=true")
+    assert migrate._db_file() is None

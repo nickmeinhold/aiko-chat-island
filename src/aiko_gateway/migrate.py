@@ -108,7 +108,7 @@ from sqlalchemy.pool import NullPool
 
 from .config import settings
 from .domain import models  # noqa: F401 — register tables on Base.metadata
-from .worker_guard import LOCK_FILENAME, _lock_path
+from .worker_guard import LOCK_FILENAME, _lock_path, sqlite_file
 
 log = logging.getLogger("aiko_gateway.migrate")
 
@@ -127,10 +127,7 @@ def _sentinel_path(db: Path) -> Path:
 def _db_file() -> Path | None:
     """The SQLite file behind ``settings.db_url``, or None for a backend with no
     volume (Postgres dev, in-memory). Same derivation as ``worker_guard``."""
-    url = make_url(settings.db_url)
-    if url.get_backend_name() == "sqlite" and url.database and url.database != ":memory:":
-        return Path(url.database).resolve()
-    return None
+    return sqlite_file(settings.db_url)
 
 
 def _lived_evidence(db: Path) -> list[Path]:
@@ -174,8 +171,10 @@ def refuse_missing_db_message(db: Path, evidence: list[Path], why: str) -> str:
         "If the database was lost or damaged: take the stack down, restore the newest "
         f"backup to {db} (`deploy/update.sh` keeps them in backups/ beside "
         "docker-compose.yml; see docs/runbooks/backup-and-rollback.md), then start. "
-        "Only if you really intend a brand-new, empty island on this volume: delete "
-        f"{names}, then start.")
+        "Only if you really intend a brand-new, empty island on this volume: take the "
+        "stack down first (`docker compose down`; the worker lock is held by any gateway "
+        "still running, and deleting a held lock lets a second gateway start beside it), "
+        f"then delete {names}, then start.")
 
 
 def _write_sentinel(db: Path) -> None:
@@ -190,7 +189,11 @@ def _write_sentinel(db: Path) -> None:
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, final)
-    dir_fd = os.open(db.parent, os.O_RDONLY)
+    _fsync_dir(db.parent)
+
+
+def _fsync_dir(path: Path) -> None:
+    dir_fd = os.open(path, os.O_RDONLY)
     try:
         os.fsync(dir_fd)
     finally:
@@ -374,12 +377,6 @@ def run() -> None:
     db = _db_file()
     evidence = _lived_evidence(db) if db is not None else []
     if not evidence:
-        if db is not None and not db.exists():
-            # Say it, so "fresh volume" and "no evidence found" are never the same
-            # silence (Noether, PR#399 r1).
-            log.warning("No sign an island has lived in %s (no %s, no %s): "
-                        "creating a NEW, empty database.",
-                        db.parent, _sentinel_path(db).name, LOCK_FILENAME)
         _migrate(db, evidence)
         return
     if not db.exists():
@@ -400,6 +397,12 @@ def _migrate(db: Path | None, evidence: list[Path]) -> None:
     if evidence and "users" not in tables:
         raise RuntimeError(refuse_missing_db_message(
             db, evidence, "holds no island (no users table: empty, 0-byte, or bookkeeping only)"))
+    if db is not None and not evidence and "users" not in tables:
+        # Say it, so "fresh volume" and "no evidence found" are never the same silence,
+        # whether the file was missing or held no island (Noether, PR#399 r1 + r3).
+        log.warning("No sign an island has lived in %s (no %s, no %s): "
+                    "creating a NEW, empty island in %s.",
+                    db.parent, _sentinel_path(db).name, LOCK_FILENAME, db.name)
     cfg = _alembic_config()
     adopting = "alembic_version" not in tables and "users" in tables
     if adopting:
@@ -440,7 +443,12 @@ def _migrate(db: Path | None, evidence: list[Path]) -> None:
             _write_sentinel(db)  # fresh volume or first adoption; a no-op thereafter
         except OSError as e:
             sentinel = _sentinel_path(db)
-            if not evidence:
+            if sentinel.exists():
+                # The rename landed; only the directory fsync failed. The record is
+                # there, so refusing would describe a failure that did not happen
+                # (Noether, PR#399 r3). Durability across a power cut is what's lost.
+                log.warning("Recorded %s, but could not fsync %s (%s).", sentinel, db.parent, e)
+            elif not evidence:
                 raise RuntimeError(
                     f"MIGRATE_REFUSE_UNRECORDED: the database {db} is migrated, but "
                     f"{sentinel} could not be written ({e}), and nothing else on this "
@@ -448,9 +456,10 @@ def _migrate(db: Path | None, evidence: list[Path]) -> None:
                     "loss of the database indistinguishable from a fresh volume. Refusing "
                     f"to start. Fix the cause (free space, or ownership of {db.parent}), "
                     "then start again: the database is intact.") from e
-            log.error("Could not record %s (%s). The database is at head and will serve; "
-                      "until it is written, %s marks this volume as having hosted an "
-                      "island.", sentinel, e, " ".join(str(p) for p in evidence))
+            else:
+                log.error("Could not record %s (%s). The database is at head and will "
+                          "serve; until it is written, %s marks this volume as having "
+                          "hosted an island.", sentinel, e, " ".join(str(p) for p in evidence))
     log.info("Database is at head.")
 
 

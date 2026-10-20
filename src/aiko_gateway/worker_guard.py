@@ -67,6 +67,30 @@ def _multiworker_allowed() -> bool:
     return os.environ.get("GATEWAY_ALLOW_MULTIWORKER", "").strip().lower() in _TRUTHY
 
 
+def sqlite_file(db_url: str) -> Path | None:
+    """The SQLite FILE behind a SQLAlchemy URL, or None when there is none (in-memory,
+    or a non-sqlite backend). The one derivation shared by this lock and
+    ``migrate``'s volume sentinel, so the two can't disagree about which directory a
+    db lives in (Carnot, PR#399 r3). Handles both spellings SQLite accepts: a plain
+    path (``sqlite:////data/aiko.db``) and a URI filename
+    (``sqlite:///file:/data/aiko.db?uri=true``, where ``mode=memory`` means no file)."""
+    from urllib.parse import unquote, urlsplit
+
+    from sqlalchemy.engine import make_url
+
+    url = make_url(db_url)
+    name = url.database
+    if url.get_backend_name() != "sqlite" or not name or name == ":memory:":
+        return None
+    if name.startswith("file:"):
+        if url.query.get("mode") == "memory":
+            return None
+        name = unquote(urlsplit(name).path)
+        if not name or name == ":memory:":
+            return None
+    return Path(name).resolve()
+
+
 def _lock_path() -> Path | None:
     """The single-worker lock path, or None when no shareable path can be proven.
 
@@ -76,17 +100,15 @@ def _lock_path() -> Path | None:
     override = os.environ.get("GATEWAY_WORKER_LOCK")
     if override:
         return Path(override)
-    from sqlalchemy.engine import make_url
-
     from .config import settings
 
-    url = make_url(settings.db_url)
     # A file-backed sqlite DB (relative OR absolute) has a real directory we can
     # co-locate the lock with. resolve() normalizes `./aiko_dev.db` and
     # `////data/aiko.db` alike, so different DBs never share a lock and same-volume
     # replicas do. In-memory sqlite and non-file backends have no such directory.
-    if url.get_backend_name() == "sqlite" and url.database and url.database != ":memory:":
-        parent = Path(url.database).resolve().parent
+    db = sqlite_file(settings.db_url)
+    if db is not None:
+        parent = db.parent
         if parent.is_dir():
             return parent / LOCK_FILENAME
     return None
