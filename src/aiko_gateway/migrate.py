@@ -66,8 +66,10 @@ shows it has lived (that sentinel, or ``worker_guard``'s ``.aiko-worker.lock``,
 which every gateway since Aug 2026 has left there and never deletes, so both live
 islands are covered before their first adoption), a missing db or one with no tables
 REFUSES (``MIGRATE_REFUSE_MISSING_DB``). The missing-file check runs BEFORE the
-first connect, or it would watch a file the connect just created; the no-tables
-check catches the 0-byte file a uvicorn-only boot leaves behind. A dotfile survives
+first connect, and on a lived volume every later connect is non-creating
+(``mode=rw``), so no window exists in which one could birth a new file. A db with
+no ``users`` table also refuses: that catches the 0-byte file a uvicorn-only boot
+leaves behind and a db holding only alembic's bookkeeping. A dotfile survives
 ``rm /data/*``, which is the point. Non-file backends (Postgres dev, in-memory) have
 no volume and are unaffected.
 
@@ -105,7 +107,7 @@ from sqlalchemy.pool import NullPool
 
 from .config import settings
 from .domain import models  # noqa: F401 — register tables on Base.metadata
-from .worker_guard import LOCK_FILENAME
+from .worker_guard import LOCK_FILENAME, _lock_path
 
 log = logging.getLogger("aiko_gateway.migrate")
 
@@ -123,9 +125,35 @@ def _db_file() -> Path | None:
 
 
 def _lived_evidence(db: Path) -> list[Path]:
-    """The files that prove an island has lived on this volume. Never connects."""
-    return [p for p in (db.parent / SENTINEL_FILENAME, db.parent / LOCK_FILENAME)
-            if p.exists()]
+    """The files that prove an island has lived on this volume. Never connects.
+
+    The sentinel counts only when it names THIS db, so one directory's record can't
+    refuse a different, never-created db beside it. The worker lock counts at its
+    default path and, when ``GATEWAY_WORKER_LOCK`` moves it, at the moved path too.
+    (A ``GATEWAY_ALLOW_MULTIWORKER`` gateway writes no lock at all; such a volume is
+    covered by the sentinel only, after its first successful run.)"""
+    found: list[Path] = []
+    sentinel = db.parent / SENTINEL_FILENAME
+    try:
+        if sentinel.read_text().split(" ", 1)[0] == db.name:
+            found.append(sentinel)
+    except OSError:
+        pass
+    for lock in {db.parent / LOCK_FILENAME, _lock_path()}:
+        if lock is not None and lock.exists():
+            found.append(lock)
+    return found
+
+
+def _non_creating_url(db: Path) -> str:
+    """``settings.db_url`` reopened as an SQLite URI with ``mode=rw``: the file must
+    already exist, and no connect can create it. On a lived volume every connect the
+    migrator makes (its own and alembic's, which reads ``settings.db_url``) goes
+    through this, so a db that vanishes after the existence check makes the next
+    connect FAIL, not birth an empty island (Carnot + Tesla, PR#399 r1)."""
+    url = make_url(settings.db_url)
+    return url.set(database=f"file:{db}", query={**url.query, "mode": "rw", "uri": "true"}
+                   ).render_as_string(hide_password=False)
 
 
 def refuse_missing_db_message(db: Path, evidence: list[Path], why: str) -> str:
@@ -333,15 +361,38 @@ async def _schema_status() -> SchemaStatus:
 
 def run() -> None:
     # Volume sentinel (design 18 §2 — see module docstring). The missing-file check
-    # MUST precede the first connect: SQLite creates the file it is asked to open.
+    # runs BEFORE any connect, and on a lived volume every connect after it is
+    # non-creating (`mode=rw`), so the check is the message and `mode=rw` is the
+    # guarantee: there is no window in which a connect could birth a new file.
     db = _db_file()
     evidence = _lived_evidence(db) if db is not None else []
-    if evidence and not db.exists():
+    if not evidence:
+        if db is not None and not db.exists():
+            # Say it, so "fresh volume" and "no evidence found" are never the same
+            # silence (Noether, PR#399 r1).
+            log.warning("No sign an island has lived in %s (no %s for %s, no %s): "
+                        "creating a NEW, empty database.",
+                        db.parent, SENTINEL_FILENAME, db.name, LOCK_FILENAME)
+        _migrate(db, evidence)
+        return
+    if not db.exists():
         raise RuntimeError(refuse_missing_db_message(db, evidence, "is missing"))
+    original = settings.db_url
+    settings.db_url = _non_creating_url(db)
+    try:
+        _migrate(db, evidence)
+    finally:
+        settings.db_url = original
+
+
+def _migrate(db: Path | None, evidence: list[Path]) -> None:
     tables = asyncio.run(_table_names())
-    if evidence and not tables:
+    # `users`, not "any table": a db holding only alembic's bookkeeping reads BEHIND
+    # and would be built into a new, empty island (Carnot, PR#399 r1). This also
+    # catches the 0-byte file a uvicorn-only boot's connect leaves behind.
+    if evidence and "users" not in tables:
         raise RuntimeError(refuse_missing_db_message(
-            db, evidence, "has no tables (an empty or 0-byte file)"))
+            db, evidence, "holds no island (no users table: empty, 0-byte, or bookkeeping only)"))
     cfg = _alembic_config()
     adopting = "alembic_version" not in tables and "users" in tables
     if adopting:
@@ -373,7 +424,14 @@ def run() -> None:
 
     command.upgrade(cfg, "head")
     if db is not None:
-        _write_sentinel(db)  # fresh volume or first adoption; a no-op thereafter
+        # A SAFETY RECORD, not the schema: failing to write it must not stop an island
+        # that just migrated cleanly. Loud, and the worker lock remains the evidence.
+        try:
+            _write_sentinel(db)  # fresh volume or first adoption; a no-op thereafter
+        except OSError as e:
+            log.error("Could not record %s beside %s (%s). The database is at head and "
+                      "will serve; until this is written, only %s marks this volume as "
+                      "having hosted an island.", SENTINEL_FILENAME, db, e, LOCK_FILENAME)
     log.info("Database is at head.")
 
 

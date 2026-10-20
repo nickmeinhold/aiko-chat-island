@@ -289,9 +289,10 @@ if [ "$DO_BACKUP" = "true" ]; then
   # copy the artifact out and remove the in-container temp. integrity_check gates.
   $COMPOSE exec -T chat-island python -c "
 import sqlite3, sys
-# Read-only: a plain connect CREATES a missing db, and the backup of that empty
-# file would pass integrity_check (design 18 v4 r3, Carnot).
-src = sqlite3.connect('file:/data/aiko.db?mode=ro', uri=True)
+# mode=rw: the file must exist, so a missing db fails here instead of being CREATED
+# and backed up as an empty file that passes integrity_check (design 18 v4 r3).
+# Not mode=ro: a read-only opener cannot checkpoint a WAL db (Tesla, PR#399 r1).
+src = sqlite3.connect('file:/data/aiko.db?mode=rw', uri=True)
 dst = sqlite3.connect('/data/_update-$ts.db')
 with dst: src.backup(dst)
 res = dst.execute('PRAGMA integrity_check').fetchone()[0]

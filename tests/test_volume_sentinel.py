@@ -73,11 +73,57 @@ def test_reboot_at_head_keeps_the_original_sentinel(tmp_path, monkeypatch) -> No
     assert _sentinel(db).read_text() == first
 
 
-def test_a_volume_with_no_file_backend_is_untouched(monkeypatch) -> None:
+def test_a_backend_with_no_file_runs_and_writes_nothing(tmp_path, monkeypatch) -> None:
+    """Drives run(), not just _db_file(): a refusal or a sentinel write widened to a
+    non-file backend goes red here (Noether, PR#399 r1)."""
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(settings, "db_url", "sqlite+aiosqlite:///:memory:")
     assert migrate._db_file() is None
+    migrate.run()
+    assert list(tmp_path.iterdir()) == []
     monkeypatch.setattr(settings, "db_url", "postgresql+asyncpg://u@h/db")
     assert migrate._db_file() is None
+
+
+def test_lock_filename_is_the_file_worker_guard_creates(tmp_path, monkeypatch) -> None:
+    """The bridge only works while the two agree on the name and the directory."""
+    from aiko_gateway import worker_guard
+    db = _point_app_at(tmp_path, monkeypatch)
+    monkeypatch.delenv("GATEWAY_WORKER_LOCK", raising=False)
+    assert worker_guard._lock_path() == db.parent / LOCK_FILENAME
+
+
+def test_a_sentinel_write_failure_does_not_stop_a_migrated_island(tmp_path, monkeypatch) -> None:
+    """Recorded by patching the logger, not via caplog: alembic's env.py runs
+    fileConfig() during the upgrade, which swaps the root handlers (caplog's among
+    them). In production the ERROR still reaches stderr: alembic.ini's root is WARNING."""
+    _point_app_at(tmp_path, monkeypatch)
+    errors: list[str] = []
+    monkeypatch.setattr(migrate.log, "error", lambda msg, *a: errors.append(msg % a))
+
+    def refuse(_db):
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(migrate, "_write_sentinel", refuse)
+    migrate.run()  # must NOT raise: the schema is at head
+    import asyncio
+    assert asyncio.run(migrate._schema_status()).state is migrate.SchemaState.HEAD
+    assert errors and "Could not record" in errors[0]
+
+
+def test_creating_a_fresh_db_says_so(tmp_path, monkeypatch, caplog) -> None:
+    """'Fresh volume' and 'no evidence found' must not be the same silence."""
+    import logging
+    _point_app_at(tmp_path, monkeypatch)
+    with caplog.at_level(logging.WARNING, logger="aiko_gateway.migrate"):
+        migrate.run()
+    assert "creating a NEW, empty database" in caplog.text
+
+
+def test_a_sentinel_for_another_db_is_not_evidence(tmp_path, monkeypatch) -> None:
+    db = _point_app_at(tmp_path, monkeypatch)
+    _sentinel(db).write_text("aiko_dev.db 2026-10-20T00:00:00+00:00\n")
+    migrate.run()  # this db was never created here: admitted as fresh
+    assert db.exists()
 
 
 # --- refuse arms ---------------------------------------------------------------
@@ -89,12 +135,53 @@ def test_lived_volume_with_a_missing_db_refuses_WITHOUT_creating_one(
     before the sentinel existed. The assert that no file appeared is the point:
     a check placed after the first connect would watch a file SQLite just made."""
     db = _point_app_at(tmp_path, monkeypatch)
-    (tmp_path / evidence).touch()
+    (tmp_path / evidence).write_text(f"{db.name} 2026-10-20T00:00:00+00:00\n")
     with pytest.raises(RuntimeError, match="MIGRATE_REFUSE_MISSING_DB") as refused:
         migrate.run()
     assert "is missing" in str(refused.value)
     assert evidence in str(refused.value)
     assert not db.exists(), "the refusal must not create the db it refused over"
+
+
+def test_a_moved_worker_lock_still_counts(tmp_path, monkeypatch) -> None:
+    db = _point_app_at(tmp_path, monkeypatch)
+    moved = tmp_path / "elsewhere" / "gw.lock"
+    moved.parent.mkdir()
+    moved.touch()
+    monkeypatch.setenv("GATEWAY_WORKER_LOCK", str(moved))
+    with pytest.raises(RuntimeError, match="MIGRATE_REFUSE_MISSING_DB") as refused:
+        migrate.run()
+    assert str(moved) in str(refused.value)
+    assert not db.exists()
+
+
+def test_a_db_that_vanishes_AFTER_the_check_is_not_reborn(tmp_path, monkeypatch) -> None:
+    """The race the existence check alone can't close: the file goes between the
+    check and the first connect. On a lived volume that connect is mode=rw, so it
+    fails instead of creating (Carnot + Tesla, PR#399 r1)."""
+    from sqlalchemy.exc import OperationalError
+    db = _point_app_at(tmp_path, monkeypatch)
+    migrate.run()
+    real = migrate._table_names
+
+    async def vanish_then_connect():
+        db.unlink()
+        return await real()
+    monkeypatch.setattr(migrate, "_table_names", vanish_then_connect)
+    with pytest.raises(OperationalError, match="unable to open"):
+        migrate.run()
+    assert not db.exists(), "a non-creating connect must not birth the file"
+    assert settings.db_url.endswith("aiko.db"), "the mode=rw URL must not leak out of run()"
+
+
+def test_lived_volume_with_only_alembic_bookkeeping_refuses(tmp_path, monkeypatch) -> None:
+    db = _point_app_at(tmp_path, monkeypatch)
+    migrate.run()
+    db.unlink()
+    with sqlite3.connect(db) as c:
+        c.execute("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)")
+    with pytest.raises(RuntimeError, match="holds no island"):
+        migrate.run()
 
 
 def test_lived_volume_with_a_zero_byte_db_refuses(tmp_path, monkeypatch) -> None:
@@ -104,7 +191,7 @@ def test_lived_volume_with_a_zero_byte_db_refuses(tmp_path, monkeypatch) -> None
     migrate.run()
     db.unlink()
     db.touch()
-    with pytest.raises(RuntimeError, match="has no tables"):
+    with pytest.raises(RuntimeError, match="holds no island"):
         migrate.run()
     assert db.stat().st_size == 0, "refused without building a schema into it"
 
