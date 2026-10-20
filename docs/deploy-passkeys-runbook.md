@@ -4,7 +4,8 @@
 > build-on-host procedure (rsync + `--build`, alembic 0007→0008, a one-time project
 > cutover). Its revision numbers, commit hashes and step-by-step commands are fossils.
 > The fleet deploys pull-based since ISL-0003 (`ISLAND_VERSION` + `deploy/update.sh`).
-> The **Rollback** section near the end is current and applies to both topologies.
+> Current backup + rollback: [`runbooks/backup-and-rollback.md`](runbooks/backup-and-rollback.md).
+> The passkey device e2e (Step 4) is still the reference for that ceremony.
 
 **Status as of 2026-06-30:** **Gate 1 CROSSED** — endpoints deployed DARK to prod
 (alembic at `0008`, AASA serving via Caddy, `/providers` still hides passkey). Gate 2
@@ -282,28 +283,5 @@ gate — don't say "done".
 
 ## Rollback
 
-The deploy is reversible at the image layer (recreate from the prior image) and the
-data layer (the step-1 backup). **An image older than the database's schema refuses to
-start** (`MIGRATE_REFUSE_UNKNOWN_REVISION`, design 18 §1; before that it crash-looped
-in `verify_schema()` with advice that could not work). So:
-
-**Two deploy topologies, two backup paths; don't mix them.** This runbook records the
-June build-on-host procedure (rsync + `--build`; step 1's backup is
-`~/aiko-db-backups/aiko.db.predeploy-$TS`). Since ISL-0003 the fleet deploys
-pull-based: `ISLAND_VERSION` + `deploy/update.sh`, whose backup is
-`backups/aiko.db.preupdate-*` in the deploy dir. Use the backup the deploy you're
-undoing actually took.
-
-- **The release ran no migration:** go back to the old code (pull-based: re-pin
-  `ISLAND_VERSION` and run `update.sh`; build-on-host: rsync the prior tree and
-  `up -d --build`). That's all.
-- **The release ran a migration:** put the database back FIRST, with the stack DOWN
-  (`docker compose down`: a merely stopped `restart: always` container comes back if
-  the Docker daemon restarts mid-restore), then go back to the old code. **Restore that deploy's backup** (see the restore drill, #17). It is
-  exact, but it loses writes made since the update.
-
-There is deliberately no serve-anyway override and no generic downgrade recipe here.
-A downgrade has to run from the NEWER image (only it has the downgrade scripts), with
-the stack stopped (never `docker exec` alembic DDL beside a live writer), and to the
-OLD image's own head, which is a different revision on every release. Alembic
-downgrades of table rebuilds are not guaranteed lossless. Restore the backup.
+Moved to [`runbooks/backup-and-rollback.md`](runbooks/backup-and-rollback.md),
+which covers both the pull-based and the June build-on-host backup paths.

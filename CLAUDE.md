@@ -33,8 +33,8 @@ file is the working-context that isn't obvious from the code.
   before the backup. Syncing is still the operator's hand; what changed is that
   forgetting is now loud instead of an outage. Rationale, rejected alternatives, and why automating this is
   blocked: [ISL-0003](docs/adr/ISL-0003-pull-based-deploy-of-pinned-image.md). Verify
-  the RUNNING container's image ref, not this doc. Runbook:
-  `docs/deploy-passkeys-runbook.md`. Two live islands: `chat.imagineering.cc`
+  the RUNNING container's image ref, not this doc. Procedure: `deploy/update.sh`
+  (its header); backup + rollback: `docs/runbooks/backup-and-rollback.md`. Two live islands: `chat.imagineering.cc`
   (`~/apps/aiko-chat-gateway`), `chat.enspyr.co` (`~/apps/aiko-chat-gateway`, `ssh
   nick-mel`, `sudo -n docker`). NOTE: imagineering's separate `matrix-*` stack is
   still the old build-on-host model — don't conflate it with the island.

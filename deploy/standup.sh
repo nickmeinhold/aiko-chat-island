@@ -760,7 +760,7 @@ Next steps:
   • Passkeys:      serve /.well-known files for $DOMAIN, then re-run with --enable-passkeys.
                    See docs/standup-guide.md § Passkeys.
   • Backups:       the SQLite store lives in volume '$DATA_VOLUME'. Set up a backup
-                   before real users arrive — see docs/deploy-passkeys-runbook.md.
+                   before real users arrive — see docs/runbooks/backup-and-rollback.md.
   • Calls:         $( [ "$DO_MEDIA" = "true" ] \
                         && echo "bundled SFU is up on $TURN_DOMAIN. Open UDP 3478, 7882-7892 and 50000-60000, and put TLS in front of 5349." \
                         || echo "no SFU — /v1/channels/*/video-token returns 503 (a supported state). Re-run with --with-media, or set LIVEKIT_URL/LIVEKIT_API_KEY/LIVEKIT_API_SECRET to use an existing one." )
