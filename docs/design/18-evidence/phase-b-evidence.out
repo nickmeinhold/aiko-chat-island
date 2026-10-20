@@ -1,0 +1,31 @@
+# phase-b-evidence.sh 0.16.1 0.17.0, run 2026-10-19 (arm64, Docker 29.5.2), alembic progress lines elided
+old=ghcr.io/nickmeinhold/aiko-chat-island:0.16.1  new=ghcr.io/nickmeinhold/aiko-chat-island:0.17.0
+ok   setup: old image creates the db                    exit=0   STAMP
+     old head: ['0027']
+ok   E1 stopped-stack backup, one-shot NEW image        exit=0   integrity_check: ok
+ok   E1 ...did NOT migrate (stamp unchanged)            exit=0   STAMP ['0027']
+ok   E2 new image migrates forward                      exit=0   STAMP
+     new head: ['0028']
+ok   E2 positive control: new image ADMITS its head     exit=0   ADMITTED
+ok   E3 previous image REFUSES the forward db           exit=1   Refusing
+ok   E3' previous image's REAL CMD exits, never binds   exit=0   Refusing
+ok   E4 new guard REFUSES an unknown stamp              exit=1   MIGRATE_REFUSE_UNKNOWN_REVISION
+ok   E5 recovery: restore the set (db, -wal, -shm)      exit=0   RESTORED
+ok   E5 ...previous image ADMITTED after restore        exit=0   ADMITTED
+ok   E6 digest -> build-info.json (no app start)        exit=0   "ref":"v0.17.0"
+     ghcr.io/nickmeinhold/aiko-chat-island@sha256:51826b10cdc34f508cd23119e79faf1d6d31d7191972590c36cea6d5d1e4df30 -> {"git_sha":"f880ab8fb11844974ba6761bab23b5f6f4f308fb","ref":"v0.17.0","built_at":"2026-10-19T10:14:26Z","aiko_services_ref":"a66424db76c5bf8f11adfed456cf3a135baf7494","aiko_chat_ref":"3e4e822b65b7e222920642c420661fb0c1e93bb6"}
+ok   E7 head(OLD) read one-shot = OLD's stamp           exit=0   HEAD 0027
+ok   E7 head(NEW) read one-shot = NEW's stamp           exit=0   HEAD 0028
+ALL EVIDENCE HELD
+
+# MUST-FAIL ARM: RESTORE replaced with `echo RESTORED` (no-op). E5 must go red:
+ok   setup: old image creates the db                    exit=0   STAMP
+ok   E1 stopped-stack backup, one-shot NEW image        exit=0   integrity_check: ok
+ok   E1 ...did NOT migrate (stamp unchanged)            exit=0   STAMP ['0027']
+ok   E2 new image migrates forward                      exit=0   STAMP
+ok   E2 positive control: new image ADMITS its head     exit=0   ADMITTED
+ok   E3 previous image REFUSES the forward db           exit=1   Refusing
+ok   E3' previous image's REAL CMD exits, never binds   exit=0   Refusing
+ok   E4 new guard REFUSES an unknown stamp              exit=1   MIGRATE_REFUSE_UNKNOWN_REVISION
+ok   E5 recovery: restore the set (db, -wal, -shm)      exit=0   RESTORED
+FAIL E5 ...previous image ADMITTED after restore: exit 1 (wanted 0)
