@@ -50,6 +50,11 @@ from pathlib import Path
 
 _TRUTHY = {"1", "true", "yes", "on"}
 
+# Co-located with the DB and never deleted, so its presence also tells
+# `migrate.run()` that a gateway has lived on this volume (the volume sentinel's
+# bridge for volumes that predate `.aiko-initialized`).
+LOCK_FILENAME = ".aiko-worker.lock"
+
 # Keep the acquired lock's fd alive for the whole process: closing it (or letting
 # it be GC'd) releases the flock. The PID pins the fd to the process that opened
 # it, so a fork child (which inherits the module global) is not fooled into
@@ -83,7 +88,7 @@ def _lock_path() -> Path | None:
     if url.get_backend_name() == "sqlite" and url.database and url.database != ":memory:":
         parent = Path(url.database).resolve().parent
         if parent.is_dir():
-            return parent / ".aiko-worker.lock"
+            return parent / LOCK_FILENAME
     return None
 
 

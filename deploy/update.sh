@@ -289,7 +289,9 @@ if [ "$DO_BACKUP" = "true" ]; then
   # copy the artifact out and remove the in-container temp. integrity_check gates.
   $COMPOSE exec -T chat-island python -c "
 import sqlite3, sys
-src = sqlite3.connect('/data/aiko.db')
+# Read-only: a plain connect CREATES a missing db, and the backup of that empty
+# file would pass integrity_check (design 18 v4 r3, Carnot).
+src = sqlite3.connect('file:/data/aiko.db?mode=ro', uri=True)
 dst = sqlite3.connect('/data/_update-$ts.db')
 with dst: src.backup(dst)
 res = dst.execute('PRAGMA integrity_check').fetchone()[0]

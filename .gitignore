@@ -14,6 +14,7 @@ backups/
 
 # single-worker guard lock (worker_guard.py) — regenerable, never committed
 .aiko-worker.lock
+.aiko-initialized
 
 # Bundled LiveKit: rendered config carries the API secret (deploy/livekit/render-config.sh)
 deploy/livekit/livekit.yaml
