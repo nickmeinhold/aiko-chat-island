@@ -52,7 +52,7 @@ _TRUTHY = {"1", "true", "yes", "on"}
 
 # Co-located with the DB and never deleted, so its presence also tells
 # `migrate.run()` that a gateway has lived on this volume (the volume sentinel's
-# bridge for volumes that predate `.aiko-initialized`).
+# bridge for volumes that predate `migrate`'s per-db `.aiko.db.initialized`).
 LOCK_FILENAME = ".aiko-worker.lock"
 
 # Keep the acquired lock's fd alive for the whole process: closing it (or letting

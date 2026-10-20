@@ -60,7 +60,7 @@ of being silently corrupted.)
 indistinguishable from a brand-new island, so a lost or half-restored ``aiko.db``
 used to come back as an EMPTY island that served (every account, message and key
 gone, `restart: always` making it permanent). The migrator now records a sentinel,
-``.aiko-initialized`` beside the db, after every successful run: on a fresh volume
+``.aiko.db.initialized`` (one per db) beside it, after every successful run: on a fresh volume
 and, the first time a new image meets an existing db, as adoption. When the volume
 shows it has lived (that sentinel, or ``worker_guard``'s ``.aiko-worker.lock``,
 which every gateway since Aug 2026 has left there and never deletes, so both live
@@ -94,6 +94,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
+from urllib.parse import quote
 
 from alembic import command
 from alembic.autogenerate import compare_metadata
@@ -112,7 +113,15 @@ from .worker_guard import LOCK_FILENAME, _lock_path
 log = logging.getLogger("aiko_gateway.migrate")
 
 BASELINE_REVISION = "0001"
-SENTINEL_FILENAME = ".aiko-initialized"
+SENTINEL_SUFFIX = ".initialized"
+
+
+def _sentinel_path(db: Path) -> Path:
+    """One record PER DATABASE, named for it (``.aiko.db.initialized``): a record
+    for another db beside it is simply a different file, so it can neither count as
+    this db's evidence nor block this db's own record (Carnot + Noether + Tesla,
+    PR#399 r2). The leading dot keeps it out of ``rm aiko.db*`` and ``rm /data/*``."""
+    return db.parent / f".{db.name}{SENTINEL_SUFFIX}"
 
 
 def _db_file() -> Path | None:
@@ -127,18 +136,15 @@ def _db_file() -> Path | None:
 def _lived_evidence(db: Path) -> list[Path]:
     """The files that prove an island has lived on this volume. Never connects.
 
-    The sentinel counts only when it names THIS db, so one directory's record can't
-    refuse a different, never-created db beside it. The worker lock counts at its
+    The sentinel is per database (see ``_sentinel_path``), so existence is the whole
+    test: nothing is parsed, so nothing can fail to parse. The worker lock counts at its
     default path and, when ``GATEWAY_WORKER_LOCK`` moves it, at the moved path too.
     (A ``GATEWAY_ALLOW_MULTIWORKER`` gateway writes no lock at all; such a volume is
     covered by the sentinel only, after its first successful run.)"""
     found: list[Path] = []
-    sentinel = db.parent / SENTINEL_FILENAME
-    try:
-        if sentinel.read_text().split(" ", 1)[0] == db.name:
-            found.append(sentinel)
-    except OSError:
-        pass
+    sentinel = _sentinel_path(db)
+    if sentinel.exists():  # EACCES et al. raise here: fail closed, never "no evidence"
+        found.append(sentinel)
     for lock in {db.parent / LOCK_FILENAME, _lock_path()}:
         if lock is not None and lock.exists():
             found.append(lock)
@@ -152,7 +158,8 @@ def _non_creating_url(db: Path) -> str:
     through this, so a db that vanishes after the existence check makes the next
     connect FAIL, not birth an empty island (Carnot + Tesla, PR#399 r1)."""
     url = make_url(settings.db_url)
-    return url.set(database=f"file:{db}", query={**url.query, "mode": "rw", "uri": "true"}
+    # Percent-encode: `?`, `#` and `%` in a path mean something in an SQLite URI.
+    return url.set(database=f"file:{quote(str(db), safe='/')}", query={**url.query, "mode": "rw", "uri": "true"}
                    ).render_as_string(hide_password=False)
 
 
@@ -174,12 +181,12 @@ def refuse_missing_db_message(db: Path, evidence: list[Path], why: str) -> str:
 def _write_sentinel(db: Path) -> None:
     """Record that this volume now hosts an island: write-tmp, fsync, rename, fsync
     the directory, so a crash leaves either no sentinel or a whole one."""
-    final = db.parent / SENTINEL_FILENAME
+    final = _sentinel_path(db)
     if final.exists():
         return
     tmp = final.with_name(final.name + ".tmp")
     with open(tmp, "w") as f:
-        f.write(f"{db.name} {datetime.now(timezone.utc).isoformat()}\n")
+        f.write(f"{datetime.now(timezone.utc).isoformat()}\n")
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, final)
@@ -370,9 +377,9 @@ def run() -> None:
         if db is not None and not db.exists():
             # Say it, so "fresh volume" and "no evidence found" are never the same
             # silence (Noether, PR#399 r1).
-            log.warning("No sign an island has lived in %s (no %s for %s, no %s): "
+            log.warning("No sign an island has lived in %s (no %s, no %s): "
                         "creating a NEW, empty database.",
-                        db.parent, SENTINEL_FILENAME, db.name, LOCK_FILENAME)
+                        db.parent, _sentinel_path(db).name, LOCK_FILENAME)
         _migrate(db, evidence)
         return
     if not db.exists():
@@ -424,14 +431,26 @@ def _migrate(db: Path | None, evidence: list[Path]) -> None:
 
     command.upgrade(cfg, "head")
     if db is not None:
-        # A SAFETY RECORD, not the schema: failing to write it must not stop an island
-        # that just migrated cleanly. Loud, and the worker lock remains the evidence.
+        # A failed write may let the island serve ONLY if something else already marks
+        # the volume (`evidence`, gathered before this run). When this write is the
+        # first witness (a fresh volume, or a multi-worker one with no lock), serving
+        # without it leaves nothing for the next boot to believe, so refuse NOW, while
+        # aiko.db is still there (Carnot + Tesla, PR#399 r2).
         try:
             _write_sentinel(db)  # fresh volume or first adoption; a no-op thereafter
         except OSError as e:
-            log.error("Could not record %s beside %s (%s). The database is at head and "
-                      "will serve; until this is written, only %s marks this volume as "
-                      "having hosted an island.", SENTINEL_FILENAME, db, e, LOCK_FILENAME)
+            sentinel = _sentinel_path(db)
+            if not evidence:
+                raise RuntimeError(
+                    f"MIGRATE_REFUSE_UNRECORDED: the database {db} is migrated, but "
+                    f"{sentinel} could not be written ({e}), and nothing else on this "
+                    "volume marks it as hosting an island. Serving now would leave a later "
+                    "loss of the database indistinguishable from a fresh volume. Refusing "
+                    f"to start. Fix the cause (free space, or ownership of {db.parent}), "
+                    "then start again: the database is intact.") from e
+            log.error("Could not record %s (%s). The database is at head and will serve; "
+                      "until it is written, %s marks this volume as having hosted an "
+                      "island.", sentinel, e, " ".join(str(p) for p in evidence))
     log.info("Database is at head.")
 
 

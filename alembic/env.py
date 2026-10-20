@@ -40,7 +40,10 @@ config = context.config
 # caller, can never silently shadow the app's real target (Carnot cage-match,
 # PR#23). Tests point alembic at a throwaway DB by monkeypatching settings.db_url,
 # which flows through here — not by setting a competing url.
-config.set_main_option("sqlalchemy.url", settings.db_url)
+# `%` doubled: set_main_option runs the value through configparser interpolation, so
+# a `%` in a path (or the `%3F` the migrator's mode=rw URI percent-encodes a `?` into)
+# raised "invalid interpolation syntax" (PR#399 r2). Alembic's documented escape.
+config.set_main_option("sqlalchemy.url", settings.db_url.replace("%", "%%"))
 
 if config.config_file_name is not None:
     # disable_existing_loggers=False: the DEFAULT (True) silently disables every

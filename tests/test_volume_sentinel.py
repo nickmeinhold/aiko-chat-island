@@ -20,8 +20,11 @@ from aiko_gateway.config import settings
 from aiko_gateway.worker_guard import LOCK_FILENAME
 
 
-def _point_app_at(tmp_path, monkeypatch):
-    db = tmp_path / "aiko.db"
+def _point_app_at(tmp_path, monkeypatch, name: str = "aiko.db"):
+    """Also clears GATEWAY_WORKER_LOCK: an operator's exported override pointing at a
+    real file would otherwise count as evidence here (Noether, PR#399 r2)."""
+    monkeypatch.delenv("GATEWAY_WORKER_LOCK", raising=False)
+    db = tmp_path / name
     monkeypatch.setattr(settings, "db_url", f"sqlite+aiosqlite:///{db}")
     return db
 
@@ -39,7 +42,7 @@ def _canary(db) -> list[str]:
 
 
 def _sentinel(db):
-    return db.parent / migrate.SENTINEL_FILENAME
+    return migrate._sentinel_path(db)
 
 
 # --- admit arms (positive controls) -------------------------------------------
@@ -49,7 +52,7 @@ def test_fresh_volume_is_admitted_and_gets_a_sentinel(tmp_path, monkeypatch) -> 
     assert not any(tmp_path.iterdir())
     migrate.run()
     assert db.exists() and _sentinel(db).exists()
-    assert _sentinel(db).read_text().startswith("aiko.db ")
+    assert _sentinel(db).name == ".aiko.db.initialized"
 
 
 def test_existing_island_without_a_sentinel_is_adopted(tmp_path, monkeypatch) -> None:
@@ -74,8 +77,9 @@ def test_reboot_at_head_keeps_the_original_sentinel(tmp_path, monkeypatch) -> No
 
 
 def test_a_backend_with_no_file_runs_and_writes_nothing(tmp_path, monkeypatch) -> None:
-    """Drives run(), not just _db_file(): a refusal or a sentinel write widened to a
-    non-file backend goes red here (Noether, PR#399 r1)."""
+    """Drives run() for the in-memory backend: a refusal or sentinel write widened to a
+    no-file backend goes red here (Noether, PR#399 r1). The Postgres arm checks only
+    _db_file(): run() against Postgres needs a server this suite doesn't have."""
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(settings, "db_url", "sqlite+aiosqlite:///:memory:")
     assert migrate._db_file() is None
@@ -93,21 +97,49 @@ def test_lock_filename_is_the_file_worker_guard_creates(tmp_path, monkeypatch) -
     assert worker_guard._lock_path() == db.parent / LOCK_FILENAME
 
 
-def test_a_sentinel_write_failure_does_not_stop_a_migrated_island(tmp_path, monkeypatch) -> None:
-    """Recorded by patching the logger, not via caplog: alembic's env.py runs
-    fileConfig() during the upgrade, which swaps the root handlers (caplog's among
-    them). In production the ERROR still reaches stderr: alembic.ini's root is WARNING."""
-    _point_app_at(tmp_path, monkeypatch)
-    errors: list[str] = []
-    monkeypatch.setattr(migrate.log, "error", lambda msg, *a: errors.append(msg % a))
-
+def _fail_sentinel_writes(monkeypatch):
     def refuse(_db):
         raise OSError(28, "No space left on device")
     monkeypatch.setattr(migrate, "_write_sentinel", refuse)
+
+
+def test_a_sentinel_write_failure_serves_when_the_lock_already_marks_the_volume(
+        tmp_path, monkeypatch) -> None:
+    """Both live islands at first boot: the lock already witnesses the volume, so a
+    failed sentinel write must not crash-loop a migrated island. Recorded by patching
+    the logger, not via caplog: alembic's env.py runs fileConfig() during the upgrade,
+    which swaps the root handlers (caplog's among them). In production the ERROR still
+    reaches stderr: alembic.ini's root is WARNING."""
+    db = _point_app_at(tmp_path, monkeypatch)
+    migrate.run()                       # the island as it stands today:
+    _sentinel(db).unlink()              # a migrated db, no sentinel yet,
+    (tmp_path / LOCK_FILENAME).touch()  # and the lock every gateway left behind
+    errors: list[str] = []
+    monkeypatch.setattr(migrate.log, "error", lambda msg, *a: errors.append(msg % a))
+
+    _fail_sentinel_writes(monkeypatch)
     migrate.run()  # must NOT raise: the schema is at head
     import asyncio
     assert asyncio.run(migrate._schema_status()).state is migrate.SchemaState.HEAD
     assert errors and "Could not record" in errors[0]
+
+
+def test_a_sentinel_write_failure_refuses_when_it_is_the_first_witness(
+        tmp_path, monkeypatch) -> None:
+    """A fresh (or multi-worker, lockless) volume: nothing else marks it, so serving
+    without the record leaves a later db loss indistinguishable from a fresh volume.
+    Refuse while aiko.db is still there; the stated fix then works (Carnot + Tesla,
+    PR#399 r2)."""
+    db = _point_app_at(tmp_path, monkeypatch)
+    real_write = migrate._write_sentinel
+    _fail_sentinel_writes(monkeypatch)
+    with pytest.raises(RuntimeError, match="MIGRATE_REFUSE_UNRECORDED") as refused:
+        migrate.run()
+    assert "the database is intact" in str(refused.value)
+    assert db.exists()
+    monkeypatch.setattr(migrate, "_write_sentinel", real_write)  # the fix: space freed
+    migrate.run()
+    assert _sentinel(db).exists()
 
 
 def test_creating_a_fresh_db_says_so(tmp_path, monkeypatch, caplog) -> None:
@@ -119,23 +151,44 @@ def test_creating_a_fresh_db_says_so(tmp_path, monkeypatch, caplog) -> None:
     assert "creating a NEW, empty database" in caplog.text
 
 
-def test_a_sentinel_for_another_db_is_not_evidence(tmp_path, monkeypatch) -> None:
+def test_another_dbs_record_neither_counts_nor_blocks_this_dbs_own(
+        tmp_path, monkeypatch) -> None:
+    """r2: a shared filename let a foreign record block this db's own forever (Carnot
+    + Noether + Tesla). Per-db names make them different files."""
+    _point_app_at(tmp_path, monkeypatch, name="aiko_dev.db")
+    migrate.run()  # the OTHER db's record, written by the code under test, not by hand
     db = _point_app_at(tmp_path, monkeypatch)
-    _sentinel(db).write_text("aiko_dev.db 2026-10-20T00:00:00+00:00\n")
     migrate.run()  # this db was never created here: admitted as fresh
-    assert db.exists()
+    assert db.exists() and _sentinel(db).exists(), "its own record must be written"
+    db.unlink()
+    with pytest.raises(RuntimeError, match="MIGRATE_REFUSE_MISSING_DB"):
+        migrate.run()  # ...and it protects this db afterwards
+
+
+def test_a_path_with_uri_metacharacters_still_migrates(tmp_path, monkeypatch) -> None:
+    """`#`, `%` and a space are legal in a DB_URL path but mean something in an SQLite
+    URI: the mode=rw URL must percent-encode them, and alembic's configparser must not
+    choke on the resulting `%` (Noether, r2). (`?` can't appear: DB_URL itself reads it
+    as a query string.) The lived run goes through the mode=rw URL, so a wrong decode
+    would open a missing file and fail."""
+    db = _point_app_at(tmp_path, monkeypatch, name="50% off #2.db")
+    migrate.run()
+    (tmp_path / LOCK_FILENAME).touch()
+    migrate.run()  # lived now: goes through the mode=rw URL
+    assert db.exists() and sorted(p.name for p in tmp_path.iterdir()) == [
+        ".50% off #2.db.initialized", LOCK_FILENAME, "50% off #2.db"]
 
 
 # --- refuse arms ---------------------------------------------------------------
 
-@pytest.mark.parametrize("evidence", [migrate.SENTINEL_FILENAME, LOCK_FILENAME])
+@pytest.mark.parametrize("evidence", [".aiko.db.initialized", LOCK_FILENAME])
 def test_lived_volume_with_a_missing_db_refuses_WITHOUT_creating_one(
         tmp_path, monkeypatch, evidence) -> None:
     """The LOCK case is the bridge: both live islands carry the worker lock from
     before the sentinel existed. The assert that no file appeared is the point:
     a check placed after the first connect would watch a file SQLite just made."""
     db = _point_app_at(tmp_path, monkeypatch)
-    (tmp_path / evidence).write_text(f"{db.name} 2026-10-20T00:00:00+00:00\n")
+    (tmp_path / evidence).touch()
     with pytest.raises(RuntimeError, match="MIGRATE_REFUSE_MISSING_DB") as refused:
         migrate.run()
     assert "is missing" in str(refused.value)
@@ -222,7 +275,7 @@ def test_fix_delete_the_evidence_starts_a_deliberately_new_island(
     db.unlink()
     with pytest.raises(RuntimeError, match="MIGRATE_REFUSE_MISSING_DB") as refused:
         migrate.run()
-    for name in (migrate.SENTINEL_FILENAME, LOCK_FILENAME):
+    for name in (_sentinel(db).name, LOCK_FILENAME):
         assert str(tmp_path / name) in str(refused.value)
         (tmp_path / name).unlink()  # the fix, as the message states it
     migrate.run()
