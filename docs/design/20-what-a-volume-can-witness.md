@@ -1,7 +1,7 @@
 # Design 20: what a volume can witness about itself
 
 Answers [#400](https://github.com/nickmeinhold/aiko-chat-island/issues/400) Q1–Q3 and
-Q7, with Q4–Q5 noted where the measurements reached them. Status: **v3, PROPOSED**.
+Q7, with Q4–Q5 noted where the measurements reached them. Status: **v3, PROPOSED. Temper CAPPED after 3 rounds (RECAST 4/4 each); the spine below is affirmed unanimously, and seven listed mechanism folds from round 3 are NOT yet applied here: see [`20-TEMPER.md` § Round 3](20-TEMPER.md). Read them before building. The most important: the migrator runs from `CMD`, so the lineage check must also run in the app lifespan.**
 v1 and v2 were each struck by four families, and both came back **RECAST 4/4**
 ([`20-TEMPER.md`](20-TEMPER.md)). This version folds round 2. Each fold is marked
 *(T2-n)*, where n is the flaw's number in that round's synthesis.
