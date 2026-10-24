@@ -112,7 +112,7 @@ def test_the_harness_actually_runs_the_real_script(island) -> None:
     assert oct(island.env_file.stat().st_mode)[-3:] == "600", ".env must be owner-only"
 
 
-NEW_ISLAND = "chat-island python -m aiko_gateway.migrate --new-island"
+BIRTH = "chat-island sh -c set -C"  # the birth copy; its script spans several logged lines
 
 
 def _compose_calls(island) -> list[str]:
@@ -125,11 +125,11 @@ def test_a_fresh_volume_creates_the_island_once_before_up(island) -> None:
     first start refuses MIGRATE_REFUSE_NO_DATABASE."""
     island.run()
     calls = [ln for ln in island.calls.read_text().splitlines() if ln.startswith("docker ")]
-    births = [i for i, ln in enumerate(calls) if ln.endswith(NEW_ISLAND)]
+    births = [i for i, ln in enumerate(calls) if ln.endswith(BIRTH)]
     ups = [i for i, ln in enumerate(calls) if ln.endswith(" up -d")]
     pulls = [i for i, ln in enumerate(calls) if ln.endswith(" pull")]
     creates = [i for i, ln in enumerate(calls) if ln == "docker volume create aiko_data"]
-    assert len(births) == 1, f"expected exactly one --new-island, got {calls}"
+    assert len(births) == 1, f"expected exactly one birth, got {calls}"
     assert " run --rm --no-deps " in calls[births[0]]
     assert ups and births[0] < ups[0], "the island must exist before the gateway starts"
     assert len(creates) == 1 and pulls[0] < creates[0] < births[0], (
@@ -147,19 +147,20 @@ exit 0
 ''')
 
 
-def test_a_failed_birth_stops_with_the_finishing_command_and_removes_nothing(island) -> None:
+def test_a_failed_birth_stops_pointing_at_the_runbook_and_removes_nothing(island) -> None:
     """Standup can't prove it made the volume it holds (`volume create` succeeds on an
     existing one), so it must never remove one: a rollback could delete a real island
     that a concurrent run or a restore put there (Noether, Carnot, Tesla, PR#405 r2).
-    It stops, before `up`, naming the one command that finishes the birth."""
-    _docker_failing_on(island, "--new-island")
+    It stops, before `up`, pointing at the runbook rather than a command (PR#405 r3)."""
+    _docker_failing_on(island, "set -C")
     r = island.run(expect_ok=False)
     assert r.returncode != 0
     calls = island.calls.read_text().splitlines()
     assert not [ln for ln in calls if ln.startswith("docker volume rm")]
     assert not [ln for ln in calls if ln.endswith(" up -d")]
     out = r.stdout + r.stderr
-    assert "will NOT retry" in out and "migrate --new-island" in out
+    assert "could not give birth" in out and "restore it" in out
+    assert "migrate --new-island" not in out and "aside" not in out
 
 
 def test_standup_never_removes_a_volume() -> None:
@@ -177,12 +178,12 @@ def test_a_failed_pull_creates_no_volume(island) -> None:
 
 
 def test_an_existing_volume_never_creates_an_island(island) -> None:
-    """A re-run, or a box whose volume already holds an island: `--new-island` must never
-    run (it would refuse on an existing db, but on a volume whose db was LOST it would
-    build a new, empty island, the exact outcome this exists to make impossible)."""
+    """A re-run, or a box whose volume already holds an island: the birth must never
+    be attempted (the copy refuses any non-empty /data, so even a volume whose db was
+    LOST is safe; this pins that standup does not lean on that by default)."""
     _stub(island.root.parent / "bin", "docker", f'echo "docker $*" >> "{island.calls}"\nexit 0\n')
     island.run()
-    assert not [ln for ln in _compose_calls(island) if "--new-island" in ln]
+    assert not [ln for ln in _compose_calls(island) if ln.endswith(BIRTH)]
     assert [ln for ln in _compose_calls(island) if ln.endswith(" up -d")]
 
 
@@ -963,3 +964,68 @@ def test_a_pre_5165_box_carries_its_ISLAND_VERSION_forward(island) -> None:
     island.run("--drop-env-keys", "ISLAND_VERSION")
     assert "ISLAND_VERSION" not in island.env_file.read_text()
     assert _pin(island) == "ISLAND_IMAGE=ghcr.io/nickmeinhold/aiko-chat-island:0.16.1\n"
+
+
+# --- the birth script itself, run for real ------------------------------------
+# The stubs above prove WHEN standup copies; these prove WHAT the copy does, by running
+# standup's own BIRTH_SH under sh with /data and the seed pointed at temp dirs.
+
+def _birth_sh() -> str:
+    text = (REPO / "deploy" / "standup.sh").read_text()
+    start = text.index("BIRTH_SH='") + len("BIRTH_SH='")
+    return text[start:text.index("'\n", start)]
+
+
+def _run_birth(tmp_path, data_contents: dict[str, str]):
+    data, seed = tmp_path / "data", tmp_path / "seed.db"
+    data.mkdir()
+    seed.write_text("SEED")
+    for name, body in data_contents.items():
+        (data / name).write_text(body)
+    script = _birth_sh().replace("/app/seed/aiko.db", str(seed)).replace("/data", str(data))
+    return subprocess.run(["sh", "-c", script], capture_output=True, text=True), data
+
+
+def test_the_birth_copies_the_seed_into_an_empty_volume(tmp_path) -> None:
+    r, data = _run_birth(tmp_path, {})
+    assert r.returncode == 0, r.stderr
+    assert (data / "aiko.db").read_text() == "SEED"
+
+
+@pytest.mark.parametrize("left", [
+    {".aiko-worker.lock": ""},  # a served volume whose aiko.db was LOST: the case that matters
+    {"aiko.db": "LIVE"},
+    {"aiko.db.preupdate-x": "BACKUP"},
+])
+def test_the_birth_refuses_any_volume_that_is_not_empty(tmp_path, left) -> None:
+    """Measured on syd 2026-10-25: a served /data holds .aiko-worker.lock (since Aug 2),
+    the db and hand-made backups. Any of them alone must refuse, and write nothing."""
+    r, data = _run_birth(tmp_path, left)
+    assert r.returncode == 3, r.stderr
+    assert "not empty" in r.stderr
+    assert {p.name: p.read_text() for p in data.iterdir()} == left
+
+
+def test_the_guides_manual_birth_keeps_the_rules_that_make_it_safe() -> None:
+    """The manual steps carry a one-line birth instead of standup's BIRTH_SH. Copies
+    drift, so pin the three parts whose loss would make it unsafe: no-clobber, the
+    empty-volume check, and copying the seed rather than building anything."""
+    guide = (REPO / "docs" / "standup-guide.md").read_text()
+    births = [ln for ln in guide.splitlines() if "/app/seed/aiko.db > /data/aiko.db" in ln]
+    assert len(births) == 1
+    assert "set -C" in births[0] and '[ -z "$(ls -A /data)" ] &&' in births[0]
+
+
+def test_the_birth_write_itself_never_overwrites(tmp_path) -> None:
+    """`set -C` covers the race the emptiness check can't: a db appearing between the
+    `ls` and the write. Strip the check and the write alone must still refuse."""
+    data, seed = tmp_path / "data", tmp_path / "seed.db"
+    data.mkdir()
+    seed.write_text("SEED")
+    (data / "aiko.db").write_text("LIVE")
+    script = _birth_sh()
+    script = script[:script.index("if [")] + script[script.index("fi\n") + 3:]
+    script = script.replace("/app/seed/aiko.db", str(seed)).replace("/data", str(data))
+    r = subprocess.run(["sh", "-c", script], capture_output=True, text=True)
+    assert r.returncode != 0
+    assert (data / "aiko.db").read_text() == "LIVE"

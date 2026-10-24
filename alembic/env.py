@@ -46,7 +46,8 @@ config = context.config
 # raised "invalid interpolation syntax" (PR#399 r2). Alembic's documented escape.
 # open_only: alembic is a door to the database too, and a hand-run `alembic upgrade
 # head` against a lost aiko.db must fail, not build a new, empty island in its place.
-# Only `python -m aiko_gateway.migrate --new-island` creates a database.
+# The gateway never creates a database: an island is born when standup copies the
+# image's seed (built by scripts/build_seed.py at `docker build`) into an empty /data.
 config.set_main_option("sqlalchemy.url", open_only(settings.db_url).replace("%", "%%"))
 
 if config.config_file_name is not None:

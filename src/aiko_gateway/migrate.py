@@ -6,8 +6,8 @@ That live DB has every table but no ``alembic_version`` row, so a naive
 ``upgrade head`` would run the baseline's ``CREATE TABLE users`` against a DB that
 already has it and abort. The fix is **stamp-or-upgrade**:
 
-  * fresh DB (no ``alembic_version``, no ``users``)      → REFUSE, unless this run
-        is ``--new-island`` (it made the file): then ``upgrade head`` builds it
+  * fresh DB (no ``alembic_version``, no ``users``)      → REFUSE, always (this runner
+        never builds an island; see "Starting never creates an island" below)
   * pre-alembic DB (``users`` present, no ``alembic_version``) → adopt: VERIFY the
         existing schema matches the baseline, then ``stamp 0001``, then
         ``upgrade head`` applies anything after it
@@ -68,10 +68,13 @@ not to detect that, it is to remove the code that did it:
   * a plain run refuses a database with no ``users`` table (empty, truncated to 0
     bytes, or alembic's bookkeeping only): building the schema into it would be the
     same new, empty island by another route;
-  * the ONE way to create an island is ``--new-island``, which makes the file with
-    ``O_EXCL`` (anything already at the path refuses) and then builds the schema.
-    ``deploy/standup.sh`` runs it once, when an island is born. It is an argument,
-    never a setting, so it can't be left switched on.
+  * the gateway has NO way to create an island, by flag, setting or otherwise. An
+    island is born as a COPY: ``docker build`` runs ``scripts/build_seed.py`` once,
+    which builds an empty island at head into ``/app/seed/aiko.db`` in an image layer
+    (where no volume exists to harm), and standup copies that file into a ``/data``
+    that is completely empty. A volume that has ever served is never empty (the
+    worker lock lives beside the db), so a lost database can't qualify (Nick,
+    2026-10-25, replacing the ``--new-island`` mode PR#405 r1-r3 reviewed).
 
 This replaced the volume sentinel (``.aiko.db.initialized``, PR#399) and the design-20
 witness built on top of it: both detected the wrong moment to create, and once
@@ -92,7 +95,6 @@ one-shot init container or an explicit lock rather than the per-replica entrypoi
 from __future__ import annotations
 
 import asyncio
-import errno
 import logging
 import os
 import tempfile
@@ -128,69 +130,57 @@ _RESTORE = (
     "If the database was lost or damaged: take the stack down, restore the newest "
     "backup (`deploy/update.sh` keeps them in backups/ beside docker-compose.yml; see "
     "docs/runbooks/backup-and-rollback.md), then start.")
-_NEW_ISLAND_COMMAND = (
-    "run `python -m aiko_gateway.migrate --new-island` once (`deploy/compose.sh run --rm "
-    "--no-deps chat-island python -m aiko_gateway.migrate --new-island` on a box)")
+# A refusal names the cause and the repair (restore), and never "move it aside": an
+# operator following a refusal is on a box whose island is in doubt (PR#405 r3).
+# Naming standup is safe: it only ever copies into an EMPTY /data, which no volume
+# that has served can be, so on this box it refuses.
+_NEVER_HELD_ONE = (
+    "A box that has never held an island gets one from standup, never from this "
+    "program.")
 
 
-def no_database_message(db: Path) -> str:
+def no_database_message(db: Path, *, via: Path | None = None) -> str:
     """Raised by both boot layers (this runner and lifespan's ``verify_schema``), so the
-    operator gets one diagnosis whichever trips first."""
+    operator gets one diagnosis whichever trips first. ``via``: the configured path, when
+    it is a symlink whose target ``db`` is what's missing."""
+    where = f"{via} is a symlink to {db}, which" if via else str(db)
     return (
-        f"MIGRATE_REFUSE_NO_DATABASE: {db} does not exist. The gateway never creates a "
+        f"MIGRATE_REFUSE_NO_DATABASE: {where} does not exist. The gateway never creates a "
         "database when it starts, so a lost one can't come back as a new, empty island. "
-        f"Refusing to start. {_RESTORE} Only if you really mean a brand-new, EMPTY island "
-        f"here: {_NEW_ISLAND_COMMAND}.")
+        f"Refusing to start. {_RESTORE} {_NEVER_HELD_ONE}")
 
 
 def not_an_island_message(db: Path | None, why: str) -> str:
     return (
         f"MIGRATE_REFUSE_NOT_AN_ISLAND: the database {db or settings.db_url} {why}. "
-        "Building the schema into it would start a new, empty island in its place, and "
-        f"only `--new-island` may do that. Refusing to start. {_RESTORE} Only if you "
-        f"really mean a brand-new, EMPTY island here: move this file aside, then "
-        f"{_NEW_ISLAND_COMMAND}.")
+        "Building the schema into it would start a new, empty island in its place. "
+        f"Refusing to start. {_RESTORE} {_NEVER_HELD_ONE}")
 
 
-def require_database_file(db: Path) -> None:
+def require_database_file(db_url: str) -> None:
     """The message, not the guarantee: every connect is open-only, so a missing file
     could not be created either way. ``lstat``, because "can't look" must never read as
     "missing", and the stdlib's answers differ by function AND by version: measured on
     3.12.8, ``os.path.exists`` says False on EACCES while ``Path.exists`` raises a raw
     PermissionError (3.13 moved ``Path.exists`` to the False behaviour). ``lstat`` raises
-    the same everywhere, so the two causes get their own messages (PR#405 r1)."""
+    the same everywhere, so the two causes get their own messages (PR#405 r1).
+    Takes the URL so every caller derives the file the same way, and so a dangling
+    symlink is named as one (the configured path, unresolved) rather than reported as a
+    plain missing file (PR#405 r3). No file behind the URL (Postgres, in-memory): no-op."""
+    db = sqlite_file(db_url)
+    if db is None:
+        return
+    given = sqlite_file(db_url, follow_symlinks=False)
     try:
         os.lstat(db)
     except FileNotFoundError:
-        raise RuntimeError(no_database_message(db)) from None
+        via = given if given != db and os.path.islink(given) else None
+        raise RuntimeError(no_database_message(db, via=via)) from None
     except OSError as e:
         raise RuntimeError(
             f"MIGRATE_REFUSE_UNREADABLE: {db} could not be checked ({e}). That is a "
             "permissions, mount or disk problem on this host, not a missing database. "
-            "Refusing to start. Fix the cause, then start again; do NOT run --new-island "
-            "to make this go away.") from e
-
-
-def _create_empty(db: Path) -> None:
-    """THE one place a database file is created. ``O_EXCL``: anything already at the
-    path (a db, a 0-byte file, a directory, a symlink, dangling or not) refuses, so
-    `--new-island` can never be pointed at an island that exists or be redirected through
-    a link. ``db`` must be the path AS GIVEN, final component unresolved
-    (``sqlite_file(follow_symlinks=False)``): resolving first would hand this the link's
-    target and create THAT (Noether, Carnot, Tesla, PR#405 r1). An empty file is a valid,
-    empty SQLite database, which the open-only connects may then build into."""
-    try:
-        fd = os.open(db, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
-    except OSError as e:
-        if not isinstance(e, FileExistsError) and e.errno != errno.ELOOP:
-            raise
-        raise RuntimeError(
-            f"MIGRATE_REFUSE_EXISTS: --new-island creates a database, and something is "
-            f"already at {db}. Refusing: it may be an island, or a link to one. If it "
-            "really is a leftover you mean to replace, take the stack down and move it "
-            "aside first.") from None
-    os.close(fd)
-    log.warning("--new-island: created %s; building a NEW, empty island in it.", db)
+            "Refusing to start. Fix the cause, then start again.") from e
 
 
 def _root() -> str:
@@ -206,18 +196,19 @@ def _root() -> str:
     return root
 
 
-NEW_ISLAND_ATTR = "aiko_new_island"
+SEED_BUILD_ATTR = "aiko_seed_build"
 
 
-def _alembic_config(*, new_island: bool = False) -> Config:
-    """``new_island`` is the capability the baseline migration requires before it builds
-    an island from nothing. Only ``--new-island`` (and scratch databases this module makes
-    for itself) grants it; a hand-run ``alembic`` CLI never does."""
+def _alembic_config(*, seed_build: bool = False) -> Config:
+    """``seed_build`` is the capability the baseline migration requires before it builds
+    an island from nothing. Only Python grants it: ``scripts/build_seed.py`` at image
+    build time, the scratch database ``_baseline_metadata`` makes for itself, and tests.
+    No command line, setting or hand-run ``alembic`` can."""
     root = _root()
     cfg = Config(os.path.join(root, "alembic.ini"))
     cfg.set_main_option("script_location", os.path.join(root, "alembic"))
-    if new_island:
-        cfg.attributes[NEW_ISLAND_ATTR] = True
+    if seed_build:
+        cfg.attributes[SEED_BUILD_ATTR] = True
     return cfg
 
 
@@ -245,7 +236,7 @@ def _baseline_metadata() -> MetaData:
         settings.db_url = f"sqlite+aiosqlite:///{ref_path}"
         open(ref_path, "x").close()  # alembic opens open-only; this scratch db is ours to create
         try:
-            command.upgrade(_alembic_config(new_island=True), BASELINE_REVISION)  # our scratch db
+            command.upgrade(_alembic_config(seed_build=True), BASELINE_REVISION)  # our scratch db
         finally:
             settings.db_url = original_url
         ref_engine = create_engine(f"sqlite:///{ref_path}")
@@ -372,37 +363,27 @@ async def _schema_status() -> SchemaStatus:
 
 
 
-def run(*, new_island: bool = False) -> None:
-    """Bring the database to head. Never creates one, except under ``new_island``
-    (the ``--new-island`` argument), which is the only way an island is born."""
+def run() -> None:
+    """Bring an existing island's database to head. Never creates one: islands are
+    born by standup copying the image's seed (see the module docstring)."""
     db = _db_file()
-    if new_island:
-        given = sqlite_file(settings.db_url, follow_symlinks=False)
-        if given is not None:
-            _create_empty(given)
-    elif db is not None:
-        require_database_file(db)
-    _migrate(db, new_island)
-
-
-def _migrate(db: Path | None, new_island: bool) -> None:
+    require_database_file(settings.db_url)
     tables = asyncio.run(_table_names())
     # THE GUARANTEE is the baseline's own gate (alembic/versions/0001_baseline.py): it
-    # builds an island from nothing, and refuses unless this run is --new-island, so no
-    # door (this runner, a hand-run alembic) can build one into an empty file. This
+    # builds an island from nothing, and refuses without the seed-build capability, so
+    # no door (this runner, a hand-run alembic) can build one into an empty file. This
     # pre-check adds a different property: a plain start that refuses TOUCHES NOTHING,
     # where the baseline's refusal comes after alembic has already written its own
     # bookkeeping table. `users`, not "any table": bookkeeping alone is not an island.
-    if "users" not in tables and not new_island:
+    if "users" not in tables:
         raise RuntimeError(not_an_island_message(
             db, "holds no island (no users table: empty, 0-byte, or alembic's bookkeeping only)"))
-    cfg = _alembic_config(new_island=new_island)
+    cfg = _alembic_config()
     # Adopt when the island is there and NOTHING is stamped: no alembic_version table,
     # or an EMPTY one. Measured (PR#405 r2): a hand-run alembic that the baseline gate
     # refused leaves an empty alembic_version table behind, and keying on the table's
     # absence would then refuse this island forever (Tesla).
-    adopting = "users" in tables and (
-        "alembic_version" not in tables or not asyncio.run(_schema_status()).stamped)
+    adopting = "alembic_version" not in tables or not asyncio.run(_schema_status()).stamped
     if adopting:
         # Fail-closed (Carnot cage-match, PR#23): only stamp a pre-alembic DB as
         # baseline if its schema ACTUALLY equals baseline 0001 — diffed against the
@@ -435,10 +416,10 @@ def _migrate(db: Path | None, new_island: bool) -> None:
 
 
 def main(argv: list[str]) -> None:
-    args = argv[1:]
-    if args not in ([], ["--new-island"]):
-        raise SystemExit(f"usage: python -m aiko_gateway.migrate [--new-island]  (got {args})")
-    run(new_island=args == ["--new-island"])
+    if argv[1:]:
+        raise SystemExit(f"usage: python -m aiko_gateway.migrate  (takes no arguments; got "
+                         f"{argv[1:]}). It never creates a database: standup does that.")
+    run()
 
 
 if __name__ == "__main__":

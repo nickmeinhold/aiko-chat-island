@@ -11,6 +11,7 @@ from alembic import command
 from sqlalchemy import create_engine, text
 
 from aiko_gateway import migrate
+import build_seed
 from aiko_gateway.config import settings
 from aiko_gateway.domain.models import DEFAULT_COMMUNITY_ID
 
@@ -23,8 +24,8 @@ def _at_0009_with(tmp_path, monkeypatch, *, channels):
     channels already carry community_id=DEFAULT_COMMUNITY_ID."""
     db = tmp_path / "b2.db"
     monkeypatch.setattr(settings, "db_url", f"sqlite+aiosqlite:///{db}")
-    migrate._create_empty(db)  # a new database is made explicitly, never by a connect
-    cfg = migrate._alembic_config(new_island=True)
+    build_seed.create_empty(db)  # a new database is made explicitly, never by a connect
+    cfg = migrate._alembic_config(seed_build=True)
     command.upgrade(cfg, "0008")
     sync_url = f"sqlite:///{db}"
     engine = create_engine(sync_url)

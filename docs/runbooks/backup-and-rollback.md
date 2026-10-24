@@ -52,3 +52,32 @@ downgrades of table rebuilds are not guaranteed lossless. Restore the backup.
 Backups from the June 2026 build-on-host era live at
 `~/aiko-db-backups/aiko.db.predeploy-*` instead; use the backup the deploy you're
 undoing actually took.
+
+## A failed birth
+
+The gateway never creates a database. An island is born once, by standup, which copies
+the image's seed (an empty island built at `docker build`) into the `aiko_data` volume,
+and only if that volume's `/data` is **completely empty**. A volume that has ever served
+is never empty: every boot writes `.aiko-worker.lock` beside the database. So on a box
+that has held an island, standup refuses, and the answer to a missing or empty database
+there is [Rollback](#rollback) (restore the newest backup), never a new island.
+
+The one case this section covers: the copy itself failed partway (a full disk, a killed
+run) on a box that has **never served**. Standup refuses to retry, because `/data` is no
+longer empty. Look first:
+
+```bash
+docker run --rm -v aiko_data:/data:ro busybox ls -la /data
+```
+
+If it holds `aiko.db` and **nothing else** (in particular no `.aiko-worker.lock`, so no
+gateway ever started on it), the volume is a failed birth: remove it and run standup
+again.
+
+```bash
+docker volume rm aiko_data
+./deploy/standup.sh
+```
+
+If it holds anything else, stop: that volume has served, or holds backups. It is not a
+failed birth.

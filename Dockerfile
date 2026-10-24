@@ -53,6 +53,21 @@ COPY alembic ./alembic
 COPY entrypoint.sh ./
 RUN chmod +x entrypoint.sh
 
+# THE SEED: an empty island at head, built HERE, once, into an image layer, where no
+# volume exists to harm. It is the only way an island is born: standup copies it into a
+# /data that is completely empty. The builder is deleted in the same layer, so no running
+# container can build an island from nothing (PR#405, Nick 2026-10-25). Read-only, so a
+# copy is a copy and the seed itself never changes under a running image.
+#
+# ENVIRONMENT=dev for this one command only (an inline env, not ENV: nothing persists into
+# the runtime image): production settings refuse to load without real secrets, and the
+# schema depends on no setting. The image still boots as production.
+COPY scripts/build_seed.py /tmp/build_seed.py
+RUN mkdir /app/seed \
+    && ENVIRONMENT=dev DB_URL=sqlite+aiosqlite:////app/seed/aiko.db python /tmp/build_seed.py \
+    && rm /tmp/build_seed.py \
+    && chmod 444 /app/seed/aiko.db
+
 # BUILD PROVENANCE — baked LAST so a new sha invalidates only this layer, never the
 # expensive pip installs above. Written as a FILE, deliberately, not as ENV: compose
 # `environment:` and the box's .env are the OPERATOR's surface, so a value read from

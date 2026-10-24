@@ -86,7 +86,7 @@ by hand (see [Manual standup](#manual-standup-no-script)).
 | Preflight | check tools + DNS | fail early, not halfway through |
 | 1 | check for `aiko_data` | no volume = this run gives birth to the island. The volume itself is created in step 3, together with the database, so a failure in between can't strand an empty one. The SQLite store's home is declared `external` in compose (decoupled from the project name so a rename never empties it) |
 | 2 | write `.env` | island identity (domain, display name, peers) + a **generated ≥32-char JWT secret**. `ENVIRONMENT` is left unset on purpose — absence means *production*, which fail-closes the boot unless a strong secret is present |
-| 3 | `pull`, then (new island only) `docker volume create aiko_data` + `migrate --new-island`, then `up -d` | pulls the official image and starts all four containers. No `--build` — nothing is built on the host. (Want to build from your own checkout instead? `--from-source`.) A new island's database is created explicitly; if that fails, standup stops before `up` and prints the one command that finishes it (it never removes a volume, since it can't prove the one it holds is its own). Every start migrates the DB to head, then serves, and never creates a database |
+| 3 | `pull`, then (new island only) `docker volume create aiko_data` + copy the image's seed into it, then `up -d` | pulls the official image and starts all four containers. No `--build` — nothing is built on the host. (Want to build from your own checkout instead? `--from-source`.) The island is born by copying the empty island the image carries (`/app/seed/aiko.db`) into the volume, and only if the volume is completely empty, which a volume that has ever served never is. If that fails, standup stops before `up` (it never removes a volume, since it can't prove the one it holds is its own; see the runbook's [failed birth](runbooks/backup-and-rollback.md#a-failed-birth)). Every start migrates the DB to head, then serves, and never creates a database |
 | 4 | bring up Caddy | TLS termination + reverse proxy to `127.0.0.1:8095`, in its own stack so it never collides with an existing proxy |
 
 Two safety properties worth knowing:
@@ -252,13 +252,17 @@ chmod 600 .env
 # 2b. pin the image (its own file, never .env: compose refuses without it)
 printf 'ISLAND_IMAGE=ghcr.io/nickmeinhold/aiko-chat-island:%s\n' 0.17.1 > image.env
 
-# 3. pull the official image, create the island's database ONCE, then bring it up.
-#    The gateway never creates a database when it starts (a lost one must not come
-#    back as a new, empty island), so a brand-new island is born explicitly. Never
-#    run --new-island against a volume that already holds an island: it refuses.
+# 3. pull the official image, give birth to the island, then bring it up.
+#    The gateway never creates a database (a lost one must not come back as a new,
+#    empty island). The image carries an empty island, /app/seed/aiko.db, and the
+#    birth copies it into the data volume ONLY if that volume is completely empty: a
+#    volume that has ever served never is, so this line refuses on any box that has
+#    held an island. If a start ever refuses for a missing or empty database, restore
+#    a backup (docs/runbooks/backup-and-rollback.md).
 #    All four containers run from this one image (bar stock mosquitto).
 ./deploy/compose.sh pull
-./deploy/compose.sh run --rm --no-deps chat-island python -m aiko_gateway.migrate --new-island
+docker volume create aiko_data
+./deploy/compose.sh run --rm --no-deps chat-island sh -c 'set -C; [ -z "$(ls -A /data)" ] && cat /app/seed/aiko.db > /data/aiko.db'
 ./deploy/compose.sh up -d
 curl -s http://127.0.0.1:8095/health         # {"status":"ok",...}
 #    (build from THIS checkout instead of pulling: `--build-overlay build` first, then

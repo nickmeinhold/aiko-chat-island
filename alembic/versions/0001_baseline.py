@@ -25,15 +25,18 @@ def upgrade() -> None:
     # back as a new, empty island. Opening files open-only stops a missing FILE being
     # created; this stops an existing empty one (0-byte, truncated) being built into an
     # island by any door, a hand-run `alembic upgrade head` included (claude-skills
-    # control, Carnot 4/4, PR#405 r1). Only `python -m aiko_gateway.migrate --new-island`
-    # grants the capability. Live databases ran this revision long ago and never run it
-    # again, so this precondition changes nothing they execute.
+    # control, Carnot 4/4, PR#405 r1). Only `scripts/build_seed.py` (run by `docker
+    # build`, into an image layer) grants the capability, from Python; no command line
+    # does. Live databases ran this revision long ago and never run it again, so this
+    # precondition changes nothing they execute.
     from alembic import context
     from sqlalchemy import inspect
 
-    from aiko_gateway.migrate import NEW_ISLAND_ATTR, not_an_island_message
+    from aiko_gateway.migrate import SEED_BUILD_ATTR, not_an_island_message
 
-    if not context.config.attributes.get(NEW_ISLAND_ATTR):
+    # Offline (`alembic upgrade --sql`) only PRINTS the DDL: it touches no database, so
+    # there is nothing to protect, and no connection to inspect (PR#405 r3).
+    if not context.is_offline_mode() and not context.config.attributes.get(SEED_BUILD_ATTR):
         if "users" in inspect(op.get_bind()).get_table_names():
             # An island with no stamp (pre-alembic, or a refused hand-run left an empty
             # alembic_version behind). The fix is adoption, and the advice must never be

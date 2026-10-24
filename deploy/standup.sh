@@ -750,15 +750,28 @@ trap 'rm -f "${ENV_TMP:-}" "${IMAGE_TMP:-}" "${LK_ENV_STAGED:-}" "${KEYS_HAVE:-}
 # Nothing here EVER removes a volume. `docker volume create` succeeds on a volume that
 # already exists, so this run can't prove it made the one it holds: a concurrent standup,
 # a restore, or a flaky `inspect` in step 1 could put a real island there, and a rollback
-# would delete it (Noether, Carnot, Tesla, PR#405 r2). A failed birth stops with the one
-# command that finishes it, and that command is safe on ANY volume: `--new-island`
-# creates with O_EXCL and refuses if a database is already there.
+# would delete it (Noether, Carnot, Tesla, PR#405 r2).
+#
+# The birth is a COPY of the image's seed (/app/seed/aiko.db, an empty island built at
+# `docker build`; the gateway itself cannot create one). It copies only into a /data that
+# is COMPLETELY empty, and that rule, not step 1's `volume inspect`, is what keeps a lost
+# database from coming back as an empty island: every volume that has served holds the
+# worker lock beside its db (.aiko-worker.lock, written on every boot), so it is never
+# empty, even with aiko.db gone. A wrong guess in step 1 therefore refuses here, loudly
+# (PR#405 r3 finding 1). `set -C` makes the write itself no-clobber (O_EXCL).
 # "$@" = island_compose's leading options (--build-overlay, or none).
+BIRTH_SH='set -C
+if [ -n "$(ls -A /data)" ]; then
+  echo "standup: /data is not empty, so this volume has held an island (or a failed birth). Refusing to copy an empty island over it." >&2
+  ls -la /data >&2
+  exit 3
+fi
+cat /app/seed/aiko.db > /data/aiko.db'
 birth_island() {
   docker volume create "$DATA_VOLUME" >/dev/null || die "could not create volume $DATA_VOLUME"
-  island_compose "$@" run --rm --no-deps chat-island python -m aiko_gateway.migrate --new-island \
-    || die "could not create the new island's database (see above). Volume $DATA_VOLUME exists but holds no island yet, so a re-run of standup will NOT retry this step. Fix the cause, then finish by hand: deploy/compose.sh run --rm --no-deps chat-island python -m aiko_gateway.migrate --new-island (safe: it refuses if a database is already there; if it says a partial aiko.db exists, move that aside first), then deploy/compose.sh up -d."
-  ok "created volume $DATA_VOLUME and the new island's database"
+  island_compose "$@" run --rm --no-deps chat-island sh -c "$BIRTH_SH" \
+    || die "could not give birth to the island in volume $DATA_VOLUME (see above). If /data was not empty, this box has held an island: restore it (docs/runbooks/backup-and-rollback.md), don't stand up a new one. If the copy itself failed, see that runbook's \"A failed birth\" section."
+  ok "created volume $DATA_VOLUME and the new island's database (from the image's seed)"
 }
 if [ "$FROM_SOURCE" = "true" ]; then
   log "Step 3/$TOTAL — building the island image from source + starting (gateway + broker + registrar + ChatServer)"

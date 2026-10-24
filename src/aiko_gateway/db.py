@@ -25,7 +25,7 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.orm import DeclarativeBase
 
 from .config import settings
-from .worker_guard import open_only, sqlite_file
+from .worker_guard import open_only
 
 
 class Base(DeclarativeBase):
@@ -87,9 +87,8 @@ SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=
 # One owner for the "not migrated at all" refusal, raised by whichever layer sees it
 # first, so the order of the two checks in verify_schema() cannot change what an
 # unmanaged DB is told (Noether, PR#392 r6). The fix it names is the one that works:
-# ``python -m aiko_gateway.migrate`` adopts a pre-alembic DB (and, with
-# ``--new-island``, builds a new one), where a bare ``alembic upgrade head`` dies on
-# CREATE TABLE users.
+# ``python -m aiko_gateway.migrate`` adopts a pre-alembic DB, where a bare
+# ``alembic upgrade head`` dies on CREATE TABLE users.
 NOT_MIGRATED_MESSAGE = (
     "DB is not migrated: no alembic_version table. The container entrypoint runs "
     "`python -m aiko_gateway.migrate` before serving; if you are running uvicorn "
@@ -187,11 +186,9 @@ async def verify_schema() -> None:
     # the schema is AHEAD and gives the working fix (Tesla, PR#392 r4).
     from .migrate import require_database_file  # lazy: migrate imports db.Base (cycle)
 
-    db = sqlite_file(settings.db_url)
-    if db is not None:
-        # The message only: the engine is open-only, so the connect below could not
-        # have created the file either way. This names the cause and the fix.
-        require_database_file(db)
+    # The message only: the engine is open-only, so the connect below could not have
+    # created the file either way. This names the cause and the repair.
+    require_database_file(settings.db_url)
     async with engine.connect() as conn:
         await conn.run_sync(_assert_at_head)
         await conn.run_sync(_assert_schema_current)

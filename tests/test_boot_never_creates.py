@@ -1,5 +1,5 @@
 """Starting never creates an island: every door to the database opens it open-only,
-and ``--new-island`` is the one way a database is made.
+and the gateway has no way to make one: ``scripts/build_seed.py`` builds the image's seed.
 
 The bad outcome this file pins: a lost or damaged ``aiko.db`` coming back as a NEW,
 EMPTY island that serves (every account, message and key gone). It is not detected
@@ -7,7 +7,7 @@ here, it is impossible: no connect can create the file. So each refuse arm asser
 refusal AND that nothing was created, and each door (the migrator, the app's engine,
 lifespan's ``verify_schema``, a hand-run alembic) is driven against a missing file.
 The admit arms are positive controls: an existing island must still boot, and
-``--new-island`` must still build one, or a standup or every live island breaks.
+the seed builder must still build one, or a standup or every live island breaks.
 """
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from alembic import command
 from sqlalchemy import text
 
 from aiko_gateway import migrate
+import build_seed
 from aiko_gateway.config import settings
 from aiko_gateway.worker_guard import open_only
 
@@ -55,29 +56,32 @@ def _canary(db) -> list[str]:
 
 # --- admit arms (positive controls) -------------------------------------------
 
-def test_new_island_builds_a_fresh_database_at_head(tmp_path, monkeypatch) -> None:
+def test_the_seed_builder_builds_a_fresh_database_at_head(tmp_path, monkeypatch) -> None:
     db = _point_app_at(tmp_path, monkeypatch)
-    migrate.run(new_island=True)
+    build_seed.build()
     assert {"users", "alembic_version"} <= _tables(db)
     assert sorted(p.name for p in tmp_path.iterdir()) == ["aiko.db"], "no side files"
 
 
 def test_an_existing_island_boots_without_the_flag(tmp_path, monkeypatch) -> None:
     db = _point_app_at(tmp_path, monkeypatch)
-    migrate.run(new_island=True)
+    build_seed.build()
     _plant_canary(db, "melb")
     migrate.run()  # every ordinary start
     assert _canary(db) == ["melb"]
 
 
-def test_main_routes_the_argument_and_rejects_anything_else(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize("arg", ["--new-island", "--create", "--seed"])
+def test_the_migrator_takes_no_arguments_so_no_flag_can_create(tmp_path, monkeypatch, arg) -> None:
+    """The create mode PR#405 r1-r3 reviewed (`--new-island`) is gone, not hidden: any
+    argument is a usage error, and nothing is created (Nick, 2026-10-25)."""
     db = _point_app_at(tmp_path, monkeypatch)
     with pytest.raises(SystemExit, match="usage"):
-        migrate.main(["migrate", "--new-islnd"])
+        migrate.main(["migrate", arg])
     assert not db.exists()
-    migrate.main(["migrate", "--new-island"])
+    build_seed.build()
+    migrate.main(["migrate"])  # the plain start admits an island
     assert "users" in _tables(db)
-    migrate.main(["migrate"])  # and the plain start admits it
 
 
 def test_a_path_with_uri_metacharacters_still_migrates(tmp_path, monkeypatch) -> None:
@@ -86,7 +90,7 @@ def test_a_path_with_uri_metacharacters_still_migrates(tmp_path, monkeypatch) ->
     on the resulting `%` (Noether, PR#399 r2). (`?` can't appear: DB_URL itself reads
     it as a query string.)"""
     db = _point_app_at(tmp_path, monkeypatch, name="50% off #2.db")
-    migrate.run(new_island=True)
+    build_seed.build()
     migrate.run()
     assert sorted(p.name for p in tmp_path.iterdir()) == ["50% off #2.db"]
     assert "users" in _tables(db)
@@ -102,7 +106,7 @@ def test_a_uri_form_db_url_is_opened_open_only_too(tmp_path, monkeypatch) -> Non
     with pytest.raises(RuntimeError, match="MIGRATE_REFUSE_NO_DATABASE"):
         migrate.run()
     assert not db.exists()
-    migrate.run(new_island=True)
+    build_seed.build()
     assert "users" in _tables(db)
 
 
@@ -126,7 +130,7 @@ def test_a_database_that_vanishes_after_the_check_is_not_reborn(tmp_path, monkey
     open-only, so a file removed between the check and the connect makes the connect
     FAIL rather than create it."""
     db = _point_app_at(tmp_path, monkeypatch)
-    migrate.run(new_island=True)
+    build_seed.build()
     real = migrate._table_names
 
     async def vanish_then_look():
@@ -156,21 +160,21 @@ def test_a_database_with_no_island_in_it_is_not_built_into_one(tmp_path, monkeyp
 
 
 @pytest.mark.parametrize("what", ["an island", "a symlink to an island"])
-def test_new_island_refuses_when_anything_is_already_there(tmp_path, monkeypatch, what) -> None:
+def test_the_seed_builder_refuses_when_anything_is_already_there(tmp_path, monkeypatch, what) -> None:
     db = _point_app_at(tmp_path, monkeypatch)
     real = tmp_path / "real.db"
     _point_app_at(tmp_path, monkeypatch, name="real.db")
-    migrate.run(new_island=True)
+    build_seed.build()
     _plant_canary(real, "melb")
     if what == "a symlink to an island":
         db.symlink_to(real)
         _point_app_at(tmp_path, monkeypatch)
-    with pytest.raises(RuntimeError, match="MIGRATE_REFUSE_EXISTS"):
-        migrate.run(new_island=True)
+    with pytest.raises(RuntimeError, match="SEED_REFUSE_EXISTS"):
+        build_seed.build()
     assert _canary(real) == ["melb"]
 
 
-def test_new_island_refuses_a_dangling_symlink_and_creates_nothing(tmp_path, monkeypatch) -> None:
+def test_the_seed_builder_refuses_a_dangling_symlink_and_creates_nothing(tmp_path, monkeypatch) -> None:
     """The case where only the UNRESOLVED path can refuse: the link's target does not
     exist, so resolving first hands the creator a free path and it creates the target
     (Noether, Carnot, Tesla, PR#405 r1). The arm above can't see this, because its
@@ -179,8 +183,8 @@ def test_new_island_refuses_a_dangling_symlink_and_creates_nothing(tmp_path, mon
     lost = tmp_path / "elsewhere" / "lost.db"
     lost.parent.mkdir()
     db.symlink_to(lost)
-    with pytest.raises(RuntimeError, match="MIGRATE_REFUSE_EXISTS"):
-        migrate.run(new_island=True)
+    with pytest.raises(RuntimeError, match="SEED_REFUSE_EXISTS"):
+        build_seed.build()
     assert not lost.exists()
 
 
@@ -189,7 +193,7 @@ def test_a_hand_run_alembic_cannot_build_an_island_into_an_empty_file(
         tmp_path, monkeypatch, contents) -> None:
     """Open-only stops a missing FILE being created; the producer of an empty island
     from an existing empty file is the baseline migration itself, and it refuses unless
-    the run is --new-island (claude-skills control, Carnot 4/4, PR#405 r1)."""
+    the run carries the seed-build capability (claude-skills control, Carnot 4/4, PR#405 r1)."""
     db = _point_app_at(tmp_path, monkeypatch)
     if contents == "zero-byte":
         db.touch()
@@ -204,8 +208,8 @@ def test_a_hand_run_alembic_cannot_build_an_island_into_an_empty_file(
 def _pre_alembic_island(tmp_path, monkeypatch):
     """An island at the baseline schema with no stamp: the live prod db before alembic."""
     db = _point_app_at(tmp_path, monkeypatch)
-    migrate._create_empty(db)
-    command.upgrade(migrate._alembic_config(new_island=True), "0001")
+    build_seed.create_empty(db)
+    command.upgrade(migrate._alembic_config(seed_build=True), "0001")
     with sqlite3.connect(db) as c:
         c.execute("DROP TABLE alembic_version")
         # Identity as file metadata, not a table: adoption verifies the schema EQUALS the
@@ -238,7 +242,7 @@ def test_a_hand_run_alembic_on_an_unstamped_island_says_adopt_and_harms_nothing(
 def test_an_unreadable_directory_is_named_as_that_not_as_a_missing_database(
         tmp_path, monkeypatch) -> None:
     """`Path.exists()` says False when it can't LOOK, which would send an operator with
-    a permissions problem to restore a backup or run --new-island (Maxwell, PR#405 r1)."""
+    a permissions problem to restore a backup (Maxwell, PR#405 r1)."""
     data = tmp_path / "data"
     data.mkdir()
     monkeypatch.setattr(settings, "db_url", f"sqlite+aiosqlite:///{data / 'aiko.db'}")
@@ -286,4 +290,66 @@ def test_a_hand_run_alembic_upgrade_creates_nothing(tmp_path, monkeypatch) -> No
     db = _point_app_at(tmp_path, monkeypatch)
     with pytest.raises(Exception, match="unable to open database file"):
         command.upgrade(migrate._alembic_config(), "head")
+    assert not db.exists()
+
+
+# --- what the refusals SAY: they name the repair, never a way to create -----------
+# An operator reading a refusal is on a box whose island is in doubt, and "move it
+# aside" or "create one" are the two steps that turn a lost island into an empty one
+# (PR#405 r3). So every gateway refusal is collected here and held to the same rule; a
+# new refusal that isn't added to this list is the gap to look for in review.
+
+
+def _refusal(tmp_path, monkeypatch, case: str) -> str:
+    db = _point_app_at(tmp_path, monkeypatch)
+    if case == "missing":
+        go = migrate.run
+    elif case == "dangling symlink":
+        db.symlink_to(tmp_path / "lost.db")
+        go = migrate.run
+    elif case == "empty file":
+        db.touch()
+        go = migrate.run
+    elif case == "empty file, hand-run alembic":
+        db.touch()
+        go = lambda: command.upgrade(migrate._alembic_config(), "head")  # noqa: E731
+    elif case == "postgres, empty":
+        go = lambda: (_ for _ in ()).throw(  # noqa: E731
+            RuntimeError(migrate.not_an_island_message(None, "is empty")))
+    with pytest.raises(RuntimeError) as refused:
+        go()
+    return str(refused.value)
+
+
+REFUSALS = ["missing", "dangling symlink", "empty file", "empty file, hand-run alembic",
+            "postgres, empty"]
+
+
+@pytest.mark.parametrize("case", REFUSALS)
+def test_no_refusal_offers_a_way_to_create_or_to_move_the_database(
+        tmp_path, monkeypatch, case) -> None:
+    msg = _refusal(tmp_path, monkeypatch, case)
+    assert "MIGRATE_REFUSE_" in msg
+    for never in ("aside", "--new-island", "build_seed", "seed"):
+        assert never not in msg.lower(), f"refusal mentions {never!r}: {msg}"
+    assert "restore" in msg and "standup" in msg
+
+
+def test_a_dangling_symlink_is_named_as_one_on_a_plain_start(tmp_path, monkeypatch) -> None:
+    """It used to read as a plain missing database and send the operator to a create
+    command, which then refused the link: a loop (PR#405 r3)."""
+    msg = _refusal(tmp_path, monkeypatch, "dangling symlink")
+    assert "is a symlink to" in msg and "lost.db" in msg
+    assert not (tmp_path / "lost.db").exists()
+
+
+def test_offline_sql_of_the_baseline_needs_no_capability_and_touches_nothing(
+        tmp_path, monkeypatch, capsys) -> None:
+    """`alembic upgrade --sql` prints DDL and opens no database, so the baseline's gate
+    has nothing to protect and no connection to inspect (PR#405 r3). To 0001 only:
+    measured, offline past it never worked here, since the batch_alter_table rebuilds
+    need a live connection to reflect from (alembic CommandError on `memberships`)."""
+    db = _point_app_at(tmp_path, monkeypatch)
+    command.upgrade(migrate._alembic_config(), "0001", sql=True)
+    assert "CREATE TABLE users" in capsys.readouterr().out
     assert not db.exists()
