@@ -308,7 +308,8 @@ def test_both_boot_layers_refuse_a_forward_migrated_db(
         migrate.run()
     # The advice is the load, not the marker (Tesla, PR#392 r2): the message must
     # send the operator to a stopped-stack restore, never to `alembic upgrade head`.
-    assert "docker compose down" in str(refused.value)
+    # `deploy/compose.sh down`: a bare `docker compose` on a box refuses since #401.
+    assert "deploy/compose.sh down" in str(refused.value)
     assert "restore the database backup" in str(refused.value)
     assert "upgrade head" not in str(refused.value)
     # Stamping would silence the guard for good (Tesla, PR#392 r4): the message may

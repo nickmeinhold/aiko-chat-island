@@ -98,7 +98,6 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from urllib.parse import quote
 
 from alembic import command
 from alembic.autogenerate import compare_metadata
@@ -106,11 +105,11 @@ from alembic.config import Config
 from alembic.runtime.migration import MigrationContext
 from alembic.script import ScriptDirectory
 from sqlalchemy import MetaData, create_engine, inspect
-from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
 from .config import settings
+from .db import non_creating_url
 from .domain import models  # noqa: F401 — register tables on Base.metadata
 from .worker_guard import LOCK_FILENAME, _lock_path, sqlite_file
 
@@ -144,30 +143,37 @@ def _lived_evidence(db: Path) -> list[Path]:
     covered by the sentinel only, after its first successful run.)"""
     found: list[Path] = []
     sentinel = _sentinel_path(db)
-    if sentinel.exists():  # EACCES et al. raise here: fail closed, never "no evidence"
+    # `_present`, not `.exists()`: `.exists()` answers False when it can't look, which
+    # here would mean "no evidence" (the old comment claimed EACCES raised; measured
+    # false, PR#404 r2).
+    if _present(sentinel):
         found.append(sentinel)
     for lock in {db.parent / LOCK_FILENAME, _lock_path()}:
-        if lock is not None and lock.exists():
+        if lock is not None and _present(lock):
             found.append(lock)
     return found
 
 
 def _non_creating_url(db: Path) -> str:
-    """``settings.db_url`` reopened as an SQLite URI with ``mode=rw``: the file must
-    already exist, and no connect can create it. On a lived volume every connect the
-    migrator makes (its own and alembic's, which reads ``settings.db_url``) goes
-    through this, so a db that vanishes after the existence check makes the next
-    connect FAIL, not birth an empty island (Carnot + Tesla, PR#399 r1)."""
-    url = make_url(settings.db_url)
-    # Percent-encode: `?`, `#` and `%` in a path mean something in an SQLite URI.
-    return url.set(database=f"file:{quote(str(db), safe='/')}", query={**url.query, "mode": "rw", "uri": "true"}
-                   ).render_as_string(hide_password=False)
+    """``settings.db_url`` reopened with ``mode=rw`` (see ``db.non_creating_url``). On a
+    lived volume every connect the migrator makes (its own and alembic's, which reads
+    ``settings.db_url``) goes through this, so a db that vanishes after the existence
+    check makes the next connect FAIL, not birth an empty island (Carnot + Tesla,
+    PR#399 r1)."""
+    return non_creating_url(settings.db_url, db)
 
 
 def refuse_missing_db_message(db: Path, evidence: list[Path], why: str) -> str:
     """Both fixes below are exercised from the refusing state by the test suite
     (test_volume_sentinel.py), so neither is advice that can't work (#393)."""
     names = " ".join(str(p) for p in evidence)
+    raw = settings.witness_dir.strip()
+    # On an enrolled host the tally still names the old island after the volume's
+    # records are deleted, so the next start would refuse as unenrolled: the "new
+    # island" fix has to go through enrolment there (Carnot, PR#404 r2).
+    then = ("then run `deploy/compose.sh enroll --replace-lineage <island_id>` (this "
+            "host has a volume tally, and only enrolment may record a new island)"
+            if raw and raw != WITNESS_DISARMED else "then start")
     return (
         f"MIGRATE_REFUSE_MISSING_DB: the database {db} {why}, but this volume has "
         f"hosted an island before ({names}). Starting would create a NEW, EMPTY island "
@@ -176,9 +182,9 @@ def refuse_missing_db_message(db: Path, evidence: list[Path], why: str) -> str:
         f"backup to {db} (`deploy/update.sh` keeps them in backups/ beside "
         "docker-compose.yml; see docs/runbooks/backup-and-rollback.md), then start. "
         "Only if you really intend a brand-new, empty island on this volume: take the "
-        "stack down first (`docker compose down`; the worker lock is held by any gateway "
-        "still running, and deleting a held lock lets a second gateway start beside it), "
-        f"then delete {names}, then start.")
+        "stack down first (`deploy/compose.sh down`; the worker lock is held by any "
+        "gateway still running, and deleting a held lock lets a second gateway start "
+        f"beside it), then delete {names}, {then}.")
 
 
 # --- the lineage predicate (design 20) -------------------------------------------
@@ -292,6 +298,23 @@ def _unreadable(path: Path, e: BaseException) -> RuntimeError:
         "becomes readable later, without anyone having checked it.")
 
 
+def _present(path: Path) -> bool:
+    """Whether ``path`` exists, where only "no such file" means no. ``os.path.exists``,
+    ``lexists`` AND ``pathlib.Path.exists`` all answer ``False`` when they merely
+    COULDN'T LOOK (a parent dir without search permission): measured, PR#404 r2. So
+    "can't tell" read as "absent", which on this module's paths means "no evidence an
+    island lived here" or "no enrolment to protect". ``lstat`` (no symlink follow: a
+    link counts as present, the fail-closed direction for evidence) raises instead, and
+    anything but ``FileNotFoundError`` refuses as unreadable."""
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError as e:
+        raise _unreadable(path, e) from e
+    return True
+
+
 def read_tally(witness: Path) -> Tally:
     """The host's tally, or a refusal. Missing, a symlink, or malformed all refuse as
     unenrolled; a read error the host caused refuses as unreadable. There is no partial
@@ -309,8 +332,8 @@ def read_tally(witness: Path) -> Tally:
         if _environmental(e):
             raise _unreadable(path, e) from e
         raise _unenrolled(f"{path} could not be read as a tally ({type(e).__name__}: {e})") from e
-    if not tally.lineage or not tally.db_path:
-        raise _unenrolled(f"{path} has an empty lineage or db_path")
+    if not tally.lineage or not tally.db_path or not tally.island_id:
+        raise _unenrolled(f"{path} has an empty lineage, db_path or island_id")
     return tally
 
 
@@ -329,6 +352,15 @@ def check_lineage(db: Path | None) -> None:
                        f"{tally.db_path}")
     if str(db) != tally.db_path:
         raise _foreign(f"this container opens {db}, but this host enrolled {tally.db_path}")
+    # The third terminal: the island this process will NAME itself on the mesh. ISLAND_ID
+    # is host-forwarded config, so without this the right volume could serve under
+    # another island's name (Tesla, PR#404 r2).
+    from .domain.peers_service import self_island_id  # lazy: keep migrate's import light
+
+    named = self_island_id(settings)
+    if named != tally.island_id:
+        raise _foreign(f"this container names itself {named!r}, but this host enrolled "
+                       f"the island {tally.island_id!r} on this volume")
     sentinel = _sentinel_path(db)
     try:
         content = _read_text_nofollow(sentinel).strip()
@@ -344,12 +376,20 @@ def check_lineage(db: Path | None) -> None:
                        f"({type(e).__name__}: {e})") from e
     if content != tally.lineage:
         raise _foreign(f"{sentinel} reads {content!r}, but this host enrolled {tally.lineage!r}")
-    # The right lineage with its database gone: refuse HERE, before any caller can
-    # connect. The lifespan's engine is a creating one, so "the schema check refuses
-    # later" would still leave a 0-byte file born where only absence was honest
-    # (Tesla, PR#404 r1). Same message the migrator gives: one rule, two entrances.
-    if not db.exists():
-        raise RuntimeError(refuse_missing_db_message(db, [sentinel], "is missing"))
+    # The right lineage with its database gone, or not a database: refuse HERE, before
+    # any caller connects, in ONE voice for both entrances (Tesla, PR#404 r1 + r2). The
+    # db is typed like the records: a non-empty regular file, not followed through a
+    # link. "Something is at the path" let a 0-byte file through to a connect, and on the
+    # uvicorn entrance to the worker lock and a refusal in the schema's voice.
+    try:
+        st = os.lstat(db)
+    except FileNotFoundError:
+        raise RuntimeError(refuse_missing_db_message(db, [sentinel], "is missing")) from None
+    except OSError as e:
+        raise _unreadable(db, e) from e
+    if not stat.S_ISREG(st.st_mode) or st.st_size == 0:
+        raise RuntimeError(refuse_missing_db_message(
+            db, [sentinel], "is not a database (empty, or not a regular file)"))
 
 
 def _sentinel_content() -> str:
@@ -367,7 +407,7 @@ def _write_sentinel(db: Path) -> None:
     """Record that this volume now hosts an island: write-tmp, fsync, rename, fsync
     the directory, so a crash leaves either no sentinel or a whole one."""
     final = _sentinel_path(db)
-    if final.exists():
+    if _present(final):
         return
     tmp = final.with_name(final.name + ".tmp")
     # The volume is untrusted until enrolled, and enrolment is exactly when this write
@@ -375,7 +415,7 @@ def _write_sentinel(db: Path) -> None:
     # aiko.db would otherwise be truncated into a timestamp (Tesla, PR#404 r1). A
     # leftover from a crash is removed first; unlinking a symlink never touches its
     # target.
-    if os.path.lexists(tmp):
+    if _present(tmp):
         os.unlink(tmp)
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
     with os.fdopen(fd, "w") as f:
@@ -545,7 +585,7 @@ def refuse_unknown_message(status: SchemaStatus) -> str:
         f"{sorted(status.unknown)} not present in this image's migration scripts, so "
         "this image is OLDER than the schema (or the stamp is from a squashed "
         "history, or corrupt). Refusing to start. To roll back across a migration: "
-        "take the stack down (`docker compose down`; a merely stopped `restart: "
+        "take the stack down (`deploy/compose.sh down`; a merely stopped `restart: "
         "always` container comes back when the Docker daemon restarts), restore the "
         "database backup taken before the newer image migrated it (this LOSES every "
         "write made since that backup), then start this image. Do NOT `alembic stamp` this volume to make the error go away: a "
@@ -571,9 +611,13 @@ def _refuse_enroll_over_a_tally() -> None:
     aside on the host first, so this refusal never blocks it."""
     raw = settings.witness_dir.strip()
     if not raw or raw == WITNESS_DISARMED:
-        return  # nothing mounted: an unenrolled host by construction
+        # Unmounted is not unenrolled: it means nobody looked (Tesla, PR#404 r2).
+        # `compose.sh enroll` always mounts witness/, so in production an unarmed
+        # `--enroll` refuses exactly as an unarmed start does.
+        _witness_dir()  # raises MIGRATE_REFUSE_UNWITNESSED in production
+        return  # outside production: no witness, nothing to protect
     tally = Path(raw) / TALLY_FILENAME
-    if os.path.lexists(tally):
+    if _present(tally):  # NOT os.path.lexists: it says False when it can't look (r2)
         raise RuntimeError(
             f"MIGRATE_REFUSE_ENROLLED: {tally} already exists, so this host has enrolled "
             "an island. `--enroll` only creates a first enrolment; it will not run over "
@@ -601,7 +645,7 @@ def run(*, enrolling: bool = False) -> None:
     if not evidence:
         _migrate(db, evidence)
         return
-    if not db.exists():
+    if not _present(db):
         raise RuntimeError(refuse_missing_db_message(db, evidence, "is missing"))
     original = settings.db_url
     settings.db_url = _non_creating_url(db)
@@ -665,7 +709,7 @@ def _migrate(db: Path | None, evidence: list[Path]) -> None:
             _write_sentinel(db)  # fresh volume or first adoption; a no-op thereafter
         except OSError as e:
             sentinel = _sentinel_path(db)
-            if sentinel.exists():
+            if _present(sentinel):
                 # The rename landed; only the directory fsync failed. The record is
                 # there, so refusing would describe a failure that did not happen
                 # (Noether, PR#399 r3). Durability across a power cut is what's lost.

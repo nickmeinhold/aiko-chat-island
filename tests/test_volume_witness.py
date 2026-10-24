@@ -38,9 +38,11 @@ def _arm(monkeypatch, witness) -> None:
 
 def _enroll(db, witness, *, lineage: str | None = None, db_path: str | None = None) -> str:
     """What `deploy/compose.sh enroll` writes: the tally, from the sentinel."""
+    from aiko_gateway.domain.peers_service import self_island_id
+
     lineage = lineage if lineage is not None else migrate._sentinel_path(db).read_text().strip()
     (witness / migrate.TALLY_FILENAME).write_text(json.dumps(
-        {"lineage": lineage, "db_path": db_path or str(db), "island_id": "test-island"}))
+        {"lineage": lineage, "db_path": db_path or str(db), "island_id": self_island_id(settings)}))
     return lineage
 
 
@@ -123,14 +125,58 @@ def test_production_refuses_an_unarmed_start(tmp_path, monkeypatch, value) -> No
     assert not db.exists(), "the arming check must run before anything connects"
 
 
-def test_production_enroll_still_runs_without_a_witness(tmp_path, monkeypatch) -> None:
-    """`--enroll` skips the lineage predicate and nothing else; it is the one way a
-    production volume gets its first sentinel before the tally exists."""
-    db, _ = _volume(tmp_path, monkeypatch)
+def test_production_enroll_runs_with_the_witness_mounted_and_no_tally(tmp_path, monkeypatch) -> None:
+    """`--enroll` skips the lineage predicate and nothing else; with the witness dir
+    mounted and empty it is how a production volume gets its first sentinel."""
+    db, witness = _volume(tmp_path, monkeypatch)
     monkeypatch.setattr(settings, "environment", "production")
-    monkeypatch.setattr(settings, "witness_dir", "")
+    _arm(monkeypatch, witness)
     migrate.run(enrolling=True)
     assert migrate._sentinel_path(db).exists()
+
+
+@pytest.mark.parametrize("value", ["", migrate.WITNESS_DISARMED])
+def test_production_enroll_without_the_witness_refuses(tmp_path, monkeypatch, value) -> None:
+    """Unmounted is not unenrolled: it means nobody looked (Tesla, PR#404 r2)."""
+    db, _ = _volume(tmp_path, monkeypatch)
+    monkeypatch.setattr(settings, "environment", "production")
+    monkeypatch.setattr(settings, "witness_dir", value)
+    with pytest.raises(RuntimeError, match="MIGRATE_REFUSE_UNWITNESSED"):
+        migrate.run(enrolling=True)
+    assert not db.exists()
+
+
+def test_the_container_naming_itself_another_island_refuses(tmp_path, monkeypatch) -> None:
+    """The third terminal: the right volume must not serve under another island's
+    name, and ISLAND_ID is host-forwarded config (Tesla, PR#404 r2)."""
+    _lived_island(tmp_path, monkeypatch)
+    monkeypatch.setattr(settings, "island_id", "some-other-island")
+    with pytest.raises(RuntimeError, match="MIGRATE_REFUSE_FOREIGN_LINEAGE"):
+        migrate.run()
+
+
+@pytest.mark.parametrize("shape", ["zero-byte", "directory", "symlink"])
+def test_a_db_that_is_not_a_database_refuses_in_one_voice(tmp_path, monkeypatch, shape) -> None:
+    """The db is typed like the records: a non-empty regular file, not followed through
+    a link. Both entrances refuse as MISSING_DB, and the app takes no lock (Tesla r2)."""
+    db, _ = _lived_island(tmp_path, monkeypatch)
+    real = db.with_name("real.db")
+    db.rename(real)
+    if shape == "zero-byte":
+        db.touch()
+    elif shape == "directory":
+        db.mkdir()
+    else:
+        os.symlink(real, db)
+    # A link is resolved by the URL->path derivation (sqlite_file), so it refuses
+    # earlier and more precisely: "this container opens real.db, but this host enrolled
+    # aiko.db". The other two shapes reach the db typing and refuse as MISSING_DB.
+    code = "MIGRATE_REFUSE_FOREIGN_LINEAGE" if shape == "symlink" else "MIGRATE_REFUSE_MISSING_DB"
+    with pytest.raises(RuntimeError, match=code):
+        migrate.run()
+    with pytest.raises(RuntimeError, match=code):
+        _boot_app_without_the_migrator(monkeypatch)
+    _assert_volume_untouched(db)
 
 
 def test_the_enroll_flag_is_exact(tmp_path, monkeypatch) -> None:
@@ -358,6 +404,76 @@ def test_an_unreadable_record_says_so_and_does_not_send_you_to_enrol(tmp_path, m
         path.chmod(0o644)
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root searches a mode-000 dir; EACCES can't be produced")
+def test_enroll_over_a_tally_it_cannot_see_still_refuses(tmp_path, monkeypatch) -> None:
+    """`os.path.lexists` says False when it CAN'T LOOK. A real tally inside an
+    unsearchable witness dir must not read as "no enrolment", or `--enroll` skips the
+    lineage check and migrates whatever is mounted (Maxwell, PR#404 r2, measured)."""
+    db, witness = _lived_island(tmp_path, monkeypatch)
+    before = db.read_bytes()
+    witness.chmod(0)
+    try:
+        with pytest.raises(RuntimeError, match="MIGRATE_REFUSE_WITNESS_UNREADABLE"):
+            migrate.main(["migrate", "--enroll"])
+    finally:
+        witness.chmod(0o755)
+    assert db.read_bytes() == before
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root searches a mode-000 dir; EACCES can't be produced")
+def test_evidence_that_cannot_be_looked_at_is_not_no_evidence(tmp_path, monkeypatch) -> None:
+    """The class, at the pre-existing sentinel site: `_lived_evidence` once trusted
+    `.exists()` to raise on EACCES (its comment said so). It returns False instead."""
+    db, _ = _volume(tmp_path, monkeypatch)
+    migrate.run()  # unarmed: a real island
+    real = migrate._sentinel_path(db)
+    monkeypatch.setattr(migrate, "_sentinel_path", lambda d: tmp_path / "locked" / real.name)
+    (tmp_path / "locked").mkdir()
+    (tmp_path / "locked").chmod(0)
+    try:
+        with pytest.raises(RuntimeError, match="MIGRATE_REFUSE_WITNESS_UNREADABLE"):
+            migrate._lived_evidence(db)
+    finally:
+        (tmp_path / "locked").chmod(0o755)
+
+
+def test_the_new_island_remedy_goes_through_enrolment_on_an_enrolled_host(tmp_path, monkeypatch) -> None:
+    """Deleting the volume's records is not enough where a tally exists: the next start
+    would refuse as unenrolled, so the advice must name enrolment (Carnot, PR#404 r2)."""
+    db, _ = _lived_island(tmp_path, monkeypatch)  # armed
+    msg = migrate.refuse_missing_db_message(db, [migrate._sentinel_path(db)], "is missing")
+    assert "enroll --replace-lineage" in msg
+    monkeypatch.setattr(settings, "witness_dir", "")
+    assert "enroll" not in migrate.refuse_missing_db_message(db, [migrate._sentinel_path(db)], "is missing")
+
+
+def test_the_serving_engine_never_creates_the_db_in_production(tmp_path, monkeypatch) -> None:
+    """The app is not what creates databases; the migrator is. In production the
+    serving URL is non-creating, so a db that vanishes after the witness looked makes
+    the connect fail instead of birthing an empty file: the window is removed, not
+    guarded (Carnot, PR#404 r2)."""
+    from sqlalchemy import text
+
+    db, _ = _volume(tmp_path, monkeypatch)
+    monkeypatch.setattr(settings, "environment", "production")
+    url = db_module.serving_url()
+    assert "mode=rw" in url
+    engine = db_module.make_engine(url)
+
+    async def _connect() -> None:
+        try:
+            async with engine.connect() as conn:
+                await conn.execute(text("SELECT 1"))
+        finally:
+            await engine.dispose()
+
+    with pytest.raises(Exception):
+        asyncio.run(_connect())
+    assert not db.exists(), "the serving engine created a database"
+    monkeypatch.setattr(settings, "environment", "test")
+    assert db_module.serving_url() == settings.db_url
+
+
 def test_compose_pins_the_witness_as_a_literal_read_only_directory() -> None:
     """WITNESS_DIR is excluded from the forwarding invariant, which also removes it from
     every value check there, so THIS test is what pins its spelling. A `${WITNESS_DIR…}`
@@ -385,7 +501,9 @@ def test_a_link_planted_after_the_cleanup_still_cannot_truncate_the_db(tmp_path,
     before = db.read_bytes()
     tmp = migrate._sentinel_path(db).with_name(migrate._sentinel_path(db).name + ".tmp")
     os.symlink(db, tmp)
-    monkeypatch.setattr(migrate.os.path, "lexists", lambda p: False)
+    real_present = migrate._present
+    monkeypatch.setattr(migrate, "_present",
+                        lambda p: False if str(p) == str(tmp) else real_present(p))
     with pytest.raises(RuntimeError, match="MIGRATE_REFUSE_UNRECORDED"):
         migrate.run()
     assert db.read_bytes() == before, "the sentinel write followed a link into the db"

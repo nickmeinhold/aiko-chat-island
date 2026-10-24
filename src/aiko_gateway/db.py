@@ -18,7 +18,11 @@ the schema, so ``create_all`` can never silently paper over a missing revision.
 """
 from __future__ import annotations
 
+from pathlib import Path
+from urllib.parse import quote
+
 from sqlalchemy import event
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import (
     AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine,
 )
@@ -70,7 +74,33 @@ def make_engine(url: str) -> AsyncEngine:
     return engine
 
 
-engine = make_engine(settings.db_url)
+def non_creating_url(url: str, db: Path) -> str:
+    """``url`` reopened as an SQLite URI with ``mode=rw``: the file must already exist,
+    and no connect through it can create one. The one spelling, shared by the migrator
+    (on a lived volume) and the serving engine (in production)."""
+    parsed = make_url(url)
+    # Percent-encode: `?`, `#` and `%` in a path mean something in an SQLite URI.
+    return parsed.set(database=f"file:{quote(str(db), safe='/')}",
+                      query={**parsed.query, "mode": "rw", "uri": "true"}
+                      ).render_as_string(hide_password=False)
+
+
+def serving_url() -> str:
+    """The URL the SERVING app connects with. In production a file-backed db is opened
+    non-creating: the migrator (the entrypoint) is what creates databases, never the
+    app. So a db that is missing, or vanishes after the volume witness looked, makes the
+    first connect FAIL rather than birth an empty file (Carnot, PR#404 r2). That removes
+    the check-then-create window instead of guarding it. Dev and tests keep the plain
+    URL; their harnesses legitimately start from no file."""
+    from .worker_guard import sqlite_file  # no cycle: worker_guard needs only config
+
+    db = sqlite_file(settings.db_url)
+    if db is None or not settings.is_production:
+        return settings.db_url
+    return non_creating_url(settings.db_url, db)
+
+
+engine = make_engine(serving_url())
 # expire_on_commit=False is LOAD-BEARING, not a default (cage-match Kelvin + Wu). These
 # paths read ORM attributes AFTER commit and would MissingGreenlet-crash on a lazy reload
 # if it were True: create_outbound -> message_view (WS/REST fanout), ban_user route

@@ -292,7 +292,10 @@ def test_the_delete_remedy_takes_the_stack_down_BEFORE_deleting(tmp_path, monkey
     with pytest.raises(RuntimeError, match="MIGRATE_REFUSE_MISSING_DB") as refused:
         migrate.run()
     msg = str(refused.value)
-    assert msg.index("docker compose down") < msg.index("then delete")
+    # `deploy/compose.sh`, not bare `docker compose`: since #401 a bare compose on a box
+    # refuses (no pin), so that advice could not work (#393 class; PR#404 r2).
+    assert msg.index("deploy/compose.sh down") < msg.index("then delete")
+    assert "docker compose down" not in msg
 
 
 def test_an_existing_islandless_db_with_no_evidence_is_named_in_the_log(
