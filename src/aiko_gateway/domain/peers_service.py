@@ -327,6 +327,14 @@ def _host_of(base_url: str) -> str:
     return m.group(1).lower().replace(".", "-")
 
 
+def self_island_id(settings) -> str:
+    """THIS island's id: ``island_id``, or the base-url host when it is unset. The one
+    derivation, shared by the directory's self entry and the volume sentinel's island
+    name (design 20), so the two can't name the island differently."""
+    return (settings.island_id
+            or _host_of(_normalize_base_url(settings.gateway_base_url))).strip().lower()
+
+
 def build_directory_from_settings(settings) -> IslandDirectory:
     """Construct the process-wide IslandDirectory from config. Self id falls back to
     the base-url host when island_id is unset.
@@ -337,7 +345,7 @@ def build_directory_from_settings(settings) -> IslandDirectory:
     `GATEWAY_BASE_URL` keeps its name deliberately and is NOT part of that rename: a
     base_url names the gateway EDGE, not the island (docs/island-vs-gateway.md)."""
     base = _normalize_base_url(settings.gateway_base_url)
-    gid = (settings.island_id or _host_of(base)).strip().lower()
+    gid = self_island_id(settings)
     self_peer = coerce_island(
         {"id": gid, "displayName": settings.island_display_name, "baseURL": base})
     if self_peer is None:

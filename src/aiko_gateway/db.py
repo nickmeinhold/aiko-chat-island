@@ -179,6 +179,14 @@ async def verify_schema() -> None:
     # columns _assert_schema_current inspects, and on that schema the shape check
     # would misdiagnose "behind the code, run upgrade head". The revision check knows
     # the schema is AHEAD and gives the working fix (Tesla, PR#392 r4).
+    #
+    # Lineage BEFORE the first connect, and here as well as in the migrator: the
+    # migrator runs from the image's CMD, so `compose run chat-island uvicorn …`
+    # replaces it and would serve with no check at all. Nothing SERVES without it
+    # (design 20 v4, T3-1). Same predicate, not a copy.
+    from .migrate import _db_file, check_lineage  # lazy: migrate imports db.Base (cycle)
+
+    check_lineage(_db_file())
     async with engine.connect() as conn:
         await conn.run_sync(_assert_at_head)
         await conn.run_sync(_assert_schema_current)

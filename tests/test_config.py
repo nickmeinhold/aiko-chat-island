@@ -770,6 +770,7 @@ _NOT_FORWARDED: dict[str, str] = {
     "AIKO_MQTT_PORT": "compose-topology-owned",
     "AIKO_NAMESPACE": "compose-topology-owned",
     "DB_URL": "compose-topology-owned — the mounted aiko_data volume",
+    "WITNESS_DIR": "compose-topology-owned — the read-only witness/ mount; a host override would disarm or redirect the volume check (design 20)",
     "ENVIRONMENT": "static-by-design — this is what makes the image a prod image",
 }
 
@@ -1558,7 +1559,7 @@ def test_no_empty_compose_default_on_a_type_an_older_image_cannot_parse():
 # edits in two places and shows up twice in a diff.
 _EXPECTED_EXCLUSIONS = frozenset({
     "HOST", "PORT", "JWT_ALGORITHM",
-    "AIKO_MQTT_HOST", "AIKO_MQTT_PORT", "AIKO_NAMESPACE", "DB_URL", "ENVIRONMENT",
+    "AIKO_MQTT_HOST", "AIKO_MQTT_PORT", "AIKO_NAMESPACE", "DB_URL", "WITNESS_DIR", "ENVIRONMENT",
 })
 
 

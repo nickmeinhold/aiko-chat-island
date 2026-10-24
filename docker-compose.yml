@@ -63,6 +63,11 @@ services:
       # File-backed SQLite on the persistent volume below (4 slashes = absolute
       # path /data/aiko.db). aiosqlite dialect ships in the image (prod dep).
       DB_URL: sqlite+aiosqlite:////data/aiko.db
+      # The host's volume tally (design 20), read-only, as a DIRECTORY (a file bind
+      # would keep the old inode across the host's tmp+rename write). LITERAL, never
+      # interpolated: a host value here would disarm or redirect the check. In
+      # production the image REFUSES to boot without it (MIGRATE_REFUSE_UNWITNESSED).
+      WITNESS_DIR: /witness
       # aiko bus — OUR own broker, by service name on this project's network.
       AIKO_MQTT_HOST: mosquitto
       AIKO_MQTT_PORT: "1883"
@@ -319,6 +324,9 @@ services:
       # Persist the SQLite store across container recreates. External + stably named
       # so the store survives any project/service rename (see volumes: block).
       - aiko_data:/data
+      # Box-local, never synced from a tag (like image.env). Written only by
+      # `deploy/compose.sh enroll`; see docs/design/20-what-a-volume-can-witness.md.
+      - ./witness:/witness:ro
     depends_on:
       - chat
 

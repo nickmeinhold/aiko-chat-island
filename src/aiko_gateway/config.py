@@ -190,6 +190,13 @@ class Settings(BaseSettings):
     # ondelete=CASCADE, so the deploy dialect's behavior must be what dev exercises).
     # A relative path → an ./aiko_dev.db file in the working dir (gitignored).
     db_url: str = "sqlite+aiosqlite:///./aiko_dev.db"
+    # Where the host's volume tally lives inside the container (design 20): a
+    # read-only DIRECTORY mount (a file bind would keep the old inode across the
+    # host's tmp+rename write). In production, unset/empty REFUSES to boot
+    # (`MIGRATE_REFUSE_UNWITNESSED`): absence is never permission. The only disarm is
+    # the explicit value "disarmed", honoured in non-production environments only.
+    # Literal in compose, never forwarded from the host: steering it is the attack.
+    witness_dir: str = ""
 
     # --- auth (JWT) ---  dev default; deploy supplies via SOPS.
     jwt_secret: str = _DEV_JWT_SECRET

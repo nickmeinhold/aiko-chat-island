@@ -87,7 +87,9 @@ one-shot init container or an explicit lock rather than the per-replica entrypoi
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import sys
 import os
 import tempfile
 from dataclasses import dataclass
@@ -177,6 +179,140 @@ def refuse_missing_db_message(db: Path, evidence: list[Path], why: str) -> str:
         f"then delete {names}, then start.")
 
 
+# --- the lineage predicate (design 20) -------------------------------------------
+#
+# A record INSIDE the volume (the sentinel) proves the volume has lived. Only a record
+# OUTSIDE it (the host's tally, mounted read-only at WITNESS_DIR) proves the volume
+# belongs to this host's island, and then only its LINEAGE: a stale copy of this
+# island is indistinguishable from a legitimate restore, and serves by design.
+#
+# Lineage bytes can be rewritten in place under a stopped container, and
+# `restart: always` restarts it with no wrapper in the path, so this is a START-time
+# fact: it is checked by whatever serves, on every start. ONE function, called from
+# BOTH `run()` (the entrypoint) and lifespan's `verify_schema()`, because the
+# entrypoint is the image's CMD and any `run <command>` replaces it (design 20 v4,
+# T3-1); the `schema_status` pattern, for the same reason.
+
+TALLY_FILENAME = "volume.tally"
+WITNESS_DISARMED = "disarmed"
+
+
+@dataclass(frozen=True)
+class Tally:
+    lineage: str   # the sentinel's full content, stripped
+    db_path: str   # the db file this island serves from, as the container sees it
+    island_id: str
+
+
+def _witness_dir() -> Path | None:
+    """The armed witness directory, or None when the check is off. Off only in a
+    non-production environment (unset, or the explicit ``disarmed``). In production,
+    absence REFUSES: an unset variable is never permission (design 16's empty-pin
+    trap; same posture as ``jwt_secret``)."""
+    raw = settings.witness_dir.strip()
+    if raw and raw != WITNESS_DISARMED:
+        return Path(raw)
+    if settings.is_production:
+        why = ("is set to 'disarmed', which only a non-production environment may do"
+               if raw == WITNESS_DISARMED else "is not set")
+        raise RuntimeError(
+            f"MIGRATE_REFUSE_UNWITNESSED: WITNESS_DIR {why}, so nothing outside this "
+            "volume can say it is the right one. Refusing to start. The compose file "
+            "mounts the deploy dir's witness/ read-only at /witness and sets "
+            "WITNESS_DIR=/witness; a container created without them must be recreated "
+            "from the current compose (`deploy/compose.sh up -d`). See "
+            "docs/design/20-what-a-volume-can-witness.md.")
+    return None
+
+
+def _read_text_nofollow(path: Path) -> str:
+    """Read a small witness file, refusing to follow a symlink (``O_NOFOLLOW``): a
+    link could point the check at a file someone else controls."""
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        with os.fdopen(fd, "r", closefd=False) as f:
+            return f.read(64 * 1024)
+    finally:
+        os.close(fd)
+
+
+def _unenrolled(why: str) -> RuntimeError:
+    return RuntimeError(
+        f"MIGRATE_REFUSE_UNENROLLED: {why}. Refusing to start. With the stack down, "
+        "run `deploy/compose.sh enroll`: it shows which island is on this volume and "
+        "asks you to confirm it before recording it.")
+
+
+def _foreign(why: str) -> RuntimeError:
+    return RuntimeError(
+        f"MIGRATE_REFUSE_FOREIGN_LINEAGE: {why}. This is not the island this host "
+        "enrolled. Refusing to start: serving it would put another island's (or an "
+        "unrelated) database behind this island's name. If the right volume is "
+        "mounted elsewhere, mount that one. If this really is the island you want "
+        "here now, take the stack down and run `deploy/compose.sh enroll "
+        "--replace-lineage <island_id>`.")
+
+
+def read_tally(witness: Path) -> Tally:
+    """The host's tally, or a refusal. Missing, unreadable, a symlink, or malformed
+    all refuse the same way: there is no partial witness."""
+    path = witness / TALLY_FILENAME
+    try:
+        raw = _read_text_nofollow(path)
+        data = json.loads(raw)
+        tally = Tally(lineage=str(data["lineage"]).strip(),
+                      db_path=str(data["db_path"]), island_id=str(data["island_id"]))
+    except FileNotFoundError:
+        raise _unenrolled(f"{path} does not exist, so this host has not enrolled the "
+                          "island on this volume") from None
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        raise _unenrolled(f"{path} could not be read as a tally ({type(e).__name__}: {e})") from e
+    if not tally.lineage or not tally.db_path:
+        raise _unenrolled(f"{path} has an empty lineage or db_path")
+    return tally
+
+
+def check_lineage(db: Path | None) -> None:
+    """THE lineage predicate. Never connects, never writes. Raises a ``MIGRATE_REFUSE_*``
+    RuntimeError, or returns when the volume is the enrolled island (or the check is
+    off outside production)."""
+    witness = _witness_dir()
+    if witness is None:
+        return
+    tally = read_tally(witness)
+    if db is None:
+        # `:memory:` or a non-file backend: there is no volume to be the right one,
+        # and nothing to compare. Armed, that is a refusal, not a pass (Tesla, r3).
+        raise _foreign(f"DB_URL does not name a database file, but this host enrolled "
+                       f"{tally.db_path}")
+    if str(db) != tally.db_path:
+        raise _foreign(f"this container opens {db}, but this host enrolled {tally.db_path}")
+    sentinel = _sentinel_path(db)
+    try:
+        content = _read_text_nofollow(sentinel).strip()
+    except FileNotFoundError:
+        raise _unenrolled(
+            f"{sentinel} is missing, but this host enrolled an island here. The volume "
+            "was wiped or replaced, or a database was restored without its sentinel "
+            "(restore them as a pair; see docs/runbooks/backup-and-rollback.md)") from None
+    except OSError as e:  # a symlink (ELOOP under O_NOFOLLOW), EACCES, …: never a pass
+        raise _foreign(f"{sentinel} could not be read as this island's record "
+                       f"({type(e).__name__}: {e})") from e
+    if content != tally.lineage:
+        raise _foreign(f"{sentinel} reads {content!r}, but this host enrolled {tally.lineage!r}")
+
+
+def _sentinel_content() -> str:
+    """A new sentinel names its island beside the time it was written, so a later
+    enrolment can check the name, not just recognise a timestamp (design 20 v4: the
+    db stores no island identity). Older sentinels hold only the timestamp and are
+    never rewritten; the lineage comparison is on the whole string either way."""
+    from .domain.peers_service import self_island_id  # lazy: keep migrate's import light
+    island = self_island_id(settings)
+    stamp = datetime.now(timezone.utc).isoformat()
+    return f"{stamp} {island}" if island else stamp
+
+
 def _write_sentinel(db: Path) -> None:
     """Record that this volume now hosts an island: write-tmp, fsync, rename, fsync
     the directory, so a crash leaves either no sentinel or a whole one."""
@@ -185,7 +321,7 @@ def _write_sentinel(db: Path) -> None:
         return
     tmp = final.with_name(final.name + ".tmp")
     with open(tmp, "w") as f:
-        f.write(f"{datetime.now(timezone.utc).isoformat()}\n")
+        f.write(f"{_sentinel_content()}\n")
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, final)
@@ -369,12 +505,20 @@ async def _schema_status() -> SchemaStatus:
         await engine.dispose()
 
 
-def run() -> None:
+def run(*, enrolling: bool = False) -> None:
+    """Bring the database to head. ``enrolling`` is the explicit ``--enroll`` argv
+    mode `deploy/compose.sh enroll` uses: it skips the lineage predicate and NOTHING
+    else, because enrolment is the act of creating the tally that predicate reads.
+    It is a flag given, never inferred from a missing variable (design 20 v4)."""
+    db = _db_file()
+    # Lineage first, before anything can connect: a foreign or unenrolled volume must
+    # not even be opened (design 20).
+    if not enrolling:
+        check_lineage(db)
     # Volume sentinel (design 18 §2 — see module docstring). The missing-file check
     # runs BEFORE any connect, and on a lived volume every connect after it is
     # non-creating (`mode=rw`), so the check is the message and `mode=rw` is the
     # guarantee: there is no window in which a connect could birth a new file.
-    db = _db_file()
     evidence = _lived_evidence(db) if db is not None else []
     if not evidence:
         _migrate(db, evidence)
@@ -463,6 +607,13 @@ def _migrate(db: Path | None, evidence: list[Path]) -> None:
     log.info("Database is at head.")
 
 
+def main(argv: list[str]) -> None:
+    args = argv[1:]
+    if args not in ([], ["--enroll"]):
+        raise SystemExit(f"usage: python -m aiko_gateway.migrate [--enroll]  (got {args})")
+    run(enrolling=args == ["--enroll"])
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    run()
+    main(sys.argv)
