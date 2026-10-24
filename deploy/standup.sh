@@ -154,7 +154,7 @@ need() { command -v "$1" >/dev/null 2>&1 || die "missing required tool: $1"; }
 # would otherwise strand a readable secret under an unexpected name beside the real file.
 # One trap covers every exit; after a successful rename the staged paths no longer exist,
 # so it is a no-op on the happy path. Set BEFORE the first mktemp, not beside it.
-trap 'rm -f "${ENV_TMP:-}" "${LK_ENV_STAGED:-}" "${KEYS_HAVE:-}" "${KEYS_WANT:-}" "${KEYS_DROPPED:-}" "${KEYS_ACKED:-}" 2>/dev/null || true' EXIT
+trap 'rm -f "${ENV_TMP:-}" "${IMAGE_TMP:-}" "${LK_ENV_STAGED:-}" "${KEYS_HAVE:-}" "${KEYS_WANT:-}" "${KEYS_DROPPED:-}" "${KEYS_ACKED:-}" 2>/dev/null || true' EXIT
 
 # Declared so a missing tool is a clear refusal at startup rather than a puzzling failure
 # mid-run. This list is NOT what makes the key-loss guard safe — dotenv_keys owns that
@@ -677,18 +677,17 @@ if [ -n "${_dropped// /}" ]; then
   claude-tasks#4437. (#3921 is closed, but it closed on this refusal, not on that fix.)"
 fi
 
-mv "$ENV_TMP" "$ENV_FILE"
-ok "wrote $ENV_FILE (mode 600, via atomic rename)"
-if [ -n "${LK_ENV_STAGED:-}" ]; then
-  mv "$LK_ENV_STAGED" "$LK_ENV_TARGET"
-  ok "wrote $LK_ENV_TARGET (mode 600, via atomic rename)"
-fi
-
 # --- the image pin: image.env, the operator's file (claude-tasks#5165) --------
 #
 # The pin used to be ISLAND_VERSION in .env, which made every release a SOPS re-lift and
 # let a missing pin mean `edge` silently. It is now one full reference in image.env, and
 # compose refuses without it (deploy/lib/island-compose.sh has the whole account).
+#
+# ORDER IS THE GUARANTEE: this runs BEFORE .env is replaced. On a pre-#5165 box the
+# .env rewrite drops ISLAND_VERSION (--drop-env-keys), so if .env were renamed first an
+# abort in between (Ctrl-C, a full disk) would leave neither home holding the pin, and
+# the next run would find no image.env and no legacy line and pin `edge`. The old home
+# must not vanish until the new one exists (Tesla, PR#401 r1).
 #
 # Written ONLY IF ABSENT. image.env belongs to the operator (and later to design 18's
 # watcher); this script's re-run promise is "leave recorded choices alone", and the
@@ -718,6 +717,13 @@ else
   printf 'ISLAND_IMAGE=%s:%s\n' "$ISLAND_REPO" "$ISLAND_TAG" > "$IMAGE_TMP"
   mv "$IMAGE_TMP" "$IMAGE_ENV"
   ok "wrote $IMAGE_ENV (ISLAND_IMAGE=$ISLAND_REPO:$ISLAND_TAG)"
+fi
+
+mv "$ENV_TMP" "$ENV_FILE"
+ok "wrote $ENV_FILE (mode 600, via atomic rename)"
+if [ -n "${LK_ENV_STAGED:-}" ]; then
+  mv "$LK_ENV_STAGED" "$LK_ENV_TARGET"
+  ok "wrote $LK_ENV_TARGET (mode 600, via atomic rename)"
 fi
 
 # --- step 3: bring the island up (4 containers, 1 image + stock mosquitto) ---

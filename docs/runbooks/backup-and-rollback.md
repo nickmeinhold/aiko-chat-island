@@ -29,6 +29,14 @@ crash-looped in `verify_schema()` with advice that could not work). So:
 
 - **The release ran no migration:** re-pin `image.env` to the prior release and
   run `update.sh`. That's all.
+- **Rolling back BELOW v0.17.2** (the release that moved the pin to `image.env`,
+  claude-tasks#5165): **keep this box's current `docker-compose.yml` and `deploy/`, and
+  pass `--skip-drift-check`.** The drift guard will refuse, because the older tag's
+  compose differs, and its advice to "sync the named files from the tag" is WRONG
+  here. That older compose reads `${ISLAND_VERSION:-edge}` from `.env`, and once the
+  SOPS re-lift has removed `ISLAND_VERSION`, it resolves `edge`: the island moves to
+  `main` with a clean-looking deploy. The current compose runs older images unchanged
+  (only the image lines differ), so keeping it is safe.
 - **The release ran a migration:** put the database back FIRST, with the stack DOWN
   (`deploy/compose.sh down`: a merely stopped `restart: always` container comes back if
   the Docker daemon restarts mid-restore), then go back to the old image. **Restore

@@ -53,6 +53,12 @@ command -v docker >/dev/null 2>&1 || die "missing required tool: docker"
 # Elevation autodetect and the one compose invocation live in a sourced lib, shared
 # with deploy/compose.sh (the operator's hand path), so the two cannot drift.
 ISLAND_ROOT="$REPO_ROOT"
+# A partial sync (update.sh without deploy/lib/) must say so, the same way an absent
+# drift guard does below. Unguarded, the `.` fails with a bare "No such file or
+# directory" before any check can explain (Maxwell, PR#401 r1).
+[ -f "$SCRIPT_DIR/lib/island-compose.sh" ] || die "deploy/lib/island-compose.sh NOT FOUND.
+     This update.sh needs it, so deploy/ was synced PARTIALLY (the 2026-09-11 shape).
+     Sync the whole of deploy/ from the tag and re-run."
 # shellcheck source=lib/island-compose.sh
 . "$SCRIPT_DIR/lib/island-compose.sh"
 island_docker_detect || die "cannot run docker (see above)"
@@ -86,6 +92,9 @@ $DOCKER compose version >/dev/null 2>&1 || die "docker compose v2 not available"
 # both. See deploy/lib/island-compose.sh for why a bare call now refuses.
 COMPOSE="island_compose"
 island_require_image_env || die "no image pin (see above) — nothing was changed"
+# ONE PIN PER RUN: every compose call below reads this snapshot, not the live file.
+ISLAND_IMAGE_ENV="$(island_snapshot_image_env)" || die "could not snapshot image.env — nothing was changed"
+trap 'rm -f "$ISLAND_IMAGE_ENV"' EXIT
 if LC_ALL=C grep -aqE '^[[:space:]]*(export[[:space:]]+)?ISLAND_VERSION[[:space:]]*=' "$REPO_ROOT/.env" 2>/dev/null; then
   warn ".env still carries an ISLAND_VERSION line. It is IGNORED: the image comes
      from image.env. Remove it at the next SOPS re-lift so nobody edits it expecting
@@ -100,6 +109,14 @@ for _v in ISLAND_VERSION ISLAND_IMAGE; do
      from image.env. Unset it (or edit image.env instead) and re-run."
   fi
 done
+
+# Resolve the whole config FIRST, with its errors visible. The running-check below
+# discards compose's stderr, so an image.env that is readable but carries no usable
+# ISLAND_IMAGE (empty, a typo'd key) would trip `${ISLAND_IMAGE:?}` THERE and be
+# reported as "isn't running, use standup.sh", sending the operator from the
+# backup-first door to one that takes no backup (Tesla, PR#401 r1). Asking compose
+# keeps compose the only reader of the pin.
+$COMPOSE config --quiet || die "compose cannot resolve this island's config (see above) — nothing was changed"
 
 # The island must actually be running (this is an UPDATE, not a first standup).
 $COMPOSE ps --status running --services 2>/dev/null | grep -qx chat-island \

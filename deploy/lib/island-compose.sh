@@ -25,7 +25,9 @@
 # that skips the pin.
 #
 # Requires (set by the caller): ISLAND_ROOT (the directory holding docker-compose.yml)
-# and DOCKER ("docker" or "sudo -n docker"; island_docker_detect sets it).
+# and DOCKER ("docker" or "sudo -n docker"; island_docker_detect sets it). Optional:
+# ISLAND_IMAGE_ENV, the pin file to read instead of $ISLAND_ROOT/image.env. update.sh
+# points it at a private SNAPSHOT so one run reads one value (see island_snapshot_image_env).
 
 ISLAND_REPO="ghcr.io/nickmeinhold/aiko-chat-island"
 
@@ -80,7 +82,20 @@ island_compose() {
   fi
   # shellcheck disable=SC2086  # $DOCKER is "docker" or "sudo -n docker", split on purpose
   env -u ISLAND_IMAGE -u ISLAND_VERSION ${DOCKER:?} compose "${files[@]}" \
-    --env-file "$ISLAND_ROOT/.env" --env-file "$ISLAND_ROOT/image.env" "$@"
+    --env-file "$ISLAND_ROOT/.env" --env-file "${ISLAND_IMAGE_ENV:-$ISLAND_ROOT/image.env}" "$@"
+}
+
+# Copy image.env to a private file and point island_compose at it, so every compose call
+# in one run (`config --images` for the drift guard, then `pull`, then `up`) resolves the
+# SAME pin. Reading the live file three times made them three resolutions: an edit during
+# the backup or the confirmation prompt, or design 18's watcher writing it, would have the
+# guard certify one release while the script deployed another (Carnot, PR#401 r1). Prints
+# the snapshot path; the caller owns removing it.
+island_snapshot_image_env() {
+  local snap
+  snap="$(umask 077; mktemp "${TMPDIR:-/tmp}/aiko-image-env.XXXXXX")" || return 1
+  cp "${ISLAND_ROOT:?}/image.env" "$snap" || { rm -f "$snap"; return 1; }
+  printf '%s\n' "$snap"
 }
 
 # Read `config --images` output on stdin; print the ONE release tag the drift guard

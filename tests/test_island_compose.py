@@ -168,3 +168,76 @@ def test_REAL_compose_bare_call_refuses_and_the_wrapper_resolves(tmp_path: Path)
                              env={**env, "ISLAND_IMAGE": "evil:1"})
     assert wrapped.returncode == 0, wrapped.stderr
     assert _ref(wrapped.stdout).stdout == "0.17.1\n"
+
+
+# ------------------------------------------------------- round-1 cage-match fixes
+
+def test_ONE_PIN_PER_RUN_island_compose_reads_the_snapshot_when_given(tmp_path: Path) -> None:
+    """Carnot, PR#401 r1: `config --images`, `pull` and `up` each re-read the live
+    image.env, so an edit mid-run (or design 18's watcher) made the guard certify one
+    release while the script deployed another. update.sh now snapshots the file once
+    and points every call at the snapshot."""
+    log = _fake_docker(tmp_path)
+    root = _island(tmp_path)
+    snap = tmp_path / "snap.env"
+    snap.write_text(f"ISLAND_IMAGE={OURS}:0.17.1\n")
+    r = subprocess.run(
+        ["bash", "-c", f'ISLAND_ROOT="{root}"; DOCKER=docker; ISLAND_IMAGE_ENV="{snap}"; '
+                       f'. "{LIB}"; island_compose ps'],
+        capture_output=True, text=True,
+        env={**os.environ, "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}"})
+    assert r.returncode == 0, r.stderr
+    argv = log.read_text().split("\n")
+    assert argv[argv.index("ps") - 1] == str(snap), "the pin must come from the snapshot"
+
+
+def test_the_snapshot_is_a_private_copy(tmp_path: Path) -> None:
+    root = _island(tmp_path)
+    r = subprocess.run(["bash", "-c", f'ISLAND_ROOT="{root}"; . "{LIB}"; island_snapshot_image_env'],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    snap = Path(r.stdout.strip())
+    try:
+        assert snap.read_text() == (root / "image.env").read_text()
+        assert oct(snap.stat().st_mode)[-3:] == "600"
+        (root / "image.env").write_text(f"ISLAND_IMAGE={OURS}:9.9.9\n")
+        assert "0.17.1" in snap.read_text(), "a later edit to image.env must not reach the run"
+    finally:
+        snap.unlink(missing_ok=True)
+
+
+def _code(path: Path) -> str:
+    return "\n".join(ln for ln in path.read_text().splitlines() if not ln.lstrip().startswith("#"))
+
+
+UPDATE = REPO / "deploy" / "update.sh"
+STANDUP = REPO / "deploy" / "standup.sh"
+
+
+def test_update_sh_snapshots_the_pin_BEFORE_its_first_compose_call() -> None:
+    code = _code(UPDATE)
+    snap = code.index('ISLAND_IMAGE_ENV="$(island_snapshot_image_env)"')
+    assert snap < code.index("$COMPOSE config --quiet") < code.index("$COMPOSE ps")
+
+
+def test_update_sh_resolves_config_LOUDLY_before_the_swallowed_running_check() -> None:
+    """Tesla, PR#401 r1: the running check discards stderr, so a readable image.env with
+    no usable ISLAND_IMAGE was reported as "isn't running, use standup.sh"."""
+    code = _code(UPDATE)
+    loud = code.index("$COMPOSE config --quiet ||")
+    quiet = code.index("$COMPOSE ps --status running --services 2>/dev/null")
+    assert loud < quiet
+
+
+def test_update_sh_names_a_partial_sync_before_sourcing_the_lib() -> None:
+    code = _code(UPDATE)
+    guard = code.index('[ -f "$SCRIPT_DIR/lib/island-compose.sh" ] || die')
+    source = code.index('. "$SCRIPT_DIR/lib/island-compose.sh"')
+    assert guard < source
+
+
+def test_standup_writes_the_new_pin_BEFORE_replacing_the_old_home() -> None:
+    """Tesla, PR#401 r1: renaming .env first left a window where an abort destroyed
+    ISLAND_VERSION before image.env existed; the next run then pinned `edge`."""
+    code = _code(STANDUP)
+    assert code.index('mv "$IMAGE_TMP" "$IMAGE_ENV"') < code.index('mv "$ENV_TMP" "$ENV_FILE"')
