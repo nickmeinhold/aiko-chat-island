@@ -4,6 +4,7 @@
 /// `chmod` run for real, in a temp directory, so the file publish is exercised.
 library;
 
+import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 
@@ -25,6 +26,7 @@ final class FakeDocker implements Runner {
     String exe,
     List<String> args, {
     String? workingDirectory,
+    bool stream = false,
   }) async {
     final line = [exe, ...args].join(' ');
     calls.add(line);
@@ -413,10 +415,10 @@ void main() {
           isA<Refusal>().having(
             (r) => r.message,
             'message',
-            allOf(
-              contains('image.env'),
-              contains('.env'),
-              contains('volume aiko_data'),
+            contains(
+              RegExp(
+                r'This run created: volume aiko_data \(label aiko\.birth=[0-9a-f]+\), image\.env, \.env\. ',
+              ),
             ),
           ),
         ),
@@ -467,6 +469,91 @@ void main() {
       );
     });
   });
+  group('PR#406 r2', () {
+    test('--version pins that release', () async {
+      const o = StandupOptions(
+        domain: 'chat.example.org',
+        displayName: 'X',
+        tag: '0.19.0',
+      );
+      await standup(FakeDocker()).run(o);
+      expect(
+        File('${root.path}/image.env').readAsStringSync(),
+        'ISLAND_IMAGE=ghcr.io/nickmeinhold/aiko-chat-island:0.19.0\n',
+      );
+      expect(out.join('\n'), isNot(contains("pinning 'edge'")));
+    });
+
+    test(
+      'run() validates too: options built directly are not trusted',
+      () async {
+        final d = FakeDocker();
+        const bad = StandupOptions(
+          domain: 'a.example.org',
+          displayName: 'X',
+          seedPeers: '[{',
+        );
+        await expectLater(standup(d).run(bad), throwsA(isA<Refusal>()));
+        expect(d.calls, isEmpty);
+      },
+    );
+
+    test('TLS is not attempted when the gateway never answered', () async {
+      final d = FakeDocker();
+      expect(
+        await standup(d, healthy: false).run(opts),
+        isA<StartedNotAnswering>(),
+      );
+      expect(
+        d.calls.where((c) => c.contains('docker-compose.caddy.yml')),
+        isEmpty,
+      );
+      expect(File('${root.path}/deploy/caddy/.env').existsSync(), isFalse);
+    });
+
+    test('health means THIS gateway said ok, not any 2xx', () {
+      expect(isGatewayHealthy(200, '{"status":"ok","version":"x"}'), isTrue);
+      expect(isGatewayHealthy(200, '<html>proxy</html>'), isFalse);
+      expect(isGatewayHealthy(204, ''), isFalse);
+      expect(isGatewayHealthy(200, '{"status":"degraded"}'), isFalse);
+      expect(isGatewayHealthy(502, '{"status":"ok"}'), isFalse);
+    });
+
+    test('docker compose itself reads the .env back exactly (the real consumer)', () async {
+      // Not our own parser: compose is what reads .env on the box (Noether r2). A " #"
+      // must not truncate, a "$" must not interpolate. Needs docker compose (CI has it).
+      const o = StandupOptions(
+        domain: 'chat.example.org',
+        displayName: r'Island #1 $HOME',
+        seedPeers: r'[{"id":"a","display_name":"A #2 $X","base_url":"https://a.example"}]',
+      );
+      File('${root.path}/.env').writeAsStringSync(renderEnv(o, 'x' * 64));
+      File('${root.path}/c.yml').writeAsStringSync(
+        'services:\n  x:\n    image: alpine\n    environment:\n'
+        '      N: \${ISLAND_DISPLAY_NAME}\n      P: \${ISLAND_SEED_PEERS}\n',
+      );
+      final r = await Process.run('docker', [
+        'compose',
+        '-f',
+        'c.yml',
+        '--env-file',
+        '.env',
+        'config',
+        '--format',
+        'json',
+      ], workingDirectory: root.path);
+      expect(r.exitCode, 0, reason: '${r.stderr}');
+      final env =
+          (jsonDecode('${r.stdout}') as Map)['services']['x']['environment']
+              as Map;
+      // Measured: `compose config` re-escapes a literal $ as $$ in its OUTPUT, so
+      // the rendered file stays valid compose. Interpolation would have printed
+      // $HOME's value instead; turning $$ back into $ undoes only the rendering.
+      String lit(Object? v) => '$v'.replaceAll(r'$$', r'$');
+      expect(lit(env['N']), o.displayName);
+      expect(lit(env['P']), o.seedPeers);
+    });
+  });
 }
 
 Set<String> _preexisting = {};
@@ -480,6 +567,7 @@ final class _AppearsLate extends FakeDocker {
     String exe,
     List<String> args, {
     String? workingDirectory,
+    bool stream = false,
   }) {
     if (args.length > 1 && args[0] == 'volume' && args[1] == 'create') {
       volumes.putIfAbsent('aiko_data', () => 'someone-else');

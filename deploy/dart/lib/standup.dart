@@ -49,10 +49,14 @@ final class RunResult {
 /// Every effect outside this process goes through here, so tests can stand in a
 /// fake that records calls and answers like Docker does.
 abstract interface class Runner {
+  /// [stream]: also show the child's output live (a pull or a `compose up` takes
+  /// minutes, and buffered silence reads as a hang; Noether, PR#406 r2). The
+  /// output is still captured, so a failure can quote it.
   Future<RunResult> run(
     String exe,
     List<String> args, {
     String? workingDirectory,
+    bool stream = false,
   });
 }
 
@@ -63,14 +67,37 @@ final class ProcessRunner implements Runner {
     String exe,
     List<String> args, {
     String? workingDirectory,
+    bool stream = false,
   }) async {
     try {
-      final r = await Process.run(
+      if (!stream) {
+        final r = await Process.run(
+          exe,
+          args,
+          workingDirectory: workingDirectory,
+        );
+        return RunResult(r.exitCode, '${r.stdout}', '${r.stderr}');
+      }
+      final p = await Process.start(
         exe,
         args,
         workingDirectory: workingDirectory,
       );
-      return RunResult(r.exitCode, '${r.stdout}', '${r.stderr}');
+      final out = StringBuffer(), err = StringBuffer();
+      final done = [
+        p.stdout.transform(utf8.decoder).forEach((s) {
+          stdout.write(s);
+          out.write(s);
+        }),
+        p.stderr.transform(utf8.decoder).forEach((s) {
+          stderr.write(s);
+          err.write(s);
+        }),
+      ];
+      final code = await p.exitCode;
+      await Future.wait(done);
+      // A failure's reason may be on either stream: quote both.
+      return RunResult(code, '$out', '$err$out');
     } on ProcessException catch (e) {
       // A missing executable is an answer ("not installed"), not a crash.
       return RunResult(127, '', '$exe: ${e.message}');
@@ -350,6 +377,10 @@ final class Standup {
   String get _caddyCompose => _f('deploy/caddy/docker-compose.caddy.yml').path;
 
   Future<StandupResult> run(StandupOptions o) async {
+    // ONE door: the options are checked here too, not only by the argument parser,
+    // so a caller constructing StandupOptions directly can't publish an unchecked
+    // value (Carnot, PR#406 r2).
+    validate(o);
     final tag = o.tag ?? 'edge';
     final image = '$islandRepo:$tag';
 
@@ -402,7 +433,7 @@ final class Standup {
         '<tag> for a release.',
       );
     }
-    final pulled = await _docker(['pull', image]);
+    final pulled = await runner.run('docker', ['pull', image], stream: true);
     if (!pulled.ok) {
       throw Refusal(
         'could not pull $image (nothing was changed):\n${pulled.stderr.trim()}',
@@ -431,19 +462,22 @@ final class Standup {
       say.step(
         'Starting the island (gateway + broker + registrar + ChatServer)',
       );
-      final up = await runner.run(_composeSh, [
-        'up',
-        '-d',
-      ], workingDirectory: root.path);
+      final up = await runner.run(
+        _composeSh,
+        ['up', '-d'],
+        workingDirectory: root.path,
+        stream: true,
+      );
       if (!up.ok) {
         throw Refusal('deploy/compose.sh up -d failed:\n${up.stderr.trim()}');
       }
     } on Object catch (e) {
       throw Refusal(
         'standup stopped partway: $e\n'
-        'This run created: ${made.join(', ')}. Nothing has served users yet, so '
-        'see docs/runbooks/backup-and-rollback.md, "A failed birth", to decide '
-        'what to remove before running standup again.',
+        'This run created: ${made.join(', ')}. A failed compose may still have '
+        'started some services, so this run makes no claim about whether anything '
+        'was used: see docs/runbooks/backup-and-rollback.md, "A failed birth", '
+        'before removing anything (Carnot, PR#406 r2).',
       );
     }
 
@@ -459,7 +493,10 @@ final class Standup {
 
     // ---- 6. TLS ----
     var tlsConfirmed = true;
-    if (o.tls) {
+    if (o.tls && !healthy) {
+      // No proxy in front of a gateway that never answered (Noether, PR#406 r2).
+      say.step('TLS not attempted: the gateway is not answering');
+    } else if (o.tls) {
       tlsConfirmed = await _tls(o.domain);
     } else {
       say.step(
@@ -694,6 +731,20 @@ Next steps:
       'https://$domain/health not answering yet. Check DNS points here and ports '
       '80+443 are open, then: docker compose -f deploy/caddy/docker-compose.caddy.yml logs',
     );
+    return false;
+  }
+}
+
+/// Whether a `/health` response is THIS gateway saying it is up: HTTP 200 and the
+/// gateway's own body, `{"status": "ok", ...}` (main.py `health`). Any 2xx was not
+/// enough: a proxy, a captive portal or another service on the port answers 200 too
+/// (Tesla, PR#406 r2).
+bool isGatewayHealthy(int statusCode, String body) {
+  if (statusCode != 200) return false;
+  try {
+    final j = jsonDecode(body);
+    return j is Map && j['status'] == 'ok';
+  } on FormatException {
     return false;
   }
 }

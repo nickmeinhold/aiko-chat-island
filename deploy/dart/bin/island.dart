@@ -8,6 +8,7 @@
 /// Run from the island checkout: the directory holding docker-compose.yml.
 library;
 
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:island_deploy/standup.dart';
@@ -69,13 +70,19 @@ Future<void> main(List<String> args) async {
 /// Whether [uri] answers 2xx within a few seconds. Any failure is "not yet".
 /// ONE deadline over the whole exchange, body included: an endpoint that sends
 /// headers and holds the body open must not stall standup (Carnot, PR#406 r1).
+/// DIRECT, never through http_proxy/https_proxy, and no redirects: it must hear
+/// this box, not something in front of it (Tesla, PR#406 r2).
 Future<bool> _probe(Uri uri) async {
-  final client = HttpClient()..connectionTimeout = const Duration(seconds: 3);
+  final client = HttpClient()
+    ..connectionTimeout = const Duration(seconds: 3)
+    ..findProxy = ((_) => 'DIRECT');
   try {
     return await () async {
-      final res = await (await client.getUrl(uri)).close();
-      await res.drain<void>();
-      return res.statusCode >= 200 && res.statusCode < 300;
+      final req = await client.getUrl(uri);
+      req.followRedirects = false;
+      final res = await req.close();
+      final body = await res.transform(utf8.decoder).take(64).join();
+      return isGatewayHealthy(res.statusCode, body);
     }().timeout(const Duration(seconds: 6));
   } on Object {
     return false;
