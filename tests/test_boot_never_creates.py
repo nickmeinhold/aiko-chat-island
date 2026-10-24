@@ -201,6 +201,39 @@ def test_a_hand_run_alembic_cannot_build_an_island_into_an_empty_file(
     assert "users" not in _tables(db)
 
 
+def _pre_alembic_island(tmp_path, monkeypatch):
+    """An island at the baseline schema with no stamp: the live prod db before alembic."""
+    db = _point_app_at(tmp_path, monkeypatch)
+    migrate._create_empty(db)
+    command.upgrade(migrate._alembic_config(new_island=True), "0001")
+    with sqlite3.connect(db) as c:
+        c.execute("DROP TABLE alembic_version")
+        # Identity as file metadata, not a table: adoption verifies the schema EQUALS the
+        # baseline and rightly refuses an extra canary table.
+        c.execute("PRAGMA user_version = 4242")
+    return db
+
+
+def _user_version(db) -> int:
+    with sqlite3.connect(_ro(db), uri=True) as c:
+        return c.execute("PRAGMA user_version").fetchone()[0]
+
+
+def test_a_hand_run_alembic_on_an_unstamped_island_says_adopt_and_harms_nothing(
+        tmp_path, monkeypatch) -> None:
+    """The baseline's refusal must not tell the owner of a living island to move it
+    aside (Tesla, PR#405 r2), and the migrator must still adopt it afterwards, even though
+    the refused run leaves an EMPTY alembic_version table behind (measured)."""
+    db = _pre_alembic_island(tmp_path, monkeypatch)
+    with pytest.raises(RuntimeError, match="MIGRATE_REFUSE_UNSTAMPED_ISLAND") as refused:
+        command.upgrade(migrate._alembic_config(), "head")
+    assert "aside" not in str(refused.value)
+    assert "alembic_version" in _tables(db), "the measured leftover this test exists for"
+    migrate.run()  # adopts: stamps the baseline, then upgrades
+    assert _user_version(db) == 4242, "the same island file, not a rebuilt one"
+    assert asyncio.run(migrate._schema_status()).state is migrate.SchemaState.HEAD
+
+
 @pytest.mark.skipif(os.geteuid() == 0, reason="root reads through mode 000")
 def test_an_unreadable_directory_is_named_as_that_not_as_a_missing_database(
         tmp_path, monkeypatch) -> None:

@@ -147,16 +147,26 @@ exit 0
 ''')
 
 
-def test_a_failed_birth_removes_the_volume_it_created(island) -> None:
-    """Otherwise the re-run sees a volume, skips the birth, and the gateway refuses
-    MIGRATE_REFUSE_NO_DATABASE forever (Noether, Carnot, Tesla, PR#405 r1)."""
+def test_a_failed_birth_stops_with_the_finishing_command_and_removes_nothing(island) -> None:
+    """Standup can't prove it made the volume it holds (`volume create` succeeds on an
+    existing one), so it must never remove one: a rollback could delete a real island
+    that a concurrent run or a restore put there (Noether, Carnot, Tesla, PR#405 r2).
+    It stops, before `up`, naming the one command that finishes the birth."""
     _docker_failing_on(island, "--new-island")
     r = island.run(expect_ok=False)
     assert r.returncode != 0
     calls = island.calls.read_text().splitlines()
-    assert "docker volume rm aiko_data" in calls
+    assert not [ln for ln in calls if ln.startswith("docker volume rm")]
     assert not [ln for ln in calls if ln.endswith(" up -d")]
-    assert "re-run standup" in r.stdout + r.stderr
+    out = r.stdout + r.stderr
+    assert "will NOT retry" in out and "migrate --new-island" in out
+
+
+def test_standup_never_removes_a_volume() -> None:
+    """The class, not the instance: no code path in standup.sh may delete a volume."""
+    code = "\n".join(ln for ln in (REPO / "deploy" / "standup.sh").read_text().splitlines()
+                     if not ln.lstrip().startswith("#"))
+    assert "volume rm" not in code
 
 
 def test_a_failed_pull_creates_no_volume(island) -> None:

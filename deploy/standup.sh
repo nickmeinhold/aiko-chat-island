@@ -744,20 +744,20 @@ island_pin_begin || die "could not snapshot image.env"
 trap 'rm -f "${ENV_TMP:-}" "${IMAGE_TMP:-}" "${LK_ENV_STAGED:-}" "${KEYS_HAVE:-}" "${KEYS_WANT:-}" "${KEYS_DROPPED:-}" "${KEYS_ACKED:-}" "${_island_pin_file:-}" 2>/dev/null || true' EXIT
 
 # --- step 3: bring the island up (4 containers, 1 image + stock mosquitto) ---
-# The volume and the database are born together, after the image is in hand. If the
-# birth fails, the volume THIS RUN created is removed, so a re-run sees no volume and
-# starts the birth again instead of stranding an empty one. "$@" = island_compose's
-# leading options (--build-overlay, or none).
+# The volume and the database are born together, after the image is in hand, which
+# shrinks the window an interrupted first run can strand to the birth itself.
+#
+# Nothing here EVER removes a volume. `docker volume create` succeeds on a volume that
+# already exists, so this run can't prove it made the one it holds: a concurrent standup,
+# a restore, or a flaky `inspect` in step 1 could put a real island there, and a rollback
+# would delete it (Noether, Carnot, Tesla, PR#405 r2). A failed birth stops with the one
+# command that finishes it, and that command is safe on ANY volume: `--new-island`
+# creates with O_EXCL and refuses if a database is already there.
+# "$@" = island_compose's leading options (--build-overlay, or none).
 birth_island() {
   docker volume create "$DATA_VOLUME" >/dev/null || die "could not create volume $DATA_VOLUME"
-  trap 'docker volume rm "$DATA_VOLUME" >/dev/null 2>&1; exit 130' INT TERM
-  if ! island_compose "$@" run --rm --no-deps chat-island python -m aiko_gateway.migrate --new-island; then
-    trap - INT TERM
-    docker volume rm "$DATA_VOLUME" >/dev/null 2>&1 \
-      && die "could not create the new island's database (see above). The volume this run created was removed: fix the cause and re-run standup."
-    die "could not create the new island's database (see above), and could not remove the volume this run created. Either remove it (docker volume rm $DATA_VOLUME) and re-run standup, or finish by hand: deploy/compose.sh run --rm --no-deps chat-island python -m aiko_gateway.migrate --new-island (move any partial aiko.db aside first)."
-  fi
-  trap - INT TERM
+  island_compose "$@" run --rm --no-deps chat-island python -m aiko_gateway.migrate --new-island \
+    || die "could not create the new island's database (see above). Volume $DATA_VOLUME exists but holds no island yet, so a re-run of standup will NOT retry this step. Fix the cause, then finish by hand: deploy/compose.sh run --rm --no-deps chat-island python -m aiko_gateway.migrate --new-island (safe: it refuses if a database is already there; if it says a partial aiko.db exists, move that aside first), then deploy/compose.sh up -d."
   ok "created volume $DATA_VOLUME and the new island's database"
 }
 if [ "$FROM_SOURCE" = "true" ]; then

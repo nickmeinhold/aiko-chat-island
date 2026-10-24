@@ -397,7 +397,12 @@ def _migrate(db: Path | None, new_island: bool) -> None:
         raise RuntimeError(not_an_island_message(
             db, "holds no island (no users table: empty, 0-byte, or alembic's bookkeeping only)"))
     cfg = _alembic_config(new_island=new_island)
-    adopting = "alembic_version" not in tables and "users" in tables
+    # Adopt when the island is there and NOTHING is stamped: no alembic_version table,
+    # or an EMPTY one. Measured (PR#405 r2): a hand-run alembic that the baseline gate
+    # refused leaves an empty alembic_version table behind, and keying on the table's
+    # absence would then refuse this island forever (Tesla).
+    adopting = "users" in tables and (
+        "alembic_version" not in tables or not asyncio.run(_schema_status()).stamped)
     if adopting:
         # Fail-closed (Carnot cage-match, PR#23): only stamp a pre-alembic DB as
         # baseline if its schema ACTUALLY equals baseline 0001 — diffed against the
