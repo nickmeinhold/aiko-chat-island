@@ -298,11 +298,22 @@ fi
 # honest in both modes rather than saying "4/4" while a fifth step follows.
 TOTAL=4; [ "$DO_MEDIA" = "true" ] && TOTAL=5
 log "Step 1/$TOTAL — persistent data volume ($DATA_VOLUME)"
+# No volume means this run gives birth to the island. The gateway never creates a
+# database when it starts, so step 3 creates the volume AND the database together
+# (`birth_island`), right before `up`. Not here: a volume created now would sit through
+# the .env ceremony, the pull and the build, and any death in between would strand an
+# existing-but-unborn volume that no re-run would ever finish (Noether, Carnot, Tesla,
+# Maxwell, PR#405 r1).
+#
+# This inspect only decides whether to ATTEMPT a birth. It never decides whether a birth is
+# safe: a flake here reaches `birth_island`, which copies only into a volume it can PROVE
+# this run created (PR#405 cage-match r1, all four seats).
+NEW_ISLAND="false"
 if docker volume inspect "$DATA_VOLUME" >/dev/null 2>&1; then
-  ok "volume $DATA_VOLUME already exists — leaving it (never re-created; it holds the DB)"
+  ok "volume $DATA_VOLUME already exists — leaving it untouched (standup never re-creates a volume or copies into one it did not just create)"
 else
-  docker volume create "$DATA_VOLUME" >/dev/null
-  ok "created external volume $DATA_VOLUME"
+  NEW_ISLAND="true"
+  ok "no volume $DATA_VOLUME yet: step 3 creates it together with the new island's database"
 fi
 
 # --- step 2: write the production .env --------------------------------------
@@ -737,12 +748,54 @@ island_pin_begin || die "could not snapshot image.env"
 trap 'rm -f "${ENV_TMP:-}" "${IMAGE_TMP:-}" "${LK_ENV_STAGED:-}" "${KEYS_HAVE:-}" "${KEYS_WANT:-}" "${KEYS_DROPPED:-}" "${KEYS_ACKED:-}" "${_island_pin_file:-}" 2>/dev/null || true' EXIT
 
 # --- step 3: bring the island up (4 containers, 1 image + stock mosquitto) ---
+# The volume and the database are born together, after the image is in hand, which
+# shrinks the window an interrupted first run can strand to the birth itself.
+#
+# Nothing here EVER removes a volume (Noether, Carnot, Tesla, PR#405 r2).
+#
+# The birth is a COPY of the image's seed (/app/seed/aiko.db, an empty island built at
+# `docker build`; the gateway itself cannot create one), and it copies only into a volume
+# this run can PROVE it created. `docker volume create` succeeds on an existing volume and
+# keeps that volume's labels (measured, Docker 29.5.2), so creating with a fresh random
+# label and reading it back is a proof of creation: a volume that existed before (an
+# island, a lost db, a concurrent standup's) carries some other label or none, and is
+# left untouched. Nothing is inferred from what the volume holds: an earlier revision
+# copied into any EMPTY /data, which relied on the worker lock living there, and
+# GATEWAY_WORKER_LOCK / GATEWAY_ALLOW_MULTIWORKER move or skip it (PR#405 cage-match r1,
+# all four seats).
+#
+# The copy is published atomically: written under a temporary name, then hard-linked to
+# aiko.db (`ln` refuses if aiko.db exists, and a reader never sees a half-copied file),
+# then the temporary name is removed. That removal cannot fail the birth, so a failure
+# exit always means aiko.db was NOT published (Carnot r1, Noether r2).
+# "$@" = island_compose's leading options (--build-overlay, or none).
+BIRTH_SH='set -eC
+cat /app/seed/aiko.db > /data/.aiko.db.seed
+ln /data/.aiko.db.seed /data/aiko.db
+rm -f /data/.aiko.db.seed || :'
+BIRTH_NONCE="$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+birth_island() {
+  [ -n "$BIRTH_NONCE" ] || die "could not draw a random volume label (od /dev/urandom)"
+  docker volume create --label "aiko.birth=$BIRTH_NONCE" "$DATA_VOLUME" >/dev/null \
+    || die "could not create volume $DATA_VOLUME"
+  local owner
+  owner="$(docker volume inspect -f '{{index .Labels "aiko.birth"}}' "$DATA_VOLUME")" \
+    || die "could not read volume $DATA_VOLUME's label back, so this run can't prove it created that volume. Nothing was copied. See docs/runbooks/backup-and-rollback.md, \"A failed birth\"."
+  [ "$owner" = "$BIRTH_NONCE" ] \
+    || die "volume $DATA_VOLUME already existed before this run (it was not created now), so it may hold an island. It was left untouched and no island was created. This box already has an island volume: standup is for a box that has none."
+  island_compose "$@" run --rm --no-deps chat-island sh -c "$BIRTH_SH" \
+    || die "could not copy the seed into volume $DATA_VOLUME (see above; an image released before the seed has no /app/seed/aiko.db, so check the --version pin). Nothing more was done. See docs/runbooks/backup-and-rollback.md, \"A failed birth\"."
+  ok "created volume $DATA_VOLUME and the new island's database (from the image's seed)"
+}
 if [ "$FROM_SOURCE" = "true" ]; then
   log "Step 3/$TOTAL — building the island image from source + starting (gateway + broker + registrar + ChatServer)"
-  island_compose --build-overlay up -d --build
+  island_compose --build-overlay build
+  [ "$NEW_ISLAND" = "true" ] && birth_island --build-overlay
+  island_compose --build-overlay up -d
 else
   log "Step 3/$TOTAL — pulling the published island image + starting (gateway + broker + registrar + ChatServer)"
   island_compose pull
+  [ "$NEW_ISLAND" = "true" ] && birth_island
   island_compose up -d
 fi
 ok "compose stack started"
