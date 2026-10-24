@@ -87,10 +87,12 @@ one-shot init container or an explicit lock rather than the per-replica entrypoi
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import logging
 import sys
 import os
+import stat
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -225,13 +227,30 @@ def _witness_dir() -> Path | None:
     return None
 
 
+WITNESS_RECORD_MAX = 4096  # a tally or sentinel is one short line; anything bigger is not one
+
+
 def _read_text_nofollow(path: Path) -> str:
-    """Read a small witness file, refusing to follow a symlink (``O_NOFOLLOW``): a
-    link could point the check at a file someone else controls."""
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    """Read a small witness record, or raise. Every way a file on an untrusted volume
+    could make the read lie or hang is refused, not tolerated (PR#404 r1):
+    a symlink (``O_NOFOLLOW``, required, never defaulted to 0 where absent); a FIFO or
+    device, which would block ``open`` forever (``O_NONBLOCK`` + ``S_ISREG`` on the
+    OPENED descriptor, not a path check that a swap could race); a record longer than
+    ``WITNESS_RECORD_MAX`` (a prefix match is not a whole-string match); and bytes that
+    aren't UTF-8. ``ValueError``/``OSError`` are the only things this raises."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
-        with os.fdopen(fd, "r", closefd=False) as f:
-            return f.read(64 * 1024)
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError(f"{path} is not a regular file")
+        data = b""
+        while len(data) <= WITNESS_RECORD_MAX:  # a short read is not EOF; read to EOF
+            chunk = os.read(fd, WITNESS_RECORD_MAX + 1 - len(data))
+            if not chunk:
+                break
+            data += chunk
+        if len(data) > WITNESS_RECORD_MAX:
+            raise ValueError(f"{path} is longer than {WITNESS_RECORD_MAX} bytes")
+        return data.decode("utf-8")
     finally:
         os.close(fd)
 
@@ -253,9 +272,30 @@ def _foreign(why: str) -> RuntimeError:
         "--replace-lineage <island_id>`.")
 
 
+def _environmental(e: BaseException) -> bool:
+    """An error that says the record couldn't be READ (permissions, a missing mount, a
+    failing disk), as opposed to one that says the record is the wrong SHAPE (a
+    symlink, a FIFO or device, oversized, not text). The two need opposite advice: a
+    wrong shape is suspicious, while an unreadable file is a host problem, and telling
+    the operator to re-enrol would have them bless a volume nobody could read
+    (Noether, PR#404 r1)."""
+    return isinstance(e, OSError) and not isinstance(e, FileNotFoundError) and e.errno != errno.ELOOP
+
+
+def _unreadable(path: Path, e: BaseException) -> RuntimeError:
+    return RuntimeError(
+        f"MIGRATE_REFUSE_WITNESS_UNREADABLE: {path} could not be read "
+        f"({type(e).__name__}: {e}). This is a permissions, mount or disk problem on "
+        "this host, not evidence of a different island. Refusing to start. Fix the "
+        "cause (ownership of the file and its directory, the mount, the disk), then start "
+        "again. Do NOT re-enrol to make this go away: enrolment would record whatever "
+        "becomes readable later, without anyone having checked it.")
+
+
 def read_tally(witness: Path) -> Tally:
-    """The host's tally, or a refusal. Missing, unreadable, a symlink, or malformed
-    all refuse the same way: there is no partial witness."""
+    """The host's tally, or a refusal. Missing, a symlink, or malformed all refuse as
+    unenrolled; a read error the host caused refuses as unreadable. There is no partial
+    witness."""
     path = witness / TALLY_FILENAME
     try:
         raw = _read_text_nofollow(path)
@@ -266,6 +306,8 @@ def read_tally(witness: Path) -> Tally:
         raise _unenrolled(f"{path} does not exist, so this host has not enrolled the "
                           "island on this volume") from None
     except (OSError, ValueError, KeyError, TypeError) as e:
+        if _environmental(e):
+            raise _unreadable(path, e) from e
         raise _unenrolled(f"{path} could not be read as a tally ({type(e).__name__}: {e})") from e
     if not tally.lineage or not tally.db_path:
         raise _unenrolled(f"{path} has an empty lineage or db_path")
@@ -295,11 +337,19 @@ def check_lineage(db: Path | None) -> None:
             f"{sentinel} is missing, but this host enrolled an island here. The volume "
             "was wiped or replaced, or a database was restored without its sentinel "
             "(restore them as a pair; see docs/runbooks/backup-and-rollback.md)") from None
-    except OSError as e:  # a symlink (ELOOP under O_NOFOLLOW), EACCES, …: never a pass
-        raise _foreign(f"{sentinel} could not be read as this island's record "
+    except (OSError, ValueError) as e:  # never a pass, but the advice depends on the cause
+        if _environmental(e):
+            raise _unreadable(sentinel, e) from e
+        raise _foreign(f"{sentinel} is not a plain record of this island "
                        f"({type(e).__name__}: {e})") from e
     if content != tally.lineage:
         raise _foreign(f"{sentinel} reads {content!r}, but this host enrolled {tally.lineage!r}")
+    # The right lineage with its database gone: refuse HERE, before any caller can
+    # connect. The lifespan's engine is a creating one, so "the schema check refuses
+    # later" would still leave a 0-byte file born where only absence was honest
+    # (Tesla, PR#404 r1). Same message the migrator gives: one rule, two entrances.
+    if not db.exists():
+        raise RuntimeError(refuse_missing_db_message(db, [sentinel], "is missing"))
 
 
 def _sentinel_content() -> str:
@@ -320,7 +370,15 @@ def _write_sentinel(db: Path) -> None:
     if final.exists():
         return
     tmp = final.with_name(final.name + ".tmp")
-    with open(tmp, "w") as f:
+    # The volume is untrusted until enrolled, and enrolment is exactly when this write
+    # runs, so the temp file is created, never opened: a planted `.tmp` symlink to
+    # aiko.db would otherwise be truncated into a timestamp (Tesla, PR#404 r1). A
+    # leftover from a crash is removed first; unlinking a symlink never touches its
+    # target.
+    if os.path.lexists(tmp):
+        os.unlink(tmp)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+    with os.fdopen(fd, "w") as f:
         f.write(f"{_sentinel_content()}\n")
         f.flush()
         os.fsync(f.fileno())
@@ -505,6 +563,24 @@ async def _schema_status() -> SchemaStatus:
         await engine.dispose()
 
 
+def _refuse_enroll_over_a_tally() -> None:
+    """``--enroll`` exists to create the first tally, so it runs only where none is
+    present. Over an existing tally it would skip the very check that says this volume
+    is foreign, then migrate it (Tesla, PR#404 r1). Replacing an enrolment is a
+    deliberate, separate act: `compose.sh enroll --replace-lineage` moves the old tally
+    aside on the host first, so this refusal never blocks it."""
+    raw = settings.witness_dir.strip()
+    if not raw or raw == WITNESS_DISARMED:
+        return  # nothing mounted: an unenrolled host by construction
+    tally = Path(raw) / TALLY_FILENAME
+    if os.path.lexists(tally):
+        raise RuntimeError(
+            f"MIGRATE_REFUSE_ENROLLED: {tally} already exists, so this host has enrolled "
+            "an island. `--enroll` only creates a first enrolment; it will not run over "
+            "an existing one. To replace it, take the stack down and run "
+            "`deploy/compose.sh enroll --replace-lineage <island_id>`.")
+
+
 def run(*, enrolling: bool = False) -> None:
     """Bring the database to head. ``enrolling`` is the explicit ``--enroll`` argv
     mode `deploy/compose.sh enroll` uses: it skips the lineage predicate and NOTHING
@@ -515,6 +591,8 @@ def run(*, enrolling: bool = False) -> None:
     # not even be opened (design 20).
     if not enrolling:
         check_lineage(db)
+    else:
+        _refuse_enroll_over_a_tally()
     # Volume sentinel (design 18 §2 — see module docstring). The missing-file check
     # runs BEFORE any connect, and on a lived volume every connect after it is
     # non-creating (`mode=rw`), so the check is the message and `mode=rw` is the

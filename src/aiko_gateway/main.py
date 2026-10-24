@@ -211,6 +211,16 @@ async def lifespan(app: FastAPI):
     # Second pass: a server that set up its handlers after importing this module
     # (anything but the uvicorn CLI) gets them covered here. Idempotent.
     log_redaction.install()
+    # The volume witness (design 20) FIRST, before the worker lock: acquiring the lock
+    # CREATES `.aiko-worker.lock` in the data dir, and the migrator counts that file as
+    # proof an island lived there. Checked after it, a refused boot on an empty or wrong
+    # volume would leave behind the very evidence the check exists to protect (measured,
+    # PR#404 r1). It must also run here and not only in the migrator: the migrator is
+    # the image's CMD, so `compose run chat-island uvicorn …` replaces it. No side
+    # effects, never connects.
+    from .migrate import _db_file, check_lineage  # lazy: migrate imports db.Base (cycle)
+
+    check_lineage(_db_file())
     # Enforce single-worker serving BEFORE any serving side-effect: the realtime Hub
     # is per-process, so a ban/disconnect can't reach sockets on another worker until
     # the #46 cross-worker sweep lands. A second worker fails to take the lock and

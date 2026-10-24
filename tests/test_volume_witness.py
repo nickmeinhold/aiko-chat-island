@@ -220,40 +220,173 @@ def test_S6_a_non_file_backend_refuses_when_armed(tmp_path, monkeypatch) -> None
 
 # --- the serving layer: nothing serves without the check ------------------------
 
-def test_verify_schema_refuses_a_foreign_lineage_before_connecting(tmp_path, monkeypatch) -> None:
-    """The migrator runs from the image's CMD, so `compose run chat-island uvicorn …`
-    skips it. The app's own startup must refuse by itself (design 20 v4, T3-1)."""
-    db, _ = _lived_island(tmp_path, monkeypatch)
-    migrate._sentinel_path(db).write_text("someone else\n")
-
-    class _NoConnect:
-        def connect(self, *a, **k):
-            raise AssertionError("verify_schema connected before checking the lineage")
-
-    monkeypatch.setattr(db_module, "engine", _NoConnect())
-    with pytest.raises(RuntimeError, match="MIGRATE_REFUSE_FOREIGN_LINEAGE"):
-        asyncio.run(db_module.verify_schema())
+class _NoConnect:
+    def connect(self, *a, **k):
+        raise AssertionError("the app connected before the volume witness refused")
 
 
-def test_verify_schema_refuses_an_unarmed_production_start(tmp_path, monkeypatch) -> None:
-    _volume(tmp_path, monkeypatch)
-    monkeypatch.setattr(settings, "environment", "production")
-    monkeypatch.setattr(settings, "witness_dir", "")
-    with pytest.raises(RuntimeError, match="MIGRATE_REFUSE_UNWITNESSED"):
-        asyncio.run(db_module.verify_schema())
-
-
-def test_the_app_lifespan_refuses_without_the_migrator(tmp_path, monkeypatch) -> None:
-    """Boot the real app (lifespan) with NO migrator run first, on a mismatched tally:
-    the shape of `compose run chat-island uvicorn aiko_gateway.main:app`."""
+def _boot_app_without_the_migrator(monkeypatch) -> None:
+    """Boot the real app (lifespan) with NO migrator run first: the shape of
+    `compose run chat-island uvicorn aiko_gateway.main:app`, which replaces the image's
+    CMD (design 20 v4, T3-1). The engine is a stub that fails if touched."""
     from aiko_gateway import main
 
-    db, witness = _lived_island(tmp_path, monkeypatch)
-    _enroll(db, witness, lineage="not this volume")
+    monkeypatch.setattr(db_module, "engine", _NoConnect())
+
     async def _boot() -> None:
         async with main.lifespan(main.app):
             pass
 
+    asyncio.run(_boot())
+
+
+def _assert_volume_untouched(db) -> None:
+    """A refused boot must leave no trace: the worker lock is itself lived evidence
+    (`_lived_evidence`), so creating it on a refused volume manufactures the witness
+    the check protects (Maxwell, PR#404 r1, measured)."""
+    from aiko_gateway.worker_guard import LOCK_FILENAME
+
+    assert not (db.parent / LOCK_FILENAME).exists(), "a refused boot created the worker lock"
+
+
+@pytest.mark.parametrize("state", ["foreign", "unenrolled-empty", "db-missing"])
+def test_the_app_refuses_before_the_lock_and_before_connecting(tmp_path, monkeypatch, state) -> None:
+    db, witness = _volume(tmp_path, monkeypatch)
+    if state == "unenrolled-empty":
+        _enroll(db, witness, lineage="an island that is not on this volume")
+        expected = "MIGRATE_REFUSE_UNENROLLED"
+    else:
+        migrate.run()  # provision + sentinel, unarmed
+        _enroll(db, witness)
+        if state == "foreign":
+            migrate._sentinel_path(db).write_text("someone else\n")
+            expected = "MIGRATE_REFUSE_FOREIGN_LINEAGE"
+        else:
+            db.unlink()
+            expected = "MIGRATE_REFUSE_MISSING_DB"
+    _arm(monkeypatch, witness)
+    with pytest.raises(RuntimeError, match=expected):
+        _boot_app_without_the_migrator(monkeypatch)
+    _assert_volume_untouched(db)
+    if state == "db-missing":
+        # The lifespan engine CREATES on connect; refusing earlier is what keeps
+        # absence honest (Tesla, PR#404 r1).
+        assert not db.exists(), "a refused boot gave birth to an empty db"
+
+
+def test_the_app_refuses_an_unarmed_production_start(tmp_path, monkeypatch) -> None:
+    db, _ = _volume(tmp_path, monkeypatch)
+    monkeypatch.setattr(settings, "environment", "production")
+    monkeypatch.setattr(settings, "witness_dir", "")
+    with pytest.raises(RuntimeError, match="MIGRATE_REFUSE_UNWITNESSED"):
+        _boot_app_without_the_migrator(monkeypatch)
+    _assert_volume_untouched(db)
+
+
+# --- PR#404 round 1: what a file on an untrusted volume can do to the reader ------
+
+@pytest.mark.parametrize("which", ["sentinel", "tally"])
+def test_a_padded_record_is_not_a_prefix_match(tmp_path, monkeypatch, which) -> None:
+    """The comparison is on the WHOLE record. A matching first line followed by
+    padding past any read buffer and then other bytes must not pass (Carnot r1)."""
+    db, witness = _lived_island(tmp_path, monkeypatch)
+    path = migrate._sentinel_path(db) if which == "sentinel" else witness / migrate.TALLY_FILENAME
+    path.write_text(path.read_text() + " " * migrate.WITNESS_RECORD_MAX + "tail")
+    with pytest.raises(RuntimeError, match="MIGRATE_REFUSE_"):
+        migrate.run()
+
+
+@pytest.mark.parametrize("which", ["sentinel", "tally"])
+def test_a_fifo_record_refuses_instead_of_hanging(tmp_path, monkeypatch, which) -> None:
+    """`open(O_RDONLY)` on a FIFO with no writer blocks forever; startup would never
+    reach its refusal (Carnot r1). O_NONBLOCK + S_ISREG on the opened fd."""
+    db, witness = _lived_island(tmp_path, monkeypatch)
+    path = migrate._sentinel_path(db) if which == "sentinel" else witness / migrate.TALLY_FILENAME
+    path.unlink()
+    os.mkfifo(path)
+    with pytest.raises(RuntimeError, match="MIGRATE_REFUSE_"):
+        migrate.run()
+
+
+def test_a_sentinel_that_is_not_utf8_refuses_in_the_refusal_vocabulary(tmp_path, monkeypatch) -> None:
+    db, _ = _lived_island(tmp_path, monkeypatch)
+    migrate._sentinel_path(db).write_bytes(b"\xff\xfe not text")
     with pytest.raises(RuntimeError, match="MIGRATE_REFUSE_FOREIGN_LINEAGE"):
-        asyncio.run(_boot())
+        migrate.run()
+
+
+def test_enroll_refuses_over_an_existing_tally(tmp_path, monkeypatch) -> None:
+    """`--enroll` creates a FIRST enrolment only. Over a tally it would skip the check
+    that calls the volume foreign, then migrate it (Tesla r1)."""
+    db, _ = _lived_island(tmp_path, monkeypatch)
+    migrate._sentinel_path(db).write_text("someone else\n")
+    before = db.read_bytes()
+    with pytest.raises(RuntimeError, match="MIGRATE_REFUSE_ENROLLED"):
+        migrate.main(["migrate", "--enroll"])
+    assert db.read_bytes() == before
+
+
+def test_a_planted_tmp_symlink_cannot_truncate_the_db(tmp_path, monkeypatch) -> None:
+    """The sentinel's temp file is CREATED (O_EXCL|O_NOFOLLOW), never opened: a planted
+    `.aiko.db.initialized.tmp -> aiko.db` must not pour a timestamp into the db (Tesla r1)."""
+    db, witness = _volume(tmp_path, monkeypatch)
+    migrate.run()  # a real island, unarmed
+    migrate._sentinel_path(db).unlink()  # db-only state: the next run adopts and writes
+    before = db.read_bytes()
+    tmp = migrate._sentinel_path(db).with_name(migrate._sentinel_path(db).name + ".tmp")
+    os.symlink(db, tmp)
+    migrate.run()
+    assert db.read_bytes() == before, "the sentinel write went through the planted link"
+    assert migrate._sentinel_path(db).read_text().strip()
+    assert not os.path.islink(migrate._sentinel_path(db))
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a mode-000 file; EACCES can't be produced")
+@pytest.mark.parametrize("which", ["sentinel", "tally"])
+def test_an_unreadable_record_says_so_and_does_not_send_you_to_enrol(tmp_path, monkeypatch, which) -> None:
+    """A permissions/mount/disk failure is not a foreign island. Its refusal must not
+    recommend `enroll --replace-lineage`, which would bless an unread volume (Noether r1)."""
+    db, witness = _lived_island(tmp_path, monkeypatch)
+    path = migrate._sentinel_path(db) if which == "sentinel" else witness / migrate.TALLY_FILENAME
+    path.chmod(0)
+    try:
+        with pytest.raises(RuntimeError, match="MIGRATE_REFUSE_WITNESS_UNREADABLE") as e:
+            migrate.run()
+        assert "Do NOT re-enrol" in str(e.value)
+        assert "--replace-lineage" not in str(e.value)
+    finally:
+        path.chmod(0o644)
+
+
+def test_compose_pins_the_witness_as_a_literal_read_only_directory() -> None:
+    """WITNESS_DIR is excluded from the forwarding invariant, which also removes it from
+    every value check there, so THIS test is what pins its spelling. A `${WITNESS_DIR…}`
+    interpolation would let a host `.env` or shell disarm or redirect the check
+    (Noether, PR#404 r1)."""
+    import yaml
+    from pathlib import Path
+
+    from test_config import _chat_island_environment
+
+    assert _chat_island_environment()["WITNESS_DIR"] == "/witness"
+    compose = yaml.safe_load(
+        (Path(__file__).resolve().parent.parent / "docker-compose.yml").read_text())
+    volumes = compose["services"]["chat-island"]["volumes"]
+    assert "./witness:/witness:ro" in volumes, volumes
+
+
+def test_a_link_planted_after_the_cleanup_still_cannot_truncate_the_db(tmp_path, monkeypatch) -> None:
+    """The race the stale-tmp unlink can't close: a link that appears between the
+    unlink and the open. Simulated by skipping the unlink. O_CREAT|O_EXCL|O_NOFOLLOW
+    must then refuse to write rather than follow the link into aiko.db."""
+    db, _ = _volume(tmp_path, monkeypatch)
+    migrate.run()
+    migrate._sentinel_path(db).unlink()
+    before = db.read_bytes()
+    tmp = migrate._sentinel_path(db).with_name(migrate._sentinel_path(db).name + ".tmp")
+    os.symlink(db, tmp)
+    monkeypatch.setattr(migrate.os.path, "lexists", lambda p: False)
+    with pytest.raises(RuntimeError, match="MIGRATE_REFUSE_UNRECORDED"):
+        migrate.run()
+    assert db.read_bytes() == before, "the sentinel write followed a link into the db"
 
