@@ -3,10 +3,11 @@
 Answers [#400](https://github.com/nickmeinhold/aiko-chat-island/issues/400) Q1–Q3 and
 Q7, with Q4–Q5 noted where the measurements reached them.
 
-**Status: v5 = v4 + the ceremony-record addendum** ([§ `--enroll` needs evidence, not
+**Status: v5.1 = v4 + the ceremony addendum** ([§ `--enroll` needs evidence, not
 absence](#--enroll-needs-evidence-not-absence-v5), from PR#404's capped cage-match,
-[ct#5189](https://github.com/enspyrco/claude-tasks/issues/5189)). **The addendum is
-UN-TEMPERED** until its `/design-temper` round lands in [`20-TEMPER.md`](20-TEMPER.md).
+[ct#5189](https://github.com/enspyrco/claude-tasks/issues/5189)). The addendum was struck
+once (A1: RECAST, 4/4 seated) and its nine findings are folded in as v5.1. **The v5.1
+folds are UN-TEMPERED** until round A2 lands in [`20-TEMPER.md`](20-TEMPER.md).
 
 **v4 history.** Four families struck
 it three times, and each round came back RECAST 4/4 ([`20-TEMPER.md`](20-TEMPER.md)).
@@ -86,6 +87,12 @@ All on 2026-10-24. Read-only on both live islands; throwaway probes on syd.
    the sentinel.
 6. **The db stores no island identity** *(T3-5)*. No column holds the island's domain
    or id. `island_id` and `passkey_rp_id` are settings, not data.
+7. **The live dbs are small, and hashing them is free** *(v5.1, A1)*. `aiko.db` is
+   393,216 B on syd and 569,344 B on melb, and `sha256sum` takes ~0 ms on each. Every
+   file in `aiko_data` is `root:root`, so the host writes the volume ticket through a
+   helper container, not as the deploy user. The volumes also hold stray hand backups
+   (`aiko.db.pre-*`, `aiko.pre-0024-*.db`): classify ignores names it doesn't own, and
+   they never count as evidence.
 
 ## Q7: the image floor *(Nick 2026-10-24)*
 
@@ -114,7 +121,14 @@ or whose container isn't armed.**
     `MIGRATE_REFUSE_FOREIGN_LINEAGE`;
   - (c) positive control: a matching tally → must reach "Database is at head".
 
-  Until that revision, only (a) applies.
+  Until that revision, only (a) applies. **Except `--enroll`** *(v5.1, A1: Maxwell,
+  Tesla)*. Its cases ship **with** the `deploy/` enroll, not later, because a v4-shaped
+  image enrols on absence and the floor would otherwise still pass it. The probe runs
+  `--enroll` against its own throwaway witness dir:
+  - (d) no record → must refuse with `MIGRATE_REFUSE_ENROLL_UNAUTHORISED`, nothing
+    created;
+  - (e) a valid new-island record but no volume ticket → must refuse, nothing created;
+  - (f) a valid adopt record with a `-wal` sibling → must refuse without connecting.
 - **The cache records which policy passed** *(T3-4)*. It is keyed by image ID **plus
   the floor-policy revision**, so raising the floor invalidates every earlier pass, and
   the next `up` re-probes. No old "yes" carries over.
@@ -187,8 +201,8 @@ before step 4:
    says so.
 4. **Mutate, if the row allows it:** migrate-only via an explicit
    `python -m aiko_gateway.migrate --enroll` (an argv mode that skips only the tally
-   check, never inferred from a missing variable, and **authorised only by the ceremony
-   record**, *v5*), then write the tally atomically (tmp, fsync, rename, fsync the
+   check, never inferred from a missing variable, and **authorised only by the
+   two-half token: witness record + volume ticket**, *v5.1*), then write the tally atomically (tmp, fsync, rename, fsync the
    directory).
 
 | Inspected state | Row | Confirmation |
@@ -220,103 +234,156 @@ Carnot + Tesla independently). In v4, `--enroll` is allowed *because the tally i
 missing*. A rule like that can't be finished by patching: the ways to make a file
 invisible are open-ended, and each patch closes one.
 
-**The flip.** `--enroll`'s permission comes from a record that **is there**: a one-shot
-`witness/enrolling` record, written by the host ceremony after it has inspected,
-classified and had the operator confirm. Every way of failing to look (unmounted,
+**The flip.** `--enroll`'s permission comes from evidence that **is there**, written by
+the host ceremony after it has inspected, classified and had the operator confirm (v5:
+one record; v5.1: two matching halves, below). Every way of failing to look (unmounted,
 unreadable, wrong directory, wrong variable) now lands on *record missing*, and record
 missing **refuses**. The list of ways to be invisible no longer matters, because
 invisible is the safe answer.
 
-**Who writes and who removes: the host, both.** The container mounts `/witness`
-read-only (v4, unchanged), so it can't remove anything there, and it must not be able
-to. The host ceremony already writes the tally; it removes the record in the same
-place. The container only **reads** the record and reports which one it acted on.
+**v5.1: the permission comes in two halves** *(A1, 3 RECAST + 1 DISSOLVE; see
+[`20-TEMPER.md`](20-TEMPER.md))*. v5 used one record. A1 showed one record isn't enough:
+on the new-island row it had nothing to bind but `"empty"`, and an unmounted data
+directory *reads* as empty (Tesla). That's the capped class again, one layer down. A1
+also showed the image couldn't spend a read-only record, so it wasn't one-shot (Carnot).
+v5.1 splits the permission into two parts that must match, like the two halves of a
+medieval tally stick. Each part lives where the other side can't forge it:
 
-**The record** is JSON with a fixed set of keys, **every value a string** (read the same
-way as the tally, below):
+- **the witness record**, `witness/enrolling`, is on the host, mounted **read-only** into
+  the container. The container can read it but not mint it. Reading it also proves the
+  container sees the directory the host wrote to. That **mount proof** is what closes
+  r3's hole: the container can't see the host's directory, and nothing outside the
+  container can check that for it (Maxwell).
+- **the volume ticket**, `.aiko-enroll-ticket`, is on the volume, beside the db. The
+  host writes it after confirmation (through a helper container: the volume's files are
+  root-owned, measured). It's the evidence that *this* volume is the one the operator
+  was shown, and the volume is read-write, so the container can **claim** it, once.
+
+Neither half on its own does anything. A recreated or wiped volume has no ticket, so S2
+is refused by construction, not by a clock.
+
+**The record** is JSON with a fixed set of keys, **every value a string** (the tally's
+reader, below):
 
 | key | value | checked by the image against |
 |---|---|---|
 | `v` | `"1"` | exact |
-| `row` | `"adopt"` (the two "no sentinel, a db with `users`" rows) or `"new-island"` (the empty-volume row) | the observation in `expect` |
+| `row` | `"adopt"` (the two "no sentinel, a db with `users`" rows) or `"new-island"` (the empty-volume row) | the row the image then enforces (step 7) |
 | `island_id` | the confirmed island id | `self_island_id(settings)` |
 | `db_path` | the db file as the container sees it | `_db_file()` |
-| `expect` | `"sha256:<hex>"` of `aiko.db` as inspected (adopt), or `"empty"` (new-island) | the volume as the image sees it now |
+| `expect` | `"sha256:<hex>"` of `aiko.db` as inspected (adopt), or `"absent"` (new-island) | the db, read through the held directory (step 6) |
+| `ticket` | 32 random hex chars | the volume ticket's content, exactly |
+| `replaces` | the current tally's lineage, or `""` for a first enrolment | the tally (step 4) |
 | `expires_at` | RFC 3339 UTC, written as *now + 5 min* | the container's clock (the host's kernel clock) |
-| `nonce` | 32 random hex chars | echoed in the log, never compared |
 
-The "sentinel present, db has `users`, no tally" row writes the tally
-straight from the sentinel and never runs `--enroll`, so it never writes a record.
-`--replace-lineage` moves the old tally aside, then joins whichever row the volume now
-classifies as.
+`expires_at` is **cleanup, not identity**. The ticket identifies the volume. Expiry only
+stops one forgotten file from becoming a standing key: `now < expires_at <= now + 10
+min`, checked again after the hash.
 
-**Why `expect` binds the bytes, not the shape.** A record that said only "a db with
-`users`" or "empty" would authorise *any* volume of that shape for as long as it lay
-there. `"empty"` is the sharp case: a `new-island` record left behind by an aborted
-ceremony would bless the next recreated-empty volume, which is exactly S2, the thing
-design 20 exists to refuse. So an adopt record carries the **hash of the db the operator
-saw the island mark of**. Hashing is cheap: it happens once, at enrolment, with the
-stack down. A `new-island` record can't carry a hash, so its defence is time: a short
-expiry, and the host removing it.
+The "sentinel present, db has `users`" row (first enrolment, or a `--replace-lineage`
+to it) writes the tally straight from the sentinel and never runs `--enroll`, so it
+writes no record and no ticket. **The old tally is never moved aside.** A replacement is
+one atomic rename over it, made at the end. A crash before that leaves the old tally,
+and the retry still needs `--replace-lineage` (Carnot).
 
 **What `--enroll` checks, in order.** It refuses at the first failure, and nothing
-connects before step 7:
+connects before step 8:
 
 1. **Armed, in every environment.** `--enroll` has no disarmed mode: with nothing to
    enrol into, it has nothing to do. An unset or `disarmed` `WITNESS_DIR` refuses
    (`MIGRATE_REFUSE_UNWITNESSED`).
 2. **The island has a name**: `self_island_id(settings)` is non-empty (the shared rule
    below).
-3. **There's no tally.** If `_present(tally)` says yes, refuse (`MIGRATE_REFUSE_ENROLLED`,
-   unchanged). Here presence *refuses*, which is the safe direction for a missing answer:
-   when the directory is unmounted, this step passes and step 4 catches it.
-4. **The record.** Read with `_read_text_nofollow`, so it can't be a symlink, FIFO,
-   device, oversized or non-UTF-8. `FileNotFoundError` →
-   **`MIGRATE_REFUSE_ENROLL_UNAUTHORISED`** ("no ceremony record: run
-   `deploy/compose.sh enroll`"). An environmental error → `_unreadable`. Malformed JSON,
-   a missing or extra key, or any non-string value → `UNAUTHORISED`.
-5. **Not expired, and not far-dated**: `now < expires_at <= now + 10 min`. The upper
-   bound means a hand-written record with a far-future date can't become standing
-   permission.
-6. **It names this container**: `island_id` and `db_path` match exactly.
-7. **It names this volume.** For `adopt`, the sentinel is absent and `sha256(aiko.db)`
-   equals `expect`. For `new-island`, `aiko.db`, the sentinel and the worker lock are all
-   absent (by `_present`, so "can't look" refuses as unreadable).
-8. Log `enrolling under ceremony <nonce>`, then the existing migrate path, unchanged.
+3. **The record: the mount proof comes first.** Read with `_read_text_nofollow`, so it
+   can't be a symlink, FIFO, device, oversized or non-UTF-8. `FileNotFoundError` →
+   **`MIGRATE_REFUSE_ENROLL_UNAUTHORISED`**. An environmental error → `_unreadable`.
+   Malformed JSON, a missing or extra key, or any non-string value → `UNAUTHORISED`. Then
+   `expires_at` is checked, and `island_id` and `db_path` must match this container.
+   These last two are host-against-host: they catch drift in the ceremony's config, not
+   a hostile volume.
+4. **The tally, against `replaces`.** Only now, with the directory proven visible, does
+   the tally's state mean anything. `replaces == ""` → the tally must be absent
+   (`_present`, and presence refuses with `MIGRATE_REFUSE_ENROLLED`). Otherwise the tally
+   must read, typed, with a lineage equal to `replaces`.
+5. **Hold the data directory.** `open(db.parent, O_DIRECTORY | O_NOFOLLOW)`. **Any**
+   failure, including `ENOENT` (the directory itself missing: an unmounted volume),
+   refuses as UNREADABLE. From here on, every name in the volume is reached by `openat`
+   on this one fd. So `ENOENT` means "absent from the directory I am holding", never "I
+   couldn't look".
+6. **The ticket, and the row.** `openat` the ticket (`O_NOFOLLOW`, regular, small):
+   `ENOENT` → `UNAUTHORISED` ("no ticket on this volume: it is not the volume the
+   ceremony prepared"). Its content must equal `ticket`. Then the row, through the same
+   fd:
+   - **`new-island`:** `aiko.db`, the sentinel and the worker lock are all `ENOENT`.
+     Absence is a fact about a directory proven to be the right one, because the ticket
+     is in it.
+   - **`adopt`:** the sentinel is `ENOENT`. `aiko.db` is a non-empty regular file whose
+     `sha256`, read through the fd, equals `expect`. **No `-wal`, `-shm` or `-journal`
+     sibling** (Tesla: the image enforces this, not only the host's classify table,
+     because the image is what opens SQLite with the predicate off).
+7. **Claim the ticket.** `renameat(ticket → .aiko-enroll-ticket.claimed-<ticket>)`, on
+   the held fd. The rename is atomic, so if a second runner raced this one, exactly one
+   rename succeeds, and the loser gets `ENOENT` and refuses. Re-check `expires_at` (the
+   hash took time). Log `enrolling under ceremony <ticket>`.
+8. **Migrate with the row pinned, not "unchanged".** `new-island` only provisions: if a
+   db exists by now, it refuses and never adopts. `adopt` only adopts or upgrades: if
+   the db is missing, it refuses and never provisions. The migrator gets the row as an
+   argument; it is not re-derived from what's on disk.
 
-Step 7's absence checks don't bring the old smell back. Absence there is a
-**precondition** the operator has already confirmed, not the source of permission. The
-permission came from step 4, and "couldn't look" still refuses.
+*Named limit:* SQLite opens by path, not by the held fd, so between step 6's hash and
+step 8's connect, a path swap isn't excluded by the fd. What excludes it is the ceremony
+below: the stack is down, the ticket is claimed, and only the uniquely named enrol
+container mounts the volume. A swap in that window needs the bypass, which is out of
+model.
 
-**What the host ceremony does around the run**, all under the wrapper's lock:
-- **Before inspecting:** if `witness/enrolling` exists, remove it, and say that an
-  earlier ceremony left one. A record is only ever made fresh, by this run.
-- **After confirming:** write the record atomically (unique temp file, fsync, rename,
-  fsync the directory), then run the container with `--enroll`.
-- **On success:** exit 0 **and** a log line naming *this* ceremony's nonce. Only then
-  read the sentinel the run just wrote (read-only helper, the same reader as inspect;
-  the run is what makes the lineage, so the tally can't be prepared in advance) and
-  write the tally from it (adding an `enrolled_by` nonce for forensics, never compared), then
-  remove the record.
-- **On any failure:** remove the record (`finally`).
+**What the host ceremony does**, under the wrapper's lock, **and** with exclusion that
+outlives the wrapper:
+- **One enrol container, by name.** The run is `create --name aiko-enroll --restart no`.
+  The **Docker daemon** enforces unique names, so a second ceremony's `create` fails
+  with a name conflict *while the first container exists*, even after its wrapper was
+  SIGKILLed and its lock released (Carnot, Tesla, Noether). The ceremony doesn't *check*
+  whether the name is free (that would be absence again). It just creates, and a
+  conflict refuses, saying: "an enrolment container exists; `docker logs aiko-enroll`,
+  wait for it to exit, then `docker rm` it". `compose.sh up` refuses the same way while
+  `aiko-enroll` exists.
+- **Before writing:** remove any leftover record, ticket or claimed ticket. Only this
+  run ever makes them.
+- **After confirming:** write the volume ticket (helper; unique temp file, fsync, rename,
+  fsync the directory), then the witness record (same writer), then create and start
+  `aiko-enroll` with `--enroll`, and wait for it.
+- **Success is read off the outcome, not the log** (Tesla, Maxwell). Exit 0, the nonce
+  in the log, **and** a read-only helper finds the claimed ticket carrying this nonce
+  **and** a sentinel whose content names the confirmed island. Only then: write the
+  tally (an atomic rename, over the old one when `replaces` is set), then remove the
+  record, the claimed ticket and the container.
+- **`ENROLL_UNAUTHORISED` after the host wrote both halves is a mount failure**
+  (Maxwell), not "run enroll": the container didn't see what the host wrote. Refuse,
+  name the bind source path and the volume, and never retry.
+- **On any failure:** remove the record and any unclaimed ticket (`finally`). A
+  container that's still running is left for the operator, as above.
 
-**Crash table.** Every interleaving falls into one of these four outcomes:
+**Crash table.** Each row is a crash at that point, with every process dead except where
+stated:
 
 | crash after… | what's left | next start | next `enroll` |
 |---|---|---|---|
-| record written, before the run | record, no tally | refuses: unenrolled | removes the record, starts over |
-| the run, before the tally | record, migrated db **+ the sentinel the run wrote**, no tally | refuses: unenrolled | removes the record; the volume now classifies as "sentinel present, db has `users`, no tally", so it writes the tally from that sentinel, with no second `--enroll` (and the stale record's hash would no longer match anyway) |
-| the tally, before removing the record | tally + record | **serves** (the predicate never reads the record) | "already enrolled"; removes the leftover |
-| removing the record | tally | serves | "already enrolled" |
+| ticket and/or record written, before the run | ticket, record, no tally | refuses: unenrolled | removes both, starts over |
+| **the wrapper dies, the container runs on** | a running `aiko-enroll` | `compose.sh up` refuses (the name exists) | `create` conflicts: refuses until the operator has waited for and removed it |
+| the run, before the tally | claimed ticket, record, migrated db + the sentinel the run wrote, no tally | refuses: unenrolled | removes the leftovers; the volume classifies as "sentinel present, db has `users`", so it writes the tally from that sentinel, with no second `--enroll` |
+| the tally, before cleanup | tally, record, claimed ticket | **serves** (the predicate reads neither) | "already enrolled"; removes the leftovers |
 
-A leftover record **next to a tally is inert**: step 3 refuses `--enroll` before step 4
-ever reads it.
+A leftover record is inert in every row: step 4 refuses it against a tally that doesn't
+match `replaces`, and step 6 finds no unclaimed ticket. A claimed ticket is inert
+everywhere, because nothing accepts that name.
 
-**The trust limit, named.** Anyone who can write the deploy dir's `witness/` can forge a
-record. But they can forge the tally just as easily, so the record adds no new trust
-root. It sits under the one the tally already depends on: the operator's box. What the
-record adds is that **forgetting** or **failing to look** can't enrol anything.
-Fixing that was the job.
+**The trust limit, named** *(Noether, Tesla)*. Anyone who can write the deploy dir's
+`witness/` and the volume can forge both halves. That's the same principal the tally
+already trusts (the operator's box), so the design adds no new trust root. It **does**
+add a second capability under that principal. The tally lets a start *serve* a lineage;
+a record plus a ticket let `--enroll` *mutate* a volume with the lineage predicate
+skipped. Name it, so nobody "fixes" a later finding by moving the check back onto the
+host. What the split token adds is that **forgetting**, **failing to look**, **a
+recreated volume** and **a second runner** can't enrol anything.
 
 ### Round-3 folds *(v5)*
 
@@ -407,7 +474,8 @@ quarantine a good digest. That handling is part of what gets built.
    - production arming (`MIGRATE_REFUSE_UNWITNESSED`), the explicit dev disarm, and
      `O_NOFOLLOW`;
    - the new refusal codes;
-   - `--enroll` mode, authorised only by the ceremony record (v5: steps 1–8,
+   - `--enroll` mode, authorised only by the two-half token (v5.1: steps 1–8, the held
+     directory fd, the ticket claim, the row pinned into the migrator,
      `MIGRATE_REFUSE_ENROLL_UNAUTHORISED`, `MIGRATE_REFUSE_UNNAMED`);
    - the sentinel now names its island, written through a unique temp file (v5);
    - the round-3 folds (v5);
@@ -417,9 +485,11 @@ quarantine a good digest. That handling is part of what gets built.
    - create-inspect-start with the policy-keyed probe cache;
    - the three-case probe;
    - the gateway's maintenance allow-list in place of `run` passthrough;
-   - `enroll` with the island mark, the db hash and the ceremony record (write, run,
-     check the nonce, tally, remove), in Dart; slice it so the read-only
+   - `enroll` with the island mark, the db hash, the volume ticket and the witness
+     record, the `aiko-enroll` named container, success read off the outcome, and
+     `up` refusing while `aiko-enroll` exists, in Dart; slice it so the read-only
      inspect-and-classify half ships first;
+   - probe cases (d)–(f) for `--enroll`;
    - the `witness/` mount in compose;
    - backups carrying the sentinel;
    - runbook changes.
