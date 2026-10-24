@@ -3,7 +3,12 @@
 Answers [#400](https://github.com/nickmeinhold/aiko-chat-island/issues/400) Q1–Q3 and
 Q7, with Q4–Q5 noted where the measurements reached them.
 
-**Status: v4. UN-TEMPERED (provisional) for its round-3 folds.** Four families struck
+**Status: v5 = v4 + the ceremony-record addendum** ([§ `--enroll` needs evidence, not
+absence](#--enroll-needs-evidence-not-absence-v5), from PR#404's capped cage-match,
+[ct#5189](https://github.com/enspyrco/claude-tasks/issues/5189)). **The addendum is
+UN-TEMPERED** until its `/design-temper` round lands in [`20-TEMPER.md`](20-TEMPER.md).
+
+**v4 history.** Four families struck
 it three times, and each round came back RECAST 4/4 ([`20-TEMPER.md`](20-TEMPER.md)).
 Round 3 affirmed the spine unanimously: one fact per place, the tally checked inside
 the image as the only copy of the lineage rule, and the floor as an execution probe.
@@ -182,8 +187,9 @@ before step 4:
    says so.
 4. **Mutate, if the row allows it:** migrate-only via an explicit
    `python -m aiko_gateway.migrate --enroll` (an argv mode that skips only the tally
-   check, never inferred from a missing variable), then write the tally atomically (tmp,
-   fsync, rename, fsync the directory).
+   check, never inferred from a missing variable, and **authorised only by the ceremony
+   record**, *v5*), then write the tally atomically (tmp, fsync, rename, fsync the
+   directory).
 
 | Inspected state | Row | Confirmation |
 |---|---|---|
@@ -202,6 +208,145 @@ The `enroll` design holds one more property: **a crash at any point leaves no ta
 the old one**, so the next start refuses and `enroll` runs again idempotently.
 `standup.sh` uses the empty-volume row and never offers itself on a volume that has
 witnesses.
+
+### `--enroll` needs evidence, not absence *(v5)*
+
+**Why this exists.** PR#404 ran three cage-match rounds, all four seats each round, and
+was capped with findings at 11 → 7 → 5+ while the diff grew 448 → 664 → 883 lines. One
+class came back one layer deeper every round: **absence read as permission**. First an
+unset `WITNESS_DIR`, then `exists()`/`lexists()`/`Path.exists()` answering False when
+they *couldn't look* (measured), then a set `WITNESS_DIR` with **nothing mounted** (r3,
+Carnot + Tesla independently). In v4, `--enroll` is allowed *because the tally is
+missing*. A rule like that can't be finished by patching: the ways to make a file
+invisible are open-ended, and each patch closes one.
+
+**The flip.** `--enroll`'s permission comes from a record that **is there**: a one-shot
+`witness/enrolling` record, written by the host ceremony after it has inspected,
+classified and had the operator confirm. Every way of failing to look (unmounted,
+unreadable, wrong directory, wrong variable) now lands on *record missing*, and record
+missing **refuses**. The list of ways to be invisible no longer matters, because
+invisible is the safe answer.
+
+**Who writes and who removes: the host, both.** The container mounts `/witness`
+read-only (v4, unchanged), so it can't remove anything there, and it must not be able
+to. The host ceremony already writes the tally; it removes the record in the same
+place. The container only **reads** the record and reports which one it acted on.
+
+**The record** is JSON with a fixed set of keys, **every value a string** (read the same
+way as the tally, below):
+
+| key | value | checked by the image against |
+|---|---|---|
+| `v` | `"1"` | exact |
+| `row` | `"adopt"` (the two "no sentinel, a db with `users`" rows) or `"new-island"` (the empty-volume row) | the observation in `expect` |
+| `island_id` | the confirmed island id | `self_island_id(settings)` |
+| `db_path` | the db file as the container sees it | `_db_file()` |
+| `expect` | `"sha256:<hex>"` of `aiko.db` as inspected (adopt), or `"empty"` (new-island) | the volume as the image sees it now |
+| `expires_at` | RFC 3339 UTC, written as *now + 5 min* | the container's clock (the host's kernel clock) |
+| `nonce` | 32 random hex chars | echoed in the log, never compared |
+
+The "sentinel present, db has `users`, no tally" row writes the tally
+straight from the sentinel and never runs `--enroll`, so it never writes a record.
+`--replace-lineage` moves the old tally aside, then joins whichever row the volume now
+classifies as.
+
+**Why `expect` binds the bytes, not the shape.** A record that said only "a db with
+`users`" or "empty" would authorise *any* volume of that shape for as long as it lay
+there. `"empty"` is the sharp case: a `new-island` record left behind by an aborted
+ceremony would bless the next recreated-empty volume, which is exactly S2, the thing
+design 20 exists to refuse. So an adopt record carries the **hash of the db the operator
+saw the island mark of**. Hashing is cheap: it happens once, at enrolment, with the
+stack down. A `new-island` record can't carry a hash, so its defence is time: a short
+expiry, and the host removing it.
+
+**What `--enroll` checks, in order.** It refuses at the first failure, and nothing
+connects before step 7:
+
+1. **Armed, in every environment.** `--enroll` has no disarmed mode: with nothing to
+   enrol into, it has nothing to do. An unset or `disarmed` `WITNESS_DIR` refuses
+   (`MIGRATE_REFUSE_UNWITNESSED`).
+2. **The island has a name**: `self_island_id(settings)` is non-empty (the shared rule
+   below).
+3. **There's no tally.** If `_present(tally)` says yes, refuse (`MIGRATE_REFUSE_ENROLLED`,
+   unchanged). Here presence *refuses*, which is the safe direction for a missing answer:
+   when the directory is unmounted, this step passes and step 4 catches it.
+4. **The record.** Read with `_read_text_nofollow`, so it can't be a symlink, FIFO,
+   device, oversized or non-UTF-8. `FileNotFoundError` →
+   **`MIGRATE_REFUSE_ENROLL_UNAUTHORISED`** ("no ceremony record: run
+   `deploy/compose.sh enroll`"). An environmental error → `_unreadable`. Malformed JSON,
+   a missing or extra key, or any non-string value → `UNAUTHORISED`.
+5. **Not expired, and not far-dated**: `now < expires_at <= now + 10 min`. The upper
+   bound means a hand-written record with a far-future date can't become standing
+   permission.
+6. **It names this container**: `island_id` and `db_path` match exactly.
+7. **It names this volume.** For `adopt`, the sentinel is absent and `sha256(aiko.db)`
+   equals `expect`. For `new-island`, `aiko.db`, the sentinel and the worker lock are all
+   absent (by `_present`, so "can't look" refuses as unreadable).
+8. Log `enrolling under ceremony <nonce>`, then the existing migrate path, unchanged.
+
+Step 7's absence checks don't bring the old smell back. Absence there is a
+**precondition** the operator has already confirmed, not the source of permission. The
+permission came from step 4, and "couldn't look" still refuses.
+
+**What the host ceremony does around the run**, all under the wrapper's lock:
+- **Before inspecting:** if `witness/enrolling` exists, remove it, and say that an
+  earlier ceremony left one. A record is only ever made fresh, by this run.
+- **After confirming:** write the record atomically (unique temp file, fsync, rename,
+  fsync the directory), then run the container with `--enroll`.
+- **On success:** exit 0 **and** a log line naming *this* ceremony's nonce. Only then
+  read the sentinel the run just wrote (read-only helper, the same reader as inspect;
+  the run is what makes the lineage, so the tally can't be prepared in advance) and
+  write the tally from it (adding an `enrolled_by` nonce for forensics, never compared), then
+  remove the record.
+- **On any failure:** remove the record (`finally`).
+
+**Crash table.** Every interleaving falls into one of these four outcomes:
+
+| crash after… | what's left | next start | next `enroll` |
+|---|---|---|---|
+| record written, before the run | record, no tally | refuses: unenrolled | removes the record, starts over |
+| the run, before the tally | record, migrated db **+ the sentinel the run wrote**, no tally | refuses: unenrolled | removes the record; the volume now classifies as "sentinel present, db has `users`, no tally", so it writes the tally from that sentinel, with no second `--enroll` (and the stale record's hash would no longer match anyway) |
+| the tally, before removing the record | tally + record | **serves** (the predicate never reads the record) | "already enrolled"; removes the leftover |
+| removing the record | tally | serves | "already enrolled" |
+
+A leftover record **next to a tally is inert**: step 3 refuses `--enroll` before step 4
+ever reads it.
+
+**The trust limit, named.** Anyone who can write the deploy dir's `witness/` can forge a
+record. But they can forge the tally just as easily, so the record adds no new trust
+root. It sits under the one the tally already depends on: the operator's box. What the
+record adds is that **forgetting** or **failing to look** can't enrol anything.
+Fixing that was the job.
+
+### Round-3 folds *(v5)*
+
+The four other real findings from PR#404 r3. Each fix removes the shape that made the
+bug possible, rather than guarding against it.
+
+- **The sentinel uses a unique temp file** *(Carnot)*. It's created `O_EXCL` under a
+  random name in the db's directory, then fsynced and renamed. The fixed `.tmp` name and
+  its "remove the leftover first" fence are deleted, not hardened. A crash's orphan temp
+  file is inert, because nothing reads that name. The same writer goes into the Dart
+  ceremony for the record and the tally.
+- **Advice comes from what was seen, not what was configured** *(Tesla)*. The
+  missing-db remedy names `--replace-lineage` only when a tally was **actually read**.
+  If the witness couldn't be looked at, the message says so and gives no remedy that
+  would re-bless. `refuse_missing_db_message` takes what was observed as a parameter
+  instead of re-reading `WITNESS_DIR`.
+- **The tally's fields are type-checked, not stringified** *(Tesla)*. `str(None)` is
+  `"None"`, which passes an emptiness check and then lands in the FOREIGN voice, whose
+  remedy re-blesses. Every field must be a JSON string (`isinstance(v, str)`), or the
+  read refuses as malformed (UNENROLLED). The record uses the same reader.
+- **One rule for an empty island id** *(Noether)*. Armed, an empty
+  `self_island_id(settings)` refuses before anything else, in **both** modes
+  (`MIGRATE_REFUSE_UNNAMED`). So the sentinel writer can no longer write a nameless
+  sentinel that the tally reader would then reject forever. Unarmed (dev/tests), the
+  legacy timestamp-only sentinel stays, and no tally reader runs there.
+
+Known release gate (r3 #6, Noether): every remedy names `compose.sh enroll`, which isn't
+in the tree until the `deploy/` PR. That's why no tag may contain the image PR before
+the `deploy/` PR lands. The `refuse_missing_db_message` docstring's claim that no advice
+is unworkable has to stay true *at the tag*, not just at the merge.
 
 ### Restores keep their lineage
 
@@ -262,15 +407,19 @@ quarantine a good digest. That handling is part of what gets built.
    - production arming (`MIGRATE_REFUSE_UNWITNESSED`), the explicit dev disarm, and
      `O_NOFOLLOW`;
    - the new refusal codes;
-   - `--enroll` mode;
-   - the sentinel now names its island;
+   - `--enroll` mode, authorised only by the ceremony record (v5: steps 1–8,
+     `MIGRATE_REFUSE_ENROLL_UNAUTHORISED`, `MIGRATE_REFUSE_UNNAMED`);
+   - the sentinel now names its island, written through a unique temp file (v5);
+   - the round-3 folds (v5);
    - tests for every state in the Q3 matrix, plus a test that boots the app **without**
      the migrator against a mismatched tally and expects a refusal.
 2. **`deploy/` PR**:
    - create-inspect-start with the policy-keyed probe cache;
    - the three-case probe;
    - the gateway's maintenance allow-list in place of `run` passthrough;
-   - `enroll` with the island mark;
+   - `enroll` with the island mark, the db hash and the ceremony record (write, run,
+     check the nonce, tally, remove), in Dart; slice it so the read-only
+     inspect-and-classify half ships first;
    - the `witness/` mount in compose;
    - backups carrying the sentinel;
    - runbook changes.
