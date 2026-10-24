@@ -94,6 +94,20 @@ final class StartedNotAnswering extends StandupResult {
   const StartedNotAnswering();
 }
 
+/// Created, started and healthy, but TLS was asked for and is not confirmed: Caddy
+/// would not start, or `https://<domain>/health` never answered (Noether, PR#406 r1).
+final class HealthyTlsUnconfirmed extends StandupResult {
+  const HealthyTlsUnconfirmed();
+}
+
+/// The process exit code for an outcome. In the library, not `main`, so a test can
+/// pin it: scripts read this number, and 0 must mean only "up and confirmed".
+int exitCodeFor(StandupResult r) => switch (r) {
+  Healthy() => 0,
+  StartedNotAnswering() => 3,
+  HealthyTlsUnconfirmed() => 4,
+};
+
 /// Standup stopped on purpose. The message is what the operator reads.
 final class Refusal implements Exception {
   Refusal(this.message);
@@ -224,11 +238,20 @@ void validate(StandupOptions o) {
   ]) {
     if (v.contains("'")) {
       throw Refusal(
-        "$what: a single quote (') can't be represented in the island's "
-        r".env. Rename, or use the JSON escape ' inside --seed-peers.",
+        "$what: a single quote (') can't be represented in the island's .env. "
+        'Rename, or use the JSON escape \\u0027 inside --seed-peers.',
       );
     }
-    if (v.contains('\n')) throw Refusal('$what must be one line');
+    if (v.codeUnits.any((c) => c < 0x20 || c == 0x7f)) {
+      throw Refusal('$what must be one line with no control characters');
+    }
+  }
+  // Compose's dotenv parser treats a backslash before the closing quote as an escape,
+  // so a name ending in `\` would swallow the following lines (Carnot, PR#406 r1). A
+  // JSON array always ends in `]`, so only the name can end in one; refuse them all
+  // in the name rather than reason about which positions are safe.
+  if (o.displayName.contains(r'\')) {
+    throw Refusal('--name can\'t contain a backslash (\\)');
   }
   _validatePeers(o.seedPeers);
 }
@@ -322,17 +345,29 @@ final class Standup {
 
   Future<RunResult> _docker(List<String> args) => runner.run('docker', args);
 
+  /// Paths standup needs from the checkout, checked before anything changes.
+  String get _composeSh => _f('deploy/compose.sh').path;
+  String get _caddyCompose => _f('deploy/caddy/docker-compose.caddy.yml').path;
+
   Future<StandupResult> run(StandupOptions o) async {
     final tag = o.tag ?? 'edge';
     final image = '$islandRepo:$tag';
 
     // ---- 1. checks: nothing below this block runs until all of them pass ----
     say.step('Checks (nothing is changed until they all pass)');
-    if (!_f('docker-compose.yml').existsSync()) {
-      throw Refusal(
-        'docker-compose.yml not found in ${root.path}: run from the island '
-        'checkout (the directory holding docker-compose.yml and deploy/).',
-      );
+    final needed = [
+      'docker-compose.yml',
+      'deploy/compose.sh',
+      if (o.tls) 'deploy/caddy/docker-compose.caddy.yml',
+    ];
+    for (final n in needed) {
+      if (!_f(n).existsSync()) {
+        throw Refusal(
+          '$n not found in ${root.path}. Run from the island checkout (the '
+          'directory holding docker-compose.yml and deploy/), with deploy/ synced. '
+          'Nothing was changed.',
+        );
+      }
     }
     for (final v in ['ISLAND_IMAGE', 'ISLAND_VERSION']) {
       if (environment.containsKey(v)) {
@@ -356,8 +391,7 @@ final class Standup {
     await _refuseIfAnIslandIsHere();
     if (o.tls) await _tlsPortAdvisory();
     say.ok('this box has no island; Docker and compose answer');
-    final secret = newSecret(random);
-    final env = renderEnv(o, secret);
+    final env = renderEnv(o, newSecret(random));
     final nonce = newSecret(random).substring(0, 16);
 
     // ---- 2. the image, before anything exists that a failed pull would strand ----
@@ -382,24 +416,37 @@ final class Standup {
     await _birth(image, nonce);
     say.ok('created volume $dataVolume and the new island\'s database');
 
-    // ---- 4. the island's files ----
-    say.step('Writing image.env and .env');
-    await _publish('image.env', renderImageEnv(tag), secret: false);
-    await _publish('.env', env, secret: true);
-    say.ok('wrote image.env ($image) and .env (mode 600, fresh JWT secret)');
+    // ---- 4 and 5: from here on, this run has created things. Any failure reports
+    // exactly what (Maxwell, Noether, Tesla, PR#406 r1), never a stack trace, never
+    // advice to run a command that can't help.
+    final made = ['volume $dataVolume (label $_label=$nonce)'];
+    try {
+      say.step('Writing image.env and .env');
+      await _publishBoth({
+        'image.env': renderImageEnv(tag),
+        '.env': env,
+      }, made: made);
+      say.ok('wrote image.env ($image) and .env (mode 600, fresh JWT secret)');
 
-    // ---- 5. start, and wait for it to answer ----
-    say.step('Starting the island (gateway + broker + registrar + ChatServer)');
-    final up = await runner.run('./deploy/compose.sh', [
-      'up',
-      '-d',
-    ], workingDirectory: root.path);
-    if (!up.ok) {
+      say.step(
+        'Starting the island (gateway + broker + registrar + ChatServer)',
+      );
+      final up = await runner.run(_composeSh, [
+        'up',
+        '-d',
+      ], workingDirectory: root.path);
+      if (!up.ok) {
+        throw Refusal('deploy/compose.sh up -d failed:\n${up.stderr.trim()}');
+      }
+    } on Object catch (e) {
       throw Refusal(
-        'the island is created but would not start:\n${up.stderr.trim()}\n'
-        'Inspect: deploy/compose.sh logs chat-island',
+        'standup stopped partway: $e\n'
+        'This run created: ${made.join(', ')}. Nothing has served users yet, so '
+        'see docs/runbooks/backup-and-rollback.md, "A failed birth", to decide '
+        'what to remove before running standup again.',
       );
     }
+
     final healthy = await _wait(Uri.parse('http://127.0.0.1:8095/health'), 30);
     if (healthy) {
       say.ok('gateway healthy on 127.0.0.1:8095');
@@ -411,8 +458,9 @@ final class Standup {
     }
 
     // ---- 6. TLS ----
+    var tlsConfirmed = true;
     if (o.tls) {
-      await _tls(o.domain);
+      tlsConfirmed = await _tls(o.domain);
     } else {
       say.step(
         'TLS skipped (--no-tls): point your own proxy at 127.0.0.1:8095',
@@ -426,13 +474,21 @@ final class Standup {
       );
       return const StartedNotAnswering();
     }
+    if (!tlsConfirmed) {
+      say.step(
+        "Island '${o.displayName}' (${o.domain}) is up on 127.0.0.1:8095, but "
+        'HTTPS is NOT confirmed (see the TLS warning above).',
+      );
+      return const HealthyTlsUnconfirmed();
+    }
     say.step("Island '${o.displayName}' (${o.domain}) is up.");
     say.out('''
 
 Next steps:
   • Verify:     curl -s https://${o.domain}/health
-  • Settings:   change peers, passkeys or the name with `island configure`.
-                Never re-run standup on this box: it refuses, by design.
+  • Settings:   never re-run standup on this box: it refuses, by design. Until
+                `island configure` exists, change peers, passkeys or the name by
+                re-running deploy/standup.sh with the flag to change.
   • Backups:    the SQLite store lives in volume '$dataVolume'. Set up backups before
                 real users arrive: docs/runbooks/backup-and-rollback.md.
   • Updates:    nobody can push this island an update. Edit ISLAND_IMAGE in image.env
@@ -442,15 +498,14 @@ Next steps:
   }
 
   Future<void> _refuseIfAnIslandIsHere() async {
-    for (final name in ['.env', 'image.env']) {
-      if (FileSystemEntity.typeSync(_f(name).path, followLinks: false) !=
-          FileSystemEntityType.notFound) {
-        throw Refusal(
-          'this box already has an island ($name exists in ${root.path}). '
-          'standup is for a box that has none; to change settings use '
-          '`island configure`.',
-        );
-      }
+    bool present(String n) =>
+        FileSystemEntity.typeSync(_f(n).path, followLinks: false) !=
+        FileSystemEntityType.notFound;
+    if (present('.env')) {
+      throw Refusal(
+        'this box already has an island (.env exists in ${root.path}). Nothing '
+        'was changed. standup is for a box that has none.',
+      );
     }
     // Positive evidence only: a listing that FAILED is not "no volume".
     final ls = await _docker([
@@ -466,12 +521,21 @@ Next steps:
         'box already has an island. Nothing was changed.\n${ls.stderr.trim()}',
       );
     }
-    if (const LineSplitter()
+    final volume = const LineSplitter()
         .convert(ls.stdout)
-        .any((l) => l.trim() == dataVolume)) {
+        .any((l) => l.trim() == dataVolume);
+    if (volume || present('image.env')) {
+      // No .env, but a volume or an image.env: an island, or an earlier standup that
+      // stopped partway. This run can't tell which, so it names what it sees and
+      // hands the decision to the runbook, never to a command (PR#406 r1).
+      final seen = [
+        if (volume) 'volume $dataVolume',
+        if (present('image.env')) 'image.env',
+      ];
       throw Refusal(
-        'this box already has an island (volume $dataVolume exists). It was '
-        'not touched. standup is for a box that has none.',
+        'this box already has ${seen.join(' and ')} (but no .env). It is either an '
+        'island or an earlier standup that stopped partway. Nothing was changed. '
+        'See docs/runbooks/backup-and-rollback.md, "A failed birth".',
       );
     }
   }
@@ -549,36 +613,46 @@ Next steps:
       throw Refusal(
         'could not copy the seed into volume $dataVolume (an image released '
         'before the seed has no /app/seed/aiko.db, so check --version):\n'
-        '${copied.stderr.trim()}\nNothing more was done. $pointer',
+        '${copied.stderr.trim()}\nThis run created volume $dataVolume '
+        '($_label=$nonce); nothing else was written. $pointer',
       );
     }
   }
 
-  /// Write [name] so it is never visible half-written, never at a looser mode while
-  /// it holds a secret, and never over an existing file: an exclusive temporary,
-  /// `chmod 600` while still EMPTY, the content, then `ln`, which refuses an
-  /// existing target (the same publish as the birth).
-  Future<void> _publish(
-    String name,
-    String content, {
-    required bool secret,
+  /// Publish every file in [files] so none is visible half-written, none holds a
+  /// secret at a looser mode, and none lands over an existing file: ALL the
+  /// temporaries are written first (exclusive, `chmod 600` while still EMPTY), and
+  /// only then each is published with `ln`, which refuses an existing target. So a
+  /// failed write publishes nothing (Tesla, PR#406 r1). Temporaries are named
+  /// `<name>.standup-*`, which .gitignore covers, so one stranded by a SIGKILL holding
+  /// the JWT secret can't be committed. Each published name is added to [made].
+  Future<void> _publishBoth(
+    Map<String, String> files, {
+    required List<String> made,
   }) async {
-    final tmp = _f('.$name.standup-${newSecret(random).substring(0, 8)}');
-    tmp.createSync(exclusive: true);
+    final tmps = <String, File>{};
     try {
-      if (secret) {
+      for (final MapEntry(key: name, value: content) in files.entries) {
+        final tmp = _f('$name.standup-${newSecret(random).substring(0, 8)}');
+        tmp.createSync(exclusive: true);
+        tmps[name] = tmp;
         final m = await runner.run('chmod', ['600', tmp.path]);
         if (!m.ok) {
           throw Refusal(
             'could not restrict ${tmp.path} to mode 600: ${m.stderr.trim()}',
           );
         }
+        tmp.writeAsStringSync(content, flush: true);
       }
-      tmp.writeAsStringSync(content, flush: true);
-      final l = await runner.run('ln', [tmp.path, _f(name).path]);
-      if (!l.ok) throw Refusal('could not publish $name: ${l.stderr.trim()}');
+      for (final MapEntry(key: name, value: tmp) in tmps.entries) {
+        final l = await runner.run('ln', [tmp.path, _f(name).path]);
+        if (!l.ok) throw Refusal('could not publish $name: ${l.stderr.trim()}');
+        made.add(name);
+      }
     } finally {
-      if (tmp.existsSync()) tmp.deleteSync();
+      for (final t in tmps.values) {
+        if (t.existsSync()) t.deleteSync();
+      }
     }
   }
 
@@ -590,32 +664,36 @@ Next steps:
     return false;
   }
 
-  Future<void> _tls(String domain) async {
+  /// Whether HTTPS was confirmed. A failure here never throws: the island is already
+  /// up on 127.0.0.1, so it is reported, and the outcome says TLS is unconfirmed.
+  Future<bool> _tls(String domain) async {
     say.step('TLS reverse proxy (Caddy, host network)');
-    _f('deploy/caddy/.env')
-        .writeAsStringSync('ISLAND_DOMAIN=$domain\n', flush: true);
-    final c = await _docker([
-      'compose',
-      '-f',
-      'deploy/caddy/docker-compose.caddy.yml',
-      'up',
-      '-d',
-    ]);
+    try {
+      _f('deploy/caddy/.env')
+          .writeAsStringSync('ISLAND_DOMAIN=$domain\n', flush: true);
+    } on FileSystemException catch (e) {
+      say.warn(
+        'could not write deploy/caddy/.env (${e.message}); Caddy not started.',
+      );
+      return false;
+    }
+    final c = await _docker(['compose', '-f', _caddyCompose, 'up', '-d']);
     if (!c.ok) {
       say.warn(
         'Caddy did not start:\n${c.stderr.trim()}\nThe island is up on '
         '127.0.0.1:8095; fix the proxy and run: docker compose -f '
         'deploy/caddy/docker-compose.caddy.yml up -d',
       );
-      return;
+      return false;
     }
     if (await _wait(Uri.parse('https://$domain/health'), 15)) {
       say.ok('https://$domain/health is live');
-    } else {
-      say.warn(
-        'https://$domain/health not answering yet. Check DNS points here and ports '
-        '80+443 are open, then: docker compose -f deploy/caddy/docker-compose.caddy.yml logs',
-      );
+      return true;
     }
+    say.warn(
+      'https://$domain/health not answering yet. Check DNS points here and ports '
+      '80+443 are open, then: docker compose -f deploy/caddy/docker-compose.caddy.yml logs',
+    );
+    return false;
   }
 }

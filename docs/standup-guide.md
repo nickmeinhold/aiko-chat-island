@@ -80,14 +80,19 @@ refuses and changes nothing. It doesn't do media yet (use `--with-media` with th
 ```bash
 V=vX.Y.Z; ARCH=$(uname -m | sed 's/aarch64/arm64/; s/x86_64/x64/')
 base=https://github.com/nickmeinhold/aiko-chat-island/releases/download/$V
-curl -fsSLO "$base/island-linux-$ARCH" && curl -fsSLO "$base/SHA256SUMS"
-sha256sum --ignore-missing -c SHA256SUMS && chmod +x "island-linux-$ARCH"
 #   optional, proves CI built it from this repo:  gh attestation verify island-linux-$ARCH --repo nickmeinhold/aiko-chat-island
-./island-linux-$ARCH standup --domain chat.example.org --name "Example Island" --version ${V#v}
+# ONE chain: if the download or the checksum fails, nothing runs (a stale
+# executable left over from an earlier download included).
+rm -f "island-linux-$ARCH" SHA256SUMS \
+  && curl -fsSLO "$base/island-linux-$ARCH" && curl -fsSLO "$base/SHA256SUMS" \
+  && sha256sum --ignore-missing -c SHA256SUMS && chmod +x "island-linux-$ARCH" \
+  && ./island-linux-$ARCH standup --domain chat.example.org --name "Example Island" --version ${V#v}
 ```
 
-It exits 0 only when the gateway answered its health check; 3 means the island was
-created and started but never answered (check `deploy/compose.sh logs chat-island`).
+It exits 0 only when the island is up AND confirmed: the gateway answered its health
+check and, unless `--no-tls`, so did `https://<domain>/health`. 3 means it was created
+and started but the gateway never answered (`deploy/compose.sh logs chat-island`); 4
+means the gateway is up but HTTPS is not confirmed (DNS, ports 80+443, or Caddy).
 
 ---
 

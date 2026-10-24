@@ -44,13 +44,14 @@ Future<void> main(List<String> args) async {
           environment: Platform.environment,
           probe: _probe,
         ).run(opts);
-        // 3, not 0: an island that never answered must not read as success to a script.
-        exit(switch (result) {
-          Healthy() => 0,
-          StartedNotAnswering() => 3,
-        });
+        // 0 only for "up and confirmed"; the mapping lives in the library, tested.
+        exit(exitCodeFor(result));
       } on Refusal catch (e) {
         stderr.writeln(' fail ${e.message}');
+        exit(1);
+      } on Object catch (e) {
+        // Anything before the birth (after it, run() reports what it created).
+        stderr.writeln(' fail unexpected error, nothing reported as done: $e');
         exit(1);
       }
     case 'configure':
@@ -66,13 +67,16 @@ Future<void> main(List<String> args) async {
 }
 
 /// Whether [uri] answers 2xx within a few seconds. Any failure is "not yet".
+/// ONE deadline over the whole exchange, body included: an endpoint that sends
+/// headers and holds the body open must not stall standup (Carnot, PR#406 r1).
 Future<bool> _probe(Uri uri) async {
   final client = HttpClient()..connectionTimeout = const Duration(seconds: 3);
   try {
-    final req = await client.getUrl(uri).timeout(const Duration(seconds: 4));
-    final res = await req.close().timeout(const Duration(seconds: 4));
-    await res.drain<void>();
-    return res.statusCode >= 200 && res.statusCode < 300;
+    return await () async {
+      final res = await (await client.getUrl(uri)).close();
+      await res.drain<void>();
+      return res.statusCode >= 200 && res.statusCode < 300;
+    }().timeout(const Duration(seconds: 6));
   } on Object {
     return false;
   } finally {

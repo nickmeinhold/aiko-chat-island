@@ -90,11 +90,18 @@ Standup standup(
 int at(FakeDocker d, String prefix) =>
     d.calls.indexWhere((c) => c.startsWith(prefix));
 
+/// For a call made by ABSOLUTE path (deploy/compose.sh), whose prefix is the temp root.
+int atPath(FakeDocker d, String tail) =>
+    d.calls.indexWhere((c) => c.startsWith(root.path) && c.contains(tail));
+
 void main() {
   setUp(() {
     root = Directory.systemTemp.createTempSync('standup');
     File('${root.path}/docker-compose.yml').writeAsStringSync('services: {}\n');
     Directory('${root.path}/deploy/caddy').createSync(recursive: true);
+    File('${root.path}/deploy/compose.sh').writeAsStringSync('#!/bin/sh\n');
+    File('${root.path}/deploy/caddy/docker-compose.caddy.yml')
+        .writeAsStringSync('');
     out = [];
   });
   tearDown(() => root.deleteSync(recursive: true));
@@ -115,7 +122,7 @@ void main() {
           inspect = at(d, 'docker volume inspect'),
           copy = at(d, 'docker run --rm -v aiko_data:/data'),
           ln = at(d, 'ln '),
-          up = at(d, './deploy/compose.sh up -d');
+          up = atPath(d, '/deploy/compose.sh up -d');
       expect(
         [pull, create, inspect, copy, ln, up].every((i) => i >= 0),
         isTrue,
@@ -328,6 +335,136 @@ void main() {
         '[]',
       ]);
       expect((o.tls, o.passkeys, o.tag), (false, true, '0.19.0'));
+    });
+  });
+  group('PR#406 r1', () {
+    test('the exit code is 0 only for up AND confirmed', () {
+      // Scripts read this number (Noether r1: the mapping was untested).
+      expect(exitCodeFor(const Healthy()), 0);
+      expect(exitCodeFor(const StartedNotAnswering()), 3);
+      expect(exitCodeFor(const HealthyTlsUnconfirmed()), 4);
+    });
+
+    for (final missing in [
+      'deploy/compose.sh',
+      'deploy/caddy/docker-compose.caddy.yml',
+    ]) {
+      test('a missing $missing refuses before anything changes', () async {
+        File('${root.path}/$missing').deleteSync();
+        final d = FakeDocker();
+        await expectLater(standup(d).run(opts), throwsA(isA<Refusal>()));
+        expect(
+          d.calls.where(
+            (c) =>
+                c.startsWith('docker pull') ||
+                c.startsWith('docker volume create'),
+          ),
+          isEmpty,
+        );
+      });
+    }
+
+    test('without TLS the Caddy compose file is not required', () async {
+      File('${root.path}/deploy/caddy/docker-compose.caddy.yml').deleteSync();
+      const noTls = StandupOptions(
+        domain: 'chat.example.org',
+        displayName: 'X',
+        tls: false,
+      );
+      expect(await standup(FakeDocker()).run(noTls), isA<Healthy>());
+    });
+
+    test('TLS that never confirms is its own outcome, not Healthy', () async {
+      final d = FakeDocker(failOn: 'docker-compose.caddy.yml');
+      expect(await standup(d).run(opts), isA<HealthyTlsUnconfirmed>());
+      expect(out.join('\n'), contains('HTTPS is NOT confirmed'));
+    });
+
+    test('a failure after the birth says what this run created, and publishes nothing half-way', () async {
+      // ln fails: the temps were all written, so neither file may appear.
+      final d = FakeDocker(failOn: 'ln ${root.path}');
+      Refusal? r;
+      try {
+        await standup(d).run(opts);
+      } on Refusal catch (e) {
+        r = e;
+      }
+      expect(r, isNotNull);
+      expect(
+        r!.message,
+        contains('This run created: volume aiko_data (label aiko.birth='),
+      );
+      expect(r.message, contains('A failed birth'));
+      expect(File('${root.path}/.env').existsSync(), isFalse);
+      expect(File('${root.path}/image.env').existsSync(), isFalse);
+      expect(
+        root.listSync().where((e) => e.path.contains('.standup-')),
+        isEmpty,
+        reason: 'temps removed',
+      );
+      expect(d.calls.where((c) => c.contains('compose.sh up')), isEmpty);
+    });
+
+    test('a failed compose up says what this run created', () async {
+      final d = FakeDocker(failOn: 'compose.sh up');
+      await expectLater(
+        standup(d).run(opts),
+        throwsA(
+          isA<Refusal>().having(
+            (r) => r.message,
+            'message',
+            allOf(
+              contains('image.env'),
+              contains('.env'),
+              contains('volume aiko_data'),
+            ),
+          ),
+        ),
+      );
+    });
+
+    test('a volume without a .env is not called an island, and no command is prescribed', () async {
+      Refusal? r;
+      try {
+        await standup(FakeDocker(volumes: {'aiko_data': ''})).run(opts);
+      } on Refusal catch (e) {
+        r = e;
+      }
+      expect(r!.message, contains('stopped partway'));
+      expect(r.message, isNot(contains('island configure')));
+    });
+
+    for (final (why, name) in [
+      ('a backslash', r'Island \'),
+      ('a carriage return', 'Island\r1'),
+      ('a tab', 'a\tb'),
+    ]) {
+      test('refuses a name with $why', () {
+        expect(
+          () => validate(
+            StandupOptions(domain: 'a.example.org', displayName: name),
+          ),
+          throwsA(isA<Refusal>()),
+        );
+      });
+    }
+
+    test('the temporary names are ignored by git (a stranded one may hold the JWT secret)', () async {
+      final r = await Process.run('git', [
+        'check-ignore', // no -q: git allows --quiet with ONE path only (exit 128)
+        '.env.standup-abcd1234',
+        'image.env.standup-abcd1234',
+      ], workingDirectory: '../..');
+      expect(r.exitCode, 0, reason: '.gitignore must cover *.standup-*');
+      expect(
+        '${r.stdout}'.trim().split('\n'),
+        hasLength(2),
+        reason: 'both names ignored',
+      );
+      expect(
+        File('lib/standup.dart').readAsStringSync(),
+        contains("'\$name.standup-"),
+      );
     });
   });
 }
