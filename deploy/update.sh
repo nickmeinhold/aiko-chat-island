@@ -91,24 +91,15 @@ $DOCKER compose version >/dev/null 2>&1 || die "docker compose v2 not available"
 # The pin is in image.env, not .env (claude-tasks#5165), and island_compose passes
 # both. See deploy/lib/island-compose.sh for why a bare call now refuses.
 COMPOSE="island_compose"
-island_require_image_env || die "no image pin (see above) — nothing was changed"
+island_require_pin || die "no usable image pin (see above) — nothing was changed"
 # ONE PIN PER RUN: every compose call below reads this snapshot, not the live file.
-ISLAND_IMAGE_ENV="$(island_snapshot_image_env)" || die "could not snapshot image.env — nothing was changed"
-trap 'rm -f "$ISLAND_IMAGE_ENV"' EXIT
+island_pin_begin || die "could not snapshot image.env — nothing was changed"
+trap 'rm -f "$_island_pin_file"' EXIT
 if LC_ALL=C grep -aqE '^[[:space:]]*(export[[:space:]]+)?ISLAND_VERSION[[:space:]]*=' "$REPO_ROOT/.env" 2>/dev/null; then
   warn ".env still carries an ISLAND_VERSION line. It is IGNORED: the image comes
      from image.env. Remove it at the next SOPS re-lift so nobody edits it expecting
      an effect."
 fi
-# The old documented pin path was `ISLAND_VERSION=v0.1.0 deploy/update.sh`. island_compose
-# strips both names from the environment, so such an export now does nothing, and a
-# habit that does nothing must say so rather than deploy image.env's release unasked.
-for _v in ISLAND_VERSION ISLAND_IMAGE; do
-  if [ -n "${!_v+set}" ]; then
-    die "$_v is set in this shell's environment. It is ignored: the image comes only
-     from image.env. Unset it (or edit image.env instead) and re-run."
-  fi
-done
 
 # Resolve the whole config FIRST, with its errors visible. The running-check below
 # discards compose's stderr, so an image.env that is readable but carries no usable
@@ -246,7 +237,10 @@ elif [ -f "$SCRIPT_DIR/preflight-compose-drift.sh" ]; then
     0) ok "deploy tree matches $drift_ref" ;;
     1) die "this box's deploy tree differs from $drift_ref (diff above) — aborting BEFORE
      the backup; the island is still running. Sync the named files from the tag and
-     re-run. To deploy anyway: deploy/update.sh --skip-drift-check" ;;
+     re-run. To deploy anyway: deploy/update.sh --skip-drift-check
+     EXCEPTION: rolling back BELOW v0.17.2? Do NOT sync. The older compose reads
+     ISLAND_VERSION from .env and resolves 'edge' (main) once it is gone. Keep this
+     compose and pass --skip-drift-check (docs/runbooks/backup-and-rollback.md)." ;;
     # NOT THE SAME ANSWER AS 'no drift'. Exit 2 means the tag could not be
     # obtained, so nothing whatsoever is known about this box's tree. Refusing is
     # the conservative read of an unknown, and the operator gets an explicit,

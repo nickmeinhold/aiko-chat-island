@@ -21,15 +21,25 @@
 # `docker compose ps` can no longer see the pin, and with `${ISLAND_IMAGE:?}` it now
 # refuses (exit 1, naming this file's wrapper) instead of quietly resolving `edge`.
 # Every compose call therefore goes through island_compose below, or deploy/compose.sh
-# for a human. The refusal is the point: there is no longer a path to the compose file
-# that skips the pin.
+# for a human.
+#
+# WHAT THE REFUSAL DOES NOT COVER, stated rather than implied (Tesla, PR#401 r2): `:?`
+# fires only when ISLAND_IMAGE is UNSET. A bare `docker compose` run with ISLAND_IMAGE
+# exported in the shell resolves that value, because the shell outranks every env file.
+# That takes a deliberate export of the new name; it is an explicit override, not a
+# forgotten pin. Every door in THIS file refuses it (island_require_pin). Closing the bare
+# door too would need a base compose file no variable can satisfy, plus a generated
+# override (Tesla's proposal), a larger change deferred to design 18's watcher work.
 #
 # Requires (set by the caller): ISLAND_ROOT (the directory holding docker-compose.yml)
-# and DOCKER ("docker" or "sudo -n docker"; island_docker_detect sets it). Optional:
-# ISLAND_IMAGE_ENV, the pin file to read instead of $ISLAND_ROOT/image.env. update.sh
-# points it at a private SNAPSHOT so one run reads one value (see island_snapshot_image_env).
+# and DOCKER ("docker" or "sudo -n docker"; island_docker_detect sets it).
 
 ISLAND_REPO="ghcr.io/nickmeinhold/aiko-chat-island"
+
+# The pin file island_compose reads. Set ONLY by island_pin_begin, inside this process.
+# Cleared on source so an exported value can never redirect the pin to another file: an
+# ambient selector is the same class as an ambient pin (Noether, PR#401 r2).
+unset _island_pin_file
 
 # Route every docker call through $DOCKER. Some hosts run the deploy user OUTSIDE the
 # docker group (enspyr-melb: user 'ubuntu' needs `sudo -n docker`), others are
@@ -48,10 +58,27 @@ island_docker_detect() {
   fi
 }
 
-# image.env must exist and be readable. Compose's own error for a missing --env-file
-# names the file but not what to put in it; this one says both.
-island_require_image_env() {
-  local f="${ISLAND_ROOT:?}/image.env"
+# EVERY DOOR'S PRECONDITION: the pin comes from image.env, and from nothing else.
+#
+# The class, enumerated once (PR#401 r2: three seats found three members of it, one door
+# at a time): what can steer the image besides image.env's one line?
+#   - ISLAND_IMAGE / ISLAND_VERSION exported in the shell  -> refused (stripped below
+#     anyway; a stripped habit that silently does nothing must say so)
+#   - an ISLAND_IMAGE line in .env (the secrets file)       -> refused: it would satisfy a
+#     bare compose's `:?` and outlive image.env's edits
+#   - any OTHER line in image.env                           -> refused: image.env is passed
+#     AFTER .env, so a `JWT_SECRET=` there would override the SOPS value (Tesla, r2)
+#   - the pin file's path from the environment              -> impossible: see unset above
+#   - the live file read more than once per run             -> island_pin_begin
+# Returns 1 with the reason on stderr; the caller dies.
+island_require_pin() {
+  local f="${ISLAND_ROOT:?}/image.env" v bad
+  for v in ISLAND_IMAGE ISLAND_VERSION; do
+    if [ -n "${!v+set}" ]; then
+      echo "$v is set in this shell's environment. It is ignored: the image comes only from $f. Unset it (or edit that file instead) and re-run." >&2
+      return 1
+    fi
+  done
   if [ ! -r "$f" ]; then
     {
       echo "no readable $f — the image this island runs is pinned there (claude-tasks#5165)."
@@ -62,6 +89,21 @@ island_require_image_env() {
         echo "  it leaves .env at the next SOPS re-lift."
       fi
     } >&2
+    return 1
+  fi
+  # A crude shape check, not a parser: every non-blank, non-comment line must assign
+  # ISLAND_IMAGE, and there must be exactly one. Compose stays the only reader of the VALUE.
+  bad="$(LC_ALL=C grep -avE '^[[:space:]]*(#|$)' "$f" | LC_ALL=C grep -avE '^[[:space:]]*(export[[:space:]]+)?ISLAND_IMAGE[[:space:]]*=' || true)"
+  if [ -n "$bad" ]; then
+    printf '%s may hold ONLY the ISLAND_IMAGE line. It is passed after .env, so any other key here overrides the secrets file. Move these out:\n%s\n' "$f" "$bad" >&2
+    return 1
+  fi
+  if [ "$(LC_ALL=C grep -acE '^[[:space:]]*(export[[:space:]]+)?ISLAND_IMAGE[[:space:]]*=' "$f" || true)" != 1 ]; then
+    echo "$f must assign ISLAND_IMAGE exactly once." >&2
+    return 1
+  fi
+  if [ -f "$ISLAND_ROOT/.env" ] && LC_ALL=C grep -aqE '^[[:space:]]*(export[[:space:]]+)?ISLAND_IMAGE[[:space:]]*=' "$ISLAND_ROOT/.env"; then
+    echo "$ISLAND_ROOT/.env carries an ISLAND_IMAGE line. The pin lives in image.env only; a copy in .env would satisfy a bare docker compose and survive edits to image.env. Remove it." >&2
     return 1
   fi
 }
@@ -82,20 +124,21 @@ island_compose() {
   fi
   # shellcheck disable=SC2086  # $DOCKER is "docker" or "sudo -n docker", split on purpose
   env -u ISLAND_IMAGE -u ISLAND_VERSION ${DOCKER:?} compose "${files[@]}" \
-    --env-file "$ISLAND_ROOT/.env" --env-file "${ISLAND_IMAGE_ENV:-$ISLAND_ROOT/image.env}" "$@"
+    --env-file "$ISLAND_ROOT/.env" --env-file "${_island_pin_file:-$ISLAND_ROOT/image.env}" "$@"
 }
 
-# Copy image.env to a private file and point island_compose at it, so every compose call
-# in one run (`config --images` for the drift guard, then `pull`, then `up`) resolves the
-# SAME pin. Reading the live file three times made them three resolutions: an edit during
-# the backup or the confirmation prompt, or design 18's watcher writing it, would have the
-# guard certify one release while the script deployed another (Carnot, PR#401 r1). Prints
-# the snapshot path; the caller owns removing it.
-island_snapshot_image_env() {
+# ONE PIN PER RUN. Copy image.env to a private file and point island_compose at it, so
+# every compose call in one run (`config --images` for the drift guard, `pull`, `up`)
+# resolves the SAME pin. Reading the live file per call made them separate resolutions:
+# an edit mid-run, or design 18's watcher writing it, would have the guard certify one
+# release while the script deployed another (Carnot, PR#401 r1, and r2 for the standup
+# door the r1 fix missed). Every multi-call door uses this. Prints the snapshot path; the
+# caller removes it (an EXIT trap).
+island_pin_begin() {
   local snap
   snap="$(umask 077; mktemp "${TMPDIR:-/tmp}/aiko-image-env.XXXXXX")" || return 1
   cp "${ISLAND_ROOT:?}/image.env" "$snap" || { rm -f "$snap"; return 1; }
-  printf '%s\n' "$snap"
+  _island_pin_file="$snap"
 }
 
 # Read `config --images` output on stdin; print the ONE release tag the drift guard
@@ -124,8 +167,10 @@ island_ref_from_images() {
     printf 'the island'"'"'s services resolve to DIFFERENT images, and they must share one:\n%s\n' "$ours" >&2
     return 1
   fi
+  # ANY `@` is a digest: compose accepts both `repo@sha256:…` and `repo:tag@sha256:…`,
+  # and the second must not reach the guard as a tag called `0.17.1@sha256:…` (Noether, r2).
   case "$ours" in
-    "$ISLAND_REPO@"*)
+    *@*)
       echo "image.env pins a digest ($ours); the drift guard compares against a git tag and a digest does not name one" >&2
       return 1 ;;
   esac

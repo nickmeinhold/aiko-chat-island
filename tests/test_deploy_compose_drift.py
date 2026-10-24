@@ -1360,7 +1360,7 @@ def test_update_sh_has_NO_edge_fallback_for_a_missing_pin() -> None:
     code = _update_sh_code()
     assert 'drift_ref="edge"' not in code and ":-edge" not in code, (
         "a missing pin must refuse, never resolve to `edge` (tracks main)")
-    assert "island_require_image_env" in code
+    assert "island_require_pin" in code
 
 
 def test_a_BROKEN_cat_cannot_hide_a_real_drift(tmp_path) -> None:
@@ -1495,17 +1495,3 @@ def test_a_ref_tree_whose_deploy_IS_EMPTY_is_CANNOT_LOOK(tmp_path) -> None:
         + result.stderr
     )
     assert "carries NONE" in result.stderr, result.stderr
-
-
-def test_update_sh_REFUSES_an_exported_pin_rather_than_ignoring_it() -> None:
-    """`ISLAND_VERSION=v0.1.0 deploy/update.sh` was this script's documented pin path.
-    island_compose now strips both names from the environment, so that habit would
-    silently deploy image.env's release instead. A habit that does nothing must say
-    so: update.sh refuses, before anything else runs, if either is exported."""
-    code = _update_sh_code()
-    loop = code.index("for _v in ISLAND_VERSION ISLAND_IMAGE; do")
-    check = code.index('if [ -n "${!_v+set}" ]; then', loop)
-    refuse = code.index("die ", check)
-    first_compose = code.index("$COMPOSE ps")
-    assert loop < check < refuse < first_compose, (
-        "the exported-pin refusal must run before the first compose call")

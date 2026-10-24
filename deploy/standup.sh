@@ -726,6 +726,12 @@ if [ -n "${LK_ENV_STAGED:-}" ]; then
   ok "wrote $LK_ENV_TARGET (mode 600, via atomic rename)"
 fi
 
+# The same precondition and one-pin-per-run snapshot every door uses (deploy/lib):
+# step 3's pull and up must resolve ONE pin (Carnot, PR#401 r2).
+island_require_pin || die "no usable image pin (see above)"
+island_pin_begin || die "could not snapshot image.env"
+trap 'rm -f "${ENV_TMP:-}" "${IMAGE_TMP:-}" "${LK_ENV_STAGED:-}" "${KEYS_HAVE:-}" "${KEYS_WANT:-}" "${KEYS_DROPPED:-}" "${KEYS_ACKED:-}" "${_island_pin_file:-}" 2>/dev/null || true' EXIT
+
 # --- step 3: bring the island up (4 containers, 1 image + stock mosquitto) ---
 if [ "$FROM_SOURCE" = "true" ]; then
   log "Step 3/$TOTAL — building the island image from source + starting (gateway + broker + registrar + ChatServer)"

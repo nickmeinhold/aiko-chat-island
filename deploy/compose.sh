@@ -29,6 +29,6 @@ ISLAND_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 . "$SCRIPT_DIR/lib/island-compose.sh"
 
 # The pin first: a missing image.env refuses before docker is touched at all.
-island_require_image_env || exit 1
+island_require_pin || exit 1
 island_docker_detect || exit 1
 island_compose "$@"

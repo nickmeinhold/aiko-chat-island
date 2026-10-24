@@ -46,6 +46,7 @@ def test_a_tag_pin_yields_that_tag() -> None:
 
 @pytest.mark.parametrize("images, why", [
     ("eclipse-mosquitto:2\n", "none of our services resolved"),
+    (f"{OURS}:0.17.1@sha256:{'0' * 64}\n", "tag-plus-digest is a digest too (Noether r2)"),
     (f"{OURS}:1\n{OURS}:2\n", "the services disagree; they must share one image"),
     (f"{OURS}@sha256:{'0' * 64}\n", "a digest names no git tag to compare against"),
     ("ghcrXio/nickmeinhold/aiko-chat-island:1\n", "a lookalike repo: the dots are literal"),
@@ -91,10 +92,18 @@ def _run_wrapper(tmp_path: Path, root: Path, *args: str, **extra_env: str):
                           capture_output=True, text=True, env=env)
 
 
+def _lib(tmp_path: Path, root: Path, script: str, **extra_env: str):
+    env = {**os.environ, "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}", **extra_env}
+    return subprocess.run(["bash", "-c", f'ISLAND_ROOT="{root}"; DOCKER=docker; . "{LIB}"; {script}'],
+                          capture_output=True, text=True, env=env)
+
+
 def test_the_wrapper_passes_BOTH_env_files_and_strips_the_shell(tmp_path: Path) -> None:
+    """island_compose itself, below every door's refusal: even if an export got past a
+    door, it must not reach compose."""
     log = _fake_docker(tmp_path)
     root = _island(tmp_path)
-    r = _run_wrapper(tmp_path, root, "ps", ISLAND_IMAGE="evil:1", ISLAND_VERSION="0.0.1")
+    r = _lib(tmp_path, root, "island_compose ps", ISLAND_IMAGE="evil:1", ISLAND_VERSION="0.0.1")
     assert r.returncode == 0, r.stderr
     argv, seen = log.read_text().rsplit("IMG=", 1)
     assert argv.split("\n")[:-1] == [
@@ -149,9 +158,11 @@ needs_compose = pytest.mark.skipif(
 
 @needs_compose
 def test_REAL_compose_bare_call_refuses_and_the_wrapper_resolves(tmp_path: Path) -> None:
-    """The two measured facts the design rests on, re-measured against the real
-    docker-compose.yml: bare refuses naming the wrapper; the wrapper resolves the
-    pin even with a hostile export in the shell."""
+    """The measured facts the design rests on, re-measured against the real
+    docker-compose.yml: with NO ISLAND_IMAGE in its environment a bare call refuses,
+    naming the wrapper; the wrapper resolves image.env's pin. (A bare call WITH an
+    exported ISLAND_IMAGE resolves the export; that is Compose's precedence and is
+    stated as a limit in deploy/lib/island-compose.sh, Tesla PR#401 r2.)"""
     root = _island(tmp_path)
     for name in COMPOSE_FILES:
         shutil.copy2(REPO / name, root / name)
@@ -164,46 +175,75 @@ def test_REAL_compose_bare_call_refuses_and_the_wrapper_resolves(tmp_path: Path)
     assert "deploy/compose.sh" in bare.stderr, bare.stderr
 
     wrapped = subprocess.run([str(root / "deploy" / "compose.sh"), "config", "--images"],
-                             capture_output=True, text=True,
-                             env={**env, "ISLAND_IMAGE": "evil:1"})
+                             capture_output=True, text=True, env=env)
     assert wrapped.returncode == 0, wrapped.stderr
     assert _ref(wrapped.stdout).stdout == "0.17.1\n"
 
 
 # ------------------------------------------------------- round-1 cage-match fixes
 
-def test_ONE_PIN_PER_RUN_island_compose_reads_the_snapshot_when_given(tmp_path: Path) -> None:
-    """Carnot, PR#401 r1: `config --images`, `pull` and `up` each re-read the live
-    image.env, so an edit mid-run (or design 18's watcher) made the guard certify one
-    release while the script deployed another. update.sh now snapshots the file once
-    and points every call at the snapshot."""
+def test_ONE_PIN_PER_RUN_island_compose_reads_the_snapshot(tmp_path: Path) -> None:
+    """Carnot, PR#401 r1+r2: each compose call re-read the live image.env, so an edit
+    mid-run (or design 18's watcher) made the guard certify one release while the script
+    deployed another. island_pin_begin snapshots it once; every call reads the snapshot,
+    and a later edit to image.env does not reach the run."""
     log = _fake_docker(tmp_path)
     root = _island(tmp_path)
-    snap = tmp_path / "snap.env"
-    snap.write_text(f"ISLAND_IMAGE={OURS}:0.17.1\n")
-    r = subprocess.run(
-        ["bash", "-c", f'ISLAND_ROOT="{root}"; DOCKER=docker; ISLAND_IMAGE_ENV="{snap}"; '
-                       f'. "{LIB}"; island_compose ps'],
-        capture_output=True, text=True,
-        env={**os.environ, "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}"})
+    r = _lib(tmp_path, root,
+             f'island_pin_begin; printf "ISLAND_IMAGE={OURS}:9.9.9\\n" > "{root}/image.env"; '
+             'island_compose ps; cat "$_island_pin_file"; '
+             'stat -f %Lp "$_island_pin_file" 2>/dev/null || stat -c %a "$_island_pin_file"; '
+             'rm -f "$_island_pin_file"')
     assert r.returncode == 0, r.stderr
     argv = log.read_text().split("\n")
-    assert argv[argv.index("ps") - 1] == str(snap), "the pin must come from the snapshot"
+    snap = argv[argv.index("ps") - 1]
+    assert snap != f"{root}/image.env", "the run must read the snapshot, not the live file"
+    assert f"{OURS}:0.17.1" in r.stdout and "9.9.9" not in r.stdout
+    assert r.stdout.strip().endswith("600"), "the snapshot must be owner-only"
 
 
-def test_the_snapshot_is_a_private_copy(tmp_path: Path) -> None:
+def test_an_AMBIENT_pin_file_selector_is_ignored(tmp_path: Path) -> None:
+    """Noether, PR#401 r2: the pin file's path must not come from the environment."""
+    log = _fake_docker(tmp_path)
     root = _island(tmp_path)
-    r = subprocess.run(["bash", "-c", f'ISLAND_ROOT="{root}"; . "{LIB}"; island_snapshot_image_env'],
-                       capture_output=True, text=True)
+    other = tmp_path / "other.env"
+    other.write_text("ISLAND_IMAGE=evil:1\n")
+    r = _lib(tmp_path, root, "island_compose ps", _island_pin_file=str(other))
     assert r.returncode == 0, r.stderr
-    snap = Path(r.stdout.strip())
-    try:
-        assert snap.read_text() == (root / "image.env").read_text()
-        assert oct(snap.stat().st_mode)[-3:] == "600"
-        (root / "image.env").write_text(f"ISLAND_IMAGE={OURS}:9.9.9\n")
-        assert "0.17.1" in snap.read_text(), "a later edit to image.env must not reach the run"
-    finally:
-        snap.unlink(missing_ok=True)
+    argv = log.read_text().split("\n")
+    assert argv[argv.index("ps") - 1] == f"{root}/image.env"
+
+
+@pytest.mark.parametrize("what, mutate, needle", [
+    ("an exported ISLAND_IMAGE", {"env": {"ISLAND_IMAGE": f"{OURS}:0.18.0"}}, "ISLAND_IMAGE is set"),
+    ("an exported ISLAND_VERSION", {"env": {"ISLAND_VERSION": "0.9.5"}}, "ISLAND_VERSION is set"),
+    ("another key in image.env", {"image": f"ISLAND_IMAGE={OURS}:0.17.1\nJWT_SECRET=x\n"}, "ONLY the ISLAND_IMAGE line"),
+    ("two pins in image.env", {"image": f"ISLAND_IMAGE={OURS}:1\nISLAND_IMAGE={OURS}:2\n"}, "exactly once"),
+    ("an empty image.env", {"image": "# nothing\n"}, "exactly once"),
+    ("an ISLAND_IMAGE line in .env", {"dotenv": f"ISLAND_IMAGE={OURS}:0.18.0\n"}, "carries an ISLAND_IMAGE line"),
+])
+def test_the_door_REFUSES_every_other_source_of_the_pin(tmp_path: Path, what, mutate, needle) -> None:
+    """The class from PR#401 r2, enumerated: anything but image.env's one line steering
+    the image refuses at the door, before docker runs."""
+    log = _fake_docker(tmp_path)
+    root = _island(tmp_path)
+    if "image" in mutate:
+        (root / "image.env").write_text(mutate["image"])
+    if "dotenv" in mutate:
+        with (root / ".env").open("a") as f:
+            f.write(mutate["dotenv"])
+    r = _run_wrapper(tmp_path, root, "up", "-d", **mutate.get("env", {}))
+    assert r.returncode != 0, f"{what} must refuse"
+    assert needle in r.stderr, r.stderr
+    assert not log.exists(), "docker must not have been invoked"
+
+
+def test_a_well_formed_image_env_with_comments_and_export_is_accepted(tmp_path: Path) -> None:
+    log = _fake_docker(tmp_path)
+    root = _island(tmp_path)
+    (root / "image.env").write_text(f"# pinned 2026-10-24\n\nexport ISLAND_IMAGE={OURS}:0.17.1\n")
+    r = _run_wrapper(tmp_path, root, "ps")
+    assert r.returncode == 0, r.stderr
 
 
 def _code(path: Path) -> str:
@@ -214,10 +254,25 @@ UPDATE = REPO / "deploy" / "update.sh"
 STANDUP = REPO / "deploy" / "standup.sh"
 
 
-def test_update_sh_snapshots_the_pin_BEFORE_its_first_compose_call() -> None:
-    code = _code(UPDATE)
-    snap = code.index('ISLAND_IMAGE_ENV="$(island_snapshot_image_env)"')
-    assert snap < code.index("$COMPOSE config --quiet") < code.index("$COMPOSE ps")
+@pytest.mark.parametrize("door, first_compose", [
+    (UPDATE, "$COMPOSE config --quiet"),
+    (STANDUP, "island_compose --build-overlay up -d --build"),
+])
+def test_every_multi_call_door_checks_and_snapshots_BEFORE_its_first_compose_call(door, first_compose) -> None:
+    """Carnot r2: the r1 snapshot covered update.sh and missed standup.sh."""
+    code = _code(door)
+    req = code.index("island_require_pin ||")
+    snap = code.index("island_pin_begin ||")
+    assert req < snap < code.index(first_compose)
+
+
+def test_the_drift_refusal_carries_the_rollback_exception() -> None:
+    """Maxwell r2: the runbook said "do not sync when rolling back below v0.17.2" while
+    the refusal the operator actually reads said "sync the named files"."""
+    code = UPDATE.read_text()
+    arm = code[code.index('1) die "this box\'s deploy tree differs'):]
+    arm = arm[: arm.index(";;")]
+    assert "BELOW v0.17.2" in arm and "Do NOT sync" in arm
 
 
 def test_update_sh_resolves_config_LOUDLY_before_the_swallowed_running_check() -> None:

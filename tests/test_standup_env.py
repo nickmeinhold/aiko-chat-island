@@ -103,8 +103,10 @@ def test_the_harness_actually_runs_the_real_script(island) -> None:
     ups = [ln for ln in island.calls.read_text().splitlines()
            if ln.startswith("docker compose ") and ln.endswith(" up -d")]
     assert ups, "the script never reached compose up"
-    assert all(f"--env-file {island.root}/image.env" in ln for ln in ups), (
-        "compose up must see the image pin (claude-tasks#5165)")
+    assert all(f"--env-file {island.root}/.env --env-file " in ln and "/aiko-image-env." in ln
+               for ln in ups), (
+        "compose up must see the image pin, through the run's snapshot of image.env "
+        "(claude-tasks#5165; Carnot PR#401 r2)")
     assert (island.root / "image.env").read_text().startswith("ISLAND_IMAGE="), (
         "a first standup must write the image pin")
     assert oct(island.env_file.stat().st_mode)[-3:] == "600", ".env must be owner-only"
