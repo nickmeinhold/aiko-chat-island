@@ -266,11 +266,10 @@ printf 'ISLAND_IMAGE=ghcr.io/nickmeinhold/aiko-chat-island:%s\n' X.Y.Z > image.e
 N=$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')
 docker volume create --label aiko.birth=$N aiko_data
 test "$(docker volume inspect -f '{{index .Labels "aiko.birth"}}' aiko_data)" = "$N" \
-  && ./deploy/compose.sh run --rm --no-deps chat-island sh -c 'set -eC; cat /app/seed/aiko.db > /data/.aiko.db.seed; ln /data/.aiko.db.seed /data/aiko.db; rm /data/.aiko.db.seed' \
+  && ./deploy/compose.sh run --rm --no-deps chat-island sh -c 'set -eC; cat /app/seed/aiko.db > /data/.aiko.db.seed; ln /data/.aiko.db.seed /data/aiko.db; rm -f /data/.aiko.db.seed || :' \
   && echo "island born" \
-  || echo "STOP: aiko_data already existed, or the copy failed. Do NOT run up; see the runbook's \"A failed birth\"."
-#    Only after "island born":
-./deploy/compose.sh up -d
+  && ./deploy/compose.sh up -d \
+  || echo "STOP: aiko_data already existed, or the copy or start failed. See the runbook's \"A failed birth\"."
 curl -s http://127.0.0.1:8095/health         # {"status":"ok",...}
 #    (build from THIS checkout instead of pulling: `--build-overlay build` first, then
 #    the same run and up, each with --build-overlay)

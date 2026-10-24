@@ -150,11 +150,19 @@ def no_database_message(db: Path, *, via: Path | None = None) -> str:
         f"Refusing to start. {_RESTORE} {_NEVER_HELD_ONE}")
 
 
+_DEV_BACKEND = (
+    "This database has no file (a dev backend such as Postgres), so no volume or backup "
+    "applies: set up an empty one as the README describes.")
+
+
 def not_an_island_message(db: Path | None, why: str) -> str:
+    # A database with no file is a dev backend: the volume repair would be wrong advice
+    # there (Noether, PR#405 r2). Decided from the URL, not `db`: the baseline passes None.
+    repair = _DEV_BACKEND if sqlite_file(settings.db_url) is None else f"{_RESTORE} {_NEVER_HELD_ONE}"
     return (
         f"MIGRATE_REFUSE_NOT_AN_ISLAND: the database {db or settings.db_url} {why}. "
         "Building the schema into it would start a new, empty island in its place. "
-        f"Refusing to start. {_RESTORE} {_NEVER_HELD_ONE}")
+        f"Refusing to start. {repair}")
 
 
 def require_database_file(db_url: str) -> None:

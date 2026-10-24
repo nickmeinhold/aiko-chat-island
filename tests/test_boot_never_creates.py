@@ -314,8 +314,15 @@ def _refusal(tmp_path, monkeypatch, case: str) -> str:
         db.touch()
         go = lambda: command.upgrade(migrate._alembic_config(), "head")  # noqa: E731
     elif case == "postgres, empty":
-        go = lambda: (_ for _ in ()).throw(  # noqa: E731
-            RuntimeError(migrate.not_an_island_message(None, "is empty")))
+        # The REAL run(), on a URL with no file: only the network read is stood in for,
+        # so a change that let this path skip the users check fails here (Noether r2).
+        monkeypatch.setattr(settings, "db_url", "postgresql+asyncpg://u@localhost/aiko_dev")
+
+        async def no_tables():
+            return set()
+
+        monkeypatch.setattr(migrate, "_table_names", no_tables)
+        go = migrate.run
     with pytest.raises(RuntimeError) as refused:
         go()
     return str(refused.value)
@@ -332,7 +339,40 @@ def test_no_refusal_offers_a_way_to_create_or_to_move_the_database(
     assert "MIGRATE_REFUSE_" in msg
     for never in ("aside", "--new-island", "build_seed", "seed"):
         assert never not in msg.lower(), f"refusal mentions {never!r}: {msg}"
-    assert "restore" in msg and "standup" in msg
+    if case == "postgres, empty":
+        assert "README" in msg and "restore" not in msg, "a dev backend has no volume to restore"
+    else:
+        assert "restore" in msg and "standup" in msg
+
+
+# The list above drives each refusal for real; this covers the ones it doesn't list. Every
+# string literal (docstrings aside) in the modules that refuse is held to the same rule, so
+# a NEW refusal is covered the day it is written, with nobody remembering to add it
+# (Noether r2: UNSTAMPED, UNREADABLE and UNKNOWN_REVISION were outside the hand list).
+REFUSING_MODULES = ["src/aiko_gateway/migrate.py", "src/aiko_gateway/db.py",
+                    "alembic/versions/0001_baseline.py", "alembic/env.py"]
+
+
+def _string_literals(path) -> list[str]:
+    import ast
+
+    tree = ast.parse(path.read_text())
+    docstrings = {id(n.body[0].value) for n in ast.walk(tree)
+                  if isinstance(n, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                  and n.body and isinstance(n.body[0], ast.Expr)
+                  and isinstance(n.body[0].value, ast.Constant)}
+    return [n.value for n in ast.walk(tree)
+            if isinstance(n, ast.Constant) and isinstance(n.value, str) and id(n) not in docstrings]
+
+
+@pytest.mark.parametrize("module", REFUSING_MODULES)
+def test_no_string_the_gateway_can_print_offers_to_create_or_move(module) -> None:
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parent.parent / module
+    for s in _string_literals(path):
+        for never in ("aside", "--new-island", "build_seed"):
+            assert never not in s.lower(), f"{module}: {never!r} in {s!r}"
 
 
 def test_a_dangling_symlink_is_named_as_one_on_a_plain_start(tmp_path, monkeypatch) -> None:

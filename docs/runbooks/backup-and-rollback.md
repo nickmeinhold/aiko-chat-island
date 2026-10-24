@@ -63,18 +63,18 @@ an island, standup refuses, and the answer to a missing or empty database there 
 [Rollback](#rollback) (restore the newest backup), never a new island.
 
 If the copy itself fails, standup says so and names the volume it just created: that
-volume holds no island and is safe to remove (`docker volume rm aiko_data`), then run
+volume holds no served island (at most an unserved copy of the empty seed) and is safe to
+remove (`docker volume rm aiko_data`), then run
 standup again.
 
 If a run was killed before it could say anything, the volume may exist with no island in
-it, and every start refuses `MIGRATE_REFUSE_NO_DATABASE`. Decide by what the volume HOLDS,
-never by guessing its history:
+it, and every start refuses `MIGRATE_REFUSE_NO_DATABASE`. Nothing on the box can tell
+that apart from an island whose database was lost: an empty volume looks the same either
+way, so this page does not decide it from what the volume holds. **You** decide, from what
+you know of this box:
 
-```bash
-docker run --rm -v aiko_data:/data:ro busybox ls -la /data
-```
-
-- **Nothing at all, or only `.aiko.db.seed`** (a copy that never finished): removing it
-  loses nothing. `docker volume rm aiko_data`, then run standup again.
-- **Anything else** (`aiko.db`, a backup, a lock file): stop. Do not remove it. If it holds
-  `aiko.db`, start the stack; if a start refuses, follow [Rollback](#rollback).
+- **This box has never served anyone** (standup's first run was interrupted, and nobody
+  ever registered): remove the volume, `docker volume rm aiko_data`, and run standup
+  again.
+- **It has served, or you are not sure:** do not remove anything. Follow
+  [Rollback](#rollback) and restore the newest backup.

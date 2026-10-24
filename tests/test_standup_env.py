@@ -1079,3 +1079,8 @@ def test_the_guides_manual_birth_is_standups_birth() -> None:
     assert "docker volume create --label aiko.birth=$N aiko_data" in guide
     assert '{{index .Labels "aiko.birth"}}' in guide and '= "$N"' in guide
     assert "STOP:" in guide
+    # `up` is IN the chain, after the birth, never a separate line a STOP can't stop (Noether,
+    # Tesla, r2): the only `up -d` in the manual block is the `&&`-chained one.
+    block = guide[guide.index("# 3. pull the official image"):guide.index("# 4. TLS")]
+    ups = [ln.strip() for ln in block.splitlines() if "compose.sh up -d" in ln]
+    assert ups == ["&& ./deploy/compose.sh up -d \\"], ups

@@ -766,12 +766,13 @@ trap 'rm -f "${ENV_TMP:-}" "${IMAGE_TMP:-}" "${LK_ENV_STAGED:-}" "${KEYS_HAVE:-}
 #
 # The copy is published atomically: written under a temporary name, then hard-linked to
 # aiko.db (`ln` refuses if aiko.db exists, and a reader never sees a half-copied file),
-# then the temporary name is removed (Carnot, r1).
+# then the temporary name is removed. That removal cannot fail the birth, so a failure
+# exit always means aiko.db was NOT published (Carnot r1, Noether r2).
 # "$@" = island_compose's leading options (--build-overlay, or none).
 BIRTH_SH='set -eC
 cat /app/seed/aiko.db > /data/.aiko.db.seed
 ln /data/.aiko.db.seed /data/aiko.db
-rm /data/.aiko.db.seed'
+rm -f /data/.aiko.db.seed || :'
 BIRTH_NONCE="$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
 birth_island() {
   [ -n "$BIRTH_NONCE" ] || die "could not draw a random volume label (od /dev/urandom)"
@@ -783,7 +784,7 @@ birth_island() {
   [ "$owner" = "$BIRTH_NONCE" ] \
     || die "volume $DATA_VOLUME already existed before this run (it was not created now), so it may hold an island. It was left untouched and no island was created. This box already has an island volume: standup is for a box that has none."
   island_compose "$@" run --rm --no-deps chat-island sh -c "$BIRTH_SH" \
-    || die "could not copy the seed into volume $DATA_VOLUME (see above; an image released before the seed has no /app/seed/aiko.db, so check the --version pin). This run created that volume moments ago and it holds no island, so it is safe to remove: docker volume rm $DATA_VOLUME, then run standup again."
+    || die "could not copy the seed into volume $DATA_VOLUME (see above; an image released before the seed has no /app/seed/aiko.db, so check the --version pin). This run created that volume moments ago and nobody has used it (it holds at most an unserved copy of the empty seed), so it is safe to remove: docker volume rm $DATA_VOLUME, then run standup again."
   ok "created volume $DATA_VOLUME and the new island's database (from the image's seed)"
 }
 if [ "$FROM_SOURCE" = "true" ]; then
