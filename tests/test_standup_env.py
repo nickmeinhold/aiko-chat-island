@@ -38,6 +38,38 @@ class Island:
     run: Callable[..., subprocess.CompletedProcess]
 
 
+def _docker_stub(bin_dir: Path, log: Path, volumes: Path, *, fail_on: str = "",
+                 flaky_plain_inspect: bool = False) -> None:
+    """A docker that models volumes the way the birth depends on (measured on Docker
+    29.5.2): `volume create --label k=v NAME` makes NAME with that label, and on an
+    EXISTING volume succeeds and KEEPS its old label; `volume inspect -f ... NAME` prints
+    the aiko.birth label; a plain `volume inspect NAME` exits 1 when NAME doesn't exist.
+    A volume is a file in `volumes/` holding its label. `fail_on`: any call containing it
+    exits 1. `flaky_plain_inspect`: the plain inspect fails even when the volume exists
+    (the r3 finding-1 flake), while `inspect -f` still answers."""
+    volumes.mkdir(exist_ok=True)
+    _stub(bin_dir, "docker", f'''
+echo "docker $*" >> "{log}"
+V="{volumes}"
+{f'case "$*" in *"{fail_on}"*) exit 1 ;; esac' if fail_on else ''}
+for a in "$@"; do name="$a"; done
+if [ "$1 $2" = "volume create" ]; then
+  label=""; prev=""
+  for a in "$@"; do [ "$prev" = "--label" ] && label="${{a#aiko.birth=}}"; prev="$a"; done
+  [ -f "$V/$name" ] || printf '%s' "$label" > "$V/$name"
+  echo "$name"; exit 0
+fi
+if [ "$1 $2" = "volume inspect" ]; then
+  [ -f "$V/$name" ] || exit 1
+  case "$3" in
+    -f) cat "$V/$name"; echo; exit 0 ;;
+    *) {'exit 1' if flaky_plain_inspect else 'exit 0'} ;;
+  esac
+fi
+exit 0
+''')
+
+
 def _stub(bin_dir: Path, name: str, body: str) -> None:
     p = bin_dir / name
     p.write_text("#!/usr/bin/env bash\n" + body)
@@ -61,15 +93,9 @@ def island(tmp_path):
 
     bin_dir = tmp_path / "bin"; bin_dir.mkdir()
     log = tmp_path / "calls.log"
-    # Honest stubs: `volume inspect` FAILS so the create path runs, everything else
-    # succeeds, and every invocation is recorded so a test can assert what was called.
-    _stub(bin_dir, "docker", f'''
-echo "docker $*" >> "{log}"
-case "$1 $2" in
-  "volume inspect") exit 1 ;;
-esac
-exit 0
-''')
+    # Honest stubs: docker models VOLUMES (see _docker_stub), starting with none, so the
+    # create path runs; everything else succeeds, and every invocation is recorded.
+    _docker_stub(bin_dir, log, tmp_path / "volumes")
     _stub(bin_dir, "openssl", f'echo "openssl $*" >> "{log}"\necho {FIXED_SECRET}\n')
     # /health answers immediately so the 30x2s wait loop does not run.
     _stub(bin_dir, "curl", f'echo "curl $*" >> "{log}"\nexit 0\n')
@@ -110,6 +136,114 @@ def test_the_harness_actually_runs_the_real_script(island) -> None:
     assert (island.root / "image.env").read_text().startswith("ISLAND_IMAGE="), (
         "a first standup must write the image pin")
     assert oct(island.env_file.stat().st_mode)[-3:] == "600", ".env must be owner-only"
+
+
+BIRTH = "chat-island sh -c set -eC"  # the birth copy; its script spans several logged lines
+
+
+def _compose_calls(island) -> list[str]:
+    return [ln for ln in island.calls.read_text().splitlines() if ln.startswith("docker compose ")]
+
+
+def _restub(island, **kw) -> None:
+    _docker_stub(island.root.parent / "bin", island.calls, island.root.parent / "volumes", **kw)
+
+
+def _existing_volume(island, label: str = "") -> None:
+    """A volume that was there before this run: an island, a lost db, another run's."""
+    vols = island.root.parent / "volumes"
+    vols.mkdir(exist_ok=True)
+    (vols / "aiko_data").write_text(label)
+
+
+def test_a_fresh_volume_creates_the_island_once_before_up(island) -> None:
+    """The gateway never creates a database when it starts, so the one moment an island
+    is born (this run created the volume) must make it explicitly, BEFORE `up`, or the
+    first start refuses MIGRATE_REFUSE_NO_DATABASE."""
+    island.run()
+    calls = [ln for ln in island.calls.read_text().splitlines() if ln.startswith("docker ")]
+    births = [i for i, ln in enumerate(calls) if ln.endswith(BIRTH)]
+    ups = [i for i, ln in enumerate(calls) if ln.endswith(" up -d")]
+    pulls = [i for i, ln in enumerate(calls) if ln.endswith(" pull")]
+    creates = [i for i, ln in enumerate(calls)
+               if ln.startswith("docker volume create --label aiko.birth=") and ln.endswith(" aiko_data")]
+    assert len(births) == 1, f"expected exactly one birth, got {calls}"
+    assert " run --rm --no-deps " in calls[births[0]]
+    assert ups and births[0] < ups[0], "the island must exist before the gateway starts"
+    assert len(creates) == 1 and pulls[0] < creates[0] < births[0], (
+        "the volume is created with the birth, after the image is in hand, never minutes "
+        "before it where a failed pull would strand it unborn")
+
+
+def test_a_flaky_inspect_on_an_existing_volume_copies_nothing(island) -> None:
+    """THE case (r3 finding 1, cage-match r1 all four seats): step 1's plain inspect
+    flakes on a volume that already exists, so standup attempts a birth. The volume
+    keeps its old label, the read-back isn't this run's, and nothing is copied, whatever
+    the volume holds (a lost db with the worker lock moved by GATEWAY_WORKER_LOCK is
+    EMPTY, which is why emptiness can't be the test)."""
+    _existing_volume(island, label="")  # e.g. made by compose or an older standup
+    _restub(island, flaky_plain_inspect=True)
+    r = island.run(expect_ok=False)
+    assert r.returncode != 0
+    assert not [ln for ln in _compose_calls(island) if ln.endswith(BIRTH)], "nothing copied"
+    assert not [ln for ln in _compose_calls(island) if ln.endswith(" up -d")]
+    out = r.stdout + r.stderr
+    assert "already existed before this run" in out and "left untouched" in out
+    assert "restore" not in out, "a flake on a HEALTHY island must not advise a restore (Noether r1)"
+
+
+def test_another_runs_volume_is_never_taken_over(island) -> None:
+    """A concurrent or earlier standup's volume carries ITS nonce, never this run's."""
+    _existing_volume(island, label="someone-elses-nonce")
+    _restub(island, flaky_plain_inspect=True)
+    r = island.run(expect_ok=False)
+    assert r.returncode != 0
+    assert not [ln for ln in _compose_calls(island) if ln.endswith(BIRTH)]
+
+
+def test_a_failed_copy_stops_and_claims_nothing_about_history(island) -> None:
+    """Standup never removes a volume itself (Noether, Carnot, Tesla, PR#405 r2). A failed
+    copy can't prove nobody used the volume (killed after `ln`, a concurrent run), so the
+    message makes no "safe to remove" claim: it points at the runbook, where the operator,
+    who knows the box's history, decides (Carnot r3)."""
+    _restub(island, fail_on=".aiko.db.seed")
+    r = island.run(expect_ok=False)
+    assert r.returncode != 0
+    calls = island.calls.read_text().splitlines()
+    assert not [ln for ln in calls if ln.startswith("docker volume rm")]
+    assert not [ln for ln in calls if ln.endswith(" up -d")]
+    out = r.stdout + r.stderr
+    assert "A failed birth" in out
+    assert "safe to remove" not in out and "nobody has used" not in out
+    assert "migrate --new-island" not in out and "aside" not in out
+
+
+def test_standup_never_removes_a_volume() -> None:
+    """The class, not the instance: no code path in standup.sh may RUN a volume removal.
+    Quoted strings are stripped first: advice printed to the operator is not a removal."""
+    import re
+
+    code = "\n".join(re.sub(r'"(?:[^"\\]|\\.)*"', '""', ln)
+                     for ln in (REPO / "deploy" / "standup.sh").read_text().splitlines()
+                     if not ln.lstrip().startswith("#"))
+    assert "volume rm" not in code
+
+
+def test_a_failed_pull_creates_no_volume(island) -> None:
+    _restub(island, fail_on=" pull")
+    r = island.run(expect_ok=False)
+    assert r.returncode != 0
+    assert not [ln for ln in island.calls.read_text().splitlines()
+                if ln.startswith("docker volume create")]
+
+
+def test_an_existing_volume_never_creates_an_island(island) -> None:
+    """A re-run, or a box whose volume already holds an island: inspect sees it, and the
+    birth is not even attempted."""
+    _existing_volume(island, label="")
+    island.run()
+    assert not [ln for ln in _compose_calls(island) if ln.endswith(BIRTH)]
+    assert [ln for ln in _compose_calls(island) if ln.endswith(" up -d")]
 
 
 def test_a_fresh_island_is_solo_and_quiet(island) -> None:
@@ -889,3 +1023,67 @@ def test_a_pre_5165_box_carries_its_ISLAND_VERSION_forward(island) -> None:
     island.run("--drop-env-keys", "ISLAND_VERSION")
     assert "ISLAND_VERSION" not in island.env_file.read_text()
     assert _pin(island) == "ISLAND_IMAGE=ghcr.io/nickmeinhold/aiko-chat-island:0.16.1\n"
+
+
+# --- the birth script itself, run for real ------------------------------------
+# The stubs above prove WHEN standup copies and into WHICH volume; these prove WHAT the
+# copy does, by running standup's own BIRTH_SH under sh with /data and the seed pointed
+# at temp dirs.
+
+def _birth_sh() -> str:
+    text = (REPO / "deploy" / "standup.sh").read_text()
+    start = text.index("BIRTH_SH='") + len("BIRTH_SH='")
+    return text[start:text.index("'\n", start)]
+
+
+def _run_birth(tmp_path, data_contents: dict[str, str], *, seed: str | None = "SEED"):
+    data, seed_path = tmp_path / "data", tmp_path / "seed.db"
+    data.mkdir()
+    if seed is not None:
+        seed_path.write_text(seed)
+    for name, body in data_contents.items():
+        (data / name).write_text(body)
+    script = _birth_sh().replace("/app/seed/aiko.db", str(seed_path)).replace("/data", str(data))
+    return subprocess.run(["sh", "-c", script], capture_output=True, text=True), data
+
+
+def test_the_birth_publishes_the_seed_and_leaves_no_temporary(tmp_path) -> None:
+    r, data = _run_birth(tmp_path, {})
+    assert r.returncode == 0, r.stderr
+    assert {p.name: p.read_text() for p in data.iterdir()} == {"aiko.db": "SEED"}
+
+
+def test_the_birth_never_overwrites_a_database(tmp_path) -> None:
+    """The publish is `ln`, which refuses an existing target: even if the volume
+    decision were somehow wrong, a database already there survives byte for byte."""
+    r, data = _run_birth(tmp_path, {"aiko.db": "LIVE"})
+    assert r.returncode != 0
+    assert (data / "aiko.db").read_text() == "LIVE"
+
+
+def test_a_missing_seed_fails_and_publishes_nothing(tmp_path) -> None:
+    """An image released before the seed has no /app/seed/aiko.db (Carnot r1): the
+    birth must fail, and no aiko.db may appear (a reader must never see a partial one)."""
+    r, data = _run_birth(tmp_path, {}, seed=None)
+    assert r.returncode != 0
+    assert not (data / "aiko.db").exists()
+
+
+def test_the_guides_manual_birth_is_standups_birth() -> None:
+    """The manual steps can't call standup's function, so they carry the same three
+    commands. Copies drift: pin the guide's line to BIRTH_SH itself, and pin the
+    ownership proof and the loud stop around it."""
+    guide = (REPO / "docs" / "standup-guide.md").read_text()
+    one_line = "; ".join(_birth_sh().splitlines())
+    assert f"sh -c '{one_line}'" in guide
+    assert "docker volume create --label aiko.birth=$N aiko_data" in guide
+    # An empty $N would make "" = "" pass against an UNLABELLED volume, and every live
+    # island's volume is unlabelled (Noether r3): the guard must come first.
+    assert 'test -n "$N" && test "$(docker volume inspect' in guide
+    assert '{{index .Labels "aiko.birth"}}' in guide and '= "$N"' in guide
+    assert "STOP:" in guide
+    # `up` is IN the chain, after the birth, never a separate line a STOP can't stop (Noether,
+    # Tesla, r2): the only `up -d` in the manual block is the `&&`-chained one.
+    block = guide[guide.index("# 3. pull the official image"):guide.index("# 4. TLS")]
+    ups = [ln.strip() for ln in block.splitlines() if "compose.sh up -d" in ln]
+    assert ups == ["&& ./deploy/compose.sh up -d \\"], ups

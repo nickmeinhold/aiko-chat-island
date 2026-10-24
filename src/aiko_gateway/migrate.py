@@ -6,7 +6,8 @@ That live DB has every table but no ``alembic_version`` row, so a naive
 ``upgrade head`` would run the baseline's ``CREATE TABLE users`` against a DB that
 already has it and abort. The fix is **stamp-or-upgrade**:
 
-  * fresh DB (no ``alembic_version``, no ``users``)      → ``upgrade head`` builds it
+  * fresh DB (no ``alembic_version``, no ``users``)      → REFUSE, always (this runner
+        never builds an island; see "Starting never creates an island" below)
   * pre-alembic DB (``users`` present, no ``alembic_version``) → adopt: VERIFY the
         existing schema matches the baseline, then ``stamp 0001``, then
         ``upgrade head`` applies anything after it
@@ -55,23 +56,30 @@ prod — was verified table-for-table to match the baseline before this shipped;
 this check encodes that verification so a future ambiguous DB fails loud instead
 of being silently corrupted.)
 
-**A volume that has hosted an island never silently becomes a new one (design 18
-§2).** SQLite creates a missing file on the first connect, and a fresh file is
-indistinguishable from a brand-new island, so a lost or half-restored ``aiko.db``
-used to come back as an EMPTY island that served (every account, message and key
-gone, `restart: always` making it permanent). The migrator now records a sentinel,
-``.aiko.db.initialized`` (one per db) beside it, after every successful run: on a fresh volume
-and, the first time a new image meets an existing db, as adoption. When the volume
-shows it has lived (that sentinel, or ``worker_guard``'s ``.aiko-worker.lock``,
-which every gateway since Aug 2026 has left there and never deletes, so both live
-islands are covered before their first adoption), a missing db or one with no tables
-REFUSES (``MIGRATE_REFUSE_MISSING_DB``). The missing-file check runs BEFORE the
-first connect, and on a lived volume every later connect is non-creating
-(``mode=rw``), so no window exists in which one could birth a new file. A db with
-no ``users`` table also refuses: that catches the 0-byte file a uvicorn-only boot
-leaves behind and a db holding only alembic's bookkeeping. A dotfile survives
-``rm /data/*``, which is the point. Non-file backends (Postgres dev, in-memory) have
-no volume and are unaffected.
+**Starting never creates an island.** SQLite creates a missing file on the first
+connect, and a fresh file is indistinguishable from a brand-new island, so a lost or
+half-restored ``aiko.db`` used to come back as an EMPTY island that served (every
+account, message and key gone, `restart: always` making it permanent). The fix is
+not to detect that, it is to remove the code that did it:
+
+  * every door to the database (this runner, the app's engine, alembic's env.py)
+    opens the file OPEN-ONLY (``worker_guard.open_only``, ``mode=rw``), so no connect
+    can create it;
+  * a plain run refuses a database with no ``users`` table (empty, truncated to 0
+    bytes, or alembic's bookkeeping only): building the schema into it would be the
+    same new, empty island by another route;
+  * the gateway has NO way to create an island, by flag, setting or otherwise. An
+    island is born as a COPY: ``docker build`` runs ``scripts/build_seed.py`` once,
+    which builds an empty island at head into ``/app/seed/aiko.db`` in an image layer
+    (where no volume exists to harm), and standup copies that file only into a volume it can PROVE it just created
+    (a random label, read back), so a volume that held an island never qualifies,
+    whatever it still holds (Nick,
+    2026-10-25, replacing the ``--new-island`` mode PR#405 r1-r3 reviewed).
+
+This replaced the volume sentinel (``.aiko.db.initialized``, PR#399) and the design-20
+witness built on top of it: both detected the wrong moment to create, and once
+nothing creates, there is nothing left to detect. Sentinel files already on a volume
+are inert.
 
 There is no host orchestrator to sequence "migrate before boot" (the deploy is a
 manual ``docker compose up -d`` — see aiko-chat-island#19), so this MUST run in
@@ -91,10 +99,8 @@ import logging
 import os
 import tempfile
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from urllib.parse import quote
 
 from alembic import command
 from alembic.autogenerate import compare_metadata
@@ -102,26 +108,16 @@ from alembic.config import Config
 from alembic.runtime.migration import MigrationContext
 from alembic.script import ScriptDirectory
 from sqlalchemy import MetaData, create_engine, inspect
-from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
 from .config import settings
 from .domain import models  # noqa: F401 — register tables on Base.metadata
-from .worker_guard import LOCK_FILENAME, _lock_path, sqlite_file
+from .worker_guard import open_only, sqlite_file
 
 log = logging.getLogger("aiko_gateway.migrate")
 
 BASELINE_REVISION = "0001"
-SENTINEL_SUFFIX = ".initialized"
-
-
-def _sentinel_path(db: Path) -> Path:
-    """One record PER DATABASE, named for it (``.aiko.db.initialized``): a record
-    for another db beside it is simply a different file, so it can neither count as
-    this db's evidence nor block this db's own record (Carnot + Noether + Tesla,
-    PR#399 r2). The leading dot keeps it out of ``rm aiko.db*`` and ``rm /data/*``."""
-    return db.parent / f".{db.name}{SENTINEL_SUFFIX}"
 
 
 def _db_file() -> Path | None:
@@ -130,74 +126,69 @@ def _db_file() -> Path | None:
     return sqlite_file(settings.db_url)
 
 
-def _lived_evidence(db: Path) -> list[Path]:
-    """The files that prove an island has lived on this volume. Never connects.
-
-    The sentinel is per database (see ``_sentinel_path``), so existence is the whole
-    test: nothing is parsed, so nothing can fail to parse. The worker lock counts at its
-    default path and, when ``GATEWAY_WORKER_LOCK`` moves it, at the moved path too.
-    (A ``GATEWAY_ALLOW_MULTIWORKER`` gateway writes no lock at all; such a volume is
-    covered by the sentinel only, after its first successful run.)"""
-    found: list[Path] = []
-    sentinel = _sentinel_path(db)
-    if sentinel.exists():  # EACCES et al. raise here: fail closed, never "no evidence"
-        found.append(sentinel)
-    for lock in {db.parent / LOCK_FILENAME, _lock_path()}:
-        if lock is not None and lock.exists():
-            found.append(lock)
-    return found
+_RESTORE = (
+    "If the database was lost or damaged: take the stack down, restore the newest "
+    "backup (`deploy/update.sh` keeps them in backups/ beside docker-compose.yml; see "
+    "docs/runbooks/backup-and-rollback.md), then start.")
+# A refusal names the cause and the repair (restore), and never "move it aside": an
+# operator following a refusal is on a box whose island is in doubt (PR#405 r3).
+# Naming standup is safe: it only ever copies into a volume it proves it just created,
+# so on this box, whose volume already exists, it refuses.
+_NEVER_HELD_ONE = (
+    "A box that has never held an island gets one from standup, never from this "
+    "program.")
 
 
-def _non_creating_url(db: Path) -> str:
-    """``settings.db_url`` reopened as an SQLite URI with ``mode=rw``: the file must
-    already exist, and no connect can create it. On a lived volume every connect the
-    migrator makes (its own and alembic's, which reads ``settings.db_url``) goes
-    through this, so a db that vanishes after the existence check makes the next
-    connect FAIL, not birth an empty island (Carnot + Tesla, PR#399 r1)."""
-    url = make_url(settings.db_url)
-    # Percent-encode: `?`, `#` and `%` in a path mean something in an SQLite URI.
-    return url.set(database=f"file:{quote(str(db), safe='/')}", query={**url.query, "mode": "rw", "uri": "true"}
-                   ).render_as_string(hide_password=False)
-
-
-def refuse_missing_db_message(db: Path, evidence: list[Path], why: str) -> str:
-    """Both fixes below are exercised from the refusing state by the test suite
-    (test_volume_sentinel.py), so neither is advice that can't work (#393)."""
-    names = " ".join(str(p) for p in evidence)
+def no_database_message(db: Path, *, via: Path | None = None) -> str:
+    """Raised by both boot layers (this runner and lifespan's ``verify_schema``), so the
+    operator gets one diagnosis whichever trips first. ``via``: the configured path, when
+    it is a symlink whose target ``db`` is what's missing."""
+    where = f"{via} is a symlink to {db}, which" if via else str(db)
     return (
-        f"MIGRATE_REFUSE_MISSING_DB: the database {db} {why}, but this volume has "
-        f"hosted an island before ({names}). Starting would create a NEW, EMPTY island "
-        "here and serve it: every account, message and key gone. Refusing to start. "
-        "If the database was lost or damaged: take the stack down, restore the newest "
-        f"backup to {db} (`deploy/update.sh` keeps them in backups/ beside "
-        "docker-compose.yml; see docs/runbooks/backup-and-rollback.md), then start. "
-        "Only if you really intend a brand-new, empty island on this volume: take the "
-        "stack down first (`docker compose down`; the worker lock is held by any gateway "
-        "still running, and deleting a held lock lets a second gateway start beside it), "
-        f"then delete {names}, then start.")
+        f"MIGRATE_REFUSE_NO_DATABASE: {where} does not exist. The gateway never creates a "
+        "database when it starts, so a lost one can't come back as a new, empty island. "
+        f"Refusing to start. {_RESTORE} {_NEVER_HELD_ONE}")
 
 
-def _write_sentinel(db: Path) -> None:
-    """Record that this volume now hosts an island: write-tmp, fsync, rename, fsync
-    the directory, so a crash leaves either no sentinel or a whole one."""
-    final = _sentinel_path(db)
-    if final.exists():
+_DEV_BACKEND = (
+    "This database has no file, so no volume or backup applies. The gateway runs on SQLite "
+    "in dev and prod alike (README): point DB_URL at a SQLite file.")
+
+
+def not_an_island_message(db: Path | None, why: str) -> str:
+    # A database with no file isn't a supported setup (README: dev runs SQLite like prod),
+    # and the volume repair would be wrong advice for it (Noether r2; premise fixed r3). Decided from the URL, not `db`: the baseline passes None.
+    repair = _DEV_BACKEND if sqlite_file(settings.db_url) is None else f"{_RESTORE} {_NEVER_HELD_ONE}"
+    return (
+        f"MIGRATE_REFUSE_NOT_AN_ISLAND: the database {db or settings.db_url} {why}. "
+        "Building the schema into it would start a new, empty island in its place. "
+        f"Refusing to start. {repair}")
+
+
+def require_database_file(db_url: str) -> None:
+    """The message, not the guarantee: every connect is open-only, so a missing file
+    could not be created either way. ``lstat``, because "can't look" must never read as
+    "missing", and the stdlib's answers differ by function AND by version: measured on
+    3.12.8, ``os.path.exists`` says False on EACCES while ``Path.exists`` raises a raw
+    PermissionError (3.13 moved ``Path.exists`` to the False behaviour). ``lstat`` raises
+    the same everywhere, so the two causes get their own messages (PR#405 r1).
+    Takes the URL so every caller derives the file the same way, and so a dangling
+    symlink is named as one (the configured path, unresolved) rather than reported as a
+    plain missing file (PR#405 r3). No file behind the URL (Postgres, in-memory): no-op."""
+    db = sqlite_file(db_url)
+    if db is None:
         return
-    tmp = final.with_name(final.name + ".tmp")
-    with open(tmp, "w") as f:
-        f.write(f"{datetime.now(timezone.utc).isoformat()}\n")
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, final)
-    _fsync_dir(db.parent)
-
-
-def _fsync_dir(path: Path) -> None:
-    dir_fd = os.open(path, os.O_RDONLY)
+    given = sqlite_file(db_url, follow_symlinks=False)
     try:
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)
+        os.lstat(db)
+    except FileNotFoundError:
+        via = given if given != db and os.path.islink(given) else None
+        raise RuntimeError(no_database_message(db, via=via)) from None
+    except OSError as e:
+        raise RuntimeError(
+            f"MIGRATE_REFUSE_UNREADABLE: {db} could not be checked ({e}). That is a "
+            "permissions, mount or disk problem on this host, not a missing database. "
+            "Refusing to start. Fix the cause, then start again.") from e
 
 
 def _root() -> str:
@@ -213,10 +204,19 @@ def _root() -> str:
     return root
 
 
-def _alembic_config() -> Config:
+SEED_BUILD_ATTR = "aiko_seed_build"
+
+
+def _alembic_config(*, seed_build: bool = False) -> Config:
+    """``seed_build`` is the capability the baseline migration requires before it builds
+    an island from nothing. Only Python grants it: ``scripts/build_seed.py`` at image
+    build time, the scratch database ``_baseline_metadata`` makes for itself, and tests.
+    No command line, setting or hand-run ``alembic`` can."""
     root = _root()
     cfg = Config(os.path.join(root, "alembic.ini"))
     cfg.set_main_option("script_location", os.path.join(root, "alembic"))
+    if seed_build:
+        cfg.attributes[SEED_BUILD_ATTR] = True
     return cfg
 
 
@@ -242,8 +242,9 @@ def _baseline_metadata() -> MetaData:
         ref_path = os.path.join(td, "baseline.db")
         original_url = settings.db_url
         settings.db_url = f"sqlite+aiosqlite:///{ref_path}"
+        open(ref_path, "x").close()  # alembic opens open-only; this scratch db is ours to create
         try:
-            command.upgrade(_alembic_config(), BASELINE_REVISION)
+            command.upgrade(_alembic_config(seed_build=True), BASELINE_REVISION)  # our scratch db
         finally:
             settings.db_url = original_url
         ref_engine = create_engine(f"sqlite:///{ref_path}")
@@ -273,8 +274,8 @@ def _compare_to(target: MetaData):
 
 async def _table_names() -> set[str]:
     """Live table names over the app's async driver (no sync driver needed: the
-    deploy has only aiosqlite, dev has asyncpg). Short-lived NullPool engine."""
-    engine = create_async_engine(settings.db_url, poolclass=NullPool)
+    deploy and dev both run aiosqlite). Short-lived NullPool engine."""
+    engine = create_async_engine(open_only(settings.db_url), poolclass=NullPool)
     try:
         async with engine.connect() as conn:
             return await conn.run_sync(lambda c: set(inspect(c).get_table_names()))
@@ -284,7 +285,7 @@ async def _table_names() -> set[str]:
 
 async def _diff_against(target: MetaData) -> list:
     """Diff the live DB against ``target`` over the async driver."""
-    engine = create_async_engine(settings.db_url, poolclass=NullPool)
+    engine = create_async_engine(open_only(settings.db_url), poolclass=NullPool)
     try:
         async with engine.connect() as conn:
             return await conn.run_sync(_compare_to(target))
@@ -361,7 +362,7 @@ def refuse_unknown_message(status: SchemaStatus) -> str:
 
 async def _schema_status() -> SchemaStatus:
     """``schema_status`` over the async driver (the deploy has only aiosqlite)."""
-    engine = create_async_engine(settings.db_url, poolclass=NullPool)
+    engine = create_async_engine(open_only(settings.db_url), poolclass=NullPool)
     try:
         async with engine.connect() as conn:
             return await conn.run_sync(schema_status)
@@ -369,42 +370,28 @@ async def _schema_status() -> SchemaStatus:
         await engine.dispose()
 
 
+
 def run() -> None:
-    # Volume sentinel (design 18 §2 — see module docstring). The missing-file check
-    # runs BEFORE any connect, and on a lived volume every connect after it is
-    # non-creating (`mode=rw`), so the check is the message and `mode=rw` is the
-    # guarantee: there is no window in which a connect could birth a new file.
+    """Bring an existing island's database to head. Never creates one: islands are
+    born by standup copying the image's seed (see the module docstring)."""
     db = _db_file()
-    evidence = _lived_evidence(db) if db is not None else []
-    if not evidence:
-        _migrate(db, evidence)
-        return
-    if not db.exists():
-        raise RuntimeError(refuse_missing_db_message(db, evidence, "is missing"))
-    original = settings.db_url
-    settings.db_url = _non_creating_url(db)
-    try:
-        _migrate(db, evidence)
-    finally:
-        settings.db_url = original
-
-
-def _migrate(db: Path | None, evidence: list[Path]) -> None:
+    require_database_file(settings.db_url)
     tables = asyncio.run(_table_names())
-    # `users`, not "any table": a db holding only alembic's bookkeeping reads BEHIND
-    # and would be built into a new, empty island (Carnot, PR#399 r1). This also
-    # catches the 0-byte file a uvicorn-only boot's connect leaves behind.
-    if evidence and "users" not in tables:
-        raise RuntimeError(refuse_missing_db_message(
-            db, evidence, "holds no island (no users table: empty, 0-byte, or bookkeeping only)"))
-    if db is not None and not evidence and "users" not in tables:
-        # Say it, so "fresh volume" and "no evidence found" are never the same silence,
-        # whether the file was missing or held no island (Noether, PR#399 r1 + r3).
-        log.warning("No sign an island has lived in %s (no %s, no %s): "
-                    "creating a NEW, empty island in %s.",
-                    db.parent, _sentinel_path(db).name, LOCK_FILENAME, db.name)
+    # THE GUARANTEE is the baseline's own gate (alembic/versions/0001_baseline.py): it
+    # builds an island from nothing, and refuses without the seed-build capability, so
+    # no door (this runner, a hand-run alembic) can build one into an empty file. This
+    # pre-check adds a different property: a plain start that refuses TOUCHES NOTHING,
+    # where the baseline's refusal comes after alembic has already written its own
+    # bookkeeping table. `users`, not "any table": bookkeeping alone is not an island.
+    if "users" not in tables:
+        raise RuntimeError(not_an_island_message(
+            db, "holds no island (no users table: empty, 0-byte, or alembic's bookkeeping only)"))
     cfg = _alembic_config()
-    adopting = "alembic_version" not in tables and "users" in tables
+    # Adopt when the island is there and NOTHING is stamped: no alembic_version table,
+    # or an EMPTY one. Measured (PR#405 r2): a hand-run alembic that the baseline gate
+    # refused leaves an empty alembic_version table behind, and keying on the table's
+    # absence would then refuse this island forever (Tesla).
+    adopting = "alembic_version" not in tables or not asyncio.run(_schema_status()).stamped
     if adopting:
         # Fail-closed (Carnot cage-match, PR#23): only stamp a pre-alembic DB as
         # baseline if its schema ACTUALLY equals baseline 0001 — diffed against the
@@ -433,36 +420,18 @@ def _migrate(db: Path | None, evidence: list[Path]) -> None:
         raise RuntimeError(refuse_unknown_message(status))
 
     command.upgrade(cfg, "head")
-    if db is not None:
-        # A failed write may let the island serve ONLY if something else already marks
-        # the volume (`evidence`, gathered before this run). When this write is the
-        # first witness (a fresh volume, or a multi-worker one with no lock), serving
-        # without it leaves nothing for the next boot to believe, so refuse NOW, while
-        # aiko.db is still there (Carnot + Tesla, PR#399 r2).
-        try:
-            _write_sentinel(db)  # fresh volume or first adoption; a no-op thereafter
-        except OSError as e:
-            sentinel = _sentinel_path(db)
-            if sentinel.exists():
-                # The rename landed; only the directory fsync failed. The record is
-                # there, so refusing would describe a failure that did not happen
-                # (Noether, PR#399 r3). Durability across a power cut is what's lost.
-                log.warning("Recorded %s, but could not fsync %s (%s).", sentinel, db.parent, e)
-            elif not evidence:
-                raise RuntimeError(
-                    f"MIGRATE_REFUSE_UNRECORDED: the database {db} is migrated, but "
-                    f"{sentinel} could not be written ({e}), and nothing else on this "
-                    "volume marks it as hosting an island. Serving now would leave a later "
-                    "loss of the database indistinguishable from a fresh volume. Refusing "
-                    f"to start. Fix the cause (free space, or ownership of {db.parent}), "
-                    "then start again: the database is intact.") from e
-            else:
-                log.error("Could not record %s (%s). The database is at head and will "
-                          "serve; until it is written, %s marks this volume as having "
-                          "hosted an island.", sentinel, e, " ".join(str(p) for p in evidence))
     log.info("Database is at head.")
 
 
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
+def main(argv: list[str]) -> None:
+    if argv[1:]:
+        raise SystemExit(f"usage: python -m aiko_gateway.migrate  (takes no arguments; got "
+                         f"{argv[1:]}). It never creates a database: standup does that.")
     run()
+
+
+if __name__ == "__main__":
+    import sys
+
+    logging.basicConfig(level=logging.INFO)
+    main(sys.argv)

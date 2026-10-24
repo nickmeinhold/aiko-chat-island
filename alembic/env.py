@@ -32,6 +32,7 @@ from sqlalchemy import pool
 from aiko_gateway.config import settings
 from aiko_gateway.db import Base
 from aiko_gateway.domain import models  # noqa: F401  (registers tables on Base)
+from aiko_gateway.worker_guard import open_only
 
 config = context.config
 # settings.db_url is THE source of truth for which database — one DB_URL, no
@@ -43,7 +44,11 @@ config = context.config
 # `%` doubled: set_main_option runs the value through configparser interpolation, so
 # a `%` in a path (or the `%3F` the migrator's mode=rw URI percent-encodes a `?` into)
 # raised "invalid interpolation syntax" (PR#399 r2). Alembic's documented escape.
-config.set_main_option("sqlalchemy.url", settings.db_url.replace("%", "%%"))
+# open_only: alembic is a door to the database too, and a hand-run `alembic upgrade
+# head` against a lost aiko.db must fail, not build a new, empty island in its place.
+# The gateway never creates a database: an island is born when standup copies the
+# image's seed (built by scripts/build_seed.py at `docker build`) into a new volume.
+config.set_main_option("sqlalchemy.url", open_only(settings.db_url).replace("%", "%%"))
 
 if config.config_file_name is not None:
     # disable_existing_loggers=False: the DEFAULT (True) silently disables every

@@ -46,6 +46,7 @@ async def file_sessionmaker(tmp_path):
     (db.make_engine -> busy_timeout). Each session() is a SEPARATE connection from
     the pool, so two of them genuinely contend — unlike the in-memory
     single-connection conftest engine."""
+    (tmp_path / "concurrency.db").touch()  # the engine is open-only: it never creates a database
     engine = make_engine(f"sqlite+aiosqlite:///{tmp_path}/concurrency.db")
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -211,6 +212,7 @@ async def test_sqlite_engine_applies_busy_timeout(tmp_path):
     each connection: busy_timeout=5000, so a concurrent writer WAITS for the lock
     instead of getting SQLITE_BUSY immediately. (WAL is deliberately NOT enabled —
     see db._tune_sqlite_concurrency — so journal_mode stays the default.)"""
+    (tmp_path / "pragmas.db").touch()  # the engine is open-only: it never creates a database
     engine = make_engine(f"sqlite+aiosqlite:///{tmp_path}/pragmas.db")
     try:
         async with engine.connect() as conn:

@@ -98,7 +98,7 @@ pip install -e ../aiko_services -e ../aiko_chat
 pip install -e '.[dev]'
 
 cp .env.example .env          # sets ENVIRONMENT=dev (relaxes the prod fail-closed guards)
-alembic upgrade head          # create the SQLite schema (./aiko_dev.db)
+python scripts/build_seed.py   # first checkout ONLY: builds ./aiko_dev.db (the gateway never creates one; refuses if it exists)
 uvicorn aiko_gateway.main:app --reload --port 8095
 
 curl localhost:8095/health    # {"status":"ok",...}
