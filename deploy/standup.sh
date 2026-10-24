@@ -298,16 +298,18 @@ fi
 # honest in both modes rather than saying "4/4" while a fifth step follows.
 TOTAL=4; [ "$DO_MEDIA" = "true" ] && TOTAL=5
 log "Step 1/$TOTAL — persistent data volume ($DATA_VOLUME)"
-# NEW_ISLAND is set ONLY where this run creates the volume: that is the one moment an
-# island is born. The gateway never creates a database when it starts, so step 3 makes
-# it explicitly (`migrate --new-island`), once, here, and never on a re-run.
+# No volume means this run gives birth to the island. The gateway never creates a
+# database when it starts, so step 3 creates the volume AND the database together
+# (`birth_island`), right before `up`. Not here: a volume created now would sit through
+# the .env ceremony, the pull and the build, and any death in between would strand an
+# existing-but-unborn volume that no re-run would ever finish (Noether, Carnot, Tesla,
+# Maxwell, PR#405 r1).
 NEW_ISLAND="false"
 if docker volume inspect "$DATA_VOLUME" >/dev/null 2>&1; then
   ok "volume $DATA_VOLUME already exists — leaving it (never re-created; it holds the DB)"
 else
-  docker volume create "$DATA_VOLUME" >/dev/null
   NEW_ISLAND="true"
-  ok "created external volume $DATA_VOLUME"
+  ok "no volume $DATA_VOLUME yet: step 3 creates it together with the new island's database"
 fi
 
 # --- step 2: write the production .env --------------------------------------
@@ -742,23 +744,31 @@ island_pin_begin || die "could not snapshot image.env"
 trap 'rm -f "${ENV_TMP:-}" "${IMAGE_TMP:-}" "${LK_ENV_STAGED:-}" "${KEYS_HAVE:-}" "${KEYS_WANT:-}" "${KEYS_DROPPED:-}" "${KEYS_ACKED:-}" "${_island_pin_file:-}" 2>/dev/null || true' EXIT
 
 # --- step 3: bring the island up (4 containers, 1 image + stock mosquitto) ---
+# The volume and the database are born together, after the image is in hand. If the
+# birth fails, the volume THIS RUN created is removed, so a re-run sees no volume and
+# starts the birth again instead of stranding an empty one. "$@" = island_compose's
+# leading options (--build-overlay, or none).
+birth_island() {
+  docker volume create "$DATA_VOLUME" >/dev/null || die "could not create volume $DATA_VOLUME"
+  trap 'docker volume rm "$DATA_VOLUME" >/dev/null 2>&1; exit 130' INT TERM
+  if ! island_compose "$@" run --rm --no-deps chat-island python -m aiko_gateway.migrate --new-island; then
+    trap - INT TERM
+    docker volume rm "$DATA_VOLUME" >/dev/null 2>&1 \
+      && die "could not create the new island's database (see above). The volume this run created was removed: fix the cause and re-run standup."
+    die "could not create the new island's database (see above), and could not remove the volume this run created. Either remove it (docker volume rm $DATA_VOLUME) and re-run standup, or finish by hand: deploy/compose.sh run --rm --no-deps chat-island python -m aiko_gateway.migrate --new-island (move any partial aiko.db aside first)."
+  fi
+  trap - INT TERM
+  ok "created volume $DATA_VOLUME and the new island's database"
+}
 if [ "$FROM_SOURCE" = "true" ]; then
   log "Step 3/$TOTAL — building the island image from source + starting (gateway + broker + registrar + ChatServer)"
   island_compose --build-overlay build
-  if [ "$NEW_ISLAND" = "true" ]; then
-    island_compose --build-overlay run --rm --no-deps chat-island python -m aiko_gateway.migrate --new-island \
-      || die "could not create the new island's database (see above)"
-    ok "created the new island's database"
-  fi
+  [ "$NEW_ISLAND" = "true" ] && birth_island --build-overlay
   island_compose --build-overlay up -d
 else
   log "Step 3/$TOTAL — pulling the published island image + starting (gateway + broker + registrar + ChatServer)"
   island_compose pull
-  if [ "$NEW_ISLAND" = "true" ]; then
-    island_compose run --rm --no-deps chat-island python -m aiko_gateway.migrate --new-island \
-      || die "could not create the new island's database (see above)"
-    ok "created the new island's database"
-  fi
+  [ "$NEW_ISLAND" = "true" ] && birth_island
   island_compose up -d
 fi
 ok "compose stack started"

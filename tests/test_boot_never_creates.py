@@ -12,6 +12,7 @@ The admit arms are positive controls: an existing island must still boot, and
 from __future__ import annotations
 
 import asyncio
+import os
 import sqlite3
 from urllib.parse import quote
 
@@ -167,6 +168,54 @@ def test_new_island_refuses_when_anything_is_already_there(tmp_path, monkeypatch
     with pytest.raises(RuntimeError, match="MIGRATE_REFUSE_EXISTS"):
         migrate.run(new_island=True)
     assert _canary(real) == ["melb"]
+
+
+def test_new_island_refuses_a_dangling_symlink_and_creates_nothing(tmp_path, monkeypatch) -> None:
+    """The case where only the UNRESOLVED path can refuse: the link's target does not
+    exist, so resolving first hands the creator a free path and it creates the target
+    (Noether, Carnot, Tesla, PR#405 r1). The arm above can't see this, because its
+    target exists and refuses for that reason instead."""
+    db = _point_app_at(tmp_path, monkeypatch)
+    lost = tmp_path / "elsewhere" / "lost.db"
+    lost.parent.mkdir()
+    db.symlink_to(lost)
+    with pytest.raises(RuntimeError, match="MIGRATE_REFUSE_EXISTS"):
+        migrate.run(new_island=True)
+    assert not lost.exists()
+
+
+@pytest.mark.parametrize("contents", ["zero-byte", "bookkeeping-only"])
+def test_a_hand_run_alembic_cannot_build_an_island_into_an_empty_file(
+        tmp_path, monkeypatch, contents) -> None:
+    """Open-only stops a missing FILE being created; the producer of an empty island
+    from an existing empty file is the baseline migration itself, and it refuses unless
+    the run is --new-island (claude-skills control, Carnot 4/4, PR#405 r1)."""
+    db = _point_app_at(tmp_path, monkeypatch)
+    if contents == "zero-byte":
+        db.touch()
+    else:
+        with sqlite3.connect(db) as c:
+            c.execute("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)")
+    with pytest.raises(RuntimeError, match="MIGRATE_REFUSE_NOT_AN_ISLAND"):
+        command.upgrade(migrate._alembic_config(), "head")
+    assert "users" not in _tables(db)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads through mode 000")
+def test_an_unreadable_directory_is_named_as_that_not_as_a_missing_database(
+        tmp_path, monkeypatch) -> None:
+    """`Path.exists()` says False when it can't LOOK, which would send an operator with
+    a permissions problem to restore a backup or run --new-island (Maxwell, PR#405 r1)."""
+    data = tmp_path / "data"
+    data.mkdir()
+    monkeypatch.setattr(settings, "db_url", f"sqlite+aiosqlite:///{data / 'aiko.db'}")
+    data.chmod(0)
+    try:
+        with pytest.raises(RuntimeError, match="MIGRATE_REFUSE_UNREADABLE"):
+            migrate.run()
+    finally:
+        data.chmod(0o755)
+    assert list(data.iterdir()) == []
 
 
 def test_the_app_engine_never_creates_the_file(tmp_path) -> None:

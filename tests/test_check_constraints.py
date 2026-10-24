@@ -205,7 +205,7 @@ def test_upgrade_0001_to_0002_preserves_data_structure_and_applies_check(
     db = tmp_path / "evolve.db"
     monkeypatch.setattr(settings, "db_url", f"sqlite+aiosqlite:///{db}")
     migrate._create_empty(db)  # a new database is made explicitly, never by a connect
-    cfg = migrate._alembic_config()
+    cfg = migrate._alembic_config(new_island=True)
 
     command.upgrade(cfg, "0001")  # baseline only — no CHECK yet
     sync_url = f"sqlite:///{db}"
@@ -439,7 +439,7 @@ def test_upgrade_0021_to_0022_preserves_populated_users_table(tmp_path, monkeypa
     db = tmp_path / "evolve_0022.db"
     monkeypatch.setattr(settings, "db_url", f"sqlite+aiosqlite:///{db}")
     migrate._create_empty(db)  # a new database is made explicitly, never by a connect
-    cfg = migrate._alembic_config()
+    cfg = migrate._alembic_config(new_island=True)
 
     command.upgrade(cfg, "0021")  # the revision both production islands sit at
     engine = create_engine(f"sqlite:///{db}")
@@ -567,7 +567,7 @@ def test_downgrade_0022_to_0021_round_trips_a_fat_row(tmp_path, monkeypatch):
     db = tmp_path / "roundtrip_0022.db"
     monkeypatch.setattr(settings, "db_url", f"sqlite+aiosqlite:///{db}")
     migrate._create_empty(db)  # a new database is made explicitly, never by a connect
-    cfg = migrate._alembic_config()
+    cfg = migrate._alembic_config(new_island=True)
 
     command.upgrade(cfg, "0021")
     engine = create_engine(f"sqlite:///{db}")
@@ -849,7 +849,7 @@ def test_0028_folds_an_out_of_set_row_rather_than_aborting(tmp_path, monkeypatch
     db = tmp_path / "fold.db"
     monkeypatch.setattr(settings, "db_url", f"sqlite+aiosqlite:///{db}")
     migrate._create_empty(db)  # a new database is made explicitly, never by a connect
-    cfg = migrate._alembic_config()
+    cfg = migrate._alembic_config(new_island=True)
     command.upgrade(cfg, "0027")
     engine = create_engine(f"sqlite:///{db}")
     try:

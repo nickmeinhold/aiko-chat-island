@@ -65,7 +65,7 @@ def _multiworker_allowed() -> bool:
     return os.environ.get("GATEWAY_ALLOW_MULTIWORKER", "").strip().lower() in _TRUTHY
 
 
-def sqlite_file(db_url: str) -> Path | None:
+def sqlite_file(db_url: str, *, follow_symlinks: bool = True) -> Path | None:
     """The SQLite FILE behind a SQLAlchemy URL, or None when there is none (in-memory,
     or a non-sqlite backend). The one derivation shared by this lock, ``open_only``
     and ``migrate``, so they can't disagree about which file a db is (Carnot, PR#399
@@ -86,7 +86,10 @@ def sqlite_file(db_url: str) -> Path | None:
         name = unquote(urlsplit(name).path)
         if not name or name == ":memory:":
             return None
-    return Path(name).resolve()
+    # follow_symlinks=False keeps the final component as given (absolute, normalised, not
+    # resolved): the creator needs to see a symlink AT the path to refuse it, and
+    # resolve() would hand it the target instead (Noether, Carnot, Tesla, PR#405 r1).
+    return Path(name).resolve() if follow_symlinks else Path(os.path.abspath(name))
 
 
 def open_only(db_url: str) -> str:

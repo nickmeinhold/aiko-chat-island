@@ -92,6 +92,7 @@ one-shot init container or an explicit lock rather than the per-replica entrypoi
 from __future__ import annotations
 
 import asyncio
+import errno
 import logging
 import os
 import tempfile
@@ -123,13 +124,13 @@ def _db_file() -> Path | None:
     return sqlite_file(settings.db_url)
 
 
-_RESTORE_OR_CREATE = (
+_RESTORE = (
     "If the database was lost or damaged: take the stack down, restore the newest "
     "backup (`deploy/update.sh` keeps them in backups/ beside docker-compose.yml; see "
-    "docs/runbooks/backup-and-rollback.md), then start. Only if you really mean a "
-    "brand-new, EMPTY island here: move this file aside and run `python -m "
-    "aiko_gateway.migrate --new-island` once (`deploy/compose.sh run --rm --no-deps "
-    "chat-island python -m aiko_gateway.migrate --new-island` on a box).")
+    "docs/runbooks/backup-and-rollback.md), then start.")
+_NEW_ISLAND_COMMAND = (
+    "run `python -m aiko_gateway.migrate --new-island` once (`deploy/compose.sh run --rm "
+    "--no-deps chat-island python -m aiko_gateway.migrate --new-island` on a box)")
 
 
 def no_database_message(db: Path) -> str:
@@ -138,28 +139,56 @@ def no_database_message(db: Path) -> str:
     return (
         f"MIGRATE_REFUSE_NO_DATABASE: {db} does not exist. The gateway never creates a "
         "database when it starts, so a lost one can't come back as a new, empty island. "
-        "Refusing to start. " + _RESTORE_OR_CREATE.replace("move this file aside and ", ""))
+        f"Refusing to start. {_RESTORE} Only if you really mean a brand-new, EMPTY island "
+        f"here: {_NEW_ISLAND_COMMAND}.")
 
 
 def not_an_island_message(db: Path | None, why: str) -> str:
     return (
         f"MIGRATE_REFUSE_NOT_AN_ISLAND: the database {db or settings.db_url} {why}. "
         "Building the schema into it would start a new, empty island in its place, and "
-        "only `--new-island` may do that. Refusing to start. " + _RESTORE_OR_CREATE)
+        f"only `--new-island` may do that. Refusing to start. {_RESTORE} Only if you "
+        f"really mean a brand-new, EMPTY island here: move this file aside, then "
+        f"{_NEW_ISLAND_COMMAND}.")
+
+
+def require_database_file(db: Path) -> None:
+    """The message, not the guarantee: every connect is open-only, so a missing file
+    could not be created either way. ``lstat``, because "can't look" must never read as
+    "missing", and the stdlib's answers differ by function AND by version: measured on
+    3.12.8, ``os.path.exists`` says False on EACCES while ``Path.exists`` raises a raw
+    PermissionError (3.13 moved ``Path.exists`` to the False behaviour). ``lstat`` raises
+    the same everywhere, so the two causes get their own messages (PR#405 r1)."""
+    try:
+        os.lstat(db)
+    except FileNotFoundError:
+        raise RuntimeError(no_database_message(db)) from None
+    except OSError as e:
+        raise RuntimeError(
+            f"MIGRATE_REFUSE_UNREADABLE: {db} could not be checked ({e}). That is a "
+            "permissions, mount or disk problem on this host, not a missing database. "
+            "Refusing to start. Fix the cause, then start again; do NOT run --new-island "
+            "to make this go away.") from e
 
 
 def _create_empty(db: Path) -> None:
     """THE one place a database file is created. ``O_EXCL``: anything already at the
-    path (a db, a 0-byte file, a symlink, a directory) refuses, so `--new-island` can
-    never be pointed at an island that exists. An empty file is a valid, empty SQLite
-    database, which the open-only connects below may then build into."""
+    path (a db, a 0-byte file, a directory, a symlink, dangling or not) refuses, so
+    `--new-island` can never be pointed at an island that exists or be redirected through
+    a link. ``db`` must be the path AS GIVEN, final component unresolved
+    (``sqlite_file(follow_symlinks=False)``): resolving first would hand this the link's
+    target and create THAT (Noether, Carnot, Tesla, PR#405 r1). An empty file is a valid,
+    empty SQLite database, which the open-only connects may then build into."""
     try:
         fd = os.open(db, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
-    except FileExistsError:
+    except OSError as e:
+        if not isinstance(e, FileExistsError) and e.errno != errno.ELOOP:
+            raise
         raise RuntimeError(
-            f"MIGRATE_REFUSE_EXISTS: --new-island creates a database, and {db} already "
-            "exists. Refusing: it may be an island. If it really is a leftover you mean "
-            "to replace, take the stack down and move it aside first.") from None
+            f"MIGRATE_REFUSE_EXISTS: --new-island creates a database, and something is "
+            f"already at {db}. Refusing: it may be an island, or a link to one. If it "
+            "really is a leftover you mean to replace, take the stack down and move it "
+            "aside first.") from None
     os.close(fd)
     log.warning("--new-island: created %s; building a NEW, empty island in it.", db)
 
@@ -177,10 +206,18 @@ def _root() -> str:
     return root
 
 
-def _alembic_config() -> Config:
+NEW_ISLAND_ATTR = "aiko_new_island"
+
+
+def _alembic_config(*, new_island: bool = False) -> Config:
+    """``new_island`` is the capability the baseline migration requires before it builds
+    an island from nothing. Only ``--new-island`` (and scratch databases this module makes
+    for itself) grants it; a hand-run ``alembic`` CLI never does."""
     root = _root()
     cfg = Config(os.path.join(root, "alembic.ini"))
     cfg.set_main_option("script_location", os.path.join(root, "alembic"))
+    if new_island:
+        cfg.attributes[NEW_ISLAND_ATTR] = True
     return cfg
 
 
@@ -208,7 +245,7 @@ def _baseline_metadata() -> MetaData:
         settings.db_url = f"sqlite+aiosqlite:///{ref_path}"
         open(ref_path, "x").close()  # alembic opens open-only; this scratch db is ours to create
         try:
-            command.upgrade(_alembic_config(), BASELINE_REVISION)
+            command.upgrade(_alembic_config(new_island=True), BASELINE_REVISION)  # our scratch db
         finally:
             settings.db_url = original_url
         ref_engine = create_engine(f"sqlite:///{ref_path}")
@@ -340,23 +377,26 @@ def run(*, new_island: bool = False) -> None:
     (the ``--new-island`` argument), which is the only way an island is born."""
     db = _db_file()
     if new_island:
-        if db is not None:
-            _create_empty(db)
-    elif db is not None and not db.exists():
-        # The message only: every connect below is open-only, so a missing file could
-        # not have been created anyway. This names the cause and the fix.
-        raise RuntimeError(no_database_message(db))
+        given = sqlite_file(settings.db_url, follow_symlinks=False)
+        if given is not None:
+            _create_empty(given)
+    elif db is not None:
+        require_database_file(db)
     _migrate(db, new_island)
 
 
 def _migrate(db: Path | None, new_island: bool) -> None:
     tables = asyncio.run(_table_names())
-    # `users`, not "any table": a db holding only alembic's bookkeeping reads BEHIND,
-    # and upgrading it would build a new, empty island into it (Carnot, PR#399 r1).
+    # THE GUARANTEE is the baseline's own gate (alembic/versions/0001_baseline.py): it
+    # builds an island from nothing, and refuses unless this run is --new-island, so no
+    # door (this runner, a hand-run alembic) can build one into an empty file. This
+    # pre-check adds a different property: a plain start that refuses TOUCHES NOTHING,
+    # where the baseline's refusal comes after alembic has already written its own
+    # bookkeeping table. `users`, not "any table": bookkeeping alone is not an island.
     if "users" not in tables and not new_island:
         raise RuntimeError(not_an_island_message(
             db, "holds no island (no users table: empty, 0-byte, or alembic's bookkeeping only)"))
-    cfg = _alembic_config()
+    cfg = _alembic_config(new_island=new_island)
     adopting = "alembic_version" not in tables and "users" in tables
     if adopting:
         # Fail-closed (Carnot cage-match, PR#23): only stamp a pre-alembic DB as

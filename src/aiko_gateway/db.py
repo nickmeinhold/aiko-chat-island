@@ -185,13 +185,13 @@ async def verify_schema() -> None:
     # columns _assert_schema_current inspects, and on that schema the shape check
     # would misdiagnose "behind the code, run upgrade head". The revision check knows
     # the schema is AHEAD and gives the working fix (Tesla, PR#392 r4).
-    from .migrate import no_database_message  # lazy: migrate imports db.Base (cycle)
+    from .migrate import require_database_file  # lazy: migrate imports db.Base (cycle)
 
     db = sqlite_file(settings.db_url)
-    if db is not None and not db.exists():
+    if db is not None:
         # The message only: the engine is open-only, so the connect below could not
         # have created the file either way. This names the cause and the fix.
-        raise RuntimeError(no_database_message(db))
+        require_database_file(db)
     async with engine.connect() as conn:
         await conn.run_sync(_assert_at_head)
         await conn.run_sync(_assert_schema_current)

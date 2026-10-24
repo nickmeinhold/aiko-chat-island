@@ -84,9 +84,9 @@ by hand (see [Manual standup](#manual-standup-no-script)).
 | Step | What | Why it's needed |
 |---|---|---|
 | Preflight | check tools + DNS | fail early, not halfway through |
-| 1 | `docker volume create aiko_data` | the SQLite store's home is declared `external` in compose (decoupled from the project name so a rename never empties it) — external volumes must exist before `up` |
+| 1 | check for `aiko_data` | no volume = this run gives birth to the island. The volume itself is created in step 3, together with the database, so a failure in between can't strand an empty one. The SQLite store's home is declared `external` in compose (decoupled from the project name so a rename never empties it) |
 | 2 | write `.env` | island identity (domain, display name, peers) + a **generated ≥32-char JWT secret**. `ENVIRONMENT` is left unset on purpose — absence means *production*, which fail-closes the boot unless a strong secret is present |
-| 3 | `docker compose pull && up -d` | pulls the official image and starts all four containers. No `--build` — nothing is built on the host. (Want to build from your own checkout instead? `--from-source`.) The container migrates the DB to head, then serves |
+| 3 | `pull`, then (new island only) `docker volume create aiko_data` + `migrate --new-island`, then `up -d` | pulls the official image and starts all four containers. No `--build` — nothing is built on the host. (Want to build from your own checkout instead? `--from-source`.) A new island's database is created explicitly; if that fails, the volume is removed so a re-run starts again. Every start migrates the DB to head, then serves, and never creates a database |
 | 4 | bring up Caddy | TLS termination + reverse proxy to `127.0.0.1:8095`, in its own stack so it never collides with an existing proxy |
 
 Two safety properties worth knowing:
@@ -231,7 +231,7 @@ If you'd rather run the steps yourself (or debug one), this is exactly what the
 script automates:
 
 ```bash
-# 1. create the external data volume
+# 1. create the external data volume (a NEW island only: step 3 then creates its database)
 docker volume create aiko_data
 
 # 2. write .env (production: NO ENVIRONMENT line; strong secret required)
@@ -252,12 +252,17 @@ chmod 600 .env
 # 2b. pin the image (its own file, never .env: compose refuses without it)
 printf 'ISLAND_IMAGE=ghcr.io/nickmeinhold/aiko-chat-island:%s\n' 0.17.1 > image.env
 
-# 3. pull the official image + bring up the island (migrates then serves).
+# 3. pull the official image, create the island's database ONCE, then bring it up.
+#    The gateway never creates a database when it starts (a lost one must not come
+#    back as a new, empty island), so a brand-new island is born explicitly. Never
+#    run --new-island against a volume that already holds an island: it refuses.
 #    All four containers run from this one image (bar stock mosquitto).
-./deploy/compose.sh pull && ./deploy/compose.sh up -d
+./deploy/compose.sh pull
+./deploy/compose.sh run --rm --no-deps chat-island python -m aiko_gateway.migrate --new-island
+./deploy/compose.sh up -d
 curl -s http://127.0.0.1:8095/health         # {"status":"ok",...}
-#    (build from THIS checkout instead of pulling:)
-#    ./deploy/compose.sh --build-overlay up -d --build
+#    (build from THIS checkout instead of pulling: `--build-overlay build` first, then
+#    the same run and up, each with --build-overlay)
 
 # 4. TLS
 echo "ISLAND_DOMAIN=chat.example.org" > deploy/caddy/.env

@@ -124,12 +124,46 @@ def test_a_fresh_volume_creates_the_island_once_before_up(island) -> None:
     is born (this run created the volume) must make it explicitly, BEFORE `up`, or the
     first start refuses MIGRATE_REFUSE_NO_DATABASE."""
     island.run()
-    calls = _compose_calls(island)
+    calls = [ln for ln in island.calls.read_text().splitlines() if ln.startswith("docker ")]
     births = [i for i, ln in enumerate(calls) if ln.endswith(NEW_ISLAND)]
     ups = [i for i, ln in enumerate(calls) if ln.endswith(" up -d")]
+    pulls = [i for i, ln in enumerate(calls) if ln.endswith(" pull")]
+    creates = [i for i, ln in enumerate(calls) if ln == "docker volume create aiko_data"]
     assert len(births) == 1, f"expected exactly one --new-island, got {calls}"
     assert " run --rm --no-deps " in calls[births[0]]
     assert ups and births[0] < ups[0], "the island must exist before the gateway starts"
+    assert len(creates) == 1 and pulls[0] < creates[0] < births[0], (
+        "the volume is created with the birth, after the image is in hand, never minutes "
+        "before it where a failed pull would strand it unborn")
+
+
+def _docker_failing_on(island, needle: str) -> None:
+    """A docker stub where the call containing `needle` fails (and volume inspect misses)."""
+    _stub(island.root.parent / "bin", "docker", f'''
+echo "docker $*" >> "{island.calls}"
+case "$*" in *"{needle}"*) exit 1 ;; esac
+case "$1 $2" in "volume inspect") exit 1 ;; esac
+exit 0
+''')
+
+
+def test_a_failed_birth_removes_the_volume_it_created(island) -> None:
+    """Otherwise the re-run sees a volume, skips the birth, and the gateway refuses
+    MIGRATE_REFUSE_NO_DATABASE forever (Noether, Carnot, Tesla, PR#405 r1)."""
+    _docker_failing_on(island, "--new-island")
+    r = island.run(expect_ok=False)
+    assert r.returncode != 0
+    calls = island.calls.read_text().splitlines()
+    assert "docker volume rm aiko_data" in calls
+    assert not [ln for ln in calls if ln.endswith(" up -d")]
+    assert "re-run standup" in r.stdout + r.stderr
+
+
+def test_a_failed_pull_creates_no_volume(island) -> None:
+    _docker_failing_on(island, " pull")
+    r = island.run(expect_ok=False)
+    assert r.returncode != 0
+    assert "docker volume create aiko_data" not in island.calls.read_text().splitlines()
 
 
 def test_an_existing_volume_never_creates_an_island(island) -> None:

@@ -195,7 +195,7 @@ def test_adopt_pre_alembic_db_stamps_baseline(tmp_path, monkeypatch) -> None:
 
     # 1. Build a genuine pre-alembic DB AT the baseline schema, then un-manage it.
     migrate._create_empty(tmp_path / "mig.db")  # a new database is made explicitly, never by a connect
-    command.upgrade(migrate._alembic_config(), "0001")
+    command.upgrade(migrate._alembic_config(new_island=True), "0001")
     seed = create_engine(sync_url)
     try:
         with seed.begin() as conn:
@@ -469,7 +469,7 @@ def test_lifespan_refuses_a_db_left_behind_head(tmp_path, monkeypatch) -> None:
     async_url, _ = _point_app_at(tmp_path, monkeypatch)
     from alembic.script import ScriptDirectory
 
-    cfg = migrate._alembic_config()
+    cfg = migrate._alembic_config(new_island=True)  # it builds from nothing: the baseline needs the capability
     script = ScriptDirectory.from_config(cfg)
     one_short = script.get_revision(script.get_current_head()).down_revision
     migrate._create_empty(tmp_path / "mig.db")  # a new database is made explicitly, never by a connect
@@ -507,7 +507,7 @@ def test_adopt_refuses_to_stamp_a_mismatched_db(tmp_path, monkeypatch) -> None:
     async_url, sync_url = _point_app_at(tmp_path, monkeypatch)
 
     migrate._create_empty(tmp_path / "mig.db")  # a new database is made explicitly, never by a connect
-    command.upgrade(migrate._alembic_config(), "0001")  # genuine baseline schema
+    command.upgrade(migrate._alembic_config(new_island=True), "0001")  # genuine baseline schema
     seed = create_engine(sync_url)
     try:
         with seed.begin() as conn:
@@ -547,7 +547,7 @@ def test_0023_backfills_existing_rows_from_the_island_setting(
     monkeypatch.setattr(settings, "apns_use_sandbox", True, raising=False)
 
     migrate._create_empty(tmp_path / "mig.db")  # a new database is made explicitly, never by a connect
-    command.upgrade(migrate._alembic_config(), "0022")  # stop one short: no push_environment yet
+    command.upgrade(migrate._alembic_config(new_island=True), "0022")  # stop one short: no push_environment yet
     engine = create_engine(sync_url)
     try:
         with engine.begin() as conn:
@@ -602,7 +602,7 @@ def test_0024_rename_preserves_the_value_a_live_row_already_carries(
     monkeypatch.setattr(settings, "apns_use_sandbox", True, raising=False)
 
     migrate._create_empty(tmp_path / "mig.db")  # a new database is made explicitly, never by a connect
-    command.upgrade(migrate._alembic_config(), "0022")
+    command.upgrade(migrate._alembic_config(new_island=True), "0022")
     engine = create_engine(sync_url)
     try:
         with engine.begin() as conn:
@@ -722,7 +722,7 @@ def test_the_0025_column_is_wide_enough_for_every_member(tmp_path, monkeypatch) 
     # schema so a revision that passes a different width to sa.String() is caught.
     _async_url, sync_url = _point_app_at(tmp_path, monkeypatch)
     migrate._create_empty(tmp_path / "mig.db")  # a new database is made explicitly, never by a connect
-    command.upgrade(migrate._alembic_config(), "head")
+    command.upgrade(migrate._alembic_config(new_island=True), "head")
     con = sqlite3.connect(sync_url.replace("sqlite:///", ""))
     ddl = con.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='device_tokens'"
@@ -754,7 +754,7 @@ def test_rows_written_at_0024_read_alert_at_0025(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(settings, "apns_use_sandbox", True, raising=False)
 
     migrate._create_empty(tmp_path / "mig.db")  # a new database is made explicitly, never by a connect
-    command.upgrade(migrate._alembic_config(), "0024")  # stop one short
+    command.upgrade(migrate._alembic_config(new_island=True), "0024")  # stop one short
     engine = create_engine(sync_url)
     try:
         with engine.begin() as conn:
@@ -833,7 +833,7 @@ def test_the_migrated_ddl_actually_carries_the_check(tmp_path, monkeypatch) -> N
 
     _async_url, sync_url = _point_app_at(tmp_path, monkeypatch)
     migrate._create_empty(tmp_path / "mig.db")  # a new database is made explicitly, never by a connect
-    command.upgrade(migrate._alembic_config(), "head")
+    command.upgrade(migrate._alembic_config(new_island=True), "head")
 
     con = sqlite3.connect(sync_url.replace("sqlite:///", ""))
     ddl = con.execute(
@@ -968,7 +968,7 @@ def test_downgrading_0025_refuses_while_a_voip_row_exists(tmp_path, monkeypatch)
 
     _async_url, sync_url = _point_app_at(tmp_path, monkeypatch)
     migrate._create_empty(tmp_path / "mig.db")  # a new database is made explicitly, never by a connect
-    command.upgrade(migrate._alembic_config(), "head")
+    command.upgrade(migrate._alembic_config(new_island=True), "head")
     path = sync_url.replace("sqlite:///", "")
 
     # An alert-only DB downgrades cleanly — the expected case, and the control
@@ -1071,7 +1071,7 @@ def test_the_0026_column_is_nullable_with_no_default(tmp_path, monkeypatch) -> N
 
     _async_url, sync_url = _point_app_at(tmp_path, monkeypatch)
     migrate._create_empty(tmp_path / "mig.db")  # a new database is made explicitly, never by a connect
-    command.upgrade(migrate._alembic_config(), "head")
+    command.upgrade(migrate._alembic_config(new_island=True), "head")
 
     engine = create_engine(sync_url, future=True)
     try:
@@ -1108,7 +1108,7 @@ def test_sender_kind_check_literal_matches_the_enum(tmp_path, monkeypatch) -> No
 
     _async_url, sync_url = _point_app_at(tmp_path, monkeypatch)
     migrate._create_empty(tmp_path / "mig.db")  # a new database is made explicitly, never by a connect
-    command.upgrade(migrate._alembic_config(), "head")
+    command.upgrade(migrate._alembic_config(new_island=True), "head")
 
     con = sqlite3.connect(sync_url.replace("sqlite:///", ""))
     ddl = con.execute(
@@ -1200,7 +1200,7 @@ def test_0027_renames_actor_rows_and_then_closes_the_set(tmp_path, monkeypatch) 
 
     _async_url, sync_url = _point_app_at(tmp_path, monkeypatch)
     migrate._create_empty(tmp_path / "mig.db")  # a new database is made explicitly, never by a connect
-    command.upgrade(migrate._alembic_config(), "0026")
+    command.upgrade(migrate._alembic_config(new_island=True), "0026")
 
     engine = create_engine(sync_url)
     # NO community seed here, and NO try/except around the setup. An earlier version
@@ -1335,7 +1335,7 @@ def test_every_in_check_constraint_reached_the_db_and_matches_its_enum(
 
     _async_url, sync_url = _point_app_at(tmp_path, monkeypatch)
     migrate._create_empty(tmp_path / "mig.db")  # a new database is made explicitly, never by a connect
-    command.upgrade(migrate._alembic_config(), "head")
+    command.upgrade(migrate._alembic_config(new_island=True), "head")
     con = sqlite3.connect(sync_url.replace("sqlite:///", ""))
     try:
         ddl_by_table = {
