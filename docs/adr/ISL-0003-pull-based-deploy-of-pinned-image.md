@@ -125,3 +125,28 @@ Two honest limits. The guard lives in `deploy/`, which is the thing that does no
 sync — so a box whose `update.sh` predates it will not run it, and protection starts
 on the deploy *after* the operator syncs `deploy/` once by hand. And `.env` is still
 out of scope: it holds per-box secrets and cannot be compared against a public tag.
+
+### Amended 2026-10-25: CI-built executables may run on a box; toolchains may not
+
+"No compiler on the box" was the rule, and the reason under it is still right: a
+toolchain is an attack surface and a maintenance burden for someone who signed up to
+run a chat server. But the rule was read as "no Dart on the box", which pushed every
+box-side tool into bash, and bash cost real reviewer rounds and real outages (a shared
+`/tmp` path, a file read mid-write, exit codes swallowed by process substitution).
+
+**Nick, 2026-10-25: "no toolchain, executable."** CI compiles `deploy/dart/bin/island.dart`
+for linux arm64 and x64 (`dart compile exe`, cross-compiled from one runner), attests
+both with the same build provenance as the image, and attaches them to the GitHub
+Release. The box downloads the binary for its architecture and runs it. It never holds
+a Dart SDK. The same properties hold as for the image:
+
+- **A known version:** the binary comes from a tagged release, and its SHA256 and
+  provenance are checkable with `gh attestation verify`.
+- **No toolchain on the box:** a self-contained ELF, about 7 MB. Measured: the arm64
+  build ran on syd (Ubuntu, glibc 2.39) with no Dart installed.
+- **No credentials in CI:** the box pulls the binary, exactly as it pulls the image.
+
+The first such tool is `island standup` (a NEW island only; it refuses on a box that
+has one). `deploy/standup.sh` stays as a supported front end for operators who prefer
+bash (Nick: "we can have a bash script for people that love bash"); both perform the
+same birth, and a test pins the two birth scripts byte for byte.

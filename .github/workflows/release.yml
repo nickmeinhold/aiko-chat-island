@@ -291,3 +291,54 @@ jobs:
             echo "::error::the update nudge would not see this release" >&2
             exit 1
           }
+
+  # The operator's `island` tool, as an EXECUTABLE (ISL-0003 amended 2026-10-25: CI-built
+  # executables may run on a box; toolchains may not). Built from deploy/dart, attested the
+  # same way the image is, and attached to the Release the box downloads from. Dart cross-
+  # compiles both arches from one runner (measured: macOS -> linux arm64 ran on syd).
+  island-binaries:
+    needs: publish-release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write       # attach assets to the Release
+      id-token: write       # sign the provenance
+      attestations: write   # file the bundle against this repo
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: '3.13.0' # pinned, as in ci.yml
+      - run: dart pub get
+        working-directory: deploy/dart
+      - name: Compile island for linux arm64 + x64
+        working-directory: deploy/dart
+        run: |
+          mkdir -p ../../dist
+          for arch in arm64 x64; do
+            dart compile exe --target-os linux --target-arch "$arch" bin/island.dart \
+              -o "../../dist/island-linux-$arch"
+          done
+          (cd ../../dist && sha256sum island-linux-* > SHA256SUMS && cat SHA256SUMS)
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: 'dist/island-linux-*'
+      - name: Attach to the Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${GITHUB_REF_NAME}" dist/island-linux-arm64 dist/island-linux-x64 \
+            dist/SHA256SUMS --repo "${{ github.repository }}"
+      # MUST-FAIL ARM: prove what an operator would DOWNLOAD verifies, not that the
+      # upload step exited 0. Fetch each asset back from the Release and verify it.
+      - name: Verify the published binaries
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p /tmp/check && cd /tmp/check
+          gh release download "${GITHUB_REF_NAME}" --repo "${{ github.repository }}" \
+            --pattern 'island-linux-*' --pattern SHA256SUMS
+          sha256sum -c SHA256SUMS
+          for f in island-linux-arm64 island-linux-x64; do
+            gh attestation verify "$f" --repo "${{ github.repository }}"
+          done
