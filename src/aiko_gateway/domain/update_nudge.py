@@ -112,8 +112,9 @@ def render_nudge(current: str, latest: str, url: str) -> str:
     act on is noise — and `update.sh` is the only supported path."""
     return (
         f"a newer island release is available: {latest} (this island runs {current}). "
-        f"Release notes: {url} — to take it, bump ISLAND_VERSION in .env to "
-        f"{latest.lstrip('v')} and run deploy/update.sh. This island will NOT update "
+        f"Release notes: {url} — to take it, set image.env to "
+        f"ISLAND_IMAGE=ghcr.io/nickmeinhold/aiko-chat-island:{latest.lstrip('v')} "
+        f"and run deploy/update.sh. This island will NOT update "
         f"itself. Set ISLAND_UPDATE_NUDGE=off to stop this check.")
 
 

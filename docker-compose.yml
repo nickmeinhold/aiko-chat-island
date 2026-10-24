@@ -25,8 +25,10 @@
 #     override: the gateway (default entrypoint), the registrar (`aiko_registrar`),
 #     and the ChatServer (`chat_start.sh`). It is published multi-arch (amd64 +
 #     arm64) at ghcr.io/nickmeinhold/aiko-chat-island by CI on every push/tag, so a
-#     new island just PULLS it — nothing to build on the host. Pin a version with
-#     ISLAND_VERSION (default `edge`, which tracks main). To build from source
+#     new island just PULLS it — nothing to build on the host. The image is pinned
+#     in image.env (ISLAND_IMAGE=<full ref>), NOT .env, and there is no default: run
+#     compose through deploy/compose.sh, which passes both files (claude-tasks#5165).
+#     To build from source
 #     instead, overlay docker-compose.build.yml (see that file). The old
 #     aiko-bridge image is gone: aiko-chat-bridge is the Matrix bridge, which an
 #     island does not run.
@@ -44,8 +46,8 @@ name: aiko
 services:
   chat-island:
     # Published multi-arch by CI; pull, don't build (build-from-source overlay:
-    # docker-compose.build.yml). ISLAND_VERSION pins the tag (default: edge=main).
-    image: ghcr.io/nickmeinhold/aiko-chat-island:${ISLAND_VERSION:-edge}
+    # docker-compose.build.yml). ISLAND_IMAGE (image.env) pins it; unset refuses.
+    image: "${ISLAND_IMAGE:?ISLAND_IMAGE is unset - the pin lives in image.env; run deploy/compose.sh, not bare docker compose}"
     restart: always
     # Reachable by Caddy on the host loopback; never exposed off-host directly.
     ports:
@@ -331,7 +333,7 @@ services:
       - mosquitto_data:/mosquitto/data
 
   registrar:
-    image: ghcr.io/nickmeinhold/aiko-chat-island:${ISLAND_VERSION:-edge}
+    image: "${ISLAND_IMAGE:?ISLAND_IMAGE is unset - the pin lives in image.env; run deploy/compose.sh, not bare docker compose}"
     restart: always
     # The image bakes a gateway HEALTHCHECK (curl /health :8095). This role serves
     # no HTTP, so that check fails forever and shows "unhealthy". Disable it — the
@@ -346,7 +348,7 @@ services:
       - mosquitto
 
   chat:
-    image: ghcr.io/nickmeinhold/aiko-chat-island:${ISLAND_VERSION:-edge}
+    image: "${ISLAND_IMAGE:?ISLAND_IMAGE is unset - the pin lives in image.env; run deploy/compose.sh, not bare docker compose}"
     restart: always
     # Same as registrar: this role serves no HTTP, so the image's baked gateway
     # HEALTHCHECK would fail forever. Disable it.

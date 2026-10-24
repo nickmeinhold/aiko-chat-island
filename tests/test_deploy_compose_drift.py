@@ -1024,29 +1024,24 @@ def test_a_DANGLING_root_compose_symlink_is_refused_not_called_absent(tmp_path) 
     )
 
 
-def test_update_sh_resolves_the_ref_THE_WAY_COMPOSE_DOES() -> None:
-    """THE SELECTOR AND THE PULL MUST BE ONE COIL (Tesla, cage-match round 5).
+def test_update_sh_takes_the_ref_FROM_COMPOSE_not_beside_it() -> None:
+    """THE SELECTOR AND THE PULL ARE ONE RESOLUTION (claude-tasks#5165).
 
-    Measured on the live box: `docker compose config` prefers the SHELL
-    ENVIRONMENT over `.env` — an exported variable beat the .env value outright.
-    Reading only `.env` meant an exported ISLAND_VERSION (direnv, a systemd
-    `Environment=`, a leftover export, or update.sh's own documented
-    `ISLAND_VERSION=v0.1.0 deploy/update.sh` pin path) made the guard fetch and
-    bless one tag while `docker compose pull` interpolated a different one.
-
-    New image, old compose, a printed clean comparison: the 2026-09-11 outage
-    wearing the interlock's own clothes.
-
-    A pin rather than a behavioural test — update.sh needs docker and a running
-    island — read against comment-stripped source, because the prose above the
-    code says the same words the code does."""
+    Round 5 (Tesla) found the guard's own reader resolving a different tag than
+    `docker compose pull` (shell env beats .env), and the fix ordered the reader
+    to match. Round 8 (Carnot) then needed a crude-grep cross-check on that
+    reader. Both were second opinions about compose. The ref now comes from
+    `config --images` through the same island_compose the pull uses, so there is
+    no opinion left to disagree. Pinned against comment-stripped source; the
+    behaviour of the parser itself is driven in tests/test_island_compose.py."""
     code = _update_sh_code()
-    env_first = code.index('drift_ref="${ISLAND_VERSION:-}"')
-    dotenv_next = code.index('dotenv_read "$REPO_ROOT/.env" ISLAND_VERSION')
-    assert env_first < dotenv_next, (
-        "the exported ISLAND_VERSION must be consulted BEFORE .env, because that "
-        "is the order compose itself resolves them in"
-    )
+    ask = code.index("$COMPOSE config --images")
+    parse = code.index("island_ref_from_images")
+    guard = code.index('"$SCRIPT_DIR/preflight-compose-drift.sh" "$REPO_ROOT" "$drift_ref"')
+    assert ask < parse < guard, (
+        "the ref handed to the guard must be parsed from compose's own resolution")
+    assert 'COMPOSE="island_compose"' in code, (
+        "update.sh must resolve and pull through the ONE shared compose invocation")
 
 
 def test_the_seam_list_matches_what_the_guard_actually_reads() -> None:
@@ -1072,8 +1067,8 @@ def test_the_seam_list_matches_what_the_guard_actually_reads() -> None:
     # in a defaulting position — not ones it merely assigns.
     read_vars = set(re.findall(r'\$\{(ISLAND_[A-Z_]+)(?::-|:\+|\})', code))
     read_vars |= set(re.findall(r'\[ -n "\$\{(ISLAND_[A-Z_]+):-\}"', code))
-    # ISLAND_VERSION is resolved by update.sh and passed in as an argument; the
-    # guard itself never reads it, so it is not expected here.
+    # The image ref is resolved by update.sh (from `config --images`) and passed in as
+    # an argument; the guard itself never reads it, so it is not expected here.
     unhandled = read_vars - set(SEAMS)
     assert not unhandled, (
         f"the guard reads ambient variable(s) {sorted(unhandled)} that are not in "
@@ -1229,13 +1224,18 @@ def test_update_sh_PINS_the_compose_file_on_every_invocation() -> None:
     invocation in update.sh may be unpinned. A future edit adding a bare
     `docker compose` re-opens every one of those windows at once."""
     code = _update_sh_code()
-    assert 'COMPOSE="$DOCKER compose -f docker-compose.yml"' in code, (
-        "update.sh must define a pinned compose invocation"
+    # Since claude-tasks#5165 the pinned invocation lives in deploy/lib/island-compose.sh,
+    # shared with deploy/compose.sh, and passes the env files as well as the file.
+    assert 'COMPOSE="island_compose"' in code, (
+        "update.sh must route compose through the shared pinned invocation"
     )
-    # The property is "no compose invocation WITHOUT an explicit -f", not
-    # "everything literally uses $COMPOSE": the --from-source path pins two
-    # files by hand (`-f docker-compose.yml -f docker-compose.build.yml`) and is
-    # equally deterministic. `compose version` takes no files at all. Writing
+    lib = "\n".join(ln for ln in (REPO / "deploy" / "lib" / "island-compose.sh")
+                    .read_text().splitlines() if not ln.lstrip().startswith("#"))
+    assert 'local files=(-f "${ISLAND_ROOT:?}/docker-compose.yml")' in lib, (
+        "island_compose must pin docker-compose.yml"
+    )
+    # The property is "no compose invocation WITHOUT the pin", not "everything
+    # literally uses $COMPOSE". `compose version` takes no files at all. Writing
     # the assertion as the property rather than as the idiom keeps it from
     # flagging a correct line — a check that fires on something harmless gets
     # relaxed, and a relaxed check stops catching the thing it was for.
@@ -1349,41 +1349,18 @@ def test_a_corrupt_archive_reports_WHY(tmp_path) -> None:
     )
 
 
-def test_update_sh_CROSS_CHECKS_the_dotenv_helper_it_depends_on() -> None:
-    """THE BOOTSTRAP CIRCULARITY (Carnot, cage-match round 8) — and a rejection
-    of mine that measurement overturned.
+def test_update_sh_has_NO_edge_fallback_for_a_missing_pin() -> None:
+    """THE SILENCE THE CROSS-CHECK EXISTED FOR IS GONE (claude-tasks#5165).
 
-    update.sh resolves which ref to certify by sourcing
-    `deploy/lib/dotenv-read.sh`, a file INSIDE the surface the guard then
-    certifies. My first response was that the failure direction is closed: a
-    broken helper returns empty, `drift_ref` falls back to `edge`, the box is
-    compared against main, and main differs so it refuses.
-
-    MEASURED ON THE LIVE BOX, THAT WAS FALSE. box-vs-main exits 0 today, because
-    main's deploy tree currently equals v0.11.0's. So a broken helper would have
-    the guard print a clean comparison for a ref the deploy will not use, with
-    no alarm anywhere — the collapse arriving through the bootstrap rather than
-    through a code path. Worth recording that arguing would have shipped it and
-    one ssh command did not.
-
-    The cross-check is deliberately a CRUDE grep rather than a second parser
-    (#3592 exists because this repo already had four): it shares no grammar with
-    the helper, so it fails differently, and it answers only "does .env mention
-    this key at all". Absence stays legitimate — an unpinned box tracks `edge`.
-    A key visibly present and unreadable does not."""
+    Round 8's crude-grep cross-check existed because a broken dotenv helper read
+    as "unpinned", which fell back to `edge`. There is no helper read and no
+    fallback any more: an unset pin refuses inside compose (`${ISLAND_IMAGE:?}`).
+    This pins that the fallback did not come back, which is the hazard, rather
+    than the cross-check, which was only its guard."""
     code = _update_sh_code()
-    assert "ISLAND_VERSION[[:space:]]*=" in code, (
-        "update.sh must cross-check the dotenv helper against a different "
-        "instrument before trusting its silence"
-    )
-    # The check must sit between the helper read and the `edge` fallback, or it
-    # cannot distinguish "absent" from "unreadable".
-    helper = code.index('dotenv_read "$REPO_ROOT/.env" ISLAND_VERSION')
-    crosscheck = code.index("ISLAND_VERSION[[:space:]]*=")
-    fallback = code.index('drift_ref="edge"')
-    assert helper < crosscheck < fallback, (
-        "the cross-check must run after the helper and before the edge fallback"
-    )
+    assert 'drift_ref="edge"' not in code and ":-edge" not in code, (
+        "a missing pin must refuse, never resolve to `edge` (tracks main)")
+    assert "island_require_image_env" in code
 
 
 def test_a_BROKEN_cat_cannot_hide_a_real_drift(tmp_path) -> None:
@@ -1518,3 +1495,17 @@ def test_a_ref_tree_whose_deploy_IS_EMPTY_is_CANNOT_LOOK(tmp_path) -> None:
         + result.stderr
     )
     assert "carries NONE" in result.stderr, result.stderr
+
+
+def test_update_sh_REFUSES_an_exported_pin_rather_than_ignoring_it() -> None:
+    """`ISLAND_VERSION=v0.1.0 deploy/update.sh` was this script's documented pin path.
+    island_compose now strips both names from the environment, so that habit would
+    silently deploy image.env's release instead. A habit that does nothing must say
+    so: update.sh refuses, before anything else runs, if either is exported."""
+    code = _update_sh_code()
+    loop = code.index("for _v in ISLAND_VERSION ISLAND_IMAGE; do")
+    check = code.index('if [ -n "${!_v+set}" ]; then', loop)
+    refuse = code.index("die ", check)
+    first_compose = code.index("$COMPOSE ps")
+    assert loop < check < refuse < first_compose, (
+        "the exported-pin refusal must run before the first compose call")

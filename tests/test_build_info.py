@@ -1,7 +1,7 @@
 """Build provenance — an island can say what code it is running (#3792 sibling).
 
-THE STATE THIS EXISTS FOR. `ISLAND_VERSION` lives only in the box's compose
-environment; it is never read by the application and never surfaced. So nothing
+THE STATE THIS EXISTS FOR. The image pin (`ISLAND_IMAGE`; `ISLAND_VERSION` before
+claude-tasks#5165) lives only in the box's compose environment; it is never read by the application and never surfaced. So nothing
 served by a running island — not `/health`, not the signed manifest, not
 `/v1/islands` — names the code inside it. "Which version is actually on that box"
 has only ever been answerable by SSHing to the box and reading a file that the

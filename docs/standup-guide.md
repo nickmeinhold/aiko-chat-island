@@ -155,7 +155,7 @@ curl -s https://chat.example.org/.well-known/assetlinks.json | jq   # non-empty 
 
 # 2. advertise passkey sign-in:
 ./deploy/standup.sh --domain chat.example.org --name "Example Island" --enable-passkeys
-# (equivalently: set PASSKEY_ENABLED=true in .env and `docker compose up -d --build`)
+# (equivalently: set PASSKEY_ENABLED=true in .env and `deploy/compose.sh up -d`)
 #
 # Note this re-run does NOT repeat --seed-peers, and does not need to: a re-run
 # preserves the federation peers and the passkey setting this island already
@@ -165,7 +165,7 @@ curl -s https://chat.example.org/.well-known/assetlinks.json | jq   # non-empty 
 # is not "off", it means "leave it as recorded".
 #
 # A re-run REFUSES if .env holds keys standup does not itself write (a signing seed, APNs
-# credentials, MODERATOR_USER_IDS, ISLAND_VERSION…). The rewrite is a whole-file replace,
+# credentials, MODERATOR_USER_IDS, a pre-#5165 ISLAND_VERSION…). The rewrite is a whole-file replace,
 # so those keys would be destroyed — several of them unrecoverably. The refusal names
 # every key at risk and leaves .env untouched.
 #
@@ -205,15 +205,17 @@ and the restore path are in [`runbooks/backup-and-rollback.md`](runbooks/backup-
 # than proceeding if .env holds keys standup does not write (see the note above):
 ./deploy/standup.sh --domain chat.example.org --name "New Name" --seed-peers '[…]'
 
-# pin a specific version instead of tracking `edge` (main):
-ISLAND_VERSION=v0.1.0 ./deploy/update.sh        # or set ISLAND_VERSION in .env
+# pin a specific release (the pin lives in image.env, never .env; an exported
+# ISLAND_VERSION or ISLAND_IMAGE is refused, not honoured):
+printf 'ISLAND_IMAGE=ghcr.io/nickmeinhold/aiko-chat-island:%s\n' 0.17.1 > image.env
+./deploy/update.sh
 
 # stop the island (data volume survives — `down` without -v keeps volumes):
-docker compose down
+./deploy/compose.sh down
 docker compose -f deploy/caddy/docker-compose.caddy.yml down
 
 # nuke everything INCLUDING data (irreversible — back up first):
-docker compose down && docker volume rm aiko_data
+./deploy/compose.sh down && docker volume rm aiko_data
 ```
 
 `update.sh` is the recommended update path: it hot-copies the sole-copy SQLite
@@ -247,12 +249,15 @@ PASSKEY_ENABLED=false
 EOF
 chmod 600 .env
 
+# 2b. pin the image (its own file, never .env: compose refuses without it)
+printf 'ISLAND_IMAGE=ghcr.io/nickmeinhold/aiko-chat-island:%s\n' 0.17.1 > image.env
+
 # 3. pull the official image + bring up the island (migrates then serves).
 #    All four containers run from this one image (bar stock mosquitto).
-docker compose pull && docker compose up -d
+./deploy/compose.sh pull && ./deploy/compose.sh up -d
 curl -s http://127.0.0.1:8095/health         # {"status":"ok",...}
 #    (build from THIS checkout instead of pulling:)
-#    docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+#    ./deploy/compose.sh --build-overlay up -d --build
 
 # 4. TLS
 echo "ISLAND_DOMAIN=chat.example.org" > deploy/caddy/.env
@@ -274,7 +279,7 @@ Two ways to hear about one, and they are complementary:
    press **Watch → Custom → Releases**. GitHub emails you. This works even when your
    island is down, and it is the one to set up first.
 2. **The island tells you.** It checks the release list and logs a line when a newer
-   release exists. Read it with `docker compose logs chat-island | grep -i "newer island release"`.
+   release exists. Read it with `./deploy/compose.sh logs chat-island | grep -i "newer island release"`.
 
 `ISLAND_UPDATE_NUDGE` in your `.env` chooses how much you hear about:
 
@@ -294,7 +299,7 @@ an event, so `off` is a real supported choice and not a debug flag.
 
 ```sh
 # in your island directory
-sed -i.bak 's/^ISLAND_VERSION=.*/ISLAND_VERSION=X.Y.Z/' .env   # the version WITHOUT the leading v
+printf 'ISLAND_IMAGE=ghcr.io/nickmeinhold/aiko-chat-island:%s\n' X.Y.Z > image.env   # WITHOUT the leading v
 ./deploy/update.sh --yes
 ```
 
@@ -349,9 +354,10 @@ command against it; a 404 is the answer.
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | `JWT_SECRET required` at boot | `.env` missing or secret too short | the script generates one; if hand-writing, use `openssl rand -hex 32` |
-| Container restarts / `/health` never answers | migration failed, or bad config | `docker compose logs chat-island` — the entrypoint migrates before serving and fails closed |
+| Container restarts / `/health` never answers | migration failed, or bad config | `./deploy/compose.sh logs chat-island` — the entrypoint migrates before serving and fails closed |
 | HTTPS never comes up | DNS not pointing here yet, or 80/443 blocked | confirm `getent hosts chat.example.org` = this host's IP; open 80+443 in the cloud SG **and** on-box firewall; `docker compose -f deploy/caddy/docker-compose.caddy.yml logs` |
-| image pull fails / `manifest unknown` | wrong/absent `ISLAND_VERSION` tag | default is `edge`; pin a real tag (`ISLAND_VERSION=v0.1.0`) or build locally with `--from-source` |
+| image pull fails / `manifest unknown` | wrong tag in `image.env` | pin a real release, without the leading `v` (`ISLAND_IMAGE=ghcr.io/nickmeinhold/aiko-chat-island:0.17.1`), or build locally with `--from-source` |
+| `required variable ISLAND_IMAGE is missing a value` | a bare `docker compose`, or no `image.env` | run `./deploy/compose.sh …` instead; it passes `image.env`. Create that file if it is missing |
 | App picker doesn't show my island | seed peers not mutual | the *other* island's operator must add your entry too |
 | Passkey sign-in starts then dies | advertised before well-known files valid | set `PASSKEY_ENABLED=false`, fix `/.well-known`, re-verify, re-enable |
 

@@ -55,7 +55,8 @@ ref="${2:?usage: preflight-compose-drift.sh <repo-root> <ref>}"
 repo_root="$(cd "$repo_root" && pwd)"
 
 # NORMALISE HERE, NOT AT THE CALL SITE (Tesla, cage-match round 2). Both live
-# boxes' .env reads `ISLAND_VERSION=0.11.0` while the git tag is `v0.11.0` — the
+# boxes pin the bare form (`…:0.11.0` then, in `.env`; `…:0.17.1` now, in
+# image.env since claude-tasks#5165) while the git tag is `v0.11.0` — the
 # image registry accepts the bare form, git does not. That rewrite is on the path
 # of EVERY real deploy, and inline in update.sh it could not be driven by a test:
 # delete the arm and every deploy 404s into "could not look", or worse, a later
@@ -188,8 +189,8 @@ materialise_ref() {
   fi
   case "$code" in
     200) : ;;
-    404) die "$slug has no ref '$ref' (looked at $path). Check ISLAND_VERSION in .env —
-     it is the tag this deploy will pull, and a typo here means a typo there." ;;
+    404) die "$slug has no ref '$ref' (looked at $path). Check ISLAND_IMAGE in image.env —
+     it is the image this deploy will pull, and a typo here means a typo there." ;;
     *)   die "$codeload answered HTTP $code for $ref. Nothing was compared." ;;
   esac
 

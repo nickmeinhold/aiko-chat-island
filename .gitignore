@@ -2,6 +2,8 @@
 __pycache__/
 *.pyc
 .env
+# the box-local image pin (claude-tasks#5165): the operator's, never the repo's
+image.env
 spike/work/
 spike/logs/
 spike/devwork/

@@ -18,8 +18,10 @@
 #   deploy/update.sh --yes           # non-interactive (no confirm prompt)
 #   deploy/update.sh --skip-drift-check  # deploy despite a drifted deploy tree (LOUD)
 #
-# Pin a version by exporting ISLAND_VERSION (e.g. ISLAND_VERSION=v0.1.0) or setting
-# it in .env; default is `edge` (tracks main).
+# The image is pinned in image.env beside docker-compose.yml, one full reference:
+#   ISLAND_IMAGE=ghcr.io/nickmeinhold/aiko-chat-island:0.17.1
+# To take a release, edit that line and run this script. There is no default: a
+# missing pin refuses rather than tracking main (claude-tasks#5165).
 
 set -euo pipefail
 
@@ -48,20 +50,12 @@ done
 
 command -v docker >/dev/null 2>&1 || die "missing required tool: docker"
 
-# Elevation autodetect: some island hosts run the deploy user OUTSIDE the docker
-# group (enspyr/nick-mel: user 'ubuntu' needs `sudo -n docker`), while others are
-# in-group (imagineering: bare docker works). Probe once and route every docker
-# call through $DOCKER so this script runs natively on BOTH without a manual shim.
-# `sudo -n` is non-interactive: if elevation is needed but passwordless sudo isn't
-# configured, fail closed with a clear message rather than a cryptic permission error.
-DOCKER="docker"
-if ! docker ps >/dev/null 2>&1; then
-  if sudo -n docker ps >/dev/null 2>&1; then
-    DOCKER="sudo -n docker"
-  else
-    die "docker needs elevation on this host but 'sudo -n docker' failed — add the deploy user to the 'docker' group, or configure passwordless sudo for docker"
-  fi
-fi
+# Elevation autodetect and the one compose invocation live in a sourced lib, shared
+# with deploy/compose.sh (the operator's hand path), so the two cannot drift.
+ISLAND_ROOT="$REPO_ROOT"
+# shellcheck source=lib/island-compose.sh
+. "$SCRIPT_DIR/lib/island-compose.sh"
+island_docker_detect || die "cannot run docker (see above)"
 
 $DOCKER compose version >/dev/null 2>&1 || die "docker compose v2 not available"
 
@@ -87,7 +81,25 @@ $DOCKER compose version >/dev/null 2>&1 || die "docker compose v2 not available"
 # COMPOSE_FILE (checked), so the resolved config is byte-identical to a bare
 # invocation. The guard still WARNS if any such file appears, because a human
 # typing `docker compose` by hand here would still get it.
-COMPOSE="$DOCKER compose -f docker-compose.yml"
+#
+# The pin is in image.env, not .env (claude-tasks#5165), and island_compose passes
+# both. See deploy/lib/island-compose.sh for why a bare call now refuses.
+COMPOSE="island_compose"
+island_require_image_env || die "no image pin (see above) — nothing was changed"
+if LC_ALL=C grep -aqE '^[[:space:]]*(export[[:space:]]+)?ISLAND_VERSION[[:space:]]*=' "$REPO_ROOT/.env" 2>/dev/null; then
+  warn ".env still carries an ISLAND_VERSION line. It is IGNORED: the image comes
+     from image.env. Remove it at the next SOPS re-lift so nobody edits it expecting
+     an effect."
+fi
+# The old documented pin path was `ISLAND_VERSION=v0.1.0 deploy/update.sh`. island_compose
+# strips both names from the environment, so such an export now does nothing, and a
+# habit that does nothing must say so rather than deploy image.env's release unasked.
+for _v in ISLAND_VERSION ISLAND_IMAGE; do
+  if [ -n "${!_v+set}" ]; then
+    die "$_v is set in this shell's environment. It is ignored: the image comes only
+     from image.env. Unset it (or edit image.env instead) and re-run."
+  fi
+done
 
 # The island must actually be running (this is an UPDATE, not a first standup).
 $COMPOSE ps --status running --services 2>/dev/null | grep -qx chat-island \
@@ -163,59 +175,26 @@ elif [ "$DRIFT_CHECK" != "true" ]; then
 elif [ -f "$SCRIPT_DIR/preflight-compose-drift.sh" ]; then
   [ -x "$SCRIPT_DIR/preflight-compose-drift.sh" ] \
     || die "preflight-compose-drift.sh exists but is not executable — refusing to deploy with a disabled safety check. chmod +x it."
-  # The ref to compare against is the one compose will actually interpolate, read
-  # through the single dotenv reader rather than a fifth grep (deploy/lib). An
-  # unset ISLAND_VERSION means `edge`, which is this script's own documented
-  # default and tracks main.
-  # shellcheck source=lib/dotenv-read.sh
-  . "$SCRIPT_DIR/lib/dotenv-read.sh"
-  # THE SELECTOR MUST RESOLVE THE WAY COMPOSE RESOLVES IT (Tesla, cage-match
-  # round 5). Measured on the live box: `docker compose config` prefers the SHELL
-  # ENVIRONMENT over `.env` — an exported TAGVAR beat the .env value outright.
-  # Reading only `.env`, as this did, means an exported ISLAND_VERSION (direnv, a
-  # systemd `Environment=`, a leftover export, or this script's own documented
-  # `ISLAND_VERSION=v0.1.0 deploy/update.sh` pin path) makes the guard fetch and
-  # bless one tag while `docker compose pull` interpolates a DIFFERENT one.
+  # THE REF IS ASKED OF COMPOSE, NOT RE-DERIVED BESIDE IT (claude-tasks#5165).
   #
-  # That is the 2026-09-11 outage wearing the interlock's own clothes: new image,
-  # old compose, a printed clean comparison, and an island that serves until it
-  # does not. The comment here used to claim this was "the ref compose will
-  # actually interpolate" — it was not, which is prose overclaiming the code
-  # inside the guard written to stop prose from governing deploys.
+  # This used to resolve the pin with its own reader: the shell environment first
+  # (Tesla, round 5: compose prefers it over .env), then .env through the dotenv
+  # helper, a crude-grep cross-check in case the helper was broken (Carnot, round 8),
+  # and finally the `edge` default. Every one of those steps was a second opinion
+  # about what compose would interpolate, and each round found a way for the opinion
+  # and the pull to disagree.
   #
-  # And note which class this belongs to: ISLAND_VERSION is the PRODUCTION member
-  # of the ambient-input family whose three TEST members were swept two rounds
-  # ago. The class was named and one instance was left live.
-  drift_ref="${ISLAND_VERSION:-}"
-  [ -n "$drift_ref" ] || drift_ref="$(dotenv_read "$REPO_ROOT/.env" ISLAND_VERSION)"
-
-  # A POSITIVE CONTROL ON THE HELPER, WITH A DIFFERENT INSTRUMENT (Carnot,
-  # cage-match round 8), and the reason it exists is that my first answer to the
-  # finding was wrong.
-  #
-  # The circularity Carnot named is real: this resolves the ref by sourcing
-  # deploy/lib/dotenv-read.sh, a file INSIDE the surface the guard is about to
-  # certify. I assumed the failure direction was closed — a broken helper returns
-  # empty, drift_ref falls back to `edge`, the box gets compared against main and
-  # refuses. MEASURED on the live box, that assumption is FALSE: box-vs-main
-  # exits 0 today, because main's deploy tree happens to equal v0.11.0's. So a
-  # broken helper would have the guard print a clean comparison for a ref it is
-  # NOT deploying, silently — exactly the epistemic collapse the exit codes exist
-  # to prevent, arriving through the bootstrap instead of through a code path.
-  #
-  # The check is a DELIBERATELY CRUDE grep, not a second parser. It shares no
-  # grammar with the helper, so it fails differently: it answers only "does .env
-  # mention this key at all", and a disagreement between the two means the helper
-  # is broken rather than the key absent. Absence is legitimate (an unpinned box
-  # tracks `edge`); a key that is visibly THERE and unreadable is not.
-  if [ -z "$drift_ref" ] && [ -f "$REPO_ROOT/.env" ] \
-     && LC_ALL=C grep -aqE '^[[:space:]]*(export[[:space:]]+)?ISLAND_VERSION[[:space:]]*=' "$REPO_ROOT/.env"; then
-    die "'.env' contains an ISLAND_VERSION line but the dotenv helper read nothing
-     from it — deploy/lib/dotenv-read.sh is broken or stale. Falling back to 'edge'
-     here would compare this box against main and could print CLEAN for a ref this
-     deploy will not use. Refusing instead. Refresh deploy/ from the tag."
-  fi
-  [ -n "$drift_ref" ] || drift_ref="edge"
+  # `config --images` is not an opinion: it is the resolution `pull` and `up` use,
+  # through the same island_compose (same files, same env files, same `env -u`). So
+  # the ref the guard certifies and the image the deploy pulls are one value by
+  # construction. The `edge` fallback is gone with the reader: an unset pin now
+  # refuses in compose itself (`${ISLAND_IMAGE:?}`), so there is no silence left for
+  # a cross-check to tell apart from absence.
+  images="$($COMPOSE config --images)" \
+    || die "compose could not resolve this island's images (see above) — nothing was changed"
+  drift_ref="$(printf '%s\n' "$images" | island_ref_from_images)" \
+    || die "cannot tell which release to compare this box against (see above). To
+     deploy anyway, deliberately: deploy/update.sh --skip-drift-check"
   # The bare-version -> tag rewrite (`0.11.0` -> `v0.11.0`, which both live boxes
   # need) lives INSIDE the guard now, where a test can drive it — it used to sit
   # here, on the path of every real deploy, untestable (Tesla, cage-match round 2).
@@ -322,7 +301,7 @@ fi
 # --- step 2: update the image + recreate ------------------------------------
 if [ "$FROM_SOURCE" = "true" ]; then
   log "Step 2/3 — building the island image from source + recreating"
-  $DOCKER compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+  $COMPOSE --build-overlay up -d --build
 else
   log "Step 2/3 — pulling the latest published image + recreating"
   $COMPOSE pull
@@ -355,5 +334,5 @@ for _ in $(seq 1 30); do
   fi
   sleep 2
 done
-die "gateway did not answer /health within ~60s after update. Inspect: docker compose logs chat-island
+die "gateway did not answer /health within ~60s after update. Inspect: deploy/compose.sh logs chat-island
      (restore path: the pre-update backup is in backups/ — see docs/runbooks/backup-and-rollback.md)"
