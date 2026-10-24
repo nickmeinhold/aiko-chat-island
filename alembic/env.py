@@ -47,7 +47,7 @@ config = context.config
 # open_only: alembic is a door to the database too, and a hand-run `alembic upgrade
 # head` against a lost aiko.db must fail, not build a new, empty island in its place.
 # The gateway never creates a database: an island is born when standup copies the
-# image's seed (built by scripts/build_seed.py at `docker build`) into an empty /data.
+# image's seed (built by scripts/build_seed.py at `docker build`) into a new volume.
 config.set_main_option("sqlalchemy.url", open_only(settings.db_url).replace("%", "%%"))
 
 if config.config_file_name is not None:

@@ -5,10 +5,11 @@
 > `docs/design-20-v5-ceremony-record`) DETECTS the moment a lost database would come
 > back as a new, empty island. The replacement removes the code that did it: no door
 > to the database can create one (SQLite `mode=rw`, through
-> `worker_guard.open_only`), and `python -m aiko_gateway.migrate --new-island` is the
-> only way an island is born. Nothing creates, so there's nothing to detect. Four
-> review rounds and a design temper all hardened the detection frame, and none
-> questioned it. The record of that is kept here and in `20-TEMPER.md` on purpose. Nick
+> `worker_guard.open_only`), and the gateway has no create path at all: an island is
+> born only when standup copies the image's seed into a volume it just created (an
+> earlier revision of PR #405 used a `--new-island` flag; Nick removed it 2026-10-25).
+> Nothing creates, so there's nothing to detect. Four review rounds and a design
+> temper all hardened the detection frame, and none questioned it. The record of that is kept here and in `20-TEMPER.md` on purpose. Nick
 > 2026-10-24: *"can't we just make it impossible to do? what's with all this
 > checking?"*
 

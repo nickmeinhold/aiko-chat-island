@@ -3,9 +3,10 @@
 The ONLY code that builds an island from nothing, and it is not part of the gateway:
 it lives outside the package, ``docker build`` runs it once into an image layer
 (``/app/seed/aiko.db``) and then deletes it, so nothing that starts, migrates or serves
-an island can reach it. An island is born when standup copies that seed into a ``/data``
-that is completely empty (Nick, 2026-10-25: "the standup executable does it"). Tests
-import ``build`` to make the databases they start from.
+an island can reach it. An island is born when standup copies that seed into a volume it
+can prove it just created (Nick, 2026-10-25: "the standup executable does it"). Tests
+import ``build`` to make the databases they start from. A dev database with no file
+(Postgres) is built in place: create the empty database first, then run this against it.
 
 The file is created with ``O_EXCL | O_NOFOLLOW`` on the path AS GIVEN: anything already
 there (a database, a 0-byte file, a symlink, dangling or not) refuses, so even at build
@@ -38,14 +39,15 @@ def create_empty(db: Path) -> None:
     os.close(fd)
 
 
-def build(revision: str = "head") -> Path:
+def build(revision: str = "head") -> Path | None:
     """Create ``settings.db_url``'s file and build an empty island in it, to
     ``revision``. Reads the same setting as every other door, so the file it makes is
-    the file they open."""
+    the file they open. A URL with no file (a Postgres dev database) has nothing to
+    create here: the schema is built into that existing database, and the baseline
+    migration itself fails if it already holds the tables (Noether, PR#405 r1)."""
     db = sqlite_file(settings.db_url, follow_symlinks=False)
-    if db is None:
-        raise RuntimeError(f"SEED_REFUSE_NO_FILE: {settings.db_url} names no SQLite file.")
-    create_empty(db)
+    if db is not None:
+        create_empty(db)
     command.upgrade(migrate._alembic_config(seed_build=True), revision)
     return db
 

@@ -86,7 +86,7 @@ by hand (see [Manual standup](#manual-standup-no-script)).
 | Preflight | check tools + DNS | fail early, not halfway through |
 | 1 | check for `aiko_data` | no volume = this run gives birth to the island. The volume itself is created in step 3, together with the database, so a failure in between can't strand an empty one. The SQLite store's home is declared `external` in compose (decoupled from the project name so a rename never empties it) |
 | 2 | write `.env` | island identity (domain, display name, peers) + a **generated ≥32-char JWT secret**. `ENVIRONMENT` is left unset on purpose — absence means *production*, which fail-closes the boot unless a strong secret is present |
-| 3 | `pull`, then (new island only) `docker volume create aiko_data` + copy the image's seed into it, then `up -d` | pulls the official image and starts all four containers. No `--build` — nothing is built on the host. (Want to build from your own checkout instead? `--from-source`.) The island is born by copying the empty island the image carries (`/app/seed/aiko.db`) into the volume, and only if the volume is completely empty, which a volume that has ever served never is. If that fails, standup stops before `up` (it never removes a volume, since it can't prove the one it holds is its own; see the runbook's [failed birth](runbooks/backup-and-rollback.md#a-failed-birth)). Every start migrates the DB to head, then serves, and never creates a database |
+| 3 | `pull`, then (new island only) `docker volume create aiko_data` + copy the image's seed into it, then `up -d` | pulls the official image and starts all four containers. No `--build` — nothing is built on the host. (Want to build from your own checkout instead? `--from-source`.) The island is born by copying the empty island the image carries (`/app/seed/aiko.db`) into the volume, and only into a volume standup proves it just created (it makes it with a random label and reads the label back; an existing volume keeps its old one, so it is never touched). If that fails, standup stops before `up` (it never removes a volume itself; see the runbook's [failed birth](runbooks/backup-and-rollback.md#a-failed-birth)). Every start migrates the DB to head, then serves, and never creates a database |
 | 4 | bring up Caddy | TLS termination + reverse proxy to `127.0.0.1:8095`, in its own stack so it never collides with an existing proxy |
 
 Two safety properties worth knowing:
@@ -231,8 +231,8 @@ If you'd rather run the steps yourself (or debug one), this is exactly what the
 script automates:
 
 ```bash
-# 1. create the external data volume (a NEW island only: step 3 then creates its database)
-docker volume create aiko_data
+# 1. (nothing to create yet: the data volume is made in step 3, together with the island,
+#    so an interrupted setup can't leave an empty volume behind)
 
 # 2. write .env (production: NO ENVIRONMENT line; strong secret required)
 cat > .env <<EOF
@@ -249,20 +249,27 @@ PASSKEY_ENABLED=false
 EOF
 chmod 600 .env
 
-# 2b. pin the image (its own file, never .env: compose refuses without it)
-printf 'ISLAND_IMAGE=ghcr.io/nickmeinhold/aiko-chat-island:%s\n' 0.17.1 > image.env
+# 2b. pin the image (its own file, never .env: compose refuses without it). It must be a
+#     release that carries the seed, /app/seed/aiko.db: v0.18.0 and older do not.
+printf 'ISLAND_IMAGE=ghcr.io/nickmeinhold/aiko-chat-island:%s\n' X.Y.Z > image.env   # WITHOUT the leading v
 
 # 3. pull the official image, give birth to the island, then bring it up.
 #    The gateway never creates a database (a lost one must not come back as a new,
 #    empty island). The image carries an empty island, /app/seed/aiko.db, and the
-#    birth copies it into the data volume ONLY if that volume is completely empty: a
-#    volume that has ever served never is, so this line refuses on any box that has
-#    held an island. If a start ever refuses for a missing or empty database, restore
-#    a backup (docs/runbooks/backup-and-rollback.md).
+#    birth copies it into a data volume this shell can PROVE it just created: it makes
+#    the volume with a random label and reads it back. A volume that already existed
+#    keeps its old label, so on any box that has held an island this prints STOP and
+#    copies nothing. If a start ever refuses for a missing or empty database, restore a
+#    backup (docs/runbooks/backup-and-rollback.md).
 #    All four containers run from this one image (bar stock mosquitto).
 ./deploy/compose.sh pull
-docker volume create aiko_data
-./deploy/compose.sh run --rm --no-deps chat-island sh -c 'set -C; [ -z "$(ls -A /data)" ] && cat /app/seed/aiko.db > /data/aiko.db'
+N=$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')
+docker volume create --label aiko.birth=$N aiko_data
+test "$(docker volume inspect -f '{{index .Labels "aiko.birth"}}' aiko_data)" = "$N" \
+  && ./deploy/compose.sh run --rm --no-deps chat-island sh -c 'set -eC; cat /app/seed/aiko.db > /data/.aiko.db.seed; ln /data/.aiko.db.seed /data/aiko.db; rm /data/.aiko.db.seed' \
+  && echo "island born" \
+  || echo "STOP: aiko_data already existed, or the copy failed. Do NOT run up; see the runbook's \"A failed birth\"."
+#    Only after "island born":
 ./deploy/compose.sh up -d
 curl -s http://127.0.0.1:8095/health         # {"status":"ok",...}
 #    (build from THIS checkout instead of pulling: `--build-overlay build` first, then

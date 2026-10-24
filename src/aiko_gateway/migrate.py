@@ -71,9 +71,9 @@ not to detect that, it is to remove the code that did it:
   * the gateway has NO way to create an island, by flag, setting or otherwise. An
     island is born as a COPY: ``docker build`` runs ``scripts/build_seed.py`` once,
     which builds an empty island at head into ``/app/seed/aiko.db`` in an image layer
-    (where no volume exists to harm), and standup copies that file into a ``/data``
-    that is completely empty. A volume that has ever served is never empty (the
-    worker lock lives beside the db), so a lost database can't qualify (Nick,
+    (where no volume exists to harm), and standup copies that file only into a volume it can PROVE it just created
+    (a random label, read back), so a volume that held an island never qualifies,
+    whatever it still holds (Nick,
     2026-10-25, replacing the ``--new-island`` mode PR#405 r1-r3 reviewed).
 
 This replaced the volume sentinel (``.aiko.db.initialized``, PR#399) and the design-20
@@ -132,8 +132,8 @@ _RESTORE = (
     "docs/runbooks/backup-and-rollback.md), then start.")
 # A refusal names the cause and the repair (restore), and never "move it aside": an
 # operator following a refusal is on a box whose island is in doubt (PR#405 r3).
-# Naming standup is safe: it only ever copies into an EMPTY /data, which no volume
-# that has served can be, so on this box it refuses.
+# Naming standup is safe: it only ever copies into a volume it proves it just created,
+# so on this box, whose volume already exists, it refuses.
 _NEVER_HELD_ONE = (
     "A box that has never held an island gets one from standup, never from this "
     "program.")

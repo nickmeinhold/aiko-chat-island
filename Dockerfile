@@ -55,7 +55,7 @@ RUN chmod +x entrypoint.sh
 
 # THE SEED: an empty island at head, built HERE, once, into an image layer, where no
 # volume exists to harm. It is the only way an island is born: standup copies it into a
-# /data that is completely empty. The builder is deleted in the same layer, so no running
+# volume it can prove it just created. The builder is deleted in the same layer, so no running
 # container can build an island from nothing (PR#405, Nick 2026-10-25). Read-only, so a
 # copy is a copy and the seed itself never changes under a running image.
 #

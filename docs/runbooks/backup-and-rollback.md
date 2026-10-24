@@ -55,29 +55,26 @@ undoing actually took.
 
 ## A failed birth
 
-The gateway never creates a database. An island is born once, by standup, which copies
-the image's seed (an empty island built at `docker build`) into the `aiko_data` volume,
-and only if that volume's `/data` is **completely empty**. A volume that has ever served
-is never empty: every boot writes `.aiko-worker.lock` beside the database. So on a box
-that has held an island, standup refuses, and the answer to a missing or empty database
-there is [Rollback](#rollback) (restore the newest backup), never a new island.
+The gateway never creates a database. An island is born once, by standup: it creates the
+`aiko_data` volume with a fresh random label, reads the label back to prove this run made
+the volume, and only then copies in the image's seed (an empty island built at
+`docker build`). A volume that already existed is never touched. So on a box that has held
+an island, standup refuses, and the answer to a missing or empty database there is
+[Rollback](#rollback) (restore the newest backup), never a new island.
 
-The one case this section covers: the copy itself failed partway (a full disk, a killed
-run) on a box that has **never served**. Standup refuses to retry, because `/data` is no
-longer empty. Look first:
+If the copy itself fails, standup says so and names the volume it just created: that
+volume holds no island and is safe to remove (`docker volume rm aiko_data`), then run
+standup again.
+
+If a run was killed before it could say anything, the volume may exist with no island in
+it, and every start refuses `MIGRATE_REFUSE_NO_DATABASE`. Decide by what the volume HOLDS,
+never by guessing its history:
 
 ```bash
 docker run --rm -v aiko_data:/data:ro busybox ls -la /data
 ```
 
-If it holds `aiko.db` and **nothing else** (in particular no `.aiko-worker.lock`, so no
-gateway ever started on it), the volume is a failed birth: remove it and run standup
-again.
-
-```bash
-docker volume rm aiko_data
-./deploy/standup.sh
-```
-
-If it holds anything else, stop: that volume has served, or holds backups. It is not a
-failed birth.
+- **Nothing at all, or only `.aiko.db.seed`** (a copy that never finished): removing it
+  loses nothing. `docker volume rm aiko_data`, then run standup again.
+- **Anything else** (`aiko.db`, a backup, a lock file): stop. Do not remove it. If it holds
+  `aiko.db`, start the stack; if a start refuses, follow [Rollback](#rollback).

@@ -98,7 +98,7 @@ def open_only(db_url: str) -> str:
     goes through this (the app's engine, the migrator's engines, alembic's env.py), so
     no start, request or hand-run ``alembic`` can ever make a new, empty island where
     one was lost. The gateway never creates an island: standup copies the image's seed
-    (``scripts/build_seed.py``) into an empty /data. A URL with no file (in-memory,
+    (``scripts/build_seed.py``) into a volume it just created. A URL with no file (in-memory,
     non-sqlite) is returned unchanged; ``mode=ro`` is kept, since it can't create
     either."""
     from urllib.parse import quote

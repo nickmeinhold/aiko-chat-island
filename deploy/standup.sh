@@ -304,6 +304,10 @@ log "Step 1/$TOTAL — persistent data volume ($DATA_VOLUME)"
 # the .env ceremony, the pull and the build, and any death in between would strand an
 # existing-but-unborn volume that no re-run would ever finish (Noether, Carnot, Tesla,
 # Maxwell, PR#405 r1).
+#
+# This inspect only decides whether to ATTEMPT a birth. It never decides whether a birth is
+# safe: a flake here reaches `birth_island`, which copies only into a volume it can PROVE
+# this run created (PR#405 cage-match r1, all four seats).
 NEW_ISLAND="false"
 if docker volume inspect "$DATA_VOLUME" >/dev/null 2>&1; then
   ok "volume $DATA_VOLUME already exists — leaving it (never re-created; it holds the DB)"
@@ -747,30 +751,39 @@ trap 'rm -f "${ENV_TMP:-}" "${IMAGE_TMP:-}" "${LK_ENV_STAGED:-}" "${KEYS_HAVE:-}
 # The volume and the database are born together, after the image is in hand, which
 # shrinks the window an interrupted first run can strand to the birth itself.
 #
-# Nothing here EVER removes a volume. `docker volume create` succeeds on a volume that
-# already exists, so this run can't prove it made the one it holds: a concurrent standup,
-# a restore, or a flaky `inspect` in step 1 could put a real island there, and a rollback
-# would delete it (Noether, Carnot, Tesla, PR#405 r2).
+# Nothing here EVER removes a volume (Noether, Carnot, Tesla, PR#405 r2).
 #
 # The birth is a COPY of the image's seed (/app/seed/aiko.db, an empty island built at
-# `docker build`; the gateway itself cannot create one). It copies only into a /data that
-# is COMPLETELY empty, and that rule, not step 1's `volume inspect`, is what keeps a lost
-# database from coming back as an empty island: every volume that has served holds the
-# worker lock beside its db (.aiko-worker.lock, written on every boot), so it is never
-# empty, even with aiko.db gone. A wrong guess in step 1 therefore refuses here, loudly
-# (PR#405 r3 finding 1). `set -C` makes the write itself no-clobber (O_EXCL).
+# `docker build`; the gateway itself cannot create one), and it copies only into a volume
+# this run can PROVE it created. `docker volume create` succeeds on an existing volume and
+# keeps that volume's labels (measured, Docker 29.5.2), so creating with a fresh random
+# label and reading it back is a proof of creation: a volume that existed before (an
+# island, a lost db, a concurrent standup's) carries some other label or none, and is
+# left untouched. Nothing is inferred from what the volume holds: an earlier revision
+# copied into any EMPTY /data, which relied on the worker lock living there, and
+# GATEWAY_WORKER_LOCK / GATEWAY_ALLOW_MULTIWORKER move or skip it (PR#405 cage-match r1,
+# all four seats).
+#
+# The copy is published atomically: written under a temporary name, then hard-linked to
+# aiko.db (`ln` refuses if aiko.db exists, and a reader never sees a half-copied file),
+# then the temporary name is removed (Carnot, r1).
 # "$@" = island_compose's leading options (--build-overlay, or none).
-BIRTH_SH='set -C
-if [ -n "$(ls -A /data)" ]; then
-  echo "standup: /data is not empty, so this volume has held an island (or a failed birth). Refusing to copy an empty island over it." >&2
-  ls -la /data >&2
-  exit 3
-fi
-cat /app/seed/aiko.db > /data/aiko.db'
+BIRTH_SH='set -eC
+cat /app/seed/aiko.db > /data/.aiko.db.seed
+ln /data/.aiko.db.seed /data/aiko.db
+rm /data/.aiko.db.seed'
+BIRTH_NONCE="$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
 birth_island() {
-  docker volume create "$DATA_VOLUME" >/dev/null || die "could not create volume $DATA_VOLUME"
+  [ -n "$BIRTH_NONCE" ] || die "could not draw a random volume label (od /dev/urandom)"
+  docker volume create --label "aiko.birth=$BIRTH_NONCE" "$DATA_VOLUME" >/dev/null \
+    || die "could not create volume $DATA_VOLUME"
+  local owner
+  owner="$(docker volume inspect -f '{{index .Labels "aiko.birth"}}' "$DATA_VOLUME")" \
+    || die "created volume $DATA_VOLUME but could not read its label back, so this run can't prove it owns it. Nothing was copied."
+  [ "$owner" = "$BIRTH_NONCE" ] \
+    || die "volume $DATA_VOLUME already existed before this run (it was not created now), so it may hold an island. It was left untouched and no island was created. This box already has an island volume: standup is for a box that has none."
   island_compose "$@" run --rm --no-deps chat-island sh -c "$BIRTH_SH" \
-    || die "could not give birth to the island in volume $DATA_VOLUME (see above). If /data was not empty, this box has held an island: restore it (docs/runbooks/backup-and-rollback.md), don't stand up a new one. If the copy itself failed, see that runbook's \"A failed birth\" section."
+    || die "could not copy the seed into volume $DATA_VOLUME (see above; an image released before the seed has no /app/seed/aiko.db, so check the --version pin). This run created that volume moments ago and it holds no island, so it is safe to remove: docker volume rm $DATA_VOLUME, then run standup again."
   ok "created volume $DATA_VOLUME and the new island's database (from the image's seed)"
 }
 if [ "$FROM_SOURCE" = "true" ]; then
