@@ -1,5 +1,7 @@
 # 20-TEMPER.md — design 20, what a volume can witness
 
+**Design status: v4, UN-TEMPERED (provisional) for its T3 folds; Nick 2026-10-24 chose option (a): next strike = the image PR cage-match, no 4th design round.**
+
 **Overall verdict: RECAST** (4/4, independently), round 1; **RECAST 4/4 again, round 2**; **RECAST 4/4, round 3 (CAP REACHED)**. v3 spine affirmed unanimously; v4 folds are UN-TEMPERED (provisional), next strike = the image PR cage-match. See "Round 3" below.
 **Struck:** dt-1792832848, 2026-10-24. Families seated: Maxwell (Claude) + Noether (DeepSeek V4.1 Flash, high), Carnot (GPT-6.1, medium), Tesla (Grok, medium). Wu disabled. Full 4-way panel, no dark seat.
 
