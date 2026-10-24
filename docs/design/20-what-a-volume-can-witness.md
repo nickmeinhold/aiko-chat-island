@@ -1,243 +1,236 @@
 # Design 20: what a volume can witness about itself
 
 Answers [#400](https://github.com/nickmeinhold/aiko-chat-island/issues/400) Q1–Q3 and
-Q7, with Q4–Q5 noted where the measurements reached them. Status: **v2, PROPOSED**.
-v1 was struck by four families and came back **RECAST 4/4**
-([`20-TEMPER.md`](20-TEMPER.md)). This version folds that strike. Each fold is marked
-*(T1-n)*, where n is the flaw's number in the TEMPER synthesis.
+Q7, with Q4–Q5 noted where the measurements reached them. Status: **v3, PROPOSED**.
+v1 and v2 were each struck by four families, and both came back **RECAST 4/4**
+([`20-TEMPER.md`](20-TEMPER.md)). This version folds round 2. Each fold is marked
+*(T2-n)*, where n is the flaw's number in that round's synthesis.
 
-## The question
+## The question, and the answer
 
 The volume sentinel (#399, v0.17.1) stops a lived volume from silently becoming a new,
 empty island. A record on a volume can say one thing: *an island has lived here*. It
-cannot say *this is the volume that should be here*, because from inside the container
-a fresh volume and a first standup look the same, byte for byte.
+can't say *this is the volume that should be here*: from inside the container, a fresh
+volume and a first standup look the same.
 
-The answer, narrowed by the strike: **a record inside the volume proves the volume has a
-past. Only a record outside it can prove the volume belongs to this host's island, and
-then only its _lineage_, not how recent it is** *(T1-4)*.
+**A record inside the volume proves the volume has a past. A record outside it, the
+tally, proves the volume belongs to this host's island. It proves the island's
+_lineage_, never how recent the copy is.** A stale copy of this island is
+indistinguishable from a legitimate restore, and is served by design.
 
-## The rule that organises v2: check each fact where it is fixed
+## The rule: check each fact where it is fixed
 
-The strike's sharpest finding (Tesla, *T1-1*): **the image a container runs is fixed
-when the container is created. Whether its database exists is true or false each time
-it starts.** `restart: always`, a daemon restart or `docker start` re-run an existing
-container with no wrapper in the path. So:
+| Fact | Can change | So it is guarded | by |
+|---|---|---|---|
+| **the image contains the guard** | only at container creation (a container keeps its image ID; a moved tag moves a name) | at **creation** | **the image floor**, in the wrapper |
+| **the lineage on the volume** (sentinel, db) | at any time: a stopped container's volume can be rewritten in place, and `restart: always` brings it back with no wrapper (Tesla, *T2-1*) | at **every start** | **the migrator**, in the image |
 
-- a host check that runs before `up` can guard **only facts fixed at creation**: which
-  image, which volume object;
-- a fact that can change between starts (is the db there, does it have tables) can only
-  be guarded by **the image itself**, because that's the only code that runs on every
-  start.
-
-v1 put a start-time rule (sentinel present, db absent) into a creation-time door, and
-three families found the gap independently. v2 puts each check where its fact is fixed.
-
-| Fact | Fixed when | Guarded by |
-|---|---|---|
-| the image contains the volume guard | container creation (the image can't change under a container) | **the image floor**, in the wrapper (§Q7) |
-| which volume object is mounted | container creation (`volume rm` refuses while any container references it, measured below) | **the tally**, in the wrapper (§Q3) |
-| the db exists and holds an island | every start | **the migrator**, in the image, on every start (existing, unchanged) |
+v2 assigned "which volume is mounted" to the wrapper, at creation. Round 2 showed the
+volume *object* is fixed at creation but its *contents* are not, and the tally vouches
+for contents. So in v3 **the tally is checked by the migrator on every start, and the
+wrapper keeps exactly one job: the floor.** Two facts, two places, one predicate each.
 
 ## What was measured
 
-All on 2026-10-24. Read-only on both live islands, plus throwaway probes on syd.
+All on 2026-10-24. Read-only on both live islands; throwaway probes on syd.
 
 | | syd (`chat.imagineering.cc`) | melb (`chat.enspyr.co`) |
 |---|---|---|
 | `.aiko.db.initialized` content | `2026-10-20T06:01:11.810364+00:00` | `2026-10-20T06:02:12.263441+00:00` |
-| Docker volume `aiko_data` `CreatedAt` | `2026-07-05T00:17:38Z` | `2026-07-11T01:28:53Z` |
-| `.aiko-worker.lock` | 0 B, 2026-08-02 22:09 | 0 B, 2026-08-02 22:36 |
-| `-wal` / `-shm` / `-journal` beside `aiko.db` | none | none |
-| `backups/` in the deploy dir | 38 entries | 39 entries |
+| `aiko_data` `CreatedAt` | `2026-07-05T00:17:38Z` | `2026-07-11T01:28:53Z` |
+| `.aiko-worker.lock` | 0 B, 2026-08-02 | 0 B, 2026-08-02 |
+| `-wal` / `-shm` / `-journal` | none | none |
 
-Behaviours, each with a control:
-1. **A missing `external: true` volume makes Compose refuse** (`external volume ... not
-   found`, exit 1, nothing created). With the volume present, the same probe started.
+1. **A missing `external: true` volume makes Compose refuse.** It does not create one.
+   A positive control (volume present) started.
 2. **`docker volume rm` refuses while any container references the volume, including a
-   stopped one, and `-f` doesn't override it** (`volume is in use`, exit 1 both ways).
-   With the container removed, the same `rm` succeeded. So replacing the volume object
-   requires removing the containers, and the next container has to be *created*, which
-   means `up` and therefore the wrapper.
-3. **Images carry no OCI labels** (`Config.Labels` is `null`). Every release image does
-   carry `/app/build-info.json` (`git_sha`, `ref`, `built_at`), readable with
-   `docker run --rm --entrypoint cat`, and the entrypoint never runs.
-4. **The guard can be detected in an image by a probe, across all 18 release images on
-   syd** (v0.9.3 → v0.17.2): `grep -c MIGRATE_REFUSE_MISSING_DB
-   /app/src/aiko_gateway/migrate.py` returns `0` for every release up to v0.17.0, and
-   `2` for v0.17.1 and v0.17.2. There are no false positives or negatives across that
-   history.
+   stopped one; `-f` doesn't override it.** The control with the container removed
+   succeeded.
+3. **Images carry no OCI labels.** Every release image carries `/app/build-info.json`
+   (`git_sha`, `ref`, `built_at`), readable with `--entrypoint cat`.
+4. **An execution probe tells guarded images from unguarded ones by behaviour** (*T2-4*).
+   - Setup: a throwaway volume holding only a sentinel; the image runs with its **real
+     entrypoint**, `--network none`, `ENVIRONMENT=development` (which disarms the
+     prod-secret config checks, not the sentinel logic).
+   - **0.16.1 and 0.17.0 created a fresh `aiko.db` and kept running.** That is Q7's
+     failure, reproduced on demand.
+   - **0.17.1 and 0.17.2 exited 1 with `MIGRATE_REFUSE_MISSING_DB` and created
+     nothing.**
+   - Control: 0.17.2 on an empty volume warned "creating a NEW, empty island" and
+     provisioned.
+   - A first attempt without `ENVIRONMENT=development` failed on *every* image with a
+     config error. That's a useful negative control: the probe must reach the migrator
+     before its result means anything.
+5. Only `chat-island` mounts `aiko_data`. `update.sh`'s backup copies `aiko.db` and **not**
+   the sentinel (*T2-2*).
 
-## Q7: the image floor *(T1-1, Nick 2026-10-24: "image floor")*
+## Q7: the image floor *(Nick 2026-10-24)*
 
-Images built before v0.17.1 ignore the sentinel. On a lived volume whose db is missing,
-one of them builds a fresh, empty island. v1 tried to re-check the db from the wrapper.
-That copy was narrower than the migrator's rule (it would pass a 0-byte file, a
-bookkeeping-only db and a lock-only volume), and it ran only at creation. **Deleted.**
+**The wrapper refuses to create the gateway container from an image that doesn't pass
+the execution probe.** No production image runs below the floor, so every start runs
+the migrator's single predicate.
 
-**The rule: the wrapper refuses to create a container from an image that doesn't
-contain the volume guard.** Nothing in production runs below v0.17.1, so every serving
-start runs the migrator's single predicate (`_lived_evidence` + the `users` check +
-`mode=rw`), on every start, including restarts. There is no second copy of the rule.
+- **The probe is measurement 4**, run against the exact image about to be used: a
+  throwaway volume with only a sentinel, `--network none`, the real entrypoint. **Pass**
+  means a non-zero exit, `MIGRATE_REFUSE_MISSING_DB` in its output, and no `aiko.db`
+  created. It tests the guard *running through the entrypoint*, not the name of the
+  guard (Noether, Tesla, *T2-4*). Results are cached by image ID in the deploy dir, so a
+  repeat `up` doesn't pay for the probe again. Once the tally lands, the probe also
+  needs a mismatching tally to refuse (see below), so the floor rises with that release.
+- **The image probed is the image used** (Carnot, *T2-5*). Under the wrapper's lock:
+  1. pull;
+  2. resolve the image ID;
+  3. probe that ID;
+  4. `up --pull never --no-build`;
+  5. afterwards, assert the gateway container's image ID equals the probed ID.
 
-- **The probe is for the capability, not a version.** `docker run --rm --entrypoint sh
-  <image> -c 'grep -q MIGRATE_REFUSE_MISSING_DB /app/src/aiko_gateway/migrate.py'`. It
-  needs no version ordering, it works on a digest pin (where there's no tag to parse)
-  and on a local build with an empty `ref`, and measurement 4 shows it separating the
-  real history exactly.
-- **The probe string becomes a contract.** A test in this repo asserts that
-  `MIGRATE_REFUSE_MISSING_DB` appears in `migrate.py`'s refusal path. Renaming it then
-  fails CI instead of silently disabling the floor. It's already an operator-facing
-  refusal code, so it's a stable name anyway.
-- **It runs at the doors that create containers:** `compose.sh up`, `create` and `run`,
-  for the gateway service, with the image resolved for this invocation. It refuses with
-  the image ref and the reason. There is **no override flag**: the wrapper may refuse,
-  never permit (Maxwell's union-of-refusals invariant, the part of it that survived).
-- **The watcher.** TEMPER-18 fold #9 already says the watcher refuses an auto-restore
-  to a pre-guard image. It goes through the same wrapper, so it's one rule at one door
-  for both the human and the watcher.
-- **Below the floor** is an explicit offline procedure: a fresh island, or forensic
-  work on a copy, run by hand without `compose.sh`. It's documented as such in the
-  rollback runbook, which will replace the "keep the current compose" note for targets
-  below v0.17.1.
-- **Bypass, named.** `docker run` by hand, or a bare compose with an exported pin
-  (#5186), never meets the wrapper. That's the same class as #401's limit, closed by the
-  same future work, and not claimed here.
+  If the post-condition fails, stop the container and refuse. A digest pin makes
+  steps 1–2 immutable.
+- **A reused container is checked too** (Noether, *T2-6*). `up` can start an existing
+  container without recreating it, so the floor applies to *the existing container's*
+  image ID. `--no-recreate` is refused for the gateway.
+- **No override flag.** The wrapper may refuse, never permit.
+- **Below the floor** is an explicit offline procedure (a fresh island, or forensic work
+  on a copy, by hand), documented in the rollback runbook.
+- **Named bypass:** a hand `docker run`, or a bare compose with the pin exported (#5186),
+  never meets the wrapper. Same class as #401's limit.
 
-Side benefit: the same `--entrypoint cat /app/build-info.json` helper gives the drift
-guard a ref for a **digest** pin, which `island_ref_from_images` can't get today (a
-listed input to design 18 step b). One helper, two uses.
+## The tally, v3: checked inside the image
 
-## Q3: doors, as states × transitions *(T1-6)*
+**What it holds:** `witness/volume.tally` in the deploy dir, with three fields:
+`<lineage = sentinel content> <db path> <island domain>`. The db path lets the migrator
+compare against the file it is actually opening (Carnot, *T2-1*). The domain is shown to
+the operator; it is never used as a secret. `CreatedAt` is recorded for forensics only
+and never compared.
 
-v1 listed four doors read off the compose file. The strike showed they mixed causes
-with states and missed transitions. This version crosses **what the volume holds** with
-**how a container gets to run**, and marks each cell.
+**How the migrator sees it:** compose mounts `./witness` **as a directory**, read-only,
+at `/witness`. A single-file bind would keep the old inode across the tmp+rename write,
+so a directory is required (Tesla). The gateway gets `WITNESS_DIR=/witness`. When
+`WITNESS_DIR` is set, `migrate.run()` does this before any connect:
 
-**Volume states:**
-- **S1** the right volume, intact;
-- **S2** a recreated empty volume;
-- **S3** another island's lineage;
-- **S4** a stale copy of *this* lineage;
-- **S5** the right volume with the db missing, 0-byte, truncated or bookkeeping-only;
-- **S6** a different db path or mount (`DB_URL`, `-v`, `-f`);
-- **S7** the host-side tally lost.
+- tally missing or unreadable → **refuse** (`MIGRATE_REFUSE_UNENROLLED`);
+- the db path it is opening ≠ the tally's path → **refuse**;
+- sentinel present and ≠ the tally's lineage → **refuse** (`MIGRATE_REFUSE_FOREIGN_LINEAGE`);
+- sentinel absent → **refuse**, with "run `compose.sh enroll`";
+- otherwise, today's checks unchanged (lived evidence, the `users` check, `mode=rw`).
+
+With `WITNESS_DIR` unset (dev, tests, the probe), behaviour is today's. That is
+fail-closed where it's configured, and the drift guard refuses a box whose compose has
+dropped the mount.
+
+**What this buys:**
+- **`restart: always` is covered.** A daemon restart after an in-place rewrite of the
+  volume, or after its witnesses were wiped, now refuses on the next start (*T2-1*).
+- **The `run -e` / `-v` blindness disappears for the tally.** The migrator checks the
+  db it actually opened, whatever the command line said, so `docker compose config` is
+  no longer part of the design (*T2-3*).
+- **What's left for the wrapper:** an `--entrypoint` override skips the migrator
+  entirely, so `compose.sh run` refuses `--entrypoint` for the gateway, and refuses
+  `-e WITNESS_DIR`/`ENVIRONMENT` overrides. Everything else `run` does is seen by the
+  migrator.
+
+### Enrolment: one ceremony, no `pending` *(T2-2, Carnot's simplification)*
+
+`pending` is deleted. Every way a volume becomes enrolled goes through
+`compose.sh enroll`, with the stack down:
+
+| Volume holds | `enroll` does | Confirmation |
+|---|---|---|
+| sentinel (a live island, a restore that kept the dotfiles) | writes the tally from it | island mark + `--yes-this-is-<domain>` |
+| db with `users`, no sentinel (a db-only backup restored into a new volume; a lock-only volume) | runs **migrate only** (`python -m aiko_gateway.migrate`, no server) from the floor image with `WITNESS_DIR` unset; that path writes the sentinel through today's logic; then writes the tally from it | island mark + `--yes-this-is-<domain>` |
+| nothing | migrate-only provisions a fresh db and sentinel; writes the tally | `--new-island <domain>` |
+| sentinel ≠ an existing tally | refuses; only `--replace-lineage <domain>` proceeds, and it prints both lineages | explicit, separate flag |
+
+- **The island mark** (Tesla, *T2-7*). Two timestamps 61 seconds apart can't be told
+  apart at 3am, so `enroll` shows recognisable facts read from the db through the
+  read-only helper: the user count, the newest message time, the island's own
+  domain/manifest name. The flag names the domain, not the timestamp.
+- **Crash safety without `pending`.** A crash before the tally is written leaves no
+  tally, so the next start refuses and `enroll` runs again. It's idempotent: the
+  sentinel now exists, so it takes the first row. The tally is written atomically (tmp,
+  fsync, rename, fsync the directory).
+- **First standup** is `standup.sh` → `enroll --new-island` → `up`. `standup` never
+  offers itself on a volume that has witnesses (Tesla).
+- **The lock-only tradeoff from v2 dissolves.** Row 2 enrols such a volume via
+  migrate-only, which today's code already adopts.
+
+### Restores keep their lineage *(T2-2)*
+
+`update.sh`'s backup copies `.aiko.db.initialized` beside `aiko.db`
+(`backups/aiko.db.preupdate-<ts>` + `.initialized`), and the restore runbook restores
+both, with the stack **down** (`compose.sh down` removes the containers, which also
+prevents a mid-restore daemon restart). A restore into the same volume keeps the
+lineage, and the tally matches. A restore into a new volume from a db-only backup goes
+through `enroll` row 2. Runbook line: *after restoring, remove any `aiko.db-journal`
+beside the restored file* (Q5).
+
+### Durability *(T2-8)*
+
+`witness/` joins `image.env` as a **box-local, never-synced** path. The drift preflight
+lists it as box state, not tag state. Any refresh of the deploy dir (design 18's watcher
+included) must leave it alone, under the same rule and test that protect `image.env`.
+Losing it makes every start refuse, both islands if both lose it. That is loud, and it's
+recovered by `enroll`.
+
+## Q3: states × transitions *(T2-6)*
 
 **Transitions:**
-- **create**: `compose.sh up`, `create` or `run` (the wrapper runs);
-- **restart**: `restart: always`, a daemon restart, `docker start` (no wrapper; same image
-  and same volume object as at creation);
+- **create**: a new container, through the wrapper;
+- **reuse**: `up` or `start` of an existing container, through the wrapper;
+- **restart**: `restart: always`, a daemon restart, a bare `docker start`; no wrapper;
 - **bypass**: a hand `docker run`, or a bare compose with the pin exported.
 
-| | create (wrapper) | restart (no wrapper) | bypass |
-|---|---|---|---|
-| **S1** intact | serves | serves | out of model |
-| **S2** recreated empty | **refused: tally** (sentinel absent) | impossible: a recreate needs every container removed (meas. 2), so the next run is a create | out of model |
-| **S3** foreign lineage | **refused: tally** (sentinel differs) | only by replacing a mounted volume's contents in place: deliberate, out of model | out of model |
-| **S4** stale same lineage | **serves, by design**: indistinguishable from a legitimate restore *(T1-4)* | serves, by design | out of model |
-| **S5** db damaged | **refused: migrator**, after the floor guarantees the image has it | **refused: migrator** (every start) | out of model |
-| **S6** other path/mount | **refused: tally** bound to the effective mount *(T1-3)*; a moved `DB_URL` inside `/data` is also caught by the lock | n/a: mount fixed at creation | out of model |
-| **S7** tally lost | **refused** *(T1-2)* | serves (it was right at creation) | out of model |
+| Volume state | create | reuse | restart | bypass |
+|---|---|---|---|---|
+| **S1** right volume, intact | serves | serves | serves | out of model |
+| **S2** recreated empty | refused: migrator (unenrolled lineage) | n/a: a recreate needs every container removed (meas. 2) | n/a, same | out of model |
+| **S3** foreign lineage | refused: migrator | refused: migrator | **refused: migrator** | out of model |
+| **S4** stale copy of this lineage | serves, by design | serves | serves | out of model |
+| **S5a** db missing / 0-byte / no `users` (witnesses intact) | refused: migrator | refused | refused | out of model |
+| **S5b** whole volume wiped in place (witnesses gone too) | refused: migrator (sentinel absent, tally present) | refused | **refused** | out of model |
+| **S5c** truncated, but `users` still readable | **not detected** until Q4's `quick_check` ships | same | same | out of model |
+| **S6** another db path or mount | refused: migrator (path ≠ tally) | refused | refused | out of model |
+| **S7** tally lost | refused: migrator (unenrolled) | refused | refused | out of model |
 
-"Out of model" means one specific thing here: actions that don't go through the
-operator's doors. It's the same boundary as #401's pin and #5186's future hardening.
-S4 is the honest limit: **the tally proves lineage, never generation.** Detecting
-freshness would need an external record of the island's progress, kept in step
-through every restore, and that record would refuse exactly the restores the runbook
-prescribes.
+On the watcher, a refusal that loops under `restart: always` is a **host-class failure**.
+Design 18's "host failed, not release failed" state applies, so S5 or S7 must never
+quarantine a good digest (Maxwell, *T2-6*).
 
-## The tally, v2
+## Q1, Q2, Q4, Q6
 
-**What it records:** `volume.tally` in the deploy dir, one line:
-`<volume name> <sentinel content>`.
-
-`CreatedAt` is **out of the refusal path** *(T1-5)*. Its only distinct row was "copied
-into a new volume object", which is a legitimate move. It's also an unmeasured clock:
-a format change in a Docker upgrade would fire on both islands the same night and teach
-operators to reach for re-adopt. It is recorded beside the tally for forensics and
-never compared.
-
-**Which volume it checks** *(T1-3)*: the gateway service's `/data` mount and `DB_URL`,
-resolved from `docker compose config` *for this invocation*, never a hardcoded
-`aiko_data`. A `run -e DB_URL=…`, a `-v` or an `-f` that points the gateway anywhere
-other than the enrolled volume and path refuses.
-
-**How it's read:** a helper container with no entrypoint, a read-only mount and no
-network (`docker run --rm --network none --entrypoint cat -v <vol>:/data:ro <guard
-image> /data/.aiko.db.initialized`). Unreadable means refuse. The helper must never run
-the app's entrypoint, which would run `migrate.run()` (Noether).
-
-**Its lifecycle** *(T1-2)*: a missing tally refuses, the way a missing `image.env`
-refuses.
-
-| Tally | Volume | Action |
-|---|---|---|
-| present, matches | lineage matches | proceed |
-| present | sentinel differs or is absent | **refuse**; print `adopt-volume` |
-| absent | anything | **refuse**; print `adopt-volume` (or `standup`, for a first island) |
-| `pending` | no evidence yet | first standup in progress: proceed, and complete the tally once the sentinel is visible |
-
-- **`adopt-volume`** is an explicit subcommand. It runs with the stack down, shows the
-  live sentinel and `CreatedAt`, requires `--yes-this-is-<island>`, and writes the tally
-  atomically (tmp, fsync, rename, fsync the directory: the same discipline as
-  `_write_sentinel`). Syd and melb are enrolled this way at the hand-sync that ships
-  this. Nothing writes a tally from whatever happens to be mounted.
-- **A first standup** writes `pending` before `up`, so a crash before the sentinel
-  exists leaves `pending`, not an absent tally (Tesla's protocol). The tally is
-  completed only once the sentinel is visible through the helper.
-- **Durability:** design 18's watcher and any refresh of the deploy dir must keep
-  `volume.tally`, or fail closed. Losing it refuses, which is loud.
-- **Rehearsal** (design 18 phase B) uses a side directory, not `aiko_data`. It must
-  never read or write the production tally. The rehearsal path is outside the wrapper's
-  serving doors, and design 18 (b) owns its own witness.
-
-## Q2: the per-directory lock is a production feature
-
-Noether r3 (#399): a directory that hosted db A refuses a fresh db B beside it while the
-lock exists. In dev that's a nuisance. In prod it guards S6 from inside the image: a
-`DB_URL` moved to `/data/aiko2.db` finds the lock and refuses. **Keep it.**
-
-## Q1: keep the lock as a witness; rename what it does
-
-Its *bridge* role is over: both live volumes carry a sentinel. But the same `exists()`
-check also does Q2's job. Keep the check, and change the docstrings and the refusal
-text to call the lock **the directory witness**. Revisit once the tally, bound to the
-effective `DB_URL`, covers S6 from the host.
-
-**Named tradeoff** *(T1-7)*: a volume carrying only the lock (no sentinel) can't be
-enrolled: `adopt-volume` refuses it, with "boot an image at or above the floor once,
-then adopt". No live volume is in this state (measured). Owner: the `deploy/` PR.
-
-## Q4, Q5, Q6
-
-- **Q5:** the real risk is a hot `aiko.db-journal` (journal mode `DELETE`; WAL is off),
-  not WAL. Runbook line: *after restoring, remove any `aiko.db-journal` beside the
-  restored file*. None exists on either volume (measured).
-- **Q4:** `PRAGMA quick_check` before `upgrade head` on a lived volume. It's unmeasured,
-  and proposed as its own PR with timings on both volumes. (S5's truncated-file row
-  depends on it for files that still have `users`.)
+- **Q2:** keep the per-directory lock as a production feature (it catches a *fresh*
+  file beside an island). Since the tally now records the db path, S6 is also caught
+  for a *copied* island, which the lock never caught (Tesla's correction).
+- **Q1:** keep the lock as a witness, renamed **the directory witness**. Revisit once
+  the tally ships: its path field covers S6 from outside the volume.
+- **Q4:** `quick_check` gets its own PR, timed on both volumes. S5c above is
+  honestly marked as not covered until then.
 - **Q6:** belongs to #393.
 
-## What gets built (after a clean round 2)
+## What gets built
 
-One `deploy/` PR, landing in the same hand-sync as #5186 and design 18 (b):
-1. The floor probe at the container-creating doors, plus the contract test for
-   `MIGRATE_REFUSE_MISSING_DB`.
-2. `volume.tally` with `adopt-volume`, `pending`, mount binding and a no-entrypoint
-   reader.
-3. The `build-info.json` reader, shared with the drift guard.
-4. The runbook changes: below-floor recovery, the hot journal, enrollment at the
-   hand-sync.
+The work is in order, because the floor depends on the tally release:
+1. **Image PR** (cage-match: trust boundary):
+   - `WITNESS_DIR` tally checks in `migrate.run()`, with the new refusal codes;
+   - a migrate-only mode;
+   - tests, including a fixture for every state in the Q3 matrix.
+2. **`deploy/` PR**:
+   - the floor probe with the identity post-condition and cache;
+   - the `run` override refusals;
+   - `enroll` and the island mark;
+   - the `witness/` mount in compose;
+   - backups carrying the sentinel;
+   - runbook changes.
+3. **Rollout:** release the image → hand-sync each box (one sync, together with #5186
+   and design 18 (b)) → `enroll` syd and melb (row 1, against the values measured above)
+   → raise the floor so it requires the tally refusal.
 
-Plus one docstring PR for Q1's rename.
+## Questions for round 3
 
-## Questions for round 2
-
-1. Does the create/restart split hold everywhere? Is there a path where a container's
-   *image* changes without a create (a `docker commit`, or the tag being moved under a
-   running container)?
-2. Is `docker compose config` the true effective model for every `compose.sh`
-   subcommand, including `run` with `-e` and `-v`?
-3. Is a grep for a refusal code too weak a capability probe? The alternative is a
-   dedicated marker file, which every pre-marker image would lack, so it needs this grep
-   as its bootstrap anyway.
+1. Does moving the tally check into the image re-create v1's problem (a second copy of
+   the rule)? Or is it now the *only* copy, with the wrapper holding only the floor?
+2. Is the `--entrypoint` / `WITNESS_DIR` / `ENVIRONMENT` refusal list for `compose.sh
+   run` complete? What else can a `run` flag do to skip the migrator?
+3. Does a migrate-only `enroll` on a volume with no sentinel run any code path that
+   could adopt the wrong data? It reuses today's adopt-or-provision logic, without the
+   tally.
