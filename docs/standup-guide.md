@@ -265,7 +265,7 @@ printf 'ISLAND_IMAGE=ghcr.io/nickmeinhold/aiko-chat-island:%s\n' X.Y.Z > image.e
 ./deploy/compose.sh pull
 N=$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')
 docker volume create --label aiko.birth=$N aiko_data
-test "$(docker volume inspect -f '{{index .Labels "aiko.birth"}}' aiko_data)" = "$N" \
+test -n "$N" && test "$(docker volume inspect -f '{{index .Labels "aiko.birth"}}' aiko_data)" = "$N" \
   && ./deploy/compose.sh run --rm --no-deps chat-island sh -c 'set -eC; cat /app/seed/aiko.db > /data/.aiko.db.seed; ln /data/.aiko.db.seed /data/aiko.db; rm -f /data/.aiko.db.seed || :' \
   && echo "island born" \
   && ./deploy/compose.sh up -d \

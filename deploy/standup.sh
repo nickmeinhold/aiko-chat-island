@@ -310,7 +310,7 @@ log "Step 1/$TOTAL — persistent data volume ($DATA_VOLUME)"
 # this run created (PR#405 cage-match r1, all four seats).
 NEW_ISLAND="false"
 if docker volume inspect "$DATA_VOLUME" >/dev/null 2>&1; then
-  ok "volume $DATA_VOLUME already exists — leaving it (never re-created; it holds the DB)"
+  ok "volume $DATA_VOLUME already exists — leaving it untouched (standup never re-creates a volume or copies into one it did not just create)"
 else
   NEW_ISLAND="true"
   ok "no volume $DATA_VOLUME yet: step 3 creates it together with the new island's database"
@@ -780,11 +780,11 @@ birth_island() {
     || die "could not create volume $DATA_VOLUME"
   local owner
   owner="$(docker volume inspect -f '{{index .Labels "aiko.birth"}}' "$DATA_VOLUME")" \
-    || die "created volume $DATA_VOLUME but could not read its label back, so this run can't prove it owns it. Nothing was copied."
+    || die "could not read volume $DATA_VOLUME's label back, so this run can't prove it created that volume. Nothing was copied. See docs/runbooks/backup-and-rollback.md, \"A failed birth\"."
   [ "$owner" = "$BIRTH_NONCE" ] \
     || die "volume $DATA_VOLUME already existed before this run (it was not created now), so it may hold an island. It was left untouched and no island was created. This box already has an island volume: standup is for a box that has none."
   island_compose "$@" run --rm --no-deps chat-island sh -c "$BIRTH_SH" \
-    || die "could not copy the seed into volume $DATA_VOLUME (see above; an image released before the seed has no /app/seed/aiko.db, so check the --version pin). This run created that volume moments ago and nobody has used it (it holds at most an unserved copy of the empty seed), so it is safe to remove: docker volume rm $DATA_VOLUME, then run standup again."
+    || die "could not copy the seed into volume $DATA_VOLUME (see above; an image released before the seed has no /app/seed/aiko.db, so check the --version pin). Nothing more was done. See docs/runbooks/backup-and-rollback.md, \"A failed birth\"."
   ok "created volume $DATA_VOLUME and the new island's database (from the image's seed)"
 }
 if [ "$FROM_SOURCE" = "true" ]; then

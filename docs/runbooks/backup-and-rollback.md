@@ -62,13 +62,8 @@ the volume, and only then copies in the image's seed (an empty island built at
 an island, standup refuses, and the answer to a missing or empty database there is
 [Rollback](#rollback) (restore the newest backup), never a new island.
 
-If the copy itself fails, standup says so and names the volume it just created: that
-volume holds no served island (at most an unserved copy of the empty seed) and is safe to
-remove (`docker volume rm aiko_data`), then run
-standup again.
-
-If a run was killed before it could say anything, the volume may exist with no island in
-it, and every start refuses `MIGRATE_REFUSE_NO_DATABASE`. Nothing on the box can tell
+If a birth fails partway (standup stops with a pointer here) or a run was killed before
+it could say anything, the volume may exist with no island in it, and every start refuses `MIGRATE_REFUSE_NO_DATABASE`. Nothing on the box can tell
 that apart from an island whose database was lost: an empty volume looks the same either
 way, so this page does not decide it from what the volume holds. **You** decide, from what
 you know of this box:

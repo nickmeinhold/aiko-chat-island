@@ -201,11 +201,11 @@ def test_another_runs_volume_is_never_taken_over(island) -> None:
     assert not [ln for ln in _compose_calls(island) if ln.endswith(BIRTH)]
 
 
-def test_a_failed_copy_stops_and_names_the_volume_it_made_as_safe_to_remove(island) -> None:
-    """Standup never removes a volume itself (Noether, Carnot, Tesla, PR#405 r2). When
-    the copy fails it KNOWS the volume is its own (the label read back), so it says that
-    volume holds no island and is safe to remove, instead of stranding it (r1, Noether
-    + Tesla)."""
+def test_a_failed_copy_stops_and_claims_nothing_about_history(island) -> None:
+    """Standup never removes a volume itself (Noether, Carnot, Tesla, PR#405 r2). A failed
+    copy can't prove nobody used the volume (killed after `ln`, a concurrent run), so the
+    message makes no "safe to remove" claim: it points at the runbook, where the operator,
+    who knows the box's history, decides (Carnot r3)."""
     _restub(island, fail_on=".aiko.db.seed")
     r = island.run(expect_ok=False)
     assert r.returncode != 0
@@ -213,8 +213,8 @@ def test_a_failed_copy_stops_and_names_the_volume_it_made_as_safe_to_remove(isla
     assert not [ln for ln in calls if ln.startswith("docker volume rm")]
     assert not [ln for ln in calls if ln.endswith(" up -d")]
     out = r.stdout + r.stderr
-    assert "This run created that volume moments ago" in out
-    assert "docker volume rm aiko_data" in out
+    assert "A failed birth" in out
+    assert "safe to remove" not in out and "nobody has used" not in out
     assert "migrate --new-island" not in out and "aside" not in out
 
 
@@ -1077,6 +1077,9 @@ def test_the_guides_manual_birth_is_standups_birth() -> None:
     one_line = "; ".join(_birth_sh().splitlines())
     assert f"sh -c '{one_line}'" in guide
     assert "docker volume create --label aiko.birth=$N aiko_data" in guide
+    # An empty $N would make "" = "" pass against an UNLABELLED volume, and every live
+    # island's volume is unlabelled (Noether r3): the guard must come first.
+    assert 'test -n "$N" && test "$(docker volume inspect' in guide
     assert '{{index .Labels "aiko.birth"}}' in guide and '= "$N"' in guide
     assert "STOP:" in guide
     # `up` is IN the chain, after the birth, never a separate line a STOP can't stop (Noether,

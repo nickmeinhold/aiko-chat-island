@@ -151,13 +151,13 @@ def no_database_message(db: Path, *, via: Path | None = None) -> str:
 
 
 _DEV_BACKEND = (
-    "This database has no file (a dev backend such as Postgres), so no volume or backup "
-    "applies: set up an empty one as the README describes.")
+    "This database has no file, so no volume or backup applies. The gateway runs on SQLite "
+    "in dev and prod alike (README): point DB_URL at a SQLite file.")
 
 
 def not_an_island_message(db: Path | None, why: str) -> str:
-    # A database with no file is a dev backend: the volume repair would be wrong advice
-    # there (Noether, PR#405 r2). Decided from the URL, not `db`: the baseline passes None.
+    # A database with no file isn't a supported setup (README: dev runs SQLite like prod),
+    # and the volume repair would be wrong advice for it (Noether r2; premise fixed r3). Decided from the URL, not `db`: the baseline passes None.
     repair = _DEV_BACKEND if sqlite_file(settings.db_url) is None else f"{_RESTORE} {_NEVER_HELD_ONE}"
     return (
         f"MIGRATE_REFUSE_NOT_AN_ISLAND: the database {db or settings.db_url} {why}. "
@@ -274,7 +274,7 @@ def _compare_to(target: MetaData):
 
 async def _table_names() -> set[str]:
     """Live table names over the app's async driver (no sync driver needed: the
-    deploy has only aiosqlite, dev has asyncpg). Short-lived NullPool engine."""
+    deploy and dev both run aiosqlite). Short-lived NullPool engine."""
     engine = create_async_engine(open_only(settings.db_url), poolclass=NullPool)
     try:
         async with engine.connect() as conn:
