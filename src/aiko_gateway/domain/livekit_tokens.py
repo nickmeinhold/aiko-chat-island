@@ -24,10 +24,14 @@ revocation is a separate, not-yet-built gate.)
     (single responsibility) — it TRUSTS that the route gated it, the same division
     the message/reaction write paths use.
 
-This is the single door: the route and any future in-process caller mint through
-``mint_room_token`` so the grant policy lives in exactly one place — and because the
-DEFAULTS are least-privilege (subscribe-only), a caller widens the grant only by an
-explicit, visible kwarg.
+There are TWO doors, and they are separate ON PURPOSE. ``mint_room_token`` is the
+JOIN door: every route and in-process caller mints participant access through it, so the
+grant policy lives in one place, and because its DEFAULTS are least-privilege
+(subscribe-only) a caller widens the grant only by an explicit, visible kwarg.
+``mint_room_admin_token`` is the ROOMSERVICE door, added for the call-occupancy read
+(#3159): it grants ``roomAdmin`` on ONE named room for 60 seconds and can never join.
+Keeping them apart means no kwarg on the join path can turn a participant token into an
+admin one — the widening would have to be a different function call, at a visible site.
 
 Named residuals (cage-match #122, honest scope, NOT closed here):
   * **Shared-key = one compromise domain (Tesla).** The imagineering SFU is shared
@@ -168,5 +172,54 @@ def mint_room_token(
         "nbf": int(now.timestamp()) - _NBF_LEEWAY_SECONDS,
         "exp": int((now + dt.timedelta(seconds=settings.livekit_token_ttl_seconds)).timestamp()),
         "video": grant,  # LiveKit VideoGrant — one room, participant powers, never admin
+    }
+    return jwt.encode(payload, settings.livekit_api_secret, algorithm=_LIVEKIT_ALG)
+
+
+# The RoomService admin grant. Distinct from the JOIN door above and deliberately
+# NARROW: ``roomAdmin`` scoped to ONE room, no ``roomJoin``, no publish, no
+# ``roomList``. LiveKit requires the grant's ``room`` field to name the room being
+# queried — a broad roomList-only token is REJECTED for ListParticipants (measured
+# 2026-09-07: 401 "permissions denied") — so the per-room scoping is enforced by the
+# SFU, not merely by our politeness.
+_ADMIN_TOKEN_TTL_SECONDS = 60
+
+
+def mint_room_admin_token(*, room: str) -> str:
+    """Mint a short-lived token authorizing RoomService reads for ONE room.
+
+    The module docstring above says the join door's grant "is never an admin grant".
+    That remains true of ``mint_room_token`` and is the reason this is a SEPARATE
+    function rather than a kwarg: a caller cannot accidentally widen a join token into
+    an admin one, and every admin mint is visible at its own call site.
+
+    Scope, honestly: ``roomAdmin`` on a named room permits participant reads AND
+    mutations (remove participant, mute track) on that room. We use it read-only; the
+    grant is not read-only, because LiveKit has no read-only room grant to ask for.
+    That is a property of the vendor's grant vocabulary, not a choice made here, and it
+    is why the TTL is 60s rather than the join token's ten minutes.
+
+    Namespacing is door-enforced exactly as in ``mint_room_token``: the caller passes
+    the BARE channel id and ``_namespaced`` applies the island prefix, so an admin token
+    can no more escape the island's namespace than a join token can.
+    """
+    if not is_configured():
+        raise LiveKitNotConfigured("LiveKit API key/secret not set on this island")
+    if not room or not room.strip():
+        raise ValueError("mint_room_admin_token: room must be non-empty")
+
+    now = dt.datetime.now(dt.timezone.utc)
+    namespaced = _namespaced(room)
+    payload = {
+        "iss": settings.livekit_api_key,
+        "sub": settings.livekit_api_key,  # a service call, not a participant identity
+        "jti": uuid.uuid4().hex,
+        "nbf": int(now.timestamp()) - _NBF_LEEWAY_SECONDS,
+        "exp": int((now + dt.timedelta(seconds=_ADMIN_TOKEN_TTL_SECONDS)).timestamp()),
+        "video": {
+            "roomAdmin": True,
+            "room": namespaced,   # SFU-enforced scope — one room, this one
+            "roomJoin": False,    # explicit: this token can never enter a room
+        },
     }
     return jwt.encode(payload, settings.livekit_api_secret, algorithm=_LIVEKIT_ALG)
