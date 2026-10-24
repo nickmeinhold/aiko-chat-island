@@ -23,6 +23,7 @@ def _at_0009_with(tmp_path, monkeypatch, *, channels):
     channels already carry community_id=DEFAULT_COMMUNITY_ID."""
     db = tmp_path / "b2.db"
     monkeypatch.setattr(settings, "db_url", f"sqlite+aiosqlite:///{db}")
+    migrate._create_empty(db)  # a new database is made explicitly, never by a connect
     cfg = migrate._alembic_config()
     command.upgrade(cfg, "0008")
     sync_url = f"sqlite:///{db}"

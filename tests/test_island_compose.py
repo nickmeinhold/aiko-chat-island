@@ -262,7 +262,7 @@ STANDUP = REPO / "deploy" / "standup.sh"
 
 @pytest.mark.parametrize("door, first_compose", [
     (UPDATE, "$COMPOSE config --quiet"),
-    (STANDUP, "island_compose --build-overlay up -d --build"),
+    (STANDUP, "island_compose --build-overlay build"),  # then --new-island on a new volume, then up
 ])
 def test_every_multi_call_door_checks_and_snapshots_BEFORE_its_first_compose_call(door, first_compose) -> None:
     """Carnot r2: the r1 snapshot covered update.sh and missed standup.sh."""

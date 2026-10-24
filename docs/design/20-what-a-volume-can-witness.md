@@ -1,5 +1,17 @@
 # Design 20: what a volume can witness about itself
 
+> **SUPERSEDED 2026-10-24. Do not build from this.** Every mechanism below (the
+> sentinel, the tally, enrolment, the v5 ceremony record kept on the unmerged branch
+> `docs/design-20-v5-ceremony-record`) DETECTS the moment a lost database would come
+> back as a new, empty island. The replacement removes the code that did it: no door
+> to the database can create one (SQLite `mode=rw`, through
+> `worker_guard.open_only`), and `python -m aiko_gateway.migrate --new-island` is the
+> only way an island is born. Nothing creates, so there's nothing to detect. Four
+> review rounds and a design temper all hardened the detection frame, and none
+> questioned it. The record of that is kept here and in `20-TEMPER.md` on purpose. Nick
+> 2026-10-24: *"can't we just make it impossible to do? what's with all this
+> checking?"*
+
 Answers [#400](https://github.com/nickmeinhold/aiko-chat-island/issues/400) Q1–Q3 and
 Q7, with Q4–Q5 noted where the measurements reached them.
 

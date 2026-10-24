@@ -112,6 +112,36 @@ def test_the_harness_actually_runs_the_real_script(island) -> None:
     assert oct(island.env_file.stat().st_mode)[-3:] == "600", ".env must be owner-only"
 
 
+NEW_ISLAND = "chat-island python -m aiko_gateway.migrate --new-island"
+
+
+def _compose_calls(island) -> list[str]:
+    return [ln for ln in island.calls.read_text().splitlines() if ln.startswith("docker compose ")]
+
+
+def test_a_fresh_volume_creates_the_island_once_before_up(island) -> None:
+    """The gateway never creates a database when it starts, so the one moment an island
+    is born (this run created the volume) must make it explicitly, BEFORE `up`, or the
+    first start refuses MIGRATE_REFUSE_NO_DATABASE."""
+    island.run()
+    calls = _compose_calls(island)
+    births = [i for i, ln in enumerate(calls) if ln.endswith(NEW_ISLAND)]
+    ups = [i for i, ln in enumerate(calls) if ln.endswith(" up -d")]
+    assert len(births) == 1, f"expected exactly one --new-island, got {calls}"
+    assert " run --rm --no-deps " in calls[births[0]]
+    assert ups and births[0] < ups[0], "the island must exist before the gateway starts"
+
+
+def test_an_existing_volume_never_creates_an_island(island) -> None:
+    """A re-run, or a box whose volume already holds an island: `--new-island` must never
+    run (it would refuse on an existing db, but on a volume whose db was LOST it would
+    build a new, empty island, the exact outcome this exists to make impossible)."""
+    _stub(island.root.parent / "bin", "docker", f'echo "docker $*" >> "{island.calls}"\nexit 0\n')
+    island.run()
+    assert not [ln for ln in _compose_calls(island) if "--new-island" in ln]
+    assert [ln for ln in _compose_calls(island) if ln.endswith(" up -d")]
+
+
 def test_a_fresh_island_is_solo_and_quiet(island) -> None:
     island.run()
     v = _values(island)

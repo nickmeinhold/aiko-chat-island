@@ -50,9 +50,7 @@ from pathlib import Path
 
 _TRUTHY = {"1", "true", "yes", "on"}
 
-# Co-located with the DB and never deleted, so its presence also tells
-# `migrate.run()` that a gateway has lived on this volume (the volume sentinel's
-# bridge for volumes that predate `migrate`'s per-db `.aiko.db.initialized`).
+# Co-located with the DB and never deleted.
 LOCK_FILENAME = ".aiko-worker.lock"
 
 # Keep the acquired lock's fd alive for the whole process: closing it (or letting
@@ -69,9 +67,9 @@ def _multiworker_allowed() -> bool:
 
 def sqlite_file(db_url: str) -> Path | None:
     """The SQLite FILE behind a SQLAlchemy URL, or None when there is none (in-memory,
-    or a non-sqlite backend). The one derivation shared by this lock and
-    ``migrate``'s volume sentinel, so the two can't disagree about which directory a
-    db lives in (Carnot, PR#399 r3). Handles both spellings SQLite accepts: a plain
+    or a non-sqlite backend). The one derivation shared by this lock, ``open_only``
+    and ``migrate``, so they can't disagree about which file a db is (Carnot, PR#399
+    r3). Handles both spellings SQLite accepts: a plain
     path (``sqlite:////data/aiko.db``) and a URI filename
     (``sqlite:///file:/data/aiko.db?uri=true``, where ``mode=memory`` means no file)."""
     from urllib.parse import unquote, urlsplit
@@ -89,6 +87,30 @@ def sqlite_file(db_url: str) -> Path | None:
         if not name or name == ":memory:":
             return None
     return Path(name).resolve()
+
+
+def open_only(db_url: str) -> str:
+    """``db_url`` with its SQLite file opened OPEN-ONLY: ``mode=rw``, so a connect to a
+    file that isn't there FAILS instead of creating it. Every door to the database
+    goes through this (the app's engine, the migrator's engines, alembic's env.py), so
+    no start, request or hand-run ``alembic`` can ever make a new, empty island where
+    one was lost. Creating an island is a separate, explicit act
+    (``python -m aiko_gateway.migrate --new-island``). A URL with no file (in-memory,
+    non-sqlite) is returned unchanged; ``mode=ro`` is kept, since it can't create
+    either."""
+    from urllib.parse import quote
+
+    from sqlalchemy.engine import make_url
+
+    db = sqlite_file(db_url)
+    if db is None:
+        return db_url
+    url = make_url(db_url)
+    mode = "ro" if url.query.get("mode") == "ro" else "rw"
+    # Percent-encode: `?`, `#` and `%` in a path mean something in an SQLite URI.
+    return url.set(database=f"file:{quote(str(db), safe='/')}",
+                   query={**url.query, "mode": mode, "uri": "true"}
+                   ).render_as_string(hide_password=False)
 
 
 def _lock_path() -> Path | None:

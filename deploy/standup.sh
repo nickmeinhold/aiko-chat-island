@@ -298,10 +298,15 @@ fi
 # honest in both modes rather than saying "4/4" while a fifth step follows.
 TOTAL=4; [ "$DO_MEDIA" = "true" ] && TOTAL=5
 log "Step 1/$TOTAL — persistent data volume ($DATA_VOLUME)"
+# NEW_ISLAND is set ONLY where this run creates the volume: that is the one moment an
+# island is born. The gateway never creates a database when it starts, so step 3 makes
+# it explicitly (`migrate --new-island`), once, here, and never on a re-run.
+NEW_ISLAND="false"
 if docker volume inspect "$DATA_VOLUME" >/dev/null 2>&1; then
   ok "volume $DATA_VOLUME already exists — leaving it (never re-created; it holds the DB)"
 else
   docker volume create "$DATA_VOLUME" >/dev/null
+  NEW_ISLAND="true"
   ok "created external volume $DATA_VOLUME"
 fi
 
@@ -739,10 +744,21 @@ trap 'rm -f "${ENV_TMP:-}" "${IMAGE_TMP:-}" "${LK_ENV_STAGED:-}" "${KEYS_HAVE:-}
 # --- step 3: bring the island up (4 containers, 1 image + stock mosquitto) ---
 if [ "$FROM_SOURCE" = "true" ]; then
   log "Step 3/$TOTAL — building the island image from source + starting (gateway + broker + registrar + ChatServer)"
-  island_compose --build-overlay up -d --build
+  island_compose --build-overlay build
+  if [ "$NEW_ISLAND" = "true" ]; then
+    island_compose --build-overlay run --rm --no-deps chat-island python -m aiko_gateway.migrate --new-island \
+      || die "could not create the new island's database (see above)"
+    ok "created the new island's database"
+  fi
+  island_compose --build-overlay up -d
 else
   log "Step 3/$TOTAL — pulling the published island image + starting (gateway + broker + registrar + ChatServer)"
   island_compose pull
+  if [ "$NEW_ISLAND" = "true" ]; then
+    island_compose run --rm --no-deps chat-island python -m aiko_gateway.migrate --new-island \
+      || die "could not create the new island's database (see above)"
+    ok "created the new island's database"
+  fi
   island_compose up -d
 fi
 ok "compose stack started"

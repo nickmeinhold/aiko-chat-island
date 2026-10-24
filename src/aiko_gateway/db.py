@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.orm import DeclarativeBase
 
 from .config import settings
+from .worker_guard import open_only, sqlite_file
 
 
 class Base(DeclarativeBase):
@@ -63,8 +64,12 @@ def _tune_sqlite_concurrency(engine: AsyncEngine) -> None:
 def make_engine(url: str) -> AsyncEngine:
     """Build the async engine for ``url``, applying the SQLite concurrency tuning
     when the URL is SQLite. Factored out (not inlined) so tests can build a
-    prod-equivalent file-backed engine and exercise the real tuning (#12)."""
-    engine = create_async_engine(url, echo=False, pool_pre_ping=True)
+    prod-equivalent file-backed engine and exercise the real tuning (#12).
+
+    The file is opened OPEN-ONLY (``worker_guard.open_only``): the app can never
+    create a database, so a lost ``aiko.db`` fails every connect instead of coming
+    back as a new, empty island."""
+    engine = create_async_engine(open_only(url), echo=False, pool_pre_ping=True)
     if url.startswith("sqlite"):
         _tune_sqlite_concurrency(engine)
     return engine
@@ -82,8 +87,9 @@ SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=
 # One owner for the "not migrated at all" refusal, raised by whichever layer sees it
 # first, so the order of the two checks in verify_schema() cannot change what an
 # unmanaged DB is told (Noether, PR#392 r6). The fix it names is the one that works:
-# ``python -m aiko_gateway.migrate`` builds a fresh DB AND adopts a pre-alembic one,
-# where a bare ``alembic upgrade head`` dies on CREATE TABLE users.
+# ``python -m aiko_gateway.migrate`` adopts a pre-alembic DB (and, with
+# ``--new-island``, builds a new one), where a bare ``alembic upgrade head`` dies on
+# CREATE TABLE users.
 NOT_MIGRATED_MESSAGE = (
     "DB is not migrated: no alembic_version table. The container entrypoint runs "
     "`python -m aiko_gateway.migrate` before serving; if you are running uvicorn "
@@ -179,6 +185,13 @@ async def verify_schema() -> None:
     # columns _assert_schema_current inspects, and on that schema the shape check
     # would misdiagnose "behind the code, run upgrade head". The revision check knows
     # the schema is AHEAD and gives the working fix (Tesla, PR#392 r4).
+    from .migrate import no_database_message  # lazy: migrate imports db.Base (cycle)
+
+    db = sqlite_file(settings.db_url)
+    if db is not None and not db.exists():
+        # The message only: the engine is open-only, so the connect below could not
+        # have created the file either way. This names the cause and the fix.
+        raise RuntimeError(no_database_message(db))
     async with engine.connect() as conn:
         await conn.run_sync(_assert_at_head)
         await conn.run_sync(_assert_schema_current)

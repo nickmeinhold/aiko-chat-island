@@ -83,7 +83,7 @@ def test_migrations_match_models(tmp_path, monkeypatch) -> None:
     """The gate: upgrade head, then assert alembic sees NO difference between the
     migrated schema and the ORM metadata."""
     _, sync_url = _point_app_at(tmp_path, monkeypatch)
-    migrate.run()  # stamp-or-upgrade -> upgrade head on a fresh DB
+    migrate.run(new_island=True)  # stamp-or-upgrade -> upgrade head on a fresh DB
 
     engine = create_engine(sync_url)
     try:
@@ -112,7 +112,7 @@ def test_migrations_match_models(tmp_path, monkeypatch) -> None:
 
 def test_fresh_db_upgrades_to_head(tmp_path, monkeypatch) -> None:
     _, sync_url = _point_app_at(tmp_path, monkeypatch)
-    migrate.run()
+    migrate.run(new_island=True)
 
     engine = create_engine(sync_url)
     try:
@@ -194,6 +194,7 @@ def test_adopt_pre_alembic_db_stamps_baseline(tmp_path, monkeypatch) -> None:
     async_url, sync_url = _point_app_at(tmp_path, monkeypatch)
 
     # 1. Build a genuine pre-alembic DB AT the baseline schema, then un-manage it.
+    migrate._create_empty(tmp_path / "mig.db")  # a new database is made explicitly, never by a connect
     command.upgrade(migrate._alembic_config(), "0001")
     seed = create_engine(sync_url)
     try:
@@ -272,7 +273,7 @@ def test_unknown_revision_refuses_to_start(tmp_path, monkeypatch, keep_known_hea
     head beside the unknown row. Neither is mutated on the way out.
     """
     _, sync_url = _point_app_at(tmp_path, monkeypatch)
-    migrate.run()  # managed DB at head
+    migrate.run(new_island=True)  # managed DB at head
     before = _stamp_ahead(sync_url, keep_known_head=keep_known_head)
 
     with pytest.raises(RuntimeError, match="MIGRATE_REFUSE_UNKNOWN_REVISION"):
@@ -301,7 +302,7 @@ def test_both_boot_layers_refuse_a_forward_migrated_db(
     from aiko_gateway import db
 
     async_url, sync_url = _point_app_at(tmp_path, monkeypatch)
-    migrate.run()
+    migrate.run(new_island=True)
     _stamp_ahead(sync_url, keep_known_head=keep_known_head)
 
     with pytest.raises(RuntimeError, match="MIGRATE_REFUSE_UNKNOWN_REVISION") as refused:
@@ -341,7 +342,7 @@ def test_a_migrated_db_reads_head_and_lifespan_admits_it(tmp_path, monkeypatch) 
     from aiko_gateway import db
 
     async_url, _ = _point_app_at(tmp_path, monkeypatch)
-    migrate.run()
+    migrate.run(new_island=True)
     assert asyncio.run(migrate._schema_status()).state is migrate.SchemaState.HEAD
 
     engine = create_async_engine(async_url)
@@ -361,7 +362,7 @@ def test_migrator_reboot_at_head_is_a_quiet_no_op(tmp_path, monkeypatch) -> None
     import asyncio
 
     _, sync_url = _point_app_at(tmp_path, monkeypatch)
-    migrate.run()
+    migrate.run(new_island=True)
     before = _versions(sync_url)
     migrate.run()  # the reboot: must NOT raise
     assert _versions(sync_url) == before
@@ -402,7 +403,7 @@ def test_lifespan_refuses_a_users_table_missing_password_hash(tmp_path, monkeypa
     from aiko_gateway import db
 
     async_url, sync_url = _point_app_at(tmp_path, monkeypatch)
-    migrate.run()
+    migrate.run(new_island=True)
     seed = create_engine(sync_url)
     try:
         with seed.begin() as conn:
@@ -436,7 +437,7 @@ def test_lifespan_names_a_forward_schema_even_when_its_columns_changed(
     from aiko_gateway import db
 
     async_url, sync_url = _point_app_at(tmp_path, monkeypatch)
-    migrate.run()
+    migrate.run(new_island=True)
     _stamp_ahead(sync_url, keep_known_head=False)
     seed = create_engine(sync_url)
     try:
@@ -471,6 +472,7 @@ def test_lifespan_refuses_a_db_left_behind_head(tmp_path, monkeypatch) -> None:
     cfg = migrate._alembic_config()
     script = ScriptDirectory.from_config(cfg)
     one_short = script.get_revision(script.get_current_head()).down_revision
+    migrate._create_empty(tmp_path / "mig.db")  # a new database is made explicitly, never by a connect
     command.upgrade(cfg, one_short)  # derived, so the next migration can't age it
     assert asyncio.run(migrate._schema_status()).state is migrate.SchemaState.BEHIND
 
@@ -504,6 +506,7 @@ def test_adopt_refuses_to_stamp_a_mismatched_db(tmp_path, monkeypatch) -> None:
 
     async_url, sync_url = _point_app_at(tmp_path, monkeypatch)
 
+    migrate._create_empty(tmp_path / "mig.db")  # a new database is made explicitly, never by a connect
     command.upgrade(migrate._alembic_config(), "0001")  # genuine baseline schema
     seed = create_engine(sync_url)
     try:
@@ -543,6 +546,7 @@ def test_0023_backfills_existing_rows_from_the_island_setting(
     _, sync_url = _point_app_at(tmp_path, monkeypatch)
     monkeypatch.setattr(settings, "apns_use_sandbox", True, raising=False)
 
+    migrate._create_empty(tmp_path / "mig.db")  # a new database is made explicitly, never by a connect
     command.upgrade(migrate._alembic_config(), "0022")  # stop one short: no push_environment yet
     engine = create_engine(sync_url)
     try:
@@ -597,6 +601,7 @@ def test_0024_rename_preserves_the_value_a_live_row_already_carries(
     _, sync_url = _point_app_at(tmp_path, monkeypatch)
     monkeypatch.setattr(settings, "apns_use_sandbox", True, raising=False)
 
+    migrate._create_empty(tmp_path / "mig.db")  # a new database is made explicitly, never by a connect
     command.upgrade(migrate._alembic_config(), "0022")
     engine = create_engine(sync_url)
     try:
@@ -716,6 +721,7 @@ def test_the_0025_column_is_wide_enough_for_every_member(tmp_path, monkeypatch) 
     # THE EMITTED DDL, not the constant. Read VARCHAR(n) back out of the migrated
     # schema so a revision that passes a different width to sa.String() is caught.
     _async_url, sync_url = _point_app_at(tmp_path, monkeypatch)
+    migrate._create_empty(tmp_path / "mig.db")  # a new database is made explicitly, never by a connect
     command.upgrade(migrate._alembic_config(), "head")
     con = sqlite3.connect(sync_url.replace("sqlite:///", ""))
     ddl = con.execute(
@@ -747,6 +753,7 @@ def test_rows_written_at_0024_read_alert_at_0025(tmp_path, monkeypatch) -> None:
     _, sync_url = _point_app_at(tmp_path, monkeypatch)
     monkeypatch.setattr(settings, "apns_use_sandbox", True, raising=False)
 
+    migrate._create_empty(tmp_path / "mig.db")  # a new database is made explicitly, never by a connect
     command.upgrade(migrate._alembic_config(), "0024")  # stop one short
     engine = create_engine(sync_url)
     try:
@@ -825,6 +832,7 @@ def test_the_migrated_ddl_actually_carries_the_check(tmp_path, monkeypatch) -> N
     from aiko_gateway.domain.models import TokenKind, _in_check
 
     _async_url, sync_url = _point_app_at(tmp_path, monkeypatch)
+    migrate._create_empty(tmp_path / "mig.db")  # a new database is made explicitly, never by a connect
     command.upgrade(migrate._alembic_config(), "head")
 
     con = sqlite3.connect(sync_url.replace("sqlite:///", ""))
@@ -959,6 +967,7 @@ def test_downgrading_0025_refuses_while_a_voip_row_exists(tmp_path, monkeypatch)
     from aiko_gateway import migrate
 
     _async_url, sync_url = _point_app_at(tmp_path, monkeypatch)
+    migrate._create_empty(tmp_path / "mig.db")  # a new database is made explicitly, never by a connect
     command.upgrade(migrate._alembic_config(), "head")
     path = sync_url.replace("sqlite:///", "")
 
@@ -1061,6 +1070,7 @@ def test_the_0026_column_is_nullable_with_no_default(tmp_path, monkeypatch) -> N
     from sqlalchemy import create_engine, inspect
 
     _async_url, sync_url = _point_app_at(tmp_path, monkeypatch)
+    migrate._create_empty(tmp_path / "mig.db")  # a new database is made explicitly, never by a connect
     command.upgrade(migrate._alembic_config(), "head")
 
     engine = create_engine(sync_url, future=True)
@@ -1097,6 +1107,7 @@ def test_sender_kind_check_literal_matches_the_enum(tmp_path, monkeypatch) -> No
     from aiko_gateway.domain.models import SenderKind, _in_check
 
     _async_url, sync_url = _point_app_at(tmp_path, monkeypatch)
+    migrate._create_empty(tmp_path / "mig.db")  # a new database is made explicitly, never by a connect
     command.upgrade(migrate._alembic_config(), "head")
 
     con = sqlite3.connect(sync_url.replace("sqlite:///", ""))
@@ -1188,6 +1199,7 @@ def test_0027_renames_actor_rows_and_then_closes_the_set(tmp_path, monkeypatch) 
     from sqlalchemy.exc import IntegrityError
 
     _async_url, sync_url = _point_app_at(tmp_path, monkeypatch)
+    migrate._create_empty(tmp_path / "mig.db")  # a new database is made explicitly, never by a connect
     command.upgrade(migrate._alembic_config(), "0026")
 
     engine = create_engine(sync_url)
@@ -1322,6 +1334,7 @@ def test_every_in_check_constraint_reached_the_db_and_matches_its_enum(
     from sqlalchemy import CheckConstraint
 
     _async_url, sync_url = _point_app_at(tmp_path, monkeypatch)
+    migrate._create_empty(tmp_path / "mig.db")  # a new database is made explicitly, never by a connect
     command.upgrade(migrate._alembic_config(), "head")
     con = sqlite3.connect(sync_url.replace("sqlite:///", ""))
     try:
