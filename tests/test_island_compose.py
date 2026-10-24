@@ -47,6 +47,7 @@ def test_a_tag_pin_yields_that_tag() -> None:
 @pytest.mark.parametrize("images, why", [
     ("eclipse-mosquitto:2\n", "none of our services resolved"),
     (f"{OURS}:0.17.1@sha256:{'0' * 64}\n", "tag-plus-digest is a digest too (Noether r2)"),
+    (f"{OURS}:\n", "an empty tag is a bad pin, not an empty ref (Noether r3)"),
     (f"{OURS}:1\n{OURS}:2\n", "the services disagree; they must share one image"),
     (f"{OURS}@sha256:{'0' * 64}\n", "a digest names no git tag to compare against"),
     ("ghcrXio/nickmeinhold/aiko-chat-island:1\n", "a lookalike repo: the dots are literal"),
@@ -174,8 +175,12 @@ def test_REAL_compose_bare_call_refuses_and_the_wrapper_resolves(tmp_path: Path)
     assert bare.returncode != 0, "a bare call must not resolve any image"
     assert "deploy/compose.sh" in bare.stderr, bare.stderr
 
-    wrapped = subprocess.run([str(root / "deploy" / "compose.sh"), "config", "--images"],
-                             capture_output=True, text=True, env=env)
+    # Through the lib with DOCKER=docker, not deploy/compose.sh: the wrapper's
+    # island_docker_detect needs a DAEMON (`docker ps`), and `config` does not. Driving
+    # the door here made a stopped daemon read as a pin regression (Carnot + Noether r3).
+    wrapped = subprocess.run(
+        ["bash", "-c", f'ISLAND_ROOT="{root}"; DOCKER=docker; . "{LIB}"; island_compose config --images'],
+        capture_output=True, text=True, env=env)
     assert wrapped.returncode == 0, wrapped.stderr
     assert _ref(wrapped.stdout).stdout == "0.17.1\n"
 
@@ -221,6 +226,7 @@ def test_an_AMBIENT_pin_file_selector_is_ignored(tmp_path: Path) -> None:
     ("two pins in image.env", {"image": f"ISLAND_IMAGE={OURS}:1\nISLAND_IMAGE={OURS}:2\n"}, "exactly once"),
     ("an empty image.env", {"image": "# nothing\n"}, "exactly once"),
     ("an ISLAND_IMAGE line in .env", {"dotenv": f"ISLAND_IMAGE={OURS}:0.18.0\n"}, "carries an ISLAND_IMAGE line"),
+    ("interpolation in image.env", {"image": "ISLAND_IMAGE=" + OURS + ":${RELEASE_TAG}\n"}, "literal image reference"),
 ])
 def test_the_door_REFUSES_every_other_source_of_the_pin(tmp_path: Path, what, mutate, needle) -> None:
     """The class from PR#401 r2, enumerated: anything but image.env's one line steering
@@ -296,3 +302,24 @@ def test_standup_writes_the_new_pin_BEFORE_replacing_the_old_home() -> None:
     ISLAND_VERSION before image.env existed; the next run then pinned `edge`."""
     code = _code(STANDUP)
     assert code.index('mv "$IMAGE_TMP" "$IMAGE_ENV"') < code.index('mv "$ENV_TMP" "$ENV_FILE"')
+
+
+@pytest.mark.parametrize("args", [["--env-file", "other.env", "up"], ["-f", "x.yml", "up"], ["--project-directory", "/", "ps"]])
+def test_the_human_door_REFUSES_global_options_that_would_outrank_the_pin(tmp_path: Path, args) -> None:
+    """Tesla, PR#401 r3: a raw `--env-file other.env` lands after the pinned ones and wins."""
+    log = _fake_docker(tmp_path)
+    root = _island(tmp_path)
+    r = _run_wrapper(tmp_path, root, *args)
+    assert r.returncode != 0 and "global option" in r.stderr, r.stderr
+    assert not log.exists()
+
+
+def test_standup_refuses_an_exported_pin_BEFORE_writing_image_env() -> None:
+    """Tesla, PR#401 r3: checked after the write, the failed run left `edge` behind."""
+    code = _code(STANDUP)
+    assert code.index("island_refuse_ambient_pin ||") < code.index('mv "$IMAGE_TMP" "$IMAGE_ENV"')
+
+
+def test_update_sh_resolves_symlinks_before_locating_its_lib() -> None:
+    code = _code(UPDATE)
+    assert code.index('while [ -L "$_src" ]; do') < code.index('SCRIPT_DIR="$(cd -P "$(dirname "$_src")" && pwd)"')

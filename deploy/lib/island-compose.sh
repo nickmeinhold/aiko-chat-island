@@ -71,14 +71,22 @@ island_docker_detect() {
 #   - the pin file's path from the environment              -> impossible: see unset above
 #   - the live file read more than once per run             -> island_pin_begin
 # Returns 1 with the reason on stderr; the caller dies.
-island_require_pin() {
-  local f="${ISLAND_ROOT:?}/image.env" v bad
+# Separate from island_require_pin so a door that WRITES image.env can refuse before it
+# writes anything: standup chose `edge`, wrote it, and only then found the export, so the
+# re-run kept the pin it should never have written (Tesla, PR#401 r3).
+island_refuse_ambient_pin() {
+  local v
   for v in ISLAND_IMAGE ISLAND_VERSION; do
     if [ -n "${!v+set}" ]; then
-      echo "$v is set in this shell's environment. It is ignored: the image comes only from $f. Unset it (or edit that file instead) and re-run." >&2
+      echo "$v is set in this shell's environment. It is ignored: the image comes only from ${ISLAND_ROOT:?}/image.env. Unset it (or edit that file instead) and re-run." >&2
       return 1
     fi
   done
+}
+
+island_require_pin() {
+  local f="${ISLAND_ROOT:?}/image.env" bad
+  island_refuse_ambient_pin || return 1
   if [ ! -r "$f" ]; then
     {
       echo "no readable $f — the image this island runs is pinned there (claude-tasks#5165)."
@@ -102,10 +110,28 @@ island_require_pin() {
     echo "$f must assign ISLAND_IMAGE exactly once." >&2
     return 1
   fi
+  # A literal, never an expression: `…:${RELEASE_TAG}` would be resolved from .env on EVERY
+  # compose call, so the snapshot would freeze the expression and not the image (Carnot, r3).
+  if LC_ALL=C grep -aq '\$' "$f"; then
+    echo "$f must hold a literal image reference; it contains '\$' (interpolation would read .env on every compose call)." >&2
+    return 1
+  fi
   if [ -f "$ISLAND_ROOT/.env" ] && LC_ALL=C grep -aqE '^[[:space:]]*(export[[:space:]]+)?ISLAND_IMAGE[[:space:]]*=' "$ISLAND_ROOT/.env"; then
     echo "$ISLAND_ROOT/.env carries an ISLAND_IMAGE line. The pin lives in image.env only; a copy in .env would satisfy a bare docker compose and survive edits to image.env. Remove it." >&2
     return 1
   fi
+}
+
+# The human door passes its raw arguments, so a leading global option would sit AFTER the
+# pinned ones and win: `--env-file other.env` would override image.env and the secrets,
+# `-f other.yml` would merge another file over the pinned one (Tesla, PR#401 r3). Global
+# options belong to the wrapper; the caller supplies a subcommand first.
+island_refuse_global_options() {
+  case "${1:-}" in
+    --build-overlay) ;;
+    -*) echo "deploy/compose.sh takes a compose SUBCOMMAND first (ps, logs, up …); global option '$1' is refused: the wrapper owns -f/--env-file/--project-directory." >&2
+        return 1 ;;
+  esac
 }
 
 # usage: island_compose [--build-overlay] <compose subcommand and args…>
@@ -174,5 +200,12 @@ island_ref_from_images() {
       echo "image.env pins a digest ($ours); the drift guard compares against a git tag and a digest does not name one" >&2
       return 1 ;;
   esac
-  printf '%s\n' "${ours#"$ISLAND_REPO":}"
+  local tag="${ours#"$ISLAND_REPO":}"
+  # An empty tag (`…aiko-chat-island:`) must be named as a bad PIN here, not reach the
+  # guard as an empty argument and surface as its usage error (Noether, r3).
+  if [ -z "$tag" ]; then
+    echo "image.env names $ISLAND_REPO with an EMPTY tag ($ours). Write the release, e.g. ${ISLAND_REPO}:0.17.1" >&2
+    return 1
+  fi
+  printf '%s\n' "$tag"
 }

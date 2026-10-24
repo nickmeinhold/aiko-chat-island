@@ -31,7 +31,15 @@ ok()   { printf '%s  ok%s %s\n' "$c_grn"  "$c_rst" "$*"; }
 warn() { printf '%s warn%s %s\n' "$c_ylw" "$c_rst" "$*" >&2; }
 die()  { printf '%s fail%s %s\n' "$c_red" "$c_rst" "$*" >&2; exit 1; }
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve symlinks before dirname, as standup.sh and compose.sh do: through a ~/bin
+# shortcut, SCRIPT_DIR would be the link's directory, the lib would look missing, and the
+# partial-sync refusal would prescribe a sync that is wrong here (Tesla, PR#401 r3).
+_src="${BASH_SOURCE[0]}"
+while [ -L "$_src" ]; do
+  _d="$(cd -P "$(dirname "$_src")" && pwd)"; _src="$(readlink "$_src")"
+  case "$_src" in /*) ;; *) _src="$_d/$_src" ;; esac
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$_src")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 [ -f docker-compose.yml ] || die "docker-compose.yml not found in $REPO_ROOT"

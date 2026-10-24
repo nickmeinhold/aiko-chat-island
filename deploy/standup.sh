@@ -696,6 +696,10 @@ ISLAND_ROOT="$REPO_ROOT"; DOCKER="docker"   # standup already requires in-group 
 # shellcheck source=lib/island-compose.sh
 . "$SCRIPT_DIR/lib/island-compose.sh"
 IMAGE_ENV="$REPO_ROOT/image.env"
+# BEFORE anything is written: an exported pin must refuse while there is still nothing to
+# keep. Checked after writing, a first standup recorded `edge` and died, and the re-run
+# then kept that file as the operator's choice (Tesla, PR#401 r3).
+island_refuse_ambient_pin || die "refusing before writing any image pin (see above)"
 if [ -e "$IMAGE_ENV" ]; then
   [ -z "$ISLAND_TAG" ] || warn "--version $ISLAND_TAG IGNORED: $IMAGE_ENV already exists and a
      re-run never rewrites it. To change releases, edit that file and run deploy/update.sh."
