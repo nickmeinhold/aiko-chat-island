@@ -10,8 +10,9 @@
 
 ## Summary
 
-An island runs `ghcr.io/nickmeinhold/aiko-chat-island:${ISLAND_VERSION}`, pinned
-in its own host `.env`. There is **no `build:` key in `docker-compose.yml`** and no
+An island runs `ghcr.io/nickmeinhold/aiko-chat-island:<tag>`, pinned in its own
+host files (`ISLAND_VERSION` in `.env` until ct#5165; since then `ISLAND_IMAGE` in a
+box-local `image.env`, outside SOPS). There is **no `build:` key in `docker-compose.yml`** and no
 compiler on the box. CI publishes a multi-arch image; each island pulls it on its
 own schedule. **CI holds an artifact, never production credentials.**
 
@@ -42,7 +43,8 @@ Shipping a fix is four steps, in order:
    repos get free arm64 hosted runners, so no QEMU emulation of a crypto-heavy
    image), pushes each by digest, and stitches them into one multi-arch manifest.
    `edge` tracks `main`; `latest` follows semver only.
-3. Bump `ISLAND_VERSION` in the box's `.env`.
+3. Set `ISLAND_IMAGE` in the box's `image.env` (before ct#5165: `ISLAND_VERSION` in
+   `.env`, which cost a SOPS re-lift per release).
 4. Run `deploy/update.sh` — **backup-first and fail-closed**: it takes an online
    hot copy of the SQLite store and aborts before touching anything if the backup
    does not land, then `compose pull && up -d`, then verifies `/health`.

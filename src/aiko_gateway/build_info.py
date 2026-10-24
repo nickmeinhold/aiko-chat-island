@@ -1,7 +1,8 @@
 """What code is actually running in this container.
 
-An island could not previously answer that about itself. `ISLAND_VERSION` exists
-only as a compose-side variable on the box; nothing in the application ever read
+An island could not previously answer that about itself. The image pin
+(`ISLAND_IMAGE` in the box's image.env; `ISLAND_VERSION` in .env before
+claude-tasks#5165) exists only as a compose-side variable on the box; nothing in the application ever read
 it, so no endpoint named the running code. The question "which version is on that
 box" was answerable only by SSH — and `deploy/update.sh` pulls the image without
 syncing `docker-compose.yml` (#2301), so the file you'd read there is not

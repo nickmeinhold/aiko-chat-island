@@ -47,6 +47,11 @@
 #                         turn.<host>, and handing clients the TURN name as LIVEKIT_URL
 #                         points them at the wrong endpoint.
 #   --from-source         build the island image from this checkout instead of pulling
+#   --version <tag>       the release to run (e.g. 0.17.1). Written to image.env ONLY when
+#                         that file does not exist yet: image.env is the operator's, and a
+#                         re-run never rewrites it. Omitted on a first standup: `edge`
+#                         (tracks main), said aloud. Change releases later by editing
+#                         image.env and running deploy/update.sh.
 #   --yes                 non-interactive; fail instead of prompting for missing values
 
 set -euo pipefail
@@ -77,7 +82,7 @@ cd "$REPO_ROOT"
 # value (deploy/resolve-gateway-env.sh); "[]" / "false" are real choices that win.
 # Collapsing those two is #3734 — a re-run silently dropped the federation link.
 DOMAIN=""; DISPLAY_NAME=""; SEED_PEERS=""; ENABLE_PASSKEYS=""; DO_TLS="true"; INTERACTIVE="true"; FROM_SOURCE="false"
-DROP_ENV_KEYS=""
+DROP_ENV_KEYS=""; ISLAND_TAG=""
 # Media is OFF by default, unlike TLS. An island without HTTPS is broken; an island
 # without an SFU is a supported configuration the code already models
 # (livekit_tokens.is_configured() -> 503 "capability disabled"). Defaulting it ON
@@ -116,6 +121,7 @@ while [ $# -gt 0 ]; do
     # AVAILABILITY when refusal has no escape — two different axes).
     --drop-env-keys)  DROP_ENV_KEYS="${2:?--drop-env-keys needs a comma-separated key list}"; shift 2 ;;
     --from-source)    FROM_SOURCE="true"; shift ;;
+    --version)        ISLAND_TAG="${2:?--version needs a tag, e.g. 0.17.1}"; shift 2 ;;
     --yes)            INTERACTIVE="false"; shift ;;
     -h|--help)        sed -n '2,/^set -euo/p' "$0" | sed 's/^# \{0,1\}//;/^set -euo/d'; exit 0 ;;
     *)                die "unknown argument: $1 (see --help)" ;;
@@ -148,7 +154,7 @@ need() { command -v "$1" >/dev/null 2>&1 || die "missing required tool: $1"; }
 # would otherwise strand a readable secret under an unexpected name beside the real file.
 # One trap covers every exit; after a successful rename the staged paths no longer exist,
 # so it is a no-op on the happy path. Set BEFORE the first mktemp, not beside it.
-trap 'rm -f "${ENV_TMP:-}" "${LK_ENV_STAGED:-}" "${KEYS_HAVE:-}" "${KEYS_WANT:-}" "${KEYS_DROPPED:-}" "${KEYS_ACKED:-}" 2>/dev/null || true' EXIT
+trap 'rm -f "${ENV_TMP:-}" "${IMAGE_TMP:-}" "${LK_ENV_STAGED:-}" "${KEYS_HAVE:-}" "${KEYS_WANT:-}" "${KEYS_DROPPED:-}" "${KEYS_ACKED:-}" 2>/dev/null || true' EXIT
 
 # Declared so a missing tool is a clear refusal at startup rather than a puzzling failure
 # mid-run. This list is NOT what makes the key-loss guard safe — dotenv_keys owns that
@@ -428,6 +434,12 @@ fi
 
 log "Step 2/$TOTAL — writing .env (island identity + secrets)"
 ENV_FILE="$REPO_ROOT/.env"
+# A box from before claude-tasks#5165 recorded its release here as ISLAND_VERSION.
+# Captured NOW, before the rewrite below: dropping that key from .env (--drop-env-keys
+# ISLAND_VERSION, which the key-loss guard requires on such a box) would otherwise erase
+# the pin before the image.env step could carry it forward, and that step would pin
+# `edge` — moving an existing island to main, silently. Found by this change's own test.
+LEGACY_TAG="$(dotenv_read "$ENV_FILE" ISLAND_VERSION)"
 
 # Preserve an explicit ISLAND_ID across re-runs. standup has never emitted one — the id
 # falls back to being derived from the base-url host — but the manual-standup recipe in
@@ -554,9 +566,9 @@ chmod 600 "$ENV_TMP"
 # by the `mv` below. Measured against the two live islands when this was written: a
 # documented unflagged re-run would have taken 15 keys off one box and 11 off the other,
 # including ISLAND_SIGNING_SEED and APNS_PRIVATE_KEY — secrets that exist nowhere else and
-# cannot be re-derived — and would have reverted ISLAND_VERSION to the compose default
-# `edge`, so the next `up -d` pulls main instead of the pinned tag. A config-preservation
-# bug that ends in an unpinned deploy.
+# cannot be re-derived — and (before claude-tasks#5165 moved the pin to image.env) would
+# have reverted ISLAND_VERSION to the compose default `edge`, so the next `up -d` pulled
+# main instead of the pinned tag. A config-preservation bug that ends in an unpinned deploy.
 #
 # #3734 fixed two instances of this by adding read-back, one key at a time as each was
 # discovered. That approach re-arms the moment anyone adds a key to a box, which is
@@ -665,6 +677,52 @@ if [ -n "${_dropped// /}" ]; then
   claude-tasks#4437. (#3921 is closed, but it closed on this refusal, not on that fix.)"
 fi
 
+# --- the image pin: image.env, the operator's file (claude-tasks#5165) --------
+#
+# The pin used to be ISLAND_VERSION in .env, which made every release a SOPS re-lift and
+# let a missing pin mean `edge` silently. It is now one full reference in image.env, and
+# compose refuses without it (deploy/lib/island-compose.sh has the whole account).
+#
+# ORDER IS THE GUARANTEE: this runs BEFORE .env is replaced. On a pre-#5165 box the
+# .env rewrite drops ISLAND_VERSION (--drop-env-keys), so if .env were renamed first an
+# abort in between (Ctrl-C, a full disk) would leave neither home holding the pin, and
+# the next run would find no image.env and no legacy line and pin `edge`. The old home
+# must not vanish until the new one exists (Tesla, PR#401 r1).
+#
+# Written ONLY IF ABSENT. image.env belongs to the operator (and later to design 18's
+# watcher); this script's re-run promise is "leave recorded choices alone", and the
+# release an island runs is the most consequential choice it records.
+ISLAND_ROOT="$REPO_ROOT"; DOCKER="docker"   # standup already requires in-group docker (preflight)
+# shellcheck source=lib/island-compose.sh
+. "$SCRIPT_DIR/lib/island-compose.sh"
+IMAGE_ENV="$REPO_ROOT/image.env"
+# BEFORE anything is written: an exported pin must refuse while there is still nothing to
+# keep. Checked after writing, a first standup recorded `edge` and died, and the re-run
+# then kept that file as the operator's choice (Tesla, PR#401 r3).
+island_refuse_ambient_pin || die "refusing before writing any image pin (see above)"
+if [ -e "$IMAGE_ENV" ]; then
+  [ -z "$ISLAND_TAG" ] || warn "--version $ISLAND_TAG IGNORED: $IMAGE_ENV already exists and a
+     re-run never rewrites it. To change releases, edit that file and run deploy/update.sh."
+  ok "image pin kept: $IMAGE_ENV"
+else
+  if [ -z "$ISLAND_TAG" ]; then
+    # A box from before #5165 recorded its release in .env (captured before the .env
+    # rewrite, see LEGACY_TAG). Carry THAT forward, so a re-run on an existing island
+    # does not quietly move it to main.
+    ISLAND_TAG="$LEGACY_TAG"
+    [ -z "$ISLAND_TAG" ] || ok "image pin taken from .env's ISLAND_VERSION ($ISLAND_TAG)"
+  fi
+  if [ -z "$ISLAND_TAG" ]; then
+    ISLAND_TAG="edge"
+    warn "no --version given: pinning 'edge', which tracks main. Pass --version <tag> for a
+     release, or edit $IMAGE_ENV later."
+  fi
+  IMAGE_TMP="$(mktemp "$REPO_ROOT/.image.env.XXXXXX")"
+  printf 'ISLAND_IMAGE=%s:%s\n' "$ISLAND_REPO" "$ISLAND_TAG" > "$IMAGE_TMP"
+  mv "$IMAGE_TMP" "$IMAGE_ENV"
+  ok "wrote $IMAGE_ENV (ISLAND_IMAGE=$ISLAND_REPO:$ISLAND_TAG)"
+fi
+
 mv "$ENV_TMP" "$ENV_FILE"
 ok "wrote $ENV_FILE (mode 600, via atomic rename)"
 if [ -n "${LK_ENV_STAGED:-}" ]; then
@@ -672,14 +730,20 @@ if [ -n "${LK_ENV_STAGED:-}" ]; then
   ok "wrote $LK_ENV_TARGET (mode 600, via atomic rename)"
 fi
 
+# The same precondition and one-pin-per-run snapshot every door uses (deploy/lib):
+# step 3's pull and up must resolve ONE pin (Carnot, PR#401 r2).
+island_require_pin || die "no usable image pin (see above)"
+island_pin_begin || die "could not snapshot image.env"
+trap 'rm -f "${ENV_TMP:-}" "${IMAGE_TMP:-}" "${LK_ENV_STAGED:-}" "${KEYS_HAVE:-}" "${KEYS_WANT:-}" "${KEYS_DROPPED:-}" "${KEYS_ACKED:-}" "${_island_pin_file:-}" 2>/dev/null || true' EXIT
+
 # --- step 3: bring the island up (4 containers, 1 image + stock mosquitto) ---
 if [ "$FROM_SOURCE" = "true" ]; then
   log "Step 3/$TOTAL — building the island image from source + starting (gateway + broker + registrar + ChatServer)"
-  docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+  island_compose --build-overlay up -d --build
 else
   log "Step 3/$TOTAL — pulling the published island image + starting (gateway + broker + registrar + ChatServer)"
-  docker compose pull
-  docker compose up -d
+  island_compose pull
+  island_compose up -d
 fi
 ok "compose stack started"
 
@@ -694,7 +758,7 @@ done
 if [ "$health_ok" = "true" ]; then
   ok "gateway healthy on 127.0.0.1:8095 (schema migrated to head)"
 else
-  warn "gateway did not answer /health within ~60s. Inspect: docker compose logs chat-island"
+  warn "gateway did not answer /health within ~60s. Inspect: deploy/compose.sh logs chat-island"
 fi
 
 # --- step 5: TLS via Caddy (optional) --------------------------------------
@@ -771,8 +835,8 @@ Next steps:
                    (press Watch -> Custom -> Releases to be emailed). This island also
                    logs a line when a newer BREAKING release exists; set
                    ISLAND_UPDATE_NUDGE to minor or all to hear about more, or off to
-                   stop it checking. To take an update: bump ISLAND_VERSION in .env
-                   and run deploy/update.sh.
+                   stop it checking. To take an update: edit ISLAND_IMAGE in image.env
+                   and run deploy/update.sh. Run compose as deploy/compose.sh.
 
 Re-running this script is safe: it won't rotate your JWT secret, wipe data, or
   reset the choices already recorded in .env (federation peers, passkey sign-in).

@@ -5,7 +5,7 @@
 # locally from THIS checkout instead — for a fork, an unreleased change, or an
 # air-gapped host that can't reach GHCR:
 #
-#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+#   deploy/compose.sh --build-overlay up -d --build
 #
 # Only `chat-island` carries `build:`. All three aiko roles share ONE image tag,
 # so building it once produces the exact tag `registrar` and `chat` reference —
@@ -16,4 +16,4 @@ name: aiko
 services:
   chat-island:
     build: .
-    image: ghcr.io/nickmeinhold/aiko-chat-island:${ISLAND_VERSION:-edge}
+    image: "${ISLAND_IMAGE:?ISLAND_IMAGE is unset - the pin lives in image.env; run deploy/compose.sh, not bare docker compose}"

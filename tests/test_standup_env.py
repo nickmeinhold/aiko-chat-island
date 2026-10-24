@@ -100,7 +100,15 @@ def test_the_harness_actually_runs_the_real_script(island) -> None:
     against a missing file. Pin that the real script ran and produced a real .env."""
     island.run()
     assert island.env_file.exists(), "standup.sh wrote no .env — the rest of this file is void"
-    assert "docker compose up -d" in island.calls.read_text(), "the script never reached compose up"
+    ups = [ln for ln in island.calls.read_text().splitlines()
+           if ln.startswith("docker compose ") and ln.endswith(" up -d")]
+    assert ups, "the script never reached compose up"
+    assert all(f"--env-file {island.root}/.env --env-file " in ln and "/aiko-image-env." in ln
+               for ln in ups), (
+        "compose up must see the image pin, through the run's snapshot of image.env "
+        "(claude-tasks#5165; Carnot PR#401 r2)")
+    assert (island.root / "image.env").read_text().startswith("ISLAND_IMAGE="), (
+        "a first standup must write the image pin")
     assert oct(island.env_file.stat().st_mode)[-3:] == "600", ".env must be owner-only"
 
 
@@ -841,3 +849,43 @@ def test_the_totality_test_reads_the_list_and_not_the_prose(island) -> None:
         f"parsed {sorted(reported)} from a run with exactly one key at risk — the parser "
         "is picking up prose, so the totality assertion would be satisfied by boilerplate"
     )
+
+
+# --- the image pin (claude-tasks#5165) ------------------------------------
+
+def _pin(island) -> str:
+    return (island.root / "image.env").read_text()
+
+
+def test_a_first_standup_pins_the_version_it_was_given(island) -> None:
+    island.run("--version", "0.17.1")
+    assert _pin(island) == "ISLAND_IMAGE=ghcr.io/nickmeinhold/aiko-chat-island:0.17.1\n"
+
+
+def test_no_version_pins_edge_EXPLICITLY_and_says_so(island) -> None:
+    r = island.run()
+    assert _pin(island) == "ISLAND_IMAGE=ghcr.io/nickmeinhold/aiko-chat-island:edge\n"
+    assert "tracks main" in r.stderr, "pinning main must be said aloud, not implied"
+
+
+def test_a_rerun_NEVER_rewrites_the_operators_pin(island) -> None:
+    island.run("--version", "0.17.1")
+    (island.root / "image.env").write_text("ISLAND_IMAGE=ghcr.io/nickmeinhold/aiko-chat-island:0.18.0\n")
+    r = island.run("--version", "0.1.0")
+    assert _pin(island) == "ISLAND_IMAGE=ghcr.io/nickmeinhold/aiko-chat-island:0.18.0\n"
+    assert "IGNORED" in r.stderr, "a --version that does nothing must say so"
+
+
+def test_a_pre_5165_box_carries_its_ISLAND_VERSION_forward(island) -> None:
+    """Without this, re-running standup on an island from before the move would
+    find no image.env and pin `edge`: the silent move-to-main #5165 exists to end."""
+    island.run("--version", "0.17.1")
+    (island.root / "image.env").unlink()
+    with island.env_file.open("a") as f:
+        f.write("ISLAND_VERSION=0.16.1\n")
+    # The key-loss guard requires naming the key standup no longer writes. That drop is
+    # exactly the case that matters: it removes the old pin from .env BEFORE the
+    # image.env step runs, so the step must have read it first.
+    island.run("--drop-env-keys", "ISLAND_VERSION")
+    assert "ISLAND_VERSION" not in island.env_file.read_text()
+    assert _pin(island) == "ISLAND_IMAGE=ghcr.io/nickmeinhold/aiko-chat-island:0.16.1\n"

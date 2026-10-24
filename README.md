@@ -105,7 +105,8 @@ curl localhost:8095/health    # {"status":"ok",...}
 ```
 
 You can run the full island (broker + registrar + ChatServer) with
-`docker compose up -d --build` instead — see [Deployment](#deployment).
+`deploy/compose.sh --build-overlay up -d --build` instead (after writing an
+`image.env`) — see [Deployment](#deployment).
 
 > **Dev deliberately runs the same SQLite engine as prod**, so local work
 > exercises SQLite's real behaviour (single-writer locking, type affinity, CHECK
@@ -201,11 +202,13 @@ Load-bearing facts (still true, grounded against the live hosts):
   `sqlite3` CLI; backups use Python's online `.backup()`
   (see [`docs/runbooks/backup-and-rollback.md`](docs/runbooks/backup-and-rollback.md)).
 - The entrypoint migrates before serving; a failed migration fails the container.
-- Pin a version with `ISLAND_VERSION` (default `edge` tracks `main`); `:latest`
-  tracks the newest `v*` release tag.
+- The image is pinned in a box-local `image.env`
+  (`ISLAND_IMAGE=ghcr.io/nickmeinhold/aiko-chat-island:<tag>`), not in `.env`, and
+  there is no default: run compose through `deploy/compose.sh`, which passes both
+  files. `edge` tracks `main`; `:latest` tracks the newest `v*` release tag.
 
 > Both live islands (`chat.imagineering.cc`, `chat.enspyr.co`) run the published
-> image, pinned `ISLAND_VERSION=0.1.0` (cut over 2026-07-11). Update them with
+> image (cut over 2026-07-11). Update them by editing `image.env` and running
 > `deploy/update.sh` — no more build-on-host.
 
 ## Testing

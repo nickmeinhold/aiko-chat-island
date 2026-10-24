@@ -3,7 +3,7 @@
 > **HISTORICAL — DO NOT EXECUTE the deploy steps below.** This records the June 2026
 > build-on-host procedure (rsync + `--build`, alembic 0007→0008, a one-time project
 > cutover). Its revision numbers, commit hashes and step-by-step commands are fossils.
-> The fleet deploys pull-based since ISL-0003 (`ISLAND_VERSION` + `deploy/update.sh`).
+> The fleet deploys pull-based since ISL-0003 (`image.env` + `deploy/update.sh`).
 > Current backup + rollback: [`runbooks/backup-and-rollback.md`](runbooks/backup-and-rollback.md).
 > The passkey device e2e (Step 4) is still the reference for that ceremony.
 

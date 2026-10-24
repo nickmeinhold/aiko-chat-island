@@ -70,11 +70,12 @@ def test_parse_version(raw, expected):
 def test_render_names_the_action_and_the_off_switch():
     line = render_nudge("v0.9.4", "v1.0.0", "https://example.test/r")
     for must in ("v1.0.0", "v0.9.4", "https://example.test/r",
-                 "ISLAND_VERSION", "deploy/update.sh", "will NOT update itself",
+                 "image.env", "deploy/update.sh", "will NOT update itself",
                  "ISLAND_UPDATE_NUDGE=off"):
         assert must in line, f"the operator-facing line must name {must!r}"
-    assert "1.0.0" in line and "ISLAND_VERSION in .env to 1.0.0" in line, (
-        "the value to paste must be the IMAGE tag (no leading v), not the git tag")
+    assert "ISLAND_IMAGE=ghcr.io/nickmeinhold/aiko-chat-island:1.0.0 " in line, (
+        "the line to paste must be the full image.env line, with the IMAGE tag "
+        "(no leading v), not the git tag")
 
 
 # --------------------------------------------------------- the fail-open contract

@@ -24,8 +24,10 @@ file is the working-context that isn't obvious from the code.
   97% of that stopped when its CI was deleted on 2026-08-17. Detail:
   `memory/reference_gha_timing_endpoint_reports_zero_billable.md`.
 - **Deploy is PULL-BASED; `--build` is wrong here** — there is NO `build:` on the
-  box. Ship a fix: merge → cut `vX.Y.Z` → bump the box's `ISLAND_VERSION` →
-  `deploy/update.sh`. **`update.sh` pulls the IMAGE and still does NOT sync
+  box. Ship a fix: merge → cut `vX.Y.Z` → set the box's `image.env`
+  (`ISLAND_IMAGE=ghcr.io/…:X.Y.Z`; the pin left SOPS in ct#5165, so a release needs
+  no re-lift) → `deploy/update.sh`. On the box run compose as `deploy/compose.sh …`:
+  a bare `docker compose` cannot see the pin and refuses. **`update.sh` pulls the IMAGE and still does NOT sync
   `docker-compose.yml`** — the box's copy is a separate artifact and has drifted
   before (#2301). Since #4230 it **refuses to deploy on drift** rather than
   discovering it: `deploy/preflight-compose-drift.sh` fetches the tag being
