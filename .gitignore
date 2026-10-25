@@ -26,3 +26,6 @@ deploy/livekit/.env
 # `island standup` writes .env / image.env via <name>.standup-* temporaries; one
 # stranded by a SIGKILL can hold the JWT secret, so it must never be committable.
 *.standup-*
+# `island configure` proves its edit in .env.configure-* before renaming it over .env;
+# one stranded by a SIGKILL holds EVERY secret in .env (signing seed, APNs key).
+*.configure-*

@@ -147,6 +147,8 @@ a Dart SDK. The same properties hold as for the image:
 - **No credentials in CI:** the box pulls the binary, exactly as it pulls the image.
 
 The first such tool is `island standup` (a NEW island only; it refuses on a box that
-has one). `deploy/standup.sh` stays as a supported front end for operators who prefer
+has one). The second is `island configure`, which changes a live island's name, peers or
+passkey switch by editing its `.env` in place, and publishes the edit only after
+`docker compose config` reads the old and new files as differing in exactly those keys. `deploy/standup.sh` stays as a supported front end for operators who prefer
 bash (Nick: "we can have a bash script for people that love bash"); both perform the
 same birth, and a test pins the two birth scripts byte for byte.

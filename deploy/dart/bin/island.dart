@@ -3,13 +3,14 @@
 /// keeps toolchains off the box, not executables (amended 2026-10-25).
 ///
 ///   island standup ...    stand up a NEW island on a box that has none
-///   island configure ...  change a live island's settings (not built yet)
+///   island configure ...  change a live island's settings, editing its .env
 ///
 /// Run from the island checkout: the directory holding docker-compose.yml.
 library;
 
 import 'dart:io';
 
+import 'package:island_deploy/configure.dart';
 import 'package:island_deploy/standup.dart';
 
 const _help = '''
@@ -17,22 +18,42 @@ island: operator tool for an aiko island box
 
   island standup --domain <host> --name "<label>" [options]
       Stand up a NEW island. Refuses if this box already has one.
-  island configure
-      Change a live island's settings (not built yet: until it is, re-run
-      deploy/standup.sh with the flag to change).
+  island configure [--name ...] [--seed-peers ...] [--enable-passkeys | --no-passkeys]
+      Change a live island's settings. With no options, print them.
 
-Run `island standup --help` for standup's options.''';
+Run `island standup --help` or `island configure --help` for the options.''';
+
+/// `exit` does not wait for buffered output; a piped stdout could lose the end of
+/// a refusal (Noether, PR#407 r2).
+Future<void> _flush() => Future.wait([stdout.flush(), stderr.flush()]);
+
+/// Whether [args] ask for help: `-h`/`--help` as an argument, never as the value of
+/// a flag that takes one (`--name -h` names an island "-h"; it must not print help
+/// and exit 0 having changed nothing, Noether, PR#407 r3).
+bool _wantsHelp(List<String> args) {
+  const takesValue = {'--domain', '--name', '--seed-peers', '--version'};
+  for (var i = 0; i < args.length; i++) {
+    if (takesValue.contains(args[i])) {
+      i++;
+    } else if (args[i] == '-h' || args[i] == '--help') {
+      return true;
+    }
+  }
+  return false;
+}
 
 Future<void> main(List<String> args) async {
   if (args.isEmpty || args.first == '-h' || args.first == '--help') {
     stdout.writeln(_help);
+    await _flush();
     exit(args.isEmpty ? 64 : 0);
   }
   switch (args.first) {
     case 'standup':
       final rest = args.sublist(1);
-      if (rest.contains('-h') || rest.contains('--help')) {
+      if (_wantsHelp(rest)) {
         stdout.writeln(usage);
+        await _flush();
         exit(0);
       }
       try {
@@ -45,23 +66,53 @@ Future<void> main(List<String> args) async {
           probe: probeHealth,
         ).run(opts);
         // 0 only for "up and confirmed"; the mapping lives in the library, tested.
+        await _flush();
         exit(exitCodeFor(result));
       } on Refusal catch (e) {
         stderr.writeln(' fail ${e.message}');
+        await _flush();
         exit(1);
       } on Object catch (e) {
         // Anything before the birth (after it, run() reports what it created).
         stderr.writeln(' fail unexpected error, nothing reported as done: $e');
+        await _flush();
         exit(1);
       }
     case 'configure':
-      stderr.writeln(
-        'island configure is not built yet. Until it is, change a live '
-        "island's settings by re-running deploy/standup.sh with the flag to change.",
-      );
-      exit(2);
+      final rest = args.sublist(1);
+      if (_wantsHelp(rest)) {
+        stdout.writeln(configureUsage);
+        await _flush();
+        exit(0);
+      }
+      try {
+        final opts = parseConfigureArgs(rest);
+        final configure = Configure(
+          runner: const ProcessRunner(),
+          root: Directory.current,
+          say: Say(stdout.writeln, stderr.writeln),
+          fetch: (u) => getLocal(u, maxBytes: 64 * 1024),
+        );
+        if (opts.isEmpty) {
+          configure.show();
+          await _flush();
+          exit(0);
+        }
+        final result = await configure.run(opts);
+        await _flush(); // after the run: its report is what must not be lost
+        exit(configureExitCode(result));
+      } on Refusal catch (e) {
+        stderr.writeln(' fail ${e.message}');
+        await _flush();
+        exit(1);
+      } on Object catch (e) {
+        stderr.writeln(' fail unexpected error: $e');
+        await _flush();
+        exit(1);
+      }
     default:
       stderr.writeln('unknown command: ${args.first}\n\n$_help');
+      await _flush();
       exit(64);
   }
 }
