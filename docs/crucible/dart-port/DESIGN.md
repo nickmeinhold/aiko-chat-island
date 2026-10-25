@@ -128,7 +128,7 @@ The orphan check is the authority; this table is its current reading (route deco
 - **[r3-fold; r4-fold] Discovery matches ONE protocol** (temper r3 #5; r4 #5, #6). **At process start, Dart reads the protocol version constant from the co-installed `aiko_chat` package in this image**: the same file the image's ChatServer runs, and the same source Python's `get_server_service_filter()` imports from. *(r4: the r3 wording "derived from the Dockerfile ARG" needed a SHA→protocol table, a second source that can drift from the installed package. Deleted.)* `:1` exists only behind a canary build flag, bound to the unpublished `bus-e2e` artifact so a release recipe cannot set it.
   - The two-dialect producer of a double match is gone from production.
   - **While** the match count is not exactly one, the bus capability is **withheld**: no publish, no subscribe. It is granted when the count becomes one, and re-evaluated on every registrar update. **It is never latched.** Zero matches is the ordinary state when the gateway boots before the ChatServer, and two is the ordinary transient when the ChatServer restarts inside its lease. A latch would turn compose start order into a process-lifetime bus outage. The state shows in the logs §2.9's triggers read.
-- **[r3-fold; r4-fold] Bus topology has authority over SUBSCRIPTIONS only, never over channel rows** (temper r3 #2; r4 #1, all four). Today `remove` → `hard_delete_channel` + messages + memberships (`client.py:169-172` → `main.py:136`), which has been dormant only because runtime removes never arrive (D1). **Recommendation to Nick:**
+- **[r3-fold; r4-fold] Bus topology has authority over SUBSCRIPTIONS only, never over channel rows** (temper r3 #2; r4 #1, all four). Today `remove` → `hard_delete_channel` + messages + memberships (`client.py:169-172` → `main.py:136`), which has been dormant only because runtime removes never arrive (D1). **DECIDED (Nick, 2026-10-25), see §7.4:**
   - a bus `remove`, or a snapshot that omits a channel, **unsubscribes, and nothing more**: no row change, no mark, no visibility change;
   - an `add` re-subscribes, and is idempotent on an existing row;
   - deliberate deletion goes through the owning service, attended.
@@ -285,7 +285,7 @@ The rest:
    - **Silence selects nothing:** the dependency enters a release only after Nick licenses it.
 2. ~~#16 narrowed, to confirm~~ **DECIDED (Nick, 2026-10-25 ~13:45): the drift ADR is a SEPARATE decision**, out of the port. Alembic stays the schema authority through the port. #16 keeps its own readiness gate: a rehearsed first drift-owned migration, seed creation and recovery.
 3. **WebAuthn registration: implement all formats, or narrow Python first** (§2.8). Nick's call, at gate G at the latest.
-4. **Nick's hard-delete ruling for #24** (§2.4). **[r4-fold] Recommended answer:** bus topology controls subscriptions only. A `remove` or an omission unsubscribes and changes nothing else (no mark); deletion is attended, through the owning service.
+4. ~~Nick's hard-delete ruling for #24~~ **DECIDED (Nick, 2026-10-25 ~14:10): bus topology controls subscriptions only.** A `remove` or an omission unsubscribes and changes nothing else (no row change, no mark); deletion is attended, through the owning service. It ships as step 0(c) part 1, which must merge before the D1 fix (part 2).
 5. **The package's name and owner**, before publishing.
 6. **The soak maximum, N and M, and the known-bug list.** Set at gate G.
 7. ~~The query layer~~ **Settled (r3/r4): `package:sqlite3` in one DB isolate** (§2.5).
