@@ -26,6 +26,7 @@
 <body>
 
 <h1>Channel Topology Reconcile <span class="tag">#1281 incr 2</span></h1>
+<p><strong>SUPERSEDED in part, 2026-10-25 (Nick's #24 ruling):</strong> a bus <code>remove</code> no longer hard-deletes. Bus topology controls relay <em>subscriptions</em> only, never channel rows; a remove unsubscribes and the channel, its messages and memberships are kept. Deliberate deletion is attended, through <code>channels_service.hard_delete_channel</code>. Kept below as the record of the old design, and no longer prescriptive: §4's remove row, §5's "a channel absent upstream ceases to exist" semantics (the cascade mechanism itself still describes <code>hard_delete_channel</code>), Decision B (§6), §8's remove-reconcile test and §10's Scope B choice. Code: PR #409. Design: <code>docs/crucible/dart-port/DESIGN.md</code> §2.4, §7.4.</p>
 <p class="sub">Gateway reads canonical channel topology from aiko's HyperSpace and reconciles it into local <code>Channel</code> rows — killing the hardcoded <code>["general"]</code> drift. Channels only; users deferred (task&nbsp;#9). Status: <strong>design, awaiting sign-off</strong>.</p>
 
 <h2>1. The headline (read this first)</h2>
@@ -68,7 +69,7 @@
 <table>
 <tr><th>Signal</th><th>Meaning</th><th>Action</th></tr>
 <tr><td>EC <code>add channel_list.X</code></td><td>Channel X exists upstream</td><td><strong>Upsert</strong> a <code>Channel</code> row (by <code>aiko_channel=X</code>)</td></tr>
-<tr><td>EC <code>remove channel_list.X</code> <em>(producer live)</em></td><td>Channel X genuinely removed upstream</td><td><strong>Hard-delete</strong> channel X + its messages/memberships (§5)</td></tr>
+<tr><td>EC <code>remove channel_list.X</code> <em>(producer live)</em></td><td>Channel X genuinely removed upstream</td><td><s><strong>Hard-delete</strong> channel X + its messages/memberships (§5)</s> <strong>Superseded 2026-10-25:</strong> unsubscribe only; rows kept (#24)</td></tr>
 <tr><td><code>_discovery_remove</code> (ChatServer gone)</td><td>Transient: ChatServer disconnected</td><td><strong>Nothing to the DB.</strong> Tear down the consumer only; rows persist</td></tr>
 </table>
 
@@ -85,10 +86,11 @@
 Neither is what was chosen.
 </div>
 <div class="decision">
-<strong>Resolution: application-level explicit cascade in one transaction</strong> — <code>DELETE memberships WHERE channel_id=…</code>, <code>DELETE messages WHERE channel_id=…</code>, then <code>DELETE channels WHERE id=…</code>. Backend-agnostic (doesn't depend on FK enforcement differing between SQLite/Postgres), explicit, and testable. This honours the chosen semantics: a channel absent upstream ceases to exist, history included. (Alternative — <code>ondelete="CASCADE"</code> + enabling the SQLite pragma — is rejected: it couples correctness to a per-connection pragma and a migration, and hides the destruction inside the FK engine.)
+<strong>Resolution: application-level explicit cascade in one transaction</strong> — <code>DELETE memberships WHERE channel_id=…</code>, <code>DELETE messages WHERE channel_id=…</code>, then <code>DELETE channels WHERE id=…</code>. Backend-agnostic (doesn't depend on FK enforcement differing between SQLite/Postgres), explicit, and testable. This honours the chosen semantics: a channel absent upstream ceases to exist, history included. <strong>(Semantics superseded 2026-10-25, #24: upstream absence no longer deletes; the cascade is now attended-only.)</strong> (Alternative — <code>ondelete="CASCADE"</code> + enabling the SQLite pragma — is rejected: it couples correctness to a per-connection pragma and a migration, and hides the destruction inside the FK engine.)
 </div>
 
-<h2>6. Decision B — real removal vs transient blip <span class="tag">resolved</span></h2>
+<h2>6. Decision B — real removal vs transient blip <span class="tag">superseded 2026-10-25</span></h2>
+<p><strong>Superseded:</strong> no bus event deletes any more (#24 ruling), so the real-vs-transient distinction no longer guards a destructive path. Kept as history.</p>
 <div class="warn">
 Hard-delete + cascade is <strong>irreversible mass deletion</strong>. If a transient event (ChatServer restart, registrar hiccup) emitted a spurious <code>remove</code>, a momentary network blip would wipe a channel's entire history. This is the destructive analogue of the transient-vs-terminal auth distinction (<code>feedback_auth_error_boundary</code>).
 </div>
@@ -105,7 +107,7 @@ Hard-delete + cascade is <strong>irreversible mass deletion</strong>. If a trans
 <ol>
 <li><strong>Parse</strong>: <code>channel_list</code> payload tuple → channel name (<code>entry[0][1]</code>); tolerate the redundant key-suffix form.</li>
 <li><strong>Add reconcile</strong>: add events for 5 channels ⇒ 5 <code>Channel</code> rows, idempotent on repeat (upsert, no dupes).</li>
-<li><strong>Remove reconcile (live)</strong>: a live EC remove for <code>X</code> ⇒ channel + its messages + memberships gone (application-cascade), in one transaction.</li>
+<li><s><strong>Remove reconcile (live)</strong>: a live EC remove for <code>X</code> ⇒ channel + its messages + memberships gone (application-cascade), in one transaction.</s> <strong>Superseded 2026-10-25 (#24):</strong> a live EC remove ⇒ unsubscribed, rows kept; tests in <code>tests/test_channels_reconcile.py</code>.</li>
 <li><strong>Transient safety</strong>: <code>_discovery_remove</code> ⇒ rows untouched; consumer torn down.</li>
 <li><strong>Seed removal</strong>: with reconcile active, the hardcoded <code>_seed_channels</code> path is deleted; <code>general</code> still present (now via reconcile, not seeding).</li>
 <li><strong>Live e2e</strong> (extends <code>e2e/test_bus_roundtrip.py</code>): real devstack, assert all 5 bootstrapped channels reconcile into the DB; the §6 restart validation gate.</li>
@@ -120,6 +122,7 @@ Hard-delete + cascade is <strong>irreversible mass deletion</strong>. If a trans
 <tr><td>Complexity / blast radius</td><td>Low — additive, no destructive path</td><td>Higher — irreversible cascade behind a branch that can't fire e2e yet</td></tr>
 </table>
 <p><strong>Recommendation was Scope A; Nick chose Scope B (2026-06-25)</strong> — build the defensive hard-delete now, unit-tested with a synthetic remove. Shipped in PR#12.</p>
+<p><strong>Reversed 2026-10-25 (Nick's #24 ruling, PR #409):</strong> the bus-driven hard-delete is removed; upstream remove unsubscribes only. Scope A's "no destructive path" is now the shipped state.</p>
 
 <h3>10.1 Cage-match hardening (PR#12 round 2)</h3>
 <p>Carnot (REQUEST_CHANGES) caught two structural issues around the destructive path that a same-family review missed; both fixed inline:</p>

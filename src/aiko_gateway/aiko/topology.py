@@ -7,9 +7,9 @@ WITHOUT importing the domain layer — which would otherwise drag
 `channels_service -> models -> db` and construct the async DB engine at import
 just to reach a prefix-stripping string function (#7).
 
-The DB-mutating half of channel reconcile (`upsert_channel` /
-`hard_delete_channel`) stays in `domain/channels_service.py`, where the session
-and models belong. Existence-on-the-bus (parse) and existence-in-the-DB
+The DB-mutating half of channel reconcile (`upsert_channel`) stays in
+`domain/channels_service.py`, where the session and models belong. A bus remove
+never mutates the DB (#24 ruling): `hard_delete_channel` is attended-only. Existence-on-the-bus (parse) and existence-in-the-DB
 (reconcile) are now cleanly separated.
 """
 from __future__ import annotations
