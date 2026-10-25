@@ -23,9 +23,14 @@ island: operator tool for an aiko island box
 
 Run `island standup --help` or `island configure --help` for the options.''';
 
+/// `exit` does not wait for buffered output; a piped stdout could lose the end of
+/// a refusal (Noether, PR#407 r2).
+Future<void> _flush() => Future.wait([stdout.flush(), stderr.flush()]);
+
 Future<void> main(List<String> args) async {
   if (args.isEmpty || args.first == '-h' || args.first == '--help') {
     stdout.writeln(_help);
+    await _flush();
     exit(args.isEmpty ? 64 : 0);
   }
   switch (args.first) {
@@ -33,6 +38,7 @@ Future<void> main(List<String> args) async {
       final rest = args.sublist(1);
       if (rest.contains('-h') || rest.contains('--help')) {
         stdout.writeln(usage);
+        await _flush();
         exit(0);
       }
       try {
@@ -45,19 +51,23 @@ Future<void> main(List<String> args) async {
           probe: probeHealth,
         ).run(opts);
         // 0 only for "up and confirmed"; the mapping lives in the library, tested.
+        await _flush();
         exit(exitCodeFor(result));
       } on Refusal catch (e) {
         stderr.writeln(' fail ${e.message}');
+        await _flush();
         exit(1);
       } on Object catch (e) {
         // Anything before the birth (after it, run() reports what it created).
         stderr.writeln(' fail unexpected error, nothing reported as done: $e');
+        await _flush();
         exit(1);
       }
     case 'configure':
       final rest = args.sublist(1);
       if (rest.contains('-h') || rest.contains('--help')) {
         stdout.writeln(configureUsage);
+        await _flush();
         exit(0);
       }
       try {
@@ -70,18 +80,23 @@ Future<void> main(List<String> args) async {
         );
         if (opts.isEmpty) {
           configure.show();
+          await _flush();
           exit(0);
         }
+        await _flush();
         exit(configureExitCode(await configure.run(opts)));
       } on Refusal catch (e) {
         stderr.writeln(' fail ${e.message}');
+        await _flush();
         exit(1);
       } on Object catch (e) {
         stderr.writeln(' fail unexpected error: $e');
+        await _flush();
         exit(1);
       }
     default:
       stderr.writeln('unknown command: ${args.first}\n\n$_help');
+      await _flush();
       exit(64);
   }
 }

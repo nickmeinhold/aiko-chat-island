@@ -273,7 +273,33 @@ final class Configure {
     return _env.readAsStringSync();
   }
 
+  /// One configure at a time on a box, held from the first read of `.env` to the
+  /// end of the restart. Without it two runs can both read the same file, both pass
+  /// the re-read before the rename, and the second rename silently discards the
+  /// first's edit: an atomic rename prevents a torn file, not a lost update
+  /// (Carnot, PR#407 r2). A hand edit doesn't take this lock; the re-read before the
+  /// rename is what catches one, in all but a tiny window.
   Future<ConfigureResult> run(ConfigureOptions o) async {
+    final lock = _f('.env.configure-lock').openSync(mode: FileMode.append);
+    try {
+      try {
+        lock.lockSync(FileLock.exclusive); // non-blocking: refuse, don't queue
+      } on FileSystemException {
+        throw Refusal(
+          'another `island configure` is running on this box. Let it finish, '
+          'then run this again. Nothing was changed.',
+        );
+      }
+      return await _run(o);
+    } finally {
+      lock.closeSync(); // closing releases the lock
+    }
+  }
+
+  /// The text of `.env` this run read, for the revert hint's exact old lines.
+  String _before = '';
+
+  Future<ConfigureResult> _run(ConfigureOptions o) async {
     // ---- 1. checks, and the edit, all before anything is written ----
     say.step('Checks (nothing is changed until they all pass)');
     for (final n in ['docker-compose.yml', 'deploy/compose.sh']) {
@@ -284,12 +310,20 @@ final class Configure {
         );
       }
     }
-    final before = _readEnv();
+    final before = _before = _readEnv();
     await _refuseIfNotOwner();
     _dockerCli = await Docker.detect(runner);
     await _refuseIfRestartWouldChangeImage();
     final current = parseDotenv(before, '.env');
-    o.seedPeers?.refuseSelf(current['GATEWAY_BASE_URL'] ?? '');
+    // syd's .env has no GATEWAY_BASE_URL (compose's default supplies it), so ask
+    // the running gateway who it is rather than check against nothing (Noether, r2).
+    final self = await _json('/v1/island');
+    for (final url in {
+      current['GATEWAY_BASE_URL'],
+      if (self is Map) self['base_url'],
+    }.whereType<String>()) {
+      o.seedPeers?.refuseSelf(url);
+    }
     if (o.passkeys == true) _refuseMismatchedRpId(current);
 
     // Unchanged means the LINE is already exactly what configure writes, not that
@@ -374,7 +408,8 @@ final class Configure {
     );
     if (!up.ok) {
       throw Refusal(
-        'the new .env IS written, but restarting the gateway failed:\n'
+        '${changes.isEmpty ? 'This run wrote nothing; .env was already as asked' : 'The new .env IS written'}, '
+        'but restarting the gateway failed:\n'
         '${up.stderr.trim()}\n${_revertHint(current, changes)}',
       );
     }
@@ -383,6 +418,9 @@ final class Configure {
         'gateway did not answer /health within ~60s. Inspect: deploy/compose.sh '
         'logs chat-island\n${_revertHint(current, changes)}',
       );
+      // The write landed and the outcome is open: an operator who waits out a slow
+      // boot and keeps the edit needs the reminder too (Tesla, r2).
+      if (changes.isNotEmpty) _sopsReminder();
       return const WrittenNotAnswering();
     }
     final wrong = await _servedMismatches(o, current);
@@ -405,7 +443,8 @@ final class Configure {
   /// migrates the database with no backup: deploy/update.sh is the door that backs
   /// up first, and configure must not be a second one (Maxwell, PR#407 r1). Measured
   /// on both boxes: this `ps` prints the pinned reference for a gateway created from
-  /// it, and an image id when the tag has since moved, which also refuses.
+  /// it. Measured locally (Docker 29.5.2): once that tag is moved to another image,
+  /// it prints the short image id instead, which also refuses.
   Future<void> _refuseIfRestartWouldChangeImage() async {
     final pinFile = _f('image.env');
     if (!pinFile.existsSync()) {
@@ -459,7 +498,17 @@ final class Configure {
   /// (Maxwell, PR#407 r1). Both unset is consistent (both defaults name one island).
   void _refuseMismatchedRpId(Map<String, String> current) {
     final rp = current['PASSKEY_RP_ID'], base = current['GATEWAY_BASE_URL'];
-    if (rp == null && base == null) return;
+    if (rp == null && base == null) {
+      // Consistent, but only for the island compose's defaults name. On any other
+      // box the whole identity, base_url included, is wrong, which configure can't
+      // tell from syd's legitimate shape; so it is said, not refused (Tesla, r2).
+      say.warn(
+        'neither PASSKEY_RP_ID nor GATEWAY_BASE_URL is set in .env, so both come '
+        "from docker-compose.yml's defaults (chat.imagineering.cc). If this island "
+        'is not chat.imagineering.cc, passkeys will not work: set both first.',
+      );
+      return;
+    }
     final host = base == null ? null : Uri.tryParse(base)?.host;
     if (rp == null || host == null || host != rp) {
       throw Refusal(
@@ -544,10 +593,18 @@ final class Configure {
     try {
       final a = await _composeEnv(oldPath, scratch);
       final b = await _composeEnv(newPath, scratch);
+      // A comparison over no keys passes by having compared nothing (Noether, r2).
+      // A live .env always has keys, so compose answering with none is a failure.
+      if (a.isEmpty || b.isEmpty) {
+        throw Refusal(
+          'docker compose reported no keys for ${a.isEmpty ? '.env' : 'the edited .env'}, '
+          'so the edit can\'t be proved safe. Nothing was changed.',
+        );
+      }
       // `compose config` prints a literal `$` as `$$` (measured), on both sides.
       String rendered(EnvValue v) => v.value.replaceAll(r'$', r'$$');
       final off = [
-        for (final k in {...a.keys, ...b.keys})
+        for (final k in {...a.keys, ...b.keys, ...changes.keys})
           if (changes.containsKey(k)
               ? b[k] != rendered(changes[k]!)
               : a[k] != b[k])
@@ -651,37 +708,68 @@ final class Configure {
   }
 
   /// How to put back what this run changed. Safe to print: the keys configure owns
-  /// are not secrets. Each value is shell-quoted whole, so an old name like `Bob's`
-  /// prints a command that works (Noether, Carnot, PR#407 r1). A key that was not set
-  /// before can't be restored by a flag, so it is named as a line to delete.
+  /// are not secrets.
+  ///
+  /// A flag is offered only if `parseConfigureArgs` accepts it, checked here by
+  /// running it: an old value this version refuses (a dotted peer id, a name with a
+  /// `'`) would otherwise print a recovery command that fails (Noether, Carnot, r2).
+  /// Such a value is given as its exact old line to put back. A key that was not
+  /// set before is named as a line to delete. Flag values are shell-quoted whole.
   String _revertHint(
     Map<String, String> before,
     Map<String, EnvValue> changes,
   ) {
     if (changes.isEmpty) return 'This run wrote nothing to .env.';
-    final args = <String>[], unset = <String>[];
+    final flags = <String>[], oldLines = <String>[], unset = <String>[];
     for (final k in changes.keys) {
       final old = before[k];
       if (old == null) {
         unset.add(k);
         continue;
       }
-      switch (k) {
-        case keyName:
-          args.add('--name ${shellQuote(old)}');
-        case keyPeers:
-          args.add('--seed-peers ${shellQuote(old)}');
-        case keyPasskeys:
-          args.add(old == 'true' ? '--enable-passkeys' : '--no-passkeys');
+      final flag = switch (k) {
+        keyName => ['--name', old],
+        keyPeers => ['--seed-peers', old],
+        keyPasskeys when old == 'true' => ['--enable-passkeys'],
+        keyPasskeys when old == 'false' => ['--no-passkeys'],
+        _ => null,
+      };
+      var accepted = flag != null;
+      if (flag != null) {
+        try {
+          parseConfigureArgs(flag);
+        } on Refusal {
+          accepted = false;
+        }
+      }
+      if (accepted) {
+        flags.addAll(flag!.map((a) => a.startsWith('--') ? a : shellQuote(a)));
+      } else {
+        oldLines.addAll(_oldLines(k));
       }
     }
+    const restart = 'deploy/compose.sh up -d --no-deps chat-island';
     return [
       'To put the previous values back:',
-      if (args.isNotEmpty) '  island configure ${args.join(' ')}',
+      if (flags.isNotEmpty) '  island configure ${flags.join(' ')}',
+      if (oldLines.isNotEmpty) ...[
+        '  put these lines back in .env exactly (this version of configure would '
+            'refuse the old values), then: $restart',
+        for (final l in oldLines) '    $l',
+      ],
       if (unset.isNotEmpty)
         '  delete the ${unset.join(', ')} line(s) from .env (not set before this '
-            'run), then: deploy/compose.sh up -d --no-deps chat-island',
+            'run), then: $restart',
     ].join('\n');
+  }
+
+  /// The exact lines [key] occupied in the `.env` this run read.
+  List<String> _oldLines(String key) {
+    final lines = _before.split('\n');
+    return [
+      for (final e in scanDotenv(_before, '.env'))
+        if (e.key == key) ...lines.sublist(e.firstLine, e.endLine),
+    ];
   }
 
   /// A copy kept elsewhere (this repo keeps its two islands' in deploy/secrets/ as
@@ -689,6 +777,7 @@ final class Configure {
   /// this run: the split-brain hazard in deploy/secrets/README.md.
   void _sopsReminder() => say.out(
     'If a copy of this .env is kept anywhere else (an encrypted copy in git, a '
-    'backup), it is now older than the box: update it, or it will undo this change.',
+    'backup), it is now older than the box: once you keep this change, update it, '
+    'or its next delivery will undo the change.',
   );
 }

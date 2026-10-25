@@ -56,12 +56,15 @@ final class ProcessRunner implements Runner {
         workingDirectory: workingDirectory,
       );
       final out = StringBuffer(), err = StringBuffer();
+      // allowMalformed: a stray byte in a child's output must not throw out of run()
+      // after the work it reports on has already happened (Tesla, PR#407 r2).
+      const decode = Utf8Decoder(allowMalformed: true);
       final done = [
-        p.stdout.transform(utf8.decoder).forEach((s) {
+        p.stdout.transform(decode).forEach((s) {
           stdout.write(s);
           out.write(s);
         }),
-        p.stderr.transform(utf8.decoder).forEach((s) {
+        p.stderr.transform(decode).forEach((s) {
           stderr.write(s);
           err.write(s);
         }),

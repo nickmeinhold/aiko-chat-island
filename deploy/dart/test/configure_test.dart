@@ -288,8 +288,13 @@ void main() {
     test('.env stays mode 600 and no temporary is left beside it', () async {
       await configure().run(args(['--name', 'X']));
       expect(envFile.statSync().modeString(), 'rw-------');
+      // The lock (.env.configure-lock) stays, empty, by design: deleting a lock
+      // file after use reopens the race it closes. Only the secret-bearing
+      // candidate must be gone.
+      final left = root.listSync().map((e) => e.path.split('/').last);
+      expect(File('${root.path}/.env.configure-lock').lengthSync(), 0);
       expect(
-        root.listSync().map((e) => e.path.split('/').last),
+        left.where((n) => n != '.env.configure-lock'),
         isNot(contains(startsWith('.env.configure-'))),
       );
     });
@@ -528,11 +533,37 @@ void main() {
       },
     );
 
-    test('the revert hint quotes an old value with an apostrophe as one shell word', () async {
+    test(
+      'an old value this version refuses is given back as its exact line',
+      () async {
+        envFile.writeAsStringSync(
+          liveShaped().replaceFirst(
+            'ISLAND_DISPLAY_NAME=Example',
+            'ISLAND_DISPLAY_NAME="Bob\'s Island"',
+          ),
+        );
+        box.upFails = true;
+        Refusal? got;
+        try {
+          await configure().run(args(['--name', 'X']));
+        } on Refusal catch (e) {
+          got = e;
+        }
+        expect(
+          got!.message,
+          contains('    ISLAND_DISPLAY_NAME="Bob\'s Island"'),
+        );
+        // And no recovery command this tool would refuse.
+        expect(got.message, isNot(contains('island configure --name')));
+      },
+    );
+
+    test('a valid old value round-trips: the real parser accepts it, sh keeps it one word', () async {
+      const old = r'Island #1 $HOME & co';
       envFile.writeAsStringSync(
         liveShaped().replaceFirst(
           'ISLAND_DISPLAY_NAME=Example',
-          'ISLAND_DISPLAY_NAME="Bob\'s Island"',
+          "ISLAND_DISPLAY_NAME='$old'",
         ),
       );
       box.upFails = true;
@@ -545,13 +576,92 @@ void main() {
       final hint = got!.message
           .split('\n')
           .firstWhere((l) => l.contains('island configure --name'));
-      // Run the printed words through a real shell: they must come back as ONE word.
-      final words = await Process.run('sh', [
+      final argv = hint.substring(hint.indexOf('island configure ') + 17);
+      // The shell's reading of the printed words, fed to the real parser.
+      final r = await Process.run('sh', [
         '-c',
-        'for w in ${hint.substring(hint.indexOf('--name') + 7)}; do echo "[\$w]"; done',
+        'for w in $argv; do printf "%s\\0" "\$w"; done',
       ]);
-      expect('${words.stdout}'.trim(), "[Bob's Island]");
+      final words = '${r.stdout}'.split('\u0000')..removeLast();
+      expect(words, ['--name', old]);
+      expect(parseConfigureArgs(words).name!.value, old);
     });
+
+    test('a second configure while one runs refuses (the lock is cross-process)', () async {
+      final lockPath = '${root.path}/.env.configure-lock';
+      File(lockPath).createSync();
+      // fcntl locks never conflict inside one process, so hold it from another.
+      final holder = await Process.start('python3', [
+        '-c',
+        'import fcntl,sys,time; f=open(sys.argv[1],"a"); '
+            'fcntl.lockf(f, fcntl.LOCK_EX); print("held", flush=True); time.sleep(30)',
+        lockPath,
+      ]);
+      await holder.stdout
+          .transform(utf8.decoder)
+          .firstWhere((l) => l.contains('held'));
+      try {
+        await refusesWith(contains('another `island configure` is running'));
+      } finally {
+        holder.kill();
+      }
+    });
+
+    test('without GATEWAY_BASE_URL, a peer naming the running gateway is still refused', () async {
+      envFile.writeAsStringSync(
+        liveShaped()
+            .replaceFirst('GATEWAY_BASE_URL=https://chat.example.org\n', '')
+            .replaceFirst('PASSKEY_RP_ID=chat.example.org\n', ''),
+      );
+      final before = envFile.readAsStringSync();
+      await expectLater(
+        configure().run(
+          args([
+            '--seed-peers',
+            '[{"id":"me","display_name":"Me","base_url":"https://chat.example.org"}]',
+          ]),
+        ),
+        throwsA(
+          isA<Refusal>().having((r) => r.message, 'm', contains('itself')),
+        ),
+      );
+      expect(envFile.readAsStringSync(), before);
+      expect(box.restarts, 0);
+    });
+
+    test(
+      'compose reporting no keys at all refuses (no comparison over nothing)',
+      () async {
+        box.onConfig = (n, r) => const RunResult(
+          0,
+          '{"services":{"probe":{"image":"scratch"}}}',
+          '',
+        );
+        await refusesWith(contains('no keys'));
+      },
+    );
+
+    test(
+      'a failed restart on the reconcile path does not claim it wrote .env',
+      () async {
+        canonicalName();
+        gateway.forwardsName = false; // served != file, so configure reconciles
+        box.upFails = true;
+        await expectLater(
+          configure().run(args(['--name', 'Example'])),
+          throwsA(
+            isA<Refusal>().having(
+              (r) => r.message,
+              'm',
+              allOf(
+                contains('This run wrote nothing'),
+                isNot(contains('IS written')),
+              ),
+            ),
+          ),
+        );
+      },
+    );
 
     test(
       'a key that was not set before is named as a line to delete, not dropped',
@@ -657,6 +767,15 @@ void main() {
       await configure().run(args(['--name', 'X']));
       expect(out.join('\n'), contains('older than the box'));
     });
+
+    test(
+      'exit 3 (written, not answering) still reminds about the copy',
+      () async {
+        gateway.healthy = false;
+        await configure().run(args(['--name', 'X']));
+        expect(out.join('\n'), contains('older than the box'));
+      },
+    );
 
     test('a gateway that never answers is exit 3, not success', () async {
       gateway.healthy = false;
