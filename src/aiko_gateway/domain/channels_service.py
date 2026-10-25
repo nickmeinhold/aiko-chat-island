@@ -89,9 +89,9 @@ async def hard_delete_channel(session: AsyncSession, aiko_channel: str) -> bool:
     not foreign keys are enforced. Attended deletion only; never from a bus event
     (#24 ruling).
     """
-    # Reserve the dm: namespace (cage-match PR#124 Tesla): a bus `remove` naming a
-    # dm:X:Y must NEVER hard-delete a private DM (+ its messages + memberships). A DM is
-    # never in channel_list, so a dm: remove is anomalous — refuse as a safe no-op.
+    # Reserve the dm: namespace (cage-match PR#124 Tesla): this tool must NEVER
+    # hard-delete a private DM (+ its messages + memberships); DM teardown belongs to
+    # account deletion. Refuse as a no-op. (No bus path reaches here since #24.)
     if dm_service.is_dm_channel_name(aiko_channel):
         return False
     channel = (await session.execute(

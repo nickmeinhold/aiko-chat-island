@@ -312,11 +312,14 @@ async def test_bus_remove_then_readd_keeps_the_original_row(session, monkeypatch
     st = _state()
     st.on_channel_remove("random")
     st.on_channel_add("random")
+    st.on_channel_add("fresh")  # proves adds actually flow through the worker
     await _drain(st)
 
-    rows = (await session.execute(select(Channel))).scalars().all()
-    assert [r.id for r in rows] == ["C1"]
-    assert await _counts(session) == (1, 1, 1)
+    by_name = {r.aiko_channel: r.id for r in
+               (await session.execute(select(Channel))).scalars().all()}
+    assert by_name["random"] == "C1"  # original row, not a re-mint
+    assert set(by_name) == {"random", "fresh"}  # without the add path, no "fresh"
+    assert await _counts(session) == (2, 1, 1)
 
 
 # --- topology worker applies adds in arrival order (Carnot P1a) ------------ #

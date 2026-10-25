@@ -103,9 +103,9 @@ class GatewayState:
     # over channel rows (Nick's #24 ruling, 2026-10-25): the gateway's SQLite is the
     # sole persister, so an upstream `remove` unsubscribes in the bus client and
     # changes nothing here. (Snapshot-omission semantics belong to the topology
-    # source switch, #24 part 2; the share only emits literal removes today.) Deliberate deletion
-    # goes through `channels_service.hard_delete_channel`, attended — never from the
-    # bus. Add callbacks fire on the AIKO thread and enqueue onto a SINGLE ordered
+    # source switch, #24 part 2; the share only emits literal removes today.)
+    # Deliberate deletion goes through `channels_service.hard_delete_channel`,
+    # attended — never from the bus. Add callbacks fire on the AIKO thread and enqueue onto a SINGLE ordered
     # asyncio queue; one worker drains it FIFO and upserts the local Channel rows.
     # Replaces the old independent `_seed_channels`.
 
@@ -116,10 +116,11 @@ class GatewayState:
         self.loop.call_soon_threadsafe(self._channel_events.put_nowait, aiko_channel)
 
     def on_channel_remove(self, aiko_channel: str) -> None:
-        # Observation only: the bus client has already unsubscribed. The row, its
-        # messages and memberships are kept (#24 ruling). Nothing is enqueued, so no
-        # bus event can reach a destructive path.
-        log.info("channel reconcile: - %s (unsubscribed; row and history kept)",
+        # Observation only. The bus client owns the subscription and logs its true
+        # outcome; this records only that a remove was seen. The row, its messages
+        # and memberships are kept (#24 ruling). Nothing is enqueued, so no bus
+        # event can reach a destructive path.
+        log.info("channel reconcile: bus remove observed for %s; row and history kept",
                  aiko_channel)
 
     async def _run_channel_worker(self) -> None:
