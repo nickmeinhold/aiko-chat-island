@@ -1,12 +1,14 @@
 # TEMPER.md: Dart port of the island gateway
 
-> **STATUS after 3 rounds (2026-10-25): RECAST 4/4 in every round; never DISSOLVE. The round budget is spent, so the design is PROVISIONAL, not tempered.**
+> **STATUS after 4 rounds (2026-10-25): RECAST 4/4 in every round; never DISSOLVE. Still PROVISIONAL, not tempered.**
 >
 > - **Round 1** (15 flaws): structural.
 > - **Round 2** (12): subtractive.
 > - **Round 3** (10): narrow, and mostly deletions. But it includes one SEVERE defect that round 3's own fold introduced: the ready gate turns a bus stall into a total island outage. The severity trend is therefore *not* monotonic.
 >
-> Post-round-3 folds are applied to `DESIGN.md` and marked **UNSTRUCK**. Whether to run a fourth round is Nick's call (see the round-3 disposition).
+> - **Round 4** (bonus, Nick's choice; post-r3 folds only): 12 findings, none a total outage. Three were introduced by the folds: the unread `removed_upstream` mark, the configure×image-exclusion crash-loop, and the fold reaching only 1 of N sites. Two of the panel's OWN proposed fixes would have added outage paths, and were rejected. Dispositions are in the round-4 synthesis; they are NOT yet applied to `DESIGN.md`.
+>
+> Post-round-3 folds are in `DESIGN.md`, still marked UNSTRUCK pending Nick's call on round 4: (a) apply the r4 folds and go to Blade, or (b) stop at PROVISIONAL.
 
 # Round 1
 
@@ -678,3 +680,246 @@ Tesla: "If you want the secrets of the universe, think in energy, frequency and 
 - C9: the dual-implementation agreement lasts until the later decision that deletes the Python gateway. CI fails unless both binaries meet the journey. The head stamped into the Dart executable is read from that image's alembic, not from a hand constant.
 - §2.1's configure proof: `docker compose config` shows the key is forwarded under invariant 7b. The proof that the switch happened is the new process's identity after the restart. A serve-check against the still-running process does not count.
 
+
+# Round 4 (bonus, Nick's choice): the post-r3 folds only
+
+**Overall verdict (round 4): RECAST (4 of 4).** No DISSOLVE. The frame was not reopened by any seat. **Every finding is about a post-r3 fold, and three of them are defects the folds INTRODUCED.** By the stop rule set for this round, the design stays **PROVISIONAL**: these are recorded and dispositioned here, not folded and re-struck.
+**Struck:** dt-1792896455 · families seated: Maxwell + Noether, Carnot, Tesla (Wu disabled) · bundle: round-4 brief, RULINGS, RESEARCH, TEMPER extract (status + r3 synthesis), DESIGN with the r3 folds (89 KB); SPARK excluded · PRODUCER FIRST lens · arrival order: Maxwell, Carnot, Noether, Tesla
+
+## Round 4 synthesis
+
+| Family | Verdict | One line |
+|---|---|---|
+| Maxwell (Claude) | RECAST | "stays out of the binary" contradicts one-process replacement; image exclusion × no fallback = an outage the operator causes themselves; folds applied to 1 of N sites |
+| Carnot (GPT) | RECAST | the topology lifecycle is undefined; the ten-journey residue escapes the gate; journey 11 contradicts linearisation |
+| Noether (DeepSeek) | RECAST | committed-without-effect; zombie `removed_upstream`; synchronous `package:sqlite3` on the event loop |
+| Tesla (Grok) | RECAST | "a gateway that proves itself alive while its topology is a fiction": the write window, the unread mark, the SHA→protocol map, the actuator vs artifact |
+
+**Fold-INTRODUCED defects (the round-3 lesson recurred):**
+
+1. **`removed_upstream` is a lifecycle with no readers, no exit, and no answer for omission.** Raised by all four. The no-delete fold removed the destruction but left a mark nobody reads. A marked channel is still joinable and writable, with relay dead. A later `add` has three possible outcomes. A full-replacement snapshot cannot say "gone".
+   - **Disposition, fold (subtractive):** *bus topology has authority over SUBSCRIPTIONS only, never over channel rows or their visibility.* A `remove` or an omission unsubscribes, and nothing else changes. There is no mark. `add` re-subscribes, idempotently on the existing row (Maxwell, Carnot; Noether's option 2).
+   - **Tesla's alternative is REJECTED for the round-3 reason.** Tesla had omission exclude the channel from every read predicate. A ChatServer restart with a partial list (runtime channels aren't in its snapshot, D1) would then hide live channels from users: a fold adding an outage producer. The gateway's SQLite is the sole persister (memory `reference_hyperspace_is_service_graph_not_datastore`).
+2. **The image exclusion, the failure contract and configure combine into a dead cell.** Raised by Maxwell and Tesla; Noether raised it as "the CI-tested digest ≠ the published digest"; Carnot dissented ("does not itself break rollback"). `island configure --gateway-impl dart` against a Dart-less published image commits, restarts and crash-loops, and the failure contract forbids both fallback and revert. The same happens on a runbook image rollback to a pre-Dart tag while `.env` says `dart`.
+   - Carnot is right that *flip-back rollback* survives: configure needs no running gateway. That makes the outage recoverable, not absent.
+   - **Disposition, fold (producer first):** the image declares the implementations it carries (an OCI label set at build); configure refuses a value missing from the label of the image pinned in `image.env`; the entrypoint's exec failure names the cause. A CI boot of the published digest at `python`. State that the Dart-inclusive digest is unpublished until the licence act, which becomes an **explicit precondition of step 8 and an input to gate G**. Rewrite §2.1 and §4, which still say the published image holds both.
+3. **The fold reached 1 of N sites.** Raised by Maxwell, Carnot and Tesla. "Ten journeys" survives in step 2 (**the gate G estimate, exactly where r3 #3 said it went blind**), step 7, gate G's stop clause, C1 and C2. Step 4 still says "both dialects". §7.7 still lists drift vs sqlite3 as open.
+   - **Disposition, fold:** sweep, with a grep as the assertion.
+
+**Other findings (narrow, not introduced):**
+
+4. **Committed-without-bus-effect during a stall.** Raised by Noether, Tesla and Carnot. "Bus-dependent actions refused until the first snapshot" plus commit-then-dispatch → a send commits, fans out locally, returns 2xx, and never relays.
+   - **Disposition: named tradeoff, and the proposed fold is REJECTED.** Noether's and Tesla's fix is to refuse before commit. During a stall that RESEARCH line 48 says can last *forever* at the prod pin, **that makes sends fail island-wide: round 3's total-outage path, moved onto the most-used route.**
+   - Python in the same stall commits, fans out locally and drops the publish (memory `reference_aiko_upstream_review_2026_10_25`: "silent publish-drop acked"). So the behaviour matches Python.
+   - **Producer-first, subtractive:** delete the "refused" clause for publish entirely. Publish is best-effort exactly as in journey 10. The partial-view harm it guarded has no producer left once flaw 1's fold lands, because topology can no longer change rows.
+   - Owner: Nick. Cost: cross-client relay is silently lost during a bus stall, as today. Mitigation: the §2.9 positive-heartbeat trigger.
+5. **Zero or two discovery matches: is it re-evaluated?** Raised by Maxwell. Zero is the ordinary state when the gateway boots before the ChatServer. Two is the ordinary transient during a ChatServer restart inside its lease. Latched, it becomes a process-lifetime bus outage, and a rollback to Python "fixes" a problem Python never had.
+   - **Fold:** withhold while the count ≠ 1; grant on exactly one; never latch.
+6. **The protocol comes from a SHA→protocol map, not from the installed package.** Raised by Tesla and Carnot. The ARG is `3e4e822`, a SHA and not `:0`. So the fold's "equivalent to Python's import" claim is false.
+   - **Fold (deletes the map):** read the version constant at process start from the co-installed `aiko_chat` that this image's ChatServer runs. Bind the `:1` canary to the unpublished `bus-e2e` artifact.
+7. **The expected head is baked in a different job.** Raised by Tesla (RESEARCH §A5: binaries and image are separate jobs).
+   - **Fold:** read the head at process start from the alembic tree the entrypoint just ran; fail the build on two heads.
+8. **`package:sqlite3` is synchronous FFI on the event loop.** Raised by Noether. Journey 7's 16-table cascade would stop the world.
+   - **Fold:** the database lives in one dedicated isolate. It is the natural home of §2.3's one-transaction rule, so this also serialises writers.
+   - Tesla adds: one write helper owns the `IslandDateTime`/BOOLEAN/JSON spellings, and raw execute is unavailable to command code.
+9. **Topology source handoff.** Raised by Carnot and Noether. Queued work from a retired source; the order of unsubscribe and subscribe.
+   - **Mostly dissolved by flaw 1's fold:** a stale callback can only add or drop a subscription, which the next snapshot heals. Remaining fold: retire the old source's owner (subscriptions plus queue) before the new one applies its snapshot.
+10. **"Any family without a journey stays out of the Dart binary" cannot coexist with one-process replacement.** Raised by Maxwell and Tesla. A missing family 404s on syd: R1 entered through a side door. It also conflicts with §2.6 route parity. Families still without a journey, counted from the route decorators: communities, `/keys`, `/blocks`, recovery enrol/policy/status, `passkey/add`, `/island(s)`, `/gateways`, `/capabilities`, `/register`, `/login`, `.well-known`.
+    - **Fold:** delete the rule. Every route family in the frozen `/openapi.json` has a journey before gate G's estimate, and CI maps path prefixes to journey ids, failing on orphans.
+11. **Journey obligations.** Journey 11's "no later frame" contradicts the linearisation boundary (Carnot). It becomes "no frame computed after the ban's commit". Journey 5's early echo needs a named serializer (Tesla). The DB isolate from flaw 8, plus a `UNIQUE(channel_id, client_msg_id)` key (#42), is that serializer.
+12. **The dual-write tax.** Raised by Maxwell. C9 makes every feature from go onward be written twice, with no end.
+    - **Named tradeoff:** Nick owns it; the cost is written in §4. The end of the melb soak forces a dated keep-or-delete-Python decision.
+
+**What holds (all four):**
+- the frame;
+- HTTP never waits on the bus (confirmed equal to Python's stall behaviour, RESEARCH line 48);
+- no fallback plus identity-proved switch;
+- the no-delete direction;
+- the WebAuthn sign-in ceiling and option (a);
+- C9's correction itself;
+- MQTT clean-session/QoS 0;
+- the licence exclusion's motive.
+
+**The severity read.** No round-4 finding is a total outage; round 3's was. The worst is an operator-caused crash-loop that one configure command recovers. **Two of the panel's own proposed folds would have ADDED an outage path** (refuse-before-commit; omission hides channels). That is the strongest evidence that another fold-and-strike round is now more likely to inject a defect than to remove one. The folds above are almost all deletions (the mark, the refusal, the SHA map, the "stays out" rule). The only additions are the image label, the DB isolate and the journey-orphan CI check.
+
+**Disposition.** RECAST, recorded PROVISIONAL per this round's stop rule. Nick's call:
+- **(a)** apply these folds to DESIGN.md as `[r4-fold]` (mostly subtractive), and go to Blade with gate G as the next real check; or
+- **(b)** stop here, with the design PROVISIONAL and these findings as the open list.
+
+## MaxwellMergeSlam's Design Strike (round 4)
+
+**Verdict:** RECAST
+
+**Summary:** Most of the folds hold. Two of them say something no other part of the plan can do: "a family without a journey stays out of the binary" can't coexist with a gateway that replaces the whole process, and "published images exclude Dart", combined with "no fallback" and "configure commits first", creates a new self-inflicted outage cell. A third fold was applied to only 1 of the places that needed it, and the missed places include gate G's own estimate. *Hans Gruber: "When you steal $600, you can just disappear. When you steal 600 million, they will find you."* Small folds can slip through. A fold that touches the estimate gets found.
+
+**Producer first:** The folds add three checks. For each, the outcome it guards and who produces that outcome:
+- **(1) No bus capability on zero or two discovery matches.** The outcome is a double-dialect publish. Its producer was our two-dialect build, and the fold deleted it. Good, but the check then over-reaches (flaw 3).
+- **(2) Reconcile disarmed until the first snapshot.** The outcome is a reconcile acting on a partial view. Its producer is the remove→delete cascade, and the no-delete fold removes it, which makes most of this check unnecessary (flaw 4).
+- **(3) Configure verifies by the new process's identity.** The outcome is a switch that silently didn't happen. Its producer is the old process passing a serve-check, and the fold correctly makes it unable to. But the fold creates a new outcome, "the selected implementation is absent from the image", and its producer is ours: configure accepts a value the pinned image cannot honour. **Make that impossible:** the image declares the implementations it carries (an OCI label written at build time), and configure refuses a value not in the label of the image pinned in `image.env`. The entrypoint then cannot be asked to exec a binary that isn't there. No runtime check and no fallback are needed (flaw 2).
+
+**Fatal flaws:**
+- **1. Flaw class: wrong option-frame. "Any family without a journey stays out of the Dart binary syd runs" (§2.2, r3-fold) cannot coexist with "Dart replaces one process" (§2.1).** One process serves one island. A family left out of the Dart binary is a family that 404s on syd while `GATEWAY_IMPL=dart`, which is the per-route strangler R1 rejected, entered through a side door. The fifteen journeys still leave these route families un-journeyed (counted from `src/aiko_gateway` route decorators):
+  - communities (create, discover, join);
+  - `/keys` (signing-key publish, an authorship trust boundary);
+  - `/blocks` (named in §2.3's re-check list, never tested);
+  - recovery enrol/policy/status (journey 15 covers only re-key);
+  - `passkey/add`;
+  - `/island` and `/islands` (the mark and manifest);
+  - `/gateways` and `/capabilities`;
+  - `/register` and `/login`;
+  - the `.well-known` files.
+
+  So the rule as written either blocks step 8 forever or ships a broken syd. Fold: the rule becomes **"every route family in the frozen `/openapi.json` has a journey before gate G's estimate"**, mechanised by a CI check that maps each openapi path prefix to a journey id and fails on any orphan. The count is then derived, not asserted as "fifteen".
+- **2. Flaw class: missing failure mode, introduced by combining two folds. Image exclusion (step 3) × no fallback × configure-commits-first (§2.1) = a gateway that crash-loops on its own operator's command.**
+  - On any published image before the licence act, `island configure --gateway-impl dart` commits, restarts and execs a missing binary.
+  - Worse, after the licence: `.env` says `dart`, and an operator follows `backup-and-rollback.md` to an older pinned image that predates Dart. The implementation axis and the image axis are independent, and their cross product has a dead cell nobody priced.
+  - Rollback by flipping the setting stays reachable (configure doesn't need a running gateway), so the island isn't down permanently. It is still an outage that one config command produces.
+  - Fold: the image label plus a configure refusal (see Producer first). Also, the entrypoint's exec failure names the cause (`GATEWAY_IMPL=dart but this image carries: python`). Also, make **Nick's licence act an explicit precondition of step 8**: as written, syd cannot run Dart from a published image before it, and gate G doesn't list it.
+- **3. Flaw class: missing failure mode. "On zero or two matches, the bus capability is never granted" (§2.4, r3-fold) doesn't say whether it is re-evaluated.**
+  - Zero matches is the ordinary state when the gateway boots before the ChatServer registers.
+  - Two matches is the ordinary transient when the ChatServer restarts inside the registrar's lease and the old entry lingers.
+  - Read as permanent for the life of the process, it turns compose start order into a bus outage for the whole process lifetime. HTTP survives, but publish and relay are dead until someone restarts the gateway, and the §2.9 heartbeat trigger would "roll back" to Python, which never had the problem.
+  - Fold: the capability is **withheld while** the match count is not exactly one, and granted when it becomes one. Re-evaluated on every registrar update. Never latched.
+- **4. Flaw class: half-built state machine / check whose producer is gone. `removed_upstream` (§2.4, r3-fold) has no named reader and no exit.**
+  - What does a marked channel do? Does the app still list it? Are sends accepted, and stored but never relayed?
+  - What happens when a later snapshot or `add` names it again? Is it re-subscribed and unmarked, or does it get a duplicate row?
+  - Is a reconnect snapshot that *omits* a channel a `remove` (so a partial view now unsubscribes live channels)?
+  - The fold deleted the destruction but replaced it with an undefined lifecycle. Producer first again: the gateway's SQLite is the sole persister (HyperSpace is a service graph, not a datastore), so **bus topology should have authority over SUBSCRIPTIONS only, never over channel ROWS' lifecycle.** Fold: a bus `remove` (or an omission) unsubscribes, and nothing more. No mark, no row change. A later `add` re-subscribes, and is idempotent on the existing row.
+  - That makes "reconcile disarmed until first snapshot" mostly unnecessary. A partial view can then only cost a temporarily missing subscription, which the next snapshot heals, never a state change. Keep the disarm only if a measured case still needs it.
+- **5. Flaw class: the fold reached 1 of N sites (incomplete fold).** The journeys fold left "ten journeys" in:
+  - **step 2**, the gate G estimate, which is exactly where temper r3 #3 said the estimate went blind;
+  - step 7 (acceptance);
+  - gate G's "stop" outcome;
+  - C1 and C2.
+
+  The one-protocol fold left step 4's "both dialects, exactly-one assertion". The sqlite3 fold left §7.7 still listing drift-versus-sqlite3 as open. Each is a one-line fix, but step 2 is load-bearing. Fold: replace each one with a reference to the derived journey set (flaw 1), and grep for the residue.
+- **6. Flaw class: under-counted cost. C9-corrected (both binaries must pass every journey with no end bound) prices the gate-G-to-deletion period at nothing.** Every feature from go onward is written twice for CI to pass, with no end condition. That includes v0.10.0 wire work, #21's per-device sealed-ring field and the #3096 agent identity. The fold is honest about its scope but names no owner and no forcing function. Fold: a named tradeoff, with Nick as owner and the dual-write tax as the cost. The **end of the melb soak forces a dated keep-or-delete-Python decision**, so "a later, separate decision" has a date.
+
+**What holds:**
+- **HTTP never waits on the bus.** RESEARCH line 48 confirms that the stale-retained-primary stall hits Python and Dart alike, so serving HTTP during a stall matches Python, and the round-3 total-outage path is gone. Sends during a stall still return 2xx and relay nothing, exactly as Python does today. That is out of scope here.
+- **The failure contract** (no fallback, commit before verify, identity-proved switch) is the right shape apart from the dead cell in flaw 2.
+- **One protocol per build from the pinned ARG.** One Dockerfile feeds both implementations, so the ARG and the installed package cannot diverge in a published image. Only the re-evaluation is missing (flaw 3).
+- **The no-delete direction** is correct (flaw 4 only shrinks it further).
+- **`package:sqlite3`**, and the expected head derived from the image's own alembic. Same image, same head; no new dependency.
+- **The WebAuthn sign-in ceiling** and the reframed option (a).
+- **Journeys 11 to 15's obligations** are well-formed individually. The defect is coverage, not content.
+
+**If RECAST, what to fold back:**
+- §2.2: replace "Fifteen journeys … any family without a journey stays out" with "every route family in the frozen `/openapi.json` has a journey before the gate G estimate; CI maps path prefixes to journey ids and fails on orphans". Add the missing families from flaw 1.
+- §2.1 and step 3: an image label lists the carried implementations; `island configure --gateway-impl` refuses values absent from the pinned image's label; the entrypoint's exec error names the cause. Gate G and step 8 list Nick's licence act as a precondition.
+- §2.4: the bus capability is withheld while matches ≠ 1 and re-granted on exactly one, never latched.
+- §2.4 and §7.4: bus `remove` or omission → unsubscribe only; no `removed_upstream` mark; no row change; `add` is idempotent. Re-justify or delete "reconcile disarmed until first snapshot".
+- Sweep the residue: steps 2, 4 and 7, gate G's stop clause, C1, C2 and §7.7.
+- §4: the dual-write tax as a named tradeoff (Nick), with a dated keep-or-delete decision at the end of the melb soak.
+
+
+## CarnotCodeCarver's Design Strike (round 4)
+
+**Verdict:** RECAST
+
+**Summary:** The frame holds, but the folds leave topology lifecycle undefined and fail to carry all fifteen journeys into the release gate. No real engine matches the Carnot cycle; a reviewer's job is to say how far short we are. These gaps create avoidable entropy.
+
+**Producer first:** Harm: an upstream disappearance disables durable local channels, or stale topology revives a relay that should be detached. Trigger: removal, reconnection, or source replacement. Producer: our topology handler coupling transient discovery to durable channel state. Remove that coupling: keep relay attachment state separate from local channel existence and permissions. Harm: silently discovering no server. Trigger: build metadata differs from the installed package. Producer: independently deriving Dart's protocol from an ARG while Python derives it from installed code. Produce both from the installed artifact instead. Network discovery and untrusted WebAuthn parsing remain necessary boundaries; their producers cannot simply be deleted. Dijkstra: "Simplicity is prerequisite for reliability."
+
+**Fatal flaws:**
+- Make transport disappearance unable to mutate durable channel availability: separate relay attachments from local channels; then removed_upstream as a permission sentinel becomes unnecessary. The fold introduces that mark without specifying its storage, readers, clearing rule, or interaction with joins, sends and re-adds. Unsubscribe alone leaves unanswered whether local sends succeed while upstream delivery is impossible. Define the pre-snapshot and disconnected behavior of each affected action, including whether refusal happens before persistence. Otherwise HTTP can answer successfully but wrongly while the bus is unavailable.
+- One topology source at a time specifies subscription count, not ownership of queued work. After replacement, callbacks or queued reconcile commands from the old source can still run against the new source's state; reconnect can likewise retain the previous snapshot's capability. Give one attachment owner responsibility for its subscriptions and queued work, retire that owner completely before replacement, and reset snapshot authority on retirement. Specify full-snapshot reconciliation and re-add behavior so omitted channels cannot retain ghost relays.
+- The protocol fold does not establish equivalence with Python: an ARG identifies intended source, while Python imports the installed package. An override, changed installation step, or canary flag can make those disagree, leaving Dart permanently refusing bus operations. Generate the discovery descriptor from the installed package used by that image, and consume that same descriptor in Dart. This deletes the independent protocol mapping rather than adding another mismatch guard.
+- The fifteen-journey fold never reaches the executable build contract. Steps 2 and 7 still require ten journeys, gate G estimates from those steps, and C1/C2 still describe ten. Thus moderation, calls, social sign-in, OAuth and recovery can escape the estimate or completion gate despite C9's broader promise. Journey 11 also demands 'no later frame', contradicting the explicitly accepted delivery of effects computed before revocation. Carry all fifteen through estimation, both-binary CI and switch eligibility, and make journey 11 use the stated linearisation boundary.
+
+**What holds:**
+- Binding HTTP independently of discovery removes the known total-outage producer. Disarming topology reconciliation is the correct placement of the remaining dependency.
+- Removing unattended hard-delete authority is a substantial improvement; deliberate deletion can remain with the owning service.
+- Excluding Dart from published images before licensing does not itself break rollback: the Dart switch becomes available only in a later image containing both gateways. CI can exercise an unpublished candidate image.
+- No automatic fallback, configuration committed before verification, and verification of the replacement process are coherent. Implementation identity must actually belong to the replacement instance.
+- C9 correctly retains both gateways as maintained implementations. Direct package:sqlite3 removes unnecessary migration machinery while preserving alembic authority.
+- The full authentication algorithm ceiling and reproduction of the existing registration accept-set preserve the intended parity boundary.
+
+**If RECAST, what to fold back:**
+- Specify local-channel behavior independently of relay availability, including pre-snapshot reads, writes, persistence and delivery acknowledgements.
+- Define topology attachment ownership, retirement, reconnect invalidation and snapshot reconciliation as one lifecycle.
+- Derive discovery metadata from the installed artifact rather than independently interpreting its build ARG.
+- Replace every operative ten-journey requirement with fifteen and align moderation's race expectation with the accepted linearisation rule.
+- State that pre-licence images support Python only; selectable Dart releases contain both implementations and pass all fifteen journeys against each.
+
+
+## NoetherNullPointer's Design Strike (round 4)
+
+**Verdict:** RECAST
+
+**Summary:** The post-r3 folds close the total-outage path, but they open new broken invariants: a committed row can be left without its bus effect, a removed channel can be served half-alive, and synchronous SQLite can freeze the event loop.
+
+**Producer first:**
+- The refusal “bus-dependent actions are refused until the first snapshot” guards against acting on a partial topology. The producer of the new harm is our command handler that commits the DB transaction before it reaches that refusal. It can be made unable: check the bus-capability precondition at the command boundary, before the transaction opens, and refuse the whole command.
+- The `removed_upstream` mark guards against hard-deleting history. The producer of the new harm is our bus `remove` handler that writes the mark but leaves every read and write path unchanged. It can be made unable: make the mark authoritative (filter reads, reject writes) or drop the mark and route deletion through the owning service.
+- The “one topology source at a time” rule guards against double subscription. The producer of the new harm is our source-switch code with no atomic handoff. It can be made unable: freeze the source per build, or apply the new source’s full snapshot before cancelling the old subscription.
+- The “published images exclude Dart until licence” gate guards against unlicensed distribution. The producer of the new harm is our release process that strips Dart after CI. It can be made unable: do not publish a release that claims both binaries until the licence is decided, or publish the exact CI-tested image.
+- No check added for SQLite. The producer of the event-loop freeze is our direct synchronous `package:sqlite3` call on the main isolate. It can be made unable: run the database in a dedicated isolate.
+
+**Fatal flaws:**
+- **Broken invariant: “a successful write means its bus effect is at least attempted.”** The fold “HTTP never waits on the bus” disarms topology reconcile and refuses bus-dependent actions until the first snapshot (§2.1), but the one-transaction rule (§2.3) commits rows before effects are dispatched. A route that writes locally and then publishes can commit, get its publish refused, and still return success. The user sees a stored action that never reaches the ChatServer. This is the same shape as journey 10’s kill-after-commit, but caused by our own refusal layer rather than a crash.
+- **Missing failure mode: `removed_upstream` has no read semantics.** §2.4 says a bus `remove` unsubscribes and marks the channel, never deletes. But nothing in the design says what reads the mark. If no route filters on it, the channel remains visible, joinable, and writable while the gateway is no longer subscribed to it. That is a half-alive channel: upstream is gone, local API still serves it. The fold prevents destruction but creates a zombie state.
+- **Coupling: synchronous SQLite on the event loop.** §2.5 selects `package:sqlite3` directly. It is a synchronous FFI API. Called from the main isolate, every DB operation blocks HTTP, WS, and bus handling. A long transaction—e.g. the 16-table account deletion in journey 7—becomes a stop-the-world pause. Python’s sync DB work runs in a threadpool; Dart’s does not unless isolated. The design does not state an isolate or async executor.
+- **Ordering gap: topology source handoff.** §2.4 says a re-lease is a “replacement, never a second live subscription,” but it does not define the handoff. Unsubscribe-then-subscribe loses events between the last old message and the new snapshot. Subscribe-then-unsubscribe briefly has two live sources, violating exactly-one. A channel add or remove during the switch can be lost or duplicated.
+- **Supply-chain divergence: CI-tested image ≠ published image.** §3 step 3 and §9 exclude Dart from published images until the licence, but C9 requires both binaries to pass every journey in CI. If the attested release image omits Dart, the both-binaries rule does not bind the artifact that is actually deployed. The CI test and the release artifact are not the same object.
+
+**What holds:**
+- The one-image / `GATEWAY_IMPL` / same-volume rollback frame survives.
+- Alembic as sole schema authority and Dart as a client holds.
+- The one-protocol-from-ARG discovery fold holds; zero/two matches refusing the bus capability is fail-safe.
+- The listener no longer waiting on the bus holds for HTTP reads.
+- The bus `remove` no longer hard-deletes history: the destructive producer is removed.
+- The fifteen journeys materially broaden coverage; C9 is correctly unbounded from gate G.
+- `package:sqlite3` is directionally right for avoiding migration machinery, but only with isolation.
+
+**If RECAST, what to fold back:**
+- Move the bus-capability precondition to the command boundary. Before opening the transaction, refuse any command whose effect set includes publish/relay. Then no committed-but-unpublished row exists.
+- Define `removed_upstream` semantics: every read filters it, every write rejects it, and deletion goes through the owning service. Or remove the mark entirely and make attended deletion the only path.
+- Run SQLite in a dedicated isolate. Never call synchronous `package:sqlite3` from the event-loop isolate.
+- Specify the topology source handoff: either make the source immutable per build, or apply the new source’s full snapshot and reconcile before cancelling the old subscription.
+- Align release and CI: either publish the Dart-inclusive image once the licence is decided, or state explicitly that the both-binaries CI gate does not apply to published images until then.
+
+## Tesla, the Arc-Prophet's Design Strike (round 4)
+
+Tesla: "If you want the secrets of the universe, think in energy, frequency and vibration."
+
+**Verdict:** RECAST
+
+**Summary:** The stall that used to hold the door shut now finds the door open, writes rows, and hums all night — three folds (HTTP unbound from the bus, `removed_upstream` with no reader, protocol baked from an ARG) share one frequency: a gateway that proves itself alive while its topology is a fiction.
+
+**Producer first:** The post-r3 folds add real checks. The producers split as follows.
+
+- **Partial-view destruction** (reconcile hard-deletes, or writes, from a snapshot that never finished). Trigger: the prod pin's stale retained `(primary found …)`, which can stall discovery forever. Producer: ours — the reconcile path, and any command that commits from that same view. Disarming reconcile removes the delete producer. It leaves the write producer standing. Make a committed bus-effect impossible before the first snapshot: those commands fail before commit. The post-commit "refuse publish" check then becomes unnecessary.
+- **History burned by a bus `remove`.** Producer: ours — `remove` → `hard_delete_channel`. The fold deletes that producer. Keep it deleted. The new mark is a second producer (a channel that still accepts joins and sends after unsubscribe) unless every read and write folds the mark in. A replacement snapshot that treats omission as a no-op is the same producer by another input.
+- **Speaking the wrong dialect, or two.** Producer: ours — the filter we choose. Reading `_VERSION` from the co-installed `aiko_chat` at process start, the file the ChatServer in this image already runs, removes the ARG-to-protocol translator. Zero matches then means the server is absent (external). That refusal stays. The build-time map does not.
+- **A switch that certifies the process which is already gone.** Producer: ours — a serve-check Python can pass. Identity proof stays; the old process cannot emit the new identity. The crash-loop is a different producer: `configure` writing `GATEWAY_IMPL=dart` when the published image has no such executable, under an entrypoint that never falls back and a verification that never reverts. Make that value unwritable unless the image contains the exe. The non-revert rule can remain for a process that actually started.
+- **Schema the SQL does not match.** Producer cannot be removed: the file is alembic's, opened from outside. The equality refusal stays. The false refusal from a head baked in a different job than the entrypoint's alembic is ours, and it goes away if the process reads the head from the alembic tree this container just migrated with.
+- **An unjourneyed family going dark at the switch.** Producer: ours — shipping a partial process in a design that replaced the whole gateway. §2.6 route parity already forbids a missing route. Delete "stays out of the Dart binary." Keep the journeys, and point C1, C2, and step 7 at the whole set.
+
+**Fatal flaws:**
+
+- **§2.1 "HTTP never waits" plus C5 — the write window is the old outage, transposed.** Dart binds after the lock and the DB open, and sign-in, history, and DMs stay up. That part holds. Publish and relay are refused until one full snapshot, and §2.2 dispatches those effects only after commit. Journey 10 already fixes the meaning of a refused post-commit publish: the row is kept, the publish is dropped, there is no retry. During the stall that RESEARCH §A1 Q1c names — discovery waiting forever on a stale retained primary — every send and join therefore commits against a projection the process has admitted it does not have, returns success, and never replays. Local fan-out makes the lie visible to sockets on this process; the ChatServer relay stays empty. `/health` may mention the bus and still listen. The switch contract proves identity, so this state counts as a successful cut. The heartbeat in §2.9 is a manual log trigger whose N and M are unset until gate G, and a rollback does not unwrite the rows. A periodic re-lease (§2.4) that drops "snapshot held" before the replacement snapshot lands repeats this window on a timer. C5 states the falsifier and then leaves the commands that trip it on the serving path.
+- **§2.4 `removed_upstream` and journey 9 — the mark is unread, and a replacement snapshot cannot retire a channel.** Nothing in the design reads the mark. After a bus `remove`, the gateway unsubscribes and the channel row remains joinable, listable, and writable: half-alive, local history growing, relay dead. Journey 9 says a reconnect snapshot that omits a channel does no hard-delete, and it does not say the omission marks, unsubscribes, or drops the channel from the visibility predicate. A re-lease that is a full replacement therefore has no legal way to express "this channel is gone." At the prod pin, incremental removes do not arrive (RESEARCH D1), so the mark stays unset and the channel set only grows. A later `add` of a marked row has no specified transition: clear-and-resubscribe, insert-again, or resubscribe while the mark still says removed. Three outcomes, one sentence.
+- **§2.4 "derived from the pinned ARG" — the claimed equivalence to Python's import is false.** Python takes the protocol from `get_server_service_filter()` inside the package it actually imported. The ARG is a git SHA (`3e4e822`), not `:0`. Some table in the Dart build translates SHA to protocol. That table diverges when the SHA bumps `_VERSION` and the table does not, or when the checkout the compiler read is not the checkout the image installed for ChatServer. Divergence is a zero-match: the bus capability is never granted, while HTTP serves and the identity proof reports `dart`. The refusal is the right shape for "two dialects." It is the wrong producer for a pin that drifted inside one image. `:1` behind a canary flag is a second binary that must never be the exe a prod image execs; the fold does not bind the flag to the unpublished artifact.
+- **§2.1 failure contract × §3 step 3 image exclusion × §2.2's fifteen journeys — the actuator, the artifact, and the gate disagree.** Configure commits `GATEWAY_IMPL`, restarts, never falls back, and a failed verification does not revert. Published release images exclude the Dart gateway until the licence act, while `island configure` is a separate released binary that step 3 grows with `--gateway-impl`. That option can commit `dart` against a digest whose entrypoint has nothing to exec: crash-loop, alembic on every restart, identity proof unable to pass, the island down until a second configure. §2.1 and §4 still say today's image gains the Dart executable and keeps both gateways. C9 demands both binaries meet every journey; step 3 tests a with-Dart image and publishes a without-Dart image, so the attested digest is not the digest that passed. Inside the journey fold, the table has fifteen and C1, C2, step 2, and step 7 still say ten. "Any family without a journey stays out of the Dart binary" cannot be satisfied together with §2.6 (a route in one binary and not the other fails CI) or with replacing the whole process. Communities, blocks, and the read-only surface have no journey. Step 7 can go green while moderation, calls, social sign-in, OAuth, and recovery — the rows this fold added — are still red. Journey 5's new obligation (an echo before the local commit yields exactly one row) has no serializer: linearisation places the echo mark with the post-commit effects, and the only dedupe is the in-memory content set. Two inserts remain able to write.
+- **§2.5 `package:sqlite3` — the converter was the enclosure, and the baked head can lie.** The version refusal stays: the file is external, and a hand-written statement cannot be made safe by deleting the comparison. What the fold removes is the single type boundary. `IslandDateTime` is a name; `package:sqlite3` binds whatever string each call site passes, and `'T'` sorts after `' '` (RESEARCH §A3). Stored-byte CI covers the writes that exist when the oracle is written, and steps 5 and 6 add the writes that matter. BOOLEAN and JSON split the same way, one interpreter per query. Separately, the expected head is "read from the image's own alembic at build time," while RESEARCH §A5 builds `island-binaries` and the image in different jobs. Two exes can bake two heads against one volume, and the equality check then refuses a schema this image's own entrypoint just applied.
+
+**What holds:**
+
+- The frame these folds sit in: one process inside today's image, `GATEWAY_IMPL`, alembic as the only schema authority, no freeze and no rollback cliff. Twelve strikes left it standing. It was not re-opened here.
+- Disarming topology reconcile until one full snapshot. That is the delete producer, removed at the source. It is the right answer to the round-3 gate, and it stays.
+- A bus `remove` that does not cascade into messages and memberships. Attended deletion through the owning service matches ISL-0002. The hole is the unread mark, not the spared history.
+- Never falling back inside the entrypoint, and proving the switch by the new process's identity. A serve-check the old process could pass would re-open temper r3 #6.
+- Sign-in implementing the full ES256/RS256/EdDSA ceiling, with the census ordering work only. Option (a) as py_webauthn's actual accept-set, non-checks included, is an honest size for gate G.
+- C9's correction itself: both gateways meet the journeys until a later decision deletes the Python one, and that obligation is not bounded by gate G. What fails is the journey set the sentence is pointed at, and the image the binaries are measured in.
+- MQTT policy (clean session, random client id, QoS 0) matching the pin, so a restart still does not resurrect a session.
+- The licence exclusion's motive. Presence in the attested AGPL image is the selection §7.1 withholds. The fold is right to keep the exe out of the published digest. It is wrong about what else it thought could stay coupled to that digest.
+
+**If RECAST, what to fold back:**
+
+- In §2.1 / C5, split the listen socket from the command. HTTP reads, sign-in, and history bind after the lock and the DB open. Any command whose correctness includes a bus effect (send, join against the live topology, publish, relay) fails before commit until the single source has applied one full snapshot, and a re-lease keeps the previous snapshot's capability until the replacement snapshot has applied. Delete post-commit "refuse."
+- In §2.4, one applicator owns the projection. A snapshot is the whole set: present means subscribed and visible; absent means unsubscribed and excluded from every read and write predicate; rows and history stay. Incremental `remove` is that same transition for one channel. `add` clears it and resubscribes. Name this as the only reader of `removed_upstream`. Journey 9's "omit does not hard-delete" becomes "omit takes the channel out of the predicate and leaves the bytes."
+- In §2.4, derive the one protocol at process start from the co-installed package's version constant in this image, the same file ChatServer runs. Keep the zero-match and two-match refusal. Delete the build-time SHA-to-protocol map. Bind the `:1` canary flag to the unpublished `bus-e2e` artifact so a release recipe cannot set it.
+- In §2.1 and §3 step 3, make `configure --gateway-impl dart` refuse to write the key unless the image it is about to restart contains the exe. The published, Dart-excluded digest therefore rejects the value cleanly. Add a CI boot of that published digest at the default `python`, and state that the with-Dart digest is unpublished until the licence act. Rewrite §2.1 and §4 so they stop saying the published image already holds both executables.
+- In §2.2, §3, and §5, retarget C1, C2, step 2, and step 7 from ten journeys to the full set, and list the user-visible families still absent (communities, blocks, the read-only surface) inside that set before gate G. Delete "stays out of the Dart binary"; §2.6 route parity is the constraint. For journey 5, name the serializer: one in-flight slot per send, echo ingest waits on it, so the early echo and the local insert cannot both commit.
+- In §2.5, keep `package:sqlite3` and the version refusal. Read the expected head at process start from the alembic tree the entrypoint just ran, and fail the build if that tree has two heads. Close the format at one boundary: services write through one helper that accepts `IslandDateTime` and the BOOLEAN/JSON spellings, and a raw execute is unavailable to command code. Stored-byte CI stays the witness, run on the queries steps 5 and 6 actually add.
