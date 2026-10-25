@@ -141,7 +141,7 @@ What a partial view could harm is made impossible at its producer instead:
 - **Schema oracle, in CI:** a checked-in `sqlite_master` dump from the alembic-built seed. Every alembic migration PR updates the dump, and Dart's queries are tested against that seed. That is all. No hand-faithful 22-table mirror is needed while alembic owns the schema.
 - **`IslandDateTime`** reads and writes `'YYYY-MM-DD HH:MM:SS.ffffff'`.
 - **ISL-0002 is unchanged:** FK off, application cascades as code.
-- **Moving schema authority to drift (#16) is a SEPARATE decision**, with its own readiness gate (a rehearsed first drift-owned migration, seed creation and recovery). It is not part of this port. **This narrows Nick's 09:51 "let's do the ADR"**: it is surfaced for him to confirm, not silently overridden (§7.2).
+- **Moving schema authority to drift (#16) is a SEPARATE decision**, with its own readiness gate (a rehearsed first drift-owned migration, seed creation and recovery). It is not part of this port. **Nick confirmed this narrowing of his 09:51 "let's do the ADR" on 2026-10-25 ~13:45** (§7.2).
 
 ### 2.6 `/openapi.json`
 
@@ -262,7 +262,7 @@ The rest:
    - **Checked:** all 52 commits are Nick's, and upstream `aiko_services` is Apache-2.0, which permits derivatives with attribution and can be included in an AGPL-3.0 work.
    - So this is **Nick's decision**, with Andy asked first as his chosen courtesy (2026-09-20).
    - **Silence selects nothing:** the dependency enters a release only after Nick licenses it.
-2. **#16 narrowed.** Nick ruled "let's do the ADR" (09:51). This design moves the drift authority change OUT of the port. It is still to be done, as its own decision with its own readiness gate. **To confirm with Nick.**
+2. ~~#16 narrowed, to confirm~~ **DECIDED (Nick, 2026-10-25 ~13:45): the drift ADR is a SEPARATE decision**, out of the port. Alembic stays the schema authority through the port. #16 keeps its own readiness gate: a rehearsed first drift-owned migration, seed creation and recovery.
 3. **WebAuthn registration: implement all formats, or narrow Python first** (§2.8). Nick's call, at gate G at the latest.
 4. **Nick's hard-delete ruling for #24** (§2.4). **[r3-fold] Recommended answer:** a bus `remove` unsubscribes and marks `removed_upstream`, never deletes; deletion is attended, through the owning service.
 5. **The package's name and owner**, before publishing.
