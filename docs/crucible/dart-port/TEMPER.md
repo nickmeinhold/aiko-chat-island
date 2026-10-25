@@ -1,4 +1,14 @@
-# TEMPER.md: Dart port of the island gateway, round 1
+# TEMPER.md: Dart port of the island gateway
+
+> **STATUS after 3 rounds (2026-10-25): RECAST 4/4 in every round; never DISSOLVE. The round budget is spent, so the design is PROVISIONAL, not tempered.**
+>
+> - **Round 1** (15 flaws): structural.
+> - **Round 2** (12): subtractive.
+> - **Round 3** (10): narrow, and mostly deletions. But it includes one SEVERE defect that round 3's own fold introduced: the ready gate turns a bus stall into a total island outage. The severity trend is therefore *not* monotonic.
+>
+> Post-round-3 folds are applied to `DESIGN.md` and marked **UNSTRUCK**. Whether to run a fourth round is Nick's call (see the round-3 disposition).
+
+# Round 1
 
 **Overall verdict: RECAST (4 of 4).** No family voted DISSOLVE. The frame holds; the oracle, the WebAuthn policy, the switch and the schema window do not, yet.
 **Struck:** dt-1792894225 · families seated: Maxwell + Noether, Carnot, Tesla (Wu/Kimi disabled) · bundle: CRUCIBLE, RULINGS, RESEARCH, SPARK, DESIGN (94 KB)
@@ -430,3 +440,241 @@ Round-1 ledger, so a closed item is not re-litigated: **closed** — 2 (sequence
 - **§2.2.** The kill between commit and publish expects: row kept, effect dropped, no retry, no outbox. A known-bug mark may not cover `DATETIME`, `BOOLEAN`, `JSON`, or `public_key` bytes.
 - **§2.7 and §3.** Remove `BUS_IMAGE` and the two-compose release contract from this design. One image, today's `update.sh`, until the Python gateway is gone. Move gate G to the moment the episode estimate exists, and make the episode list the nine journeys above rather than a coverage map of every branch. §7 item 1: Andy's silence does not select vendoring; only his yes, or a Nick exception written down, does.
 - **§0.** "Nothing runs in production before step 8" is already false: 0(b) and 0(c) are production behavior. Say so, or the throttle is a lullaby.
+
+
+---
+---
+
+# Round 3 (final)
+
+**Overall verdict (round 3): RECAST (4 of 4).** No DISSOLVE. This was the first strike carrying the PRODUCER FIRST lens, and every seat answered it.
+
+## Round 3 synthesis
+
+**Round-2 ledger, per the panel.** Closed:
+- 2: one image, `GATEWAY_IMPL`;
+- 3: alembic authority, Dart as client, no freeze or cliff;
+- 4: licensing as a decision;
+- 6: the linearisation rule and journey 10;
+- 7: the bounded known-bug list;
+- 8: thresholds at gate G (manual);
+- 11: R5 replaced by "stop";
+- 12.
+
+Converted to Nick decisions: 1 (the WebAuthn transactional home is closed; registration is a). Still open: 5 (now the ready gate) and 10 (hard-delete authority).
+
+**Deduped flaws, most severe first:**
+1. **The ready gate makes HTTP availability depend on the bus.** Raised by ALL FOUR. At the prod pin, a stale retained `(primary found …)` can stall discovery forever (RESEARCH Q1c), Caddy does no health checking, and so the island becomes a permanent 502, sign-in and history included. The gate also cannot be satisfied by the `channel_list` fallback (Carnot). And "exactly as during every restart today" is false (Noether).
+   - **Producer first:** the harm the gate guarded (a reconcile acting on a partial view) is produced by the reconcile path. Disarm reconcile until the first full snapshot, and the gate is unnecessary.
+   - **Fold:** bind after the lock and the DB open, as Python does. Topology reconcile is disarmed until one full snapshot from the single chosen source. Bus-dependent actions (publish, relay) refuse until then; HTTP reads are never gated.
+2. **A bus `remove` still has authority to hard-delete history.** Raised by Carnot, Tesla and Maxwell. The Category transition also ships in 0(c) before the harness exists (Tesla), and a re-lease fallback could become a second live feed.
+   - **Producer first:** the gateway's `remove` → `hard_delete_channel` cascade is ours.
+   - **Fold:** a bus `remove` unsubscribes and marks, and never deletes. Deliberate deletion goes through the owning service, attended. One topology source at a time: the re-lease is a *replacement*, never a second subscription. The Category switch leaves the port's critical path and is reviewed separately (#24). This is still Nick's ruling, but now as a recommendation.
+3. **The journeys do not cover what steps 5 and 6 build.** Raised by Tesla. Moderation (ban disconnect and fan-out), calls, OAuth and ID-token sign-in, and recovery re-key are absent, so gate G's estimate is blind again. Journey 5's early echo has no expected world.
+   - **Fold:** extend the list to every user-visible family before the estimate. Anything without a journey stays out of the Dart binary syd runs.
+4. **The licence is selected by presence in the image.** Raised by Tesla. Step 3 puts the Dart executable into the published image before Nick's licence act; `GATEWAY_IMPL=python` is not the act.
+   - **Fold:** CI proves the build. Published images exclude the Dart gateway until the licence is decided.
+5. **Exactly-one has no actuator** (Noether: `/health` is read by nothing), **and the two-dialect producer is ours** (Maxwell). Tesla: keep the assertion.
+   - **Fold:** the prod build matches ONE protocol, derived from the pinned ARG (`:1` only behind a canary build flag). On zero or two matches, the bus capability is never granted: no publish, no subscribe. The condition is visible in the logs that §2.9's triggers read.
+6. **The `GATEWAY_IMPL` failure and rollback contract is missing.** Raised by Noether and Tesla.
+   - **Fold:** the entrypoint never falls back (a crash is a crash). Configure commits, then restarts, then verifies; a failed verification does not revert, so rollback is reachable while down. The switch is proved by the new process's identity, not by a serve-check against the old one. Compose forwards the key.
+   - Plus the one-image-many-roles audit (memory `feedback_one_image_many_roles_audit`): HEALTHCHECK, entrypoint and env defaults hold for both implementations.
+7. **WebAuthn sign-in must not shrink to a census.** Raised by Tesla and Noether.
+   - **Fold:** sign-in always implements the ES256/RS256/EdDSA ceiling; the census orders the work only. Option (a) is reframed as *reproduce py_webauthn's actual accept-set, including its non-checks* (no trust roots except Apple's), which is far smaller than "implement every format".
+8. **C9 was false.** Raised by Tesla. The dual implementation lasts until a later decision deletes the Python gateway, and CI requires both binaries to meet the journeys. Dart's expected alembic head is read from the image's own alembic, not a hand constant.
+9. **The query layer.** Carnot: prefer `package:sqlite3` directly, because migration machinery with no migrations is just another refusal path.
+10. **Minor.** Name the injected-clock mechanism (a test-only control, compiled out). Define "invariant 7b" (compose forwards every `Settings` field the image reads; CLAUDE.md memory `concept_inert_var_config_not_forwarded`).
+
+**Named tradeoffs (owner + cost + rationale):**
+- **Nick:**
+  - two gateways in one image (wider attack surface) until the Python gateway's later deletion, in exchange for rollback that never ends;
+  - the image stays Python-sized;
+  - rollback triggers are manual, read from logs (an automatic flip would be a new flapping producer);
+  - restart losses are accepted as today;
+  - the registration policy;
+  - an effect computed before a revocation's commit may reach a socket before the disconnect lands (Noether: acceptable, recorded).
+- **Migration authors:** keep both gateways compatible with every new alembic head.
+- **Gateway maintainers:** the frozen `/openapi.json` and the step-7 inventory.
+
+**Disposition.** RECAST again, and **the 3-round budget is spent**. The skill says to STOP and report provisional.
+
+The ten folds above are narrow and mostly deletions. They are applied to `DESIGN.md` as **post-round-3, UNSTRUCK**.
+
+The severity trend argues the case both ways:
+- *against* a 4th round: findings fell from 15 structural to 12 subtractive to 10 narrow, and the frame held in all 12 strikes;
+- *for* one: round 3's worst finding was a defect round 3's own fold INTRODUCED. A fold that can add a total-outage path can do it again, and Nick has overridden a round cap before when severity, not count, was the signal (memory `feedback_cage_match_stop_signal_is_severity_trend`).
+
+**Nick's call:**
+- **(a)** accept the design as PROVISIONAL and go to Blade, with gate G as the next real check; or
+- **(b)** one more strike on the post-r3 folds only.
+**Struck:** dt-1792895490 · first strike carrying the PRODUCER FIRST lens (enspyrco/claude-skills#543) · bundle: CRUCIBLE, RULINGS, RESEARCH, SPARK, TEMPER r1+r2 syntheses, DESIGN r3 (106 KB) · landed so far: Maxwell
+
+<!-- arrival order, not ranking -->
+
+## MaxwellMergeSlam's Design Strike (round 3)
+
+**Verdict:** RECAST (narrow: three producer-first deletions, no structural change)
+
+**Summary:** The subtraction worked, and the frame now holds. But three of round 3's own new checks guard outcomes that our own code produces and could simply be unable to produce, and one of them quietly makes the whole island's HTTP availability depend on the bus.
+
+`Hans Gruber: "When you steal $600, you can just disappear. When you steal 600 million, they will find you, unless they think you're already dead."` A check that guards our own producer is a dead man nobody went looking for.
+
+**Producer first:**
+- **Ready-after-snapshot (§2.1).**
+  - *Harm:* a channel created during the switch is missing from the new gateway's subscriptions.
+  - *Producer:* relying on incrementals to learn topology.
+  - *But:* a new lease always delivers a full snapshot (measured in D1), so the harm self-heals when the snapshot lands, and the producer is already neutralised by the lease mechanism.
+  - The gate then **produces a new harm of its own:** if mosquitto or the ChatServer is down at boot, Dart never binds its HTTP port, and the island serves NOTHING (sign-in, history, DMs, push registration) because of the bus. Today's Python serves regardless and connects to the bus lazily.
+  - **Delete the gate.** Serve immediately, as Python does. The snapshot arrives when the bus does, and bus health is a heartbeat trigger (§2.9), not a precondition for HTTP.
+- **Exactly-one ChatServer assertion (§2.4).**
+  - *Harm:* the gateway binds to the wrong or a second ChatServer.
+  - *Producer:* OUR discovery accepting two dialects (`:0` and `:1`) in production. `:1` exists only because CI's `bus-e2e` runs geekscape master.
+  - Once #23 adds the pinned job (step 0a), production needs exactly the dialect its pinned `aiko_chat` speaks, which is known at build time from the Dockerfile ARG.
+  - **Make dual-match impossible:** the production build matches ONE protocol string, derived from the pinned ARG (the Dart equivalent of Python importing `get_server_service_filter()` from the co-installed aiko_chat). `:1` support lives behind a build flag for the canary job only. The assertion becomes unnecessary.
+- **Journey 9 plus Nick's hard-delete ruling plus "a snapshot that omits a channel → no hard-delete" (§2.4, #24).**
+  - *Harm:* messages, memberships and reactions destroyed because a bus event said `remove`.
+  - *Producer:* OUR reconcile worker calling `hard_delete_channel` on a bus `remove` (`main.py:136`). The trigger (a HyperSpace remove, a transient snapshot gap) is external; the destruction is ours.
+  - **Make it impossible:** a bus `remove` only UNSUBSCRIBES and marks the channel `removed_upstream`. Hard deletion becomes an explicit, attended action (operator or moderator, through the owning service), never a reaction to an unattended bus event.
+  - That is the lens's own example ("a dangerous step moved out of the path that runs unattended"). The snapshot-omission guard and most of journey 9's defensive cases become unnecessary.
+  - It is still Nick's ruling (it changes behaviour), but the design should RECOMMEND this, not merely ask.
+- **`alembic_version` assertion at Dart open (§2.5).**
+  - *Producer of skew:* an image whose Dart binary and alembic directory disagree. One image built from one commit makes that structurally impossible on the normal path, because the entrypoint migrates to the head the same build carries.
+  - *Remaining trigger:* an operator restoring a NEWER volume under an OLDER image (rollback across a migration). That is external, and alembic already refuses it (#392). **Keep the assertion**, for that stated reason only.
+- **Stored-byte CI equality (§2.2).**
+  - *Producer:* two libraries writing the same columns. That cannot be removed while two gateways exist (the port IS the second writer).
+  - The producer-side fix already exists (`IslandDateTime`, re-encoded COSE), and the CI check verifies it. **Keep.**
+- **Rollback triggers and the heartbeat (§2.9).**
+  - *Producer:* Dart defects, which cannot be removed in advance. **Keep.**
+
+**Fatal flaws:**
+- **[producer-first] Delete ready-after-snapshot.** As cast, it turns a bus outage into a full island outage, which is a regression against today. Serve immediately; bus state is eventually consistent by the lease snapshot.
+- **[producer-first] Make dual-dialect discovery impossible in production builds.** Delete the exactly-one assertion in its favour.
+- **[producer-first, Nick's call] A bus `remove` must not be able to hard-delete.** Recommend unsubscribe-and-mark, with hard deletion attended. #24's risk shrinks from "can destroy messages" to "can hide a channel", and journey 9 sheds its defensive cases.
+
+**What holds:**
+- **One image with `GATEWAY_IMPL`.** Rollback that never ends is the single best change in three rounds: it deletes the freeze, the cliff, the second pin and the drain protocol at once.
+- **Alembic as authority, with Dart as a client** that never writes on open (C4's probe still owed).
+- **The ten journeys with obligations,** the linearisation rule, and journey 10's "row kept, publish dropped, no retry".
+- **WebAuthn split into authentication parity and a registration choice** for Nick.
+- **The licensing finding,** checked against fact; silence selects nothing.
+- **Gate G with "stop"** as an honest outcome, and steps 0 to 4 paying for themselves.
+
+**If RECAST, what to fold back:**
+- §2.1: delete "ready means … Category snapshot". Dart binds when the DB opens, as Python does. Bus health feeds the heartbeat trigger only.
+- §2.4: the production build matches the single protocol of its pinned aiko_chat, derived from the Dockerfile ARG. `:1` sits behind a canary build flag. Delete the exactly-one assertion. Update C5.
+- §2.4, §3 0(c), §7.4: recommend that a bus `remove` unsubscribes and marks `removed_upstream`, never hard-deletes; hard deletion is attended. Present it to Nick as the recommended answer to his ruling, and trim journey 9 accordingly.
+
+
+---
+
+## NoetherNullPointer's Design Strike
+
+**Verdict:** RECAST
+
+**Summary:** Round 3 conserves one writer, one schema authority, one image and one switch — but it silently breaks the invariant that **HTTP availability is independent of bus availability**, and it claims that broken symmetry is "exactly as during every restart today."
+
+**Producer first:**
+
+- **The ready-before-bind gate (§2.1).** Harm: a user's message is dropped, or a WS subscriber is silently unsubscribed, because Dart served before it knew the topology. Trigger (external, unpreventable): the share reply is late, the registrar is slow, the broker blips. **Producer (ours): the boot ordering — bind the HTTP listener, *then* subscribe — plus process-wide readiness.** It is removable. Make boot a single ordered step (subscribe before bind), and make readiness *per-path*: bus-dependent routes (WS subscribe, bus ingest, publish) return 503 until the observer is up; HTTP reads are never gated. Then the process-wide gate, and the outage it manufactures, become unnecessary.
+- **The exactly-one discovery assertion (§2.4).** Harm: the gateway publishes as a user to a dead or stale ChatServer and the message vanishes. Producer: selection among an ambiguous match set. The check is the right *shape* (fail closed, don't pick), but it has no actuator — see Fatal flaw 2. Fix the action, not the flag.
+- **The alembic-version assert (§2.5).** Harm: Dart reads a schema it was not built for and returns wrong data. Producer: compiled queries coupled to a mutable schema. Partly removable — the CI oracle (Dart's queries tested against the alembic-built seed, refreshed per migration PR) is the structural fix. The assert is belt-and-braces; not fatal.
+- **The stored-byte comparator (§2.2).** Producer: two date/boolean/JSON codecs. Removable — one `IslandDateTime`, one encoder. **Already done**; the comparator is verification, not the fix.
+- **The one-transaction service function (§2.3).** Producer: a stateful step split across transactions (spent challenge, no credential). Removable by construction. **Already done** — good producer-first thinking.
+- **The rollback triggers (§2.9).** Producer: a bad build that changes behavior silently. Not removable; a signal is required. Review normally.
+
+**Fatal flaws:**
+
+- **F1 — Ready-before-bind couples HTTP liveness to bus liveness, and the parity claim is false (§2.1).** Class: unstated coupling / under-counted blast radius. Today the Python gateway binds after migrations and *before* discovery completes; a bus outage degrades the bus, not the API. This design binds only after a full Category snapshot, so a slow registrar, a broken share, or a broker blip now takes the **entire HTTP surface** down, not just the relay. The sentence "exactly as during every restart today" is the design's own symmetry claim and it does not hold: the outage window is strictly larger and, in the failure case, unbounded. This is the one that must close.
+- **F2 — The exactly-one assertion has no actuator (§2.4).** Class: a guard that cannot act. "Fails `/health` loudly, rather than picking one" — but §2.1 states Caddy does no health checking, and no rollback trigger in §2.9 reads `/health`. At the prod pin the stale-retained registration fix (`7bb08db`) is *not present*, so a power cycle can leave two matches and this fires for a reason the design does not own, and nothing happens. A hole in a guard is evidence the guard is the wrong shape: make the gateway **refuse the bus-dependent action** on ambiguity (never publish, never subscribe), and wire the condition to a rollback trigger — or drop the assertion and state the deterministic pick rule.
+- **F3 — `GATEWAY_IMPL` failure behavior and rollback reachability are unspecified (§2.1, §2.9).** Class: missing failure mode. If `GATEWAY_IMPL=dart` and Dart fails its DB assert or cannot take `.aiko-worker.lock`, the entrypoint has already `exec`ed it, the container exits and crash-loops, and the island is down. Rollback is "the same setting flipped back," but §2.1 says `island configure` "checks the island serves afterwards" — if it verifies-then-commits, or reverts on verify failure, the operator cannot switch back while the gateway is down. State the entrypoint never falls back (a crash is a crash, as today), and that configure **commits before it verifies**.
+
+**What holds:**
+
+- One writer, one boot; process memory (Hub, echo, rate limiter, topology queue) moves together. #46 and #42 stay off the critical path.
+- One image, `GATEWAY_IMPL`, no `BUS_IMAGE`, no second compose shape, no `update.sh` change (r2-2 closed; R11).
+- Alembic stays sole authority; Dart is a client that never writes on open; no freeze, no rollback cliff, no 22-table mirror (r2-3 closed; R12; §7.2).
+- Licensing: silence selects nothing (r2-4 closed; §7.1).
+- Observer, not Actor; two explicit dialect filters; Feb pin; no production tapes.
+- The linearisation rule and journey 10 close kill-after-commit (r2-6), with one named edge: an effect computed *before* a revocation's commit may still reach a socket before the disconnect lands. Acceptable, but record it.
+- Ten journeys with obligations replace the coverage map, trace and injection seam (r2-9 closed); C2 bounds their coverage explicitly.
+- The WebAuthn **transactional home** is closed (§2.3); the registration accept-set is a named Nick decision, not a hidden scope bomb (r2-1 converted, not eliminated).
+- Gate G with "stop" as a defined outcome; R5 deleted (r2-11 closed).
+- The D1 fix lands in Python first, under cage-match, before the Dart port trusts the share (r2-10 on the Python side).
+
+**If RECAST, what to fold back:**
+
+1. **§2.1 — delete the process-wide ready gate.** Bind the HTTP listener as today; make readiness per-path. Bus-dependent routes (WS subscribe, bus ingest, `send_message` publish) return 503 until the observer has applied its first snapshot; HTTP reads, `/openapi.json` and health are served immediately. Replace "Dart does not bind its HTTP port at all" with "Dart binds, and the bus-dependent paths are closed until the snapshot lands." Then remove the false parity claim, or replace it with the honest one: HTTP availability is no longer coupled to bus availability.
+2. **§2.4 — give the exactly-one assertion an actuator.** On zero or two matches, the gateway refuses to publish and refuses to subscribe (capability never granted), and the condition becomes a rollback trigger in §2.9. Do not leave it as a health flag nothing reads.
+3. **§2.1, §2.9 — state the failure and rollback contract.** Entrypoint never falls back to Python on Dart failure. `island configure --gateway-impl` writes the setting, then restarts, then verifies; verification failure does not revert the write, so rollback is reachable while the gateway is down. Rehearse both directions on the rig.
+4. **§2.4 — one topology source, one snapshot name.** The fallback ("periodic re-lease of `channel_list`") is the mechanism whose *incrementals* D1 says are broken; its *snapshot* works. Say so, and make readiness wait for "a full topology snapshot from whichever source is configured," not specifically "a full Category snapshot."
+5. **§2.8 — reframe option (a) as parity, not implementation.** py_webauthn with no trust roots accepts nearly every `fmt` by parsing and not chaining (only Apple's root is checked). Option (a) is "reproduce py_webauthn's actual accept-set, including its non-checks," which is far smaller than "implement every format." Frame it that way so option (b) is chosen on real evidence and the estimate is not inflated.
+6. **Minor:** §2.2's "injected clock" is stated as solved but the mechanism is not named (test-only control surface compiled out of prod, or an external clock); §2.1 cites "invariant 7b," which is not defined in this bundle. Name the clock mechanism; define or drop the reference.
+
+Record as a named tradeoff with an owner: **the two-gateway image widens the attack surface for the duration of the port, in exchange for rollback that never ends** (§4) — owner Nick, revisited when the Python gateway is deleted by its own later decision.
+
+---
+
+## CarnotCodeCarver's Design Strike (round 3)
+
+**Verdict:** RECAST
+
+**Summary:** The subtraction substantially holds, but r2-10 remains open: topology discovery still carries authority to erase history, and its fallback contradicts readiness. Fold topology back to relay attachment and remove that fallback dependency. No real engine matches the Carnot cycle; a reviewer's job is to say how far short we are.
+
+**Producer first:** Producer first: The harm is users losing stored channel history and memberships after a topology change. A Category removal or incomplete reconciliation is the trigger; the gateway's remove → hard_delete_channel cascade is the producer. That coupling can be deleted: bus topology should control relay attachment, while an explicitly authorised owning service controls deletion. The schema and deploy subtraction already remove other producers: Dart cannot migrate the file, and two gateways cannot own it concurrently. Discovery and cryptographic validation remain necessary because the gateway must interpret external service identities and untrusted authentication bytes.
+
+**Fatal flaws:**
+- Make accidental history erasure impossible: remove bus topology's authority to hard-delete channels, messages and memberships; then Nick's hard-delete permission gate and destructive-removal safeguards become unnecessary. §2.4 acknowledges the newly activated cascade but leaves its disposition to a later ruling. Under the requested final-round standard, r2-10 is named, not closed. This production behaviour change is also unnecessary to replacing the gateway executable.
+- The topology fallback cannot satisfy the startup contract. §2.4 permits periodic channel_list snapshots when Category fails, but §2.1 forbids binding HTTP until a full Category snapshot has been applied. Selecting the documented fallback therefore leaves the replacement unavailable. Delete the unproven Category transition from the port's critical path and use one selected snapshot source consistently for startup, renewal and reconnect.
+
+**What holds:**
+- R2-2, 3, 4, 11 and 12 close structurally: one image, one pin, Alembic authority, explicit licensing, an honest stop outcome, and no schema freeze. This removes machinery and entropy.
+- R2-5 closes for the stated availability contract: an ordinary restart accepts dropped push retries and unsubscribed bus traffic; positive readiness replaces an impossible drain.
+- R2-6 and 7 close at the design level: committed-message effects have an explicit ordering rule, kill-after-commit has an expected result, and known-bug exceptions cannot excuse authentication or storage divergence.
+- R2-1 has a workable transactional home. Implementing full registration parity or separately narrowing Python first are honest alternatives, provided Nick selects the target before approving its cost. A census informs that policy decision; it cannot prove an accept-set.
+- R2-8 and 9 have concrete implementation obligations: Nick sets rollback thresholds and soak duration at gate G; ten journeys retain reject, race and fault expectations, supplemented by converted tests and the step-7 inventory.
+- Keeping both gateways and maintaining compatibility with every new Alembic head are continuing costs, not fatal flaws. Nick owns that compatibility commitment until Python rollback is explicitly retired.
+
+**If RECAST, what to fold back:**
+- Keep topology removal non-destructive: detach the relay and preserve stored state. Route deliberate deletion through the existing authorised owning service.
+- Select one topology snapshot mechanism before implementation approval. Define readiness and heartbeat against that same mechanism; Category can remain a separately reviewed improvement.
+- Record owners for the remaining tradeoffs: Nick for registration policy, restart losses and rollback lifetime; migration authors for both-gateway schema compatibility; gateway maintainers for the frozen OpenAPI contract and test inventory.
+- Prefer sqlite3 directly unless drift provides a demonstrated query benefit. With Alembic owning DDL and no generated table mirror, retaining migration machinery merely creates another refusal path. Dijkstra: "Simplicity is prerequisite for reliability."
+
+
+---
+
+## Tesla, the Arc-Prophet's Design Strike (round 3)
+
+*Verbatim, except a leading sentence of the seat narrating its own read ("The brief is truncated at the bus section…"), which ran into the header; split off.*
+
+**Verdict:** RECAST
+
+**Summary:** The subtraction holds the one-writer frame, and then the ready-gate tunes the whole island to the registrar's note — a frequency the February pin can sustain forever — so the restart that was meant to match today's outage becomes a 502 that does not end.
+
+Tesla: "If you want the secrets of the universe, think in energy, frequency and vibration."
+
+**Producer first:** The new listen-gate (§2.1) is aimed at a real harm: a partial Category view hard-deleting channels, or traffic arriving before the observer has subscribed. The producer of that harm is the reconcile path, and it can be made unable to run before one full snapshot. Once reconcile is dark, the listen-gate is unnecessary, and it is itself the producer of a worse harm: every HTTP route stays unbound for as long as the bus withholds a snapshot. The `alembic_version` assert stays. A volume can sit ahead of an older image, the schema is bytes we parse, and no type can make a wrong head unrepresentable. Derive the stamp from that image's own alembic heads so the assert cannot false-fire inside the image that just migrated. The exactly-one ChatServer assert stays. A broker we do not control can present zero or two `chat_server` matches, and the design already has no pick-one branch. The stored-byte comparison stays while both binaries are allowed to be the writer across a restart. The rollback triggers stay human-actuated. An automatic flip would be a new flapping producer. Their owner is Nick. The census-as-allow-list does not stay. It produces sign-in lockout for a key registered after the count. Always verify the ceiling ES256, RS256 and EdDSA, and the census stops being a gate. The image-build that copies the Dart executable in at step 3 produces the licensing outcome §7.1 forbids. Silence selects nothing only if a release image cannot contain the binary until Nick licenses it. The journey oracle does not cover the switch. Steps 5 and 6 still produce moderation, calls and OAuth with no expected world. Make those paths unable to reach syd by leaving them out of the Dart process until each has a journey inside the step-2 estimate.
+
+**Fatal flaws:**
+- §2.1's ready rule is the old non-converging drain, moved onto the listen socket. Ready requires a full Category snapshot before the port opens. RESEARCH Q1(c) measured the production pin: a stale retained `(primary found …)` leaves every client waiting forever, Python and Dart alike. Caddy has no health check, so that wait is a total 502, including history and sign-in, which do not need the share. Journey 10 already accepts a committed row whose publish was dropped. §2.4's `channel_list` re-lease is not in the ready predicate, so the fallback cannot unblock boot. The prod-pin primary wait is the future input. This check is the wrong shape.
+- §10 maps r2-9 onto "ten journeys," and the ten are not the surface that flips. §3 step 5 still builds moderation and calls. Step 6 still builds ID tokens and OAuth. Recovery re-key, which disconnects every socket, is in neither the journeys nor that list. Gate G takes the step-2 estimate before any of that mass is counted, so the stop/go that closed round-1 flaw 4 is blind again. Journey 5 names "an echo arriving before commit" and states no world for it. A named race with no expected result is the linearisation fold left open.
+- §2.4 says the Category share does not ship until journey 9 is green and Nick has ruled on hard-delete. §3 step 0(c) ships that share in production Python before the harness in steps 1–2 exists. Today `remove` already calls `hard_delete_channel` (`client.py:169-172` → `main.py:136`) and has never fired under a live lease. Connecting it first, testing it second, is the dormant delete waking at 3am on a glitch. The fallback sentence ("bounds staleness by the period") can be read as a second live feed beside Category. Two topology producers and one hard-delete function is a split-brain delete.
+- §7.1 says the dependency enters a release only after Nick licenses it, and silence selects nothing. §3 step 3 puts the AOT executable into today's image, and unrelated releases are not frozen. The attested image is the bundle. Presence in the layer is the selection §7.1 says must not happen. CRUCIBLE's licensing hole is the AGPL image carrying the library, whether or not `GATEWAY_IMPL` defaults to python.
+
+**What holds:**
+- One process, one lock, one boot. Rollback is the same setting on the same volume. `#46` and `#42` stay off the critical path. Restart losses match today's: in-process push retries dropped, publishes during the gap dropped, no retry, no duplicate (journey 10).
+- Alembic remains the only schema authority. No `user_version` stamp, no freeze, no authority cliff. FK stays off. Cascades stay code. `IslandDateTime` writes the space-separated form. The drift-versus-`sqlite3` probe fails closed if `onCreate` runs on `user_version=0`.
+- Observer, not Actor. The February pin is the target. `:0` and `:1` are explicit. Exactly one match. MQTT stays clean session, random client id, QoS 0, which is why a redelivery duplicate does not fire under this policy.
+- WebAuthn's round-2 bomb is closed as a decision, not as a smuggled policy. Authentication parity includes non-canonical DER, the EdDSA header patch, and re-encoded COSE. Registration is Nick's (a) or (b) at gate G. Challenge, credential and sign-count share one transaction (§2.3). Stored form stays Python-readable for as long as rollback exists.
+- R5 is gone. Two images are gone. The known-bug list cannot cover stored bytes, the accept-set, or anything the app reads. `/openapi.json` and the settings vector are priced. Gate G may stop, and steps 0–4 still pay.
+- Named tradeoffs, not fatals, to record with an owner. Nick owns them. The image stays Python-sized plus one executable until a later decision (§4). Both binaries remain behavior-locked with no end date. §4 states that. C9's "bounded by gate G's estimate" is the false sentence. Soak triggers are manual, read from existing logs, with N and M set at gate G. Nick is the watcher. No actuator flips `GATEWAY_IMPL`.
+
+**If RECAST, what to fold back:**
+- §2.1: bind after the worker lock and a successful open of the alembic file. Hard-delete and any other topology reconcile stay unconnected until one full snapshot has been applied from the single chosen source. `/health` may report the bus. The listen socket may not wait on it. Cite the stale-primary wait in the claim beside C5.
+- §2.2 and §3: before the step-2 estimate, extend the journey list to every user-visible family steps 5–6 still name — moderation (ban disconnect and fanout), calls, OAuth and ID-token sign-in, recovery re-key — each with a success, a reject, and a race world where one exists. Anything still unnamed is not in the Dart binary that syd runs. Journey 5's early echo resolves to exactly one stored row.
+- §2.4 and step 0(c): the share PR contains its own green cases, and it does not wire `remove` to `hard_delete_channel` unless Nick's ruling in that PR says so. The `channel_list` re-lease is a replacement source, never a second live subscription.
+- §7.1 and step 3: CI may prove the native-asset build. The published island image does not contain the Dart gateway until the licence act. `GATEWAY_IMPL` defaulting to python is not that act.
+- §2.8: sign-in always implements the three-algorithm ceiling. The `alg` census orders the work and informs registration option (b) for `fmt`. It does not shrink the sign-in accept-set.
+- C9: the dual-implementation agreement lasts until the later decision that deletes the Python gateway. CI fails unless both binaries meet the journey. The head stamped into the Dart executable is read from that image's alembic, not from a hand constant.
+- §2.1's configure proof: `docker compose config` shows the key is forwarded under invariant 7b. The proof that the switch happened is the new process's identity after the restart. A serve-check against the still-running process does not count.
+
