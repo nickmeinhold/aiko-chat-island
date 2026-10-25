@@ -1,287 +1,299 @@
-# Design: port the island gateway to Dart, prove it with conformance tests, and switch once
+# Design: replace the gateway's command with a Dart one, in the image that already exists
 
-*Movement 4 (Cast), round 2. 2026-10-25. Bundle: `CRUCIBLE.md` (the case), `RULINGS.md` (the decisions this rests on), `RESEARCH.md` (Heat), `SPARK.md` (the sparks and their fusion), `TEMPER.md` (round 1: RECAST 4/4, 15 deduped flaws). Every one of those flaws is folded below; §10 maps each to where it landed. §9 says what each cast changed.*
+*Movement 4 (Cast), round 3. 2026-10-25. Bundle: `CRUCIBLE.md`, `RULINGS.md`, `RESEARCH.md`, `SPARK.md`, `TEMPER.md` (r1: RECAST 4/4, 15 flaws; r2: RECAST 4/4, subtractive). §9 says what each round changed; §10 maps r2's flaws.*
+
+**What round 3 is.** Round 2's panel told the design to subtract, and it does. The port no longer changes the image layout, the deploy contract or the schema authority. **Dart replaces one process (the gateway) inside today's image.** Everything else on the island stays as it is: alembic, the registrar, the ChatServer, `update.sh`, one pin. The design is smaller than round 2's by intent; where it is not, §9 says why.
 
 ## 0. Blast radius and consent, first
 
-- **Who this reaches.** Every user of both islands, at one moment per island: the switch.
-  - **Riskiest: sign-in.** A Dart verifier that rejects a passkey Python accepted locks a person out; one that accepts an invalid assertion lets someone in as someone else. Hence §2.8 *parity first*: no policy change rides inside the port.
-  - **Second: stored bytes.** Dart writes into the file Python built, and rollback needs Python to read what Dart wrote (§2.5, C3).
+- **Who it reaches.** Every user of an island, at that island's switch.
+  - Riskiest is sign-in (§2.8: parity, never policy).
+  - Then stored bytes Python must still read on rollback (§2.5).
+- **What is NOT behind the switch (fold r2-12).** Steps 0(b) and 0(c) change PRODUCTION behaviour now, in Python, each under its own review:
+  - 0(c) is a **state-lifecycle change with a hard-delete path** (§2.4): cage-match by law.
+  - Nothing *of the port* runs in production before step 8.
 - **Owners.**
-  - Nick decides gate G (§3) and each switch.
-  - Andy is asked at step 0, not step 8, about ADR-0007 and the `aiko_services_dart` licence (outward-facing, so it is Nick's hands).
-  - The app tab is told before the switch that `/openapi.json` becomes a maintained file (§2.6).
+  - Nick: gate G, each switch, the `aiko_services_dart` licence (§7.1), and any narrowing of the WebAuthn registration policy (§2.8).
+  - Andy is asked at step 0 as Nick's chosen courtesy.
+  - The app tab is told at step 1 that `/openapi.json` becomes a maintained file.
 - **Throttle.**
-  - Nothing runs in production before step 8.
-  - syd (the test island) switches first, with named rollback triggers and a named maximum soak (§2.9). Then melb.
-  - Python rollback is supported until the drift authority change, and **explicitly not after it** (§2.9).
-- **Cage-match by law** on every PR touching auth, moderation, account deletion, the wire or state lifecycle, which covers most of steps 5 to 8. The WebAuthn package gets its own strike before anything uses it.
+  - syd first, then melb, each switchable back independently at any time (§2.9), because nothing about the schema or the image changes.
+- **Cage-match by law** on auth, moderation, account deletion, wire and state-lifecycle PRs. The WebAuthn package gets its own strike first.
 
-## 1. The problem
+## 1. The problem (unchanged facts)
 
-The gateway is 19,466 lines of Python. The reason it is Python measures at 397 lines (the bus client). Nick ruled the port twice on 2026-10-25. Heat measured four things that shape it:
-
-- **No cheap coexistence.** Account deletion is one transaction across 16 tables. Sockets, echo suppression, the rate limiter and the topology queue live in one process's memory, and a worker lock forbids a second process. Only read-only routes and the push worker could split off without first building #46 and #42 (RESEARCH §A2).
-- **The suite is not an oracle as it stands.** No test runs the real server or opens a WebSocket. About 23% could drive a binary given a seeded DB and stubs; about 13k lines are in-process service tests (§A6).
-- **Python stays on the box anyway.** The registrar, ChatServer, seed-building and boot migrations all use Python (§A5).
-- **Prod and CI speak different chat protocols:** `chat_server:0` with JSON against `chat_server:1` with S-expressions. The local rig runs prod's exact pins (§A1, verified by hand).
+- **No cheap coexistence.** One 16-table deletion transaction; in-memory sockets, echo, rate limiter and topology queue; a worker lock (RESEARCH §A2).
+- **The suite is not an oracle as it stands** (§A6).
+- **Python stays on the box** for the registrar, ChatServer, seed and migrations (§A5).
+- **Prod speaks `chat_server:0`** with JSON; CI speaks `:1` with S-expressions. The rig runs prod's pins (§A1).
 
 ## 2. The shape
 
-### 2.1 One writer, one switch
+### 2.1 One image, one more executable, one switch
 
-Dart never runs as a second live writer. It is built and proven on the rig, then, per island, takes over at a single, rehearsed switch. Everything held in process memory moves at once, so **#46 and #42 are not prerequisites of the port** (they remain good ideas on their own).
+- **Today's image gains the Dart gateway executable**, AOT-compiled with its native SQLite asset, beside the Python one.
+- The compose `gateway` service keeps its image. Its **entrypoint runs alembic exactly as today** (`python -m aiko_gateway.migrate`) and then `exec`s **either** the Python gateway **or** the Dart one, chosen by one setting in the operator's `.env` (`GATEWAY_IMPL=python|dart`, default `python`).
+- Rollback is the same setting flipped back on the same volume.
+- **There is no `BUS_IMAGE`, no second compose shape, no change to `update.sh`, the preflights or standup** (fold r2-2).
+- The size win from a Dart-only image is **deferred**, as a separate later decision that needs the Python gateway to be gone first.
 
-**The switch protocol** (fold 5):
-1. Stop admission at Caddy (503 with `Retry-After` on `/v1/*` and the WS upgrade).
-2. Let Python drain: in-flight requests finish, the topology queue empties, the push queue empties, all bounded by a timeout.
-3. Stop Python with SIGTERM. SQLite is crash-safe, so a cut mid-transaction rolls back whole.
-4. Back up the volume (the existing `update.sh` backup).
-5. Start Dart. It takes `.aiko-worker.lock`, validates the schema (§2.5), and only then reports ready.
-6. Re-admit traffic.
+**The switch is a restart, the same as every release today** (fold r2-5):
+1. Change the setting with a **new `island configure --gateway-impl` option**. Today configure edits only named keys (`--name`, `--seed-peers`, the passkey switch, `--domain`; `configure.dart:103-116`), so adding the option is a small step 3 PR. `GATEWAY_IMPL` also has to be forwarded by compose, under invariant 7b. Configure already rewrites only that line, proves it with `docker compose config`, and checks the island serves afterwards.
+2. Restart the gateway service.
+3. Python receives SIGTERM, and uvicorn closes connections and drains in-flight requests within its graceful timeout.
 
-A bus message published during steps 2 to 5 is lost, exactly as during any `update.sh` restart today (F6). **The MQTT session policy is stated, not inherited:** clean session, random client id, QoS 0 subscriptions. That is what paho's defaults give at the prod pin (`mqtt.py:112`, `:230`, `:235` at `a66424d`), so the broker never redelivers into the new process. The Dart client must match it, because a persistent session would turn the switch's loss into duplication, and duplication is #42's problem.
+Two losses are **accepted exactly as on every restart today**:
+- in-process push retries are dropped;
+- bus messages published while no gateway is subscribed are lost.
 
-### 2.2 The oracle: conformance tests, not universal replay
+Neither is migrated, retried or duplicated.
 
-*Round 2 replaced "Python and Dart must produce identical normalised ledgers" (fold 2, Carnot's subtraction).*
+**Ready means something positive.** Dart reports ready only after:
+- it holds `.aiko-worker.lock`;
+- it has opened the DB (§2.5);
+- the bus observer has applied a **full Category snapshot** (§2.4).
 
-An **episode** is a scripted user journey driven over the real wire against a real binary, with **its own expected results written down**. Python's behaviour today is the *reference* for "unchanged" properties, but it is not the definition of correct. The episodes cover:
-- **Happy paths:** register, sign in, join, send and fan out, DM, react, call token, push.
-- **Invariants with independent expected results** (fold 2):
-  - Account deletion is all-or-none: a fault injected between the cascade's statements leaves either all 16 tables untouched or all purged, checked by a snapshot taken mid-episode.
-  - No forbidden effect is ever observed, even transiently: no fan-out to a banned user, no push to a deleted account, no frame to a socket after disconnect.
-  - Commit happens before fan-out, which happens before push and bus publish. The ledger records **the sequence** of commits and effects, not one final diff.
-- **Adversarial schedules:** ban versus send, deletion versus push, refresh-token reuse, challenge replay, topology removal mid-message, an echo arriving before the local commit.
-- **Faults:** kill between commit and bus publish; restart mid-episode; stub servers that fail or time out.
-- **Clocks** (fold 15): an injected clock, and episodes that cross the 300s challenge TTL, the JWT expiry and the 300s EC lease.
-- **The silent-desync rule** (fold 10): an episode whose request body carries an unknown field, which must succeed.
+**Until then Dart does not bind its HTTP port at all**, so Caddy gets connection-refused and answers 502, exactly as during every restart today. **CHECKED:** the Caddyfile has no health check (`reverse_proxy localhost:8095` and nothing else), so readiness must live in the gateway, not the proxy. This replaces "wait until the queue empties": the producer stays live, so that condition never converges.
 
-**What is compared, and how** (folds 3 and 10). Two equalities, specified rather than improvised:
-- **App-observable equality.** Status codes; the JSON fields the app reads, checked against the frozen `openapi.json` schema (§2.6); WS frame types and fields; push payload keys. **Not compared:** error prose, JSON key order, pydantic's 422 `detail` text.
-- **Stored-byte equality.** The `DATETIME`, `BOOLEAN`, `JSON` and `public_key` columns are compared as **raw bytes, never parsed by the comparator**. This is checked in both directions: Dart reads a Python-written alembic seed, and Python reads a copy Dart wrote. `validateDatabaseSchema` cannot do this (it compares affinity), so it is its own test.
+**MQTT policy, stated:** clean session, random client id, QoS 0. This matches paho's defaults at the pin (`mqtt.py:112,230,235` at `a66424d`), so no session survives the restart and nothing is redelivered.
 
-**A harness-only decision trace** (fold 2, Tesla). In test builds, Dart records the sequence of `Decision` variants each episode produced, so a red episode names the variant that fired. It is compiled out of production, is never a table in the island database, and no tape is ever made in production (RULINGS: no broker door, no record of who called whom, account deletion). In step 5 the harness can also **inject** decisions at that seam, so the applier goes green before its parsers exist.
+### 2.2 The oracle: a fixed set of journeys, each with its own obligations
 
-**Known bugs are marked, not specified** (F7): an episode that records behaviour we believe is wrong is marked as a known bug, and Dart need not reproduce it. D1 proved the need the same day.
+*Fold r2-9: no injectable Decision seam, no decision trace, no every-branch coverage map.*
 
-### 2.3 Inside Dart: parse, then authorise and apply in one transaction
+**Ten journeys**, driven over the real wire against a real binary (uvicorn or Dart) on the rig at prod's pins, with an injected clock. Each has written obligations: a **success** case, a **rejected** case, and where relevant a **race** or **fault** case, each with its own expected result. Python's behaviour is the reference only for "unchanged".
 
-- **Parsers** turn bytes into a `Decision`. The list of parsers:
-  - HTTP and WS bodies;
-  - bus frames (`:0` JSON, `:1` S-expression);
-  - WebAuthn CBOR;
-  - provider ID tokens;
-  - **and `Settings`** (fold 11): the 62-field env with pydantic's coercions (whitespace, None defaults, `ge=1` bounds that fail loud).
-- **A `Decision` is an authenticated command with provenance**, not a verdict (fold 8). It says *who asked for what, through which door*. It does NOT carry "is allowed".
-- **The applier re-checks every piece of mutable authorisation inside the owning transaction:** membership, ban, session generation, block. That is the one-door law (CLAUDE.md), and it closes the gap where a `MessageAccepted` built before a ban commits after it. External effects (fan-out, push, bus publish) become eligible only after commit, in the order §2.2 asserts.
-- `Decision` is a sealed class, a closed set we construct. That is design 15's law used on purpose: the compiler pays in the applier. **Whether the island's defects actually live there in `src/` is claim C10, to be measured, not assumed** (fold 13).
-- **Differential agreement** with a Python reference function is required for every parser that has one:
-  - `payload.py` and `topology.py` on a fuzz corpus;
-  - Settings via an env → effective-settings vector file run by both (the `test_seed_peer_vectors.py` pattern);
-  - WebAuthn per §2.8.
-- **Every parser obeys the silent-desync rule:** unknown fields are ignored, never rejected.
+| # | journey | obligations beyond success |
+|---|---|---|
+| 1 | register a passkey | malformed body → 4xx; challenge replay → rejected; expired challenge (TTL crossed) → rejected |
+| 2 | sign in | wrong origin → rejected; sign-count regression → rejected; refresh reuse → rejected; JWT expiry crossed |
+| 3 | join a channel | non-member reads → rejected; ban, then join → rejected |
+| 4 | send and fan out | ban vs send race (linearisation rule below); unknown request field → accepted (silent-desync) |
+| 5 | echo | a bus echo of our own send is not stored twice; an echo arriving before commit |
+| 6 | DM and reactions | non-participant → rejected |
+| 7 | delete an account | **all-or-none**: kill the process during the cascade → all 16 tables untouched or all purged; push to the deleted account → none |
+| 8 | push | device registered → wake planned; recipient budget exceeded → throttled |
+| 9 | topology | Category add → subscribed + row; Category remove → per §2.4's rule; reconnect snapshot that omits a channel → no hard-delete |
+| 10 | kill after commit | commit, then kill before bus publish → **row kept, publish dropped, no retry, no duplicate** (fold r2-6) |
 
-### 2.4 The bus: target the pin production runs, speak both dialects, on the share that works
+**The linearisation rule** (fold r2-6):
+- A message's effects (fan-out, push, publish) are computed from the transaction that committed it and dispatched after that commit.
+- A revocation (ban, delete, session bump) that commits **later** does not recall effects already computed. It does disconnect the revoked sockets, so **no frame computed after the revocation's commit reaches them.**
+- Journeys 3, 4 and 7 test that exact interleaving with barriers.
 
-- **The port targets the February pin, and the bump (task #22) is NOT done first**, because the bump would couple two migrations (the bump forces aiko_chat `:1`).
-- **The Dart gateway is a bus observer, not an Actor:** a service-id-0 `BusProcess` that registers nothing. That removes the latent "any bus client can make the gateway post as anyone" surface (RESEARCH §A1 Q1b).
-- **It finds the ChatServer by `name=chat_server` with two explicit filters, `:0` and `:1`**, not `*`, so a future `:2` fails loudly. It decodes both payload tiers.
-- **Topology comes from the `channels` Category's `entries` share, NOT `channel_list`** (fold 7). Step 0(c) measured that `channel_list` never sends runtime adds or removes at the pin. The Python fix lands first, and the Dart observer mirrors the *fixed* behaviour.
-  - Before either is trusted, the replacement path passes add, remove, reconnect, and snapshot-versus-incremental agreement on the rig. The removal frame gets captured too, since only the add frame has been seen so far.
-  - The pin's f-string incrementals on other shares are a **known February-pin defect** (marked per F7), not a third dialect to emulate.
-- **`send_message` is one `bus.send('$path/in', ...)`.** It has never been exercised live from Dart, so it gets its own round-trip assertion.
-- New code on top of `aiko_services_dart`: roughly 150 to 200 lines.
-- **Prerequisite:** a `bus-e2e` job pinned to the Dockerfile ARGs (task #23). The master job stays as a canary.
+**Two equalities, specified:**
+- **App-observable:** status codes; the JSON fields the app reads, validated against the frozen `openapi.json` request and response schemas (§2.6); WS frame types; push payload keys. Not error prose, not key order.
+- **Stored bytes:** `DATETIME`, `BOOLEAN`, `JSON`, `public_key`, compared raw, never parsed by the comparator. Checked **in CI**, in both directions: Dart reads an alembic-built seed, and Python reads a copy Dart wrote. **Not on the boot path**, where Python is not present to read.
 
-### 2.5 The database: drift opens the alembic DB; alembic stays the authority while building
+**Known bugs** (fold r2-7): an exception list is frozen before gate G. Each entry has its own expected behaviour and an approval. **No entry may cover stored bytes, the WebAuthn accept-set, or anything the app reads.** New entries go through the same review.
 
-- Dart opens the live file through drift's `setup` hook, **validating before writing anything** (fold 12):
-  1. assert `alembic_version` is the expected head;
-  2. set `busy_timeout=5000`;
-  3. run `validateDatabaseSchema(validateDropped: true)` plus the stored-byte checks (§2.2);
-  4. **only then** stamp `PRAGMA user_version`.
+### 2.3 Inside Dart: parsers write nothing; one transaction does everything stateful
 
-  If any step fails, it refuses to serve, and opening the file has written nothing. The rollback journal stays (WAL stays off for the restore drill).
-- **Tables are hand-faithful:** `customConstraint` text copied from alembic, a `CustomSqlType('DATETIME')`, and an `IslandDateTime` that reads and **writes** `'YYYY-MM-DD HH:MM:SS.ffffff'`.
-- **What this buys, stated honestly:** a *checked migration discipline* (drift snapshots, runtime validation, CI against an alembic-built seed). It is stronger than `alembic heads` run by hand, but it is **not a compile-time proof**. CRUCIBLE's claim to the contrary is corrected in place.
-- **While building, there is no schema freeze.** Each new alembic migration is mirrored into drift in the same PR, and CI validates the drift definitions against a seed built by the real alembic.
-- **From the first switch to the authority change, there is a freeze** (fold 6, §2.9). No release in that window may raise the alembic head, and CI enforces it. A schema-shaped bug found on syd is a **rollback, not a migration**.
-- **The seed:** the Dart image builds `/app/seed/aiko.db` in a **Python build stage** (multi-stage) until the authority change, then moves it to Dart.
-- **Boot migrations** need Python today, which is why the window is frozen.
-- **The authority change** (task #16, superseding ISL-0001) lands right after melb's soak. It ends Python rollback (§2.9).
-- ISL-0002 is unchanged: FK off, application cascades ported as code.
+- **Parsers** turn bytes into typed commands, and **write nothing**: HTTP and WS bodies, bus frames (`:0`, `:1`), WebAuthn CBOR, ID tokens, and `Settings`. `Settings` is checked by an env → effective-settings vector file run by both implementations.
+- **Each command is handled by one service function that owns one transaction** (fold r2-1, Tesla). Inside it:
+  - re-check every piece of mutable authorisation (membership, ban, block, session generation);
+  - **consume the WebAuthn challenge**;
+  - insert the credential or update the sign count;
+  - bump the session generation;
+  - write the rows.
 
-### 2.6 What does not change, and the one artifact that does
+  Effects are dispatched only after commit (§2.2). This is the one-door law, and the list of stateful steps is this short on purpose.
+- **Commands are ordinary sealed values**, not a framework. The compiler checks exhaustive handling, which is design 15's law where it pays. Whether defects actually live there in `src/` is **C10, measured at step 0(g)**.
+- **Silent-desync:** unknown fields in HTTP and WS JSON are ignored. *Narrowed* (Carnot): this does not extend to cryptographic structures, where WebAuthn parsing follows §2.8.
 
-- The `/v1/*` wire, as the app observes it (§2.2's first equality).
-- Message bodies stay byte-opaque, including the coming K-epoch-in-signature.
-- The deploy model: pinned, pulled, attested images (ISL-0003).
-- History stays owned by the island. Upstream's planned "persistence and replay" (`e_00_TransitionPlan.md:210`) is unbuilt; if it arrives, it is one more parser into `MessageAccepted`.
-- **`/openapi.json` stops being generated** (fold 9). FastAPI generates it today: live, 76,186 bytes, and CLAUDE.md names it as the cross-tab wire contract. `shelf` generates nothing.
-  - Step 1 freezes today's file into the repo.
-  - Episodes validate responses against it.
-  - Dart serves it.
-  - CI fails if a route exists in the router but not in the file, or the reverse.
-  - The app tab is told at step 1 that from the switch it becomes a maintained file, changed only in a PR both tabs see.
+### 2.4 The bus
 
-### 2.7 Images and the release contract, proven early
+- **The Feb pin is the target; no bump first.**
+- **Observer, not Actor:** service id 0, registers nothing.
+- **Discovery:** `name=chat_server` with explicit `:0` and `:1` filters. **Exactly one match is asserted** (fold r2-10). Two live matches, or none for longer than a bound, fails `/health` loudly, rather than picking one.
+- **Topology comes from the `channels` Category `entries` share (#24).** It lands in Python first (step 0c) and is cage-matched by law, because **it turns the dormant hard-delete live**: today a share `remove` → `hard_delete_channel` + messages + memberships (`client.py:169-172` → `main.py:136`), and it has never fired under a live lease. Before it ships:
+  - journey 9's cases are green;
+  - Nick decides whether a bus `remove` may hard-delete, or only soft-mark pending confirmation.
 
-- **Two images at the switch:**
-  - `aiko-chat-island` (Dart on distroless/cc, estimated 25 to 35 MB);
-  - `aiko-bus` (registrar plus ChatServer at the pins: today's image minus the gateway layer).
+  **If the Category share fails those cases, the fallback is a periodic re-lease of `channel_list`.** A new lease gets a full snapshot (measured in D1), which bounds staleness by the period without trusting incrementals (fold r2-10).
+- **`send_message`** is one `bus.send('$path/in', …)`, with a live round-trip assertion.
+- **New code** on `aiko_services_dart`: roughly 150 to 200 lines. CI gets a `bus-e2e` job pinned to the Dockerfile ARGs (#23).
 
-  Both are attested on the index digest.
-- **The release contract is built at step 3, not discovered at step 8** (fold 5, Carnot):
-  - `image.env` gains `BUS_IMAGE`;
-  - `update.sh`, the compose-drift preflight, standup and the compat guard learn both compose shapes (one image with three commands; two pins);
-  - native-asset packaging (`sqlite3` build hooks) is proven for both arches.
+### 2.5 The database: Dart is a client of the alembic file, never its owner
 
-  Every allowed upgrade and rollback transition is rehearsed on the rig before step 5 starts.
+*Fold r2-3: no adoption, no stamp, no drift migrations during the port.*
 
-### 2.8 WebAuthn: parity first, policy later
+- **Alembic stays the sole schema authority, ISL-0001 unchanged.** The entrypoint runs it at every boot, as today, before either gateway starts. So there is **no freeze window and no rollback cliff**: a new migration ships in a release exactly as now, and both gateways must read it.
+- **Dart opens the file as a client:**
+  - `busy_timeout=5000`, rollback journal;
+  - no `PRAGMA user_version` write, no `onCreate`, no migrations;
+  - before serving, it asserts `alembic_version` equals the head it was built for, and refuses otherwise.
 
-*Round 2 rewrote this section (fold 1, all four families).*
+  The query layer is drift **with migrations disabled** (an `onCreate` that refuses, a `beforeOpen` that only checks), or `package:sqlite3` directly. **A step 3 probe decides**, with the deciding question being "does opening ever write?".
+- **Schema oracle, in CI:** a checked-in `sqlite_master` dump from the alembic-built seed. Every alembic migration PR updates the dump, and Dart's queries are tested against that seed. That is all. No hand-faithful 22-table mirror is needed while alembic owns the schema.
+- **`IslandDateTime`** reads and writes `'YYYY-MM-DD HH:MM:SS.ffffff'`.
+- **ISL-0002 is unchanged:** FK off, application cascades as code.
+- **Moving schema authority to drift (#16) is a SEPARATE decision**, with its own readiness gate (a rehearsed first drift-owned migration, seed creation and recovery). It is not part of this port. **This narrows Nick's 09:51 "let's do the ADR"**: it is surfaced for him to confirm, not silently overridden (§7.2).
 
-- **At the switch, the Dart verifier's accept-set equals py_webauthn 3.0.0's plus our handlers'.** That includes formats, algorithms, `crossOrigin` handling (parsed and ignored), credential-ID length and origins. Every tightening of the earlier draft (reject `crossOrigin`, reject `topOrigin`, the 1023-byte ID cap, origins derived from cert fingerprints) is a **separate, later PR**, shipped to whichever verifier is live at the time. Never inside the switch.
-- **Storage stays py_webauthn-compatible until Python rollback is retired.** `public_key` is written in py_webauthn's re-encoded COSE form, not the authenticator's original bytes, and both directions are tested (C3).
-- **Evidence for what prod actually sees** (fold 1):
-  - a census of `aaguid` **and of COSE `alg`**, parsed from stored `public_key` on both islands (read-only aggregates, Nick's go);
-  - a **real-device matrix on a staging RP** before step 8: iOS Safari, iOS app, Android app (with `android:apk-key-hash:` origins), macOS Safari and Chrome. Each registers and signs in against both verifiers, and their `clientDataJSON` shapes are captured as test vectors.
-- **Vectors:**
-  - W3C L3 §16, go-webauthn's spec vectors, py_webauthn's fixtures;
-  - our software authenticator, extended past P-256 `none`;
-  - the device captures above;
-  - existing `public_key` rows round-tripped.
-- **The package:** pure Dart (`pointycastle` ES256/RS256 with strict DER and range checks; `cryptography` Ed25519; a narrow hand-written CBOR parser). Developed under `packages/`, **not published** until Nick confirms the name and owner.
-- **Separable, now:** step 0(b) fixes the Python 500 on malformed finish bodies.
+### 2.6 `/openapi.json`
 
-### 2.9 Switch, soak, rollback and the end of rollback
+- FastAPI generates it today: live, 76,186 bytes, and it is the cross-tab wire contract.
+- Step 1 freezes it into the repo. The journeys validate **request and response schemas** against it (Carnot: route-name parity alone is not schema parity). The Dart gateway serves the file.
+- CI fails on any route present in one but not the other.
+- The app tab is told at step 1.
 
-- **syd first.** Rollback triggers, any one of which rolls back:
-  - sign-in failures above baseline;
-  - any 5xx rate above baseline;
-  - push accepted/failed ratio below baseline;
-  - bus relay silent for longer than a channel's normal quiet period;
-  - any stored-byte check failing on a nightly copy.
+### 2.7 (removed)
 
-  Nick is the watcher, with the existing health endpoints plus one added for the triggers. **The maximum soak is named at gate G** (fold 6).
-- **Within that soak:** no alembic head bump, schema work queues, and a schema bug means a rollback.
-- **At the end of the soak, one of two things happens:**
-  - melb switches on the same build, soaks, and then the authority change lands; or
-  - syd rolls back.
+Two images, `BUS_IMAGE` and the two-pin release contract are gone (fold r2-2). See §2.1.
 
-  The window may not simply stay open.
-- **Rollback** is a rehearsed compose transition back to the one-image shape on the same volume, schema unchanged at the frozen head. Consumed passkey challenges are harmless (300s TTL). Refresh tokens issued by either side verify on the other (C3).
-- **Python rollback ends at the authority change, by design.** From then on, recovery is a forward fix or a volume restore.
+### 2.8 WebAuthn: split authentication from registration; parity in both, policy never
 
-## 3. Build order (each step useful on its own; one gate)
+*Fold r2-1, all four families.*
 
-0. **Separable work, now, not absorbed into the port:**
+**Authentication** (existing passkeys signing in) needs only:
+- signature verification for the algorithms **actually stored**: census `alg` from `public_key` on both islands (ES256, RS256 and EdDSA are the ceiling);
+- the same `clientDataJSON`, `rpIdHash`, flag and sign-count checks py_webauthn 3.0.0 makes.
+
+Parity is defined by py_webauthn's **own fixtures plus ours**, including:
+- non-canonical DER signatures, which py_webauthn accepts, so Dart accepts them too;
+- **its EdDSA header patch**;
+- its COSE re-encoding, read back.
+
+"Strict DER", reject `crossOrigin`, reject `topOrigin` and the 1023-byte cap all move to the later-policy list.
+
+**Registration** (new passkeys) is where the accept-set is big: py_webauthn verifies whatever `fmt` arrives (none, packed, tpm, apple, android-key, android-safetynet, fido-u2f), with no trust roots except Apple's. Two honest options, **Nick's call** (§7.3):
+- **(a)** Implement every format py_webauthn accepts, with positive and negative vectors for each. This is a large, well-specified job.
+- **(b)** *Before* the port, in a separate reviewed Python PR, narrow registration to what the islands actually receive. Then the Dart parity target is the narrowed set.
+
+  `fmt` is not stored today. With `attestation` unset (so "none" is requested), platform passkeys from Apple and Google send `fmt: none`. So (b) likely means `none` plus `packed`, and the evidence is a short period of logging the received `fmt` and `aaguid` as aggregate counts, with Nick's go.
+
+The rest:
+- **Storage stays py_webauthn-compatible** (re-encoded COSE) for as long as `GATEWAY_IMPL=python` is a possible rollback, which in this design is indefinitely.
+- **Real-device vectors** (fold r2, Maxwell): syd's own RP (it is the test island), a test account, and Nick's own iOS, Android and macOS devices. Assertions are captured against Python and verified offline in Dart. These are tester bytes, not user traffic. No staging RP and no new app build.
+- **The package:** pure Dart (`pointycastle`, `cryptography`, a narrow CBOR parser) under `packages/`. **Not published** until Nick confirms the name and owner.
+- **Step 0(b)** fixes the Python 500 on malformed finish bodies, now.
+
+### 2.9 Switch, soak, rollback
+
+- **syd first.** Baselines are measured on Python on syd during steps 1 to 3, read from **existing logs only** (no new endpoint; the island declines to know).
+- **Rollback triggers**, read from the same logs, each with a window and a count floor so one event on a small island is not an infinite rate:
+  - sign-in failures over N in M minutes above baseline;
+  - 5xx over N in M minutes above baseline;
+  - **positive bus heartbeat lost:** the observer's subscription is up and a sync has been applied within the lease period. This replaces "relay silent", which cannot tell a quiet channel from a dead relay.
+
+  N and M are set at gate G.
+- **Rollback** is `GATEWAY_IMPL=python` plus a restart, rehearsed on the rig: the same image, the same schema, at any time, on either island independently. **There is no point at which rollback ends** while alembic is the authority, so melb can switch or switch back without touching syd. That dissolves r2's melb-rollback gap (Noether).
+- **The soak** has a maximum, named at gate G. At its end, either melb switches or syd rolls back.
+
+## 3. Build order
+
+0. **Now, separable, each under its own review:**
    - (a) pinned `bus-e2e` (#23);
-   - (b) the WebAuthn finish handlers map every py_webauthn error to 4xx (#17 adjacent);
-   - (c) **D1: switch the Python gateway to the `channels` Category `entries` share (#24)**, proven on add, remove, reconnect and snapshot/incremental agreement;
-   - (d) `aaguid` + `alg` census (Nick's go);
-   - (e) pyright in CI, strict on `domain/`;
-   - (f) **ask Andy** about ADR-0007 and the licence (Nick's hands);
-   - (g) **measure C10**: classify the gateway's own fix history (`git log` over `src/`) into decision defects versus parse defects.
-1. **Wire harness, proven against the Python binary.** Real uvicorn on the rig: a seeded alembic DB, stubs, a real WS client, the bus at prod pins, an injected clock. **Freeze `/openapi.json`** and tell the app tab. *Alone, it is the island's first real-lifespan and real-WebSocket tests.*
-2. **Conformance episodes** (§2.2), including the invariant, adversarial, fault and clock classes, run against Python. **Output: the coverage map**, which links every in-memory machine and every cascade branch (echo, rate limit, topology queue, provider-token caches, the 16-table purge) to the episodes that hit it, plus **a size estimate for steps 5 to 7.** *Alone, it is a regression net for Python.*
-3. **Dart skeleton, drift adoption and the release contract.** Hand-faithful definitions for all 22 tables, validated against the alembic seed; stored-byte checks both ways; both image shapes, `BUS_IMAGE`, `update.sh` and the preflights; native-asset packaging; every upgrade and rollback transition rehearsed. *Alone, it proves the drift ADR and the deploy shape are feasible.*
-4. **Dart bus observer on the rig:** both dialects, Category share topology, subscribe, and a live `send_message` round trip, with the bus episodes green. *Alone, it is the first real exercise of `aiko_services_dart` against a ChatServer.*
+   - (b) WebAuthn finish → 4xx;
+   - (c) **Category share (#24), cage-match by law, with Nick's hard-delete ruling**;
+   - (d) the `alg` census, plus, if option (b) is chosen, aggregate `fmt`/`aaguid` counting;
+   - (e) pyright in CI;
+   - (f) Andy asked (Nick);
+   - (g) measure C10;
+   - (h) **#21 is unaffected**: there is no freeze, so it ships whenever the app tab is ready.
+1. **Wire harness against Python** (real uvicorn, real WS, stubs, injected clock, the bus at pins). **Freeze `/openapi.json`**; tell the app tab.
+2. **The ten journeys against Python**, with their obligations. **Output: an estimate for steps 5 to 7**, with each journey's Dart size counted from the Python services it touches.
+3. **Dart skeleton:** opens the alembic seed as a client (the write probe from §2.5), the `sqlite_master` CI oracle, stored-byte CI both ways, and the executable built into today's image for both arches (native-asset packaging proven), selectable with `GATEWAY_IMPL`.
+4. **Dart bus observer on the rig:** both dialects, exactly-one assertion, Category topology, send round trip.
 
-   **GATE G (Nick's go).** Inputs: the coverage map, the size estimate, C10's measurement, Andy's answer (or its absence), and the step 3 and 4 results. It also names the syd soak maximum. **Outcomes:**
-   - **go**, which starts steps 5 to 9;
-   - **R5**, which ports the decisions only and keeps the HTTP shell in Python;
-   - **stop.** Each of steps 0 to 4 has already paid for itself.
+   **GATE G (Nick).** Inputs: the estimate, C10, Andy's answer or its absence, the steps 3 and 4 results, the WebAuthn registration choice (§2.8). Outcomes:
+   - **go**;
+   - **stop** (fold r2-11). Python stays, keeping the harness, the ten journeys, pyright and the D1 fix, all of which have already paid for themselves.
 
-5. **The applier, kind by kind:** messages, channels and memberships, Hub and echo, push, moderation, account deletion, reactions, DMs, calls. Decisions are injected at the seam, and episodes go green.
-6. **The parsers:** Settings, REST, WS, then auth (the WebAuthn package, struck first), social ID tokens, OAuth.
-7. **Coverage closure.** Every episode green against Dart, the converted wire tests green, and a written list of what the Python service tests pinned that was not carried, and why.
-8. **Staging real-device matrix, then syd:** the switch protocol (§2.1), the soak (§2.9).
-9. **melb, then the authority change.** Alembic and the Python gateway retire; Python rollback ends.
+   Gate G also fixes the soak maximum, N and M, and the known-bug list.
+5. **Services, journey by journey:** messages and channels, echo, push, moderation, deletion, reactions, DMs, calls.
+6. **Parsers:** Settings, REST, WS, then auth (the package, struck first), ID tokens, OAuth.
+7. **All ten journeys green against Dart**, plus the converted wire tests, plus a written list of what the Python service tests pinned and how each item is carried or why it is not.
+8. **Device vectors on syd's RP, then syd:** `GATEWAY_IMPL=dart`, soak.
+9. **melb.** The Python gateway's code is deleted only by a later, separate decision; until then, rollback is one setting.
 
 ## 4. Tradeoffs taken
 
-- **Risk concentrates in two switches** instead of a gradual strangler. Accepted because every step before is proven on a rig at prod's pins, rollback is rehearsed, and the triggers are named.
-- **No production traffic in the oracle**, to honour three rulings. The rig at prod pins, the staging device matrix and the census stand in (C6).
-- **Two pins after the switch:** more deploy surface, in exchange for the size win and an honest split between our cadence and Andy's.
-- **`/openapi.json` becomes hand-maintained.** Some drift risk, bounded by the route-parity CI check.
-- **A schema freeze on each island from its switch to the authority change**, bounded by the named maximum soak.
-- **Python keeps running the bus roles.** Moving them is out of scope (R6).
+- **The image stays Python-sized** (about 177 MB) during and after the port, because the bus needs it anyway. The size win waits for a separate decision.
+- **Both gateways stay in the image** until a later decision removes Python's. That is a larger attack surface for that period, in exchange for rollback that never ends.
+- **Alembic stays the schema authority.** Drift's checked migrations wait for #16.
+- **No production traffic in the oracle.** Tester bytes on syd's RP stand in for real devices.
+- **`/openapi.json` becomes hand-maintained**, bounded by the CI route and schema check.
 
 ## 5. Claims to falsify
 
-- **C1. Determinism where it is required.** Episodes with an injected clock and bound identifiers are repeatable against Python, including the TTL- and lease-crossing ones.
-- **C2. Coverage.** The coverage map (step 2) shows every in-memory machine and cascade branch hit by at least one episode. If it cannot be written, gate G takes R5.
-- **C3. Rollback is real, both ways.** Stored bytes (dates, booleans, JSON, `public_key`) and sessions (access and refresh tokens, `gen`) written by either side are read correctly by the other.
-- **C4. drift models the schema faithfully:** all 22 tables, including `channels`' multi-column CHECKs and the 7 rebuilt tables.
-- **C5. The switch protocol drains cleanly** within its timeout, and nothing outside SQLite and memory (sidecar files, `-journal` ownership, the lock, the container UID) blocks Dart.
-- **C6. The rig plus staging is an adequate oracle.** D1 showed the rig reproduces prod's bus bugs; the device matrix covers what the rig cannot (real authenticators).
-- **C7. Steps 0 to 4 pay for themselves** even if gate G says stop.
-- **C8. The build needs no schema freeze; only the switch window does.**
-- **C9. The moving target is affordable.** A Python change that alters observable behaviour fails CI until its episode exists. The double-implementation window is bounded by gate G's estimate.
-- **C10. Defects live in decisions in `src/` too.** This is measured at step 0(g), and it orders steps 5 and 6. If parse defects dominate, the parsers go first.
+- **C1.** The ten journeys are repeatable against Python with an injected clock.
+- **C2.** The ten journeys' obligations cover what an island user can observe at a switch. The step 7 list says what they do not.
+- **C3.** Stored bytes and sessions written by either gateway are read correctly by the other (CI, both ways).
+- **C4.** Dart can open the alembic file without ever writing on open (step 3 probe).
+- **C5.** The switch is an ordinary restart. Binding the port only after the snapshot holds traffic correctly. Caddy does no health checking, so a ready-too-early Dart takes traffic.
+- **C6.** The rig plus syd's-RP device vectors is an adequate oracle.
+- **C7.** Steps 0 to 4 pay for themselves if gate G says stop.
+- **C8.** Alembic at every boot, with two gateways reading one schema, adds no freeze and no cliff.
+- **C9.** The double-implementation window is bounded by gate G's estimate. A Python change that alters a journey's observable behaviour fails CI until the journey is updated.
+- **C10.** Defects live in decisions in `src/` (measured at 0g; it orders steps 5 and 6).
 
 ## 6. Rejected alternatives
 
-- **R1. Strangler by route behind Caddy.** Only read-only GETs move free. Writing routes need #46, #42 and lifting the worker lock.
-- **R2. Push worker first, out of process.** Needs a trigger channel that dies at the switch.
-- **R3. A Python decision log (Tesla's tape).** Removed in the second cast. What survives is the harness-only decision trace (§2.2).
-- **R4. Bump the bus first.** It couples two migrations.
-- **R5. Port only the decisions; keep the HTTP shell in Python.** Kept, and now a **named gate-G outcome**.
-- **R6. The island becomes the ChatServer** (Maxwell's spark). Post-switch, needs ADR-0007 and an EC producer.
-- **R7. Adopt `passkeys_server`.** It checks almost nothing.
-- **R8. Record production traffic.** Excluded by three rulings.
-- **R9. Don't port; type-check the Python.** It dissolves the `assert_never` motivation (no type checker runs anywhere today; 9 `assert_never` calls are unchecked). It does not dissolve the rest, or Nick's ruling. Adopted as step 0(e).
-- **R10. Universal deterministic replay, with Python as the oracle for everything** (round 1's §2.2). Replaced by conformance tests with independent expected results. Python agreement cannot prove atomicity, absence of forbidden effects, or race safety (Carnot, Noether).
+- **R1.** Strangler by route.
+- **R2.** Push worker first.
+- **R3.** A Python decision log.
+- **R4.** Bump the bus first.
+- **R5.** A Python HTTP shell over Dart decisions. It needs an FFI/IPC boundary and a second transaction owner (Carnot r2), so it is no longer an outcome; gate G's fallback is "stop".
+- **R6.** The island as the ChatServer.
+- **R7.** `passkeys_server`.
+- **R8.** Production tapes.
+- **R9.** Type-check instead of porting. Adopted as 0(e), not as a replacement.
+- **R10.** Universal replay.
+- **R11 (new).** Two images and two pins (round 2's §2.7). Too much deploy surface for a win that needs the Python gateway gone first.
+- **R12 (new).** Drift adoption and authority as part of the port (round 2's §2.5). It created the freeze window, the rollback cliff and an adoption path that did not run as written. It is decoupled into #16.
 
-## 7. Open variables (not rounded to "ready")
+## 7. Open variables
 
-1. **Andy's answer** on ADR-0007 and the licence. Asked at step 0(f); it feeds gate G. Fallback: vendor the roughly 1.5k lines used under the island's AGPL.
-2. **The WebAuthn package's name and owner**, before `dart pub publish`.
-3. **The syd soak maximum**, named at gate G.
-4. **The `aaguid` and `alg` census results**, and what the staging device matrix captures.
-5. **drift fixes** (#3694, #3794, #3830) in 2.34, or a bump.
-6. **Native-asset cross-compilation,** or per-arch native builds (resolved at step 3).
-7. **Container UID and file ownership** across the switch (resolved at step 3's rehearsal).
-8. **Timing.** #386 has no milestone; this design asserts none.
-9. **The size of steps 5 to 7.** Unknown until step 2; it is gate G's main input.
-10. **Whether the D1 fix is ours alone,** or also an upstream report to Andy (the ChatServer's alias is the root).
+1. **The `aiko_services_dart` licence.**
+   - **Checked:** all 52 commits are Nick's, and upstream `aiko_services` is Apache-2.0, which permits derivatives with attribution and can be included in an AGPL-3.0 work.
+   - So this is **Nick's decision**, with Andy asked first as his chosen courtesy (2026-09-20).
+   - **Silence selects nothing:** the dependency enters a release only after Nick licenses it.
+2. **#16 narrowed.** Nick ruled "let's do the ADR" (09:51). This design moves the drift authority change OUT of the port. It is still to be done, as its own decision with its own readiness gate. **To confirm with Nick.**
+3. **WebAuthn registration: implement all formats, or narrow Python first** (§2.8). Nick's call, at gate G at the latest.
+4. **Nick's hard-delete ruling for #24** (§2.4).
+5. **The package's name and owner**, before publishing.
+6. **The soak maximum, N and M, and the known-bug list.** Set at gate G.
+7. **The query layer:** drift with migrations off, or `sqlite3` (step 3 probe).
+8. **Native-asset packaging** for both arches (step 3).
+9. **Timing.** No milestone is asserted.
 
-## 8. Fold notes (movement 5, round 1; still true)
+## 8. Fold notes
 
-F1 the post-switch migration freeze · F2 the seed via a Python build stage · F3 session rollback · F4 the moving target · F5 R9 · F6 the in-flight bus loss, now stated policy (§2.1) · F7 known-bug episodes.
+F1 to F7 from round 1 still hold where they still apply:
+- F1 and F6 are dissolved: alembic still runs at boot, and restart losses are the same as today's.
+- F2 is dissolved: the seed is unchanged.
+- F3 holds (C3).
+- F4 holds (C9).
+- F5 holds (R9).
+- F7 is bounded (§2.2).
 
-## 9. What each cast changed
+## 9. What each round changed
 
-- **Cast 1 → cast 2:** removed the Python `decision_log`. The sealed `Decision` lives only inside Dart.
-- **Cast 2 → round 2 (after temper r1):**
-  - the oracle went from *identical normalised ledgers* to *conformance tests with independent expected results plus two specified equalities* (a subtraction: most normalisation machinery is gone);
-  - WebAuthn went from *stricter* to *parity first*;
-  - the switch became a protocol with triggers;
-  - the freeze window was bounded;
-  - the bus moved to the Category share;
-  - `Decision` became a command whose authorisation is rechecked in-transaction;
-  - `/openapi.json` and `Settings` were priced;
-  - gate G was added, with R5 as a named outcome.
+- **Cast 1 → 2:** the Python decision log was removed.
+- **Round 2 (after temper r1):** conformance tests replaced replay; WebAuthn parity-first; the switch protocol; the freeze bounded; the Category share; in-transaction re-checks; `/openapi.json` and Settings priced; gate G.
+- **Round 3 (after temper r2), subtractive:**
+  - one image and `GATEWAY_IMPL` replace two images and two pins;
+  - alembic stays the authority and drift becomes a client, which deletes the freeze, the rollback cliff and the 22-table mirror;
+  - ten journeys with obligations replace the coverage map, the decision trace and the injection seam;
+  - the switch is an ordinary restart with ready-after-snapshot;
+  - WebAuthn is split into authentication (small) and registration (Nick's call);
+  - R5 is replaced by "stop".
+- **Added in round 3:** the linearisation rule, the exactly-one discovery assertion, the Category fallback, bounded known bugs, count-floored triggers and a positive heartbeat. Each answers a named r2 flaw.
 
-## 10. Temper r1 → where each flaw landed
+## 10. Temper r2 → where each flaw landed
 
-| # | flaw | landed in |
+| # | flaw | landed |
 |---|---|---|
-| 1 | WebAuthn policy inside a port | §2.8, §0, step 8 matrix |
-| 2 | oracle blind to atomicity, ordering, races | §2.2 invariants, schedules, faults, trace |
-| 3 | normaliser erases rollback bytes | §2.2 stored-byte equality, C3 |
-| 4 | no size estimate or stop | step 2 map + estimate, gate G, C2, C9 |
-| 5 | no release-state model | §2.1 protocol, §2.7, §2.9, step 3 |
-| 6 | incoherent freeze window | §2.5, §2.9 |
-| 7 | step 4 on the broken share | §2.4, step 0(c) |
-| 8 | stale pre-authorised Decision | §2.3 |
-| 9 | `/openapi.json` disappears | §2.6, step 1 |
-| 10 | byte-for-byte; silent-desync | §2.2 equalities, §2.3 |
-| 11 | Settings unlisted | §2.3 |
-| 12 | drift overclaim; stamp-before-validate | §2.5, CRUCIBLE corrected |
-| 13 | unmeasured "defects in decisions" | C10, step 0(g) |
-| 14 | Andy asked last | step 0(f), gate G |
-| 15 | clocks | §2.2, C1 |
+| 1 | WebAuthn scope bomb; transactional home | §2.8 auth/reg split + Nick's call; §2.3 one transaction |
+| 2 | deploy over-complication | §2.1 one image + `GATEWAY_IMPL`; R11 |
+| 3 | authority change not needed; adoption path broken | §2.5 client-only; R12; §7.2 |
+| 4 | licensing fallback | §7.1, checked against fact |
+| 5 | drain cannot converge; premature ready | §2.1 restart + ready-after-snapshot |
+| 6 | linearisation; kill-after-commit | §2.2 rule + journey 10 |
+| 7 | unbounded known-bug mark | §2.2 frozen list, forbidden on bytes, accept-set, app-read |
+| 8 | triggers undefined | §2.9 windows, floors, heartbeat, logs |
+| 9 | Decision seam, trace, coverage map | §2.2 ten journeys; §2.3 plain sealed values |
+| 10 | D1 hard-delete; Category unmeasured; exactly-one | §2.4, journey 9, fallback, assertion |
+| 11 | R5 not cheap | R5 replaced by "stop" |
+| 12 | #21 freeze; §0 throttle | no freeze (0h); §0 rewritten |
