@@ -33,8 +33,8 @@ The island is one language away from being one system. The app is Dart. `deploy/
 
 **What it would change:**
 - A contributor (the reason CI exists) reads one language from handset to box.
-- The schema authority becomes compile-checked (`drift`) instead of `alembic heads` run by hand.
-- The image drops a Python runtime plus two git-cloned editable installs.
+- ~~The schema authority becomes compile-checked (`drift`)~~ **CORRECTED by Heat and temper r1 (Carnot):** drift checks migrations against its own past snapshots at test time, and validates a live schema only at RUNTIME, by affinity. It is a *checked migration discipline*, stronger than `alembic heads` run by hand, but not a compile-time proof.
+- ~~The image drops a Python runtime~~ **CORRECTED by Heat (RESEARCH §A5):** the same image also runs the registrar and ChatServer, so Python stays at about 143 of 177.5 MB unless the bus roles get their own image. The gateway's own layer is about 34 MB.
 - The passkey trust root becomes code we wrote and can read, rather than a dependency we never audited.
 
 **The spark:** *the bus is the seam the island was already built to cut at.* The port does not have to be a rewrite. It can be a sequence of swaps, each proven against the thing it replaces.
