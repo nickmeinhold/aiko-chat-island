@@ -1,9 +1,9 @@
 name: island_deploy
 description: >-
-  Operator-side deploy tooling for aiko-chat-island. Runs on the OPERATOR's
-  machine and drives a box over ssh; nothing here is installed on a sovereign
-  island box (ISL-0003 rejects a toolchain there, which is precisely why this
-  package may be Dart at all).
+  Deploy tooling for aiko-chat-island. Some of it runs on the OPERATOR's machine
+  and drives a box over ssh; `bin/island.dart` runs ON the box, but only as an
+  executable CI compiled: ISL-0003 (amended 2026-10-25) keeps toolchains off the
+  box, not executables.
 publish_to: none
 version: 0.1.0
 

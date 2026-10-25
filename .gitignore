@@ -22,3 +22,7 @@ backups/
 # Bundled LiveKit: rendered config carries the API secret (deploy/livekit/render-config.sh)
 deploy/livekit/livekit.yaml
 deploy/livekit/.env
+
+# `island standup` writes .env / image.env via <name>.standup-* temporaries; one
+# stranded by a SIGKILL can hold the JWT secret, so it must never be committable.
+*.standup-*

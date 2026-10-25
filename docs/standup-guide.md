@@ -70,6 +70,31 @@ To also list an existing island so the app's picker shows both:
 
 Run `./deploy/standup.sh --help` for every flag.
 
+### Or: the `island` executable
+
+The same new-island standup, as one prebuilt binary (no Dart or anything else to
+install; ISL-0003). It is attached to every release from the first one after v0.18.0,
+for `arm64` and `x64`. It does **only** a new island: on a box that already has one it
+refuses and changes nothing. It doesn't do media yet (use `--with-media` with the script).
+
+```bash
+V=vX.Y.Z; ARCH=$(uname -m | sed 's/aarch64/arm64/; s/x86_64/x64/')
+base=https://github.com/nickmeinhold/aiko-chat-island/releases/download/$V
+#   optional, proves CI built it from this repo:  gh attestation verify island-linux-$ARCH --repo nickmeinhold/aiko-chat-island
+# ONE chain: if the download or the checksum fails, nothing runs (a stale
+# executable left over from an earlier download included).
+rm -f "island-linux-$ARCH" SHA256SUMS \
+  && curl -fsSLO "$base/island-linux-$ARCH" && curl -fsSLO "$base/SHA256SUMS" \
+  && grep -E "^[0-9a-f]{64}  island-linux-$ARCH\$" SHA256SUMS | sha256sum -c - \
+  && chmod +x "island-linux-$ARCH" \
+  && ./island-linux-$ARCH standup --domain chat.example.org --name "Example Island" --version ${V#v}
+```
+
+It exits 0 only when the island is up AND confirmed: the gateway answered its health
+check and, unless `--no-tls`, so did `https://<domain>/health`. 3 means it was created
+and started but the gateway never answered (`deploy/compose.sh logs chat-island`); 4
+means the gateway is up but HTTPS is not confirmed (DNS, ports 80+443, or Caddy).
+
 ---
 
 ## What the script does
