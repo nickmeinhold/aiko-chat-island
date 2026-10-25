@@ -63,9 +63,13 @@ void _checkName(String what, String v) {
   if (v.trim() != v) {
     throw Refusal('$what has leading or trailing spaces: "$v"');
   }
-  if (v.length > maxNameLength) {
+  // Code points, as Python's len() counts them (MAX_NAME_LEN), not Dart's UTF-16
+  // units: an emoji is one character to the gateway and two to `length`
+  // (Noether, PR#407 r3).
+  final chars = v.runes.length;
+  if (chars > maxNameLength) {
     throw Refusal(
-      '$what is ${v.length} characters; islands drop names over '
+      '$what is $chars characters; islands drop names over '
       '$maxNameLength',
     );
   }

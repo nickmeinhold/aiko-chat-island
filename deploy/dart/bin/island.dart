@@ -27,6 +27,21 @@ Run `island standup --help` or `island configure --help` for the options.''';
 /// a refusal (Noether, PR#407 r2).
 Future<void> _flush() => Future.wait([stdout.flush(), stderr.flush()]);
 
+/// Whether [args] ask for help: `-h`/`--help` as an argument, never as the value of
+/// a flag that takes one (`--name -h` names an island "-h"; it must not print help
+/// and exit 0 having changed nothing, Noether, PR#407 r3).
+bool _wantsHelp(List<String> args) {
+  const takesValue = {'--domain', '--name', '--seed-peers', '--version'};
+  for (var i = 0; i < args.length; i++) {
+    if (takesValue.contains(args[i])) {
+      i++;
+    } else if (args[i] == '-h' || args[i] == '--help') {
+      return true;
+    }
+  }
+  return false;
+}
+
 Future<void> main(List<String> args) async {
   if (args.isEmpty || args.first == '-h' || args.first == '--help') {
     stdout.writeln(_help);
@@ -36,7 +51,7 @@ Future<void> main(List<String> args) async {
   switch (args.first) {
     case 'standup':
       final rest = args.sublist(1);
-      if (rest.contains('-h') || rest.contains('--help')) {
+      if (_wantsHelp(rest)) {
         stdout.writeln(usage);
         await _flush();
         exit(0);
@@ -65,7 +80,7 @@ Future<void> main(List<String> args) async {
       }
     case 'configure':
       final rest = args.sublist(1);
-      if (rest.contains('-h') || rest.contains('--help')) {
+      if (_wantsHelp(rest)) {
         stdout.writeln(configureUsage);
         await _flush();
         exit(0);
@@ -83,8 +98,9 @@ Future<void> main(List<String> args) async {
           await _flush();
           exit(0);
         }
-        await _flush();
-        exit(configureExitCode(await configure.run(opts)));
+        final result = await configure.run(opts);
+        await _flush(); // after the run: its report is what must not be lost
+        exit(configureExitCode(result));
       } on Refusal catch (e) {
         stderr.writeln(' fail ${e.message}');
         await _flush();

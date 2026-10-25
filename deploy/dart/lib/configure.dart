@@ -129,9 +129,6 @@ ConfigureOptions parseConfigureArgs(List<String> args) {
   );
 }
 
-/// [s] as one POSIX shell word: single-quoted, each `'` written as `'\\''`.
-String shellQuote(String s) => "'${s.replaceAll("'", r"'\''")}'";
-
 /// [text] with each key in [changes] set to its value: the lines of an existing
 /// assignment are replaced (keeping its indentation and any `export `), a missing
 /// key is appended, and every other byte is left as it was. Pure, so it can be
@@ -280,6 +277,9 @@ final class Configure {
   /// (Carnot, PR#407 r2). A hand edit doesn't take this lock; the re-read before the
   /// rename is what catches one, in all but a tiny window.
   Future<ConfigureResult> run(ConfigureOptions o) async {
+    // Before the lock file is created: a run from the wrong directory must leave
+    // nothing behind (Maxwell, PR#407 r3).
+    _readEnv();
     final lock = _f('.env.configure-lock').openSync(mode: FileMode.append);
     try {
       try {
@@ -707,59 +707,34 @@ final class Configure {
     return wrong;
   }
 
-  /// How to put back what this run changed. Safe to print: the keys configure owns
-  /// are not secrets.
+  /// How to put back what this run changed: the exact lines each key had, to put
+  /// back by hand. Safe to print: the keys configure owns are not secrets.
   ///
-  /// A flag is offered only if `parseConfigureArgs` accepts it, checked here by
-  /// running it: an old value this version refuses (a dotted peer id, a name with a
-  /// `'`) would otherwise print a recovery command that fails (Noether, Carnot, r2).
-  /// Such a value is given as its exact old line to put back. A key that was not
-  /// set before is named as a line to delete. Flag values are shell-quoted whole.
+  /// Exact lines, never a synthesized `island configure` command. Three rounds of
+  /// cage-match each found a new way a synthesized command failed to restore the
+  /// old state: quoting (r1), old values this version's validators refuse (r2), and
+  /// values compose had interpolated, which a parsed value can't reproduce (r3,
+  /// Carnot: "parser acceptance proves representability, not reversibility"). The
+  /// old bytes are reversible by construction, so no rule has to be got right.
   String _revertHint(
     Map<String, String> before,
     Map<String, EnvValue> changes,
   ) {
     if (changes.isEmpty) return 'This run wrote nothing to .env.';
-    final flags = <String>[], oldLines = <String>[], unset = <String>[];
-    for (final k in changes.keys) {
-      final old = before[k];
-      if (old == null) {
-        unset.add(k);
-        continue;
-      }
-      final flag = switch (k) {
-        keyName => ['--name', old],
-        keyPeers => ['--seed-peers', old],
-        keyPasskeys when old == 'true' => ['--enable-passkeys'],
-        keyPasskeys when old == 'false' => ['--no-passkeys'],
-        _ => null,
-      };
-      var accepted = flag != null;
-      if (flag != null) {
-        try {
-          parseConfigureArgs(flag);
-        } on Refusal {
-          accepted = false;
-        }
-      }
-      if (accepted) {
-        flags.addAll(flag!.map((a) => a.startsWith('--') ? a : shellQuote(a)));
-      } else {
-        oldLines.addAll(_oldLines(k));
-      }
-    }
     const restart = 'deploy/compose.sh up -d --no-deps chat-island';
+    final set = [for (final k in changes.keys) ..._oldLines(k)];
+    final unset = [
+      for (final k in changes.keys)
+        if (before[k] == null) k,
+    ];
     return [
-      'To put the previous values back:',
-      if (flags.isNotEmpty) '  island configure ${flags.join(' ')}',
-      if (oldLines.isNotEmpty) ...[
-        '  put these lines back in .env exactly (this version of configure would '
-            'refuse the old values), then: $restart',
-        for (final l in oldLines) '    $l',
+      'To put the previous values back, edit .env by hand, then run: $restart',
+      if (set.isNotEmpty) ...[
+        '  replace those lines with exactly:',
+        for (final l in set) '    $l',
       ],
       if (unset.isNotEmpty)
-        '  delete the ${unset.join(', ')} line(s) from .env (not set before this '
-            'run), then: $restart',
+        '  delete the ${unset.join(', ')} line(s) (not set before this run)',
     ].join('\n');
   }
 

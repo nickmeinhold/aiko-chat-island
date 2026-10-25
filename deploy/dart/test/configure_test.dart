@@ -558,12 +558,13 @@ void main() {
       },
     );
 
-    test('a valid old value round-trips: the real parser accepts it, sh keeps it one word', () async {
-      const old = r'Island #1 $HOME & co';
+    test('the revert gives back the exact old bytes, even a value compose interpolated', () async {
+      // Unquoted, so compose expanded $X: no flag value could reproduce that
+      // (Carnot, PR#407 r3). The old line can.
       envFile.writeAsStringSync(
         liveShaped().replaceFirst(
           'ISLAND_DISPLAY_NAME=Example',
-          "ISLAND_DISPLAY_NAME='$old'",
+          r'ISLAND_DISPLAY_NAME=Cost$X',
         ),
       );
       box.upFails = true;
@@ -573,19 +574,50 @@ void main() {
       } on Refusal catch (e) {
         got = e;
       }
-      final hint = got!.message
-          .split('\n')
-          .firstWhere((l) => l.contains('island configure --name'));
-      final argv = hint.substring(hint.indexOf('island configure ') + 17);
-      // The shell's reading of the printed words, fed to the real parser.
-      final r = await Process.run('sh', [
-        '-c',
-        'for w in $argv; do printf "%s\\0" "\$w"; done',
-      ]);
-      final words = '${r.stdout}'.split('\u0000')..removeLast();
-      expect(words, ['--name', old]);
-      expect(parseConfigureArgs(words).name!.value, old);
+      expect(got!.message, contains(r'    ISLAND_DISPLAY_NAME=Cost$X'));
+      expect(got.message, isNot(contains('island configure --')));
     });
+
+    test('a name of 64 emoji is 64 characters, as the gateway counts', () {
+      final name = String.fromCharCodes(List.filled(64, 0x1F30A));
+      expect(DisplayName(name).value.runes.length, 64);
+      expect(
+        () => DisplayName(String.fromCharCodes(List.filled(65, 0x1F30A))),
+        throwsA(isA<Refusal>()),
+      );
+    });
+
+    test(
+      'a refused run from the wrong directory leaves no lock file behind',
+      () async {
+        envFile.deleteSync();
+        await expectLater(
+          configure().run(args(['--name', 'X'])),
+          throwsA(isA<Refusal>()),
+        );
+        expect(File('${root.path}/.env.configure-lock').existsSync(), isFalse);
+      },
+    );
+
+    test(
+      '`--name -h` is a name, not a request for help that exits 0',
+      () async {
+        // The real executable, in a directory with no island: it must refuse
+        // (exit 1, "no .env"), not print usage and exit 0. No .env, so it stops at
+        // the first check and never reaches this machine's Docker.
+        envFile.deleteSync();
+        final r = await Process.run('dart', [
+          'run',
+          '${Directory.current.path}/bin/island.dart',
+          'configure',
+          '--name',
+          '-h',
+        ], workingDirectory: root.path);
+        expect(r.exitCode, 1, reason: '${r.stdout}${r.stderr}');
+        expect('${r.stderr}', contains('no .env'));
+        expect('${r.stdout}', isNot(contains('usage:')));
+      },
+    );
 
     test('a second configure while one runs refuses (the lock is cross-process)', () async {
       final lockPath = '${root.path}/.env.configure-lock';
@@ -732,7 +764,11 @@ void main() {
       );
       expect(r, isA<AnsweringNotServing>());
       expect(configureExitCode(r), 5);
-      expect(out.join('\n'), contains('island configure --seed-peers'));
+      // The old peer line, byte for byte, to put back.
+      expect(
+        out.join('\n'),
+        contains('    ISLAND_SEED_PEERS=[{"id": "enspyr"'),
+      );
     });
 
     test('a removed peer still served is caught (gossip off)', () async {
@@ -794,7 +830,10 @@ void main() {
             isA<Refusal>().having(
               (r) => r.message,
               'message',
-              allOf(contains('IS written'), contains("--name 'Example'")),
+              allOf(
+                contains('IS written'),
+                contains('    ISLAND_DISPLAY_NAME=Example'),
+              ),
             ),
           ),
         );
