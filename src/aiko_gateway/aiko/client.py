@@ -148,16 +148,16 @@ class GatewayChatActor(aiko.Actor):
         """ECConsumer handler (aiko thread). Translate a channel_list add/remove
         into (1) the bus subscription for message relay AND (2) the DB topology
         callback. `add`/`update` => existence (idempotent upsert + subscribe);
-        `remove` => the ONLY hard-delete trigger (+ unsubscribe). Non-channel
-        items (the bare `channel_list` parent, other keys) are ignored.
+        `remove` => unsubscribe, then an observation-only callback: bus topology
+        controls subscriptions, never channel rows (#24 ruling, 2026-10-25).
+        Non-channel items (the bare `channel_list` parent, other keys) are ignored.
 
         Ordering matters per direction:
           * add: SUBSCRIBE first, then signal the DB upsert. A message arriving
             in the gap is caught by persist_inbound's upsert (the existing
             safety net) — no relay lost.
-          * remove: UNSUBSCRIBE first, then signal the DB delete. Stops new
-            messages BEFORE the row is deleted, so none can re-mint the channel
-            via persist_inbound after the delete (the #6 drift vector)."""
+          * remove: UNSUBSCRIBE, then notify. The row and its history stay; a
+            later add re-subscribes and upserts idempotently."""
         name = channel_name_from_item(item_name)
         if name is None:
             return

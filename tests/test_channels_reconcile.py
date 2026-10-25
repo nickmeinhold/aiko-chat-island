@@ -6,7 +6,9 @@ The gateway mirrors aiko's canonical channel set (received via the
 the one asyncio loop, so no concurrency race):
 
   * add/update event -> `upsert_channel` (idempotent existence)
-  * live remove event -> `hard_delete_channel` (application-cascade; IRREVERSIBLE)
+  * remove event -> unsubscribe ONLY; rows and history kept (Nick's #24 ruling,
+    2026-10-25: bus topology controls subscriptions, never channel rows).
+    `hard_delete_channel` remains the attended deletion tool, never bus-driven.
 
 Design: docs/design/01-channel-topology-reconcile.html. These specs pin the
 destructive contract (Decision A's cascade) before the code that can destroy.
@@ -207,27 +209,80 @@ def test_channel_name_from_item_ignores_parent_and_unrelated():
     assert topology.channel_name_from_item(None) is None
 
 
-# --- topology worker serializes events in arrival order (Carnot P1a) ------- #
+# --- a bus remove never reaches the DB (#24 ruling) ------------------------ #
 
 @pytest.mark.asyncio
-async def test_channel_worker_applies_events_in_fifo_order(monkeypatch):
-    """The single worker must drain the queue FIFO so an add/remove pair for the
-    same channel can never interleave across the aiko->asyncio bridge. A bare
-    create_task-per-event let the remove run before the add and resurrect a
-    deleted channel — the exact irreversible-path hazard the queue dissolves."""
+async def test_bus_remove_keeps_channel_messages_and_memberships(session, monkeypatch):
+    """The #24 ruling, end to end at the gateway seam: a bus `remove` for a channel
+    with history leaves the channel row, its messages and its memberships intact,
+    and never calls the destructive cascade."""
     import asyncio
 
     from aiko_gateway import main
 
-    calls: list[tuple[str, str]] = []
+    # Record, don't raise: the worker's `except Exception` would swallow a raise.
+    delete_calls: list[str] = []
+
+    async def recording_delete(_session, name):
+        delete_calls.append(name)
+        return True
+
+    monkeypatch.setattr(main.channels_service, "hard_delete_channel", recording_delete)
+
+    user = User(id="U1", username="alice", display_name="Alice",
+                password_hash="x", aiko_username="alice")
+    ch = Channel(id="C1", name="random", kind="standard", aiko_channel="random")
+    session.add_all([user, ch])
+    await session.flush()
+    session.add_all([
+        Membership(channel_id="C1", user_id="U1", role="member"),
+        Message(id="M1", channel_id="C1", sender_user_id="U1", sender_kind="human",
+                body="hi"),
+    ])
+    await session.commit()
+
+    st = main.GatewayState()
+    st.loop = asyncio.get_running_loop()
+    st._channel_events = asyncio.Queue()
+    st.on_channel_remove("random")
+    await asyncio.sleep(0)  # call_soon_threadsafe delivers on the next tick
+
+    worker = asyncio.create_task(st._run_channel_worker())
+    await asyncio.wait_for(st._channel_events.join(), timeout=2)
+    worker.cancel()
+
+    assert delete_calls == []  # no bus path reaches the cascade
+    for model, n in ((Channel, 1), (Message, 1), (Membership, 1)):
+        assert (await session.execute(
+            select(func.count()).select_from(model))).scalar_one() == n
+
+
+@pytest.mark.asyncio
+async def test_bus_readd_after_remove_is_idempotent(session):
+    """remove -> add: the channel re-subscribes on the existing row; no duplicate."""
+    session.add(Channel(id="C1", name="random", kind="standard", aiko_channel="random"))
+    await session.commit()
+    ch = await channels_service.upsert_channel(session, "random")
+    assert ch.id == "C1"
+    assert (await session.execute(
+        select(func.count()).select_from(Channel))).scalar_one() == 1
+
+
+# --- topology worker applies adds in arrival order (Carnot P1a) ------------ #
+
+@pytest.mark.asyncio
+async def test_channel_worker_applies_adds_in_fifo_order(monkeypatch):
+    """The single worker drains the queue FIFO, so adds land in arrival order even
+    when an upsert yields mid-op."""
+    import asyncio
+
+    from aiko_gateway import main
+
+    calls: list[str] = []
 
     async def fake_upsert(_session, name):
         await asyncio.sleep(0)  # force a scheduler yield mid-op
-        calls.append(("add", name))
-
-    async def fake_delete(_session, name):
-        calls.append(("remove", name))
-        return True
+        calls.append(name)
 
     class _NoSession:
         async def __aenter__(self):
@@ -240,18 +295,18 @@ async def test_channel_worker_applies_events_in_fifo_order(monkeypatch):
             pass
 
     monkeypatch.setattr(main.channels_service, "upsert_channel", fake_upsert)
-    monkeypatch.setattr(main.channels_service, "hard_delete_channel", fake_delete)
     monkeypatch.setattr(main, "SessionLocal", lambda: _NoSession())
 
     st = main.GatewayState()
     st.loop = asyncio.get_running_loop()
     st._channel_events = asyncio.Queue()
-    st._channel_events.put_nowait(("add", "random"))
-    st._channel_events.put_nowait(("remove", "random"))
+    st.on_channel_add("random")
+    st.on_channel_remove("random")  # observation only; must not enqueue
+    st.on_channel_add("general")
+    await asyncio.sleep(0)  # let call_soon_threadsafe deliver the puts
 
     worker = asyncio.create_task(st._run_channel_worker())
     await asyncio.wait_for(st._channel_events.join(), timeout=2)
     worker.cancel()
 
-    # add MUST land before remove despite the yield inside upsert.
-    assert calls == [("add", "random"), ("remove", "random")]
+    assert calls == ["random", "general"]

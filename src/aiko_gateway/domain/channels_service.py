@@ -21,9 +21,10 @@ commit per event.
         Backend-agnostic: it does NOT rely on `ondelete=CASCADE` or SQLite's
         `foreign_keys` pragma (the schema has neither), so a raw `DELETE channels`
         would either IntegrityError on Postgres or orphan messages on SQLite.
-        IRREVERSIBLE — callers MUST only invoke it on a live-producer EC `remove`
-        (Decision B), never on ChatServer disconnect, and the reconcile worker
-        serializes events so an add/remove pair can't race (Carnot P1a).
+        IRREVERSIBLE — attended deletion only, through the owning service. It is
+        NEVER called from the bus: an EC `remove` unsubscribes and nothing more
+        (Nick's #24 ruling, 2026-10-25, superseding Decision B's live-remove
+        trigger, which was dormant only because runtime removes never arrived).
 
 Name -> Channel fields matches the retired `_seed_channels` exactly: HyperSpace
 channels are public existence; private/ACL stays a gateway-local overlay.
@@ -85,7 +86,8 @@ async def hard_delete_channel(session: AsyncSession, aiko_channel: str) -> bool:
     found and deleted (False is the safe no-op for an already-absent channel).
 
     Children are deleted before the parent so the operation is correct whether or
-    not foreign keys are enforced. Only call on a live-producer EC `remove`.
+    not foreign keys are enforced. Attended deletion only; never from a bus event
+    (#24 ruling).
     """
     # Reserve the dm: namespace (cage-match PR#124 Tesla): a bus `remove` naming a
     # dm:X:Y must NEVER hard-delete a private DM (+ its messages + memberships). A DM is

@@ -97,20 +97,25 @@ class GatewayState:
             log.exception("ingest failed for bus message")
 
     # -- channel topology reconcile (#1281 incr 2) --------------------------- #
-    # The aiko ChatServer's `channel_list` EC share is the canonical source of
-    # channel existence. Callbacks fire on the AIKO thread and enqueue onto a
-    # SINGLE ordered asyncio queue; one worker drains it FIFO and reconciles
-    # into the local Channel rows. The queue is what makes ordering safe — a bare
-    # `create_task` per event let an add/remove pair for the same channel
-    # interleave at the DB await and finish out of order, which for an
-    # irreversible hard-delete is unacceptable (cage-match PR#12, Carnot P1a).
+    # The aiko ChatServer's `channel_list` EC share tells the gateway which
+    # channels to RELAY. Bus topology has authority over subscriptions only, never
+    # over channel rows (Nick's #24 ruling, 2026-10-25): the gateway's SQLite is the
+    # sole persister, so an upstream `remove` (or a snapshot that omits a channel)
+    # unsubscribes in the bus client and changes nothing here. Deliberate deletion
+    # goes through `channels_service.hard_delete_channel`, attended — never from the
+    # bus. Add callbacks fire on the AIKO thread and enqueue onto a SINGLE ordered
+    # asyncio queue; one worker drains it FIFO and upserts the local Channel rows.
     # Replaces the old independent `_seed_channels`.
 
     def on_channel_add(self, aiko_channel: str) -> None:
         self._enqueue_channel_event("add", aiko_channel)
 
     def on_channel_remove(self, aiko_channel: str) -> None:
-        self._enqueue_channel_event("remove", aiko_channel)
+        # Observation only: the bus client has already unsubscribed. The row, its
+        # messages and memberships are kept (#24 ruling). Nothing is enqueued, so no
+        # bus event can reach a destructive path.
+        log.info("channel reconcile: - %s (unsubscribed; row and history kept)",
+                 aiko_channel)
 
     def _enqueue_channel_event(self, action: str, aiko_channel: str) -> None:
         """AIKO thread -> the one ordered topology queue (thread-safe handoff)."""
@@ -121,9 +126,9 @@ class GatewayState:
         )
 
     async def _run_channel_worker(self) -> None:
-        """Single consumer of the topology queue — serializes every add/remove so
-        they apply in arrival order. Owns the transaction boundary (the services
-        only flush)."""
+        """Single consumer of the topology queue — applies adds in arrival order.
+        Owns the transaction boundary (the services only flush). There is no
+        remove arm: a bus remove never reaches the DB (#24 ruling)."""
         assert self._channel_events is not None
         while True:
             action, aiko_channel = await self._channel_events.get()
@@ -133,14 +138,6 @@ class GatewayState:
                         await channels_service.upsert_channel(session, aiko_channel)
                         await session.commit()
                         log.info("channel reconcile: + %s", aiko_channel)
-                    elif action == "remove":
-                        deleted = await channels_service.hard_delete_channel(
-                            session, aiko_channel)
-                        await session.commit()
-                        if deleted:
-                            log.warning(
-                                "channel reconcile: HARD-DELETED %s "
-                                "(+ its messages + memberships)", aiko_channel)
             except channels_service.ReservedDmChannel:
                 # A bus channel_list named a reserved dm: channel — anomalous (a DM never
                 # federates). Skip cleanly (not a stack-trace error): the dm: namespace is
