@@ -129,6 +129,9 @@ ConfigureOptions parseConfigureArgs(List<String> args) {
   );
 }
 
+/// [s] as one POSIX shell word: single-quoted, each `'` written as `'\\''`.
+String shellQuote(String s) => "'${s.replaceAll("'", r"'\''")}'";
+
 /// [text] with each key in [changes] set to its value: the lines of an existing
 /// assignment are replaced (keeping its indentation and any `export `), a missing
 /// key is appended, and every other byte is left as it was. Pure, so it can be
@@ -284,22 +287,34 @@ final class Configure {
     final before = _readEnv();
     await _refuseIfNotOwner();
     _dockerCli = await Docker.detect(runner);
+    await _refuseIfRestartWouldChangeImage();
     final current = parseDotenv(before, '.env');
     o.seedPeers?.refuseSelf(current['GATEWAY_BASE_URL'] ?? '');
+    if (o.passkeys == true) _refuseMismatchedRpId(current);
 
+    // Unchanged means the LINE is already exactly what configure writes, not that
+    // this parser reads an equal value: an unquoted legacy value with a `$` reads
+    // equal here while compose expands it, and a key set twice reads as its last
+    // copy (Tesla, PR#407 r1). Anything else is rewritten, through the compose proof.
     final changes = {
       for (final MapEntry(key: k, value: v) in o.wanted.entries)
-        if (current[k] != v.value) k: v,
+        if (!_isWrittenAs(before, k, v)) k: v,
     };
     if (changes.isEmpty) {
-      say.ok('every setting asked for already has that value; nothing to do');
-      return const Unchanged();
-    }
-    if (o.passkeys == true && current['PASSKEY_RP_ID'] == null) {
-      say.warn(
-        "PASSKEY_RP_ID is not set in .env, so compose's default applies. Make sure "
-        'that is this island\'s domain before relying on passkeys.',
+      // "The file already says so" is not "the island does": a run whose restart
+      // failed left the new .env behind, and a retry (or the printed revert) must
+      // still restart, not report success over a gateway serving the old values
+      // (Carnot, PR#407 r1). So nothing is done only when the gateway agrees too.
+      if (await _healthyNow() &&
+          (await _servedMismatches(o, current)).isEmpty) {
+        say.ok('every setting asked for already has that value, and is served');
+        return const Unchanged();
+      }
+      say.step(
+        '.env already has these values, but the gateway is not serving them: '
+        'restarting it',
       );
+      return _restartAndVerify(o, current, const {});
     }
     final after = editDotenv(before, changes);
 
@@ -330,7 +345,25 @@ final class Configure {
     for (final MapEntry(key: k, value: v) in changes.entries) {
       say.ok('$k: ${current[k] ?? '(not set)'}  ->  ${v.value}');
     }
+    return _restartAndVerify(o, current, changes);
+  }
 
+  /// Whether [text] sets [key] exactly once, on a line configure itself would write.
+  static bool _isWrittenAs(String text, String key, EnvValue v) {
+    final at = scanDotenv(text, '.env').where((e) => e.key == key).toList();
+    if (at.length != 1) return false;
+    final e = at.single;
+    final span = text.split('\n').sublist(e.firstLine, e.endLine).join('\n');
+    return span.substring(e.lead.length) == '$key=${v.dotenv}';
+  }
+
+  /// Restart the gateway and confirm it serves what [o] asks for. [changes] is what
+  /// this run wrote (empty when it only reconciles), for the revert hint.
+  Future<ConfigureResult> _restartAndVerify(
+    ConfigureOptions o,
+    Map<String, String> current,
+    Map<String, EnvValue> changes,
+  ) async {
     // ---- 4. restart the gateway, then ask it what it serves ----
     say.step('Restarting the gateway so it reads the new settings');
     final up = await runner.run(
@@ -353,7 +386,6 @@ final class Configure {
       return const WrittenNotAnswering();
     }
     final wrong = await _servedMismatches(o, current);
-    _sopsReminder();
     if (wrong.isNotEmpty) {
       for (final w in wrong) {
         say.warn(w);
@@ -362,7 +394,86 @@ final class Configure {
       return AnsweringNotServing(wrong);
     }
     say.step('The gateway is serving the new settings.');
+    // Only now: on a mismatch the operator is about to revert, and a copy updated
+    // first would carry the rejected value back on its next delivery (Tesla, r1).
+    if (changes.isNotEmpty) _sopsReminder();
     return const Applied();
+  }
+
+  /// The restart recreates the gateway from the image `image.env` pins. If that is
+  /// not the image the gateway is running, the restart is an UPGRADE, and its boot
+  /// migrates the database with no backup: deploy/update.sh is the door that backs
+  /// up first, and configure must not be a second one (Maxwell, PR#407 r1). Measured
+  /// on both boxes: this `ps` prints the pinned reference for a gateway created from
+  /// it, and an image id when the tag has since moved, which also refuses.
+  Future<void> _refuseIfRestartWouldChangeImage() async {
+    final pinFile = _f('image.env');
+    if (!pinFile.existsSync()) {
+      throw Refusal(
+        'no image.env in ${root.path}, so the restart could not be pinned to the '
+        'running release. Nothing was changed.',
+      );
+    }
+    final pin = parseDotenv(
+      pinFile.readAsStringSync(),
+      'image.env',
+    )['ISLAND_IMAGE'];
+    final ps = await _dockerCli.run([
+      'ps',
+      '--filter',
+      'label=com.docker.compose.service=chat-island',
+      '--format',
+      '{{.Image}}',
+    ]);
+    if (!ps.ok) {
+      throw Refusal(
+        'could not list running containers, so this run can\'t tell whether a '
+        'restart would change the release. Nothing was changed.',
+      );
+    }
+    final running = const LineSplitter()
+        .convert(ps.stdout)
+        .map((l) => l.trim())
+        .where((l) => l.isNotEmpty)
+        .toSet();
+    if (running.isEmpty) {
+      throw Refusal(
+        'the gateway (chat-island) is not running. configure changes a running '
+        'island; start it with deploy/update.sh first. Nothing was changed.',
+      );
+    }
+    if (running.length != 1 || running.single != pin) {
+      throw Refusal(
+        'image.env pins ${pin ?? '(nothing)'}, but the gateway is running '
+        '${running.join(', ')}. Restarting it to apply settings would also change '
+        'the release, with no backup. Run deploy/update.sh first (it backs up), '
+        'then configure. Nothing was changed.',
+      );
+    }
+  }
+
+  /// Passkeys bind to the RP id. A `.env` that sets only one of PASSKEY_RP_ID and
+  /// GATEWAY_BASE_URL gets compose's default for the other, which names
+  /// chat.imagineering.cc (docker-compose.yml), so every other island would
+  /// advertise passkeys under the wrong id: a green check and no working sign-in
+  /// (Maxwell, PR#407 r1). Both unset is consistent (both defaults name one island).
+  void _refuseMismatchedRpId(Map<String, String> current) {
+    final rp = current['PASSKEY_RP_ID'], base = current['GATEWAY_BASE_URL'];
+    if (rp == null && base == null) return;
+    final host = base == null ? null : Uri.tryParse(base)?.host;
+    if (rp == null || host == null || host != rp) {
+      throw Refusal(
+        'passkeys need PASSKEY_RP_ID to be this island\'s domain, and .env has '
+        'PASSKEY_RP_ID=${rp ?? '(not set)'} with '
+        'GATEWAY_BASE_URL=${base ?? '(not set)'}. Set PASSKEY_RP_ID to the domain '
+        'in GATEWAY_BASE_URL, then run again. Nothing was changed.',
+      );
+    }
+  }
+
+  Future<bool> _healthyNow() async {
+    final r = await fetch(Uri.parse('http://127.0.0.1:8095/health'));
+    return r != null && isGatewayHealthy(r.status, r.body);
   }
 
   /// A file written by another user (say, root via sudo) would leave .env owned by
@@ -539,25 +650,38 @@ final class Configure {
     return wrong;
   }
 
-  /// The command that puts back what this run changed. Safe to print: the keys
-  /// configure owns are not secrets.
+  /// How to put back what this run changed. Safe to print: the keys configure owns
+  /// are not secrets. Each value is shell-quoted whole, so an old name like `Bob's`
+  /// prints a command that works (Noether, Carnot, PR#407 r1). A key that was not set
+  /// before can't be restored by a flag, so it is named as a line to delete.
   String _revertHint(
     Map<String, String> before,
     Map<String, EnvValue> changes,
   ) {
-    final args = <String>[];
+    if (changes.isEmpty) return 'This run wrote nothing to .env.';
+    final args = <String>[], unset = <String>[];
     for (final k in changes.keys) {
       final old = before[k];
+      if (old == null) {
+        unset.add(k);
+        continue;
+      }
       switch (k) {
-        case keyName when old != null:
-          args.add("--name '$old'");
+        case keyName:
+          args.add('--name ${shellQuote(old)}');
         case keyPeers:
-          args.add("--seed-peers '${old ?? '[]'}'");
+          args.add('--seed-peers ${shellQuote(old)}');
         case keyPasskeys:
           args.add(old == 'true' ? '--enable-passkeys' : '--no-passkeys');
       }
     }
-    return 'To put the previous values back: island configure ${args.join(' ')}';
+    return [
+      'To put the previous values back:',
+      if (args.isNotEmpty) '  island configure ${args.join(' ')}',
+      if (unset.isNotEmpty)
+        '  delete the ${unset.join(', ')} line(s) from .env (not set before this '
+            'run), then: deploy/compose.sh up -d --no-deps chat-island',
+    ].join('\n');
   }
 
   /// A copy kept elsewhere (this repo keeps its two islands' in deploy/secrets/ as

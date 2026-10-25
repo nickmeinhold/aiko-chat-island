@@ -24,6 +24,7 @@ final bs = String.fromCharCode(92); // a backslash no tool on the way can decode
 String liveShaped() => [
   'JWT_SECRET=${'s' * 48}',
   'GATEWAY_BASE_URL=https://chat.example.org',
+  'PASSKEY_RP_ID=chat.example.org',
   'ISLAND_ID=me',
   'ISLAND_DISPLAY_NAME=Example',
   'ISLAND_SEED_PEERS=[{"id": "enspyr", "display_name": "Enspyr", "base_url": "https://chat.enspyr.co"}]',
@@ -56,8 +57,15 @@ final class FakeBox implements Runner {
   RunResult Function(int n, RunResult r)? onConfig;
   int _configs = 0;
 
-  /// What the gateway read at its last restart; null = never restarted.
+  /// What the running gateway read when it last started. setUp starts it on the
+  /// fixture, as a live island is; null = the gateway is down.
   Map<String, String>? gatewayEnv;
+
+  /// How many times configure restarted the gateway.
+  int restarts = 0;
+
+  /// What `docker ps` reports the gateway was created from; null = not running.
+  String? runningImage = pinnedImage;
 
   @override
   Future<RunResult> run(
@@ -79,6 +87,9 @@ final class FakeBox implements Runner {
         return const RunResult(1, '', 'permission denied on docker.sock');
       case 'sudo' when !sudoWorks:
         return const RunResult(1, '', 'sudo: a password is required');
+      case 'docker' || 'sudo'
+          when args.contains('ps') && args.contains('--filter'):
+        return RunResult(0, runningImage == null ? '' : '$runningImage\n', '');
       case 'docker' || 'sudo' when args.contains('config'):
         final p = await Process.run(
           'docker',
@@ -89,6 +100,7 @@ final class FakeBox implements Runner {
         return onConfig?.call(_configs++, r) ?? r;
     }
     if (exe.endsWith('deploy/compose.sh')) {
+      restarts++;
       if (upFails) return const RunResult(1, '', 'up failed');
       gatewayEnv = parseDotenv(
         File('${root.path}/.env').readAsStringSync(),
@@ -146,6 +158,8 @@ late List<String> out;
 
 File get envFile => File('${root.path}/.env');
 
+const pinnedImage = 'ghcr.io/nickmeinhold/aiko-chat-island:0.19.0';
+
 Configure configure() => Configure(
   runner: box,
   root: root,
@@ -167,15 +181,23 @@ List<String> changedLines(String before, String after) {
   ];
 }
 
-/// Refuses `--name X` with [message], leaving .env byte for byte and no restart.
-Future<void> refusesWith(Matcher message) async {
+/// Rewrites the fixture's unquoted name line as configure itself writes it.
+void canonicalName() => envFile.writeAsStringSync(
+  envFile.readAsStringSync().replaceFirst(
+    'ISLAND_DISPLAY_NAME=Example',
+    "ISLAND_DISPLAY_NAME='Example'",
+  ),
+);
+
+/// Refuses `--name <name>` with [message], leaving .env byte for byte and no restart.
+Future<void> refusesWith(Matcher message, {String name = 'X'}) async {
   final before = envFile.readAsStringSync();
   await expectLater(
-    configure().run(parseConfigureArgs(['--name', 'X'])),
+    configure().run(parseConfigureArgs(['--name', name])),
     throwsA(isA<Refusal>().having((r) => r.message, 'message', message)),
   );
   expect(envFile.readAsStringSync(), before);
-  expect(box.gatewayEnv, isNull);
+  expect(box.restarts, 0);
 }
 
 void main() {
@@ -186,7 +208,9 @@ void main() {
     File('${root.path}/deploy/compose.sh').writeAsStringSync('#!/bin/sh\n');
     envFile.writeAsStringSync(liveShaped());
     Process.runSync('chmod', ['600', envFile.path]);
-    box = FakeBox(root);
+    File('${root.path}/image.env')
+        .writeAsStringSync('ISLAND_IMAGE=$pinnedImage\n');
+    box = FakeBox(root)..gatewayEnv = parseDotenv(liveShaped(), '.env');
     gateway = FakeGateway(box);
     out = [];
   });
@@ -199,7 +223,7 @@ void main() {
       expect(r, isA<Applied>());
       final after = envFile.readAsStringSync();
       expect(changedLines(before, after), [
-        "4: ISLAND_DISPLAY_NAME='New Name #2'",
+        "5: ISLAND_DISPLAY_NAME='New Name #2'",
       ]);
     });
 
@@ -292,13 +316,14 @@ void main() {
     test(
       'every setting already has that value (and does not restart)',
       () async {
+        canonicalName();
         final before = envFile.readAsStringSync();
         final r = await configure().run(
           args(['--name', 'Example', '--enable-passkeys']),
         );
         expect(r, isA<Unchanged>());
         expect(envFile.readAsStringSync(), before);
-        expect(box.gatewayEnv, isNull);
+        expect(box.restarts, 0);
       },
     );
 
@@ -313,7 +338,7 @@ void main() {
         throwsA(isA<Refusal>().having((r) => r.message, 'message', message)),
       );
       if (before != null) expect(envFile.readAsStringSync(), before);
-      expect(box.gatewayEnv == null, !restarted);
+      expect(box.restarts > 0, restarted);
     }
 
     test(
@@ -342,7 +367,7 @@ void main() {
       await expectLater(configure().run(o), throwsA(isA<Refusal>()));
       // The other writer's file, not ours, is what is there.
       expect(envFile.readAsStringSync(), endsWith('NEW=1\n'));
-      expect(box.gatewayEnv, isNull);
+      expect(box.restarts, 0);
     });
 
     test('compose cannot read the file at all', () async {
@@ -395,7 +420,7 @@ void main() {
 
   group('Docker outside the docker group (enspyr-melb)', () {
     test(
-      'compose is asked through `sudo -n docker`, and configure still applies',
+      'compose is asked through `sudo -n docker` (compose.sh elevates itself)',
       () async {
         box.dockerNeedsSudo = true;
         final r = await configure().run(args(['--name', 'X']));
@@ -412,6 +437,178 @@ void main() {
         ..sudoWorks = false;
       await refusesWith(contains('sudo -n docker'));
     });
+  });
+
+  group('PR#407 r1', () {
+    test('a restart that would change the release refuses (no un-backed-up upgrade)', () async {
+      box.runningImage = 'ghcr.io/nickmeinhold/aiko-chat-island:0.18.0';
+      await refusesWith(
+        allOf(contains('deploy/update.sh'), contains('0.18.0')),
+      );
+    });
+
+    test(
+      'a gateway that is not running refuses (configure changes a live island)',
+      () async {
+        box.runningImage = null;
+        await refusesWith(contains('not running'));
+      },
+    );
+
+    test('no image.env refuses: the restart could not be pinned', () async {
+      File('${root.path}/image.env').deleteSync();
+      await refusesWith(contains('image.env'));
+    });
+
+    test(
+      'a retry after a failed restart restarts and verifies, never Unchanged',
+      () async {
+        box.upFails = true;
+        await expectLater(
+          configure().run(args(['--name', 'X'])),
+          throwsA(isA<Refusal>()),
+        );
+        // .env now says X; the gateway still serves Example.
+        box.upFails = false;
+        final r = await configure().run(args(['--name', 'X']));
+        expect(r, isA<Applied>());
+        expect(box.restarts, 2);
+      },
+    );
+
+    test(
+      'Unchanged only when the gateway serves it too, and then no restart',
+      () async {
+        canonicalName();
+        final r = await configure().run(args(['--name', 'Example']));
+        expect(r, isA<Unchanged>());
+        expect(box.restarts, 0);
+      },
+    );
+
+    test('an unquoted legacy line is rewritten once, then Unchanged', () async {
+      expect(
+        await configure().run(args(['--name', 'Example'])),
+        isA<Applied>(),
+      );
+      expect(
+        envFile.readAsStringSync(),
+        contains("ISLAND_DISPLAY_NAME='Example'"),
+      );
+      expect(
+        await configure().run(args(['--name', 'Example'])),
+        isA<Unchanged>(),
+      );
+      expect(box.restarts, 1);
+    });
+
+    test('an unquoted value with a \$ is not "already set": compose would expand it', () async {
+      envFile.writeAsStringSync(
+        liveShaped().replaceFirst(
+          'ISLAND_DISPLAY_NAME=Example',
+          r'ISLAND_DISPLAY_NAME=Cost$X',
+        ),
+      );
+      final r = await configure().run(args(['--name', r'Cost$X']));
+      expect(r, isA<Applied>());
+      expect(
+        envFile.readAsStringSync(),
+        contains(r"ISLAND_DISPLAY_NAME='Cost$X'"),
+      );
+    });
+
+    test(
+      'a key set twice whose last copy matches still refuses, not Unchanged',
+      () async {
+        canonicalName();
+        envFile.writeAsStringSync(
+          "${envFile.readAsStringSync()}ISLAND_DISPLAY_NAME='Example'\n",
+        );
+        await refusesWith(contains('set 2 times'), name: 'Example');
+      },
+    );
+
+    test('the revert hint quotes an old value with an apostrophe as one shell word', () async {
+      envFile.writeAsStringSync(
+        liveShaped().replaceFirst(
+          'ISLAND_DISPLAY_NAME=Example',
+          'ISLAND_DISPLAY_NAME="Bob\'s Island"',
+        ),
+      );
+      box.upFails = true;
+      Refusal? got;
+      try {
+        await configure().run(args(['--name', 'X']));
+      } on Refusal catch (e) {
+        got = e;
+      }
+      final hint = got!.message
+          .split('\n')
+          .firstWhere((l) => l.contains('island configure --name'));
+      // Run the printed words through a real shell: they must come back as ONE word.
+      final words = await Process.run('sh', [
+        '-c',
+        'for w in ${hint.substring(hint.indexOf('--name') + 7)}; do echo "[\$w]"; done',
+      ]);
+      expect('${words.stdout}'.trim(), "[Bob's Island]");
+    });
+
+    test(
+      'a key that was not set before is named as a line to delete, not dropped',
+      () async {
+        envFile.writeAsStringSync(
+          liveShaped().replaceFirst(
+            RegExp(r'ISLAND_DISPLAY_NAME=Example\n'),
+            '',
+          ),
+        );
+        box.upFails = true;
+        await expectLater(
+          configure().run(args(['--name', 'X'])),
+          throwsA(
+            isA<Refusal>().having(
+              (r) => r.message,
+              'message',
+              contains('delete the ISLAND_DISPLAY_NAME line'),
+            ),
+          ),
+        );
+      },
+    );
+
+    test(
+      'passkeys refuse when PASSKEY_RP_ID does not match GATEWAY_BASE_URL',
+      () async {
+        envFile.writeAsStringSync(
+          liveShaped().replaceFirst(
+            'PASSKEY_RP_ID=chat.example.org',
+            'PASSKEY_RP_ID=chat.imagineering.cc',
+          ),
+        );
+        final before = envFile.readAsStringSync();
+        await expectLater(
+          configure().run(args(['--enable-passkeys'])),
+          throwsA(isA<Refusal>()),
+        );
+        expect(envFile.readAsStringSync(), before);
+      },
+    );
+
+    test(
+      'passkeys with neither key set (compose defaults agree) are allowed',
+      () async {
+        envFile.writeAsStringSync(
+          liveShaped()
+              .replaceFirst('GATEWAY_BASE_URL=https://chat.example.org\n', '')
+              .replaceFirst('PASSKEY_RP_ID=chat.example.org\n', '')
+              .replaceFirst('PASSKEY_ENABLED=true', 'PASSKEY_ENABLED=false'),
+        );
+        expect(
+          await configure().run(args(['--enable-passkeys'])),
+          isA<Applied>(),
+        );
+      },
+    );
   });
 
   group('after the restart, the gateway must SERVE it', () {
@@ -448,6 +645,17 @@ void main() {
       gateway.forwardsName = false;
       final r = await configure().run(args(['--name', 'X']));
       expect(r, isA<AnsweringNotServing>());
+    });
+
+    test('a mismatch does not tell the operator to update their copy (they will revert)', () async {
+      gateway.forwardsName = false;
+      await configure().run(args(['--name', 'X']));
+      expect(out.join('\n'), isNot(contains('older than the box')));
+    });
+
+    test('success does remind them their copy is now older', () async {
+      await configure().run(args(['--name', 'X']));
+      expect(out.join('\n'), contains('older than the box'));
     });
 
     test('a gateway that never answers is exit 3, not success', () async {

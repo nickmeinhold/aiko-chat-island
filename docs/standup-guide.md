@@ -74,8 +74,9 @@ Run `./deploy/standup.sh --help` for every flag.
 
 The same new-island standup, as one prebuilt binary (no Dart or anything else to
 install; ISL-0003). It is attached to every release from the first one after v0.18.0,
-for `arm64` and `x64`. It does **only** a new island: on a box that already has one it
-refuses and changes nothing. It doesn't do media yet (use `--with-media` with the script).
+for `arm64` and `x64`. `island standup` does **only** a new island: on a box that already
+has one it refuses and changes nothing (to change a live island's settings, `island
+configure`; see below). It doesn't do media yet (use `--with-media` with the script).
 
 ```bash
 V=vX.Y.Z; ARCH=$(uname -m | sed 's/aarch64/arm64/; s/x86_64/x64/')
@@ -148,7 +149,8 @@ To list peers, pass `--seed-peers` a JSON array of `{"id","display_name","base_u
 
 Federation is **mutual by convention**: for the other islands to list *you*, their
 operators add your entry to *their* seed peers and redeploy. Send them your
-`{"id","display_name","base_url"}` (id is conventionally your domain).
+`{"id","display_name","base_url"}`. The id is a short lowercase slug such as `enspyr`,
+**not** your domain: the gateway silently drops an id containing a dot.
 
 > Gossip-based auto-discovery exists in the code but ships **off** (`GATEWAY_GOSSIP_ENABLED=false`)
 > — for a handful of islands, seed peers are simpler and avoid the fetch/SSRF
