@@ -21,6 +21,9 @@ final class FakeDocker implements Runner {
   final calls = <String>[];
   bool lsFails = false;
 
+  /// What `ss -ltnH` prints: one listening socket per line.
+  String ssOut = '';
+
   @override
   Future<RunResult> run(
     String exe,
@@ -37,7 +40,7 @@ final class FakeDocker implements Runner {
       final r = await Process.run(exe, args);
       return RunResult(r.exitCode, '${r.stdout}', '${r.stderr}');
     }
-    if (exe == 'ss') return const RunResult(0, '', '');
+    if (exe == 'ss') return RunResult(0, ssOut, '');
     if (exe != 'docker') return const RunResult(0, '', '');
     final name = args.last;
     switch (args) {
@@ -382,23 +385,24 @@ void main() {
       expect(out.join('\n'), contains('HTTPS is NOT confirmed'));
     });
 
-    test('a failure after the birth says what this run created, and publishes nothing half-way', () async {
-      // ln fails: the temps were all written, so neither file may appear.
-      final d = FakeDocker(failOn: 'ln ${root.path}');
+    test('a failed WRITE publishes nothing: all temporaries are written before any ln', () async {
+      // .env's temp fails at chmod, AFTER image.env's temp is written. A publish-each-
+      // as-you-go implementation would already have published image.env here; the
+      // two-phase one has published nothing (Noether r3: the old test failed both lns).
+      final d = FakeDocker(failOn: 'chmod 600 ${root.path}/.env.standup');
       Refusal? r;
       try {
         await standup(d).run(opts);
       } on Refusal catch (e) {
         r = e;
       }
-      expect(r, isNotNull);
       expect(
         r!.message,
         contains('This run created: volume aiko_data (label aiko.birth='),
       );
       expect(r.message, contains('A failed birth'));
-      expect(File('${root.path}/.env').existsSync(), isFalse);
       expect(File('${root.path}/image.env').existsSync(), isFalse);
+      expect(File('${root.path}/.env').existsSync(), isFalse);
       expect(
         root.listSync().where((e) => e.path.contains('.standup-')),
         isEmpty,
@@ -406,6 +410,30 @@ void main() {
       );
       expect(d.calls.where((c) => c.contains('compose.sh up')), isEmpty);
     });
+
+    test(
+      'a failed second ln is reported honestly: image.env is named as created',
+      () async {
+        // Two-phase can't make two lns atomic. What it owes is the truth about the gap.
+        final d = FakeDocker(failOn: 'ln ${root.path}/.env.standup');
+        Refusal? r;
+        try {
+          await standup(d).run(opts);
+        } on Refusal catch (e) {
+          r = e;
+        }
+        expect(File('${root.path}/image.env').existsSync(), isTrue);
+        expect(File('${root.path}/.env').existsSync(), isFalse);
+        expect(
+          r!.message,
+          matches(
+            RegExp(
+              r'This run created: volume aiko_data \(label aiko\.birth=[0-9a-f]+\), image\.env\. ',
+            ),
+          ),
+        );
+      },
+    );
 
     test('a failed compose up says what this run created', () async {
       final d = FakeDocker(failOn: 'compose.sh up');
@@ -552,6 +580,74 @@ void main() {
       String lit(Object? v) => '$v'.replaceAll(r'$$', r'$');
       expect(lit(env['N']), o.displayName);
       expect(lit(env['P']), o.seedPeers);
+    });
+  });
+  group('PR#406 r3', () {
+    for (final args in [
+      ['--domain', 'chat.example.org', '--name', '--no-tls'],
+      ['--domain', 'chat.example.org', '--name', '--enable-passkeys'],
+      ['--domain', '--name', 'X'],
+    ]) {
+      test('a flag is never taken as a value: ${args.join(' ')}', () {
+        expect(
+          () => parseStandupArgs(args),
+          throwsA(
+            isA<Refusal>().having(
+              (r) => r.message,
+              'message',
+              contains('needs a value'),
+            ),
+          ),
+        );
+      });
+    }
+
+    test(
+      'a busy 8095 refuses before anything changes, even with --no-tls',
+      () async {
+        final d = FakeDocker()
+          ..ssOut = 'LISTEN 0 4096 127.0.0.1:8095 0.0.0.0:*\n';
+        const noTls = StandupOptions(
+          domain: 'chat.example.org',
+          displayName: 'X',
+          tls: false,
+        );
+        await expectLater(
+          standup(d).run(noTls),
+          throwsA(
+            isA<Refusal>().having(
+              (r) => r.message,
+              'message',
+              contains('8095'),
+            ),
+          ),
+        );
+        expect(
+          d.calls.where(
+            (c) =>
+                c.startsWith('docker pull') ||
+                c.startsWith('docker volume create'),
+          ),
+          isEmpty,
+        );
+      },
+    );
+
+    test('80/443 busy refuses only when TLS is wanted', () async {
+      final busy = 'LISTEN 0 4096 0.0.0.0:443 0.0.0.0:*\n';
+      await expectLater(
+        standup(FakeDocker()..ssOut = busy).run(opts),
+        throwsA(isA<Refusal>()),
+      );
+      const noTls = StandupOptions(
+        domain: 'chat.example.org',
+        displayName: 'X',
+        tls: false,
+      );
+      expect(
+        await standup(FakeDocker()..ssOut = busy).run(noTls),
+        isA<Healthy>(),
+      );
     });
   });
 }

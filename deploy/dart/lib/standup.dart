@@ -187,7 +187,11 @@ StandupOptions parseStandupArgs(List<String> args) {
   var peers = '[]';
   var passkeys = false, tls = true;
   String value(int i, String flag) {
-    if (i + 1 >= args.length) throw Refusal('$flag needs a value\n\n$usage');
+    // A value that looks like a flag is a missing value: `--name --no-tls` must not
+    // name the island "--no-tls" and silently leave TLS on (Noether, PR#406 r3).
+    if (i + 1 >= args.length || args[i + 1].startsWith('--')) {
+      throw Refusal('$flag needs a value\n\n$usage');
+    }
     return args[i + 1];
   }
 
@@ -420,7 +424,7 @@ final class Standup {
       );
     }
     await _refuseIfAnIslandIsHere();
-    if (o.tls) await _tlsPortAdvisory();
+    await _portCheck(tls: o.tls);
     say.ok('this box has no island; Docker and compose answer');
     final env = renderEnv(o, newSecret(random));
     final nonce = newSecret(random).substring(0, 16);
@@ -577,22 +581,28 @@ Next steps:
     }
   }
 
-  Future<void> _tlsPortAdvisory() async {
+  /// 8095 must be free on every run: another gateway already listening there would
+  /// answer "ok" for a container of ours that cannot bind (Tesla, PR#406 r3). 80 and
+  /// 443 only matter when the bundled Caddy will need them.
+  Future<void> _portCheck({required bool tls}) async {
     final ss = await runner.run('ss', ['-ltnH']);
     if (!ss.ok) {
       say.warn(
-        'could not check ports 80/443 (no `ss`); if another proxy runs here, use --no-tls.',
+        'could not check whether ports 8095${tls ? ', 80 and 443' : ''} are free (no `ss`).',
       );
       return;
     }
-    final busy = const LineSplitter()
-        .convert(ss.stdout)
-        .map((l) {
-          final cols = l.trim().split(RegExp(r'\s+'));
-          return cols.length > 3 ? cols[3].split(':').last : '';
-        })
-        .where((p) => p == '80' || p == '443');
-    if (busy.isNotEmpty) {
+    final listening = const LineSplitter().convert(ss.stdout).map((l) {
+      final cols = l.trim().split(RegExp(r'\s+'));
+      return cols.length > 3 ? cols[3].split(':').last : '';
+    }).toSet();
+    if (listening.contains('8095')) {
+      throw Refusal(
+        'port 8095 is already in use: something here already serves where this '
+        'island\'s gateway must. Nothing was changed.',
+      );
+    }
+    if (tls && (listening.contains('80') || listening.contains('443'))) {
       throw Refusal(
         'port 80 and/or 443 is already in use (an existing proxy?). The bundled '
         'Caddy needs them for Let\'s Encrypt. Stop the other proxy, or use --no-tls and '
@@ -746,5 +756,50 @@ bool isGatewayHealthy(int statusCode, String body) {
     return j is Map && j['status'] == 'ok';
   } on FormatException {
     return false;
+  }
+}
+
+/// Whether [uri] answers as this gateway (see [isGatewayHealthy]), asking THIS box.
+///
+/// The connection always goes to [address] (127.0.0.1), whatever DNS says, and never
+/// through a proxy or a redirect. For https the TLS handshake still sends `uri.host`
+/// as SNI and verifies the certificate against it, so a pass means "this box's Caddy
+/// holds a valid certificate for the domain and proxies to a healthy gateway", not
+/// "something at the domain's current DNS answer said ok": a box whose A record still
+/// names another island no longer passes (Carnot, Tesla, PR#406 r3). Measured from the
+/// SDK source: with a connectionFactory and no proxy, HttpClient uses the returned
+/// socket as is, so the factory does the TLS itself.
+///
+/// One deadline covers the whole exchange, and the body is capped in BYTES.
+Future<bool> probeHealth(Uri uri, {String address = '127.0.0.1'}) async {
+  final client = HttpClient()
+    ..connectionTimeout = const Duration(seconds: 3)
+    ..findProxy = ((_) => 'DIRECT')
+    ..connectionFactory = (u, _, _) async {
+      final plain = Socket.connect(address, u.port);
+      final Future<Socket> socket = u.scheme == 'https'
+          ? plain.then((s) => SecureSocket.secure(s, host: u.host))
+          : plain;
+      return ConnectionTask.fromSocket(socket, () {});
+    };
+  try {
+    return await () async {
+      final req = await client.getUrl(uri);
+      req.followRedirects = false;
+      final res = await req.close();
+      final bytes = <int>[];
+      await for (final chunk in res) {
+        bytes.addAll(chunk);
+        if (bytes.length > 4096) return false; // not a /health body
+      }
+      return isGatewayHealthy(
+        res.statusCode,
+        utf8.decode(bytes, allowMalformed: true),
+      );
+    }().timeout(const Duration(seconds: 6));
+  } on Object {
+    return false;
+  } finally {
+    client.close(force: true);
   }
 }

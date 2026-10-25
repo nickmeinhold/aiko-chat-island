@@ -214,7 +214,9 @@ jobs:
   # source created by remembering to type `gh release create` is a hand-managed artifact
   # with no declared desired state. This job declares it.
   publish-release:
-    needs: merge
+    # island-binaries FIRST: a release whose binaries failed to build must not exist at
+    # all, rather than exist with a download that 404s (Noether, PR#406 r3).
+    needs: [merge, island-binaries]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
@@ -262,7 +264,11 @@ jobs:
           }
           echo "--- notes to be published ---"; cat /tmp/release-notes.md
 
-      - name: Create the Release
+      - uses: actions/download-artifact@v4
+        with:
+          name: island-binaries
+          path: dist
+      - name: Create the Release, with the island binaries attached in the same call
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -270,7 +276,20 @@ jobs:
             --repo "${{ github.repository }}" \
             --title "${GITHUB_REF_NAME}" \
             --notes-file /tmp/release-notes.md \
-            --verify-tag
+            --verify-tag \
+            dist/island-linux-arm64 dist/island-linux-x64 dist/SHA256SUMS
+      # MUST-FAIL ARM: what an operator would DOWNLOAD verifies, checksum and provenance.
+      - name: Verify the published island binaries
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p /tmp/check && cd /tmp/check
+          gh release download "${GITHUB_REF_NAME}" --repo "${{ github.repository }}" \
+            --pattern 'island-linux-*' --pattern SHA256SUMS
+          sha256sum -c SHA256SUMS
+          for f in island-linux-arm64 island-linux-x64; do
+            gh attestation verify "$f" --repo "${{ github.repository }}"
+          done
 
       # MUST-FAIL ARM. Without this the job proves only that `gh release create` exited
       # 0; this asserts the endpoint the nudge actually reads now answers with THIS tag.
@@ -297,11 +316,10 @@ jobs:
   # same way the image is, and attached to the Release the box downloads from. Dart cross-
   # compiles both arches from one runner (measured: macOS -> linux arm64 ran on syd).
   island-binaries:
-    needs: publish-release
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
-      contents: write       # attach assets to the Release
+      contents: read
       id-token: write       # sign the provenance
       attestations: write   # file the bundle against this repo
     steps:
@@ -323,22 +341,12 @@ jobs:
       - uses: actions/attest-build-provenance@v2
         with:
           subject-path: 'dist/island-linux-*'
-      - name: Attach to the Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release upload "${GITHUB_REF_NAME}" dist/island-linux-arm64 dist/island-linux-x64 \
-            dist/SHA256SUMS --repo "${{ github.repository }}"
-      # MUST-FAIL ARM: prove what an operator would DOWNLOAD verifies, not that the
-      # upload step exited 0. Fetch each asset back from the Release and verify it.
-      - name: Verify the published binaries
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          mkdir -p /tmp/check && cd /tmp/check
-          gh release download "${GITHUB_REF_NAME}" --repo "${{ github.repository }}" \
-            --pattern 'island-linux-*' --pattern SHA256SUMS
-          sha256sum -c SHA256SUMS
-          for f in island-linux-arm64 island-linux-x64; do
-            gh attestation verify "$f" --repo "${{ github.repository }}"
-          done
+      # Handed to publish-release, which attaches them when it creates the Release.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: island-binaries
+          path: |
+            dist/island-linux-arm64
+            dist/island-linux-x64
+            dist/SHA256SUMS
+          if-no-files-found: error

@@ -85,7 +85,8 @@ base=https://github.com/nickmeinhold/aiko-chat-island/releases/download/$V
 # executable left over from an earlier download included).
 rm -f "island-linux-$ARCH" SHA256SUMS \
   && curl -fsSLO "$base/island-linux-$ARCH" && curl -fsSLO "$base/SHA256SUMS" \
-  && sha256sum --ignore-missing -c SHA256SUMS && chmod +x "island-linux-$ARCH" \
+  && grep -E "^[0-9a-f]{64}  island-linux-$ARCH\$" SHA256SUMS | sha256sum -c - \
+  && chmod +x "island-linux-$ARCH" \
   && ./island-linux-$ARCH standup --domain chat.example.org --name "Example Island" --version ${V#v}
 ```
 
