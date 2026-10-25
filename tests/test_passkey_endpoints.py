@@ -511,14 +511,41 @@ async def test_register_finish_malformed_credential_is_400(client, mangle):
     pytest.param(SoftAuthenticator(), "android-safetynet",
                  {"ver": "1", "response": b"x.y.z"},
                  id="safetynet-garbage"),  # binascii.Error
+    pytest.param(SoftAuthenticator(), "fido-u2f",
+                 {"sig": b"x", "x5c": [b"not-a-cert"]},
+                 id="fido-u2f-garbage-x5c"),  # ValueError (asn1)
+    # Keys py_webauthn decodes but never loads (#421): these used to REGISTER, and
+    # then could never sign in.
+    pytest.param(SoftAuthenticator(cose_key={1: 2, 3: -7, -1: 1,
+                                             -2: b"\x00" * 32, -3: b"\x00" * 32}),
+                 "none", None, id="ec2-off-curve"),  # ValueError at key load
+    pytest.param(SoftAuthenticator(cose_key={1: 2, 3: -7, -1: 99,
+                                             -2: _P256_X, -3: _P256_Y}),
+                 "none", None, id="ec2-unknown-curve"),  # UnsupportedEC2Curve
 ])
-async def test_register_finish_hostile_attestation_is_401(client, auth, fmt, att_stmt):
+async def test_register_finish_hostile_attestation_is_401(
+    client, session, auth, fmt, att_stmt,
+):
     start = (await client.post("/v1/auth/passkey/register/start")).json()
     finish = await client.post("/v1/auth/passkey/register/finish", json={
         "state": start["state"],
         "credential": auth.register(start["options"]["challenge"],
                                     fmt=fmt, att_stmt=att_stmt)})
     assert finish.status_code == 401, finish.text
+    assert await passkey_service.get_credential(
+        session, bytes_to_base64url(auth.credential_id)) is None
+
+
+async def test_register_finish_server_misconfig_stays_loud(client, monkeypatch):
+    """The catch-all covers py_webauthn's frames only. A fault in OUR inputs (here
+    the origin list) must escape as a server error, never a 401 for the device."""
+    monkeypatch.setattr(settings, "passkey_extra_origins", None)
+    auth = SoftAuthenticator()
+    start = (await client.post("/v1/auth/passkey/register/start")).json()
+    with pytest.raises(TypeError):
+        await client.post("/v1/auth/passkey/register/finish", json={
+            "state": start["state"],
+            "credential": auth.register(start["options"]["challenge"])})
 
 
 async def test_register_finish_malformed_then_honest_retry_same_state(client, session):
@@ -587,3 +614,40 @@ async def test_authenticate_finish_backed_up_not_eligible_is_401(client):
     finish = await client.post("/v1/auth/passkey/authenticate/finish", json={
         "state": start["state"], "credential": auth.authenticate(start["options"]["challenge"])})
     assert finish.status_code == 401, finish.text
+
+
+async def test_authenticate_finish_bad_user_handle_is_400(client):
+    """py_webauthn decodes userHandle outside its own wrapper: "a" raised a bare
+    binascii.Error before any signature check (Carnot + Tesla, #422 r1)."""
+    reg, auth = await _register_passkey(client)
+    assert reg.status_code == 200, reg.text
+    start = (await client.post("/v1/auth/passkey/authenticate/start")).json()
+    cred = auth.authenticate(start["options"]["challenge"])
+    cred["response"]["userHandle"] = "a"
+    finish = await client.post("/v1/auth/passkey/authenticate/finish", json={
+        "state": start["state"], "credential": cred})
+    assert finish.status_code == 400, finish.text
+    assert finish.json()["detail"] == "malformed passkey credential"
+
+
+async def test_authenticate_finish_malformed_unknown_id_is_400(client):
+    """Same malformed body, never-registered id: still 400, so the status does not
+    reveal whether a credential id exists (it was 401 for unknown, 400 for known)."""
+    ghost = SoftAuthenticator(credential_id=b"ghost-credential-0006")
+    start = (await client.post("/v1/auth/passkey/authenticate/start")).json()
+    finish = await client.post("/v1/auth/passkey/authenticate/finish", json={
+        "state": start["state"],
+        "credential": _strip(ghost.authenticate(start["options"]["challenge"]), "response")})
+    assert finish.status_code == 400, finish.text
+
+
+async def test_register_finish_refusal_logs_its_cause(client, caplog):
+    """The service folds a dozen causes into one type; the route must log which one,
+    or a hostile body and a real authenticator bug read the same to an operator."""
+    auth = SoftAuthenticator(cose_key={1: 2, -1: 1, -2: _P256_X, -3: _P256_Y})  # KeyError
+    start = (await client.post("/v1/auth/passkey/register/start")).json()
+    with caplog.at_level("WARNING", logger="aiko_gateway.rest.auth"):
+        finish = await client.post("/v1/auth/passkey/register/finish", json={
+            "state": start["state"], "credential": auth.register(start["options"]["challenge"])})
+    assert finish.status_code == 401, finish.text
+    assert "KeyError" in caplog.text
