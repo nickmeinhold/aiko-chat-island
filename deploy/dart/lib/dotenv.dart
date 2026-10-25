@@ -44,16 +44,39 @@ class DotenvParseException implements Exception {
   String toString() => message;
 }
 
-/// Parse `text` into key -> value.
+/// One assignment in a `.env`: its key, its value, and where it sits.
+final class DotenvEntry {
+  const DotenvEntry(
+    this.key,
+    this.value,
+    this.firstLine,
+    this.endLine,
+    this.lead,
+  );
+  final String key;
+  final String value;
+
+  /// The lines it occupies, as indexes into `text.split('\n')`: [firstLine,
+  /// endLine). More than one line for a multi-line quoted value (the PEM).
+  final int firstLine;
+  final int endLine;
+
+  /// What came before the key on its first line: indentation and any `export `.
+  final String lead;
+}
+
+/// Every assignment in `text`, in file order, duplicates included.
 ///
-/// [where] names the source in any error, because "parsed zero keys" is useless
-/// without knowing which side it happened on.
-Map<String, String> parseDotenv(String text, String where) {
-  final out = <String, String>{};
+/// The one grammar in this package. [parseDotenv] is built on it, and so is
+/// `configure`'s editor, which uses the line spans to replace exactly one key's
+/// lines and leave every other byte alone.
+List<DotenvEntry> scanDotenv(String text, String where) {
+  final out = <DotenvEntry>[];
   final runes = text.split('\n');
   var i = 0;
 
   while (i < runes.length) {
+    final first = i;
     var line = runes[i];
     i++;
 
@@ -62,6 +85,7 @@ Map<String, String> parseDotenv(String text, String where) {
 
     var body = trimmed;
     if (body.startsWith('export ')) body = body.substring(7).trimLeft();
+    final lead = line.substring(0, line.length - body.length);
 
     final eq = body.indexOf('=');
     // A line with no '=' is not a comment and not a pair. Skipping it silently
@@ -119,13 +143,20 @@ Map<String, String> parseDotenv(String text, String where) {
       if (hash >= 0) v = v.substring(0, hash);
       value = v.trim();
     }
-
-    // LAST WINS, matching both dotenv and Compose. Recording it as a collision
-    // instead would be a different tool; silently keeping the FIRST would make
-    // this parser disagree with the box about which value is live.
-    out[key] = value;
+    out.add(DotenvEntry(key, value, first, i, lead));
   }
+  return out;
+}
 
+/// Parse `text` into key -> value.
+///
+/// [where] names the source in any error, because "parsed zero keys" is useless
+/// without knowing which side it happened on.
+Map<String, String> parseDotenv(String text, String where) {
+  // LAST WINS, matching both dotenv and Compose. Recording it as a collision
+  // instead would be a different tool; silently keeping the FIRST would make
+  // this parser disagree with the box about which value is live.
+  final out = {for (final e in scanDotenv(text, where)) e.key: e.value};
   if (out.isEmpty) {
     throw DotenvParseException(
       'parsed zero keys from $where — refusing to call that a match',

@@ -24,7 +24,7 @@
 # Usage:
 #   deploy/standup.sh --domain chat.example.org --name "Example Island"
 #   deploy/standup.sh --domain chat.example.org --name "Example Island" \
-#       --seed-peers '[{"id":"chat.imagineering.cc","display_name":"Aiko","base_url":"https://chat.imagineering.cc"}]'
+#       --seed-peers '[{"id":"imagineering","display_name":"Imagineering","base_url":"https://chat.imagineering.cc"}]'
 #   deploy/standup.sh --domain chat.example.org --name "Example Island" --no-tls
 #   deploy/standup.sh --domain chat.example.org --name "Example Island" \
 #       --with-media --turn-domain turn.example.org

@@ -26,6 +26,12 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 
+import 'box.dart';
+import 'options.dart';
+
+export 'box.dart';
+export 'options.dart';
+
 /// Byte-identical to `BIRTH_SH` in `deploy/standup.sh` (a test pins the two).
 const birthScript =
     'set -eC\n'
@@ -36,74 +42,6 @@ const birthScript =
 const islandRepo = 'ghcr.io/nickmeinhold/aiko-chat-island';
 const dataVolume = 'aiko_data';
 const _label = 'aiko.birth';
-
-/// What one external command did.
-final class RunResult {
-  const RunResult(this.exitCode, this.stdout, this.stderr);
-  final int exitCode;
-  final String stdout;
-  final String stderr;
-  bool get ok => exitCode == 0;
-}
-
-/// Every effect outside this process goes through here, so tests can stand in a
-/// fake that records calls and answers like Docker does.
-abstract interface class Runner {
-  /// [stream]: also show the child's output live (a pull or a `compose up` takes
-  /// minutes, and buffered silence reads as a hang; Noether, PR#406 r2). The
-  /// output is still captured, so a failure can quote it.
-  Future<RunResult> run(
-    String exe,
-    List<String> args, {
-    String? workingDirectory,
-    bool stream = false,
-  });
-}
-
-final class ProcessRunner implements Runner {
-  const ProcessRunner();
-  @override
-  Future<RunResult> run(
-    String exe,
-    List<String> args, {
-    String? workingDirectory,
-    bool stream = false,
-  }) async {
-    try {
-      if (!stream) {
-        final r = await Process.run(
-          exe,
-          args,
-          workingDirectory: workingDirectory,
-        );
-        return RunResult(r.exitCode, '${r.stdout}', '${r.stderr}');
-      }
-      final p = await Process.start(
-        exe,
-        args,
-        workingDirectory: workingDirectory,
-      );
-      final out = StringBuffer(), err = StringBuffer();
-      final done = [
-        p.stdout.transform(utf8.decoder).forEach((s) {
-          stdout.write(s);
-          out.write(s);
-        }),
-        p.stderr.transform(utf8.decoder).forEach((s) {
-          stderr.write(s);
-          err.write(s);
-        }),
-      ];
-      final code = await p.exitCode;
-      await Future.wait(done);
-      // A failure's reason may be on either stream: quote both.
-      return RunResult(code, '$out', '$err$out');
-    } on ProcessException catch (e) {
-      // A missing executable is an answer ("not installed"), not a crash.
-      return RunResult(127, '', '$exe: ${e.message}');
-    }
-  }
-}
 
 /// How a standup that did not refuse ended. Sealed, so a caller cannot forget
 /// the case that is NOT success.
@@ -135,34 +73,29 @@ int exitCodeFor(StandupResult r) => switch (r) {
   HealthyTlsUnconfirmed() => 4,
 };
 
-/// Standup stopped on purpose. The message is what the operator reads.
-final class Refusal implements Exception {
-  Refusal(this.message);
-  final String message;
-  @override
-  String toString() => message;
-}
-
-/// The operator's choices for one standup.
+/// The operator's choices for one standup. Every field is a checked type
+/// (options.dart), so holding a StandupOptions means holding valid values: there is
+/// no separate `validate` to forget (Carnot, PR#406 r2 and r3).
 final class StandupOptions {
-  const StandupOptions({
+  StandupOptions({
     required this.domain,
     required this.displayName,
-    this.seedPeers = '[]',
+    this.seedPeers = const SeedPeers.none(),
     this.passkeys = false,
     this.tls = true,
     this.tag,
-  });
-  final String domain;
-  final String displayName;
-
-  /// JSON array of `{"id","display_name","base_url"}`. `[]` = a solo island.
-  final String seedPeers;
+  }) {
+    // The one check that needs two fields: a peer that IS this island.
+    seedPeers.refuseSelf(domain.baseUrl);
+  }
+  final Domain domain;
+  final DisplayName displayName;
+  final SeedPeers seedPeers;
   final bool passkeys;
   final bool tls;
 
   /// The release to pin; null pins `edge` (tracks main), said aloud.
-  final String? tag;
+  final ImageTag? tag;
 }
 
 const usage = '''
@@ -224,88 +157,14 @@ StandupOptions parseStandupArgs(List<String> args) {
   if (name == null || name.isEmpty) {
     throw Refusal('--name is required\n\n$usage');
   }
-  final opts = StandupOptions(
-    domain: domain,
-    displayName: name,
-    seedPeers: peers,
+  return StandupOptions(
+    domain: Domain(domain),
+    displayName: DisplayName(name),
+    seedPeers: SeedPeers.parse(peers),
     passkeys: passkeys,
     tls: tls,
-    tag: tag,
+    tag: tag == null ? null : ImageTag(tag),
   );
-  validate(opts);
-  return opts;
-}
-
-final _host = RegExp(
-  r'^(?=.{1,253}$)([A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$',
-);
-final _tag = RegExp(r'^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$');
-
-/// Everything about the options that can be checked without touching the box.
-void validate(StandupOptions o) {
-  if (!_host.hasMatch(o.domain)) {
-    throw Refusal(
-      '--domain must be a bare hostname like chat.example.org (no scheme, '
-      'port or path): ${o.domain}',
-    );
-  }
-  final tag = o.tag;
-  if (tag != null) {
-    if (tag.startsWith('v') && RegExp(r'^v\d').hasMatch(tag)) {
-      throw Refusal(
-        '--version $tag: image tags have no leading v (use ${tag.substring(1)})',
-      );
-    }
-    if (!_tag.hasMatch(tag)) {
-      throw Refusal('--version $tag is not a valid image tag');
-    }
-  }
-  // Values are written single-quoted, which dotenv and compose both take literally
-  // (a ` #` inside a name can't truncate it). The one character that can't be carried
-  // is the quote itself, so it is refused, not mangled (deploy/standup.sh, #3734).
-  for (final (what, v) in [
-    ('--name', o.displayName),
-    ('--seed-peers', o.seedPeers),
-  ]) {
-    if (v.contains("'")) {
-      throw Refusal(
-        "$what: a single quote (') can't be represented in the island's .env. "
-        'Rename, or use the JSON escape \\u0027 inside --seed-peers.',
-      );
-    }
-    if (v.codeUnits.any((c) => c < 0x20 || c == 0x7f)) {
-      throw Refusal('$what must be one line with no control characters');
-    }
-  }
-  // Compose's dotenv parser treats a backslash before the closing quote as an escape,
-  // so a name ending in `\` would swallow the following lines (Carnot, PR#406 r1). A
-  // JSON array always ends in `]`, so only the name can end in one; refuse them all
-  // in the name rather than reason about which positions are safe.
-  if (o.displayName.contains(r'\')) {
-    throw Refusal('--name can\'t contain a backslash (\\)');
-  }
-  _validatePeers(o.seedPeers);
-}
-
-void _validatePeers(String json) {
-  final Object? decoded;
-  try {
-    decoded = jsonDecode(json);
-  } on FormatException catch (e) {
-    throw Refusal('--seed-peers is not valid JSON: ${e.message}');
-  }
-  if (decoded is! List) throw Refusal('--seed-peers must be a JSON array');
-  for (final p in decoded) {
-    if (p is! Map ||
-        p['id'] is! String ||
-        p['display_name'] is! String ||
-        p['base_url'] is! String) {
-      throw Refusal(
-        '--seed-peers: every entry needs string "id", "display_name" and '
-        '"base_url": ${jsonEncode(p)}',
-      );
-    }
-  }
 }
 
 /// The `.env` for a new island. No ENVIRONMENT line: absence means production,
@@ -320,34 +179,18 @@ String renderEnv(StandupOptions o, String jwtSecret) =>
 JWT_SECRET=$jwtSecret
 
 # --- island identity ---
-GATEWAY_BASE_URL=https://${o.domain}
-ISLAND_DISPLAY_NAME='${o.displayName}'
+GATEWAY_BASE_URL=${o.domain.baseUrl}
+ISLAND_DISPLAY_NAME=${o.displayName.dotenv}
 PASSKEY_RP_ID=${o.domain}
 
 # Federation: operator-curated peers. JSON array of {"id","display_name","base_url"}.
-ISLAND_SEED_PEERS='${o.seedPeers}'
+ISLAND_SEED_PEERS=${o.seedPeers.dotenv}
 
 # Passkeys: advertise sign-in only once /.well-known assetlinks.json + AASA serve.
-PASSKEY_ENABLED=${o.passkeys}
+PASSKEY_ENABLED=${PasskeysEnabled(o.passkeys).dotenv}
 ''';
 
 String renderImageEnv(String tag) => 'ISLAND_IMAGE=$islandRepo:$tag\n';
-
-/// 32 random bytes as 64 hex characters (the gateway requires at least 32).
-String newSecret(Random r) => List.generate(
-  32,
-  (_) => r.nextInt(256).toRadixString(16).padLeft(2, '0'),
-).join();
-
-/// Where standup reports. Plain sinks, so tests can read what an operator would.
-final class Say {
-  Say(this.out, this.err);
-  final void Function(String) out;
-  final void Function(String) err;
-  void step(String s) => out('==> $s');
-  void ok(String s) => out('  ok $s');
-  void warn(String s) => err(' warn $s');
-}
 
 /// One standup run. Effects go through [runner]; [probe] answers a health URL;
 /// [sleep] is the wait between probes.
@@ -374,18 +217,17 @@ final class Standup {
 
   File _f(String name) => File('${root.path}/$name');
 
-  Future<RunResult> _docker(List<String> args) => runner.run('docker', args);
+  /// Set by the first check; every Docker call goes through it (sudo where needed).
+  late final Docker _dockerCli;
+  Future<RunResult> _docker(List<String> args, {bool stream = false}) =>
+      _dockerCli.run(args, stream: stream);
 
   /// Paths standup needs from the checkout, checked before anything changes.
   String get _composeSh => _f('deploy/compose.sh').path;
   String get _caddyCompose => _f('deploy/caddy/docker-compose.caddy.yml').path;
 
   Future<StandupResult> run(StandupOptions o) async {
-    // ONE door: the options are checked here too, not only by the argument parser,
-    // so a caller constructing StandupOptions directly can't publish an unchecked
-    // value (Carnot, PR#406 r2).
-    validate(o);
-    final tag = o.tag ?? 'edge';
+    final tag = o.tag?.tag ?? 'edge';
     final image = '$islandRepo:$tag';
 
     // ---- 1. checks: nothing below this block runs until all of them pass ----
@@ -412,12 +254,7 @@ final class Standup {
         );
       }
     }
-    if (!(await _docker(['info'])).ok) {
-      throw Refusal(
-        'cannot talk to the Docker daemon (is it running? are you in the '
-        'docker group?)',
-      );
-    }
+    _dockerCli = await Docker.detect(runner);
     if (!(await _docker(['compose', 'version'])).ok) {
       throw Refusal(
         'docker compose v2 is not available (install the compose plugin)',
@@ -437,7 +274,7 @@ final class Standup {
         '<tag> for a release.',
       );
     }
-    final pulled = await runner.run('docker', ['pull', image], stream: true);
+    final pulled = await _docker(['pull', image], stream: true);
     if (!pulled.ok) {
       throw Refusal(
         'could not pull $image (nothing was changed):\n${pulled.stderr.trim()}',
@@ -501,7 +338,7 @@ final class Standup {
       // No proxy in front of a gateway that never answered (Noether, PR#406 r2).
       say.step('TLS not attempted: the gateway is not answering');
     } else if (o.tls) {
-      tlsConfirmed = await _tls(o.domain);
+      tlsConfirmed = await _tls(o.domain.host);
     } else {
       say.step(
         'TLS skipped (--no-tls): point your own proxy at 127.0.0.1:8095',
@@ -527,9 +364,8 @@ final class Standup {
 
 Next steps:
   • Verify:     curl -s https://${o.domain}/health
-  • Settings:   never re-run standup on this box: it refuses, by design. Until
-                `island configure` exists, change peers, passkeys or the name by
-                re-running deploy/standup.sh with the flag to change.
+  • Settings:   change the name, peers or passkeys with `island configure`. Never
+                re-run standup on this box: it refuses, by design.
   • Backups:    the SQLite store lives in volume '$dataVolume'. Set up backups before
                 real users arrive: docs/runbooks/backup-and-rollback.md.
   • Updates:    nobody can push this island an update. Edit ISLAND_IMAGE in image.env
@@ -742,64 +578,5 @@ Next steps:
       '80+443 are open, then: docker compose -f deploy/caddy/docker-compose.caddy.yml logs',
     );
     return false;
-  }
-}
-
-/// Whether a `/health` response is THIS gateway saying it is up: HTTP 200 and the
-/// gateway's own body, `{"status": "ok", ...}` (main.py `health`). Any 2xx was not
-/// enough: a proxy, a captive portal or another service on the port answers 200 too
-/// (Tesla, PR#406 r2).
-bool isGatewayHealthy(int statusCode, String body) {
-  if (statusCode != 200) return false;
-  try {
-    final j = jsonDecode(body);
-    return j is Map && j['status'] == 'ok';
-  } on FormatException {
-    return false;
-  }
-}
-
-/// Whether [uri] answers as this gateway (see [isGatewayHealthy]), asking THIS box.
-///
-/// The connection always goes to [address] (127.0.0.1), whatever DNS says, and never
-/// through a proxy or a redirect. For https the TLS handshake still sends `uri.host`
-/// as SNI and verifies the certificate against it, so a pass means "this box's Caddy
-/// holds a valid certificate for the domain and proxies to a healthy gateway", not
-/// "something at the domain's current DNS answer said ok": a box whose A record still
-/// names another island no longer passes (Carnot, Tesla, PR#406 r3). Measured from the
-/// SDK source: with a connectionFactory and no proxy, HttpClient uses the returned
-/// socket as is, so the factory does the TLS itself.
-///
-/// One deadline covers the whole exchange, and the body is capped in BYTES.
-Future<bool> probeHealth(Uri uri, {String address = '127.0.0.1'}) async {
-  final client = HttpClient()
-    ..connectionTimeout = const Duration(seconds: 3)
-    ..findProxy = ((_) => 'DIRECT')
-    ..connectionFactory = (u, _, _) async {
-      final plain = Socket.connect(address, u.port);
-      final Future<Socket> socket = u.scheme == 'https'
-          ? plain.then((s) => SecureSocket.secure(s, host: u.host))
-          : plain;
-      return ConnectionTask.fromSocket(socket, () {});
-    };
-  try {
-    return await () async {
-      final req = await client.getUrl(uri);
-      req.followRedirects = false;
-      final res = await req.close();
-      final bytes = <int>[];
-      await for (final chunk in res) {
-        bytes.addAll(chunk);
-        if (bytes.length > 4096) return false; // not a /health body
-      }
-      return isGatewayHealthy(
-        res.statusCode,
-        utf8.decode(bytes, allowMalformed: true),
-      );
-    }().timeout(const Duration(seconds: 6));
-  } on Object {
-    return false;
-  } finally {
-    client.close(force: true);
   }
 }

@@ -1,0 +1,24 @@
+{
+  "_about": "Seed-peer entries and what the gateway's coerce_island (src/aiko_gateway/domain/peers_service.py) does with each: keep it as written, drop it (returns None), or rewrite it (keeps a changed copy). `island standup` and `island configure` accept an entry exactly when the gateway would KEEP it unchanged. Read by deploy/dart/test/configure_test.dart AND tests/test_seed_peer_vectors.py, so the two rule sets can't drift apart without one going red.",
+  "vectors": [
+    {"python": "keep", "why": "plain", "entry": {"id": "enspyr", "display_name": "Enspyr", "base_url": "https://chat.enspyr.co"}},
+    {"python": "keep", "why": "port and path", "entry": {"id": "a-1", "display_name": "A", "base_url": "https://a.example:8443/x/y"}},
+    {"python": "keep", "why": "64-char id", "entry": {"id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "display_name": "A", "base_url": "https://a.example"}},
+    {"python": "keep", "why": "64-char name", "entry": {"id": "a", "display_name": "NNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNN", "base_url": "https://a.example"}},
+    {"python": "keep", "why": "a quote and a hash in the name", "entry": {"id": "a", "display_name": "Nick's #1 $X", "base_url": "https://a.example"}},
+    {"python": "drop", "why": "65-char id", "entry": {"id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "display_name": "A", "base_url": "https://a.example"}},
+    {"python": "drop", "why": "65-char name", "entry": {"id": "a", "display_name": "NNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNN", "base_url": "https://a.example"}},
+    {"python": "drop", "why": "id starts with a dash", "entry": {"id": "-a", "display_name": "A", "base_url": "https://a.example"}},
+    {"python": "drop", "why": "id with a dot", "entry": {"id": "a.b", "display_name": "A", "base_url": "https://a.example"}},
+    {"python": "drop", "why": "http, not https", "entry": {"id": "a", "display_name": "A", "base_url": "http://a.example"}},
+    {"python": "drop", "why": "userinfo phishing form", "entry": {"id": "a", "display_name": "A", "base_url": "https://real@evil.example"}},
+    {"python": "drop", "why": "a query string", "entry": {"id": "a", "display_name": "A", "base_url": "https://a.example/?x=1"}},
+    {"python": "drop", "why": "blank name", "entry": {"id": "a", "display_name": "   ", "base_url": "https://a.example"}},
+    {"python": "drop", "why": "id not a string", "entry": {"id": 7, "display_name": "A", "base_url": "https://a.example"}},
+    {"python": "drop", "why": "no base_url", "entry": {"id": "a", "display_name": "A"}},
+    {"python": "rewrite", "why": "uppercase id (lowercased)", "entry": {"id": "Enspyr", "display_name": "Enspyr", "base_url": "https://chat.enspyr.co"}},
+    {"python": "rewrite", "why": "trailing slash (stripped)", "entry": {"id": "a", "display_name": "A", "base_url": "https://a.example/"}},
+    {"python": "rewrite", "why": "padded name (trimmed)", "entry": {"id": "a", "display_name": " A ", "base_url": "https://a.example"}},
+    {"python": "rewrite", "why": "legacy camelCase keys (read as the snake_case ones)", "entry": {"id": "a", "displayName": "A", "baseURL": "https://a.example"}}
+  ]
+}

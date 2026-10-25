@@ -1,0 +1,570 @@
+/// `island configure`: change a LIVE island's settings by editing its `.env`.
+///
+/// EDIT, NEVER REPLACE. `deploy/standup.sh`'s re-run rewrote the whole file from a
+/// heredoc, so every key it did not write was destroyed: measured on the live boxes,
+/// an unflagged re-run would have taken 15 keys off one and 11 off the other,
+/// including ISLAND_SIGNING_SEED and APNS_PRIVATE_KEY, which exist nowhere else. Bash
+/// answered with a guard that compares key lists and refuses, and its own refusal
+/// names the real fix as "preserve-on-rewrite, UNBUILT" (claude-tasks#4437). This is
+/// that fix. It replaces the lines of the keys it owns and leaves every other byte
+/// alone, so there is no key list to guard and the guard dissolves.
+///
+/// WHAT IT OWNS: ISLAND_DISPLAY_NAME, ISLAND_SEED_PEERS, PASSKEY_ENABLED. A flag left
+/// out means "leave it as it is", never "turn it off" (#3734). JWT_SECRET is not
+/// touched, so it can't be rotated by accident. The domain is not here: it is the
+/// passkey RP id, and changing it strands every passkey the island has issued.
+///
+/// COMPOSE PROVES THE EDIT before it lands. This file's parser chooses which lines
+/// to replace; if it ever disagreed with compose about where a value ends (a quote,
+/// a backslash, a PEM), it would corrupt a neighbour. So before publishing, the old
+/// file and the new one are both read by `docker compose config` itself, the program
+/// that reads `.env` on the box, and the edit is published only if compose sees
+/// exactly the intended keys change and every other key unchanged. Measured: with
+/// `env_file:`, `compose config` lists every key, multi-line values and `export`
+/// included, and prints a literal `$` as `$$`.
+///
+/// THEN THE GATEWAY PROVES IT IS SERVING IT. After the restart, `configure` asks the
+/// gateway on 127.0.0.1:8095 what it serves (`/v1/island`, `/v1/islands`,
+/// `/v1/auth/providers`) and compares. A value written but never forwarded by
+/// compose, or a peer the gateway dropped, is a green health check and a wrong
+/// island; this catches both.
+library;
+
+import 'dart:convert';
+import 'dart:io';
+import 'dart:math';
+
+import 'box.dart';
+import 'dotenv.dart';
+import 'options.dart';
+
+const keyName = 'ISLAND_DISPLAY_NAME';
+const keyPeers = 'ISLAND_SEED_PEERS';
+const keyPasskeys = 'PASSKEY_ENABLED';
+
+/// The settings one run changes. A null field is left as it is.
+final class ConfigureOptions {
+  const ConfigureOptions({this.name, this.seedPeers, this.passkeys});
+  final DisplayName? name;
+  final SeedPeers? seedPeers;
+  final bool? passkeys;
+
+  bool get isEmpty => name == null && seedPeers == null && passkeys == null;
+
+  /// What this run asks for, as `.env` key -> value, in a fixed order.
+  Map<String, EnvValue> get wanted => {
+    if (name != null) keyName: name!,
+    if (seedPeers != null) keyPeers: seedPeers!,
+    if (passkeys != null) keyPasskeys: PasskeysEnabled(passkeys!),
+  };
+}
+
+const configureUsage = '''
+usage: island configure [--name "<label>"] [--seed-peers <json>]
+                        [--enable-passkeys | --no-passkeys]
+
+Changes a live island's settings by editing its .env in place: only the keys named
+below are touched, everything else stays byte for byte. Then the gateway is
+restarted and checked to be serving the new values. With no options, prints the
+current settings and changes nothing.
+
+  --name "<label>"      human label shown in the app's island picker
+  --seed-peers <json>   the WHOLE peer list, replacing the old one: a JSON array of
+                        {"id","display_name","base_url"}. '[]' makes a solo island.
+  --enable-passkeys     advertise passkey sign-in (only once /.well-known files serve)
+  --no-passkeys         stop advertising passkey sign-in
+
+An option left out leaves that setting as it is. The domain can't be changed here:
+it is the passkey RP id, so changing it breaks every passkey already issued.''';
+
+/// Parse `island configure` arguments. Throws [Refusal] with the reason.
+ConfigureOptions parseConfigureArgs(List<String> args) {
+  String? name, peers;
+  bool? passkeys;
+  String value(int i, String flag) {
+    // As in standup: a value that looks like a flag is a missing value.
+    if (i + 1 >= args.length || args[i + 1].startsWith('--')) {
+      throw Refusal('$flag needs a value\n\n$configureUsage');
+    }
+    return args[i + 1];
+  }
+
+  void setPasskeys(bool v, String flag) {
+    if (passkeys != null && passkeys != v) {
+      throw Refusal(
+        '--enable-passkeys and --no-passkeys contradict each other',
+      );
+    }
+    passkeys = v;
+  }
+
+  for (var i = 0; i < args.length; i++) {
+    switch (args[i]) {
+      case '--name':
+        name = value(i++, '--name');
+      case '--seed-peers':
+        peers = value(i++, '--seed-peers');
+      case '--enable-passkeys':
+        setPasskeys(true, args[i]);
+      case '--no-passkeys':
+        setPasskeys(false, args[i]);
+      case '--domain':
+        throw Refusal(
+          "--domain: an island's domain is its passkey RP id, so changing it "
+          'breaks every passkey already issued. configure does not change it.',
+        );
+      case '--with-media' || '--turn-domain' || '--livekit-domain':
+        throw Refusal(
+          '${args[i]}: media is not in `island configure` yet. Use '
+          'deploy/standup.sh for media.',
+        );
+      default:
+        throw Refusal('unknown argument: ${args[i]}\n\n$configureUsage');
+    }
+  }
+  return ConfigureOptions(
+    name: name == null ? null : DisplayName(name),
+    seedPeers: peers == null ? null : SeedPeers.parse(peers),
+    passkeys: passkeys,
+  );
+}
+
+/// [text] with each key in [changes] set to its value: the lines of an existing
+/// assignment are replaced (keeping its indentation and any `export `), a missing
+/// key is appended, and every other byte is left as it was. Pure, so it can be
+/// tested on its own; [Configure.run] still has compose check the result.
+String editDotenv(String text, Map<String, EnvValue> changes) {
+  if (text.contains('\r')) {
+    // A CR left on a replaced line's neighbours would be ours to explain.
+    throw Refusal(
+      '.env has Windows (CRLF) line endings; convert it (dos2unix .env) first',
+    );
+  }
+  final entries = scanDotenv(text, '.env');
+  final lines = text.split('\n');
+  final replace = <int, (DotenvEntry, String)>{};
+  final append = <String>[];
+  for (final MapEntry(key: key, value: v) in changes.entries) {
+    final at = entries.where((e) => e.key == key).toList();
+    if (at.length > 1) {
+      // Compose would use the last; the operator reading the file sees the first.
+      // Which one they meant is theirs to say, not ours to guess.
+      throw Refusal(
+        '$key is set ${at.length} times in .env (lines '
+        '${at.map((e) => e.firstLine + 1).join(', ')}). Delete all but one, then '
+        'run configure again. Nothing was changed.',
+      );
+    }
+    final line = '$key=${v.dotenv}';
+    if (at.isEmpty) {
+      append.add(line);
+    } else {
+      replace[at.single.firstLine] = (at.single, '${at.single.lead}$line');
+    }
+  }
+  final out = <String>[];
+  for (var i = 0; i < lines.length;) {
+    final r = replace[i];
+    if (r == null) {
+      out.add(lines[i]);
+      i++;
+    } else {
+      out.add(r.$2);
+      i = r.$1.endLine;
+    }
+  }
+  if (append.isNotEmpty) {
+    // `lines` ends with '' when the file ends in a newline; keep exactly one.
+    if (out.isNotEmpty && out.last.isEmpty) out.removeLast();
+    out
+      ..addAll(append)
+      ..add('');
+  }
+  return out.join('\n');
+}
+
+/// How a configure that did not refuse ended. Sealed, so a caller cannot forget the
+/// cases that are not success.
+sealed class ConfigureResult {
+  const ConfigureResult();
+}
+
+/// Every setting asked for already had that value. Nothing was written or restarted.
+final class Unchanged extends ConfigureResult {
+  const Unchanged();
+}
+
+/// Written, restarted, and the gateway serves the new values.
+final class Applied extends ConfigureResult {
+  const Applied();
+}
+
+/// Written and restarted, but the gateway never answered /health.
+final class WrittenNotAnswering extends ConfigureResult {
+  const WrittenNotAnswering();
+}
+
+/// Written, restarted and answering, but not serving what was written.
+final class AnsweringNotServing extends ConfigureResult {
+  const AnsweringNotServing(this.mismatches);
+  final List<String> mismatches;
+}
+
+/// The process exit code for an outcome; 0 means the island serves what was asked.
+int configureExitCode(ConfigureResult r) => switch (r) {
+  Unchanged() || Applied() => 0,
+  WrittenNotAnswering() => 3,
+  AnsweringNotServing() => 5,
+};
+
+/// One configure run. Effects go through [runner]; [fetch] asks the local gateway.
+final class Configure {
+  Configure({
+    required this.runner,
+    required this.root,
+    required this.say,
+    required this.fetch,
+    this.sleep = _sleep,
+    Random? random,
+  }) : random = random ?? Random.secure();
+
+  final Runner runner;
+  final Directory root;
+  final Say say;
+  final Future<LocalResponse?> Function(Uri) fetch;
+  final Future<void> Function(Duration) sleep;
+  final Random random;
+
+  static Future<void> _sleep(Duration d) => Future<void>.delayed(d);
+
+  File _f(String name) => File('${root.path}/$name');
+  File get _env => _f('.env');
+
+  /// Set by the checks; compose is asked through it (sudo where needed).
+  late final Docker _dockerCli;
+
+  /// Print the current settings. Changes nothing.
+  void show() {
+    final cur = parseDotenv(_readEnv(), '.env');
+    String v(String k) => cur[k] ?? '(not set: the compose default applies)';
+    say.out('$keyName=${v(keyName)}');
+    say.out('$keyPeers=${v(keyPeers)}');
+    say.out('$keyPasskeys=${v(keyPasskeys)}');
+  }
+
+  String _readEnv() {
+    final type = FileSystemEntity.typeSync(_env.path, followLinks: false);
+    if (type == FileSystemEntityType.notFound) {
+      throw Refusal(
+        'no .env in ${root.path}: there is no island here to configure. Run from '
+        'the island checkout, or stand one up with `island standup`.',
+      );
+    }
+    if (type != FileSystemEntityType.file) {
+      // A rename would replace the link with a file, silently moving the island's
+      // config out from under whatever the link pointed at.
+      throw Refusal(
+        '.env is not a regular file ($type); configure edits only a file',
+      );
+    }
+    return _env.readAsStringSync();
+  }
+
+  Future<ConfigureResult> run(ConfigureOptions o) async {
+    // ---- 1. checks, and the edit, all before anything is written ----
+    say.step('Checks (nothing is changed until they all pass)');
+    for (final n in ['docker-compose.yml', 'deploy/compose.sh']) {
+      if (!_f(n).existsSync()) {
+        throw Refusal(
+          '$n not found in ${root.path}. Run from the island checkout. Nothing '
+          'was changed.',
+        );
+      }
+    }
+    final before = _readEnv();
+    await _refuseIfNotOwner();
+    _dockerCli = await Docker.detect(runner);
+    final current = parseDotenv(before, '.env');
+    o.seedPeers?.refuseSelf(current['GATEWAY_BASE_URL'] ?? '');
+
+    final changes = {
+      for (final MapEntry(key: k, value: v) in o.wanted.entries)
+        if (current[k] != v.value) k: v,
+    };
+    if (changes.isEmpty) {
+      say.ok('every setting asked for already has that value; nothing to do');
+      return const Unchanged();
+    }
+    if (o.passkeys == true && current['PASSKEY_RP_ID'] == null) {
+      say.warn(
+        "PASSKEY_RP_ID is not set in .env, so compose's default applies. Make sure "
+        'that is this island\'s domain before relying on passkeys.',
+      );
+    }
+    final after = editDotenv(before, changes);
+
+    // ---- 2. the candidate, written beside .env, proved by compose ----
+    final tmp = _f('.env.configure-${newSecret(random).substring(0, 8)}');
+    try {
+      tmp.createSync(exclusive: true);
+      final m = await runner.run('chmod', ['600', tmp.path]);
+      if (!m.ok) {
+        throw Refusal(
+          'could not restrict ${tmp.path} to mode 600: ${m.stderr.trim()}',
+        );
+      }
+      tmp.writeAsStringSync(after, flush: true);
+      await _composeAgrees(_env.path, tmp.path, changes);
+
+      // ---- 3. publish, unless .env changed while this ran ----
+      if (_env.readAsStringSync() != before) {
+        throw Refusal(
+          '.env changed while configure was running (another edit?). Nothing was '
+          'written; run configure again.',
+        );
+      }
+      tmp.renameSync(_env.path);
+    } finally {
+      if (tmp.existsSync()) tmp.deleteSync();
+    }
+    for (final MapEntry(key: k, value: v) in changes.entries) {
+      say.ok('$k: ${current[k] ?? '(not set)'}  ->  ${v.value}');
+    }
+
+    // ---- 4. restart the gateway, then ask it what it serves ----
+    say.step('Restarting the gateway so it reads the new settings');
+    final up = await runner.run(
+      _f('deploy/compose.sh').path,
+      ['up', '-d', '--no-deps', 'chat-island'],
+      workingDirectory: root.path,
+      stream: true,
+    );
+    if (!up.ok) {
+      throw Refusal(
+        'the new .env IS written, but restarting the gateway failed:\n'
+        '${up.stderr.trim()}\n${_revertHint(current, changes)}',
+      );
+    }
+    if (!await _waitHealthy()) {
+      say.warn(
+        'gateway did not answer /health within ~60s. Inspect: deploy/compose.sh '
+        'logs chat-island\n${_revertHint(current, changes)}',
+      );
+      return const WrittenNotAnswering();
+    }
+    final wrong = await _servedMismatches(o, current);
+    _sopsReminder();
+    if (wrong.isNotEmpty) {
+      for (final w in wrong) {
+        say.warn(w);
+      }
+      say.warn(_revertHint(current, changes));
+      return AnsweringNotServing(wrong);
+    }
+    say.step('The gateway is serving the new settings.');
+    return const Applied();
+  }
+
+  /// A file written by another user (say, root via sudo) would leave .env owned by
+  /// that user, and compose run as the operator could no longer read it.
+  Future<void> _refuseIfNotOwner() async {
+    final me = await runner.run('id', ['-u']);
+    final owner = await runner.run('stat', ['-c', '%u', _env.path]);
+    if (!me.ok || !owner.ok) {
+      say.warn('could not compare .env\'s owner with this user; continuing');
+      return;
+    }
+    if (me.stdout.trim() != owner.stdout.trim()) {
+      throw Refusal(
+        '.env is owned by uid ${owner.stdout.trim()} but this is uid '
+        '${me.stdout.trim()}. Run configure as the user who owns .env (not with '
+        'sudo), so the file stays theirs. Nothing was changed.',
+      );
+    }
+  }
+
+  /// Every key and value compose sees in [path]. Values never leave this process.
+  Future<Map<String, String>> _composeEnv(
+    String path,
+    Directory scratch,
+  ) async {
+    final yml = File('${scratch.path}/compose.yml')
+      ..writeAsStringSync(
+        'services:\n  probe:\n    image: scratch\n    env_file: [${jsonEncode(path)}]\n',
+      );
+    final r = await _dockerCli.run([
+      'compose',
+      '-f',
+      yml.path,
+      'config',
+      '--format',
+      'json',
+    ], workingDirectory: scratch.path);
+    if (!r.ok) {
+      // stderr can quote a line of the file; say which file, not what compose said.
+      throw Refusal(
+        'docker compose could not read ${path == _env.path ? '.env' : 'the edited .env'}, '
+        'so the edit can\'t be proved safe. Nothing was changed.',
+      );
+    }
+    final Object? env;
+    try {
+      env =
+          ((jsonDecode(r.stdout) as Map)['services']
+              as Map)['probe']['environment'];
+    } on Object {
+      throw Refusal(
+        'could not read `docker compose config` output. Nothing was changed.',
+      );
+    }
+    return {
+      for (final MapEntry(:key, :value) in ((env as Map?) ?? {}).entries)
+        '$key': '${value ?? ''}',
+    };
+  }
+
+  /// Refuse unless compose reads [newPath] as [oldPath] with exactly [changes].
+  Future<void> _composeAgrees(
+    String oldPath,
+    String newPath,
+    Map<String, EnvValue> changes,
+  ) async {
+    final scratch = Directory.systemTemp.createTempSync('island-configure');
+    try {
+      final a = await _composeEnv(oldPath, scratch);
+      final b = await _composeEnv(newPath, scratch);
+      // `compose config` prints a literal `$` as `$$` (measured), on both sides.
+      String rendered(EnvValue v) => v.value.replaceAll(r'$', r'$$');
+      final off = [
+        for (final k in {...a.keys, ...b.keys})
+          if (changes.containsKey(k)
+              ? b[k] != rendered(changes[k]!)
+              : a[k] != b[k])
+            k,
+      ];
+      if (off.isNotEmpty) {
+        throw Refusal(
+          'docker compose would read the edited .env differently from what '
+          'configure meant, at: ${off.join(', ')}. Nothing was changed. This is a '
+          'disagreement between configure and compose about the file\'s syntax; '
+          'please report it with those key names (never the values).',
+        );
+      }
+    } finally {
+      scratch.deleteSync(recursive: true);
+    }
+  }
+
+  Future<bool> _waitHealthy() async {
+    for (var i = 0; i < 30; i++) {
+      final r = await fetch(Uri.parse('http://127.0.0.1:8095/health'));
+      if (r != null && isGatewayHealthy(r.status, r.body)) return true;
+      await sleep(const Duration(seconds: 2));
+    }
+    return false;
+  }
+
+  Future<Object?> _json(String path) async {
+    final r = await fetch(Uri.parse('http://127.0.0.1:8095$path'));
+    if (r == null || r.status != 200) return null;
+    try {
+      return jsonDecode(r.body);
+    } on FormatException {
+      return null;
+    }
+  }
+
+  /// What the gateway serves that differs from what this run asked for. Checks
+  /// every setting asked for, changed or not: "already had that value" was a
+  /// reading of .env, and this is the reading of the running gateway.
+  Future<List<String>> _servedMismatches(
+    ConfigureOptions o,
+    Map<String, String> before,
+  ) async {
+    final wrong = <String>[];
+    final self = await _json('/v1/island');
+    final selfId = self is Map ? self['id'] : null;
+    if (o.name != null) {
+      final served = self is Map ? self['display_name'] : null;
+      if (served != o.name!.value) {
+        wrong.add(
+          'the gateway serves its name as ${jsonEncode(served)}, not '
+          '${jsonEncode(o.name!.value)}',
+        );
+      }
+    }
+    if (o.seedPeers != null) {
+      final dir = await _json('/v1/islands');
+      final list = dir is Map ? dir['islands'] : null;
+      if (list is! List || selfId == null) {
+        wrong.add(
+          'could not read the island directory (/v1/island, /v1/islands)',
+        );
+      } else {
+        // By the three fields, so the comparison can't hinge on key order.
+        String peer(Map<Object?, Object?> p) =>
+            jsonEncode([p['id'], p['display_name'], p['base_url']]);
+        final served = {
+          for (final p in list)
+            if (p is Map && p['id'] != selfId) peer(p),
+        };
+        final asked = {for (final p in o.seedPeers!.peers) peer(p.toJson())};
+        for (final p in asked.difference(served)) {
+          wrong.add('peer not served (the gateway dropped it?): $p');
+        }
+        // With gossip on, the gateway learns peers it was never told about, so an
+        // extra entry is expected there and is not this run's to judge.
+        if (before['GATEWAY_GOSSIP_ENABLED'] != 'true') {
+          for (final p in served.difference(asked)) {
+            wrong.add('peer still served though not in the new list: $p');
+          }
+        }
+      }
+    }
+    if (o.passkeys != null) {
+      final prov = await _json('/v1/auth/providers');
+      final list = prov is Map ? prov['providers'] : null;
+      if (list is! List) {
+        wrong.add('could not read /v1/auth/providers');
+      } else {
+        final offered = list.any((p) => p is Map && p['slug'] == 'passkey');
+        if (offered != o.passkeys) {
+          wrong.add(
+            'passkey sign-in is ${offered ? '' : 'NOT '}offered, though '
+            '$keyPasskeys=${o.passkeys}',
+          );
+        }
+      }
+    }
+    return wrong;
+  }
+
+  /// The command that puts back what this run changed. Safe to print: the keys
+  /// configure owns are not secrets.
+  String _revertHint(
+    Map<String, String> before,
+    Map<String, EnvValue> changes,
+  ) {
+    final args = <String>[];
+    for (final k in changes.keys) {
+      final old = before[k];
+      switch (k) {
+        case keyName when old != null:
+          args.add("--name '$old'");
+        case keyPeers:
+          args.add("--seed-peers '${old ?? '[]'}'");
+        case keyPasskeys:
+          args.add(old == 'true' ? '--enable-passkeys' : '--no-passkeys');
+      }
+    }
+    return 'To put the previous values back: island configure ${args.join(' ')}';
+  }
+
+  /// A copy kept elsewhere (this repo keeps its two islands' in deploy/secrets/ as
+  /// SOPS files) is now older than the box, and the next delivery of it would undo
+  /// this run: the split-brain hazard in deploy/secrets/README.md.
+  void _sopsReminder() => say.out(
+    'If a copy of this .env is kept anywhere else (an encrypted copy in git, a '
+    'backup), it is now older than the box: update it, or it will undo this change.',
+  );
+}

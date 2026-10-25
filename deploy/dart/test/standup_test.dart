@@ -21,6 +21,9 @@ final class FakeDocker implements Runner {
   final calls = <String>[];
   bool lsFails = false;
 
+  /// Like enspyr-melb: Docker answers only through `sudo -n docker`.
+  bool dockerNeedsSudo = false;
+
   /// What `ss -ltnH` prints: one listening socket per line.
   String ssOut = '';
 
@@ -41,6 +44,20 @@ final class FakeDocker implements Runner {
       return RunResult(r.exitCode, '${r.stdout}', '${r.stderr}');
     }
     if (exe == 'ss') return RunResult(0, ssOut, '');
+    if (exe == 'docker' && dockerNeedsSudo) {
+      return const RunResult(1, '', 'permission denied on docker.sock');
+    }
+    if (exe == 'sudo') {
+      // `sudo -n docker ...`: answer as docker would, recording only the sudo line.
+      final was = dockerNeedsSudo;
+      dockerNeedsSudo = false;
+      try {
+        return await run('docker', args.sublist(2));
+      } finally {
+        dockerNeedsSudo = was;
+        calls.removeLast();
+      }
+    }
     if (exe != 'docker') return const RunResult(0, '', '');
     final name = args.last;
     switch (args) {
@@ -70,9 +87,9 @@ final class FakeDocker implements Runner {
   }
 }
 
-const opts = StandupOptions(
-  domain: 'chat.example.org',
-  displayName: 'Island #1',
+final opts = StandupOptions(
+  domain: Domain('chat.example.org'),
+  displayName: DisplayName('Island #1'),
 );
 
 late Directory root;
@@ -146,11 +163,13 @@ void main() {
 
     test('.env is mode 600, production (no ENVIRONMENT), and reads back what was given', () async {
       final o = StandupOptions(
-        domain: 'chat.example.org',
-        displayName:
-            'Island #1', // a " #" an unquoted dotenv value would truncate
-        seedPeers:
-            '[{"id":"a","display_name":"A #2","base_url":"https://a.example"}]',
+        domain: Domain('chat.example.org'),
+        displayName: DisplayName(
+          'Island #1',
+        ), // a " #" an unquoted dotenv value would truncate
+        seedPeers: SeedPeers.parse(
+          '[{"id":"a","display_name":"A #2","base_url":"https://a.example"}]',
+        ),
         passkeys: true,
       );
       await standup(FakeDocker()).run(o);
@@ -160,7 +179,7 @@ void main() {
       expect(env.containsKey('ENVIRONMENT'), isFalse);
       expect(env['JWT_SECRET'], hasLength(64));
       expect(env['ISLAND_DISPLAY_NAME'], 'Island #1');
-      expect(env['ISLAND_SEED_PEERS'], o.seedPeers);
+      expect(env['ISLAND_SEED_PEERS'], o.seedPeers.value);
       expect(env['GATEWAY_BASE_URL'], 'https://chat.example.org');
       expect(env['PASSKEY_RP_ID'], 'chat.example.org');
       expect(env['PASSKEY_ENABLED'], 'true');
@@ -339,7 +358,7 @@ void main() {
         '--seed-peers',
         '[]',
       ]);
-      expect((o.tls, o.passkeys, o.tag), (false, true, '0.19.0'));
+      expect((o.tls, o.passkeys, o.tag?.tag), (false, true, '0.19.0'));
     });
   });
   group('PR#406 r1', () {
@@ -371,9 +390,9 @@ void main() {
 
     test('without TLS the Caddy compose file is not required', () async {
       File('${root.path}/deploy/caddy/docker-compose.caddy.yml').deleteSync();
-      const noTls = StandupOptions(
-        domain: 'chat.example.org',
-        displayName: 'X',
+      final noTls = StandupOptions(
+        domain: Domain('chat.example.org'),
+        displayName: DisplayName('X'),
         tls: false,
       );
       expect(await standup(FakeDocker()).run(noTls), isA<Healthy>());
@@ -470,12 +489,7 @@ void main() {
       ('a tab', 'a\tb'),
     ]) {
       test('refuses a name with $why', () {
-        expect(
-          () => validate(
-            StandupOptions(domain: 'a.example.org', displayName: name),
-          ),
-          throwsA(isA<Refusal>()),
-        );
+        expect(() => DisplayName(name), throwsA(isA<Refusal>()));
       });
     }
 
@@ -499,10 +513,10 @@ void main() {
   });
   group('PR#406 r2', () {
     test('--version pins that release', () async {
-      const o = StandupOptions(
-        domain: 'chat.example.org',
-        displayName: 'X',
-        tag: '0.19.0',
+      final o = StandupOptions(
+        domain: Domain('chat.example.org'),
+        displayName: DisplayName('X'),
+        tag: ImageTag('0.19.0'),
       );
       await standup(FakeDocker()).run(o);
       expect(
@@ -512,19 +526,20 @@ void main() {
       expect(out.join('\n'), isNot(contains("pinning 'edge'")));
     });
 
-    test(
-      'run() validates too: options built directly are not trusted',
-      () async {
-        final d = FakeDocker();
-        const bad = StandupOptions(
-          domain: 'a.example.org',
-          displayName: 'X',
-          seedPeers: '[{',
-        );
-        await expectLater(standup(d).run(bad), throwsA(isA<Refusal>()));
-        expect(d.calls, isEmpty);
-      },
-    );
+    test('an unchecked value cannot be built, so run() never sees one (r2, now by type)', () {
+      expect(() => SeedPeers.parse('[{'), throwsA(isA<Refusal>()));
+      // The one two-field rule lives in the constructor, not in a validate().
+      expect(
+        () => StandupOptions(
+          domain: Domain('chat.example.org'),
+          displayName: DisplayName('X'),
+          seedPeers: SeedPeers.parse(
+            '[{"id":"me","display_name":"Me","base_url":"https://chat.example.org"}]',
+          ),
+        ),
+        throwsA(isA<Refusal>()),
+      );
+    });
 
     test('TLS is not attempted when the gateway never answered', () async {
       final d = FakeDocker();
@@ -550,10 +565,12 @@ void main() {
     test('docker compose itself reads the .env back exactly (the real consumer)', () async {
       // Not our own parser: compose is what reads .env on the box (Noether r2). A " #"
       // must not truncate, a "$" must not interpolate. Needs docker compose (CI has it).
-      const o = StandupOptions(
-        domain: 'chat.example.org',
-        displayName: r'Island #1 $HOME',
-        seedPeers: r'[{"id":"a","display_name":"A #2 $X","base_url":"https://a.example"}]',
+      final o = StandupOptions(
+        domain: Domain('chat.example.org'),
+        displayName: DisplayName(r'Island #1 $HOME'),
+        seedPeers: SeedPeers.parse(
+          r'[{"id":"a","display_name":"A #2 $X","base_url":"https://a.example"}]',
+        ),
       );
       File('${root.path}/.env').writeAsStringSync(renderEnv(o, 'x' * 64));
       File('${root.path}/c.yml').writeAsStringSync(
@@ -578,10 +595,23 @@ void main() {
       // the rendered file stays valid compose. Interpolation would have printed
       // $HOME's value instead; turning $$ back into $ undoes only the rendering.
       String lit(Object? v) => '$v'.replaceAll(r'$$', r'$');
-      expect(lit(env['N']), o.displayName);
-      expect(lit(env['P']), o.seedPeers);
+      expect(lit(env['N']), o.displayName.value);
+      expect(lit(env['P']), o.seedPeers.value);
     });
   });
+  group('Docker outside the docker group (enspyr-melb)', () {
+    test('every Docker call goes through `sudo -n docker`, and the birth still happens', () async {
+      final d = FakeDocker()..dockerNeedsSudo = true;
+      expect(await standup(d).run(opts), isA<Healthy>());
+      final viaSudo = d.calls
+          .where((c) => c.startsWith('sudo -n docker '))
+          .toList();
+      expect(viaSudo, contains(startsWith('sudo -n docker pull ')));
+      expect(viaSudo, contains(startsWith('sudo -n docker volume create ')));
+      expect(viaSudo, contains(startsWith('sudo -n docker run ')));
+    });
+  });
+
   group('PR#406 r3', () {
     for (final args in [
       ['--domain', 'chat.example.org', '--name', '--no-tls'],
@@ -607,9 +637,9 @@ void main() {
       () async {
         final d = FakeDocker()
           ..ssOut = 'LISTEN 0 4096 127.0.0.1:8095 0.0.0.0:*\n';
-        const noTls = StandupOptions(
-          domain: 'chat.example.org',
-          displayName: 'X',
+        final noTls = StandupOptions(
+          domain: Domain('chat.example.org'),
+          displayName: DisplayName('X'),
           tls: false,
         );
         await expectLater(
@@ -639,9 +669,9 @@ void main() {
         standup(FakeDocker()..ssOut = busy).run(opts),
         throwsA(isA<Refusal>()),
       );
-      const noTls = StandupOptions(
-        domain: 'chat.example.org',
-        displayName: 'X',
+      final noTls = StandupOptions(
+        domain: Domain('chat.example.org'),
+        displayName: DisplayName('X'),
         tls: false,
       );
       expect(
