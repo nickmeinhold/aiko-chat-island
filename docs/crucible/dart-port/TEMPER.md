@@ -6,9 +6,9 @@
 > - **Round 2** (12): subtractive.
 > - **Round 3** (10): narrow, and mostly deletions. But it includes one SEVERE defect that round 3's own fold introduced: the ready gate turns a bus stall into a total island outage. The severity trend is therefore *not* monotonic.
 >
-> - **Round 4** (bonus, Nick's choice; post-r3 folds only): 12 findings, none a total outage. Three were introduced by the folds: the unread `removed_upstream` mark, the configure×image-exclusion crash-loop, and the fold reaching only 1 of N sites. Two of the panel's OWN proposed fixes would have added outage paths, and were rejected. Dispositions are in the round-4 synthesis; they are NOT yet applied to `DESIGN.md`.
+> - **Round 4** (bonus, Nick's choice; post-r3 folds only): 12 findings, none a total outage. Three were introduced by the folds: the unread `removed_upstream` mark, the configure×image-exclusion crash-loop, and the fold reaching only 1 of N sites. Two of the panel's OWN proposed fixes would have added outage paths, and were rejected. Dispositions are in the round-4 synthesis; they are applied to `DESIGN.md` as `[r4-fold]`.
 >
-> Post-round-3 folds are in `DESIGN.md`, still marked UNSTRUCK pending Nick's call on round 4: (a) apply the r4 folds and go to Blade, or (b) stop at PROVISIONAL.
+> **Nick chose (a), 2026-10-25 ~14:06:** the r4 dispositions are applied to `DESIGN.md` as `[r4-fold]` without a fifth strike, and the design goes to Blade as PROVISIONAL. Gate G is the next real check.
 
 # Round 1
 
