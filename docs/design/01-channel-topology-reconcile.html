@@ -26,6 +26,7 @@
 <body>
 
 <h1>Channel Topology Reconcile <span class="tag">#1281 incr 2</span></h1>
+<p><strong>SUPERSEDED in part, 2026-10-25 (Nick's #24 ruling):</strong> a bus <code>remove</code> no longer hard-deletes. Bus topology controls relay <em>subscriptions</em> only, never channel rows; a remove unsubscribes and the channel, its messages and memberships are kept. Deliberate deletion is attended, through <code>channels_service.hard_delete_channel</code>. The remove row of §2 and Decision B (§6) below are kept as the record of the old design. Code: PR #409. Design: <code>docs/crucible/dart-port/DESIGN.md</code> §2.4, §7.4.</p>
 <p class="sub">Gateway reads canonical channel topology from aiko's HyperSpace and reconciles it into local <code>Channel</code> rows — killing the hardcoded <code>["general"]</code> drift. Channels only; users deferred (task&nbsp;#9). Status: <strong>design, awaiting sign-off</strong>.</p>
 
 <h2>1. The headline (read this first)</h2>
@@ -68,7 +69,7 @@
 <table>
 <tr><th>Signal</th><th>Meaning</th><th>Action</th></tr>
 <tr><td>EC <code>add channel_list.X</code></td><td>Channel X exists upstream</td><td><strong>Upsert</strong> a <code>Channel</code> row (by <code>aiko_channel=X</code>)</td></tr>
-<tr><td>EC <code>remove channel_list.X</code> <em>(producer live)</em></td><td>Channel X genuinely removed upstream</td><td><strong>Hard-delete</strong> channel X + its messages/memberships (§5)</td></tr>
+<tr><td>EC <code>remove channel_list.X</code> <em>(producer live)</em></td><td>Channel X genuinely removed upstream</td><td><s><strong>Hard-delete</strong> channel X + its messages/memberships (§5)</s> <strong>Superseded 2026-10-25:</strong> unsubscribe only; rows kept (#24)</td></tr>
 <tr><td><code>_discovery_remove</code> (ChatServer gone)</td><td>Transient: ChatServer disconnected</td><td><strong>Nothing to the DB.</strong> Tear down the consumer only; rows persist</td></tr>
 </table>
 
@@ -88,7 +89,8 @@ Neither is what was chosen.
 <strong>Resolution: application-level explicit cascade in one transaction</strong> — <code>DELETE memberships WHERE channel_id=…</code>, <code>DELETE messages WHERE channel_id=…</code>, then <code>DELETE channels WHERE id=…</code>. Backend-agnostic (doesn't depend on FK enforcement differing between SQLite/Postgres), explicit, and testable. This honours the chosen semantics: a channel absent upstream ceases to exist, history included. (Alternative — <code>ondelete="CASCADE"</code> + enabling the SQLite pragma — is rejected: it couples correctness to a per-connection pragma and a migration, and hides the destruction inside the FK engine.)
 </div>
 
-<h2>6. Decision B — real removal vs transient blip <span class="tag">resolved</span></h2>
+<h2>6. Decision B — real removal vs transient blip <span class="tag">superseded 2026-10-25</span></h2>
+<p><strong>Superseded:</strong> no bus event deletes any more (#24 ruling), so the real-vs-transient distinction no longer guards a destructive path. Kept as history.</p>
 <div class="warn">
 Hard-delete + cascade is <strong>irreversible mass deletion</strong>. If a transient event (ChatServer restart, registrar hiccup) emitted a spurious <code>remove</code>, a momentary network blip would wipe a channel's entire history. This is the destructive analogue of the transient-vs-terminal auth distinction (<code>feedback_auth_error_boundary</code>).
 </div>

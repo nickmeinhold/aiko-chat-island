@@ -56,10 +56,11 @@ class GatewayState:
         self.bus: "AikoBusClient | None" = None
         self.hub: Hub = Hub()
         self.loop: asyncio.AbstractEventLoop | None = None
-        # Single ordered lane for channel topology events (set up in lifespan
-        # once the loop exists). One worker drains it FIFO so an add/remove pair
-        # for the same channel can never interleave (cage-match PR#12, P1a).
-        self._channel_events: "asyncio.Queue[tuple[str, str]] | None" = None
+        # Single ordered lane of channel ADDS (set up in lifespan once the loop
+        # exists): one worker upserts them FIFO. It carries names only, because an
+        # add is the only topology event that reaches the DB (#24 ruling): there is
+        # no action field for a remove to ride in on.
+        self._channel_events: "asyncio.Queue[str] | None" = None
         self._channel_worker: "asyncio.Task | None" = None
 
     def on_bus_message(self, msg: InboundMessage) -> None:
@@ -100,15 +101,19 @@ class GatewayState:
     # The aiko ChatServer's `channel_list` EC share tells the gateway which
     # channels to RELAY. Bus topology has authority over subscriptions only, never
     # over channel rows (Nick's #24 ruling, 2026-10-25): the gateway's SQLite is the
-    # sole persister, so an upstream `remove` (or a snapshot that omits a channel)
-    # unsubscribes in the bus client and changes nothing here. Deliberate deletion
+    # sole persister, so an upstream `remove` unsubscribes in the bus client and
+    # changes nothing here. (Snapshot-omission semantics belong to the topology
+    # source switch, #24 part 2; the share only emits literal removes today.) Deliberate deletion
     # goes through `channels_service.hard_delete_channel`, attended — never from the
     # bus. Add callbacks fire on the AIKO thread and enqueue onto a SINGLE ordered
     # asyncio queue; one worker drains it FIFO and upserts the local Channel rows.
     # Replaces the old independent `_seed_channels`.
 
     def on_channel_add(self, aiko_channel: str) -> None:
-        self._enqueue_channel_event("add", aiko_channel)
+        """AIKO thread -> the one ordered add queue (thread-safe handoff)."""
+        if self.loop is None or self._channel_events is None:
+            return
+        self.loop.call_soon_threadsafe(self._channel_events.put_nowait, aiko_channel)
 
     def on_channel_remove(self, aiko_channel: str) -> None:
         # Observation only: the bus client has already unsubscribed. The row, its
@@ -117,35 +122,25 @@ class GatewayState:
         log.info("channel reconcile: - %s (unsubscribed; row and history kept)",
                  aiko_channel)
 
-    def _enqueue_channel_event(self, action: str, aiko_channel: str) -> None:
-        """AIKO thread -> the one ordered topology queue (thread-safe handoff)."""
-        if self.loop is None or self._channel_events is None:
-            return
-        self.loop.call_soon_threadsafe(
-            self._channel_events.put_nowait, (action, aiko_channel)
-        )
-
     async def _run_channel_worker(self) -> None:
         """Single consumer of the topology queue — applies adds in arrival order.
         Owns the transaction boundary (the services only flush). There is no
         remove arm: a bus remove never reaches the DB (#24 ruling)."""
         assert self._channel_events is not None
         while True:
-            action, aiko_channel = await self._channel_events.get()
+            aiko_channel = await self._channel_events.get()
             try:
                 async with SessionLocal() as session:
-                    if action == "add":
-                        await channels_service.upsert_channel(session, aiko_channel)
-                        await session.commit()
-                        log.info("channel reconcile: + %s", aiko_channel)
+                    await channels_service.upsert_channel(session, aiko_channel)
+                    await session.commit()
+                    log.info("channel reconcile: + %s", aiko_channel)
             except channels_service.ReservedDmChannel:
                 # A bus channel_list named a reserved dm: channel — anomalous (a DM never
                 # federates). Skip cleanly (not a stack-trace error): the dm: namespace is
                 # reserved for island-local DMs (#2633, cage-match PR#124 Tesla).
-                log.warning("channel reconcile: refused reserved dm: name %s (%s)",
-                            aiko_channel, action)
+                log.warning("channel reconcile: refused reserved dm: name %s", aiko_channel)
             except Exception:
-                log.exception("channel reconcile failed: %s %s", action, aiko_channel)
+                log.exception("channel reconcile failed: + %s", aiko_channel)
             finally:
                 self._channel_events.task_done()
 
@@ -236,41 +231,44 @@ async def lifespan(app: FastAPI):
         # (closes the startup window). See #1281 incr 2.
         state._channel_events = asyncio.Queue()
         state._channel_worker = asyncio.create_task(state._run_channel_worker())
-        # Lazy import: pulling aiko_services happens only at startup, never at
-        # module import time (see the import-block note above).
-        from .aiko.client import AikoBusClient
-        state.bus = AikoBusClient(
-            settings.aiko_channels, state.on_bus_message,
-            on_channel_add=state.on_channel_add,
-            on_channel_remove=state.on_channel_remove,
-        )
-        state.bus.start()
-        log.info("Gateway started; subscribed channels=%s (topology via channel_list share)",
-                 settings.aiko_channels)
-        # Gateway directory gossip (#1546): converge the known-peer set by anti-entropy.
-        # FAIL-CLOSED: the fetch path is an SSRF surface (#1578), so it runs ONLY when
-        # explicitly enabled. Off by default, the directory still serves self +
-        # seed_peers with no network fetch — the safe operator-curated path.
-        gi = settings.gateway_gossip_interval_seconds
-        if settings.gateway_gossip_enabled and gi > 0:
-            gossip_task = asyncio.create_task(_gossip_loop(gi))
-            log.info("gateway directory gossip ENABLED (interval=%ds, bootstrap_peers=%d)",
-                     gi, len(settings.gateway_bootstrap_peers))
-        else:
-            log.info("gateway directory gossip disabled; serving self + %d seed peer(s)",
-                     len(settings.island_seed_peers))
-        # Operator update nudge: say something when a newer release exists, and do
-        # nothing else. Default `major` — see config for why this is ON by default.
-        from .domain.update_nudge import UpdateNudge as _Nudge
-        ui = settings.island_update_check_interval_seconds
-        if settings.island_update_nudge is not _Nudge.OFF and ui > 0:
-            nudge_task = asyncio.create_task(
-                _update_nudge_loop(ui, settings.island_update_nudge))
-            log.info("operator update nudge ENABLED (level=%s, every %ds)",
-                     settings.island_update_nudge.value, ui)
-        else:
-            log.info("operator update nudge off — this island will not check for releases")
+        # The worker exists from here on, so every exit path from here must cancel
+        # it: the try below opens NOW, not at `yield`, so a bus import/construct/
+        # start failure cannot leak the task (cage-match PR#409, Carnot).
         try:
+            # Lazy import: pulling aiko_services happens only at startup, never at
+            # module import time (see the import-block note above).
+            from .aiko.client import AikoBusClient
+            state.bus = AikoBusClient(
+                settings.aiko_channels, state.on_bus_message,
+                on_channel_add=state.on_channel_add,
+                on_channel_remove=state.on_channel_remove,
+            )
+            state.bus.start()
+            log.info("Gateway started; subscribed channels=%s (topology via channel_list share)",
+                     settings.aiko_channels)
+            # Gateway directory gossip (#1546): converge the known-peer set by anti-entropy.
+            # FAIL-CLOSED: the fetch path is an SSRF surface (#1578), so it runs ONLY when
+            # explicitly enabled. Off by default, the directory still serves self +
+            # seed_peers with no network fetch — the safe operator-curated path.
+            gi = settings.gateway_gossip_interval_seconds
+            if settings.gateway_gossip_enabled and gi > 0:
+                gossip_task = asyncio.create_task(_gossip_loop(gi))
+                log.info("gateway directory gossip ENABLED (interval=%ds, bootstrap_peers=%d)",
+                         gi, len(settings.gateway_bootstrap_peers))
+            else:
+                log.info("gateway directory gossip disabled; serving self + %d seed peer(s)",
+                         len(settings.island_seed_peers))
+            # Operator update nudge: say something when a newer release exists, and do
+            # nothing else. Default `major` — see config for why this is ON by default.
+            from .domain.update_nudge import UpdateNudge as _Nudge
+            ui = settings.island_update_check_interval_seconds
+            if settings.island_update_nudge is not _Nudge.OFF and ui > 0:
+                nudge_task = asyncio.create_task(
+                    _update_nudge_loop(ui, settings.island_update_nudge))
+                log.info("operator update nudge ENABLED (level=%s, every %ds)",
+                         settings.island_update_nudge.value, ui)
+            else:
+                log.info("operator update nudge off — this island will not check for releases")
             yield
         finally:
             if state.bus is not None:

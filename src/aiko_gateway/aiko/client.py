@@ -133,14 +133,19 @@ class GatewayChatActor(aiko.Actor):
         log.info("subscribed channel relay: %s", channel)
 
     def _unsubscribe_channel(self, channel: str) -> None:
-        """Stop relaying `channel`. No-op if not subscribed."""
-        topic = self._subscribed.pop(channel, None)
+        """Stop relaying `channel`. No-op if not subscribed. The channel is forgotten
+        only after the detach succeeds: a failed detach leaves the handler on the
+        topic, and forgetting it anyway would make the next add attach a SECOND
+        handler (two relays, two ingests per message; cage-match PR#409, Tesla)."""
+        topic = self._subscribed.get(channel)
         if topic is None:
             return
         try:
             self.remove_message_handler(self._on_payload, topic)
         except Exception:
-            log.exception("Error removing payload handler for %s", topic)
+            log.exception("Error removing payload handler for %s; still subscribed", topic)
+            return
+        del self._subscribed[channel]
         log.info("unsubscribed channel relay: %s", channel)
 
     # -- channel topology (bus share -> reconcile) ------------------------

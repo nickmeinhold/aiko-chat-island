@@ -211,24 +211,46 @@ def test_channel_name_from_item_ignores_parent_and_unrelated():
 
 # --- a bus remove never reaches the DB (#24 ruling) ------------------------ #
 
-@pytest.mark.asyncio
-async def test_bus_remove_keeps_channel_messages_and_memberships(session, monkeypatch):
-    """The #24 ruling, end to end at the gateway seam: a bus `remove` for a channel
-    with history leaves the channel row, its messages and its memberships intact,
-    and never calls the destructive cascade."""
+class _SharedSession:
+    """Hands the worker the TEST's own session, so the rows these tests assert on
+    are the rows the worker could touch (a worker on its own SessionLocal would
+    make the row assertions decorative; cage-match PR#409, Noether)."""
+
+    def __init__(self, session):
+        self._session = session
+
+    async def __aenter__(self):
+        return self._session
+
+    async def __aexit__(self, *a):
+        return False
+
+
+async def _drain(st):
+    """Run the worker until the queue is empty, then stop it cleanly."""
+    import asyncio
+    import contextlib
+
+    await asyncio.sleep(0)  # call_soon_threadsafe delivers on the next tick
+    worker = asyncio.create_task(st._run_channel_worker())
+    await asyncio.wait_for(st._channel_events.join(), timeout=2)
+    worker.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await worker
+
+
+def _state():
     import asyncio
 
     from aiko_gateway import main
 
-    # Record, don't raise: the worker's `except Exception` would swallow a raise.
-    delete_calls: list[str] = []
+    st = main.GatewayState()
+    st.loop = asyncio.get_running_loop()
+    st._channel_events = asyncio.Queue()
+    return st
 
-    async def recording_delete(_session, name):
-        delete_calls.append(name)
-        return True
 
-    monkeypatch.setattr(main.channels_service, "hard_delete_channel", recording_delete)
-
+async def _channel_with_history(session):
     user = User(id="U1", username="alice", display_name="Alice",
                 password_hash="x", aiko_username="alice")
     ch = Channel(id="C1", name="random", kind="standard", aiko_channel="random")
@@ -241,39 +263,69 @@ async def test_bus_remove_keeps_channel_messages_and_memberships(session, monkey
     ])
     await session.commit()
 
-    st = main.GatewayState()
-    st.loop = asyncio.get_running_loop()
-    st._channel_events = asyncio.Queue()
-    st.on_channel_remove("random")
-    await asyncio.sleep(0)  # call_soon_threadsafe delivers on the next tick
 
-    worker = asyncio.create_task(st._run_channel_worker())
-    await asyncio.wait_for(st._channel_events.join(), timeout=2)
-    worker.cancel()
-
-    assert delete_calls == []  # no bus path reaches the cascade
-    for model, n in ((Channel, 1), (Message, 1), (Membership, 1)):
-        assert (await session.execute(
-            select(func.count()).select_from(model))).scalar_one() == n
+async def _counts(session):
+    out = []
+    for m in (Channel, Message, Membership):
+        out.append((await session.execute(
+            select(func.count()).select_from(m))).scalar_one())
+    return tuple(out)
 
 
 @pytest.mark.asyncio
-async def test_bus_readd_after_remove_is_idempotent(session):
-    """remove -> add: the channel re-subscribes on the existing row; no duplicate."""
-    session.add(Channel(id="C1", name="random", kind="standard", aiko_channel="random"))
-    await session.commit()
-    ch = await channels_service.upsert_channel(session, "random")
-    assert ch.id == "C1"
-    assert (await session.execute(
-        select(func.count()).select_from(Channel))).scalar_one() == 1
+async def test_bus_remove_keeps_channel_messages_and_memberships(session, monkeypatch):
+    """The #24 ruling at the gateway seam: a bus `remove` for a channel with history
+    leaves the channel row, its messages and its memberships intact, and never
+    reaches the destructive cascade. The worker runs on the test's own session, so
+    a deletion by ANY path (not just hard_delete_channel) would show in the counts."""
+    from aiko_gateway import main
+
+    # Record, don't raise: the worker's `except Exception` would swallow a raise.
+    delete_calls: list[str] = []
+
+    async def recording_delete(_session, name):
+        delete_calls.append(name)
+        return True
+
+    monkeypatch.setattr(main.channels_service, "hard_delete_channel", recording_delete)
+    monkeypatch.setattr(main, "SessionLocal", lambda: _SharedSession(session))
+    await _channel_with_history(session)
+
+    st = _state()
+    st.on_channel_remove("random")
+    await _drain(st)
+
+    assert delete_calls == []
+    assert await _counts(session) == (1, 1, 1)
+
+
+@pytest.mark.asyncio
+async def test_bus_remove_then_readd_keeps_the_original_row(session, monkeypatch):
+    """remove -> add through the real callbacks and worker: the channel comes back
+    on its ORIGINAL row with its history. Under the old worker, remove hard-deleted
+    and the re-add minted a new row with a new id and no messages."""
+    from aiko_gateway import main
+
+    monkeypatch.setattr(main, "SessionLocal", lambda: _SharedSession(session))
+    await _channel_with_history(session)
+
+    st = _state()
+    st.on_channel_remove("random")
+    st.on_channel_add("random")
+    await _drain(st)
+
+    rows = (await session.execute(select(Channel))).scalars().all()
+    assert [r.id for r in rows] == ["C1"]
+    assert await _counts(session) == (1, 1, 1)
 
 
 # --- topology worker applies adds in arrival order (Carnot P1a) ------------ #
 
 @pytest.mark.asyncio
 async def test_channel_worker_applies_adds_in_fifo_order(monkeypatch):
-    """The single worker drains the queue FIFO, so adds land in arrival order even
-    when an upsert yields mid-op."""
+    """The single worker drains the queue FIFO. The FIRST upsert yields many times
+    and the second not at all, so any concurrent drain (a task per event) would let
+    the second finish first; only a serial worker keeps arrival order."""
     import asyncio
 
     from aiko_gateway import main
@@ -281,7 +333,9 @@ async def test_channel_worker_applies_adds_in_fifo_order(monkeypatch):
     calls: list[str] = []
 
     async def fake_upsert(_session, name):
-        await asyncio.sleep(0)  # force a scheduler yield mid-op
+        if name == "random":
+            for _ in range(5):
+                await asyncio.sleep(0)  # yield repeatedly mid-op
         calls.append(name)
 
     class _NoSession:
@@ -297,16 +351,9 @@ async def test_channel_worker_applies_adds_in_fifo_order(monkeypatch):
     monkeypatch.setattr(main.channels_service, "upsert_channel", fake_upsert)
     monkeypatch.setattr(main, "SessionLocal", lambda: _NoSession())
 
-    st = main.GatewayState()
-    st.loop = asyncio.get_running_loop()
-    st._channel_events = asyncio.Queue()
+    st = _state()
     st.on_channel_add("random")
-    st.on_channel_remove("random")  # observation only; must not enqueue
     st.on_channel_add("general")
-    await asyncio.sleep(0)  # let call_soon_threadsafe deliver the puts
-
-    worker = asyncio.create_task(st._run_channel_worker())
-    await asyncio.wait_for(st._channel_events.join(), timeout=2)
-    worker.cancel()
+    await _drain(st)
 
     assert calls == ["random", "general"]
