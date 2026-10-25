@@ -644,6 +644,7 @@ async def passkey_add_finish(
         raise HTTPException(
             status.HTTP_401_UNAUTHORIZED, "passkey registration verification failed")
     try:
+        # link_passkey_credential COMMITS (the link and the challenge burn) itself.
         await users_service.link_passkey_credential(
             session, user_id=uid, material=material)
     except IntegrityError:

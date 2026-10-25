@@ -473,6 +473,13 @@ async def test_add_passkey_duplicate_credential_conflicts(client, session):
 _P256_X, _P256_Y = b"\x11" * 32, b"\x22" * 32
 
 
+def _on_curve_key(alg: int) -> dict:
+    """A COSE EC2 key with a REAL P-256 point, carrying whatever alg is given."""
+    nums = ec.generate_private_key(ec.SECP256R1()).public_key().public_numbers()
+    return {1: 2, 3: alg, -1: 1, -2: nums.x.to_bytes(32, "big"),
+            -3: nums.y.to_bytes(32, "big")}
+
+
 def _strip(cred: dict, *keys: str) -> dict:
     return {k: v for k, v in cred.items() if k not in keys}
 
@@ -522,6 +529,12 @@ async def test_register_finish_malformed_credential_is_400(client, mangle):
     pytest.param(SoftAuthenticator(cose_key={1: 2, 3: -7, -1: 99,
                                              -2: _P256_X, -3: _P256_Y}),
                  "none", None, id="ec2-unknown-curve"),  # UnsupportedEC2Curve
+    # A valid P-256 point labelled with an alg that isn't EC2's: loads fine, then
+    # verify_signature's EC branch raises UnsupportedAlgorithm (Maxwell + Carnot, r2).
+    pytest.param(SoftAuthenticator(cose_key=_on_curve_key(-257)),
+                 "none", None, id="ec2-key-rs256-alg"),
+    pytest.param(SoftAuthenticator(cose_key=_on_curve_key(-8)),
+                 "none", None, id="ec2-key-eddsa-alg"),
 ])
 async def test_register_finish_hostile_attestation_is_401(
     client, session, auth, fmt, att_stmt,
@@ -592,8 +605,8 @@ async def test_add_passkey_hostile_attestation_is_401(client):
 
 @pytest.mark.parametrize("field", ["response", "rawId"])
 async def test_authenticate_finish_malformed_credential_is_400(client, field):
-    """The credential id is KNOWN (so the lookup passes) but the body is no
-    assertion, so py_webauthn's InvalidJSONStructure is what's raised."""
+    """A registered authenticator's body with a field stripped: the parse, which
+    runs before the credential lookup, refuses it as malformed."""
     reg, auth = await _register_passkey(client)
     assert reg.status_code == 200, reg.text
     start = (await client.post("/v1/auth/passkey/authenticate/start")).json()
@@ -651,3 +664,20 @@ async def test_register_finish_refusal_logs_its_cause(client, caplog):
             "state": start["state"], "credential": auth.register(start["options"]["challenge"])})
     assert finish.status_code == 401, finish.text
     assert "KeyError" in caplog.text
+    assert "ALG" in caplog.text  # the inner detail (which COSE field), not just the class
+
+
+async def test_authenticate_finish_corrupt_stored_key_stays_loud(client, session):
+    """The stored key is OURS: one that won't decode is a server fault and must
+    escape, never fold into a 401 that blames the device."""
+    reg, auth = await _register_passkey(client)
+    assert reg.status_code == 200, reg.text
+    cred = await passkey_service.get_credential(
+        session, bytes_to_base64url(auth.credential_id))
+    cred.public_key = bytes_to_base64url(cbor2.dumps({1: 2}))  # no alg, no point
+    await session.commit()
+    start = (await client.post("/v1/auth/passkey/authenticate/start")).json()
+    with pytest.raises(KeyError):  # what decode raises on a missing alg (measured)
+        await client.post("/v1/auth/passkey/authenticate/finish", json={
+            "state": start["state"],
+            "credential": auth.authenticate(start["options"]["challenge"])})

@@ -49,13 +49,15 @@ import json
 import secrets
 
 import webauthn
+from cryptography.exceptions import InvalidSignature
 from webauthn.helpers import (
     base64url_to_bytes, bytes_to_base64url, decode_credential_public_key,
     decoded_public_key_to_cryptography, parse_authentication_credential_json,
+    verify_signature,
 )
 from webauthn.helpers.exceptions import (
     InvalidAuthenticationResponse, InvalidBackupFlags, InvalidJSONStructure,
-    InvalidRegistrationResponse,
+    InvalidRegistrationResponse, UnsupportedPublicKey,
 )
 from webauthn.helpers.structs import (
     AuthenticationCredential,
@@ -232,8 +234,10 @@ def verify_registration(*, raw_challenge: bytes, credential: dict) -> dict:
     already wraps its own clientDataJSON and attestationObject parses like this.
 
     Only py_webauthn's frames are inside the catch. OUR inputs (the serialised
-    body, rp_id, origins, the UV setting) are computed first, so a server
-    misconfiguration stays a loud 500 instead of a 401 that blames the device."""
+    body, rp_id, origins, the UV setting) are computed first, so a fault BUILDING
+    them stays a loud 500 instead of a 401 that blames the device. A well-formed
+    but WRONG value (a mistyped rp_id) still reads as a refused response: at
+    request time it is indistinguishable from a device presenting the wrong RP."""
     payload = json.dumps(credential)
     rp_id = settings.passkey_rp_id
     origins = _expected_origins()
@@ -246,16 +250,13 @@ def verify_registration(*, raw_challenge: bytes, credential: dict) -> dict:
             expected_origin=origins,
             require_user_verification=require_uv,
         )
-        # py_webauthn decodes the COSE key's fields but never loads the key, so an
-        # off-curve point or an unknown curve registers and then can never sign in
-        # (#421). Load it now, so a key we store is a key that can verify.
-        decoded_public_key_to_cryptography(
-            decode_credential_public_key(verified.credential_public_key))
+        _assert_can_verify(verified.credential_public_key)
     except (InvalidJSONStructure, InvalidRegistrationResponse):
         raise
     except Exception as exc:
         raise InvalidRegistrationResponse(
-            f"registration response rejected ({type(exc).__name__})") from exc
+            f"registration response rejected ({type(exc).__name__}: {str(exc)[:120]})"
+        ) from exc
     # Transports are reported by the authenticator in the RESPONSE (not on the
     # verified result) — a hint for future allowCredentials. Best-effort: store
     # them as a JSON array if present and well-formed, else None.
@@ -270,6 +271,28 @@ def verify_registration(*, raw_challenge: bytes, credential: dict) -> dict:
         "transports": transports,
         "aaguid": verified.aaguid,
     }
+
+
+def _assert_can_verify(credential_public_key: bytes) -> None:
+    """Refuse a key that no sign-in could ever verify (#421). py_webauthn's
+    registration decodes the COSE key's fields but never uses the key, so an
+    off-curve point, an unknown curve, or an `alg` that doesn't fit the key type
+    (an EC2 key labelled RS256) all register and then fail every sign-in.
+
+    Run the SAME three calls authentication runs (verify_authentication_response
+    .py:174-183: decode, load, verify_signature with the key's own alg) against an
+    empty signature. The one acceptable answer is InvalidSignature: the key could
+    be asked. Anything else propagates and is folded into a refusal by the caller.
+    Being the same calls, not a list of known-bad shapes, is what makes "stored"
+    imply "verifiable"."""
+    decoded = decode_credential_public_key(credential_public_key)
+    try:
+        verify_signature(
+            public_key=decoded_public_key_to_cryptography(decoded),
+            signature_alg=decoded.alg, signature=b"", data=b"")
+    except InvalidSignature:
+        return
+    raise UnsupportedPublicKey("an empty signature verified")  # unreachable in practice
 
 
 def parse_assertion(credential: dict) -> AuthenticationCredential:
