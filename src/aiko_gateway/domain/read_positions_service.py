@@ -62,13 +62,15 @@ from __future__ import annotations
 import datetime as dt
 import enum
 import re
+import time
 from dataclasses import dataclass
 
 from sqlalchemy import and_, literal, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .models import Channel, ChannelReadPosition
+from .ids import new_ulid
+from .models import Channel, ChannelReadPosition, User
 
 # A CANONICAL ULID: uppercase Crockford base32, and a FIRST character of 0-7. 26
 # chars x 5 bits is 130 bits for a 128-bit value, so a real ULID's top two bits are
@@ -76,6 +78,12 @@ from .models import Channel, ChannelReadPosition
 # check accepts it, aiko_chat_app#431) but sorts above every real ULID, which
 # freezes a channel's unread count at zero.
 _CANONICAL_ULID = re.compile(r"[0-7][0-9A-HJKMNP-TV-Z]{25}")
+# A watermark names a message the island has already minted, so its timestamp
+# (the first 10 chars; Crockford keeps lexicographic order == time order) cannot
+# be later than now. "7" + "Z"*25 is canonical but dated thousands of years out,
+# and under the app's "a forward read wins" policy it would stick on every device
+# (Tesla, #429 r2). The skew allows for the clock moving under us, not for clients.
+_FUTURE_SKEW_MS = 60 * 60 * 1000
 # SQLite's INTEGER is signed 64-bit. The island stores base_seq + 1, so the
 # largest base it can accept is one below that.
 _MAX_SEQ = 2**63 - 1
@@ -131,6 +139,11 @@ def _validate(channel_id: str, last_read: str, base_seq: int) -> None:
         raise InvalidReadPosition(
             channel_id, "last_read must be a canonical ULID (uppercase "
             "Crockford, first character 0-7) or the empty floor ''")
+    if last_read and last_read[:10] > new_ulid(
+            int(time.time() * 1000) + _FUTURE_SKEW_MS)[:10]:
+        raise InvalidReadPosition(
+            channel_id, "last_read is dated in the future; a watermark names a "
+            "message the island has already minted")
     if not 0 <= base_seq <= MAX_BASE_SEQ:
         raise InvalidReadPosition(
             channel_id, f"base_seq must be between 0 and {MAX_BASE_SEQ}")
@@ -141,16 +154,21 @@ async def _write(session: AsyncSession, *, user_id: str, channel_id: str,
     """The one conditional statement for one entry. Its effect is read back by
     the caller, so this returns nothing: the stored row is the answer."""
     if base_seq == 0:
-        # A first write: only where the channel exists (the row is selected FROM
-        # channels), and only if no row exists yet (DO NOTHING is the conflict).
+        # A first write: only where the channel AND the user exist (the row is
+        # selected FROM both), and only if no row exists yet (DO NOTHING is the
+        # conflict). The user join closes a race: a PUT that authenticated, then
+        # lost to delete_user_account, would otherwise re-create a deleted user's
+        # rows, and FK is off in prod (Carnot, #429 r2). Existence is decided in
+        # the statement, never by the earlier authentication.
         cols = ChannelReadPosition.__table__.c
         source = select(
-            literal(user_id, cols.user_id.type),
+            User.id,
             Channel.id,
             literal(last_read, cols.last_read.type),
             literal(1, cols.seq.type),
             literal(now, cols.updated_at.type),
-        ).where(Channel.id == channel_id)
+        ).select_from(User).join(Channel, Channel.id == channel_id).where(
+            User.id == user_id)  # one row at most: both sides are pinned by PK
         stmt = sqlite_insert(ChannelReadPosition).from_select(
             ['user_id', 'channel_id', 'last_read', 'seq', 'updated_at'], source
         ).on_conflict_do_nothing(

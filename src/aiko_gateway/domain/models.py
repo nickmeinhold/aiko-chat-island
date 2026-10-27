@@ -738,9 +738,11 @@ class ChannelReadPosition(Base):
     """
     __tablename__ = "channel_read_positions"
     __table_args__ = (
-        # Versions start at 1 and only ever go up by one. Refusing a negative at
-        # the column means nothing above it has to reason about one.
-        CheckConstraint("seq >= 0", name="ck_channel_read_positions_seq"),
+        # Versions start at 1 and only ever go up by one. 0 is the WIRE's name for
+        # "no row", so a stored row at 0 would answer every write with "conflict at
+        # 0, resend from 0", and the resend could never move it (Noether, Tesla,
+        # #429 r2). The column makes that state unrepresentable.
+        CheckConstraint("seq >= 1", name="ck_channel_read_positions_seq"),
         # The PK leads with user_id (every read is "my positions"), so a lookup by
         # channel alone, which hard_delete_channel does, needs its own index: the
         # mirror of ix_memberships_user_id (#2633).

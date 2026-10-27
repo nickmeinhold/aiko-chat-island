@@ -8,6 +8,8 @@ client can choose a version that beats everyone forever.
 """
 from __future__ import annotations
 
+import time
+
 import pytest
 import pytest_asyncio
 from fastapi import FastAPI
@@ -207,6 +209,31 @@ async def test_a_malformed_last_read_is_refused(session, bad_last_read):
         await _put(session, u, {ch.id: (bad_last_read, 0)})
 
 
+@pytest.mark.parametrize("future", [
+    "7" + "Z" * 25,                                     # canonical, millennia out
+    new_ulid(int(time.time() * 1000) + 3 * 3600 * 1000),  # three hours out
+])
+async def test_a_watermark_from_the_future_is_refused(session, future):
+    """A watermark names a message the island already minted, so it can't be later
+    than now. Under the app's "a forward read wins" policy a future value would
+    stick on every device (Tesla, #429 r2)."""
+    u, ch = await _user(session, "alice"), await _channel(session)
+    with pytest.raises(svc.InvalidReadPosition):
+        await _put(session, u, {ch.id: (future, 0)})
+
+
+async def test_a_deleted_user_cannot_get_rows_recreated(session):
+    """A PUT that authenticated, then lost the race to account deletion, must not
+    re-create the deleted user's rows: the first-write insert selects FROM users
+    as well as channels (Carnot, #429 r2). FK is off in prod, so nothing else
+    would stop it."""
+    ch = await _channel(session)
+    ghost = new_ulid()  # a user id with no users row: the account is gone
+    await svc.set_positions(session, user_id=ghost, positions={ch.id: (_ulid(10), 0)})
+    rows = (await session.execute(select(ChannelReadPosition))).scalars().all()
+    assert rows == []
+
+
 async def test_a_negative_base_is_refused(session):
     u, ch = await _user(session, "alice"), await _channel(session)
     with pytest.raises(svc.InvalidReadPosition):
@@ -267,15 +294,18 @@ async def test_deleting_a_channel_removes_its_read_positions(session):
 # the constraint, at the DB rather than only above it
 # ---------------------------------------------------------------------------
 
-async def test_the_db_itself_refuses_a_negative_seq(session):
-    """The service refuses first; this proves the column would too."""
+@pytest.mark.parametrize("bad_seq", [-5, 0])
+async def test_the_db_itself_refuses_a_seq_below_1(session, bad_seq):
+    """The service never writes below 1; this proves the column refuses it too.
+    0 matters most: it is the wire's name for "no row", and a stored row at 0
+    would answer every write with "resend from 0", which could never move it."""
     u, ch = await _user(session, "alice"), await _channel(session)
     with pytest.raises(Exception) as exc:
         await session.execute(text(
             "INSERT INTO channel_read_positions "
             "(user_id, channel_id, last_read, seq, updated_at) "
-            "VALUES (:u, :c, '', -5, '2026-09-26 00:00:00')"),
-            {"u": u.id, "c": ch.id})
+            "VALUES (:u, :c, '', :s, '2026-09-26 00:00:00')"),
+            {"u": u.id, "c": ch.id, "s": bad_seq})
         await session.commit()
     assert "ck_channel_read_positions_seq" in str(exc.value) or "CHECK" in str(
         exc.value), (

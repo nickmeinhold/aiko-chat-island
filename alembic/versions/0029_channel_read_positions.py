@@ -34,8 +34,8 @@ what forces that to have happened: it introspects every FK-to-users.id column an
 fails on a new one. This table was added WITH that test red, then green — the
 tripwire worked as designed rather than being remembered.
 
-CHECK ON seq >= 0: versions start at 1 and only go up, so nothing above the column
-has to reason about a negative one. Derived from the model via a literal that
+CHECK ON seq >= 1: versions start at 1 and only go up. 0 is the wire's name for
+"no row", so a stored row at 0 could never be moved; the column refuses it. Derived from the model via a literal that
 `test_migrations`' generic parity gate compares against `Base.metadata`.
 
 Revision ID: 0029
@@ -69,7 +69,7 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(["user_id"], ["users.id"]),
         sa.ForeignKeyConstraint(["channel_id"], ["channels.id"]),
         sa.PrimaryKeyConstraint("user_id", "channel_id"),
-        sa.CheckConstraint("seq >= 0", name="ck_channel_read_positions_seq"),
+        sa.CheckConstraint("seq >= 1", name="ck_channel_read_positions_seq"),
     )
     op.create_index("ix_channel_read_positions_channel_id",
                     "channel_read_positions", ["channel_id"])

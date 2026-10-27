@@ -15,15 +15,13 @@ and fail where nobody sees it. These endpoints are additive: a client that never
 calls them behaves exactly as it does today, which is what makes shipping first
 safe rather than merely conventional.
 
-THE WIRE IS snake_case — `last_read`, NOT `lastRead`. #4834 records the agreed
-shape as `{lastRead: ulid, seq: int}`, which is DART FIELD NAMING written in
-prose, not a wire spec. Checked against the app's own decoders rather than
-inferred: `channel.dart` reads `j['aiko_channel']`, `channel_member.dart` reads
-`j['can_post']` and `j['display_name']` — snake_case on the wire, camelCase in
-Dart, throughout. Every other island endpoint agrees. This is written down
-because it is exactly the silent-desync shape CLAUDE.md warns about: an unknown
-key is IGNORED, not rejected, so `lastRead` would decode as null, every watermark
-would read as absent, and both sides would look healthy.
+THE WIRE IS snake_case. A PUT entry is `{last_read, base_seq}`; GET and the PUT
+reply carry `{last_read, seq}` (the island's version). The contract is PR #429's
+v2 comment. snake_case is checked against the app's own decoders, not inferred:
+`channel.dart` reads `j['aiko_channel']`, `channel_member.dart` reads
+`j['can_post']`. An unknown key is IGNORED, not rejected, so a camelCase key
+would decode as null and every watermark would read as absent, with both sides
+looking healthy.
 
 AUTHORIZATION IS OWNERSHIP, FULL STOP. Both routes read the caller's own id from
 ``CurrentUser`` and never accept a user id from the request. There is no path
