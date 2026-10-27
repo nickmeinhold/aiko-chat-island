@@ -49,8 +49,18 @@ import json
 import secrets
 
 import webauthn
-from webauthn.helpers import base64url_to_bytes, bytes_to_base64url
+from cryptography.exceptions import InvalidSignature
+from webauthn.helpers import (
+    base64url_to_bytes, bytes_to_base64url, decode_credential_public_key,
+    decoded_public_key_to_cryptography, parse_authentication_credential_json,
+    verify_signature,
+)
+from webauthn.helpers.exceptions import (
+    InvalidAuthenticationResponse, InvalidBackupFlags, InvalidJSONStructure,
+    InvalidRegistrationResponse, UnsupportedPublicKey,
+)
 from webauthn.helpers.structs import (
+    AuthenticationCredential,
     AuthenticatorSelectionCriteria,
     ResidentKeyRequirement,
     UserVerificationRequirement,
@@ -209,16 +219,44 @@ async def start_authentication(session: AsyncSession) -> dict:
 
 def verify_registration(*, raw_challenge: bytes, credential: dict) -> dict:
     """Verify an attestation response and return JSON-safe credential material
-    (base64url strings) ready to persist directly via create_passkey_account. Raises
-    webauthn InvalidRegistrationResponse on any failure (the caller maps to a 4xx).
-    The expected_challenge/origin/rp_id are OURS, never read from the response."""
-    verified = webauthn.verify_registration_response(
-        credential=json.dumps(credential),
-        expected_challenge=raw_challenge,
-        expected_rp_id=settings.passkey_rp_id,
-        expected_origin=_expected_origins(),
-        require_user_verification=settings.passkey_require_user_verification,
-    )
+    (base64url strings) ready to persist directly via create_passkey_account.
+    The expected_challenge/origin/rp_id are OURS, never read from the response.
+
+    Raises exactly two things, both the caller's fault (the route maps them to 4xx):
+    InvalidJSONStructure when the credential isn't a registration response at all
+    (missing rawId/response, wrong type), and InvalidRegistrationResponse for
+    everything else. Everything else is broad ON PURPOSE: py_webauthn 3.0.0 leaves
+    the COSE key decode, the attestation-statement verifiers and the backup-flag
+    parse unwrapped, so a fmt:"none" body that needs no signature can raise
+    KeyError, TypeError, ValueError, binascii.Error, UnsupportedPublicKeyType or
+    InvalidBackupFlags (measured), and each attestation format fails its own way,
+    so a list of types would leak whichever one nobody measured. py_webauthn
+    already wraps its own clientDataJSON and attestationObject parses like this.
+
+    Only py_webauthn's frames are inside the catch. OUR inputs (the serialised
+    body, rp_id, origins, the UV setting) are computed first, so a fault BUILDING
+    them stays a loud 500 instead of a 401 that blames the device. A well-formed
+    but WRONG value (a mistyped rp_id) still reads as a refused response: at
+    request time it is indistinguishable from a device presenting the wrong RP."""
+    payload = json.dumps(credential)
+    rp_id = settings.passkey_rp_id
+    origins = _expected_origins()
+    require_uv = settings.passkey_require_user_verification
+    try:
+        verified = webauthn.verify_registration_response(
+            credential=payload,
+            expected_challenge=raw_challenge,
+            expected_rp_id=rp_id,
+            expected_origin=origins,
+            require_user_verification=require_uv,
+        )
+        _assert_can_verify(verified.credential_public_key)
+    except (InvalidJSONStructure, InvalidRegistrationResponse):
+        raise
+    except Exception as exc:
+        raise InvalidRegistrationResponse(
+            f"registration response rejected ({type(exc).__name__}: {str(exc)[:120]})"
+        ) from exc
     # Transports are reported by the authenticator in the RESPONSE (not on the
     # verified result) — a hint for future allowCredentials. Best-effort: store
     # them as a JSON array if present and well-formed, else None.
@@ -235,34 +273,83 @@ def verify_registration(*, raw_challenge: bytes, credential: dict) -> dict:
     }
 
 
+def _assert_can_verify(credential_public_key: bytes) -> None:
+    """Refuse a key that no sign-in could ever verify (#421). py_webauthn's
+    registration decodes the COSE key's fields but never uses the key, so an
+    off-curve point, an unknown curve, or an `alg` that doesn't fit the key type
+    (an EC2 key labelled RS256) all register and then fail every sign-in.
+
+    Run the SAME three calls authentication runs (verify_authentication_response
+    .py:174-183: decode, load, verify_signature with the key's own alg) against an
+    empty signature. The one acceptable answer is InvalidSignature: the key could
+    be asked. Anything else propagates and is folded into a refusal by the caller.
+    Being the same calls, not a list of known-bad shapes, is what makes "stored"
+    imply "verifiable"."""
+    decoded = decode_credential_public_key(credential_public_key)
+    try:
+        verify_signature(
+            public_key=decoded_public_key_to_cryptography(decoded),
+            signature_alg=decoded.alg, signature=b"", data=b"")
+    except InvalidSignature:
+        return
+    raise UnsupportedPublicKey("an empty signature verified")  # unreachable in practice
+
+
+def parse_assertion(credential: dict) -> AuthenticationCredential:
+    """Parse the caller's assertion body: the caller-only phase of authentication,
+    run BEFORE the stored credential is looked up. Raises InvalidJSONStructure on
+    any failure (the route maps it to 400), whatever py_webauthn raised: 3.0.0
+    base64-decodes `userHandle` outside its own wrapper, so `"userHandle": "a"`
+    raised a bare binascii.Error. Nothing here touches anything of ours, so
+    folding every failure is safe. Parsing first also means a malformed body gets
+    the same answer whether or not its credential id exists."""
+    try:
+        return parse_authentication_credential_json(json.dumps(credential))
+    except InvalidJSONStructure:
+        raise
+    except Exception as exc:
+        raise InvalidJSONStructure(
+            f"assertion could not be parsed ({type(exc).__name__})") from exc
+
+
 def verify_authentication(
-    *, raw_challenge: bytes, credential: dict, public_key_b64: str,
-    current_sign_count: int,
+    *, raw_challenge: bytes, assertion: AuthenticationCredential,
+    public_key_b64: str, current_sign_count: int,
 ) -> int:
-    """Verify an assertion against the STORED public key and return the new
+    """Verify a parsed assertion against the STORED public key and return the new
     sign_count to persist. Raises webauthn InvalidAuthenticationResponse on a bad
     signature / origin / rp_id / challenge, AND on a clone-indicating sign_count
     regression (py_webauthn enforces the spec-correct rule — only when the counts
-    are nonzero; a 0/0 platform authenticator is permitted, see module docstring)."""
-    verified = webauthn.verify_authentication_response(
-        credential=json.dumps(credential),
-        expected_challenge=raw_challenge,
-        expected_rp_id=settings.passkey_rp_id,
-        expected_origin=_expected_origins(),
-        credential_public_key=base64url_to_bytes(public_key_b64),
-        credential_current_sign_count=current_sign_count,
-        require_user_verification=settings.passkey_require_user_verification,
-    )
+    are nonzero; a 0/0 platform authenticator is permitted, see module docstring).
+
+    Unlike registration this is NOT broadened: the public key here is the one WE
+    stored, so a key that fails to decode is a server-side fault and must stay a
+    loud 500, never a 401 that blames the device. The caller's body was already
+    parsed by parse_assertion; the one caller-controlled escape left is the
+    backup-flag check, which py_webauthn runs AFTER the signature (BS set without
+    BE), folded into InvalidAuthenticationResponse."""
+    try:
+        verified = webauthn.verify_authentication_response(
+            credential=assertion,
+            expected_challenge=raw_challenge,
+            expected_rp_id=settings.passkey_rp_id,
+            expected_origin=_expected_origins(),
+            credential_public_key=base64url_to_bytes(public_key_b64),
+            credential_current_sign_count=current_sign_count,
+            require_user_verification=settings.passkey_require_user_verification,
+        )
+    except InvalidBackupFlags as exc:
+        raise InvalidAuthenticationResponse(str(exc)) from exc
     return verified.new_sign_count
 
 
 # --- credential persistence ------------------------------------------------ #
 
-def credential_id_of(credential: dict) -> str:
-    """Normalise the credential id from an assertion response to the same
-    unpadded-base64url form we store at registration (so the lookup key matches
-    regardless of the client's padding)."""
-    return bytes_to_base64url(base64url_to_bytes(credential["id"]))
+def credential_id_of(assertion: AuthenticationCredential) -> str:
+    """The parsed assertion's raw id in the same unpadded-base64url form we store
+    at registration (so the lookup key matches regardless of the client's
+    padding). py_webauthn rejects an assertion whose `id` and `rawId` disagree."""
+    return bytes_to_base64url(assertion.raw_id)
 
 
 async def get_credential(

@@ -60,14 +60,17 @@ class SoftAuthenticator:
     a fmt:'none' attestation and signs assertions exactly as a real device would."""
 
     def __init__(self, credential_id: bytes = b"test-credential-0001",
-                 user_verified: bool = True):
+                 user_verified: bool = True, *, extra_flags: int = 0,
+                 cose_key: object = None):
         self._key = ec.generate_private_key(ec.SECP256R1())
         self.credential_id = credential_id
         self.sign_count = 0  # platform passkeys report 0 and never increment
         self.user_verified = user_verified  # whether the UV flag is set in authData
+        self.extra_flags = extra_flags  # hostile bits OR'd into authData flags
+        self.cose_key = cose_key  # a hostile COSE key (a dict, or raw bytes) if set
 
     def _flags(self, *, include_cred: bool) -> int:
-        flags = 0x01  # UP (user present) always
+        flags = 0x01 | self.extra_flags  # UP (user present) always
         if self.user_verified:
             flags |= 0x04  # UV (user verified)
         if include_cred:
@@ -75,6 +78,10 @@ class SoftAuthenticator:
         return flags
 
     def _cose_public_key(self) -> bytes:
+        if isinstance(self.cose_key, bytes):
+            return self.cose_key
+        if self.cose_key is not None:
+            return cbor2.dumps(self.cose_key)
         nums = self._key.public_key().public_numbers()
         x = nums.x.to_bytes(32, "big")
         y = nums.y.to_bytes(32, "big")
@@ -96,12 +103,14 @@ class SoftAuthenticator:
             "origin": ORIGIN, "crossOrigin": False,
         }).encode()
 
-    def register(self, challenge_b64: str) -> dict:
+    def register(self, challenge_b64: str, *, fmt: str = "none",
+                 att_stmt: dict | None = None) -> dict:
         auth_data = self._auth_data(
             flags=self._flags(include_cred=True), include_cred=True)
         client_data = self._client_data(
             ceremony="webauthn.create", challenge_b64=challenge_b64)
-        att_obj = cbor2.dumps({"fmt": "none", "attStmt": {}, "authData": auth_data})
+        att_obj = cbor2.dumps(
+            {"fmt": fmt, "attStmt": att_stmt or {}, "authData": auth_data})
         return {
             "id": bytes_to_base64url(self.credential_id),
             "rawId": bytes_to_base64url(self.credential_id),
@@ -453,3 +462,222 @@ async def test_add_passkey_duplicate_credential_conflicts(client, session):
         json={"state": start["state"],
               "credential": first.register(start["options"]["challenge"])})
     assert r.status_code == 409, r.text
+
+
+# --- PR-B: a hostile finish body is a 4xx, never a 500 ----------------------- #
+# py_webauthn 3.0.0 raises InvalidJSONStructure (a sibling of the two types the
+# routes caught) for a body that isn't a credential at all, and leaves the COSE
+# key decode, attestation verifiers and backup-flag parse unwrapped. Each case
+# below escaped as an uncaught 500 before the service sealed its surface.
+
+_P256_X, _P256_Y = b"\x11" * 32, b"\x22" * 32
+
+
+def _on_curve_key(alg: int) -> dict:
+    """A COSE EC2 key with a REAL P-256 point, carrying whatever alg is given."""
+    nums = ec.generate_private_key(ec.SECP256R1()).public_key().public_numbers()
+    return {1: 2, 3: alg, -1: 1, -2: nums.x.to_bytes(32, "big"),
+            -3: nums.y.to_bytes(32, "big")}
+
+
+def _strip(cred: dict, *keys: str) -> dict:
+    return {k: v for k, v in cred.items() if k not in keys}
+
+
+@pytest.mark.parametrize("mangle", [
+    pytest.param(lambda c: _strip(c, "rawId"), id="no-rawId"),
+    pytest.param(lambda c: _strip(c, "response"), id="no-response"),
+    pytest.param(lambda c: {**c, "response": "x"}, id="response-not-object"),
+    pytest.param(lambda c: {**c, "type": "nope"}, id="wrong-type"),
+])
+async def test_register_finish_malformed_credential_is_400(client, mangle):
+    auth = SoftAuthenticator()
+    start = (await client.post("/v1/auth/passkey/register/start")).json()
+    finish = await client.post("/v1/auth/passkey/register/finish", json={
+        "state": start["state"],
+        "credential": mangle(auth.register(start["options"]["challenge"]))})
+    assert finish.status_code == 400, finish.text
+    assert finish.json()["detail"] == "malformed passkey credential"
+
+
+@pytest.mark.parametrize("auth, fmt, att_stmt", [
+    pytest.param(SoftAuthenticator(cose_key={1: 2, -1: 1, -2: _P256_X, -3: _P256_Y}),
+                 "none", None, id="cose-no-alg"),  # KeyError
+    pytest.param(SoftAuthenticator(cose_key={1: 9, 3: -7}),
+                 "none", None, id="cose-unknown-kty"),  # UnsupportedPublicKeyType
+    pytest.param(SoftAuthenticator(cose_key=b"\x01"),
+                 "none", None, id="cose-not-a-map"),  # TypeError
+    pytest.param(SoftAuthenticator(extra_flags=0x10),
+                 "none", None, id="backed-up-not-eligible"),  # InvalidBackupFlags
+    pytest.param(SoftAuthenticator(), "packed",
+                 {"alg": -7, "sig": b"x", "x5c": [b"not-a-cert"]},
+                 id="packed-garbage-x5c"),  # ValueError (asn1)
+    pytest.param(SoftAuthenticator(), "tpm",
+                 {"ver": "2.0", "alg": -7, "sig": b"x", "x5c": [b"x"],
+                  "certInfo": b"x", "pubArea": b"x"}, id="tpm-garbage"),  # KeyError
+    pytest.param(SoftAuthenticator(), "android-safetynet",
+                 {"ver": "1", "response": b"x.y.z"},
+                 id="safetynet-garbage"),  # binascii.Error
+    pytest.param(SoftAuthenticator(), "fido-u2f",
+                 {"sig": b"x", "x5c": [b"not-a-cert"]},
+                 id="fido-u2f-garbage-x5c"),  # ValueError (asn1)
+    # Keys py_webauthn decodes but never loads (#421): these used to REGISTER, and
+    # then could never sign in.
+    pytest.param(SoftAuthenticator(cose_key={1: 2, 3: -7, -1: 1,
+                                             -2: b"\x00" * 32, -3: b"\x00" * 32}),
+                 "none", None, id="ec2-off-curve"),  # ValueError at key load
+    pytest.param(SoftAuthenticator(cose_key={1: 2, 3: -7, -1: 99,
+                                             -2: _P256_X, -3: _P256_Y}),
+                 "none", None, id="ec2-unknown-curve"),  # UnsupportedEC2Curve
+    # A valid P-256 point labelled with an alg that isn't EC2's: loads fine, then
+    # verify_signature's EC branch raises UnsupportedAlgorithm (Maxwell + Carnot, r2).
+    pytest.param(SoftAuthenticator(cose_key=_on_curve_key(-257)),
+                 "none", None, id="ec2-key-rs256-alg"),
+    pytest.param(SoftAuthenticator(cose_key=_on_curve_key(-8)),
+                 "none", None, id="ec2-key-eddsa-alg"),
+])
+async def test_register_finish_hostile_attestation_is_401(
+    client, session, auth, fmt, att_stmt,
+):
+    start = (await client.post("/v1/auth/passkey/register/start")).json()
+    finish = await client.post("/v1/auth/passkey/register/finish", json={
+        "state": start["state"],
+        "credential": auth.register(start["options"]["challenge"],
+                                    fmt=fmt, att_stmt=att_stmt)})
+    assert finish.status_code == 401, finish.text
+    assert await passkey_service.get_credential(
+        session, bytes_to_base64url(auth.credential_id)) is None
+
+
+async def test_register_finish_server_misconfig_stays_loud(client, monkeypatch):
+    """The catch-all covers py_webauthn's frames only. A fault in OUR inputs (here
+    the origin list) must escape as a server error, never a 401 for the device."""
+    monkeypatch.setattr(settings, "passkey_extra_origins", None)
+    auth = SoftAuthenticator()
+    start = (await client.post("/v1/auth/passkey/register/start")).json()
+    with pytest.raises(TypeError):
+        await client.post("/v1/auth/passkey/register/finish", json={
+            "state": start["state"],
+            "credential": auth.register(start["options"]["challenge"])})
+
+
+async def test_register_finish_malformed_then_honest_retry_same_state(client, session):
+    """A refused body burns nothing: the SAME state then completes honestly."""
+    auth = SoftAuthenticator()
+    start = (await client.post("/v1/auth/passkey/register/start")).json()
+    good = auth.register(start["options"]["challenge"])
+    bad = await client.post("/v1/auth/passkey/register/finish", json={
+        "state": start["state"], "credential": _strip(good, "response")})
+    assert bad.status_code == 400, bad.text
+    assert await _count_users(session) == 0
+    ok = await client.post("/v1/auth/passkey/register/finish", json={
+        "state": start["state"], "credential": good})
+    assert ok.status_code == 200, ok.text
+
+
+async def test_add_passkey_malformed_credential_is_400(client, session):
+    reg, _ = await _register_passkey(client)
+    token = reg.json()["access_token"]
+    start = (await client.post("/v1/auth/passkey/register/start")).json()
+    added = SoftAuthenticator(credential_id=b"added-malformed-0004")
+    r = await client.post(
+        "/v1/auth/passkey/add/finish",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"state": start["state"], "credential": _strip(
+            added.register(start["options"]["challenge"]), "response")})
+    assert r.status_code == 400, r.text
+    assert await passkey_service.get_credential(
+        session, bytes_to_base64url(added.credential_id)) is None
+
+
+async def test_add_passkey_hostile_attestation_is_401(client):
+    reg, _ = await _register_passkey(client)
+    token = reg.json()["access_token"]
+    start = (await client.post("/v1/auth/passkey/register/start")).json()
+    added = SoftAuthenticator(credential_id=b"added-hostile-0005", cose_key={1: 9, 3: -7})
+    r = await client.post(
+        "/v1/auth/passkey/add/finish",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"state": start["state"],
+              "credential": added.register(start["options"]["challenge"])})
+    assert r.status_code == 401, r.text
+
+
+@pytest.mark.parametrize("field", ["response", "rawId"])
+async def test_authenticate_finish_malformed_credential_is_400(client, field):
+    """A registered authenticator's body with a field stripped: the parse, which
+    runs before the credential lookup, refuses it as malformed."""
+    reg, auth = await _register_passkey(client)
+    assert reg.status_code == 200, reg.text
+    start = (await client.post("/v1/auth/passkey/authenticate/start")).json()
+    finish = await client.post("/v1/auth/passkey/authenticate/finish", json={
+        "state": start["state"],
+        "credential": _strip(auth.authenticate(start["options"]["challenge"]), field)})
+    assert finish.status_code == 400, finish.text
+    assert finish.json()["detail"] == "malformed passkey credential"
+
+
+async def test_authenticate_finish_backed_up_not_eligible_is_401(client):
+    """A correctly SIGNED assertion whose flags claim backed-up-but-not-eligible:
+    py_webauthn checks this after the signature, unwrapped."""
+    reg, auth = await _register_passkey(client)
+    assert reg.status_code == 200, reg.text
+    auth.extra_flags = 0x10  # BS without BE
+    start = (await client.post("/v1/auth/passkey/authenticate/start")).json()
+    finish = await client.post("/v1/auth/passkey/authenticate/finish", json={
+        "state": start["state"], "credential": auth.authenticate(start["options"]["challenge"])})
+    assert finish.status_code == 401, finish.text
+
+
+async def test_authenticate_finish_bad_user_handle_is_400(client):
+    """py_webauthn decodes userHandle outside its own wrapper: "a" raised a bare
+    binascii.Error before any signature check (Carnot + Tesla, #422 r1)."""
+    reg, auth = await _register_passkey(client)
+    assert reg.status_code == 200, reg.text
+    start = (await client.post("/v1/auth/passkey/authenticate/start")).json()
+    cred = auth.authenticate(start["options"]["challenge"])
+    cred["response"]["userHandle"] = "a"
+    finish = await client.post("/v1/auth/passkey/authenticate/finish", json={
+        "state": start["state"], "credential": cred})
+    assert finish.status_code == 400, finish.text
+    assert finish.json()["detail"] == "malformed passkey credential"
+
+
+async def test_authenticate_finish_malformed_unknown_id_is_400(client):
+    """Same malformed body, never-registered id: still 400, so the status does not
+    reveal whether a credential id exists (it was 401 for unknown, 400 for known)."""
+    ghost = SoftAuthenticator(credential_id=b"ghost-credential-0006")
+    start = (await client.post("/v1/auth/passkey/authenticate/start")).json()
+    finish = await client.post("/v1/auth/passkey/authenticate/finish", json={
+        "state": start["state"],
+        "credential": _strip(ghost.authenticate(start["options"]["challenge"]), "response")})
+    assert finish.status_code == 400, finish.text
+
+
+async def test_register_finish_refusal_logs_its_cause(client, caplog):
+    """The service folds a dozen causes into one type; the route must log which one,
+    or a hostile body and a real authenticator bug read the same to an operator."""
+    auth = SoftAuthenticator(cose_key={1: 2, -1: 1, -2: _P256_X, -3: _P256_Y})  # KeyError
+    start = (await client.post("/v1/auth/passkey/register/start")).json()
+    with caplog.at_level("WARNING", logger="aiko_gateway.rest.auth"):
+        finish = await client.post("/v1/auth/passkey/register/finish", json={
+            "state": start["state"], "credential": auth.register(start["options"]["challenge"])})
+    assert finish.status_code == 401, finish.text
+    assert "KeyError" in caplog.text
+    assert "ALG" in caplog.text  # the inner detail (which COSE field), not just the class
+
+
+async def test_authenticate_finish_corrupt_stored_key_stays_loud(client, session):
+    """The stored key is OURS: one that won't decode is a server fault and must
+    escape, never fold into a 401 that blames the device."""
+    reg, auth = await _register_passkey(client)
+    assert reg.status_code == 200, reg.text
+    cred = await passkey_service.get_credential(
+        session, bytes_to_base64url(auth.credential_id))
+    cred.public_key = bytes_to_base64url(cbor2.dumps({1: 2}))  # no alg, no point
+    await session.commit()
+    start = (await client.post("/v1/auth/passkey/authenticate/start")).json()
+    with pytest.raises(KeyError):  # what decode raises on a missing alg (measured)
+        await client.post("/v1/auth/passkey/authenticate/finish", json={
+            "state": start["state"],
+            "credential": auth.authenticate(start["options"]["challenge"])})

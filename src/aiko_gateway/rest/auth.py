@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from webauthn.helpers.exceptions import (
-    InvalidAuthenticationResponse, InvalidRegistrationResponse,
+    InvalidAuthenticationResponse, InvalidJSONStructure, InvalidRegistrationResponse,
 )
 
 from ..config import settings
@@ -548,13 +548,24 @@ async def passkey_register_finish(req: PasskeyFinishReq, session: DbSession) -> 
     try:
         material = passkey_service.verify_registration(
             raw_challenge=raw, credential=req.credential)
-    except InvalidRegistrationResponse:
-        # Covers both a malformed credential and a failed attestation (py_webauthn
-        # wraps parse failures too). Fail closed; the deferred challenge burn rolls
-        # back so an honest retry of the SAME ceremony is possible.
+    except InvalidJSONStructure as exc:
+        # Not a registration response at all (no rawId/response). Was an uncaught
+        # 500 until the service sealed its exception surface. The burn rolls back
+        # as below. Causes are logged with %r: py_webauthn's messages can quote
+        # caller text (an origin), and %r keeps a newline in it from forging lines.
         await session.rollback()
-        log.warning("passkey.register.finish: REJECT attestation verification failed state=%s",
-                    _short(req.state))
+        log.warning("passkey.register.finish: REJECT malformed credential state=%s: %r",
+                    _short(req.state), str(exc)[:200])
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, "malformed passkey credential")
+    except InvalidRegistrationResponse as exc:
+        # Every other refusal of the response, however deep in py_webauthn it was
+        # raised: the service folds them all into this one type. Fail closed; the
+        # deferred challenge burn rolls back so an honest retry of the SAME
+        # ceremony is possible.
+        await session.rollback()
+        log.warning("passkey.register.finish: REJECT attestation verification failed "
+                    "state=%s: %r", _short(req.state), str(exc)[:200])
         raise HTTPException(
             status.HTTP_401_UNAUTHORIZED, "passkey registration verification failed")
     try:
@@ -620,13 +631,20 @@ async def passkey_add_finish(
     try:
         material = passkey_service.verify_registration(
             raw_challenge=raw, credential=req.credential)
-    except InvalidRegistrationResponse:
+    except InvalidJSONStructure as exc:
         await session.rollback()
-        log.warning("passkey.add.finish: REJECT attestation verification failed state=%s user=%s",
-                    _short(req.state), uid)
+        log.warning("passkey.add.finish: REJECT malformed credential state=%s user=%s: %r",
+                    _short(req.state), uid, str(exc)[:200])
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, "malformed passkey credential")
+    except InvalidRegistrationResponse as exc:
+        await session.rollback()
+        log.warning("passkey.add.finish: REJECT attestation verification failed "
+                    "state=%s user=%s: %r", _short(req.state), uid, str(exc)[:200])
         raise HTTPException(
             status.HTTP_401_UNAUTHORIZED, "passkey registration verification failed")
     try:
+        # link_passkey_credential COMMITS (the link and the challenge burn) itself.
         await users_service.link_passkey_credential(
             session, user_id=uid, material=material)
     except IntegrityError:
@@ -665,13 +683,16 @@ async def passkey_authenticate_finish(
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST, "invalid or expired passkey challenge")
     try:
-        cred_id = passkey_service.credential_id_of(req.credential)
-    except (KeyError, TypeError, ValueError):
+        # Parse BEFORE the lookup: a malformed body is a 400 whether or not its
+        # credential id exists, so the status can't confirm an id.
+        assertion = passkey_service.parse_assertion(req.credential)
+    except InvalidJSONStructure as exc:
         await session.rollback()
-        log.warning("passkey.authenticate.finish: REJECT malformed credential state=%s",
-                    _short(req.state))
+        log.warning("passkey.authenticate.finish: REJECT malformed credential state=%s: %r",
+                    _short(req.state), str(exc)[:200])
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST, "malformed passkey credential")
+    cred_id = passkey_service.credential_id_of(assertion)
     cred = await passkey_service.get_credential(session, cred_id)
     if cred is None:
         await session.rollback()
@@ -681,12 +702,12 @@ async def passkey_authenticate_finish(
             status.HTTP_401_UNAUTHORIZED, "unknown passkey credential")
     try:
         new_count = passkey_service.verify_authentication(
-            raw_challenge=raw, credential=req.credential,
+            raw_challenge=raw, assertion=assertion,
             public_key_b64=cred.public_key, current_sign_count=cred.sign_count)
-    except InvalidAuthenticationResponse:
+    except InvalidAuthenticationResponse as exc:
         await session.rollback()
         log.warning("passkey.authenticate.finish: REJECT assertion verification failed "
-                    "cred=%s state=%s", _short(cred_id), _short(req.state))
+                    "cred=%s state=%s: %r", _short(cred_id), _short(req.state), str(exc)[:200])
         raise HTTPException(
             status.HTTP_401_UNAUTHORIZED, "passkey authentication verification failed")
     user = await users_service.get_by_id(session, cred.user_id)
