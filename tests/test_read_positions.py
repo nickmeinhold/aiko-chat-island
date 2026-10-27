@@ -7,11 +7,18 @@ WINS when two devices disagree, and that mark-as-unread survives it.
 from __future__ import annotations
 
 import pytest
+import pytest_asyncio
+from fastapi import FastAPI
+from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select, text
 
+from aiko_gateway.domain import channels_service, security
 from aiko_gateway.domain import read_positions_service as svc
 from aiko_gateway.domain.models import ChannelReadPosition, Channel, User
 from aiko_gateway.domain.ids import new_ulid
+from aiko_gateway.rest import read_positions as read_position_routes
+from aiko_gateway.rest.deps import get_session
+from aiko_gateway.rest.errors import register_error_handlers
 
 
 def _ulid(n: int) -> str:
@@ -163,7 +170,15 @@ async def test_the_empty_floor_is_a_VALUE_not_a_missing_one(session):
     assert ch.id in got  # present, not absent
 
 
-@pytest.mark.parametrize("bad_last_read", ["short", "x" * 27, "!" * 26])
+@pytest.mark.parametrize("bad_last_read", [
+    "short", "x" * 27, "!" * 26,
+    # Crockford-valid letters, but a first character above 7: no real ULID starts
+    # there, and these sort above every real one (the unread-freezing value).
+    "Z" * 26, "8" + "0" * 25,
+    "0" * 25 + "a",   # lowercase: not canonical
+    "0" * 25 + "I",   # I, L, O and U are not in Crockford's alphabet
+    "0" * 25 + "\u00e9",  # isalnum() accepted Unicode letters
+])
 async def test_a_malformed_last_read_is_refused(session, bad_last_read):
     """Not cosmetic: the app sorts watermarks lexicographically, so a value above
     every real ULID pins a bad monotonic floor and freezes unread at zero forever
@@ -225,3 +240,104 @@ async def test_the_db_itself_refuses_a_negative_seq(session):
     assert "ck_channel_read_positions_seq" in str(exc.value) or "CHECK" in str(
         exc.value), (
         f"the row was refused, but not demonstrably by the seq CHECK: {exc.value}")
+
+
+# ---------------------------------------------------------------------------
+# #429 review fixes: canonical ULIDs, bounded seq, existence in the write
+# ---------------------------------------------------------------------------
+
+async def test_a_real_ulid_is_accepted(session):
+    """The tightened check must still accept what the island actually mints."""
+    u = await _user(session, "alice")
+    ch = await _channel(session)
+    real = new_ulid()
+    await svc.set_positions(session, user_id=u.id, positions={ch.id: (real, 1)})
+    assert await svc.get_positions(session, user_id=u.id) == {ch.id: (real, 1)}
+
+
+async def test_seq_is_bounded_by_sqlite_integer(session):
+    """2**63 overflowed SQLite's INTEGER inside the driver (a 500). The largest
+    value SQLite holds is accepted; one past it is refused as a bad position."""
+    u = await _user(session, "alice")
+    ch = await _channel(session)
+    await svc.set_positions(session, user_id=u.id,
+                            positions={ch.id: (_ulid(10), 2**63 - 1)})
+    with pytest.raises(svc.InvalidReadPosition):
+        await svc.set_positions(session, user_id=u.id,
+                                positions={ch.id: (_ulid(10), 2**63)})
+
+
+async def test_an_unknown_channel_is_SKIPPED_and_the_rest_is_stored(session):
+    """Skipped, not refused: a batch is all-or-nothing, so refusing would let one
+    deleted channel block every future sync from a device that remembers it."""
+    u = await _user(session, "alice")
+    ch = await _channel(session)
+    await svc.set_positions(session, user_id=u.id, positions={
+        ch.id: (_ulid(10), 1), "no-such-channel": (_ulid(20), 1)})
+    assert await svc.get_positions(session, user_id=u.id) == {ch.id: (_ulid(10), 1)}
+    rows = (await session.execute(select(ChannelReadPosition))).scalars().all()
+    assert [r.channel_id for r in rows] == [ch.id]
+
+
+async def test_deleting_a_channel_removes_its_read_positions(session):
+    """FK is OFF in prod (ISL-0002): the owning service must clear the children."""
+    u = await _user(session, "alice")
+    keep = await _channel(session, "keep")
+    gone = await _channel(session, "gone")
+    await svc.set_positions(session, user_id=u.id, positions={
+        keep.id: (_ulid(10), 1), gone.id: (_ulid(20), 1)})
+    assert await channels_service.hard_delete_channel(session, "gone") is True
+    await session.commit()
+    assert await svc.get_positions(session, user_id=u.id) == {keep.id: (_ulid(10), 1)}
+
+
+# --- the wire, through the route ---------------------------------------------
+
+@pytest_asyncio.fixture
+async def client(session):
+    async def _override_session():
+        yield session
+
+    app = FastAPI()
+    register_error_handlers(app)
+    app.include_router(read_position_routes.router)
+    app.dependency_overrides[get_session] = _override_session
+    async with AsyncClient(transport=ASGITransport(app=app),
+                           base_url="http://test") as c:
+        yield c
+
+
+def _auth(user) -> dict:
+    return {"Authorization": f"Bearer {security.issue_access(user.id)}"}
+
+
+async def test_route_a_batch_with_the_empty_floor_is_204(client, session):
+    """The app tab's catch (#429): '' is a real watermark the app persists. A check
+    that refused it would 422 the whole batch, and that device would never sync."""
+    u = await _user(session, "alice")
+    c1 = await _channel(session, "one")
+    c2 = await _channel(session, "two")
+    r = await client.put("/v1/read-positions", headers=_auth(u), json={"positions": {
+        c1.id: {"last_read": "", "seq": 1},
+        c2.id: {"last_read": new_ulid(), "seq": 1}}})
+    assert r.status_code == 204, r.text
+    got = (await client.get("/v1/read-positions", headers=_auth(u))).json()
+    assert got["positions"][c1.id] == {"last_read": "", "seq": 1}
+    assert set(got["positions"]) == {c1.id, c2.id}
+
+
+async def test_route_an_oversized_seq_is_422_not_500(client, session):
+    u = await _user(session, "alice")
+    ch = await _channel(session)
+    r = await client.put("/v1/read-positions", headers=_auth(u), json={"positions": {
+        ch.id: {"last_read": "", "seq": 2**63}}})
+    assert r.status_code == 422, r.text
+
+
+async def test_route_an_unknown_channel_is_204_and_not_stored(client, session):
+    u = await _user(session, "alice")
+    r = await client.put("/v1/read-positions", headers=_auth(u), json={"positions": {
+        "no-such-channel": {"last_read": "", "seq": 1}}})
+    assert r.status_code == 204, r.text
+    got = (await client.get("/v1/read-positions", headers=_auth(u))).json()
+    assert got == {"positions": {}}

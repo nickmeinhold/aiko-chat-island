@@ -33,20 +33,42 @@ grants nothing, reveals nothing about the channel, and is only ever readable by
 its owner. Gating it on membership would mean a user who leaves a channel loses
 their place in it — and rejoining would silently resume from a stale watermark.
 The ACL that matters is on the MESSAGES, which is where it already is.
+
+THE CHANNEL MUST EXIST, AND A MISSING ONE IS SKIPPED, NOT REFUSED. Existence is a
+different question from membership: it is what keeps this table bounded by real
+data (users x channels) instead of by whatever ids a client invents, since FK is
+OFF in prod (ISL-0002) and the declared FK enforces nothing. It is decided INSIDE
+the upsert (``INSERT ... SELECT ... FROM channels WHERE id = ?``), so a channel
+deleted mid-write cannot leave an orphan; ``hard_delete_channel`` removes the rows
+that already exist. An unknown id is SKIPPED rather than refused because a batch
+is all-or-nothing: a device still holding a watermark for a channel someone has
+since deleted would otherwise have every future sync refused, and both sides
+would look healthy. That watermark can display nowhere, so dropping it loses
+nothing. A MALFORMED value is still refused: that is a broken client, not a stale
+one.
 """
 from __future__ import annotations
 
 import datetime as dt
 
-from sqlalchemy import select
+import re
+
+from sqlalchemy import literal, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .models import ChannelReadPosition
+from .models import Channel, ChannelReadPosition
 
-# A ULID is 26 chars; '' is the app's documented first-sight floor for a channel
-# that was empty at settle time (`channel_read_store.dart`), not a missing value.
-_ULID_LEN = 26
+# A CANONICAL ULID: uppercase Crockford base32, and a FIRST character of 0-7. The
+# app checks the alphabet (`channel_read_store.dart:44`) but not the first
+# character, and the first character is the one that matters here: 26 chars x 5
+# bits is 130 bits for a 128-bit value, so a real ULID's top two bits are zero and
+# it starts 0-7. "Z" * 26 is valid Crockford, sorts above every real ULID, and is
+# exactly the value that freezes a channel's unread count at zero.
+_CANONICAL_ULID = re.compile(r"[0-7][0-9A-HJKMNP-TV-Z]{25}")
+# SQLite's INTEGER is a signed 64-bit value; anything larger raised OverflowError
+# inside the driver (a 500), so it is refused here as a 422 instead.
+_MAX_SEQ = 2**63 - 1
 
 
 class InvalidReadPosition(Exception):
@@ -70,14 +92,15 @@ def _validate(channel_id: str, last_read: str, seq: int) -> None:
     """
     if not channel_id:
         raise InvalidReadPosition('channel_id must not be empty')
-    if last_read != '' and len(last_read) != _ULID_LEN:
+    # '' stays LEGAL: it is the app's first-sight floor, a real watermark it
+    # persists (`isSortableWatermark = ulid.isEmpty || regex`). Refusing it would
+    # refuse the whole all-or-nothing batch for any device with one empty channel.
+    if last_read != '' and not _CANONICAL_ULID.fullmatch(last_read):
         raise InvalidReadPosition(
-            f'last_read must be a 26-char ULID or the empty floor, got '
-            f'{len(last_read)} chars')
-    if not last_read.isalnum() and last_read != '':
-        raise InvalidReadPosition('last_read must be alphanumeric (ULID)')
-    if seq < 0:
-        raise InvalidReadPosition('seq must be >= 0')
+            "last_read must be a canonical ULID (uppercase Crockford, first "
+            "character 0-7) or the empty floor ''")
+    if not 0 <= seq <= _MAX_SEQ:
+        raise InvalidReadPosition(f'seq must be between 0 and {_MAX_SEQ}')
 
 
 async def set_positions(
@@ -92,7 +115,8 @@ async def set_positions(
     write after a newer one changes nothing, because the ``WHERE`` clause on the
     upsert refuses a non-increasing ``seq``. Every position is validated BEFORE
     anything is written, so a batch containing one bad entry stores none of it
-    rather than a prefix.
+    rather than a prefix. An entry for a channel that does not exist is skipped
+    (see the module docstring), and the rest of the batch is stored.
     """
     for channel_id, (last_read, seq) in positions.items():
         _validate(channel_id, last_read, seq)
@@ -101,14 +125,20 @@ async def set_positions(
         return
 
     now = dt.datetime.now(dt.timezone.utc)
+    cols = ChannelReadPosition.__table__.c
     for channel_id, (last_read, seq) in positions.items():
-        stmt = sqlite_insert(ChannelReadPosition).values(
-            user_id=user_id,
-            channel_id=channel_id,
-            last_read=last_read,
-            seq=seq,
-            updated_at=now,
-        )
+        # EXISTENCE IN THE WRITE: the row is selected FROM channels, so a channel
+        # that does not exist (or is deleted mid-write) yields no row to insert.
+        # A check-then-insert would leave the gap #410 is about.
+        source = select(
+            literal(user_id, cols.user_id.type),
+            Channel.id,
+            literal(last_read, cols.last_read.type),
+            literal(seq, cols.seq.type),
+            literal(now, cols.updated_at.type),
+        ).where(Channel.id == channel_id)
+        stmt = sqlite_insert(ChannelReadPosition).from_select(
+            ['user_id', 'channel_id', 'last_read', 'seq', 'updated_at'], source)
         # THE MERGE RULE, in the statement rather than around it. Without the
         # WHERE this is last-write-wins and the seq is decoration.
         stmt = stmt.on_conflict_do_update(

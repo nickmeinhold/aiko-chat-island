@@ -35,7 +35,8 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from . import dm_service, reactions_service
-from .models import Channel, Membership, Message, MessageReport, Retraction
+from .models import (
+    Channel, ChannelReadPosition, Membership, Message, MessageReport, Retraction)
 
 
 class ReservedDmChannel(Exception):
@@ -113,6 +114,10 @@ async def hard_delete_channel(session: AsyncSession, aiko_channel: str) -> bool:
         delete(MessageReport).where(MessageReport.message_id.in_(channel_msg_ids)))
     await reactions_service.purge_reactions_for_messages(session, channel_msg_ids)
     await session.execute(delete(Message).where(Message.channel_id == channel.id))
+    # Read positions (#358) FK the channel. Upserts can't create one for a
+    # missing channel, so this clears the ones that already exist.
+    await session.execute(
+        delete(ChannelReadPosition).where(ChannelReadPosition.channel_id == channel.id))
     await session.execute(delete(Channel).where(Channel.id == channel.id))
     await session.flush()  # caller owns commit (see module docstring)
     return True

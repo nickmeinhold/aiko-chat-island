@@ -62,7 +62,7 @@ class ReadPosition(BaseModel):
                     "channel that was empty at settle time. '' is a VALUE, not a "
                     "missing field.",
     )
-    seq: int = Field(ge=0)
+    seq: int = Field(ge=0, le=2**63 - 1)  # SQLite INTEGER is signed 64-bit
 
 
 class SetReadPositionsReq(BaseModel):
