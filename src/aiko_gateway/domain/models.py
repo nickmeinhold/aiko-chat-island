@@ -708,17 +708,14 @@ class ChannelReadPosition(Base):
     consequence is the one Nick named: two handsets disagree about what is unread
     until each is opened.
 
-    SEQ, NOT MAX-ON-ULID, and the reason is the whole design. The obvious merge —
-    keep the greatest `last_read` — makes MARK-AS-UNREAD IMPOSSIBLE: moving the
-    watermark backwards writes a LOWER ulid, which always loses to the stored one.
-    The app tab got this wrong first, Nick rejected it, and they corrected to a
-    client-supplied monotonic `seq`: a mark-as-unread writes a HIGHER seq carrying a
-    LOWER last_read, and wins. Verified here rather than taken on trust — the
-    argument is checkable and it holds.
-
-    So the merge rule is `seq`-max, and `last_read` is CARRIED not compared. A
-    write whose seq is not greater than the stored seq is a no-op, which makes the
-    endpoint idempotent and makes a stale device's late replay harmless.
+    `seq` IS THE ISLAND'S VERSION, ADVANCED BY COMPARE-AND-SWAP. A write names the
+    version it is editing (`base_seq`), and the island stores `base_seq + 1` only if
+    that is still the version it holds (PR #429's v2 contract). The first design,
+    where a client sent an absolute `seq` and the highest won, was dropped after
+    #429's round 1: a losing write looked like success, equal numbers resolved by
+    arrival order, and one huge value froze a channel forever. The island increments
+    but never orders edits. MARK-AS-UNREAD is an ordinary edit carrying an earlier
+    ULID; `last_read` is never compared, so it applies like any other.
 
     ONE ROW PER (user, channel). The PK leads with `user_id`, the INVERSE of
     `Membership` — deliberately. Every access path here is user-first ("my read
@@ -741,9 +738,8 @@ class ChannelReadPosition(Base):
     """
     __tablename__ = "channel_read_positions"
     __table_args__ = (
-        # A negative seq cannot be a monotonic counter, and a client that sends
-        # one is either buggy or probing. Refusing at the column means the merge
-        # rule below never has to reason about it.
+        # Versions start at 1 and only ever go up by one. Refusing a negative at
+        # the column means nothing above it has to reason about one.
         CheckConstraint("seq >= 0", name="ck_channel_read_positions_seq"),
         # The PK leads with user_id (every read is "my positions"), so a lookup by
         # channel alone, which hard_delete_channel does, needs its own index: the
@@ -756,9 +752,8 @@ class ChannelReadPosition(Base):
     # A 26-char ULID, or '' (the first-sight floor). NOT a closed set, so it is
     # correctly absent from test_closed_set_guard's vocabulary shapes.
     last_read: Mapped[str] = mapped_column(String(26), nullable=False)
-    # CLIENT-SUPPLIED monotonic version. The island never mints it: the island
-    # cannot order two devices' edits, which is the entire reason the client owns
-    # the counter.
+    # The island's version of this row: 1 on the first write, +1 per applied
+    # compare-and-swap. Clients never write it directly (they send base_seq).
     seq: Mapped[int] = mapped_column(Integer, nullable=False)
     updated_at: Mapped[dt.datetime] = mapped_column(UtcDateTime, default=_utcnow)
 

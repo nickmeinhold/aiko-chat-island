@@ -1,8 +1,10 @@
-"""Read positions — the island half of #4834a.
+"""Read positions — the island half of #358, under the v2 contract (compare-and-
+swap; PR #429's v2 comment is the one statement of it).
 
-THE TESTS THAT MATTER ARE THE MERGE ONES. A store that keeps what it was last
-told is trivially correct and trivially wrong; the whole design is which write
-WINS when two devices disagree, and that mark-as-unread survives it.
+THE TESTS THAT MATTER ARE THE CONFLICT ONES. A store that keeps what it was last
+told is trivially correct and trivially wrong. The design is what happens when two
+devices disagree: the one that loses must be TOLD, with the value that won, and no
+client can choose a version that beats everyone forever.
 """
 from __future__ import annotations
 
@@ -20,10 +22,12 @@ from aiko_gateway.rest import read_positions as read_position_routes
 from aiko_gateway.rest.deps import get_session
 from aiko_gateway.rest.errors import register_error_handlers
 
+APPLIED, CONFLICT, SKIPPED = svc.Outcome.APPLIED, svc.Outcome.CONFLICT, svc.Outcome.SKIPPED
+
 
 def _ulid(n: int) -> str:
-    """A sortable 26-char ULID-shaped id. Lexicographic order tracks n, which is
-    what the mark-as-unread test needs to express 'an EARLIER message'."""
+    """A canonical 26-char ULID whose lexicographic order tracks n, which is what
+    the mark-as-unread test needs to express 'an EARLIER message'."""
     return str(n).rjust(26, "0")
 
 
@@ -43,81 +47,100 @@ async def _channel(session, name: str = "general") -> Channel:
     return ch
 
 
+async def _put(session, user, positions):
+    return await svc.set_positions(session, user_id=user.id, positions=positions)
+
+
 # ---------------------------------------------------------------------------
-# the merge rule
+# compare-and-swap
 # ---------------------------------------------------------------------------
 
-async def test_a_higher_seq_wins(session):
-    u = await _user(session, "alice")
-    ch = await _channel(session)
-    await svc.set_positions(session, user_id=u.id,
-                            positions={ch.id: (_ulid(10), 1)})
-    await svc.set_positions(session, user_id=u.id,
-                            positions={ch.id: (_ulid(20), 2)})
-    assert await svc.get_positions(session, user_id=u.id) == {
-        ch.id: (_ulid(20), 2)}
+async def test_a_first_write_is_applied_at_version_1(session):
+    u, ch = await _user(session, "alice"), await _channel(session)
+    r = await _put(session, u, {ch.id: (_ulid(10), 0)})
+    assert r == {ch.id: svc.EntryResult(APPLIED, _ulid(10), 1)}
+    assert await svc.get_positions(session, user_id=u.id) == {ch.id: (_ulid(10), 1)}
 
 
-async def test_MARK_AS_UNREAD_survives_the_merge(session):
-    """A LOWER last_read with a HIGHER seq must WIN. This is the whole design.
-
-    Merging by max(ULID) — the obvious rule, and the app tab's first proposal,
-    which Nick rejected — makes this impossible: moving the watermark backwards
-    writes a lower ULID that always loses to the stored one, so a user can never
-    mark a channel unread again from any device. The explicit seq is what buys
-    it back, and this test is the reason the column exists.
-    """
-    u = await _user(session, "alice")
-    ch = await _channel(session)
-    await svc.set_positions(session, user_id=u.id,
-                            positions={ch.id: (_ulid(50), 1)})
-    # The user marks it unread: an EARLIER position, a LATER version.
-    await svc.set_positions(session, user_id=u.id,
-                            positions={ch.id: (_ulid(10), 2)})
-    assert await svc.get_positions(session, user_id=u.id) == {
-        ch.id: (_ulid(10), 2)}, "mark-as-unread was swallowed by the merge"
+async def test_a_write_on_the_current_version_is_applied_and_advances_it(session):
+    u, ch = await _user(session, "alice"), await _channel(session)
+    await _put(session, u, {ch.id: (_ulid(10), 0)})
+    r = await _put(session, u, {ch.id: (_ulid(20), 1)})
+    assert r[ch.id] == svc.EntryResult(APPLIED, _ulid(20), 2)
 
 
-async def test_a_stale_devices_late_replay_is_a_no_op(session):
-    """Device B synced first; device A's older write arrives after. Nothing moves.
-
-    This is the ordering the island cannot control — it sees network order, not
-    causal order — and it is why the client owns the counter.
-    """
-    u = await _user(session, "alice")
-    ch = await _channel(session)
-    await svc.set_positions(session, user_id=u.id,
-                            positions={ch.id: (_ulid(20), 5)})
-    await svc.set_positions(session, user_id=u.id,
-                            positions={ch.id: (_ulid(99), 3)})  # older device
-    assert await svc.get_positions(session, user_id=u.id) == {
-        ch.id: (_ulid(20), 5)}
+async def test_the_LOSER_of_a_race_is_told_the_winner(session):
+    """Two devices both saw version 1. The first write applies; the second is a
+    CONFLICT carrying the value that won, so the losing device converges in the
+    same round trip. Under the first design this was a silent 204 (#429 r1)."""
+    u, ch = await _user(session, "alice"), await _channel(session)
+    await _put(session, u, {ch.id: (_ulid(10), 0)})
+    phone = await _put(session, u, {ch.id: (_ulid(30), 1)})
+    tablet = await _put(session, u, {ch.id: (_ulid(20), 1)})
+    assert phone[ch.id] == svc.EntryResult(APPLIED, _ulid(30), 2)
+    assert tablet[ch.id] == svc.EntryResult(CONFLICT, _ulid(30), 2), (
+        "the losing device must learn what the island holds, including its seq")
+    assert await svc.get_positions(session, user_id=u.id) == {ch.id: (_ulid(30), 2)}
 
 
-async def test_an_equal_seq_does_not_overwrite(session):
-    """Strictly greater, not >=. Two devices that both reached seq 4 independently
-    have no ordering between them, and picking the later arrival would be
-    last-write-wins wearing a version number."""
-    u = await _user(session, "alice")
-    ch = await _channel(session)
-    await svc.set_positions(session, user_id=u.id,
-                            positions={ch.id: (_ulid(20), 4)})
-    await svc.set_positions(session, user_id=u.id,
-                            positions={ch.id: (_ulid(77), 4)})
-    assert await svc.get_positions(session, user_id=u.id) == {
-        ch.id: (_ulid(20), 4)}
+async def test_MARK_AS_UNREAD_is_an_ordinary_edit(session):
+    """An EARLIER ULID on the current version applies. Nothing compares ULIDs, so
+    moving the watermark backwards is never refused for being backwards."""
+    u, ch = await _user(session, "alice"), await _channel(session)
+    await _put(session, u, {ch.id: (_ulid(50), 0)})
+    r = await _put(session, u, {ch.id: (_ulid(10), 1)})
+    assert r[ch.id] == svc.EntryResult(APPLIED, _ulid(10), 2), (
+        "mark-as-unread was refused")
 
 
-async def test_replaying_the_same_write_is_idempotent(session):
-    u = await _user(session, "alice")
-    ch = await _channel(session)
-    for _ in range(3):
-        await svc.set_positions(session, user_id=u.id,
-                                positions={ch.id: (_ulid(20), 2)})
-    rows = (await session.execute(
-        select(ChannelReadPosition).where(
-            ChannelReadPosition.user_id == u.id))).scalars().all()
-    assert len(rows) == 1
+async def test_a_stale_base_writes_nothing(session):
+    u, ch = await _user(session, "alice"), await _channel(session)
+    await _put(session, u, {ch.id: (_ulid(10), 0)})
+    await _put(session, u, {ch.id: (_ulid(20), 1)})
+    r = await _put(session, u, {ch.id: (_ulid(99), 1)})  # still thinks it's v1
+    assert r[ch.id] == svc.EntryResult(CONFLICT, _ulid(20), 2)
+    assert await svc.get_positions(session, user_id=u.id) == {ch.id: (_ulid(20), 2)}
+
+
+async def test_a_base_of_0_against_an_existing_row_is_a_conflict(session):
+    """A second device's first write must not clobber the first device's."""
+    u, ch = await _user(session, "alice"), await _channel(session)
+    await _put(session, u, {ch.id: (_ulid(10), 0)})
+    r = await _put(session, u, {ch.id: (_ulid(77), 0)})
+    assert r[ch.id] == svc.EntryResult(CONFLICT, _ulid(10), 1)
+
+
+async def test_a_base_ahead_of_a_missing_row_is_a_conflict_at_version_0(session):
+    """No row is version 0: a client whose base names a version the island no
+    longer holds is told 0, and can resend from there."""
+    u, ch = await _user(session, "alice"), await _channel(session)
+    r = await _put(session, u, {ch.id: (_ulid(10), 5)})
+    assert r[ch.id] == svc.EntryResult(CONFLICT, None, 0)
+    assert await svc.get_positions(session, user_id=u.id) == {}
+
+
+async def test_a_retried_write_whose_reply_was_lost_reports_applied(session):
+    """A phone's PUT lands but the reply is lost; it retries the same body. The
+    island already holds exactly that write's result, so the retry says applied
+    rather than handing the phone a conflict carrying its own value."""
+    u, ch = await _user(session, "alice"), await _channel(session)
+    await _put(session, u, {ch.id: (_ulid(10), 0)})
+    first = await _put(session, u, {ch.id: (_ulid(20), 1)})
+    retry = await _put(session, u, {ch.id: (_ulid(20), 1)})
+    assert first[ch.id] == retry[ch.id] == svc.EntryResult(APPLIED, _ulid(20), 2)
+    assert await svc.get_positions(session, user_id=u.id) == {ch.id: (_ulid(20), 2)}
+
+
+async def test_no_client_can_choose_a_version_that_wins_forever(session):
+    """The first design's freeze: one client sent seq near 2**63, won, and nothing
+    could beat it. Now a client never sends a version, only the base it saw, and
+    a base beyond the island's range is malformed."""
+    u, ch = await _user(session, "alice"), await _channel(session)
+    with pytest.raises(svc.InvalidReadPosition):
+        await _put(session, u, {ch.id: (_ulid(10), svc.MAX_BASE_SEQ + 1)})
+    r = await _put(session, u, {ch.id: (_ulid(10), svc.MAX_BASE_SEQ)})
+    assert r[ch.id] == svc.EntryResult(CONFLICT, None, 0), (
+        "a huge base must not be able to create or move a row")
 
 
 # ---------------------------------------------------------------------------
@@ -125,27 +148,20 @@ async def test_replaying_the_same_write_is_idempotent(session):
 # ---------------------------------------------------------------------------
 
 async def test_positions_are_per_user(session):
-    a = await _user(session, "alice")
-    b = await _user(session, "bob")
+    a, b = await _user(session, "alice"), await _user(session, "bob")
     ch = await _channel(session)
-    await svc.set_positions(session, user_id=a.id,
-                            positions={ch.id: (_ulid(10), 1)})
-    await svc.set_positions(session, user_id=b.id,
-                            positions={ch.id: (_ulid(90), 1)})
-    assert await svc.get_positions(session, user_id=a.id) == {
-        ch.id: (_ulid(10), 1)}
-    assert await svc.get_positions(session, user_id=b.id) == {
-        ch.id: (_ulid(90), 1)}
+    await _put(session, a, {ch.id: (_ulid(10), 0)})
+    await _put(session, b, {ch.id: (_ulid(90), 0)})
+    assert await svc.get_positions(session, user_id=a.id) == {ch.id: (_ulid(10), 1)}
+    assert await svc.get_positions(session, user_id=b.id) == {ch.id: (_ulid(90), 1)}
 
 
 async def test_positions_are_per_channel(session):
     u = await _user(session, "alice")
-    c1 = await _channel(session, "one")
-    c2 = await _channel(session, "two")
-    await svc.set_positions(session, user_id=u.id, positions={
-        c1.id: (_ulid(10), 1), c2.id: (_ulid(20), 1)})
-    got = await svc.get_positions(session, user_id=u.id)
-    assert got == {c1.id: (_ulid(10), 1), c2.id: (_ulid(20), 1)}
+    c1, c2 = await _channel(session, "one"), await _channel(session, "two")
+    await _put(session, u, {c1.id: (_ulid(10), 0), c2.id: (_ulid(20), 0)})
+    assert await svc.get_positions(session, user_id=u.id) == {
+        c1.id: (_ulid(10), 1), c2.id: (_ulid(20), 1)}
 
 
 async def test_no_positions_is_an_empty_map_not_an_error(session):
@@ -162,12 +178,18 @@ async def test_the_empty_floor_is_a_VALUE_not_a_missing_one(session):
     (channel_read_store.dart). Storing it must work, and must be distinguishable
     from no row at all — an absence with two causes is the defect class this repo
     keeps re-finding."""
-    u = await _user(session, "alice")
-    ch = await _channel(session)
-    await svc.set_positions(session, user_id=u.id, positions={ch.id: ("", 1)})
+    u, ch = await _user(session, "alice"), await _channel(session)
+    await _put(session, u, {ch.id: ("", 0)})
     got = await svc.get_positions(session, user_id=u.id)
     assert got == {ch.id: ("", 1)}
-    assert ch.id in got  # present, not absent
+
+
+async def test_a_real_ulid_is_accepted(session):
+    """The check must still accept what the island actually mints."""
+    u, ch = await _user(session, "alice"), await _channel(session)
+    real = new_ulid()
+    r = await _put(session, u, {ch.id: (real, 0)})
+    assert r[ch.id] == svc.EntryResult(APPLIED, real, 1)
 
 
 @pytest.mark.parametrize("bad_last_read", [
@@ -177,44 +199,68 @@ async def test_the_empty_floor_is_a_VALUE_not_a_missing_one(session):
     "Z" * 26, "8" + "0" * 25,
     "0" * 25 + "a",   # lowercase: not canonical
     "0" * 25 + "I",   # I, L, O and U are not in Crockford's alphabet
-    "0" * 25 + "\u00e9",  # isalnum() accepted Unicode letters
+    "0" * 25 + "é",  # isalnum() accepted Unicode letters
 ])
 async def test_a_malformed_last_read_is_refused(session, bad_last_read):
-    """Not cosmetic: the app sorts watermarks lexicographically, so a value above
-    every real ULID pins a bad monotonic floor and freezes unread at zero forever
-    (cage-match #109). The app refuses it at its end; this is the other end."""
-    u = await _user(session, "alice")
-    ch = await _channel(session)
+    u, ch = await _user(session, "alice"), await _channel(session)
     with pytest.raises(svc.InvalidReadPosition):
-        await svc.set_positions(session, user_id=u.id,
-                                positions={ch.id: (bad_last_read, 1)})
+        await _put(session, u, {ch.id: (bad_last_read, 0)})
 
 
-async def test_a_negative_seq_is_refused(session):
-    u = await _user(session, "alice")
-    ch = await _channel(session)
+async def test_a_negative_base_is_refused(session):
+    u, ch = await _user(session, "alice"), await _channel(session)
     with pytest.raises(svc.InvalidReadPosition):
-        await svc.set_positions(session, user_id=u.id,
-                                positions={ch.id: (_ulid(10), -1)})
+        await _put(session, u, {ch.id: (_ulid(10), -1)})
 
 
-async def test_one_bad_entry_stores_NONE_of_the_batch(session):
-    """A partial store would leave the client believing a sync succeeded while
-    some channels silently kept an old watermark — worse than a refusal, because
-    it is invisible."""
+async def test_a_refusal_names_the_channel(session):
+    """So a client can find and drop the one bad entry (Tesla, #429 r1)."""
     u = await _user(session, "alice")
-    c1 = await _channel(session, "one")
-    c2 = await _channel(session, "two")
+    c1, c2 = await _channel(session, "one"), await _channel(session, "two")
+    with pytest.raises(svc.InvalidReadPosition) as exc:
+        await _put(session, u, {c1.id: (_ulid(10), 0), c2.id: ("nope", 0)})
+    assert exc.value.channel_id == c2.id
+    assert c2.id in str(exc.value)
+
+
+async def test_one_malformed_entry_stores_NONE_of_the_batch(session):
+    u = await _user(session, "alice")
+    c1, c2 = await _channel(session, "one"), await _channel(session, "two")
     with pytest.raises(svc.InvalidReadPosition):
-        await svc.set_positions(session, user_id=u.id, positions={
-            c1.id: (_ulid(10), 1), c2.id: ("nope", 1)})
+        await _put(session, u, {c1.id: (_ulid(10), 0), c2.id: ("nope", 0)})
     assert await svc.get_positions(session, user_id=u.id) == {}
 
 
 async def test_an_empty_batch_is_a_no_op(session):
     u = await _user(session, "alice")
-    await svc.set_positions(session, user_id=u.id, positions={})
+    assert await _put(session, u, {}) == {}
     assert await svc.get_positions(session, user_id=u.id) == {}
+
+
+# ---------------------------------------------------------------------------
+# existence, and the channel cascade
+# ---------------------------------------------------------------------------
+
+async def test_an_unknown_channel_is_SKIPPED_and_the_rest_is_stored(session):
+    """Skipped, not refused: malformed entries refuse the whole batch, so refusing
+    a merely STALE one would let one deleted channel block every future sync."""
+    u, ch = await _user(session, "alice"), await _channel(session)
+    r = await _put(session, u, {ch.id: (_ulid(10), 0),
+                                "no-such-channel": (_ulid(20), 0)})
+    assert r == {ch.id: svc.EntryResult(APPLIED, _ulid(10), 1),
+                 "no-such-channel": svc.EntryResult(SKIPPED)}
+    rows = (await session.execute(select(ChannelReadPosition))).scalars().all()
+    assert [r.channel_id for r in rows] == [ch.id]
+
+
+async def test_deleting_a_channel_removes_its_read_positions(session):
+    """FK is OFF in prod (ISL-0002): the owning service must clear the children."""
+    u = await _user(session, "alice")
+    keep, gone = await _channel(session, "keep"), await _channel(session, "gone")
+    await _put(session, u, {keep.id: (_ulid(10), 0), gone.id: (_ulid(20), 0)})
+    assert await channels_service.hard_delete_channel(session, "gone") is True
+    await session.commit()
+    assert await svc.get_positions(session, user_id=u.id) == {keep.id: (_ulid(10), 1)}
 
 
 # ---------------------------------------------------------------------------
@@ -222,14 +268,8 @@ async def test_an_empty_batch_is_a_no_op(session):
 # ---------------------------------------------------------------------------
 
 async def test_the_db_itself_refuses_a_negative_seq(session):
-    """The service refuses first; this proves the column would too.
-
-    Same posture as every other closed-set/range guard in this schema: a gate the
-    service alone enforces is a gate the next caller can walk past — which is the
-    hole 0028 was written to close for message_reports.reason.
-    """
-    u = await _user(session, "alice")
-    ch = await _channel(session)
+    """The service refuses first; this proves the column would too."""
+    u, ch = await _user(session, "alice"), await _channel(session)
     with pytest.raises(Exception) as exc:
         await session.execute(text(
             "INSERT INTO channel_read_positions "
@@ -243,55 +283,8 @@ async def test_the_db_itself_refuses_a_negative_seq(session):
 
 
 # ---------------------------------------------------------------------------
-# #429 review fixes: canonical ULIDs, bounded seq, existence in the write
+# the wire, through the route
 # ---------------------------------------------------------------------------
-
-async def test_a_real_ulid_is_accepted(session):
-    """The tightened check must still accept what the island actually mints."""
-    u = await _user(session, "alice")
-    ch = await _channel(session)
-    real = new_ulid()
-    await svc.set_positions(session, user_id=u.id, positions={ch.id: (real, 1)})
-    assert await svc.get_positions(session, user_id=u.id) == {ch.id: (real, 1)}
-
-
-async def test_seq_is_bounded_by_sqlite_integer(session):
-    """2**63 overflowed SQLite's INTEGER inside the driver (a 500). The largest
-    value SQLite holds is accepted; one past it is refused as a bad position."""
-    u = await _user(session, "alice")
-    ch = await _channel(session)
-    await svc.set_positions(session, user_id=u.id,
-                            positions={ch.id: (_ulid(10), 2**63 - 1)})
-    with pytest.raises(svc.InvalidReadPosition):
-        await svc.set_positions(session, user_id=u.id,
-                                positions={ch.id: (_ulid(10), 2**63)})
-
-
-async def test_an_unknown_channel_is_SKIPPED_and_the_rest_is_stored(session):
-    """Skipped, not refused: a batch is all-or-nothing, so refusing would let one
-    deleted channel block every future sync from a device that remembers it."""
-    u = await _user(session, "alice")
-    ch = await _channel(session)
-    await svc.set_positions(session, user_id=u.id, positions={
-        ch.id: (_ulid(10), 1), "no-such-channel": (_ulid(20), 1)})
-    assert await svc.get_positions(session, user_id=u.id) == {ch.id: (_ulid(10), 1)}
-    rows = (await session.execute(select(ChannelReadPosition))).scalars().all()
-    assert [r.channel_id for r in rows] == [ch.id]
-
-
-async def test_deleting_a_channel_removes_its_read_positions(session):
-    """FK is OFF in prod (ISL-0002): the owning service must clear the children."""
-    u = await _user(session, "alice")
-    keep = await _channel(session, "keep")
-    gone = await _channel(session, "gone")
-    await svc.set_positions(session, user_id=u.id, positions={
-        keep.id: (_ulid(10), 1), gone.id: (_ulid(20), 1)})
-    assert await channels_service.hard_delete_channel(session, "gone") is True
-    await session.commit()
-    assert await svc.get_positions(session, user_id=u.id) == {keep.id: (_ulid(10), 1)}
-
-
-# --- the wire, through the route ---------------------------------------------
 
 @pytest_asyncio.fixture
 async def client(session):
@@ -311,45 +304,77 @@ def _auth(user) -> dict:
     return {"Authorization": f"Bearer {security.issue_access(user.id)}"}
 
 
-async def test_route_a_batch_with_the_empty_floor_is_204(client, session):
+async def _rput(client, user, positions):
+    return await client.put("/v1/read-positions", headers=_auth(user),
+                            json={"positions": positions})
+
+
+async def test_route_reply_carries_every_outcome(client, session):
+    """The wire shape the app tab builds against: per entry, a status and (unless
+    skipped) the value the island now holds. A conflict carries the STORED seq,
+    which the client needs to resend (app tab, #429)."""
+    u = await _user(session, "alice")
+    c1, c2 = await _channel(session, "one"), await _channel(session, "two")
+    await _rput(client, u, {c2.id: {"last_read": _ulid(5), "base_seq": 0}})
+    r = await _rput(client, u, {
+        c1.id: {"last_read": _ulid(10), "base_seq": 0},
+        c2.id: {"last_read": _ulid(99), "base_seq": 7},
+        "no-such-channel": {"last_read": "", "base_seq": 0}})
+    assert r.status_code == 200, r.text
+    assert r.json() == {"positions": {
+        c1.id: {"status": "applied", "last_read": _ulid(10), "seq": 1},
+        c2.id: {"status": "conflict", "last_read": _ulid(5), "seq": 1},
+        "no-such-channel": {"status": "skipped"}}}
+
+
+async def test_route_a_conflict_with_nothing_stored_is_version_0(client, session):
+    u, ch = await _user(session, "alice"), await _channel(session)
+    r = await _rput(client, u, {ch.id: {"last_read": "", "base_seq": 3}})
+    assert r.json()["positions"][ch.id] == {
+        "status": "conflict", "last_read": None, "seq": 0}
+
+
+async def test_route_a_first_design_body_is_a_loud_422(client, session):
+    """`seq` instead of `base_seq` must not be silently misread: an unknown key is
+    ignored, so the missing required base_seq is what makes this loud."""
+    u, ch = await _user(session, "alice"), await _channel(session)
+    r = await _rput(client, u, {ch.id: {"last_read": "", "seq": 1}})
+    assert r.status_code == 422, r.text
+    assert await svc.get_positions(session, user_id=u.id) == {}
+
+
+async def test_route_a_batch_with_the_empty_floor_is_applied(client, session):
     """The app tab's catch (#429): '' is a real watermark the app persists. A check
     that refused it would 422 the whole batch, and that device would never sync."""
     u = await _user(session, "alice")
-    c1 = await _channel(session, "one")
-    c2 = await _channel(session, "two")
-    r = await client.put("/v1/read-positions", headers=_auth(u), json={"positions": {
-        c1.id: {"last_read": "", "seq": 1},
-        c2.id: {"last_read": new_ulid(), "seq": 1}}})
-    assert r.status_code == 204, r.text
+    c1, c2 = await _channel(session, "one"), await _channel(session, "two")
+    r = await _rput(client, u, {c1.id: {"last_read": "", "base_seq": 0},
+                                c2.id: {"last_read": new_ulid(), "base_seq": 0}})
+    assert r.status_code == 200, r.text
+    assert {v["status"] for v in r.json()["positions"].values()} == {"applied"}
     got = (await client.get("/v1/read-positions", headers=_auth(u))).json()
     assert got["positions"][c1.id] == {"last_read": "", "seq": 1}
-    assert set(got["positions"]) == {c1.id, c2.id}
 
 
-async def test_route_an_oversized_seq_is_422_not_500(client, session):
-    u = await _user(session, "alice")
-    ch = await _channel(session)
-    r = await client.put("/v1/read-positions", headers=_auth(u), json={"positions": {
-        ch.id: {"last_read": "", "seq": 2**63}}})
+async def test_route_a_malformed_entry_is_422_naming_the_channel(client, session):
+    u, ch = await _user(session, "alice"), await _channel(session)
+    r = await _rput(client, u, {ch.id: {"last_read": "Z" * 26, "base_seq": 0}})
     assert r.status_code == 422, r.text
+    assert ch.id in r.text
 
 
-async def test_route_an_unknown_channel_is_204_and_not_stored(client, session):
-    u = await _user(session, "alice")
-    r = await client.put("/v1/read-positions", headers=_auth(u), json={"positions": {
-        "no-such-channel": {"last_read": "", "seq": 1}}})
-    assert r.status_code == 204, r.text
-    got = (await client.get("/v1/read-positions", headers=_auth(u))).json()
-    assert got == {"positions": {}}
+async def test_route_an_oversized_base_is_422_not_500(client, session):
+    u, ch = await _user(session, "alice"), await _channel(session)
+    r = await _rput(client, u, {ch.id: {"last_read": "", "base_seq": 2**63}})
+    assert r.status_code == 422, r.text
 
 
 async def test_route_a_batch_over_the_cap_is_422(client, session):
     """The 1000-entry cap is a pydantic `Field(max_length=...)` on a dict: pin
     that it is live on the pinned pydantic rather than decorative."""
     u = await _user(session, "alice")
-    over = {f"c{i}": {"last_read": "", "seq": 1} for i in range(1001)}
-    r = await client.put("/v1/read-positions", headers=_auth(u),
-                         json={"positions": over})
+    over = {f"c{i}": {"last_read": "", "base_seq": 0} for i in range(1001)}
+    r = await _rput(client, u, over)
     assert r.status_code == 422, r.text
 
 
@@ -358,10 +383,8 @@ async def test_route_put_is_rate_limited_per_user(client, session, monkeypatch):
     persist behind it (#429 r1). The 61st PUT in a window is refused."""
     from aiko_gateway.config import settings
     monkeypatch.setattr(settings, "rate_limit_enabled", True)
-    u = await _user(session, "alice")
-    ch = await _channel(session)
-    body = {"positions": {ch.id: {"last_read": "", "seq": 1}}}
-    codes = [(await client.put("/v1/read-positions", headers=_auth(u), json=body)
-              ).status_code for _ in range(61)]
-    assert codes[:60] == [204] * 60, codes
+    u, ch = await _user(session, "alice"), await _channel(session)
+    body = {ch.id: {"last_read": "", "base_seq": 0}}
+    codes = [(await _rput(client, u, body)).status_code for _ in range(61)]
+    assert codes[:60] == [200] * 60, codes
     assert codes[60] == 429, codes[60]

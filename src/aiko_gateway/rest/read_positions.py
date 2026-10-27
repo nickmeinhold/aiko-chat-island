@@ -6,7 +6,7 @@ better than the one this repo started with: the two multi-device consumers have
 DIFFERENT CONFLICT SEMANTICS. A read watermark wants version-max; a device label
 wants last-write-wins. One general key-value store either lies to one of them or
 grows a per-key merge policy — the generality creep that killed design 16. So the
-merge rule lives in the endpoint that needs it, and the label (ruling 2) gets its
+conflict rule lives in the endpoint that needs it, and the label (ruling 2) gets its
 own when it is built.
 
 THE ISLAND SHIPS FIRST, per CLAUDE.md's silent-desync rule. An unknown wire key is
@@ -49,25 +49,28 @@ router = APIRouter(prefix="/v1", tags=["read-positions"])
 _MAX_POSITIONS = 1000
 
 
-class ReadPosition(BaseModel):
-    """One channel's position.
+class ReadPositionWrite(BaseModel):
+    """One channel's write: a watermark, and the version the client last saw.
 
-    ``seq`` is CLIENT-SUPPLIED and monotonic per (user, channel). The island does
-    not mint it and could not: it sees network order, not causal order, so a
-    server counter would degrade the merge to last-write-wins — exactly the
-    semantics ``seq`` exists to prevent."""
+    ``base_seq`` is NOT a version the client chooses. It names the version the
+    client is editing (0 = it has never seen one), and the island applies the
+    write only if that is still the version it holds (compare-and-swap; the
+    contract is PR #429's v2 comment). The field is deliberately not called
+    ``seq``: an unknown key is ignored, not rejected, so a body shaped for the
+    first design (``{last_read, seq}``) is a loud 422 for the missing
+    ``base_seq`` rather than a silent misreading."""
 
     last_read: str = Field(
         max_length=26,
-        description="26-char ULID, or '' — the client's first-sight floor for a "
+        description="Canonical ULID, or '' — the client's first-sight floor for a "
                     "channel that was empty at settle time. '' is a VALUE, not a "
                     "missing field.",
     )
-    seq: int = Field(ge=0, le=2**63 - 1)  # SQLite INTEGER is signed 64-bit
+    base_seq: int = Field(ge=0, le=read_positions_service.MAX_BASE_SEQ)
 
 
 class SetReadPositionsReq(BaseModel):
-    positions: dict[str, ReadPosition] = Field(max_length=_MAX_POSITIONS)
+    positions: dict[str, ReadPositionWrite] = Field(max_length=_MAX_POSITIONS)
 
 
 @router.get("/read-positions")
@@ -96,33 +99,43 @@ async def get_read_positions(user: CurrentUser, session: DbSession) -> dict:
 # so syncing on each channel switch at one switch a second fits for one device,
 # and two of the same user's devices at a more realistic rate fit together. The
 # per-IP bound only stops one address cycling through many accounts.
-@router.put("/read-positions", status_code=status.HTTP_204_NO_CONTENT,
+@router.put("/read-positions",
             dependencies=[
                 rate_limit_user("read_positions_user", limit=60, window=60),
                 rate_limit("read_positions", limit=600, window=60),
             ])
 async def set_read_positions(
     req: SetReadPositionsReq, user: CurrentUser, session: DbSession,
-) -> None:
-    """Merge the caller's positions by ``seq``-max. Idempotent and
-    order-independent.
+) -> dict:
+    """Apply the caller's writes by compare-and-swap; reply per channel.
 
-    A PUT rather than a POST because it is a merge into a named resource whose
-    identity is the caller — replaying it changes nothing, which is the property
-    a multi-device sync needs when two handsets come back online together.
+    200 with ``{"positions": {channel_id: {"status", "last_read", "seq"}}}``.
+    ``status`` is ``applied``, ``conflict`` or ``skipped``. On ``applied`` and
+    ``conflict`` the pair is the value the island NOW holds, so a device that lost
+    learns the winner in the same round trip instead of believing it synced (the
+    first design's 204 hid that). On a conflict with nothing stored, ``seq`` is 0
+    and ``last_read`` is null: resend from base 0. ``skipped`` (no such channel)
+    carries neither.
 
-    A batch containing one invalid entry stores NONE of it. A partial store would
-    leave the client believing a sync succeeded while some channels silently kept
-    an old watermark, which is a worse failure than a refused request."""
+    A batch containing one MALFORMED entry stores none of it, and the 422 names
+    the channel, so the client can find and drop the bad entry."""
     try:
-        await read_positions_service.set_positions(
+        results = await read_positions_service.set_positions(
             session,
             user_id=user.id,
             positions={
-                cid: (p.last_read, p.seq) for cid, p in req.positions.items()
+                cid: (p.last_read, p.base_seq) for cid, p in req.positions.items()
             },
         )
     except read_positions_service.InvalidReadPosition as exc:
         # 422, matching the boundary's own vocabulary for a well-formed request
         # carrying an unusable value.
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc))
+    out: dict[str, dict] = {}
+    for cid, r in results.items():
+        entry: dict = {"status": r.outcome.value}
+        if r.outcome is not read_positions_service.Outcome.SKIPPED:
+            entry["last_read"] = r.last_read
+            entry["seq"] = r.seq
+        out[cid] = entry
+    return {"positions": out}

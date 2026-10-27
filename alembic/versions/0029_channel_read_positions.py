@@ -7,15 +7,10 @@ resumes from a stale watermark, or from nothing) and must exist for channels a
 membership row was never written for. Hanging it off memberships would tie a
 private note's lifetime to an authorization fact.
 
-THE SHAPE IS THE APP TAB'S, and it is `{last_read, seq}` rather than `last_read`
-alone for one reason: merging by max(ULID) makes MARK-AS-UNREAD IMPOSSIBLE,
-because moving a watermark backwards writes a lower ULID that always loses. The
-app tab proposed max-on-ULID first, Nick rejected it, they corrected. Recorded in
-#4834; the argument was re-derived here rather than taken on trust, and it holds.
-
-SEQ IS CLIENT-SUPPLIED. The island cannot order two devices' edits — it sees
-network order, not causal order — so a server-minted counter would degrade the
-merge to last-write-wins, which is the semantics `seq` exists to avoid.
+THE SHAPE IS `{last_read, seq}`, where `seq` is the ISLAND'S version of the row,
+advanced by compare-and-swap (a write names the version it edits; PR #429's v2
+contract). It is a version, not a timestamp or a ULID comparison, so mark-as-unread
+(an earlier ULID) applies like any other edit.
 
 NO BACKFILL, AND NOTHING TO MIGRATE. Read positions have never been stored
 server-side: `rest/dm.py`'s `list_dms` docstring records the old contract
@@ -39,8 +34,8 @@ what forces that to have happened: it introspects every FK-to-users.id column an
 fails on a new one. This table was added WITH that test red, then green — the
 tripwire worked as designed rather than being remembered.
 
-CHECK ON seq >= 0: a negative value cannot be a monotonic counter, so the merge
-rule never has to reason about one. Derived from the model via a literal that
+CHECK ON seq >= 0: versions start at 1 and only go up, so nothing above the column
+has to reason about a negative one. Derived from the model via a literal that
 `test_migrations`' generic parity gate compares against `Base.metadata`.
 
 Revision ID: 0029
