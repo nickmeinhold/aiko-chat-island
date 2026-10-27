@@ -37,8 +37,9 @@ file is the working-context that isn't obvious from the code.
   blocked: [ISL-0003](docs/adr/ISL-0003-pull-based-deploy-of-pinned-image.md). Verify
   the RUNNING container's image ref, not this doc. Procedure: `deploy/update.sh`
   (its header); backup + rollback: `docs/runbooks/backup-and-rollback.md`. Two live islands: `chat.imagineering.cc`
-  (`~/apps/aiko-chat-gateway`), `chat.enspyr.co` (`~/apps/aiko-chat-gateway`, `ssh
-  nick-mel`, `sudo -n docker`). NOTE: imagineering's separate `matrix-*` stack is
+  (`ssh enspyr-syd`, `~/apps/aiko-chat-gateway`), `chat.enspyr.co` (`ssh enspyr-melb`,
+  `~/apps/aiko-chat-gateway`, `sudo -n docker`). The old aliases `imagineering` /
+  `nick-mel` no longer resolve (2026-10-27). NOTE: imagineering's separate `matrix-*` stack is
   still the old build-on-host model — don't conflate it with the island.
 - **Alembic is the sole schema authority; `alembic heads` must show ONE head** —
   two `0006`s merge clean in git but wedge boot (mergeable ≠ correct). SQLite is
