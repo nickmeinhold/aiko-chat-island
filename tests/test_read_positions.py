@@ -341,3 +341,27 @@ async def test_route_an_unknown_channel_is_204_and_not_stored(client, session):
     assert r.status_code == 204, r.text
     got = (await client.get("/v1/read-positions", headers=_auth(u))).json()
     assert got == {"positions": {}}
+
+
+async def test_route_a_batch_over_the_cap_is_422(client, session):
+    """The 1000-entry cap is a pydantic `Field(max_length=...)` on a dict: pin
+    that it is live on the pinned pydantic rather than decorative."""
+    u = await _user(session, "alice")
+    over = {f"c{i}": {"last_read": "", "seq": 1} for i in range(1001)}
+    r = await client.put("/v1/read-positions", headers=_auth(u),
+                         json={"positions": over})
+    assert r.status_code == 422, r.text
+
+
+async def test_route_put_is_rate_limited_per_user(client, session, monkeypatch):
+    """Prod SQLite has one writer; an unthrottled PUT loop queues every message
+    persist behind it (#429 r1). The 61st PUT in a window is refused."""
+    from aiko_gateway.config import settings
+    monkeypatch.setattr(settings, "rate_limit_enabled", True)
+    u = await _user(session, "alice")
+    ch = await _channel(session)
+    body = {"positions": {ch.id: {"last_read": "", "seq": 1}}}
+    codes = [(await client.put("/v1/read-positions", headers=_auth(u), json=body)
+              ).status_code for _ in range(61)]
+    assert codes[:60] == [204] * 60, codes
+    assert codes[60] == 429, codes[60]

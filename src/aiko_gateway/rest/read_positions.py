@@ -37,7 +37,8 @@ from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field
 
 from ..domain import read_positions_service
-from .deps import CurrentUser, DbSession
+from ..domain.rate_limit import rate_limit
+from .deps import CurrentUser, DbSession, rate_limit_user
 
 router = APIRouter(prefix="/v1", tags=["read-positions"])
 
@@ -87,7 +88,19 @@ async def get_read_positions(user: CurrentUser, session: DbSession) -> dict:
     }
 
 
-@router.put("/read-positions", status_code=status.HTTP_204_NO_CONTENT)
+# RATE-LIMITED, unlike GET: each PUT can carry 1000 entries and runs them inside one
+# write transaction, and prod SQLite has ONE writer, so an unthrottled loop would
+# queue every message persist behind it (Maxwell, #429 r1). Keyed on the USER, as
+# call occupancy learned (#3159): a per-IP budget alone makes everyone behind one
+# NAT share it. 60 per 60s per user: a client batches every channel into one PUT,
+# so syncing on each channel switch at one switch a second fits for one device,
+# and two of the same user's devices at a more realistic rate fit together. The
+# per-IP bound only stops one address cycling through many accounts.
+@router.put("/read-positions", status_code=status.HTTP_204_NO_CONTENT,
+            dependencies=[
+                rate_limit_user("read_positions_user", limit=60, window=60),
+                rate_limit("read_positions", limit=600, window=60),
+            ])
 async def set_read_positions(
     req: SetReadPositionsReq, user: CurrentUser, session: DbSession,
 ) -> None:

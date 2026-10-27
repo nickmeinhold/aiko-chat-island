@@ -745,6 +745,10 @@ class ChannelReadPosition(Base):
         # one is either buggy or probing. Refusing at the column means the merge
         # rule below never has to reason about it.
         CheckConstraint("seq >= 0", name="ck_channel_read_positions_seq"),
+        # The PK leads with user_id (every read is "my positions"), so a lookup by
+        # channel alone, which hard_delete_channel does, needs its own index: the
+        # mirror of ix_memberships_user_id (#2633).
+        Index("ix_channel_read_positions_channel_id", "channel_id"),
     )
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), primary_key=True)
     channel_id: Mapped[str] = mapped_column(

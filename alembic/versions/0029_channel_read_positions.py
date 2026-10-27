@@ -76,7 +76,11 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("user_id", "channel_id"),
         sa.CheckConstraint("seq >= 0", name="ck_channel_read_positions_seq"),
     )
+    op.create_index("ix_channel_read_positions_channel_id",
+                    "channel_read_positions", ["channel_id"])
 
 
 def downgrade() -> None:
+    op.drop_index("ix_channel_read_positions_channel_id",
+                  table_name="channel_read_positions")
     op.drop_table("channel_read_positions")
