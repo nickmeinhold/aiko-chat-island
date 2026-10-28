@@ -346,10 +346,11 @@ async def update_profile(
     change is a single conditional UPDATE whose WHERE carries the cooldown predicate,
     so a concurrent double-change can't both pass a stale in-memory read of
     handle_changed_at (the observe-then-write TOCTOU the project forbids —
-    concept_visibility_gate_atomic_with_write). rowcount==0 ⇒ the predicate rejected
-    the write; the row always exists (it is the authed user), so that is
-    unambiguously the cooldown, not a missing row (the SQLite rowcount==0 ambiguity
-    doesn't arise here)."""
+    concept_visibility_gate_atomic_with_write). rowcount==0 ⇒ the WHERE rejected the
+    write, for one of two reasons: the cooldown, or the row already holds the requested
+    handle (`username != :handle`). The row is re-read INSIDE the same transaction,
+    before the rollback, to tell them apart, so the classification describes the state
+    the UPDATE actually ran against."""
     if handle is None and display_name is None:
         raise ValueError("update_profile requires handle and/or display_name")
     now = now or dt.datetime.now(dt.timezone.utc)
@@ -430,13 +431,21 @@ async def update_profile(
         # reading user.id afterwards would lazy-load outside the async context
         # (MissingGreenlet).
         uid = user.id
-        await session.rollback()
+        # READ BEFORE THE ROLLBACK (cage-match #438 r2, Carnot + Noether). The UPDATE,
+        # even matching nothing, holds SQLite's write lock until this transaction
+        # ends (measured: another writer gets "database is locked" in the
+        # rollback-journal mode prod runs), so this read sees the state the UPDATE ran
+        # against. Read after the rollback, a concurrent first claim could commit in
+        # between: a changed username with a still-NULL stamp, classified as a
+        # cooldown, and `now - None` was a 500.
         row = (await session.execute(
             select(User.username, User.handle_changed_at)
             .where(User.id == uid))).one_or_none()
+        await session.rollback()
         if row is None:
-            # The row vanished between the UPDATE and this read — a concurrent
-            # self-account-deletion. Don't one()-500 (cage-match #118, Carnot+Tesla);
+            # The row is gone: a concurrent self-account-deletion committed before this
+            # request's UPDATE (it can no longer land between the UPDATE and this read,
+            # which share a transaction). Don't one()-500 (cage-match #118, Carnot+Tesla);
             # report the full window, non-crashing — the account is going away anyway.
             raise HandleChangeCooldown(cooldown_seconds)
         cur_username, last = row

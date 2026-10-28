@@ -501,3 +501,31 @@ async def test_a_repeated_first_claim_of_the_same_handle_keeps_the_free_fix(sess
     await session.refresh(user)
     await users_service.update_profile(session, user, handle="paul2", cooldown_seconds=cooldown)
     assert await _stamp_of(session, user.id) is not None  # the free fix was still there
+
+
+@pytest.mark.asyncio
+async def test_a_no_op_is_classified_against_the_state_its_update_saw(session, monkeypatch):
+    """A same-handle request matches no row, and the zero-rows arm re-reads the row to
+    tell "already that handle" from "the cooldown". If that read came AFTER the
+    rollback, a concurrent first claim could commit in between (new username, stamp
+    still NULL), and the arm would classify it as a cooldown and compute `now - None`:
+    a 500 (cage-match #438 r2, Carnot + Noether). Simulated by committing that claim
+    the moment this request rolls back; the read must already have happened."""
+    from sqlalchemy import update as _update
+
+    from aiko_gateway.domain.models import User
+
+    user = await _make_auto_user(session)
+    uid, assigned_handle = user.id, user.username
+    real_rollback = session.rollback
+
+    async def rollback_then_a_concurrent_first_claim():
+        await real_rollback()
+        monkeypatch.setattr(session, "rollback", real_rollback)
+        await session.execute(_update(User).where(User.id == uid).values(
+            username="claimed-by-the-other-device", handle_assigned=False))
+        await session.commit()
+
+    monkeypatch.setattr(session, "rollback", rollback_then_a_concurrent_first_claim)
+    await users_service.update_profile(
+        session, user, handle=assigned_handle, cooldown_seconds=30 * 24 * 3600)
