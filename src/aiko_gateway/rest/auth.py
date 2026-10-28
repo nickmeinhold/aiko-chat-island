@@ -95,6 +95,9 @@ class MeView(BaseModel):
     display_name: str
     aiko_username: str
     is_moderator: bool
+    # True while the account still carries the handle register/finish assigned (never
+    # changed, `aiko-<12 hex>`). The app asks for a handle before chat while it is.
+    handle_auto: bool
 
 
 class PatchMeReq(BaseModel):
@@ -132,7 +135,8 @@ class PatchMeReq(BaseModel):
 
 def _user_view(u: User) -> dict:
     return {"user_id": u.id, "username": u.username,
-            "display_name": u.display_name, "aiko_username": u.aiko_username}
+            "display_name": u.display_name, "aiko_username": u.aiko_username,
+            "handle_auto": users_service.handle_is_auto(u)}
 
 
 def _me_view(u: User) -> dict:
@@ -542,8 +546,31 @@ def registration_open() -> bool:
     return bool(settings.open_registration)
 
 
-@router.post("/passkey/register/start", dependencies=[rate_limit("passkey")])
-async def passkey_register_start(session: DbSession) -> dict:
+async def _passkey_label_from(request: Request) -> str | None:
+    """The optional `{"name": ...}` body of register/start, read LENIENTLY: absent,
+    empty, malformed JSON or a non-object all mean "no label". This route is also
+    add-a-device's start, so a cosmetic field must never give it a new way to fail
+    (a declared pydantic body would 422 on malformed JSON)."""
+    try:
+        body = await request.json()
+    except ValueError:  # JSONDecodeError and UnicodeDecodeError are both ValueErrors
+        return None
+    return passkey_service.passkey_label(body.get("name") if isinstance(body, dict) else None)
+
+
+# Declared for the OpenAPI contract only; the route reads the body itself (above).
+_REGISTER_START_BODY = {"requestBody": {"required": False, "content": {"application/json": {
+    "schema": {"type": "object", "properties": {"name": {
+        "type": "string", "maxLength": 64,
+        "description": "Label for the passkey in the phone's password manager (the "
+                       "handle being chosen, or the signed-in user's handle when adding "
+                       "a device). Cosmetic; grants nothing. Invalid or absent means a "
+                       "random label."}}}}}}}
+
+
+@router.post("/passkey/register/start", dependencies=[rate_limit("passkey")],
+             openapi_extra=_REGISTER_START_BODY)
+async def passkey_register_start(session: DbSession, request: Request) -> dict:
     """Begin registration for an ANONYMOUS caller (first-passkey-creates-account).
     Returns {state, options} — the raw WebAuthn-JSON the platform authenticator
     parses. No body, no prior session.
@@ -566,9 +593,12 @@ async def passkey_register_start(session: DbSession) -> dict:
     chokepoint — `create_passkey_account` is called from there and nowhere else —
     and it is gated before the challenge is consumed, so nothing an anonymous
     caller starts here can become an account."""
-    result = await passkey_service.start_registration(session)
-    log.info("passkey.register.start: challenge issued state=%s ttl=%ss",
-             _short(result.get("state")), settings.passkey_challenge_ttl_seconds)
+    label = await _passkey_label_from(request)
+    result = await passkey_service.start_registration(session, label=label)
+    # Logs whether a label was given, never the label: it is a handle being chosen.
+    log.info("passkey.register.start: challenge issued state=%s ttl=%ss labelled=%s",
+             _short(result.get("state")), settings.passkey_challenge_ttl_seconds,
+             label is not None)
     return result
 
 

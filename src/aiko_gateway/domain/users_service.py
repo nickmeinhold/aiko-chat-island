@@ -23,6 +23,24 @@ _AIKO_USERNAME_RE = re.compile(r"[^A-Za-z0-9_]")
 # deliberate 503 rather than letting it escape as an uncategorised 500.
 _MAX_HANDLE_ATTEMPTS = 5
 
+# The auto-assigned handle and the test for it, side by side so neither changes alone
+# (test_auto_handle_is_recognised pins the pair).
+_AUTO_HANDLE_RE = re.compile(r"aiko-[0-9a-f]{12}")
+
+
+def _new_auto_handle() -> str:
+    return f"aiko-{secrets.token_hex(6)}"
+
+
+def handle_is_auto(user: User) -> bool:
+    """Whether `user` still carries the handle register/finish assigned: never changed,
+    and auto-shaped. Both halves are needed. Handles are free text, so someone can
+    CHOOSE an `aiko-<12 hex>` handle, and choosing it stamps handle_changed_at. And a
+    handle set at creation (social claim, password register) has a NULL
+    handle_changed_at without being auto. The app uses this to ask for a handle before
+    letting a user into chat, on every device, including accounts made before it asked."""
+    return user.handle_changed_at is None and bool(_AUTO_HANDLE_RE.fullmatch(user.username))
+
 
 class HandleAllocationExhausted(Exception):
     """create_passkey_account could not find a free auto-handle within
@@ -203,7 +221,7 @@ async def create_passkey_account(
         raise CredentialAlreadyRegistered(existing)
 
     for _ in range(_MAX_HANDLE_ATTEMPTS):
-        handle = f"aiko-{secrets.token_hex(6)}"
+        handle = _new_auto_handle()
         user = User(
             id=new_ulid(),
             username=handle,

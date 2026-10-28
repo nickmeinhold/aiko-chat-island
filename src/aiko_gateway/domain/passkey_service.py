@@ -47,6 +47,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import secrets
+import unicodedata
 
 import webauthn
 from cryptography.exceptions import InvalidSignature
@@ -158,16 +159,49 @@ async def consume_challenge(
 
 # --- ceremony start (mint options + challenge) ----------------------------- #
 
-async def start_registration(session: AsyncSession) -> dict:
+# The longest label a caller may put on its own passkey. Authenticators may truncate
+# user.name to 64 BYTES; a 64-character cap keeps the label recognisable where they do.
+_PASSKEY_LABEL_MAX = 64
+# Control characters, plus the bidi overrides and isolates (U+202A-202E, U+2066-2069),
+# which can make a label read differently from what it is. ZWJ (U+200D) is NOT here:
+# it is what joins emoji sequences, and a handle may be one.
+_LABEL_STRIP = frozenset(map(chr, [*range(0x202A, 0x202F), *range(0x2066, 0x206A)]))
+
+
+def passkey_label(raw: object) -> str | None:
+    """The label a caller asked for on its passkey, cleaned, or None to use the random
+    default. Absent, non-string, empty after cleaning, or longer than
+    _PASSKEY_LABEL_MAX all answer None: the label is cosmetic, so a bad one falls back
+    rather than failing a ceremony that is also add-a-device's start."""
+    if not isinstance(raw, str):
+        return None
+    cleaned = "".join(
+        ch for ch in raw
+        if unicodedata.category(ch) != "Cc" and ch not in _LABEL_STRIP
+    ).strip()
+    if not cleaned or len(cleaned) > _PASSKEY_LABEL_MAX:
+        return None
+    return cleaned
+
+
+async def start_registration(session: AsyncSession, *, label: str | None = None) -> dict:
     """Mint a registration ceremony for an ANONYMOUS caller (first-passkey-creates-
     account). Returns {state, options} — options is the raw WebAuthn-JSON the
     platform authenticator parses. resident_key REQUIRED so the credential is
-    discoverable (usernameless authentication later)."""
+    discoverable (usernameless authentication later).
+
+    `label` (from `passkey_label`) names the passkey in the phone's password manager:
+    the handle a new user is about to choose, or a signed-in user's handle when adding
+    a device. It is a label on the caller's own device and grants nothing."""
     raw = secrets.token_bytes(32)
     # The WebAuthn user_name/display_name are COSMETIC ceremony metadata (shown in the
     # OS passkey list) — distinct from the account handle, which register/finish
-    # auto-generates when it creates the account (create_passkey_account). A random
-    # provisional name here just avoids collisions in that OS list.
+    # auto-generates when it creates the account (create_passkey_account). Without a
+    # caller label, a random provisional name just avoids collisions in that OS list.
+    # (That random name is `aiko-<8 hex>` and the account's auto handle is
+    # `aiko-<12 hex>`: they were never the same string, which is why a label is worth
+    # sending.)
+    name = label or f"aiko-{secrets.token_hex(4)}"
     #
     # user_id is the WebAuthn user HANDLE. It is EPHEMERAL here: we never persist it
     # and authenticate looks credentials up by credential_id, so its only constraint
@@ -178,7 +212,8 @@ async def start_registration(session: AsyncSession) -> dict:
     options = webauthn.generate_registration_options(
         rp_id=settings.passkey_rp_id,
         rp_name=settings.passkey_rp_name,
-        user_name=f"aiko-{secrets.token_hex(4)}",
+        user_name=name,
+        user_display_name=name,
         user_id=secrets.token_bytes(16),
         challenge=raw,
         authenticator_selection=AuthenticatorSelectionCriteria(

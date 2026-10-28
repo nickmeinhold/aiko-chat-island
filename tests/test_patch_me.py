@@ -83,9 +83,10 @@ async def test_me_view_shape_stable(client, session):
     # Exact CLOSED key set (not just membership) — response_model=MeView is the real
     # filter; the test must catch an accidental extra/removed field (append-only).
     assert set(body) == {"user_id", "username", "display_name", "aiko_username",
-                         "is_moderator"}
+                         "is_moderator", "handle_auto"}
     assert body["user_id"] == user.id
     assert body["username"] == "alice"
+    assert body["handle_auto"] is False  # a chosen handle, set at creation
 
 
 # --- display_name (free, no cooldown) ---------------------------------------
@@ -341,3 +342,52 @@ async def test_cooldown_predicate_beats_a_stale_read(session):
     # And the row was not mutated by the refused write.
     await session.refresh(user)
     assert user.username == "alice"
+
+
+# --- handle_auto (handle-first sign-up, app tab 2026-10-28) ---------------- #
+
+def test_auto_handle_is_recognised():
+    """The generator and the predicate live side by side in users_service; this pins
+    the pair. Change the auto-handle format without the regex and this goes red."""
+    for _ in range(200):
+        assert users_service._AUTO_HANDLE_RE.fullmatch(users_service._new_auto_handle())
+
+
+@pytest.mark.asyncio
+async def test_handle_auto_is_true_until_the_first_handle_change(client, session):
+    user = await _make_user(session, username=users_service._new_auto_handle())
+    assert (await client.get("/v1/me", headers=_auth(user))).json()["handle_auto"] is True
+    resp = await client.patch("/v1/me", json={"handle": "paul"}, headers=_auth(user))
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["handle_auto"] is False
+    assert (await client.get("/v1/me", headers=_auth(user))).json()["handle_auto"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_taken_handle_leaves_handle_auto_true_and_the_retry_open(client, session):
+    """A 409 must not stamp the cooldown: the app answers it with "pick again", and
+    that second PATCH has to pass."""
+    await _make_user(session, username="paul")
+    user = await _make_user(session, username=users_service._new_auto_handle())
+    # Headers built ONCE, before the 409: its rollback expires every instance in the
+    # session this test shares with the app, and re-reading `user` afterwards would
+    # be a lazy load outside the async context.
+    headers = _auth(user)
+    taken = await client.patch("/v1/me", json={"handle": "paul"}, headers=headers)
+    assert taken.status_code == 409, taken.text
+    assert (await client.get("/v1/me", headers=headers)).json()["handle_auto"] is True
+    retry = await client.patch("/v1/me", json={"handle": "paul2"}, headers=headers)
+    assert retry.status_code == 200, retry.text
+    assert retry.json()["handle_auto"] is False
+
+
+@pytest.mark.asyncio
+async def test_choosing_an_auto_shaped_handle_is_not_auto(client, session):
+    """Handles are free text, so someone can pick `aiko-<12 hex>` on purpose. The shape
+    alone would call that auto; the stamped handle_changed_at says it was chosen."""
+    user = await _make_user(session, username="bob")
+    chosen = users_service._new_auto_handle()
+    resp = await client.patch("/v1/me", json={"handle": chosen}, headers=_auth(user))
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["username"] == chosen
+    assert resp.json()["handle_auto"] is False

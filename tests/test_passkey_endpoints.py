@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import struct
 
 import cbor2
@@ -171,9 +172,12 @@ async def test_register_finish_creates_account_and_returns_session(client, sessi
     body = finish.json()
     # AUTHENTICATED outcome (byte-identical to the social/broker door), NOT provisioning.
     assert set(body) == {"access_token", "refresh_token", "user"}
-    assert set(body["user"]) == {"user_id", "username", "display_name", "aiko_username"}
-    # An auto-generated handle — nobody picked one, and it did not collide.
+    assert set(body["user"]) == {"user_id", "username", "display_name", "aiko_username",
+                                 "handle_auto"}
+    # An auto-generated handle — nobody picked one, and it did not collide — and the
+    # outcome says so, which is what sends the app to "choose a handle".
     assert body["user"]["username"].startswith("aiko-")
+    assert body["user"]["handle_auto"] is True
     # The credential is persisted right now (the #1728 orphan is impossible).
     cred = await passkey_service.get_credential(
         session, bytes_to_base64url(auth.credential_id))
@@ -746,3 +750,72 @@ async def test_authenticate_finish_corrupt_stored_key_stays_loud(client, session
         await client.post("/v1/auth/passkey/authenticate/finish", json={
             "state": start["state"],
             "credential": auth.authenticate(start["options"]["challenge"])})
+
+
+# --- passkey labels (handle-first sign-up, app tab 2026-10-28) ------------- #
+
+_RANDOM_LABEL = re.compile(r"aiko-[0-9a-f]{8}")
+
+
+async def test_register_start_labels_the_passkey_with_the_given_name(client):
+    """The name becomes BOTH user.name and user.displayName, trimmed, so the phone's
+    password manager shows the handle being chosen instead of `aiko-<hex>`."""
+    resp = await client.post("/v1/auth/passkey/register/start", json={"name": "  paul  "})
+    assert resp.status_code == 200, resp.text
+    user = resp.json()["options"]["user"]
+    assert user["name"] == "paul"
+    assert user["displayName"] == "paul"
+
+
+@pytest.mark.parametrize("kwargs", [
+    {},                                                   # no body (today's app)
+    {"json": {}},
+    {"json": {"name": ""}},
+    {"json": {"name": "   "}},
+    {"json": {"name": 123}},
+    {"json": {"name": "x" * 65}},
+    {"json": ["paul"]},
+    {"json": {"name": "‮\u0007"}},                   # nothing left once cleaned
+    {"content": b"{not json", "headers": {"content-type": "application/json"}},
+    {"content": b"\xff\xfe", "headers": {"content-type": "application/json"}},
+], ids=["absent", "empty-object", "empty", "blank", "non-string", "too-long",
+        "non-object", "only-stripped", "malformed", "not-utf8"])
+async def test_register_start_falls_back_to_a_random_label_never_an_error(client, kwargs):
+    """register/start is ALSO add-a-device's start, so a cosmetic field must never
+    give it a new way to fail: every bad body is a 200 with today's random label."""
+    resp = await client.post("/v1/auth/passkey/register/start", **kwargs)
+    assert resp.status_code == 200, resp.text
+    user = resp.json()["options"]["user"]
+    assert _RANDOM_LABEL.fullmatch(user["name"]), user
+    assert user["displayName"] == user["name"]
+
+
+@pytest.mark.parametrize("raw, cleaned", [
+    ("pa‮ul\u0007", "paul"),                         # bidi override + BEL stripped
+    ("⁦paul⁩", "paul"),                         # bidi isolates stripped
+    ("\U0001F469‍\U0001F4BBdev", "\U0001F469‍\U0001F4BBdev"),  # ZWJ kept
+    ("x" * 64, "x" * 64),                                 # the cap is inclusive
+])
+async def test_register_start_cleans_the_label(client, raw, cleaned):
+    resp = await client.post("/v1/auth/passkey/register/start", json={"name": raw})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["options"]["user"]["name"] == cleaned
+
+
+async def test_a_label_grants_nothing(client, monkeypatch):
+    """The label names the passkey on the caller's phone and NOTHING else: a start
+    labelled "nick" still creates an account with an auto handle, so a label is never
+    a way to claim someone's handle. The app claims a handle afterwards, with
+    PATCH /v1/me, where taken handles and the cooldown are enforced."""
+    monkeypatch.setattr(settings, "open_registration", True)
+    auth = SoftAuthenticator()
+    start = (await client.post("/v1/auth/passkey/register/start",
+                               json={"name": "nick"})).json()
+    assert start["options"]["user"]["name"] == "nick"
+    finish = await client.post("/v1/auth/passkey/register/finish", json={
+        "state": start["state"], "credential": auth.register(start["options"]["challenge"])})
+    assert finish.status_code == 200, finish.text
+    user = finish.json()["user"]
+    assert user["username"] != "nick"
+    assert re.fullmatch(r"aiko-[0-9a-f]{12}", user["username"])
+    assert user["handle_auto"] is True
