@@ -5,7 +5,6 @@ import datetime as dt
 import math
 import re
 import secrets
-import unicodedata
 
 from sqlalchemy import or_, select, update
 from sqlalchemy.exc import IntegrityError
@@ -24,61 +23,22 @@ _AIKO_USERNAME_RE = re.compile(r"[^A-Za-z0-9_]")
 # deliberate 503 rather than letting it escape as an uncategorised 500.
 _MAX_HANDLE_ATTEMPTS = 5
 
-# The auto-assigned handle and the test for it, side by side so neither changes alone
-# (test_auto_handle_is_recognised pins the pair).
-_AUTO_HANDLE_RE = re.compile(r"aiko-[0-9a-f]{12}")
-
-
 def _new_auto_handle() -> str:
+    """The handle register/finish assigns: `aiko-` and twelve hex digits. Migration
+    0030's backfill matches this shape; change the format and that history still
+    describes the old one, which is fine because it ran once."""
     return f"aiko-{secrets.token_hex(6)}"
 
 
-def is_reserved_handle(handle: str) -> bool:
-    """`aiko-<12 hex>` belongs to the generator. No person may choose it, at any door
-    that sets a handle (PATCH /v1/me, social claim, dev register): a chosen handle of
-    that shape would be indistinguishable from an assigned one, and `handle_is_auto`
-    would send its owner back to "choose a handle". Refused as HandleTaken (409), which
-    is what it is: the system holds that name space."""
-    return bool(_AUTO_HANDLE_RE.fullmatch(handle))
-
-
 def handle_is_auto(user: User) -> bool:
-    """Whether `user` still carries the handle register/finish assigned: never changed,
-    and auto-shaped. Since `is_reserved_handle` no door lets a person choose that
-    shape, so the shape alone now means "assigned". handle_changed_at stays in the test
-    for rows from before the reservation (a change TO the shape stamped it; measured on
-    enspyr 2026-10-28: 0 such rows). The app uses this to ask for a handle before letting
-    a user into chat, on every device, including accounts made before it asked."""
-    return user.handle_changed_at is None and bool(_AUTO_HANDLE_RE.fullmatch(user.username))
-
-
-# ZWJ joins emoji sequences, and the tag characters (U+E0020-E007F) spell subdivision
-# flags. They are the only invisible formatting characters a handle may carry.
-_ZWJ = "\u200d"
-_JOINERS = frozenset({_ZWJ, *map(chr, range(0xE0020, 0xE0080))})
-
-
-def handle_text_problem(text: str) -> str | None:
-    """Why `text` can't be a handle, or None if it can. ONE repertoire for every door
-    that sets a handle AND for the passkey label (which is the handle being chosen), so
-    a label is either the handle or not used, never a third string.
-
-    Refused: control characters (Cc), lone surrogates (Cs, which can't even be encoded),
-    line and paragraph separators (Zl, Zp), and every invisible formatting character
-    (Cf: bidi overrides and isolates, LRM/RLM/ALM, zero-width space, soft hyphen, BOM)
-    except the joiners above. These make a handle render as something it is not:
-    `nick` followed by an RLM looks exactly like `nick`. A handle made only of
-    joiners is invisible, so it is refused too. Unassigned code points are allowed,
-    so emoji newer than this Python's Unicode tables still work."""
-    for ch in text:
-        category = unicodedata.category(ch)
-        if category in ("Cc", "Cs", "Zl", "Zp"):
-            return "control, surrogate or line-separator character"
-        if category == "Cf" and ch not in _JOINERS:
-            return "invisible formatting character"
-    if text and all(ch in _JOINERS for ch in text):
-        return "nothing visible"
-    return None
+    """Whether `user` still carries the handle register/finish assigned. STORED, not
+    inferred: `handle_assigned` is set by create_passkey_account and cleared by the
+    first real handle change. An inference from the spelling misread a person who
+    chose an `aiko-<12 hex>` handle, and keeping it honest needed a refusal at every
+    door that sets a handle (cage-match #435: Carnot, Tesla). The app uses this to ask
+    for a handle before letting a user into chat, on every device, including accounts
+    made before it asked."""
+    return bool(user.handle_assigned)
 
 
 class HandleAllocationExhausted(Exception):
@@ -118,8 +78,6 @@ def _sanitize_aiko_username(username: str) -> str:
 async def create_user(
     session: AsyncSession, *, username: str, display_name: str, password: str
 ) -> User:
-    if is_reserved_handle(username):
-        raise HandleTaken()
     user = User(
         id=new_ulid(),
         username=username,
@@ -184,10 +142,7 @@ async def create_social_user(
     """Create a local user for a verified federated identity and link it, in ONE
     transaction. password_hash stays None (social-only). Raises IntegrityError if
     the handle is taken (username/aiko_username UNIQUE) OR the (provider, sub) is
-    already claimed (uq_social_provider_sub) — the caller maps both to 409. A reserved
-    (auto-shaped) handle raises HandleTaken, which the caller also maps to 409."""
-    if is_reserved_handle(handle):
-        raise HandleTaken()
+    already claimed (uq_social_provider_sub) — the caller maps both to 409."""
     user = User(
         id=new_ulid(),
         username=handle,
@@ -273,6 +228,7 @@ async def create_passkey_account(
             password_hash=None,
             aiko_username=_sanitize_aiko_username(handle),
             email=None,
+            handle_assigned=True,  # the user view's handle_auto, until they choose one
         )
         try:
             async with session.begin_nested():  # SAVEPOINT — isolates this attempt
@@ -423,16 +379,14 @@ async def update_profile(
         await session.refresh(user)
         return user
 
-    # Handle CHANGE — fold the cooldown predicate into the write. A change TO the
-    # reserved auto shape is refused first, and only here: a DB-confirmed no-op (an
-    # auto user re-sending the handle they already have) took the branch above.
-    if is_reserved_handle(handle):
-        raise HandleTaken()
+    # Handle CHANGE — fold the cooldown predicate into the write.
     cutoff = now - dt.timedelta(seconds=cooldown_seconds)
     values: dict = {
         "username": handle,
         "aiko_username": _sanitize_aiko_username(handle),
         "handle_changed_at": now,
+        # A chosen handle: the account no longer carries the one it was assigned.
+        "handle_assigned": False,
     }
     if display_name is not None:  # atomic with the handle change (all-or-nothing)
         values["display_name"] = display_name

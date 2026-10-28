@@ -119,8 +119,6 @@ class PatchMeReq(BaseModel):
     def _handle_nonempty_after_strip(cls, v: str | None) -> str | None:
         if v is not None and not v:
             raise ValueError("handle must not be blank")
-        if v is not None and (problem := users_service.handle_text_problem(v)):
-            raise ValueError(f"handle contains a {problem}")
         return v
 
     @field_validator("display_name")
@@ -181,8 +179,6 @@ async def register(req: RegisterReq, session: DbSession) -> dict:
             session, username=req.username,
             display_name=req.display_name, password=req.password,
         )
-    except users_service.HandleTaken:  # the reserved auto shape (nothing was written)
-        raise HTTPException(status.HTTP_409_CONFLICT, "username already taken")
     except IntegrityError:
         # Roll back the failed transaction before reusing/closing the session
         # (a failed commit leaves it needing rollback).
@@ -235,8 +231,6 @@ class SocialClaimReq(BaseModel):
     def _handle_nonempty_after_strip(cls, v: str) -> str:
         if not v:
             raise ValueError("handle must not be blank")
-        if problem := users_service.handle_text_problem(v):
-            raise ValueError(f"handle contains a {problem}")
         return v
 
 
@@ -421,9 +415,6 @@ async def social_claim(req: SocialClaimReq, session: DbSession) -> dict:
             handle=req.handle, display_name=req.display_name,
             email=pending["email"],
         )
-    except users_service.HandleTaken:  # the reserved auto shape (nothing was written)
-        raise HTTPException(
-            status.HTTP_409_CONFLICT, "handle already taken or identity already claimed")
     except IntegrityError:
         # Handle already taken OR this identity was already claimed (race).
         await session.rollback()
@@ -556,7 +547,7 @@ def registration_open() -> bool:
     return bool(settings.open_registration)
 
 
-async def _passkey_label_from(request: Request) -> tuple[str | None, str]:
+async def _passkey_label_from(request: Request) -> tuple[str | None, passkey_service.LabelStatus]:
     """The optional `{"name": ...}` body of register/start, read LENIENTLY, and why
     there is or isn't a label. Absent, empty, malformed or a non-object all mean "no
     label": this route is also add-a-device's start, so a cosmetic field must never

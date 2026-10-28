@@ -348,20 +348,16 @@ async def test_cooldown_predicate_beats_a_stale_read(session):
 # --- handle_auto (handle-first sign-up, app tab 2026-10-28) ---------------- #
 
 async def _make_auto_user(session):
-    """An account as register/finish makes it: an assigned `aiko-<12 hex>` handle and a
-    NULL handle_changed_at. Built with the generator's own seed helper, because the
-    handle-choosing doors (create_user, social claim, PATCH) refuse that shape."""
-    return await users_service.create_passkey_user(
+    """An account as register/finish makes it: an assigned `aiko-<12 hex>` handle with
+    handle_assigned set. (The register/finish path itself is covered end to end in
+    test_passkey_endpoints.)"""
+    user = await users_service.create_passkey_user(
         session, handle=users_service._new_auto_handle(), display_name="", email=None,
         material={"credential_id": users_service._new_auto_handle(), "public_key": "cGs",
                   "sign_count": 0, "transports": None, "aaguid": None})
-
-
-def test_auto_handle_is_recognised():
-    """The generator and the predicate live side by side in users_service; this pins
-    the pair. Change the auto-handle format without the regex and this goes red."""
-    for _ in range(200):
-        assert users_service.is_reserved_handle(users_service._new_auto_handle())
+    user.handle_assigned = True
+    await session.commit()
+    return user
 
 
 @pytest.mark.asyncio
@@ -377,8 +373,8 @@ async def test_handle_auto_is_true_until_the_first_handle_change(client, session
 
 @pytest.mark.asyncio
 async def test_a_taken_handle_leaves_handle_auto_true_and_the_retry_open(client, session):
-    """A 409 must not stamp the cooldown: the app answers it with "pick again", and
-    that second PATCH has to pass."""
+    """A 409 must not stamp the cooldown or clear the flag: the app answers it with
+    "pick again", and that second PATCH has to pass."""
     await _make_user(session, username="paul")
     user = await _make_auto_user(session)
     # Headers built ONCE, before the 409: its rollback expires every instance in the
@@ -394,25 +390,28 @@ async def test_a_taken_handle_leaves_handle_auto_true_and_the_retry_open(client,
 
 
 @pytest.mark.asyncio
-async def test_an_auto_shaped_handle_cannot_be_chosen(client, session):
-    """`aiko-<12 hex>` belongs to the generator. If a person could choose it, a chosen
-    handle would read as assigned and its owner would be sent back to "choose a
-    handle" (cage-match #435: Carnot, Noether, Tesla). Refused as taken, the app's
-    existing "pick again" path."""
-    user = await _make_user(session, username="bob")
-    headers = _auth(user)
-    resp = await client.patch(
-        "/v1/me", json={"handle": users_service._new_auto_handle()}, headers=headers)
-    assert resp.status_code == 409, resp.text
-    me = (await client.get("/v1/me", headers=headers)).json()
-    assert me["username"] == "bob"
-    assert me["handle_auto"] is False
+async def test_a_handle_chosen_at_creation_that_looks_auto_is_not_auto(client, session):
+    """The case an inference from the spelling got wrong (cage-match #435, all four
+    seats): a person who CHOSE `aiko-<12 hex>` is not sent back to "choose a handle".
+    The flag is stored when the account is made, so the spelling decides nothing."""
+    user = await _make_user(session, username=users_service._new_auto_handle())
+    assert (await client.get("/v1/me", headers=_auth(user))).json()["handle_auto"] is False
 
 
 @pytest.mark.asyncio
-async def test_resending_your_own_auto_handle_is_a_no_op_not_a_409(client, session):
-    """The reservation refuses a CHANGE to the shape, never the no-op of an auto user
-    sending the handle they already have."""
+async def test_choosing_an_auto_shaped_handle_later_is_not_auto(client, session):
+    user = await _make_user(session, username="bob")
+    chosen = users_service._new_auto_handle()
+    resp = await client.patch("/v1/me", json={"handle": chosen}, headers=_auth(user))
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["username"] == chosen
+    assert resp.json()["handle_auto"] is False
+
+
+@pytest.mark.asyncio
+async def test_resending_your_own_auto_handle_is_a_no_op(client, session):
+    """A no-op handle write (with a display-name edit) neither clears the flag nor
+    stamps the cooldown."""
     user = await _make_auto_user(session)
     headers = _auth(user)
     resp = await client.patch("/v1/me", json={"handle": user.username,
@@ -420,38 +419,3 @@ async def test_resending_your_own_auto_handle_is_a_no_op_not_a_409(client, sessi
     assert resp.status_code == 200, resp.text
     assert resp.json()["handle_auto"] is True
     assert resp.json()["display_name"] == "Paul"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("handle", [
-    "nick\u200f", "\u200bnick", "ni\u202eck", "ni\u0007ck", "ni\u2028ck", "\u200d"],
-    ids=["rlm", "zwsp", "bidi-override", "control", "line-separator", "only-zwj"])
-async def test_a_handle_that_renders_as_something_else_is_refused(client, session, handle):
-    """One repertoire for every handle door and the passkey label: a handle that would
-    look like another (`nick` + RLM looks exactly like `nick`) is a 422, before any
-    cooldown or uniqueness check."""
-    user = await _make_user(session, username="bob")
-    resp = await client.patch("/v1/me", json={"handle": handle}, headers=_auth(user))
-    assert resp.status_code == 422, resp.text
-
-
-@pytest.mark.asyncio
-async def test_an_emoji_handle_with_a_joiner_is_allowed(client, session):
-    user = await _make_user(session, username="bob")
-    handle = "\U0001F469\u200d\U0001F4BBdev"
-    resp = await client.patch("/v1/me", json={"handle": handle}, headers=_auth(user))
-    assert resp.status_code == 200, resp.text
-    assert resp.json()["username"] == handle
-
-
-def test_a_legacy_row_changed_to_the_auto_shape_is_not_auto():
-    """Before the reservation a person could change TO `aiko-<12 hex>`, which stamped
-    handle_changed_at. No API path can make that row now, so the half of
-    handle_is_auto that reads the stamp is pinned directly."""
-    from aiko_gateway.domain.models import User
-
-    legacy = User(id="legacy", username=users_service._new_auto_handle(), display_name="",
-                  aiko_username="x", handle_changed_at=dt.datetime(2026, 9, 1))
-    assert users_service.handle_is_auto(legacy) is False
-    legacy.handle_changed_at = None
-    assert users_service.handle_is_auto(legacy) is True

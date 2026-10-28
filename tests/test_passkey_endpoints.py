@@ -782,24 +782,22 @@ async def test_register_start_labels_the_passkey_with_the_given_name(client):
     {"json": {"name": "   "}},
     {"json": {"name": 123}},
     {"json": ["paul"]},
-    {"json": {"name": "pa\u202eul"}},                     # bidi override
-    {"json": {"name": "nick\u200f"}},                     # RLM: looks exactly like nick
-    {"json": {"name": "\u200bpaul"}},                     # zero-width space
     {"json": {"name": "pa\u0007ul"}},                     # control character
-    {"json": {"name": "\u200d\u200d"}},                   # nothing visible
+    {"json": {"name": "pa\u2028ul"}},                     # line separator
+    {"json": {"name": "\u200d" * 21 + "\u00e9"}},          # the 64-byte cut leaves nothing
     {"content": b'{"name": "\\ud800"}', "headers": {"content-type": "application/json"}},
     {"content": b"[" * 60000, "headers": {"content-type": "application/json"}},
     {"content": b"{not json", "headers": {"content-type": "application/json"}},
     {"content": b"\xff\xfe", "headers": {"content-type": "application/json"}},
 ], ids=["absent", "empty-object", "empty", "blank", "non-string", "non-object",
-        "bidi-override", "rlm", "zwsp", "control", "only-joiners", "lone-surrogate",
+        "control", "line-separator", "emptied-by-cut", "lone-surrogate",
         "deeply-nested", "malformed", "not-utf8"])
 async def test_register_start_falls_back_to_a_random_label_never_an_error(client, kwargs):
     """register/start is ALSO add-a-device's start, so a cosmetic field must never
     give it a new way to fail: every bad body is a 200 with today's random label. A
-    name a handle couldn't be is refused, not rewritten (stripping would make a third
-    string). The lone surrogate and the deeply nested body were both anonymous 500s
-    (cage-match #435: Carnot, Maxwell)."""
+    label is refused, not rewritten (stripping would make a third string). The lone
+    surrogate and the deeply nested body were both anonymous 500s, and a cut that left
+    nothing was once logged as "given" (cage-match #435: Carnot, Maxwell, Noether)."""
     assert _RANDOM_LABEL.fullmatch(await _start_label(client, **kwargs))
 
 
@@ -820,18 +818,30 @@ async def test_register_start_cuts_the_label_to_64_bytes(client, raw, label):
     assert len(got.encode("utf-8")) <= 64
 
 
+async def test_a_label_is_what_was_sent_never_rewritten(client):
+    """The label's rule is only about what a passkey dialog can show. Which handles may
+    exist is decided where handles are set, so a label the handle doors would accept
+    passes through exactly, invisible formatting included: it is the caller's own phone,
+    and anything else would be a third string."""
+    for name in ("nick\u200f", "pa\u202eul", "\U0001F469\u200d\U0001F4BBdev"):
+        assert await _start_label(client, json={"name": name}) == name
+
+
 async def test_register_start_logs_why_there_is_no_label(client, caplog):
     """A fallback must be able to report itself: the log says absent, malformed or
     rejected (never the label), so a client bug isn't the same line as no label."""
     import logging
     with caplog.at_level(logging.INFO, logger="aiko_gateway.rest.auth"):
         await _start_label(client)
-        await _start_label(client, json={"name": "nick\u200f"})
+        await _start_label(client, json={"name": "pa\u0007ul"})
         await _start_label(client, content=b"{", headers={"content-type": "application/json"})
+        # A cut that leaves nothing: the phone gets the random label either way, so only
+        # the status can show it was refused, not "given" (Noether, cage-match #435).
+        await _start_label(client, json={"name": "\u200d" * 21 + "\u00e9"})
         await _start_label(client, json={"name": "paul"})
     lines = [r.getMessage() for r in caplog.records if "passkey.register.start" in r.getMessage()]
     assert [line.rsplit("label=", 1)[1] for line in lines] == [
-        "absent", "rejected", "malformed", "given"]
+        "absent", "rejected", "malformed", "rejected", "given"]
     assert not any("paul" in line for line in lines)
 
 

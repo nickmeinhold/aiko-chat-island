@@ -538,6 +538,13 @@ class User(Base):
     # stay stable (see project_identity_social_cluster).
     handle_changed_at: Mapped[dt.datetime | None] = mapped_column(
         UtcDateTime, nullable=True)
+    # True while the account still carries the handle register/finish ASSIGNED
+    # (create_passkey_account sets it; the first real handle change clears it, in the
+    # same UPDATE). Stored, not inferred from the handle's spelling: a person can type
+    # `aiko-<12 hex>` too, and a guess from the spelling needed a guard at every door
+    # that sets a handle (cage-match #435). Serves the user view's `handle_auto`.
+    handle_assigned: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="0")
     # What this account IS (#3096). server_default 'human' so every pre-existing row
     # backfills as a human account — the honest reading, since no agent account can
     # exist before this migration. Set at CREATION only: there is deliberately no
