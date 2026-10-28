@@ -168,6 +168,10 @@ def test_main_mounts_auth_only_through_include_auth_routers():
     import aiko_gateway.main as main_module
 
     source = inspect.getsource(main_module)
-    assert "auth_routes.include_auth_routers(app)" in source
-    for direct in ("auth_routes.router", "auth_routes.me_router", "auth_routes.dev_router"):
-        assert direct not in source, f"main.py mounts {direct} directly"
+    assert source.count("include_auth_routers(app)") == 1
+    # The bare identifier, not one spelling of it: `from .rest.auth import
+    # dev_router` (or any alias of the module) still has to name it.
+    assert "dev_router" not in source, "main.py names dev_router; mount it only via include_auth_routers"
+    for line in source.splitlines():
+        if "include_router(" in line:
+            assert "auth" not in line, f"main.py mounts an auth router directly: {line.strip()}"

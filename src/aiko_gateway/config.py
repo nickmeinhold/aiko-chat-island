@@ -1234,9 +1234,11 @@ class Settings(BaseSettings):
             )
         #
         # BOTH WARNINGS ABOVE ARE PLACED HERE, AFTER THE DEFAULT IS RESOLVED, AND
-        # THAT IS LOAD-BEARING: each tests `open_registration is False`, which is
-        # never true inside the production branch above, where the value is still
-        # None. An earlier revision put the SOCIAL warning there and it could not
+        # THAT IS LOAD-BEARING: each tests `open_registration is False`, and inside
+        # the production branch above the value is still None whenever the
+        # operator left OPEN_REGISTRATION unset, which is the default case, so
+        # there the test misses exactly the islands it is for. An earlier
+        # revision put the SOCIAL warning there and it could not
         # fire; its own test caught it, which is the only reason it did not ship
         # silently disabled, the exact class it was added to prevent. The
         # nobody-can-join warning has the same dependency and its own test

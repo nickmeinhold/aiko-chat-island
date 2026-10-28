@@ -476,10 +476,12 @@ def _require_may_provision_account(*, door: Literal["password", "passkey", "soci
     `social_signin_enabled` gates social provisioning (Nick, 2026-06-27).
 
     So collapsing both onto `open_registration`, which is what the panel
-    prescribed, would make social sign-in permanently unable to create an account
-    in production and silently retire that decision. The finding was right and the
-    prescribed fix was not; the panel could not see it because `config.py` is not
-    in this diff.
+    prescribed, would make social sign-in unable to create an account on any
+    production island left at the registration default (and, when it was
+    written, while production refused to boot with the flag open, on every one),
+    silently retiring that decision. The finding was right and the prescribed
+    fix was not; the panel could not see it because `config.py` was not in that
+    diff.
 
     What changes: the exemption is now ONE explicit, tested branch in ONE function
     instead of an emergent property of which flag each route happened to check.
@@ -1076,8 +1078,9 @@ async def list_providers() -> dict:
     live, so it can deploy dark."""
     providers: list[dict] = []
     if settings.passkey_enabled:
-        # `creates_accounts`: may this island's passkey door create a NEW account?
-        # The app hides "Create account" when it's false. Without it the app could
+        # `creates_accounts`: may this island's PASSKEY door create a NEW account?
+        # It describes this entry only, not the island: the app hides passkey
+        # "Create account" when it's false. Without it the app could
         # only find out by running the ceremony, which saves a passkey on the phone
         # before the island refuses (an orphan the user can't easily delete).
         # Sign-in and add-a-device work either way. Additive: older apps ignore it.

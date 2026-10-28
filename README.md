@@ -138,7 +138,7 @@ FastAPI app (`aiko_gateway.main:app`), OpenAPI at `/docs`. Route groups:
 
 | Router | Prefix | Purpose |
 |---|---|---|
-| `auth` | `/v1/auth`, `/v1` | register/login, social sign-in, OAuth broker, passkeys, `/me` |
+| `auth` | `/v1/auth`, `/v1` | login, social sign-in, OAuth broker, passkeys, `/me`; password register is dev-only (`dev_router`, not mounted in production) |
 | `channels` | `/v1` | channel list + history (mirrors bus topology) |
 | `messages` | `/v1` | send + fetch messages |
 | `members` | `/v1` | channel membership, roles, join policy |
