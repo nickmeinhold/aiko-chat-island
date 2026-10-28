@@ -339,10 +339,12 @@ def test_a_mixed_fanout_routes_each_row_to_its_own_transport():
 # THE COLUMN IS STORED AND NOT READ (claude-tasks#4384). `install_id` was minted
 # to be the device identity the routing table never had, and the first cut of
 # this PR used it to prefer voip within a group. The cage-match (PR#179, all four
-# families) refused that unanimously: the value is client-minted and the OS
-# clones it on a device restore, so one value can cover TWO physical handsets and
-# the suppression silences the second one's only reach. Suppression waits on the
-# value being device-bound at the client (app-side, claude-tasks#3385).
+# families) refused that unanimously: the value is client-minted, and if one value
+# covers TWO physical handsets the suppression silences the second one's only
+# reach. The review's premise was that a device restore clones it; what shipped
+# (iOS Keychain, `ThisDeviceOnly`; no other platform sends one) narrowed that to
+# one unmeasured path, iPhone Quick Start (aiko_chat_app#337). Suppression waits
+# on that measurement.
 #
 # So these are NEGATIVE tests, and that is the point. Every one of them asserts
 # that carrying an install identity changes NOTHING about what gets pushed. They

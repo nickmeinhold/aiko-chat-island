@@ -1119,8 +1119,9 @@ class DeviceToken(Base):
     # WHICH HANDSET THIS TOKEN IS ON (claude-tasks#4384) — an opaque, client-minted,
     # per-INSTALL string, stored so the client half can send it. It is a CLAIM the
     # island cannot authenticate, and `plan_deliveries` deliberately does not read
-    # it: the OS clones a self-minted id across a device restore, so one value can
-    # cover two physical handsets. That docstring holds the argument.
+    # it: nothing has yet shown that one value names one physical handset (the one
+    # unmeasured path is iPhone Quick Start, aiko_chat_app#337). That docstring
+    # holds the argument.
     #
     # NULLABLE WITH NO server_default, which is the OPPOSITE of `token_kind` one
     # line up and is the whole safety argument. There is no constant that is
