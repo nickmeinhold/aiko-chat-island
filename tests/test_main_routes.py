@@ -152,3 +152,26 @@ async def test_guarded_paths_reach_handler_when_authed(client, session):
         f"{HISTORY_PATH} did not reach its handler with a valid token "
         f"(got {history.status_code}; expected 404 for the absent channel)"
     )
+
+
+def test_main_mounts_auth_only_through_include_auth_routers():
+    """A STRUCTURAL TRIPWIRE, because the behaviour cannot be observed here. This
+    suite imports `aiko_gateway.main` once, under ENVIRONMENT=test, so the real app
+    always mounts the dev-only password door and no behavioural test of `main` can
+    see what PRODUCTION mounts. `include_auth_routers` is tested under both
+    environments (test_register_gate.py); this pins that main.py reaches the auth
+    routers only through it. A direct `app.include_router(auth_routes.dev_router)`
+    in main would serve /register in production while every other test stayed
+    green (cage-match PR#433)."""
+    import inspect
+
+    import aiko_gateway.main as main_module
+
+    source = inspect.getsource(main_module)
+    assert source.count("include_auth_routers(app)") == 1
+    # The bare identifier, not one spelling of it: `from .rest.auth import
+    # dev_router` (or any alias of the module) still has to name it.
+    assert "dev_router" not in source, "main.py names dev_router; mount it only via include_auth_routers"
+    for line in source.splitlines():
+        if "include_router(" in line:
+            assert "auth" not in line, f"main.py mounts an auth router directly: {line.strip()}"

@@ -125,7 +125,7 @@ Never deploy `.env.example` or anything derived from it.
 |---|---|---|
 | Core | `ENVIRONMENT`, `JWT_SECRET`, `DB_URL` | prod requires a real secret; DB defaults to `./aiko_dev.db` |
 | Bus | `AIKO_MQTT_HOST/_PORT`, `AIKO_NAMESPACE` | exported into `os.environ` for aiko_services |
-| Registration | `OPEN_REGISTRATION` | explicit `true` is **rejected in prod** until membership I2 (#36) |
+| Registration | `OPEN_REGISTRATION` | closed by default in prod; explicit `true` opens **passkey** sign-up. Password `/register` is dev-only: production does not mount it |
 | Social sign-in | `SOCIAL_SIGNIN_ENABLED`, `APPLE_CLIENT_IDS`, `GOOGLE_CLIENT_IDS`, `SOCIAL_NONCE_REQUIRED` | Apple/Google ID-token verify + replay-nonce (#13) |
 | OAuth broker | `GITHUB_CLIENT_ID/_SECRET`, `APP_OAUTH_CALLBACK_URL` | server-side code exchange + app-bound handoff (#21/#34) |
 | Passkeys | `PASSKEY_ENABLED`, `PASSKEY_RP_ID`, `PASSKEY_IOS_APP_ID`, `PASSKEY_ANDROID_PACKAGE` | WebAuthn (#1471); domain-bound, advertised via `/v1/auth/providers` |
@@ -138,7 +138,7 @@ FastAPI app (`aiko_gateway.main:app`), OpenAPI at `/docs`. Route groups:
 
 | Router | Prefix | Purpose |
 |---|---|---|
-| `auth` | `/v1/auth`, `/v1` | register/login, social sign-in, OAuth broker, passkeys, `/me` |
+| `auth` | `/v1/auth`, `/v1` | login, social sign-in, OAuth broker, passkeys, `/me`; password register is dev-only (`dev_router`, not mounted in production) |
 | `channels` | `/v1` | channel list + history (mirrors bus topology) |
 | `messages` | `/v1` | send + fetch messages |
 | `members` | `/v1` | channel membership, roles, join policy |

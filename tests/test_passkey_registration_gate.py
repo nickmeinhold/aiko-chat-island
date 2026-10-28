@@ -1,8 +1,9 @@
 """`/v1/auth/passkey/register/*` is gated by `settings.open_registration`.
 
 THE HOLE THIS CLOSES. `/v1/auth/register` has been gated since task #38, and
-`open_registration` is force-closed in production precisely because I2 membership
-(#36) is unenforced — a self-registered account can read everything. The PASSKEY
+`open_registration` was then force-closed in production (a boot refusal written
+"until I2 membership is enforced"; I2 landed the next day and the refusal was
+retired 2026-10-28, leaving the flag closed by default). The PASSKEY
 door was never given the same check, so the gate covered the door nobody uses and
 left open the one the app actually ships. Measured against the live island on
 2026-09-15: an unauthenticated `POST /v1/auth/passkey/register/start` returned 200
@@ -64,8 +65,9 @@ async def test_passkey_register_start_STAYS_OPEN_when_registration_is_closed(
 
     `register/start` is ALSO `add/start` — there is no such endpoint, and
     `passkey/add/finish` consumes a challenge issued here. Gating this route is a
-    PERMANENT LOCKOUT of device-add on every production island, because
-    `open_registration` is force-closed there as standing law.
+    PERMANENT LOCKOUT of device-add on every production island whose
+    `open_registration` is closed, which is the production default (and was, at
+    the time, the only legal production setting).
 
     Round 1 of this PR gated it, and this test asserted the lockout as correct —
     the jig holding the bad weld. Tesla caught it; two other families reviewed the
@@ -182,11 +184,13 @@ async def test_social_claim_is_exempt_from_open_registration(client, monkeypatch
     session has spent the day removing. Caught before merge; recorded so it is not
     reintroduced.
 
-    WHY THE EXEMPTION EXISTS: `config.py` REJECTS `open_registration=True` in
-    production, while social sign-in MAY be enabled there (Nick, 2026-06-27). A
+    WHY THE EXEMPTION EXISTS: `open_registration` is closed by default in
+    production (until 2026-10-28 `config.py` refused to boot with it open), while
+    social sign-in MAY be enabled there (Nick, 2026-06-27). A
     cage-match panel (Kelvin + Carnot, independently) prescribed routing social
-    through `open_registration`; that would make social sign-in permanently unable
-    to provision an account in production and silently retire that decision. The
+    through `open_registration`; that would make social sign-in unable to provision
+    an account on any production island left at the default (and, when written,
+    on every one) and silently retire that decision. The
     panel could not see it — `config.py` is not in this diff.
 
     So: registration CLOSED, social ENABLED, a REAL provisioning token. The claim
@@ -202,7 +206,7 @@ async def test_social_claim_is_exempt_from_open_registration(client, monkeypatch
         "provisioning_token": prov, "handle": "exemptcheck"})
     assert "registration is closed" not in resp.text, (
         "the social exemption was lost — social sign-in can no longer provision an "
-        "account on a closed island, which is PERMANENTLY the case in production, "
+        "account on a closed island, which is the production default, "
         "and reverses the 2026-06-27 decision")
     assert resp.status_code == 200, (
         f"expected the claim to succeed, got {resp.status_code}: {resp.text[:200]}")
