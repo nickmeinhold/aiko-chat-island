@@ -31,12 +31,13 @@ because the door has only one room behind it.
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
 from ..domain import read_positions_service
 from ..domain.rate_limit import rate_limit
 from .deps import CurrentUser, DbSession, rate_limit_user
+from .errors import InvalidReadPositionError
 
 router = APIRouter(prefix="/v1", tags=["read-positions"])
 
@@ -58,13 +59,16 @@ class ReadPositionWrite(BaseModel):
     first design (``{last_read, seq}``) is a loud 422 for the missing
     ``base_seq`` rather than a silent misreading."""
 
+    # NO length or range bounds here, deliberately: the service checks both, so
+    # every refused VALUE comes back as one structured 422 naming its channel
+    # (rest.errors.InvalidReadPositionError), which the app's healer keys on. A
+    # pydantic bound would answer the same refusal in a different shape.
     last_read: str = Field(
-        max_length=26,
         description="Canonical ULID, or '' — the client's first-sight floor for a "
                     "channel that was empty at settle time. '' is a VALUE, not a "
                     "missing field.",
     )
-    base_seq: int = Field(ge=0, le=read_positions_service.MAX_BASE_SEQ)
+    base_seq: int
 
 
 class SetReadPositionsReq(BaseModel):
@@ -126,9 +130,7 @@ async def set_read_positions(
             },
         )
     except read_positions_service.InvalidReadPosition as exc:
-        # 422, matching the boundary's own vocabulary for a well-formed request
-        # carrying an unusable value.
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc))
+        raise InvalidReadPositionError(exc.channel_id, str(exc)) from exc
     out: dict[str, dict] = {}
     for cid, r in results.items():
         entry: dict = {"status": r.outcome.value}

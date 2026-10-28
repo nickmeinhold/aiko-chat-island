@@ -8,7 +8,7 @@ client can choose a version that beats everyone forever.
 """
 from __future__ import annotations
 
-import time
+import datetime as dt
 
 import pytest
 import pytest_asyncio
@@ -18,7 +18,8 @@ from sqlalchemy import select, text
 
 from aiko_gateway.domain import channels_service, security
 from aiko_gateway.domain import read_positions_service as svc
-from aiko_gateway.domain.models import ChannelReadPosition, Channel, User
+from aiko_gateway.domain.models import (
+    ChannelReadPosition, Channel, Membership, Message, Retraction, User)
 from aiko_gateway.domain.ids import new_ulid
 from aiko_gateway.rest import read_positions as read_position_routes
 from aiko_gateway.rest.deps import get_session
@@ -209,17 +210,86 @@ async def test_a_malformed_last_read_is_refused(session, bad_last_read):
         await _put(session, u, {ch.id: (bad_last_read, 0)})
 
 
-@pytest.mark.parametrize("future", [
-    "7" + "Z" * 25,                                     # canonical, millennia out
-    new_ulid(int(time.time() * 1000) + 3 * 3600 * 1000),  # three hours out
-])
-async def test_a_watermark_from_the_future_is_refused(session, future):
-    """A watermark names a message the island already minted, so it can't be later
-    than now. Under the app's "a forward read wins" policy a future value would
-    stick on every device (Tesla, #429 r2)."""
+# --- the channel bound: a watermark is a POSITION, not a reference -----------
+
+async def _member(session, ch, u):
+    session.add(Membership(channel_id=ch.id, user_id=u.id, role="member"))
+    await session.commit()
+
+
+async def _msg(session, ch, n: int, *, deleted: bool = False) -> str:
+    mid = _ulid(n)
+    session.add(Message(
+        id=mid, channel_id=ch.id, sender_user_id=None, sender_kind="unknown",
+        body="x", created_at=dt.datetime(2026, 10, 1, tzinfo=dt.timezone.utc),
+        deleted_at=dt.datetime(2026, 10, 2, tzinfo=dt.timezone.utc) if deleted else None))
+    await session.commit()
+    return mid
+
+
+async def test_a_member_cannot_store_a_position_past_the_newest_item(session):
+    """"7"+"Z"*25 is canonical and sorts past every real item; under the app's
+    "a forward read wins" policy it would stick on every device. It's refused
+    because it is past the channel's newest item, with no clock involved (#429
+    r3: the clock window kept growing holes)."""
     u, ch = await _user(session, "alice"), await _channel(session)
+    await _member(session, ch, u)
+    await _msg(session, ch, 50)
+    for past in ("7" + "Z" * 25, _ulid(51)):
+        with pytest.raises(svc.InvalidReadPosition) as exc:
+            await _put(session, u, {ch.id: (past, 0)})
+        assert exc.value.channel_id == ch.id
+
+
+async def test_the_newest_item_itself_is_a_valid_position(session):
+    u, ch = await _user(session, "alice"), await _channel(session)
+    await _member(session, ch, u)
+    newest = await _msg(session, ch, 50)
+    r = await _put(session, u, {ch.id: (newest, 0)})
+    assert r[ch.id] == svc.EntryResult(APPLIED, newest, 1)
+
+
+async def test_a_deleted_messages_id_is_still_a_valid_position(session):
+    """App tab: a message read today can be soft-deleted or hidden tomorrow, and
+    the watermark still names it. Bounding against the VISIBLE view would 422 an
+    honest client and lose that user's place."""
+    u, ch = await _user(session, "alice"), await _channel(session)
+    await _member(session, ch, u)
+    gone = await _msg(session, ch, 50, deleted=True)
+    r = await _put(session, u, {ch.id: (gone, 0)})
+    assert r[ch.id].outcome is APPLIED
+
+
+async def test_a_retraction_can_be_the_newest_position(session):
+    """The subscribe fence (`latest_ulid`) is the newest of visible messages AND
+    retractions, so a baseline can be a retraction's ULID."""
+    u, ch = await _user(session, "alice"), await _channel(session)
+    await _member(session, ch, u)
+    target = await _msg(session, ch, 50)
+    rt = Retraction(target_msg_id=target, channel_id=ch.id)
+    session.add(rt)
+    await session.commit()
+    assert rt.id > target
+    r = await _put(session, u, {ch.id: (rt.id, 0)})
+    assert r[ch.id] == svc.EntryResult(APPLIED, rt.id, 1)
+
+
+async def test_an_empty_channel_admits_only_the_floor(session):
+    u, ch = await _user(session, "alice"), await _channel(session)
+    await _member(session, ch, u)
+    assert (await _put(session, u, {ch.id: ("", 0)}))[ch.id].outcome is APPLIED
     with pytest.raises(svc.InvalidReadPosition):
-        await _put(session, u, {ch.id: (future, 0)})
+        await _put(session, u, {ch.id: (_ulid(1), 1)})
+
+
+async def test_a_non_member_skips_the_bound_so_it_cannot_probe(session):
+    """For a non-member the bound would leak the channel's last-activity time to
+    anyone who knows its id, so it is skipped: the outcome cannot depend on items
+    the caller can't see (operator's call, 2026-10-28)."""
+    u, ch = await _user(session, "alice"), await _channel(session)
+    await _msg(session, ch, 50)  # alice is NOT a member
+    r = await _put(session, u, {ch.id: (_ulid(99), 0)})
+    assert r[ch.id].outcome is APPLIED
 
 
 async def test_a_deleted_user_cannot_get_rows_recreated(session):
@@ -386,17 +456,36 @@ async def test_route_a_batch_with_the_empty_floor_is_applied(client, session):
     assert got["positions"][c1.id] == {"last_read": "", "seq": 1}
 
 
-async def test_route_a_malformed_entry_is_422_naming_the_channel(client, session):
+@pytest.mark.parametrize("entry", [
+    {"last_read": "Z" * 26, "base_seq": 0},         # malformed value
+    {"last_read": "0" * 27, "base_seq": 0},         # too long: NOT a pydantic 422
+    {"last_read": "", "base_seq": 2**63},           # out of range: NOT a pydantic 422
+    {"last_read": "", "base_seq": -1},
+])
+async def test_route_a_refused_value_is_ONE_structured_422(client, session, entry):
+    """The app's healer drops the entry the 422 names and resends the rest
+    (aiko_chat_app#431), so the shape is contract: a top-level `error` code and a
+    `channel_id` FIELD, for every refused value. A pydantic bound would answer
+    the same refusal in a different shape, which is why the route has none."""
     u, ch = await _user(session, "alice"), await _channel(session)
-    r = await _rput(client, u, {ch.id: {"last_read": "Z" * 26, "base_seq": 0}})
+    r = await _rput(client, u, {ch.id: entry})
     assert r.status_code == 422, r.text
-    assert ch.id in r.text
+    body = r.json()
+    assert body["error"] == "invalid_read_position"
+    assert body["channel_id"] == ch.id
+    assert isinstance(body["detail"], str)
+    assert set(body) == {"error", "channel_id", "detail"}
 
 
-async def test_route_an_oversized_base_is_422_not_500(client, session):
+async def test_route_a_position_past_the_newest_item_is_a_structured_422(
+    client, session,
+):
     u, ch = await _user(session, "alice"), await _channel(session)
-    r = await _rput(client, u, {ch.id: {"last_read": "", "base_seq": 2**63}})
+    await _member(session, ch, u)
+    await _msg(session, ch, 50)
+    r = await _rput(client, u, {ch.id: {"last_read": _ulid(51), "base_seq": 0}})
     assert r.status_code == 422, r.text
+    assert r.json()["channel_id"] == ch.id
 
 
 async def test_route_a_batch_over_the_cap_is_422(client, session):

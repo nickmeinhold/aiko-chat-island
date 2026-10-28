@@ -62,28 +62,21 @@ from __future__ import annotations
 import datetime as dt
 import enum
 import re
-import time
 from dataclasses import dataclass
 
-from sqlalchemy import and_, literal, select, update
+from sqlalchemy import and_, func, literal, select, union_all, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .ids import new_ulid
-from .models import Channel, ChannelReadPosition, User
+from .models import (
+    Channel, ChannelReadPosition, Membership, Message, Retraction, User)
 
-# A CANONICAL ULID: uppercase Crockford base32, and a FIRST character of 0-7. 26
-# chars x 5 bits is 130 bits for a 128-bit value, so a real ULID's top two bits are
-# zero and it starts 0-7. "Z" * 26 is valid Crockford (so the app's alphabet-only
-# check accepts it, aiko_chat_app#431) but sorts above every real ULID, which
-# freezes a channel's unread count at zero.
+# A CANONICAL ULID: uppercase Crockford base32 with a first character of 0-7 (26
+# chars x 5 bits is 130 bits for a 128-bit value). This is WIRE HYGIENE, not the
+# harm control: the app's own loader drops a non-canonical watermark, so storing
+# one would leave the island and the app disagreeing about the same position. The
+# harm control is the channel bound below.
 _CANONICAL_ULID = re.compile(r"[0-7][0-9A-HJKMNP-TV-Z]{25}")
-# A watermark names a message the island has already minted, so its timestamp
-# (the first 10 chars; Crockford keeps lexicographic order == time order) cannot
-# be later than now. "7" + "Z"*25 is canonical but dated thousands of years out,
-# and under the app's "a forward read wins" policy it would stick on every device
-# (Tesla, #429 r2). The skew allows for the clock moving under us, not for clients.
-_FUTURE_SKEW_MS = 60 * 60 * 1000
 # SQLite's INTEGER is signed 64-bit. The island stores base_seq + 1, so the
 # largest base it can accept is one below that.
 _MAX_SEQ = 2**63 - 1
@@ -122,14 +115,9 @@ class InvalidReadPosition(Exception):
 
 
 def _validate(channel_id: str, last_read: str, base_seq: int) -> None:
-    """Refuse at the WRITE, the same posture `UtcDateTime` takes on naive datetimes.
-
-    A malformed ``last_read`` is not cosmetic: the app sorts watermarks
-    lexicographically, so a value above every real ULID would pin a bad floor and
-    freeze that channel's unread count at zero. The app checks at its own
-    boundary too; a store that only the client validates is a store the client
-    validates.
-    """
+    """Refuse a malformed entry at the WRITE, the same posture `UtcDateTime` takes
+    on naive datetimes. Shape only: whether a well-formed value is too far ahead
+    is `_check_bounds`'s question, because it needs the channel's data."""
     if not channel_id:
         raise InvalidReadPosition(channel_id, "channel_id must not be empty")
     # '' stays LEGAL: it is the app's first-sight floor, a real watermark it
@@ -139,14 +127,60 @@ def _validate(channel_id: str, last_read: str, base_seq: int) -> None:
         raise InvalidReadPosition(
             channel_id, "last_read must be a canonical ULID (uppercase "
             "Crockford, first character 0-7) or the empty floor ''")
-    if last_read and last_read[:10] > new_ulid(
-            int(time.time() * 1000) + _FUTURE_SKEW_MS)[:10]:
-        raise InvalidReadPosition(
-            channel_id, "last_read is dated in the future; a watermark names a "
-            "message the island has already minted")
     if not 0 <= base_seq <= MAX_BASE_SEQ:
         raise InvalidReadPosition(
             channel_id, f"base_seq must be between 0 and {MAX_BASE_SEQ}")
+
+
+async def _check_bounds(
+    session: AsyncSession, *, user_id: str, positions: dict[str, tuple[str, int]],
+) -> None:
+    """A watermark is a POSITION in the channel's ordering, not a reference to a
+    row (app tab, #429). So it may name any id up to the channel's newest stored
+    item, of ANY kind: deleted, hidden, or a retraction (the subscribe fence,
+    `messages_service.latest_ulid`, can be a retraction's ULID). Nothing past it.
+
+    This replaces the round-2 clock window, which three rounds kept finding holes
+    around (#429 r3, Carnot and Tesla). A fabricated value can now be at most
+    "read up to the newest item", which an honest client can also send, and the
+    next message to arrive is unread again. The bound only grows (messages and
+    retractions are never hard-deleted except with their channel), so a valid
+    watermark stays valid forever, and checking it inside this transaction
+    before the writes cannot go stale.
+
+    MEMBERS ONLY. The bound reads items the caller may not be able to see, so
+    whether it refuses leaks something. For a non-member it would leak a channel's
+    last-activity time to anyone who knows its id, so non-members skip it (their
+    position is inert until they rejoin). For a member the residual is that a
+    refusal can reveal that a hidden item (say, from someone they blocked) is
+    newer than anything visible: accepted by the operator, 2026-10-28.
+    """
+    ids = [cid for cid, (last_read, _) in positions.items() if last_read]
+    if not ids:
+        return
+    member_of = set((await session.execute(
+        select(Membership.channel_id).where(
+            Membership.user_id == user_id, Membership.channel_id.in_(ids))
+    )).scalars())
+    if not member_of:
+        return
+    items = union_all(
+        select(Message.channel_id.label("cid"), Message.id.label("item_id"))
+        .where(Message.channel_id.in_(member_of)),
+        select(Retraction.channel_id.label("cid"), Retraction.id.label("item_id"))
+        .where(Retraction.channel_id.in_(member_of)),
+    ).subquery()
+    newest = dict((await session.execute(
+        select(items.c.cid, func.max(items.c.item_id)).group_by(items.c.cid)
+    )).all())
+    for cid in ids:
+        if cid not in member_of:
+            continue
+        last_read = positions[cid][0]
+        bound = newest.get(cid)
+        if bound is None or last_read > bound:
+            raise InvalidReadPosition(
+                cid, "last_read is past the channel's newest item")
 
 
 async def _write(session: AsyncSession, *, user_id: str, channel_id: str,
@@ -202,6 +236,7 @@ async def set_positions(
         _validate(channel_id, last_read, base_seq)
     if not positions:
         return {}
+    await _check_bounds(session, user_id=user_id, positions=positions)
 
     now = dt.datetime.now(dt.timezone.utc)
     results: dict[str, EntryResult] = {}

@@ -19,6 +19,7 @@ from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 
 ACCOUNT_SUSPENDED = "account_suspended"
+INVALID_READ_POSITION = "invalid_read_position"
 
 
 class AccountSuspended(HTTPException):
@@ -47,7 +48,33 @@ async def _account_suspended_handler(
     )
 
 
+class InvalidReadPositionError(HTTPException):
+    """422 for a read-position entry the island refuses, naming its channel.
+
+    The channel id is a STRUCTURED field, not text inside `detail`, because the
+    app depends on it: its client heals by dropping the named entry and resending
+    the rest (aiko_chat_app#431). A refusal it couldn't attribute would leave that
+    device unable to sync.
+    """
+    code = INVALID_READ_POSITION
+
+    def __init__(self, channel_id: str, detail: str) -> None:
+        super().__init__(status.HTTP_422_UNPROCESSABLE_CONTENT, detail)
+        self.channel_id = channel_id
+
+
+async def _invalid_read_position_handler(
+    request: Request, exc: InvalidReadPositionError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": exc.code, "channel_id": exc.channel_id,
+                 "detail": exc.detail},
+    )
+
+
 def register_error_handlers(app: FastAPI) -> None:
     """Install the structured-error handlers. Call from `main` AND every test app
     builder that asserts a structured body — the single door for the wire shape."""
     app.add_exception_handler(AccountSuspended, _account_suspended_handler)
+    app.add_exception_handler(InvalidReadPositionError, _invalid_read_position_handler)
