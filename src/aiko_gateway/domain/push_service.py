@@ -513,20 +513,25 @@ def plan_deliveries(
 
     `install_id` IS STORED AND IS DELIBERATELY NOT READ HERE. The column
     (claude-tasks#4384) carries a CLIENT-MINTED string the island cannot
-    authenticate, and the OS clones it: a self-minted value in NSUserDefaults or
-    SharedPreferences is swept into iCloud Backup / Android Auto Backup, so a
-    device restore puts TWO PHYSICAL handsets under one value. Preferring voip
-    within such a group silences the alert row that is the second handset's only
-    reach — arm (A)'s missed call, arrived at through the very column minted to
-    forbid it (cage-match PR#179, unanimous). No shape heuristic rescues it:
-    inferring a handset from the token-kind multiset is exactly the inference
-    Decision 2a refuses, and its false positive misses the same call.
+    authenticate, and nothing has yet shown that one value names ONE physical
+    handset. If two handsets share it, preferring voip within the group silences
+    the alert row that is the second handset's only reach — arm (A)'s missed call,
+    arrived at through the very column minted to forbid it (cage-match PR#179,
+    unanimous). No shape heuristic rescues it: inferring a handset from the
+    token-kind multiset is exactly the inference Decision 2a refuses, and its false
+    positive misses the same call.
 
-    So this is a MISSING FACT, not a tuning dial. Suppression waits on the value
-    being DEVICE-BOUND at the client — backup-excluded storage, or an API that
-    does not restore onto another body — which is app-side work (claude-tasks#3385).
-    Until that ships, storing the field and trusting it for preference stay
-    separate, and the redundant banner stands.
+    THE REASON HAS NARROWED SINCE PR#179; THE CONCLUSION HAS NOT MOVED. That review
+    assumed the value lived in NSUserDefaults / SharedPreferences, which iCloud and
+    Android Auto Backup copy onto a restored device. What shipped is narrower: only
+    iOS sends one, minted into the Keychain as `ThisDeviceOnly`, which a backup
+    cannot restore onto another device; Android and macOS send none (aiko_chat_app
+    `push_providers.dart`). The one unmeasured path to two handsets under one value
+    is iPhone Quick Start, a direct transfer rather than a backup (aiko_chat_app#337).
+
+    So this is a MISSING FACT, not a tuning dial. Until #337 is measured, storing
+    the field and trusting it for preference stay separate, and the redundant
+    banner stands.
     """
     deliveries: list[Delivery] = []
     skips: list[tuple[str, str]] = []

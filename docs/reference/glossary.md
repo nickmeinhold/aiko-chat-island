@@ -169,9 +169,10 @@ the garbage is never created.
 
 ### install_id
 A client-minted string identifying an app installation. **[BUILT but deliberately
-unread]** — stored since v0.13.0, ignored by the router on purpose: the OS copies it
-into iCloud / Android Auto Backup, so a restore puts two physical handsets under one
-value. Blocked on app-side #3385 making it device-bound.
+unread]** — stored since v0.13.0, ignored by the router on purpose: nothing has yet
+shown that one value names one physical handset. Only iOS sends one, from the Keychain
+as `ThisDeviceOnly`, which a backup cannot restore onto another device; the one
+unmeasured path is iPhone Quick Start ([aiko_chat_app#337](https://github.com/nickmeinhold/aiko_chat_app/issues/337)).
 
 ---
 
