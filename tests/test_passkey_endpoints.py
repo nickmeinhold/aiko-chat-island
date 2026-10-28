@@ -357,9 +357,67 @@ async def test_providers_advertises_passkey_only_when_enabled(client, monkeypatc
     slugs = [p["slug"] for p in (await client.get("/v1/auth/providers")).json()["providers"]]
     assert "passkey" not in slugs
     monkeypatch.setattr(settings, "passkey_enabled", True)
+    for open_ in (True, False):
+        monkeypatch.setattr(settings, "open_registration", open_)
+        providers = (await client.get("/v1/auth/providers")).json()["providers"]
+        entry = next(p for p in providers if p["slug"] == "passkey")
+        assert entry == {"slug": "passkey", "display_name": "Passkey", "kind": "passkey",
+                         "creates_accounts": open_}
+
+
+@pytest.mark.parametrize("environment", ["test", "production"])
+@pytest.mark.parametrize("open_", [True, False])
+async def test_creates_accounts_matches_what_register_finish_does(
+    client, monkeypatch, open_, environment,
+):
+    """The advertisement and the enforcement come from ONE predicate
+    (`registration_open`), so they cannot disagree: when /providers says the
+    island creates accounts, register/finish creates one; when it says no,
+    register/finish is the 403. This is what lets the app hide "Create account"
+    instead of leaving an orphaned passkey on the phone. Run in production too,
+    because production is where the two doors now answer differently and where
+    the app actually reads this."""
+    monkeypatch.setattr(settings, "environment", environment)
+    monkeypatch.setattr(settings, "passkey_enabled", True)
+    monkeypatch.setattr(settings, "open_registration", open_)
     providers = (await client.get("/v1/auth/providers")).json()["providers"]
-    entry = next(p for p in providers if p["slug"] == "passkey")
-    assert entry == {"slug": "passkey", "display_name": "Passkey", "kind": "passkey"}
+    says = next(p for p in providers if p["slug"] == "passkey")["creates_accounts"]
+    finish, _ = await _register_passkey(client)
+    assert says is open_
+    assert finish.status_code == (200 if open_ else 403), finish.text
+
+
+async def test_in_production_the_flag_opens_passkey_and_not_password(
+        client, monkeypatch):
+    """ONE SETTING, TWO DOORS, OPPOSITE ANSWERS (Nick, 2026-10-28). Production with
+    OPEN_REGISTRATION=true lets a passkey create an account and still refuses
+    password /register, which takes any username and any password. Both requests
+    run under identical settings, so the password 403 cannot be "production
+    refuses everything": the passkey 200 beside it is the control."""
+    monkeypatch.setattr(settings, "environment", "production")
+    monkeypatch.setattr(settings, "passkey_enabled", True)
+    monkeypatch.setattr(settings, "open_registration", True)
+    finish, _ = await _register_passkey(client)
+    assert finish.status_code == 200, finish.text
+    password = await client.post("/v1/auth/register", json={
+        "username": "admin", "display_name": "", "password": ""})
+    assert password.status_code == 403, password.text
+    assert password.json()["detail"] == "registration is closed"
+
+
+def test_every_account_door_must_name_itself():
+    """`door` has no default, and an unknown door raises instead of borrowing an
+    answer. A new account-creating route that forgot to say which door it is
+    would otherwise inherit the passkey answer, which in production is the
+    permissive one."""
+    import inspect
+
+    from aiko_gateway.rest.auth import _require_may_provision_account, registration_open
+
+    door = inspect.signature(_require_may_provision_account).parameters["door"]
+    assert door.default is inspect.Parameter.empty
+    with pytest.raises(ValueError):
+        registration_open("pasword")
 
 
 async def test_well_known_apple_app_site_association(client):

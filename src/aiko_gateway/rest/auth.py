@@ -1,14 +1,18 @@
 """Auth endpoints: register (gated), login, refresh, me.
 
-/register is open in dev for testing and closed by default in production
-(settings.open_registration, resolved by environment). With open registration a
-self-created account can read everything until I2 membership lands (#36), so
-prod fails closed; an explicit OPEN_REGISTRATION override re-opens it.
+Who may create an account is `registration_open`, per door. Passkey sign-up (the
+door the app ships) follows settings.open_registration: open in dev, closed by
+default in production, opened there by an explicit OPEN_REGISTRATION=true as the
+operator's choice. (That used to be impossible in production, "until I2
+membership lands": I2 landed 2026-06-24.) Password /register is DEV-ONLY: it
+follows the flag outside production and is closed in production whatever the
+flag says, because it takes any username and any password and no client uses it.
 """
 from __future__ import annotations
 
 import datetime as dt
 import logging
+from typing import Literal
 
 import jwt
 from fastapi import APIRouter, HTTPException, Request, Response, status
@@ -141,7 +145,7 @@ def _deny_if_banned(user: User) -> None:
 
 @router.post("/register", dependencies=[rate_limit("account")])
 async def register(req: RegisterReq, session: DbSession) -> dict:
-    _require_may_provision_account()
+    _require_may_provision_account(door="password")
     try:
         user = await users_service.create_user(
             session, username=req.username,
@@ -375,7 +379,7 @@ async def social_claim(req: SocialClaimReq, session: DbSession) -> dict:
     # ...and then through the SAME provisioning door as every other account
     # creator, declaring its `open_registration` exemption explicitly rather than
     # having it be the accident of never asking.
-    _require_may_provision_account(via_social=True)
+    _require_may_provision_account(door="social")
     try:
         user = await users_service.create_social_user(
             session,
@@ -423,8 +427,14 @@ def _short(value: object, n: int = 10) -> str:
     return s[:n] + ("…" if len(s) > n else "")
 
 
-def _require_may_provision_account(*, via_social: bool = False) -> None:
+def _require_may_provision_account(*, door: Literal["password", "passkey", "social"]) -> None:
     """THE ONE PLACE that answers "may a NEW ACCOUNT be created right now?".
+
+    `door` IS REQUIRED, with no default, so a new account-creating route cannot
+    reach this without saying which door it is. The doors are not equal: passkey
+    allocates a random handle, password takes whatever username it is sent, and
+    social has its own switch. A default would let a future caller inherit one
+    door's answer by omission.
 
     Every route that creates a user calls this and nothing else decides it. Before
     it there were three doors consulting two different flags and no one place to
@@ -436,11 +446,10 @@ def _require_may_provision_account(*, via_social: bool = False) -> None:
 
     SOCIAL IS EXEMPT FROM `open_registration`, AND THAT IS A RECORDED DECISION,
     NOT AN OVERSIGHT — which is why this is a predicate with a parameter rather
-    than one flag for everything. `config.py` REJECTS `open_registration=True` at
-    boot in production (an open `/register` exposes every channel while I2
-    membership, #36, is unenforced), while social sign-in *may* be enabled in
-    production — Nick, 2026-06-27, the same I2 risk named and accepted "for the
-    current early-users phase so the live gateway is reachable at all".
+    than one flag for everything. The two flags are independent operator
+    choices: `open_registration` (closed by default in production) gates the
+    passkey door and the dev-only password door (see `registration_open`), and
+    `social_signin_enabled` gates social provisioning (Nick, 2026-06-27).
 
     So collapsing both onto `open_registration`, which is what the panel
     prescribed, would make social sign-in permanently unable to create an account
@@ -454,10 +463,11 @@ def _require_may_provision_account(*, via_social: bool = False) -> None:
     the exemption is ever withdrawn, it is deleted here and every door moves at
     once.
     """
-    if via_social:
+    if door == "social":
         # Gated by its OWN switch — AND RE-CHECKED HERE RATHER THAN TRUSTED.
         # `social_claim` does check it first today, so this is redundant today.
-        # It is not redundant tomorrow: Tesla, cage-match round 2 — *"a copy-paste
+        # It is not redundant tomorrow: Tesla, cage-match round 2 (the parameter
+        # was then `via_social=True`) — *"a copy-paste
         # of `via_social=True` is a provisioning door with no kill switch. The
         # single-door claim is true only for the default path."* A door whose
         # exemption depends on every future caller remembering a check elsewhere
@@ -467,10 +477,10 @@ def _require_may_provision_account(*, via_social: bool = False) -> None:
             raise HTTPException(
                 status.HTTP_403_FORBIDDEN, "social sign-in is disabled")
         return
-    _require_open_registration_flag()
+    _require_open_registration_flag(door)
 
 
-def _require_open_registration_flag() -> None:
+def _require_open_registration_flag(door: Literal["password", "passkey"]) -> None:
     """Refuse an account-CREATING request on an island with registration closed.
 
     ONE PREDICATE, TWO CALL SITES, and that is the whole point. `/v1/auth/register`
@@ -489,8 +499,27 @@ def _require_open_registration_flag() -> None:
     keys and never no sign-in — conflating them would lock out the very users the
     island is for.
     """
-    if not settings.open_registration:
+    if not registration_open(door):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "registration is closed")
+
+
+def registration_open(door: Literal["password", "passkey"]) -> bool:
+    """May this door create a NEW account right now? The one predicate behind both
+    the refusal above and `/providers`' `creates_accounts`, so what the island
+    advertises can't drift from what it enforces.
+
+    PASSWORD IS CLOSED IN PRODUCTION WHATEVER `open_registration` SAYS (Nick,
+    2026-10-28). Until that day production refused to boot with the flag on, so
+    both doors were shut there. Lifting the refusal to let passkey sign-up open
+    would have opened this door too, which checks nothing: any username (`nick`,
+    `admin`), any password, empty included. No client uses it; only dev spikes do.
+    So the flag opens the passkey door in production, and password stays a dev
+    door. An unknown door raises rather than defaulting to either answer."""
+    if door == "passkey":
+        return bool(settings.open_registration)
+    if door == "password":
+        return bool(settings.open_registration) and not settings.is_production
+    raise ValueError(f"unknown account door: {door!r}")
 
 
 @router.post("/passkey/register/start", dependencies=[rate_limit("passkey")])
@@ -507,8 +536,8 @@ async def passkey_register_start(session: DbSession) -> dict:
     register"). One hallway, two rooms.
 
     So a gate here is not "refuse early" — it is a PERMANENT LOCKOUT of
-    device-add on every production island, because `open_registration` is
-    force-closed there as standing law. An existing user could never add a second
+    device-add on every production island whose `open_registration` is closed,
+    which is the production default. An existing user could never add a second
     passkey again. An earlier revision of this change did exactly that, and its
     own test asserted the lockout as correct; Tesla caught it in cage-match round
     1 while two other families approved of the gate's placement.
@@ -536,7 +565,7 @@ async def passkey_register_finish(req: PasskeyFinishReq, session: DbSession) -> 
     THE CHOKEPOINT. Gated before the challenge is consumed, so a caller that
     skipped `start` — or held a challenge from before registration was closed —
     still meets the gate, and a refused request burns nothing."""
-    _require_may_provision_account()
+    _require_may_provision_account(door="passkey")
     raw = await passkey_service.consume_challenge(
         session, req.state, PasskeyOperation.REGISTER)
     if raw is None:
@@ -1029,8 +1058,14 @@ async def list_providers() -> dict:
     live, so it can deploy dark."""
     providers: list[dict] = []
     if settings.passkey_enabled:
+        # `creates_accounts`: may this island's passkey door create a NEW account?
+        # The app hides "Create account" when it's false. Without it the app could
+        # only find out by running the ceremony, which saves a passkey on the phone
+        # before the island refuses (an orphan the user can't easily delete).
+        # Sign-in and add-a-device work either way. Additive: older apps ignore it.
         providers.append(
-            {"slug": "passkey", "display_name": "Passkey", "kind": "passkey"})
+            {"slug": "passkey", "display_name": "Passkey", "kind": "passkey",
+             "creates_accounts": registration_open("passkey")})
     if settings.social_signin_enabled:
         if settings.apple_client_ids:
             providers.append(

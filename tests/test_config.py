@@ -4,7 +4,7 @@ Invariants (all prod-only unless noted):
   1. A production-like deployment MUST NOT boot with the dev-default/weak
      jwt_secret — `Settings(_env_file=None)` raises rather than serving forgeable tokens.
   2. Open self-registration defaults OFF in production and ON in dev, with an
-     explicit override either way (and no prod break-glass until I2 lands).
+     explicit override either way (prod's refusal of `true` retired 2026-10-28).
   3. Social sign-in enabled in prod requires a usable provider (native client
      IDs or a fully-configured broker); an empty allowlist would reject-all.
   4. An OAuth broker provider is both-or-neither: a half (id XOR secret) config
@@ -205,12 +205,38 @@ def test_open_registration_defaults_off_in_prod():
     assert s.open_registration is False
 
 
-def test_open_registration_override_rejected_in_prod():
-    # No break-glass while I2 (#36) is unenforced: an explicit OPEN_REGISTRATION
-    # in prod fails closed rather than reopening the endpoint.
-    with pytest.raises(ValidationError):
-        Settings(_env_file=None, environment="production",
-                 jwt_secret=_STRONG_SECRET, open_registration=True)
+def test_open_registration_can_be_opened_in_prod():
+    """An operator's choice since 2026-10-28. The old refusal ("until I2 membership
+    is enforced") outlived its reason: I2 landed 2026-06-24 (f0fb48a). Built on the
+    FULL valid prod baseline, so it fails only for the reason it names. The test it
+    replaces omitted the baseline and passed whatever the registration check did."""
+    s = Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
+                 passkey_enabled=True, open_registration=True, **_PROD_MOD)
+    assert s.open_registration is True
+
+
+def test_prod_warns_when_nobody_can_join(caplog):
+    """Passkey is the app's only ingress and passkey sign-up needs registration
+    open, so registration closed + social off = an island nobody can join. Both
+    islands booted silently in that state until a real user hit it (2026-10-28)."""
+    import logging
+    with caplog.at_level(logging.WARNING):
+        Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
+                 passkey_enabled=True, **_PROD_MOD)
+    assert any("NO NEW ACCOUNT CAN BE CREATED" in r.message for r in caplog.records)
+
+
+@pytest.mark.parametrize("extra", [
+    dict(open_registration=True),
+    dict(social_signin_enabled=True, google_client_ids=["x.apps.googleusercontent.com"]),
+], ids=["registration-open", "social-on"])
+def test_prod_does_NOT_warn_nobody_can_join_when_someone_can(caplog, extra):
+    """Negative controls: a warning that always fires tells an operator nothing."""
+    import logging
+    with caplog.at_level(logging.WARNING):
+        Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
+                 passkey_enabled=True, **_PROD_MOD, **extra)
+    assert not any("NO NEW ACCOUNT CAN BE CREATED" in r.message for r in caplog.records)
 
 
 def test_open_registration_override_allowed_in_dev():
@@ -224,7 +250,7 @@ def test_prod_warns_when_social_reopens_account_creation(caplog):
 
     `open_registration=False` reads as "no new accounts", but `/v1/auth/social/claim`
     provisions accounts under `social_signin_enabled` — deliberately (2026-06-27:
-    prod force-closes open_registration while permitting social). A cage-match
+    prod closes open_registration by default while permitting social). A cage-match
     (Carnot, both rounds) called the silence the defect, not the exemption.
 
     WARNING, not refusal: the configuration is legal and intended. What is not
@@ -262,8 +288,8 @@ def test_prod_social_enabled_without_client_ids_raises():
 
 
 def test_prod_social_enabled_with_client_ids_boots():
-    # Unlike open_registration, social sign-in IS permitted in prod (the I2
-    # tradeoff is accepted) — as long as at least one provider client ID is set.
+    # Social sign-in IS permitted in prod, as long as at least one provider
+    # client ID is set.
     s = Settings(_env_file=None, environment="production",
                  jwt_secret=_STRONG_SECRET, social_signin_enabled=True,
                  google_client_ids=["my-client-id.apps.googleusercontent.com"], **_PROD_MOD)
@@ -339,13 +365,23 @@ def test_dev_broker_half_config_boots():
 # --- invariant 5: at-least-one-viable-ingress in prod (#1927 / #49) ----------
 
 def test_prod_no_ingress_raises():
-    # THE locked-island guard. passkey OFF + social OFF + open_registration
-    # force-closed in prod = an island that can authenticate pre-existing accounts
+    # THE locked-island guard. passkey OFF + social OFF in prod (open_registration
+    # alone is not an ingress there) = an island that can authenticate pre-existing accounts
     # but can never onboard a new user. Fail LOUD at boot (same fail-closed
     # discipline as the broker XOR guard). This is the durable fix for "retiring
     # social is one env line from bricking onboarding" (#1923).
     with pytest.raises(ValidationError):
         Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET)
+
+
+def test_prod_open_registration_alone_is_not_an_ingress():
+    """In production the flag opens the passkey door and nothing else (password
+    /register stays closed there), so with passkey and social both off it opens
+    nothing, and the locked-island guard must still refuse. Built on the full
+    prod baseline so the only thing missing is an ingress."""
+    with pytest.raises(ValidationError, match="no viable sign-in ingress"):
+        Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
+                 open_registration=True, **_PROD_MOD)
 
 
 def test_prod_passkey_only_boots():

@@ -379,12 +379,10 @@ class Settings(BaseSettings):
 
     # --- social sign-in (#13: Apple + Google native ID-token flow) ---
     # Explicit on/off, default False, LOUD in prod (mirror open_registration's
-    # explicit-default posture). Unlike open_registration, social sign-in MAY be
-    # enabled in production (Nick's decision 2026-06-27): the SAME I2 risk applies
-    # — until #36 membership lands, any signed-in user can read every channel —
-    # but that tradeoff is ACCEPTED for the current early-users phase so the live
-    # gateway is reachable at all. The risk is named here and in the PR, not
-    # silently absorbed.
+    # explicit-default posture). Enabled in production by Nick's decision
+    # 2026-06-27, while #36 (I2 membership) was still unenforced; I2 landed the
+    # next day (f0fb48a), so that risk is gone. Like open_registration, it is an
+    # operator's choice of who may create an account.
     social_signin_enabled: bool = False
     # Replay defense (#13). This flag is the SINGLE SWITCH for option-a (the
     # server-ISSUED single-use nonce). When True, /v1/auth/social (a) REFUSES a
@@ -1000,16 +998,20 @@ class Settings(BaseSettings):
                     "print(base64.urlsafe_b64encode(os.urandom(32)).rstrip(b'=').decode())\"`, "
                     "via SOPS)."
                 )
-            # No break-glass for open registration in prod: with I2 membership
-            # not yet enforced, an open prod /register lets any self-created
-            # account read every channel. Forbid the override until I2 lands.
-            if self.open_registration is True:
-                raise ValueError(
-                    "open_registration must not be enabled in production until "
-                    "I2 membership is enforced (an open /register would expose "
-                    "all channels to any self-registered user)."
-                )
-            # Social sign-in IS permitted in prod (unlike open_registration), but
+            # OPEN REGISTRATION IS AN OPERATOR CHOICE IN PRODUCTION. It is closed by
+            # DEFAULT (resolved below) and opened only by an explicit
+            # OPEN_REGISTRATION=true. This used to be a boot refusal, "until I2
+            # membership is enforced": added 2026-06-23 (a80e6bb), and I2 landed the
+            # NEXT DAY (f0fb48a, "enforce I2 membership on reads, subscribe, and
+            # send"). The refusal outlived its reason by four months and, with no
+            # social button in the app, left both islands unable to onboard anyone
+            # (a real user hit it 2026-10-28). A self-registered account now sees
+            # what any signed-in user is meant to see: public channels, and the
+            # private ones it is a member of (acl). In production the flag opens the
+            # PASSKEY door only: password /register stays closed there whatever it
+            # says (it takes any username and password, and no client uses it; see
+            # rest/auth.py `registration_open`).
+            # Social sign-in IS permitted in prod, but
             # enabling it with NO client-ID allowlist is a guaranteed-broken
             # config: the verifier would reject every token (empty aud allowlist
             # = reject-all). Fail LOUD at boot rather than silently 401 every
@@ -1050,10 +1052,12 @@ class Settings(BaseSettings):
                         f"the missing {slug.upper()}_{missing.upper()} or unset "
                         "both to disable the provider."
                     )
-            # At least one viable NEW-USER ingress must exist in production.
-            # open_registration is force-closed above (I2 unenforced), so the ONLY
-            # ways a new account comes into existence in prod are passkey
-            # registration or social sign-in. With BOTH off, the island can still
+            # At least one ENABLED sign-in ingress must exist in production. Note
+            # what this does NOT prove: passkey sign-up also needs
+            # open_registration, which is resolved further down, so "passkey
+            # enabled" here does not mean a new user can join. That case (passkey
+            # on, registration closed, social off: an island nobody can join) is
+            # warned about after the default is resolved, below. With BOTH off, the island can still
             # authenticate pre-existing password accounts via /login but can never
             # ONBOARD anyone — a locked, un-joinable deployment. This is the
             # "retirement is one env line from being false" footgun (#1927):
@@ -1071,11 +1075,12 @@ class Settings(BaseSettings):
             # rp_id but CANNOT confirm a working ceremony from Settings alone. So this
             # invariant's honest guarantee is "at least one ingress is ENABLED and not
             # obviously-misconfigured", not "a registration will succeed". That
-            # enabled-check is itself complete and is the real value here. When a THIRD
-            # legitimate prod ingress lands
-            # (open_registration/invites after I2 membership, #36), this predicate
-            # MUST be extended in the same change or a joinable-by-policy island
-            # would refuse boot — see the follow-up task.
+            # enabled-check is itself complete and is the real value here.
+            # open_registration became a legal prod setting on 2026-10-28; it does
+            # NOT extend this predicate, because it is not an ingress of its own: in
+            # production it opens only the passkey door (password /register stays
+            # closed there). What it changes is whether passkey can ONBOARD, and
+            # that is the "nobody can join" warning below.
             #
             # Passkey RP-ID SANITY (prod) — a BEST-EFFORT lint, NOT a guarantee the
             # ceremony works. Honest scope (cage-match PR#97, Carnot + Tesla): Settings
@@ -1117,8 +1122,7 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "no viable sign-in ingress is configured for production: both "
                     "passkey (PASSKEY_ENABLED) and social sign-in "
-                    "(SOCIAL_SIGNIN_ENABLED) are disabled, and self-registration "
-                    "is closed in production until I2 membership is enforced. The "
+                    "(SOCIAL_SIGNIN_ENABLED) are disabled. The "
                     "island could authenticate pre-existing accounts but could "
                     "never onboard a new user (a locked, un-joinable deployment). "
                     "Refusing to boot — enable at least one of PASSKEY_ENABLED or "
@@ -1186,9 +1190,10 @@ class Settings(BaseSettings):
         # Carnot, both rounds). `open_registration=False` is read by an
         # operator as "no new accounts". It is not: `social/claim` provisions
         # accounts under `social_signin_enabled`, deliberately and by Nick's
-        # 2026-06-27 decision — production force-closes `open_registration`
-        # while permitting social, so the two CANNOT be collapsed without
-        # retiring that decision.
+        # 2026-06-27 decision — production closes `open_registration` by
+        # default while permitting social (and, until 2026-10-28, refused to
+        # open it at all), so the two CANNOT be collapsed without retiring that
+        # decision.
         #
         # What was actually wrong was not the exemption but its SILENCE: the
         # combination that makes the name a lie produced no signal anywhere.
@@ -1207,6 +1212,22 @@ class Settings(BaseSettings):
                 "deliberate (2026-06-27), but 'registration is closed' is "
                 "then true only of the password and passkey doors. To close "
                 "account creation entirely, also set SOCIAL_SIGNIN_ENABLED=false."
+            )
+        #
+        # THE MIRROR CASE: an island NOBODY can join. Passkey is the app's only
+        # ingress, and passkey sign-up needs open_registration, so with
+        # registration closed and social off no new account can be created at
+        # all. Legal (a closed island is an operator's choice), but it must be
+        # audible: on 2026-10-28 it was true of both islands and nothing said so,
+        # and a real user met it as "We couldn't verify that passkey".
+        if (self.is_production and self.passkey_enabled
+                and self.open_registration is False
+                and not self.social_signin_enabled):
+            _log.warning(
+                "NO NEW ACCOUNT CAN BE CREATED on this island: passkey sign-up "
+                "needs OPEN_REGISTRATION=true, which is false, and "
+                "SOCIAL_SIGNIN_ENABLED is false. Existing users can sign in and "
+                "add devices. To let new users join, set OPEN_REGISTRATION=true."
             )
         #
         # PLACED HERE, AFTER THE DEFAULT IS RESOLVED, AND THAT IS LOAD-BEARING.
