@@ -206,3 +206,44 @@ async def test_no_message_lost_in_the_subscribe_effectiveness_gap(session, monke
         f"not <= fence {fence!r}. `conn.subscribed` must be set BEFORE the fence read.")
     # It persisted strictly after the fence read, so it can only be covered LIVE.
     assert delivered_live
+
+
+# --- the fence is NOT monotonic, by design (pinned for aiko_chat_app#336) --- #
+#
+# The app takes its read-position baseline from the CURRENT subscribe's fence and
+# relies on that fence moving BACKWARDS when the newest item becomes hidden to this
+# viewer (island #431 bounds a watermark by the newest VISIBLE item). A future
+# "the fence only grows" optimisation here would silently break that: these two
+# tests make it loud.
+
+async def _subscribe_fence(session, channel_id: str, user_id: str = "u1") -> str:
+    conn = _RecordingConn(user_id)
+    await _handle_subscribe(
+        conn, {"type": "subscribe", "channel_ids": [channel_id]}, session)
+    return _suback_fences(conn)[channel_id]
+
+
+async def test_fence_goes_backwards_across_subscribes_when_the_newest_is_soft_deleted(session):
+    cid = await _seed(session, count=2)
+    assert await _subscribe_fence(session, cid) == _ulid(2)
+    (await session.get(Message, _ulid(2))).deleted_at = _now()
+    await session.commit()
+    assert await _subscribe_fence(session, cid) == _ulid(1), (
+        "the fence must fall back to the newest VISIBLE item, not stay at a hidden one")
+
+
+async def test_fence_goes_backwards_for_a_viewer_who_blocks_the_newest_author(session):
+    from aiko_gateway.domain import moderation_service, users_service
+    viewer = await users_service.create_user(
+        session, username="viewer", display_name="Viewer", password="pw")
+    author = await users_service.create_user(
+        session, username="author", display_name="Author", password="pw")
+    cid = await _seed(session, count=1)
+    session.add(Message(id=_ulid(2), channel_id=cid, sender_kind="human",
+                        sender_user_id=author.id, body="newest",
+                        created_at=_now() + dt.timedelta(seconds=9)))
+    await session.commit()
+    assert await _subscribe_fence(session, cid, viewer.id) == _ulid(2)
+    await moderation_service.block_user(session, viewer.id, author.id)
+    assert await _subscribe_fence(session, cid, viewer.id) == _ulid(1), (
+        "a block must pull this viewer's fence back below the blocked author's message")
