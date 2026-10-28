@@ -207,9 +207,13 @@ async def test_combined_body_is_atomic_under_cooldown(client, session):
     r2 = await client.patch("/v1/me", json={"handle": "alice3", "display_name": "Zed"},
                             headers=hdr)
     assert r2.status_code == 429
-    me = (await client.get("/v1/me", headers=hdr)).json()
-    assert me["username"] == "alice2"       # handle unchanged
-    assert me["display_name"] == "Alice"    # display_name NOT applied (atomic)
+    # Read the ROW, not GET /v1/me: that answers from the session's identity map, and a
+    # refusal that wrongly COMMITTED the name would leave the in-memory copy at "Alice"
+    # while the row said "Zed", so this test passed it (a surviving mutant, #443 r2).
+    from aiko_gateway.domain.models import User
+    row = (await session.execute(select(User.username, User.display_name)
+                                 .where(User.username.in_(["alice2", "alice3"])))).one()
+    assert row == ("alice2", "Alice"), "the refused body's display name landed"
 
 
 @pytest.mark.asyncio
@@ -306,14 +310,15 @@ async def test_handle_change_survives_concurrent_row_deletion(session):
     from aiko_gateway.domain.models import User
 
     user = await _make_user(session, username="alice")
-    # Fresh stamp so the cooldown predicate rejects, THEN delete the row out from
-    # under the update — the re-read finds nothing.
+    # A fresh stamp, so the deleted row would also have been on cooldown: the answer
+    # must be AccountGone, not the cooldown it used to be dressed as.
     await session.execute(_update(User).where(User.id == user.id).values(
         handle_changed_at=dt.datetime.now(dt.timezone.utc)))
     await session.commit()
     uid = user.id
-    # Simulate the delete landing between the failed UPDATE and the re-read by
-    # deleting now; update_profile's UPDATE matches 0 rows, re-read finds nothing.
+    # The deletion commits before the statement runs, which is the only way it can
+    # reach this request now: the statement matches on the id alone, so the deleted
+    # row returns nothing.
     await session.execute(_delete(User).where(User.id == uid))
     await session.commit()
     with pytest.raises(users_service.AccountGone):
@@ -425,6 +430,49 @@ async def test_success_never_reads_the_row_after_its_commit(session, monkeypatch
     assert result.display_name == change.get("display_name", "Alice")
 
 
+@pytest.mark.parametrize("setup, change, outcome", [
+    pytest.param("fresh", {"handle": "alice2"}, None, id="change"),
+    pytest.param("fresh", {"handle": "alice", "display_name": "X"}, None, id="no-op"),
+    pytest.param("fresh", {"display_name": "X"}, None, id="display-name-only"),
+    pytest.param("stamped", {"handle": "alice2", "display_name": "X"},
+                 users_service.HandleChangeCooldown, id="refused"),
+    pytest.param("deleted", {"handle": "alice2"}, users_service.AccountGone, id="gone"),
+])
+@pytest.mark.asyncio
+async def test_every_outcome_is_one_statement(session, monkeypatch, setup, change, outcome):
+    """The title of #439, made checkable: each outcome is decided by ONE statement and
+    nothing reads the row a second time. A refused change used to cost a second read to
+    tell it from a vanished row, and that read was only as good as the lock it ran under
+    (Tesla, #443 r1). Counted at the session: exactly one execute, whatever the outcome."""
+    from sqlalchemy import delete as _delete
+    from sqlalchemy import update as _update
+
+    from aiko_gateway.domain.models import User
+
+    user = await _make_user(session, username="alice")
+    if setup == "stamped":
+        await session.execute(_update(User).where(User.id == user.id).values(
+            handle_changed_at=dt.datetime.now(dt.timezone.utc)))
+        await session.commit()
+    elif setup == "deleted":
+        await session.execute(_delete(User).where(User.id == user.id))
+        await session.commit()
+    real_execute, calls = session.execute, []
+
+    async def counting_execute(*args, **kwargs):
+        calls.append(args[0])
+        return await real_execute(*args, **kwargs)
+
+    monkeypatch.setattr(session, "execute", counting_execute)
+    if outcome is None:
+        await users_service.update_profile(session, user, cooldown_seconds=30 * 24 * 3600, **change)
+    else:
+        with pytest.raises(outcome):
+            await users_service.update_profile(
+                session, user, cooldown_seconds=30 * 24 * 3600, **change)
+    assert len(calls) == 1, f"{len(calls)} statements: {[str(c)[:40] for c in calls]}"
+
+
 @pytest.mark.asyncio
 async def test_patch_me_on_an_account_deleted_mid_request_is_401(
         client, session, monkeypatch):
@@ -452,21 +500,31 @@ async def test_patch_me_on_an_account_deleted_mid_request_is_401(
 @pytest.mark.asyncio
 async def test_cooldown_predicate_beats_a_stale_read(session):
     """Regression for the folded-predicate fix (cage-match #118): the cooldown lives
-    in the UPDATE's WHERE, not a pre-read. Simulate the concurrent race by giving the
-    DB row a fresh handle_changed_at while the in-memory user still reads None (what a
-    second concurrent request's snapshot would see) — the change must STILL be refused."""
+    in the UPDATE itself, not a pre-read. The DB row gets a fresh handle_changed_at
+    while the in-memory user holds None (what a second concurrent request's snapshot
+    would see), and the change must STILL be refused.
+
+    The stale None is PINNED and asserted, so the test states its own precondition
+    instead of inheriting it from whatever create_user leaves loaded. Noether (#443
+    r1) said the unpinned version never built that snapshot; measured, it did: a
+    mutant that trusts the in-memory stamp failed it with DID NOT RAISE. So this
+    makes a working precondition explicit; it did not close a hole."""
+    from sqlalchemy import inspect as _inspect
     from sqlalchemy import update as _update
+    from sqlalchemy.orm.attributes import set_committed_value
 
     from aiko_gateway.domain.models import User
 
     user = await _make_user(session, username="alice")
-    # DB row: changed 'just now' (a concurrent winner's committed write). We do NOT
-    # touch user.handle_changed_at — leaving the in-memory attribute at its loaded
-    # value is exactly the stale snapshot a second concurrent request would hold. The
-    # folded predicate must consult the DB, not that in-memory value, and refuse.
+    # DB row: changed 'just now' (a concurrent winner's committed write), behind the
+    # loaded object's back. The in-memory stamp is then pinned to the stale None.
     await session.execute(_update(User).where(User.id == user.id).values(
-        handle_changed_at=dt.datetime.now(dt.timezone.utc)))
+        handle_changed_at=dt.datetime.now(dt.timezone.utc)
+    ).execution_options(synchronize_session=False))
     await session.commit()
+    set_committed_value(user, "handle_changed_at", None)
+    assert _inspect(user).attrs.handle_changed_at.loaded_value is None, (
+        "the stale snapshot this test depends on was not built")
 
     with pytest.raises(users_service.HandleChangeCooldown):
         await users_service.update_profile(
