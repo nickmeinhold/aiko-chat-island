@@ -44,3 +44,18 @@ def test_no_literal_invisible_characters_in_python_sources():
     assert not offenders, (
         "literal invisible character(s) in source; write them as \\u escapes:\n  "
         + "\n  ".join(offenders))
+
+
+def test_the_classifier_still_sees_what_it_is_for():
+    """The scan's success value is identical to its disabled value: a typo in
+    `_invisible` (say a misspelled category) would let every literal through with the
+    suite green, because the tree holds none to catch (Noether, cage-match #435 r4).
+    So the classifier is pinned on known cases, both ways. Written as code points, not
+    escapes: an escape is exactly what an editor can turn into the character itself
+    (it happened while writing this test, and the scan above caught it)."""
+    invisible = (0x200B, 0x200D, 0x200F, 0x202E, 0x2066, 0xFEFF, 0x2028, 0x2029, 0x00, 0x0C)
+    visible = (0x61, 0x5A, 0x30, 0x20, 0x09, 0x0A, 0x0D, 0xE9, 0x1F469)
+    for cp in invisible:
+        assert _invisible(chr(cp)), f"U+{cp:04X} must count as invisible"
+    for cp in visible:
+        assert not _invisible(chr(cp)), f"U+{cp:04X} must not count as invisible"

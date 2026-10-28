@@ -6,7 +6,7 @@ import math
 import re
 import secrets
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import case, literal, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -303,7 +303,8 @@ class HandleChangeCooldown(Exception):
     cooldown window (settings.handle_change_cooldown_seconds). Carries retry_after
     (whole seconds until the window lifts) which the caller surfaces as 429 +
     Retry-After. display_name-only edits and no-op same-handle writes never raise
-    this — only an ACTUAL handle change starts/consults the cooldown."""
+    this — only an ACTUAL handle change consults the cooldown, and every one starts
+    it except the first claim away from an assigned handle (#437)."""
 
     def __init__(self, retry_after: int) -> None:
         super().__init__("handle change on cooldown")
@@ -332,7 +333,9 @@ async def update_profile(
         still changes the visible handle, so it legitimately consumes the cooldown).
         A change is refused with HandleChangeCooldown while within cooldown_seconds
         of the last change; on success username + aiko_username are rewritten
-        together and handle_changed_at is stamped. A UNIQUE clash → HandleTaken.
+        together and handle_changed_at is stamped, EXCEPT on the first change away
+        from the handle register/finish assigned, which leaves it NULL so the next
+        change is free too (#437). A UNIQUE clash → HandleTaken.
       * display_name: applied whenever provided; never rate-limited on its OWN. In a
         COMBINED body {handle, display_name} the whole update is ATOMIC — if the
         handle change is refused (cooldown/taken) the display_name is NOT applied
@@ -381,10 +384,20 @@ async def update_profile(
 
     # Handle CHANGE — fold the cooldown predicate into the write.
     cutoff = now - dt.timedelta(seconds=cooldown_seconds)
+    # THE FIRST CLAIM DOES NOT START THE CLOCK (Nick, 2026-10-28, #437). Moving off
+    # the handle register/finish ASSIGNED leaves handle_changed_at as it is (NULL), so
+    # a sign-up typo can be fixed once more straight away, and that change stamps. The
+    # CASE reads the ROW's handle_assigned, in the same statement that clears it, so a
+    # stale loaded user can't choose the branch, and two devices racing their first
+    # claim can't both skip: the second sees the flag already cleared and stamps.
+    stamp = case(
+        (User.handle_assigned.is_(True), User.handle_changed_at),
+        else_=literal(now, User.__table__.c.handle_changed_at.type),
+    )
     values: dict = {
         "username": handle,
         "aiko_username": _sanitize_aiko_username(handle),
-        "handle_changed_at": now,
+        "handle_changed_at": stamp,
         # A chosen handle: the account no longer carries the one it was assigned.
         "handle_assigned": False,
     }

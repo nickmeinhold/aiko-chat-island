@@ -28,6 +28,7 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import select
 
 from aiko_gateway.domain import security, users_service
 from aiko_gateway.rest import auth as auth_routes
@@ -419,3 +420,59 @@ async def test_resending_your_own_auto_handle_is_a_no_op(client, session):
     assert resp.status_code == 200, resp.text
     assert resp.json()["handle_auto"] is True
     assert resp.json()["display_name"] == "Paul"
+
+
+# --- the first claim doesn't start the cooldown (#437, Nick 2026-10-28) ---- #
+
+async def _stamp_of(session, user_id):
+    from aiko_gateway.domain.models import User
+    return (await session.execute(
+        select(User.handle_changed_at).where(User.id == user_id))).scalar_one()
+
+
+@pytest.mark.asyncio
+async def test_the_first_claim_does_not_start_the_cooldown(client, session):
+    """Moving off the handle register/finish assigned leaves handle_changed_at NULL,
+    so a sign-up typo can be fixed once more straight away. That second change stamps,
+    and the third is refused: the cooldown is intact for every change after the first
+    claim."""
+    user = await _make_auto_user(session)
+    uid, headers = user.id, _auth(user)
+    first = await client.patch("/v1/me", json={"handle": "pual"}, headers=headers)
+    assert first.status_code == 200, first.text
+    assert first.json()["handle_auto"] is False
+    assert await _stamp_of(session, uid) is None
+    fixed = await client.patch("/v1/me", json={"handle": "paul"}, headers=headers)
+    assert fixed.status_code == 200, fixed.text
+    assert await _stamp_of(session, uid) is not None
+    third = await client.patch("/v1/me", json={"handle": "paul3"}, headers=headers)
+    assert third.status_code == 429, third.text
+    assert third.json()["code"] == "handle_change_cooldown"
+
+
+@pytest.mark.asyncio
+async def test_the_skip_reads_the_row_not_a_stale_user(session):
+    """The CASE that skips the stamp reads the ROW's handle_assigned. A user object
+    loaded while the account was still assigned, used after another device already
+    claimed a handle, must not skip again: the DB says the flag is cleared, so this
+    change stamps."""
+    from sqlalchemy import update as _update
+    from sqlalchemy.orm.attributes import set_committed_value
+
+    from aiko_gateway.domain.models import User
+
+    user = await _make_auto_user(session)
+    await session.execute(_update(User).where(User.id == user.id).values(
+        username="claimed-elsewhere", handle_assigned=False))
+    await session.commit()
+    # The commit EXPIRES `user`, so reading the flag now would quietly reload False
+    # from the DB, and an earlier version of this test held no stale value at all (its
+    # in-memory mutant survived). Reload, then put back the stale True AS IF LOADED,
+    # without marking it changed: what a request that loaded before the other
+    # device's claim would hold.
+    await session.refresh(user)
+    set_committed_value(user, "handle_assigned", True)
+    assert user.handle_assigned is True
+    await users_service.update_profile(
+        session, user, handle="paul", cooldown_seconds=30 * 24 * 3600)
+    assert await _stamp_of(session, user.id) is not None
