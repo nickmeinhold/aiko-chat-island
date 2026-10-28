@@ -9,6 +9,10 @@ rest of the suite.
 """
 from __future__ import annotations
 
+import cbor2
+import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec, ed25519, rsa
 from sqlalchemy import func, select
 
 from aiko_gateway.config import settings
@@ -47,6 +51,41 @@ async def test_start_registration_offers_default_alg_set_incl_eddsa(session):
     out = await passkey_service.start_registration(session)
     algs = {p["alg"] for p in out["options"]["pubKeyCredParams"]}
     assert algs == {-7, -8, -257}, f"expected the default ES256+EdDSA+RS256, got {algs}"
+
+
+def _int_bytes(i: int) -> bytes:
+    return i.to_bytes((i.bit_length() + 7) // 8, "big")
+
+
+def _es256_key() -> dict:
+    nums = ec.generate_private_key(ec.SECP256R1()).public_key().public_numbers()
+    return {1: 2, 3: -7, -1: 1, -2: nums.x.to_bytes(32, "big"),
+            -3: nums.y.to_bytes(32, "big")}
+
+
+def _eddsa_key() -> dict:
+    raw = ed25519.Ed25519PrivateKey.generate().public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    return {1: 1, 3: -8, -1: 6, -2: raw}
+
+
+def _rs256_key() -> dict:
+    nums = rsa.generate_private_key(
+        public_exponent=65537, key_size=2048).public_key().public_numbers()
+    return {1: 3, 3: -257, -1: _int_bytes(nums.n), -2: _int_bytes(nums.e)}
+
+
+@pytest.mark.parametrize("make_key", [
+    pytest.param(_es256_key, id="es256-p256"),
+    pytest.param(_eddsa_key, id="eddsa-ed25519"),
+    pytest.param(_rs256_key, id="rs256-rsa2048"),
+])
+def test_assert_can_verify_accepts_a_real_key_of_every_offered_alg(make_key):
+    """The other half of the #421 predicate: a GOOD key of each alg we offer
+    (the test above) passes. The endpoint suite only ever registers ES256, so a
+    cryptography or predicate change that refused RS256 (Windows Hello) or EdDSA
+    would otherwise show up as 401s in production, not as a red test (#428)."""
+    passkey_service._assert_can_verify(cbor2.dumps(make_key()))
 
 
 async def test_start_authentication_is_usernameless(session):

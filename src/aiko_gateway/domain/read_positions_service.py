@@ -145,8 +145,9 @@ async def _check_bounds(
     * the newest item VISIBLE to them: `messages_service.latest_ulids`, the same
       one implementation as the subscribe fence (not soft-deleted, not hidden by a
       block, plus retractions), so a baseline taken from the fence always fits;
-    * their OWN stored value, so a watermark they synced before the message it
-      names was hidden (soft-deleted, or its author blocked) can be re-sent.
+    * their OWN stored value, as it stands NOW, so a watermark still stored after
+      the message it names was hidden (soft-deleted, or its author blocked) can be
+      re-sent.
 
     The first #429 bound used the channel's newest item of ANY kind, hidden ones
     included, and so answered a question about rows the caller can't see: about 48
@@ -154,10 +155,15 @@ async def _check_bounds(
     of the newest hidden item (Tesla, #429 fresh round). The operator chose this
     bound instead (2026-10-28).
 
-    THE ONE COST. A watermark naming a message hidden BEFORE this device ever
-    synced it is refused (structured 422, naming the channel); the app drops that
-    entry and re-baselines from the fence, which is the newest visible item, so
-    almost the same place.
+    THE ONE COST. A watermark naming a hidden message is refused (structured 422,
+    naming the channel) whenever the stored value is below it. The bound keeps
+    the CURRENT stored value, not every value ever synced, and positions are per
+    USER, not per device, so that happens two ways: the message was hidden before
+    any device stored a position at or past it; or one was stored, then a write
+    moved it back (mark-as-unread is an ordinary edit, module docstring) and an
+    older device re-sends the higher one (Carnot, #431). Either way the app drops
+    that entry and re-baselines from the fence, which is the newest visible item,
+    so almost the same place.
 
     Still no clock: a fabricated value is at most the newest visible item, which
     an honest client can also send, and the next message is unread again.

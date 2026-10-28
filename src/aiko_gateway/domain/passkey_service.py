@@ -282,10 +282,11 @@ def verify_registration(*, raw_challenge: bytes, credential: dict) -> dict:
     (base64url strings) ready to persist directly via create_passkey_account.
     The expected_challenge/origin/rp_id are OURS, never read from the response.
 
-    Raises exactly two things, both the caller's fault (the route maps them to 4xx):
-    InvalidJSONStructure when the credential isn't a registration response at all
-    (missing rawId/response, wrong type), and InvalidRegistrationResponse for
-    everything else. Everything else is broad ON PURPOSE: py_webauthn 3.0.0 leaves
+    A failure the CALLER caused raises exactly one of two things (the route maps
+    them to 4xx): InvalidJSONStructure when the credential isn't a registration
+    response at all (missing rawId/response, wrong type), and
+    InvalidRegistrationResponse for every other caller-caused failure. That second
+    one is broad ON PURPOSE: py_webauthn 3.0.0 leaves
     the COSE key decode, the attestation-statement verifiers and the backup-flag
     parse unwrapped, so a fmt:"none" body that needs no signature can raise
     KeyError, TypeError, ValueError, binascii.Error, UnsupportedPublicKeyType or
@@ -334,7 +335,7 @@ def verify_registration(*, raw_challenge: bytes, credential: dict) -> dict:
 
 
 def _assert_can_verify(credential_public_key: bytes) -> None:
-    """Refuse a key that no sign-in could ever verify (#421). py_webauthn's
+    """Refuse a key that sign-in could never even ask (#421). py_webauthn's
     registration decodes the COSE key's fields but never uses the key, so an
     off-curve point, an unknown curve, or an `alg` that doesn't fit the key type
     (an EC2 key labelled RS256) all register and then fail every sign-in.
@@ -343,8 +344,16 @@ def _assert_can_verify(credential_public_key: bytes) -> None:
     .py:174-183: decode, load, verify_signature with the key's own alg) against an
     empty signature. The one acceptable answer is InvalidSignature: the key could
     be asked. Anything else propagates and is folded into a refusal by the caller.
-    Being the same calls, not a list of known-bad shapes, is what makes "stored"
-    imply "verifiable"."""
+
+    WHAT THAT GUARANTEES, exactly: no stored key can make sign-in fail as a server
+    error. Every step of the sign-in dispatch that depends on the key alone has
+    already run once, here, on the same bytes, so all that is left at sign-in is
+    the verifier's answer about the signature. It does NOT promise the key can
+    ever sign: a degenerate RSA key (n=3233) passes, registers, and then gets a
+    clean 401 at every sign-in (probed, #428). That is useless but no worse than a
+    lost private key, and no authenticator produces one. Being the same calls, not
+    a list of known-bad shapes, is what makes the guarantee cover shapes nobody
+    listed."""
     decoded = decode_credential_public_key(credential_public_key)
     try:
         verify_signature(

@@ -663,7 +663,7 @@ async def test_add_passkey_malformed_credential_is_400(client, session):
         session, bytes_to_base64url(added.credential_id)) is None
 
 
-async def test_add_passkey_hostile_attestation_is_401(client):
+async def test_add_passkey_hostile_attestation_is_401(client, session):
     reg, _ = await _register_passkey(client)
     token = reg.json()["access_token"]
     start = (await client.post("/v1/auth/passkey/register/start")).json()
@@ -674,6 +674,8 @@ async def test_add_passkey_hostile_attestation_is_401(client):
         json={"state": start["state"],
               "credential": added.register(start["options"]["challenge"])})
     assert r.status_code == 401, r.text
+    assert await passkey_service.get_credential(
+        session, bytes_to_base64url(added.credential_id)) is None
 
 
 @pytest.mark.parametrize("field", ["response", "rawId"])

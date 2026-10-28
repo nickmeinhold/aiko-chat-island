@@ -268,7 +268,9 @@ async def test_the_newest_item_itself_is_a_valid_position(session):
 async def test_a_synced_watermark_survives_its_message_being_hidden(session):
     """App tab: a message read today can be soft-deleted tomorrow, and the
     watermark still names it. The bound includes the caller's OWN stored value, so
-    re-sending a watermark already synced is never refused."""
+    re-sending the watermark that is still stored is never refused. One that was
+    stored and then moved back is another matter
+    (`test_a_watermark_moved_back_then_hidden_is_refused_on_resend`)."""
     u, ch = await _user(session, "alice"), await _channel(session, ceiling=False)
     await _member(session, ch, u)
     await _msg(session, ch, 40)
@@ -291,6 +293,25 @@ async def test_a_watermark_hidden_before_it_was_ever_synced_is_refused(session):
     gone = await _msg(session, ch, 50, deleted=True)
     with pytest.raises(svc.InvalidReadPosition) as exc:
         await _put(session, u, {ch.id: (gone, 0)})
+    assert exc.value.channel_id == ch.id
+
+
+async def test_a_watermark_moved_back_then_hidden_is_refused_on_resend(session):
+    """THE ONE COST, its second way (Carnot, #431): the bound keeps the CURRENT
+    stored value, not every value ever synced. The phone syncs the newest message,
+    the tablet marks the channel unread, the message is hidden, and the phone
+    re-sends what it last had. Same recovery: re-baseline from the fence."""
+    u, ch = await _user(session, "alice"), await _channel(session, ceiling=False)
+    await _member(session, ch, u)
+    earlier = await _msg(session, ch, 40)
+    newest = await _msg(session, ch, 50)
+    await _put(session, u, {ch.id: (newest, 0)})                 # phone, version 1
+    await _put(session, u, {ch.id: (earlier, 1)})                # tablet: unread
+    (await session.get(Message, newest)).deleted_at = dt.datetime(
+        2026, 10, 3, tzinfo=dt.timezone.utc)
+    await session.commit()                                         # then hidden
+    with pytest.raises(svc.InvalidReadPosition) as exc:
+        await _put(session, u, {ch.id: (newest, 2)})              # phone re-sends
     assert exc.value.channel_id == ch.id
 
 
