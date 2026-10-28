@@ -67,12 +67,12 @@ import enum
 import re
 from dataclasses import dataclass
 
-from sqlalchemy import and_, exists, func, literal, select, union_all, update
+from sqlalchemy import and_, exists, literal, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from . import acl
-from .models import Channel, ChannelReadPosition, Message, Retraction, User
+from . import acl, messages_service
+from .models import Channel, ChannelReadPosition, User
 
 # A CANONICAL ULID: uppercase Crockford base32 with a first character of 0-7 (26
 # chars x 5 bits is 130 bits for a 128-bit value). This is WIRE HYGIENE, not the
@@ -139,47 +139,48 @@ async def _check_bounds(
     session: AsyncSession, *, user_id: str, positions: dict[str, tuple[str, int]],
 ) -> None:
     """A watermark is a POSITION in the channel's ordering, not a reference to a
-    row (app tab, #429). So it may name any id up to the channel's newest stored
-    item, of ANY kind: deleted, hidden, or a retraction (the subscribe fence,
-    `messages_service.latest_ulid`, can be a retraction's ULID). Nothing past it.
+    row (app tab, #429). Its bound is the later of two things the CALLER already
+    knows, so a refusal reveals nothing they couldn't see:
 
-    This replaces the round-2 clock window, which three rounds kept finding holes
-    around (#429 r3, Carnot and Tesla). A fabricated value can now be at most
-    "read up to the newest item", which an honest client can also send, and the
-    next message to arrive is unread again. The bound only grows (messages and
-    retractions are never hard-deleted except with their channel), so a valid
-    watermark stays valid forever, and checking it inside this transaction
-    before the writes cannot go stale.
+    * the newest item VISIBLE to them: `messages_service.latest_ulids`, the same
+      one implementation as the subscribe fence (not soft-deleted, not hidden by a
+      block, plus retractions), so a baseline taken from the fence always fits;
+    * their OWN stored value, so a watermark they synced before the message it
+      names was hidden (soft-deleted, or its author blocked) can be re-sent.
 
-    READABLE CHANNELS ONLY, and that is not an exemption: a channel the caller
-    can't read is skipped by the write itself (module docstring), so there is no
-    stored value to bound. For a channel the caller CAN read, the residual is that
-    a refusal compares against items they may not see (a soft-deleted message, or
-    one from someone they blocked).
+    The first #429 bound used the channel's newest item of ANY kind, hidden ones
+    included, and so answered a question about rows the caller can't see: about 48
+    refusals (a binary search over a ULID's millisecond prefix) gave the exact time
+    of the newest hidden item (Tesla, #429 fresh round). The operator chose this
+    bound instead (2026-10-28).
+
+    THE ONE COST. A watermark naming a message hidden BEFORE this device ever
+    synced it is refused (structured 422, naming the channel); the app drops that
+    entry and re-baselines from the fence, which is the newest visible item, so
+    almost the same place.
+
+    Still no clock: a fabricated value is at most the newest visible item, which
+    an honest client can also send, and the next message is unread again.
+    Unreadable channels are skipped by the write itself (module docstring), so
+    they are never bounded and never answer anything.
     """
     ids = [cid for cid, (last_read, _) in positions.items() if last_read]
     if not ids:
         return
-    readable = set(await acl.filter_readable_ids(session, user_id, ids))
+    readable = await acl.filter_readable_ids(session, user_id, ids)
     if not readable:
         return
-    items = union_all(
-        select(Message.channel_id.label("cid"), Message.id.label("item_id"))
-        .where(Message.channel_id.in_(readable)),
-        select(Retraction.channel_id.label("cid"), Retraction.id.label("item_id"))
-        .where(Retraction.channel_id.in_(readable)),
-    ).subquery()
-    newest = dict((await session.execute(
-        select(items.c.cid, func.max(items.c.item_id)).group_by(items.c.cid)
+    visible = await messages_service.latest_ulids(session, readable, user_id)
+    stored = dict((await session.execute(
+        select(ChannelReadPosition.channel_id, ChannelReadPosition.last_read).where(
+            ChannelReadPosition.user_id == user_id,
+            ChannelReadPosition.channel_id.in_(readable))
     )).all())
-    for cid in ids:
-        if cid not in readable:
-            continue
-        last_read = positions[cid][0]
-        bound = newest.get(cid)
-        if bound is None or last_read > bound:
+    for cid in readable:
+        bound = max(visible[cid], stored.get(cid, ""))
+        if not bound or positions[cid][0] > bound:
             raise InvalidReadPosition(
-                cid, "last_read is past the channel's newest item")
+                cid, "last_read is past the newest item you can see")
 
 
 async def _write(session: AsyncSession, *, user_id: str, channel_id: str,
