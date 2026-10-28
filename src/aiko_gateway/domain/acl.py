@@ -39,6 +39,14 @@ def _readable_predicate(user_id: str):
     return Channel.is_private.is_(False) | member
 
 
+def readable_predicate(user_id: str):
+    """The same "readable by user_id" predicate, for COMPOSING into a statement
+    that correlates on ``Channel`` (a write's ``SELECT … FROM channels``, or an
+    ``EXISTS`` beside an UPDATE), so a write can decide readability in the row it
+    writes rather than in an earlier read. One predicate, every door."""
+    return _readable_predicate(user_id)
+
+
 async def _membership(
     session: AsyncSession, channel_id: str, user_id: str
 ) -> Membership | None:

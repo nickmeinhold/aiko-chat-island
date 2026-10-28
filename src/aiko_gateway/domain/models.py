@@ -696,6 +696,70 @@ class Membership(Base):
     joined_at: Mapped[dt.datetime] = mapped_column(UtcDateTime, default=_utcnow)
 
 
+class ChannelReadPosition(Base):
+    """Where a user has read up to in a channel — the ISLAND half of Nick's ruling
+    2026-09-25, *"different devices should see the same thing"* (#4834a).
+
+    THIS REVERSES A CONTRACT THAT WAS RECORDED ON BOTH SIDES, which is why it is a
+    cross-tab change and not an addition. `rest/dm.py`'s `list_dms` docstring says
+    *"NO ``unread`` (client-side per the contract — the island has no read-position
+    store)"*, and the app's `channel_read_store.dart` says its watermarks *"never
+    leave the device"*. Both were right about the old design. The measured
+    consequence is the one Nick named: two handsets disagree about what is unread
+    until each is opened.
+
+    `seq` IS THE ISLAND'S VERSION, ADVANCED BY COMPARE-AND-SWAP. A write names the
+    version it is editing (`base_seq`), and the island stores `base_seq + 1` only if
+    that is still the version it holds (PR #429's v2 contract). The first design,
+    where a client sent an absolute `seq` and the highest won, was dropped after
+    #429's round 1: a losing write looked like success, equal numbers resolved by
+    arrival order, and one huge value froze a channel forever. The island increments
+    but never orders edits. MARK-AS-UNREAD is an ordinary edit carrying an earlier
+    ULID; `last_read` is never compared, so it applies like any other.
+
+    ONE ROW PER (user, channel). The PK leads with `user_id`, the INVERSE of
+    `Membership` — deliberately. Every access path here is user-first ("my read
+    positions"), whereas memberships are read channel-first; #2633 had to add
+    `ix_memberships_user_id` precisely because that table's composite PK led with
+    the wrong column for a user-first query. Leading correctly costs nothing now
+    and saves the same index later.
+
+    LAST_READ MAY BE THE EMPTY STRING. That is the app's first-sight floor for a
+    channel empty at settle time (`channel_read_store.dart`), not a missing value.
+    Storing it as `''` rather than NULL keeps the column NOT NULL and keeps an
+    absence meaning exactly one thing — a row that does not exist. An absence with
+    two causes is the defect class this repo keeps re-finding.
+
+    NOT A GENERAL KEY-VALUE STORE, and the app tab's argument for that is better
+    than mine was: the two multi-device consumers have DIFFERENT conflict semantics
+    — a watermark wants version-max, a device label wants last-write-wins. One
+    general store either lies to one consumer or grows a per-key merge policy,
+    which is the generality creep that killed design 16.
+    """
+    __tablename__ = "channel_read_positions"
+    __table_args__ = (
+        # Versions start at 1 and only ever go up by one. 0 is the WIRE's name for
+        # "no row", so a stored row at 0 would answer every write with "conflict at
+        # 0, resend from 0", and the resend could never move it (Noether, Tesla,
+        # #429 r2). The column makes that state unrepresentable.
+        CheckConstraint("seq >= 1", name="ck_channel_read_positions_seq"),
+        # The PK leads with user_id (every read is "my positions"), so a lookup by
+        # channel alone, which hard_delete_channel does, needs its own index: the
+        # mirror of ix_memberships_user_id (#2633).
+        Index("ix_channel_read_positions_channel_id", "channel_id"),
+    )
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), primary_key=True)
+    channel_id: Mapped[str] = mapped_column(
+        ForeignKey("channels.id"), primary_key=True)
+    # A 26-char ULID, or '' (the first-sight floor). NOT a closed set, so it is
+    # correctly absent from test_closed_set_guard's vocabulary shapes.
+    last_read: Mapped[str] = mapped_column(String(26), nullable=False)
+    # The island's version of this row: 1 on the first write, +1 per applied
+    # compare-and-swap. Clients never write it directly (they send base_seq).
+    seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[dt.datetime] = mapped_column(UtcDateTime, default=_utcnow)
+
+
 class Community(Base):
     """A community ("server") that owns channels (#32, Option B / Phase B1).
 
