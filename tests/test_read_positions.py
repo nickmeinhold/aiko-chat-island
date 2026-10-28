@@ -481,6 +481,17 @@ async def test_route_a_conflict_with_nothing_stored_is_version_0(client, session
         "status": "conflict", "last_read": None, "seq": 0}
 
 
+async def test_route_a_conflict_returns_the_stored_floor_verbatim(client, session):
+    """The app's conflict rule compares the reply's last_read against what it last
+    saw, so the stored value must come back VERBATIM. The '' floor is a real, older
+    position and must arrive as "", never null: null means "no row" (seq 0)."""
+    u, ch = await _user(session, "alice"), await _channel(session)
+    await _rput(client, u, {ch.id: {"last_read": "", "base_seq": 0}})
+    r = await _rput(client, u, {ch.id: {"last_read": _ulid(9), "base_seq": 0}})
+    assert r.json()["positions"][ch.id] == {
+        "status": "conflict", "last_read": "", "seq": 1}
+
+
 async def test_route_a_first_design_body_is_a_loud_422(client, session):
     """`seq` instead of `base_seq` must not be silently misread: an unknown key is
     ignored, so the missing base_seq is what makes this loud, and it names the
