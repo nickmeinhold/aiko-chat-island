@@ -6,9 +6,10 @@ import math
 import re
 import secrets
 
-from sqlalchemy import case, literal, or_, select, update
+from sqlalchemy import and_, case, literal, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import set_committed_value
 
 from .ids import new_ulid
 from .models import PasskeyCredential, SocialIdentity, User
@@ -311,6 +312,23 @@ class HandleChangeCooldown(Exception):
         self.retry_after = retry_after
 
 
+class AccountGone(Exception):
+    """The account's row is gone: a deletion (its own, from another device) committed
+    before this request's write. The caller maps it to the same opaque 401 the auth
+    door gives a token whose user no longer exists (`deps.get_current_user`), which is
+    what every later request from that token gets anyway (#439). Before, this was a
+    500 on the display-name path (the ORM failing to flush or refresh a deleted row)
+    and a full-window cooldown 429 on the handle path: a wait for an account that
+    will never come back."""
+
+
+# What `update_profile`'s one statement RETURNS and puts on the instance: every column
+# it can write, plus the id the user view reads (so even an expire_on_commit session
+# needs no reload to answer).
+_PROFILE_COLUMNS = (User.id, User.username, User.aiko_username, User.display_name,
+                    User.handle_changed_at, User.handle_assigned)
+
+
 async def update_profile(
     session: AsyncSession, user: User, *,
     handle: str | None = None, display_name: str | None = None,
@@ -336,131 +354,111 @@ async def update_profile(
         together and handle_changed_at is stamped, EXCEPT on the first change away
         from the handle register/finish assigned, which leaves it NULL so the next
         change is free too (#437). A UNIQUE clash → HandleTaken.
+      * A row that is gone (a deletion committed first) → AccountGone, on either
+        path, never a 500 and never a cooldown.
       * display_name: applied whenever provided; never rate-limited on its OWN. In a
         COMBINED body {handle, display_name} the whole update is ATOMIC — if the
         handle change is refused (cooldown/taken) the display_name is NOT applied
         either (the folded UPDATE below is all-or-nothing). A display_name-only
         request is never gated.
 
-    Cooldown folded INTO the write (cage-match PR#118, Carnot+Tesla+Wu): the handle
-    change is a single conditional UPDATE whose WHERE carries the cooldown predicate,
-    so a concurrent double-change can't both pass a stale in-memory read of
-    handle_changed_at (the observe-then-write TOCTOU the project forbids —
-    concept_visibility_gate_atomic_with_write). rowcount==0 ⇒ the WHERE rejected the
-    write, for one of two reasons: the cooldown, or the row already holds the requested
-    handle (`username != :handle`). The row is re-read INSIDE the same transaction,
-    before the rollback, to tell them apart, so the classification describes the state
-    the UPDATE actually ran against."""
+    ONE STATEMENT DECIDES AND APPLIES (#439). The cooldown was folded into the write
+    by cage-match PR#118 (Carnot+Tesla+Wu); now everything is: one `UPDATE …
+    RETURNING` decides change-or-no-op, applies the cooldown and writes the display
+    name together. The row it RETURNS is the outcome, and its values go onto `user`
+    directly, so nothing reads or writes the row again once the statement is done.
+    #438's rounds kept finding a decision taken in the DB and then acted on after
+    the lock was released, where a rename or a self-deletion could land in between;
+    with no second step there is no in between. Zero rows means the cooldown refused
+    a real change, or the row is gone, told apart by one read inside the same
+    transaction, before the rollback."""
     if handle is None and display_name is None:
         raise ValueError("update_profile requires handle and/or display_name")
     now = now or dt.datetime.now(dt.timezone.utc)
-
-    # A same-handle request is NOT spotted here from the loaded user. That snapshot can
-    # be stale either way: a concurrent change may have moved the handle away from it
-    # (cage-match #118) or onto the very handle requested (#438: two devices, or a
-    # double submit, both claiming `paul` from an assigned account, where the second
-    # would otherwise stamp the cooldown and spend the free fix while changing
-    # nothing). The UPDATE below refuses a write that wouldn't change the handle
-    # (`username != :handle`), and the rowcount == 0 branch returns it as a no-op,
-    # so the ROW decides.
+    # Captured up front: a rollback expires the instance, and reading user.id after
+    # one would lazy-load outside the async context (MissingGreenlet).
+    uid = user.id
 
     if handle is None:
-        # display_name-only: no cooldown, no atomic gate.
-        if display_name is not None:
-            user.display_name = display_name
-        await session.commit()
-        # Symmetric with the handle path's post-commit refresh. Not strictly required
-        # today (SessionLocal is expire_on_commit=False — db.py:79), but making BOTH
-        # success paths end the same way removes the asymmetry cross-family reviewers
-        # read as a MissingGreenlet risk, and stays correct if that ever flips.
-        await session.refresh(user)
-        return user
-
-    # Handle CHANGE — fold the cooldown predicate into the write.
-    cutoff = now - dt.timedelta(seconds=cooldown_seconds)
-    # THE FIRST CLAIM DOES NOT START THE CLOCK (Nick, 2026-10-28, #437). Moving off
-    # the handle register/finish ASSIGNED leaves handle_changed_at as it is (NULL), so
-    # a sign-up typo can be fixed once more straight away, and that change stamps. The
-    # CASE reads the ROW's handle_assigned, in the same statement that clears it, so a
-    # stale loaded user can't choose the branch, and two devices racing their first
-    # claim can't both skip: the second sees the flag already cleared and stamps.
-    stamp = case(
-        (User.handle_assigned.is_(True), User.handle_changed_at),
-        else_=literal(now, User.__table__.c.handle_changed_at.type),
-    )
-    values: dict = {
-        "username": handle,
-        "aiko_username": _sanitize_aiko_username(handle),
-        "handle_changed_at": stamp,
-        # A chosen handle: the account no longer carries the one it was assigned.
-        "handle_assigned": False,
-    }
-    if display_name is not None:  # atomic with the handle change (all-or-nothing)
-        values["display_name"] = display_name
+        # display_name-only: no cooldown, no handle columns. Still one statement with
+        # RETURNING, so a deleted row is a named refusal (AccountGone) rather than the
+        # ORM failing to flush or refresh it, a 500.
+        values: dict = {"display_name": display_name}
+        gate = User.id == uid
+    else:
+        cutoff = now - dt.timedelta(seconds=cooldown_seconds)
+        # THE ROW DECIDES whether this is a change. Every SET and WHERE expression here
+        # reads the row as it was before this statement (SQL evaluates them all against
+        # the old values), so `same` is the row's answer, never the loaded user's: that
+        # snapshot can be stale either way (cage-match #118: moved away from it; #438:
+        # moved onto the very handle requested, two devices both claiming `paul`). A
+        # same-handle request MATCHES and changes nothing: every handle column keeps
+        # its value, so it never stamps the cooldown, never spends the free first
+        # claim, and never rewrites aiko_username (which need not equal the sanitised
+        # handle on every row).
+        same = User.username == handle
+        cols = User.__table__.c
+        values = {
+            "username": handle,
+            "aiko_username": case(
+                (same, User.aiko_username),
+                else_=literal(_sanitize_aiko_username(handle), cols.aiko_username.type)),
+            # THE FIRST CLAIM DOES NOT START THE CLOCK (Nick, 2026-10-28, #437). Moving
+            # off the handle register/finish ASSIGNED leaves the stamp as it is (NULL),
+            # so a sign-up typo can be fixed once more straight away, and that change
+            # stamps. Read from the row in the statement that clears the flag, so two
+            # devices racing their first claim can't both skip.
+            "handle_changed_at": case(
+                (same, User.handle_changed_at),
+                (User.handle_assigned.is_(True), User.handle_changed_at),
+                else_=literal(now, cols.handle_changed_at.type)),
+            # A chosen handle: the account no longer carries the one it was assigned.
+            "handle_assigned": case(
+                (same, User.handle_assigned),
+                else_=literal(False, cols.handle_assigned.type)),
+        }
+        if display_name is not None:  # atomic with the handle (all-or-nothing)
+            values["display_name"] = display_name
+        gate = and_(User.id == uid, or_(
+            same, User.handle_changed_at.is_(None), User.handle_changed_at <= cutoff))
     stmt = (
-        update(User)
-        .where(
-            User.id == user.id,
-            # A write that wouldn't change the handle matches nothing, so it can never
-            # stamp the cooldown or clear handle_assigned (see the rowcount == 0 arm).
-            User.username != handle,
-            or_(User.handle_changed_at.is_(None), User.handle_changed_at <= cutoff),
-        )
-        .values(**values)
-        # synchronize_session=False: the cooldown predicate must be evaluated by the
-        # DB (the whole point of folding it into the write), NOT re-evaluated in
-        # Python against the loaded ORM object — that in-memory eval compares a
-        # SQLite-naive handle_changed_at against the tz-aware cutoff and TypeErrors,
-        # and would also defeat the atomicity. We refresh() the row after a hit.
+        update(User).where(gate).values(**values)
+        .returning(*_PROFILE_COLUMNS)
+        # synchronize_session=False: the gate must be evaluated by the DB (the whole
+        # point of folding it into the write), never re-run in Python against the
+        # loaded object, which compares a stale value and defeats the atomicity.
         .execution_options(synchronize_session=False)
     )
     try:
-        result = await session.execute(stmt)
+        row = (await session.execute(stmt)).one_or_none()
     except IntegrityError as e:
         await session.rollback()
         if _is_handle_conflict(e):
             raise HandleTaken() from e
         raise  # a non-handle constraint is NOT a taken handle — don't mislabel it
-    if result.rowcount == 0:
-        # The conditional UPDATE matched no row for one of two reasons: the cooldown
-        # predicate rejected it (handle_changed_at set AND newer than cutoff), OR the
-        # row already holds the requested handle (a same-handle request, a concurrent
-        # winner, an idempotent retry: `username != :handle` refuses all three).
-        # Re-read the current handle + stamp to tell them apart. Capture the
-        # id BEFORE rollback — rollback expires every instance unconditionally, so
-        # reading user.id afterwards would lazy-load outside the async context
-        # (MissingGreenlet).
-        uid = user.id
-        # READ BEFORE THE ROLLBACK (cage-match #438 r2, Carnot + Noether). The UPDATE,
-        # even matching nothing, holds SQLite's write lock until this transaction
-        # ends (measured: another writer gets "database is locked" in the
-        # rollback-journal mode prod runs), so this read sees the state the UPDATE ran
-        # against. Read after the rollback, a concurrent first claim could commit in
-        # between: a changed username with a still-NULL stamp, classified as a
-        # cooldown, and `now - None` was a 500.
-        row = (await session.execute(
-            select(User.username, User.handle_changed_at)
-            .where(User.id == uid))).one_or_none()
+    if row is None:
+        # Zero rows: the cooldown refused a real change, or the row is gone. A
+        # same-handle request can't land here (`same` matches it). READ BEFORE THE
+        # ROLLBACK (cage-match #438 r2, Carnot + Noether): the UPDATE, even matching
+        # nothing, holds SQLite's write lock until this transaction ends (measured:
+        # another writer gets "database is locked" in the rollback-journal mode prod
+        # runs), so this read sees the row exactly as the UPDATE saw it.
+        found = (await session.execute(
+            select(User.handle_changed_at).where(User.id == uid))).one_or_none()
         await session.rollback()
-        if row is None:
-            # The row is gone: a concurrent self-account-deletion committed before this
-            # request's UPDATE (it can no longer land between the UPDATE and this read,
-            # which share a transaction). Don't one()-500 (cage-match #118, Carnot+Tesla);
-            # report the full window, non-crashing — the account is going away anyway.
-            raise HandleChangeCooldown(cooldown_seconds)
-        cur_username, last = row
-        if cur_username == handle:
-            # The row ALREADY holds the requested handle. "Set my handle to X" when it
-            # is already X is a no-op success, NOT a cooldown rejection (cage-match
-            # #118 r4, Carnot): no stamp, handle_assigned untouched; apply any
-            # display_name and return rather than a spurious 429.
-            await session.refresh(user)
-            if display_name is not None:
-                user.display_name = display_name
-                await session.commit()
-                await session.refresh(user)
-            return user
-        if last is not None and last.tzinfo is None:
+        if found is None or handle is None:
+            # The row is gone: a deletion (its own, from another device) committed
+            # before this statement. A display-name-only UPDATE can match zero rows in
+            # no other way.
+            raise AccountGone()
+        (last,) = found
+        if last is None:
+            # Unreachable while the read shares the UPDATE's lock: a NULL stamp passes
+            # the gate. If it ever happens, the statement and this read disagree about
+            # the row, which is a bug to see, not a cooldown to invent (`now - None`
+            # was #438 r2's 500).
+            raise RuntimeError("update_profile: zero rows, but the row's stamp is NULL")
+        if last.tzinfo is None:
             last = last.replace(tzinfo=dt.timezone.utc)
         # Recompute now AFTER the read: under a concurrent race the request-start `now`
         # can predate the winner's stamp, making elapsed negative and retry_after
@@ -470,7 +468,13 @@ async def update_profile(
         raise HandleChangeCooldown(
             max(1, min(cooldown_seconds, math.ceil(cooldown_seconds - elapsed))))
     await session.commit()
-    await session.refresh(user)  # Core UPDATE bypassed the ORM — reload the labels
+    # The RETURNED values ARE the outcome: put them on the instance as committed
+    # state, after the commit so an expire_on_commit session can't discard them. No
+    # refresh: re-reading the row after the commit is the window a concurrent
+    # deletion fell into (ObjectDeletedError, a 500). The instance answers with what
+    # this statement wrote, whatever happens to the row next.
+    for key, value in row._mapping.items():
+        set_committed_value(user, key, value)
     return user
 
 

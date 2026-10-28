@@ -1170,6 +1170,8 @@ async def me(user: CurrentUser) -> dict:
     # DB-write-storm dial.
     responses={
         400: {"description": "neither handle nor display_name provided"},
+        401: {"description": "invalid or expired token, including an account deleted "
+                             "while this request ran"},
         409: {"description": "handle already taken"},
         429: {
             "description": "handle changed within the cooldown window",
@@ -1198,6 +1200,8 @@ async def patch_me(
       * 429 (+ retry_after + Retry-After header) if the handle changed within the
         cooldown window (settings.handle_change_cooldown_seconds). A no-op
         same-handle write and any display_name edit never trip the cooldown.
+      * 401 if the account was deleted while this request ran: the same opaque
+        answer the auth door gives a token whose user is gone (#439).
     """
     if req.handle is None and req.display_name is None:
         raise HTTPException(
@@ -1209,6 +1213,8 @@ async def patch_me(
         )
     except users_service.HandleTaken:
         raise HTTPException(status.HTTP_409_CONFLICT, "handle already taken")
+    except users_service.AccountGone:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid or expired token")
     except users_service.HandleChangeCooldown as e:
         # Custom body carries retry_after alongside detail (HTTPException would only
         # emit {"detail"}); the Retry-After header mirrors it. Returning a Response
