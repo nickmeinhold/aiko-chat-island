@@ -265,14 +265,55 @@ async def test_the_newest_item_itself_is_a_valid_position(session):
     assert r[ch.id] == svc.EntryResult(APPLIED, newest, 1)
 
 
-async def test_a_deleted_messages_id_is_still_a_valid_position(session):
-    """App tab: a message read today can be soft-deleted or hidden tomorrow, and
-    the watermark still names it. Bounding against the VISIBLE view would 422 an
-    honest client and lose that user's place."""
+async def test_a_synced_watermark_survives_its_message_being_hidden(session):
+    """App tab: a message read today can be soft-deleted tomorrow, and the
+    watermark still names it. The bound includes the caller's OWN stored value, so
+    re-sending a watermark already synced is never refused."""
     u, ch = await _user(session, "alice"), await _channel(session, ceiling=False)
     await _member(session, ch, u)
+    await _msg(session, ch, 40)
+    newest = await _msg(session, ch, 50)
+    await _put(session, u, {ch.id: (newest, 0)})                 # synced while visible
+    (await session.get(Message, newest)).deleted_at = dt.datetime(
+        2026, 10, 3, tzinfo=dt.timezone.utc)
+    await session.commit()                                         # then hidden
+    r = await _put(session, u, {ch.id: (newest, 1)})              # re-sent
+    assert r[ch.id] == svc.EntryResult(APPLIED, newest, 2)
+
+
+async def test_a_watermark_hidden_before_it_was_ever_synced_is_refused(session):
+    """THE ONE COST of bounding by what the caller can see (operator, 2026-10-28):
+    the app drops the named entry and re-baselines from the fence, the newest
+    visible item, which is almost the same place."""
+    u, ch = await _user(session, "alice"), await _channel(session, ceiling=False)
+    await _member(session, ch, u)
+    await _msg(session, ch, 40)
     gone = await _msg(session, ch, 50, deleted=True)
-    r = await _put(session, u, {ch.id: (gone, 0)})
+    with pytest.raises(svc.InvalidReadPosition) as exc:
+        await _put(session, u, {ch.id: (gone, 0)})
+    assert exc.value.channel_id == ch.id
+
+
+async def test_a_hidden_item_is_never_consulted_so_nothing_leaks(session):
+    """The first bound counted hidden items, so ~48 refusals binary-searched the
+    exact time of the newest one: e.g. when someone you blocked last posted (Tesla,
+    #429 fresh round). Now a value past the newest VISIBLE item is refused even
+    though a newer hidden one exists, so the answer depends only on what the
+    caller can see."""
+    from aiko_gateway.domain import moderation_service
+    u, ch = await _user(session, "alice"), await _channel(session, ceiling=False)
+    other = await _user(session, "mallory")
+    await _member(session, ch, u)
+    await _msg(session, ch, 40)
+    session.add(Message(
+        id=_ulid(90), channel_id=ch.id, sender_user_id=other.id,
+        sender_kind="human", body="hidden from alice",
+        created_at=dt.datetime(2026, 10, 1, tzinfo=dt.timezone.utc)))
+    await session.commit()
+    await moderation_service.block_user(session, u.id, other.id)
+    with pytest.raises(svc.InvalidReadPosition):
+        await _put(session, u, {ch.id: (_ulid(60), 0)})  # between visible and hidden
+    r = await _put(session, u, {ch.id: (_ulid(40), 0)})
     assert r[ch.id].outcome is APPLIED
 
 

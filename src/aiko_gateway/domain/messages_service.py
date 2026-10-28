@@ -463,20 +463,35 @@ async def latest_ulid(session: AsyncSession, channel_id: str, viewer_id: str) ->
     regardless of block state. Only the message component carries the visibility-shrink
     coupling described above.
     """
-    msg_result = await session.execute(
-        select(func.max(Message.id)).where(
-            Message.channel_id == channel_id,
+    return (await latest_ulids(session, [channel_id], viewer_id))[channel_id]
+
+
+async def latest_ulids(
+    session: AsyncSession, channel_ids: list[str], viewer_id: str
+) -> dict[str, str]:
+    """``latest_ulid`` for many channels in two grouped queries: the ONE
+    implementation of the fence, so the subscribe fence and the read-position
+    bound (`read_positions_service`) can never disagree about what a viewer can
+    see. Same visibility as ``get_history``: not soft-deleted, not hidden by a
+    block, plus the channel's retractions (never block-filtered)."""
+    if not channel_ids:
+        return {}
+    msgs = dict((await session.execute(
+        select(Message.channel_id, func.max(Message.id)).where(
+            Message.channel_id.in_(channel_ids),
             Message.deleted_at.is_(None),
             moderation_service.not_blocked_predicate(viewer_id),
-        )
-    )
-    ret_result = await session.execute(
-        select(func.max(Retraction.id)).where(Retraction.channel_id == channel_id)
-    )
+        ).group_by(Message.channel_id)
+    )).all())
+    rets = dict((await session.execute(
+        select(Retraction.channel_id, func.max(Retraction.id))
+        .where(Retraction.channel_id.in_(channel_ids))
+        .group_by(Retraction.channel_id)
+    )).all())
     # "" is lexicographically below any 26-char ULID, so max() picks the newer real
     # id and collapses to "" only when the channel has neither a visible message nor
     # a retraction.
-    return max(msg_result.scalar_one() or "", ret_result.scalar_one() or "")
+    return {cid: max(msgs.get(cid) or "", rets.get(cid) or "") for cid in channel_ids}
 
 
 async def get_history(
