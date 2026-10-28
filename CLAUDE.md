@@ -37,8 +37,9 @@ file is the working-context that isn't obvious from the code.
   blocked: [ISL-0003](docs/adr/ISL-0003-pull-based-deploy-of-pinned-image.md). Verify
   the RUNNING container's image ref, not this doc. Procedure: `deploy/update.sh`
   (its header); backup + rollback: `docs/runbooks/backup-and-rollback.md`. Two live islands: `chat.imagineering.cc`
-  (`~/apps/aiko-chat-gateway`), `chat.enspyr.co` (`~/apps/aiko-chat-gateway`, `ssh
-  nick-mel`, `sudo -n docker`). NOTE: imagineering's separate `matrix-*` stack is
+  (`ssh enspyr-syd`, `~/apps/aiko-chat-gateway`), `chat.enspyr.co` (`ssh enspyr-melb`,
+  `~/apps/aiko-chat-gateway`, `sudo -n docker`). The old aliases `imagineering` /
+  `nick-mel` no longer resolve (2026-10-27). NOTE: imagineering's separate `matrix-*` stack is
   still the old build-on-host model — don't conflate it with the island.
 - **Alembic is the sole schema authority; `alembic heads` must show ONE head** —
   two `0006`s merge clean in git but wedge boot (mergeable ≠ correct). SQLite is
@@ -59,10 +60,10 @@ file is the working-context that isn't obvious from the code.
 ## Working conventions
 
 - **Conventional Commits.** Branch off `main`; commit + push proactively.
-- **Work is staged by VERSION, on `claude-tasks` milestones named `aiko-chat-island vX.Y.Z`**
-  (prefixed because that repo is shared across projects — a bare `v0.10.0` collides with the
-  app's). Nick's rule, 2026-08-29: *far off gets higher version numbers.* The ladder, and the
-  test for each rung:
+- **Work is staged by VERSION, on this repo's milestones named `vX.Y.Z`** (moved off the
+  shared tracker 2026-10-25 with the tasks themselves; the old `aiko-chat-island ` prefix
+  only existed to dodge the app's milestones there). Nick's rule, 2026-08-29: *far off gets
+  higher version numbers.* The ladder, and the test for each rung:
   - **`v0.9.1` (patch)** — no schema change, no wire change. Ships on any quiet day, needs no
     coordination with the app tab.
   - **`v0.10.0` (next increment)** — the live call/ring path. May change the wire; anything
@@ -101,7 +102,7 @@ file is the working-context that isn't obvious from the code.
   intent, the other tab's design is the other half of the binding contract. Read:
   `../aiko_chat_app/docs/adr/` (numbered ADR **outcomes** — decisions of record,
   these win), then `docs/design/`, `docs/crucible/`, the `HANDOFF-from-app-tab-*`
-  answers, the matching `nickmeinhold/claude-tasks` issue comments, and (for wire
+  answers, the matching issue comments on either repo, and (for wire
   specifically) the published `/openapi.json`. This is the **#2634 lesson**: that
   build came off the ticket + a narrow app answer, never checked against the
   recorded design, and the cage-match then hardened the wrong premise for 7
@@ -120,6 +121,11 @@ file is the working-context that isn't obvious from the code.
 - Design docs: `docs/design/0{1,2,3}-*.html` (topology, bus-decouple, auth-on-bus).
 - Memory dir (this project's recall):
   `~/.claude/projects/-Users-nick-git-orgs-aiko-aiko-chat-island/memory/`.
-- Tasks: `nickmeinhold/claude-tasks`, label `project:aiko-chat-island`.
+- Tasks: **this repo's own issues** (Nick, 2026-10-25: nothing lands on the shared
+  tracker any more). File with `~/.claude/scripts/file-task --dir .`: the repo is public,
+  so it PII-scans title + body and refuses on a hit, with no override and no fallback.
+  It's a gate, not a guarantee, so read the body yourself. A cross-tab handoff is an issue
+  on the RECEIVING repo plus a link from ours; a shared contract lives in one place and
+  both issues link it rather than restating it.
 - Sibling repos (editable installs): `../aiko_services`, `../aiko_chat`; the
   client is `aiko_chat_app`.
