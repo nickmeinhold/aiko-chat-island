@@ -20,6 +20,7 @@ from fastapi.responses import JSONResponse
 
 ACCOUNT_SUSPENDED = "account_suspended"
 INVALID_READ_POSITION = "invalid_read_position"
+TOO_MANY_READ_POSITIONS = "too_many_read_positions"
 
 
 class AccountSuspended(HTTPException):
@@ -73,8 +74,26 @@ async def _invalid_read_position_handler(
     )
 
 
+class TooManyReadPositionsError(HTTPException):
+    """422 for a read-position batch over the cap. No entry is at fault, so it
+    names none; its own code tells the client to split the batch rather than
+    drop an entry."""
+    code = TOO_MANY_READ_POSITIONS
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(status.HTTP_422_UNPROCESSABLE_CONTENT, detail)
+
+
+async def _too_many_read_positions_handler(
+    request: Request, exc: TooManyReadPositionsError
+) -> JSONResponse:
+    return JSONResponse(status_code=exc.status_code,
+                        content={"error": exc.code, "detail": exc.detail})
+
+
 def register_error_handlers(app: FastAPI) -> None:
     """Install the structured-error handlers. Call from `main` AND every test app
     builder that asserts a structured body — the single door for the wire shape."""
     app.add_exception_handler(AccountSuspended, _account_suspended_handler)
     app.add_exception_handler(InvalidReadPositionError, _invalid_read_position_handler)
+    app.add_exception_handler(TooManyReadPositionsError, _too_many_read_positions_handler)

@@ -45,12 +45,15 @@ not refused, because malformed entries refuse the whole batch: a device holding 
 watermark for a since-deleted channel would otherwise never sync again. A
 MALFORMED value is still refused (a broken client, not a stale one).
 
-MEMBERSHIP IS NOT CHECKED HERE, and that is a deliberate boundary rather than an
-omission. A read position is a private per-user note about a channel id; it
-grants nothing, reveals nothing about the channel, and is only ever readable by
-its owner. Gating it on membership would mean a user who leaves a channel loses
-their place in it — and rejoining would silently resume from a stale watermark.
-The ACL that matters is on the MESSAGES, which is where it already is.
+A CHANNEL YOU CAN'T READ DOESN'T EXIST FOR YOU. Readability (`acl`, the one door
+for read access: public, or a membership row) gates WRITING a position; it never
+gates KEEPING one. A user who leaves a private channel keeps their row and finds
+their place on return, but while they can't read it a write is SKIPPED, the same
+answer as "no such channel" (the ACL's existence-hiding). That is what stops
+"leave, write a value past the end, rejoin" from serving a poisoned watermark to
+every device (#429 fresh round, all four seats), and it means the outcome never
+depends on a channel the caller can't see. The ACL that matters for CONTENT is
+still on the messages.
 
 DIALECT-SPECIFIC ON PURPOSE. ``sqlite.insert`` is used because SQLite is the sole
 engine in dev AND prod (CLAUDE.md, and the same reasoning ``domain/types.py``
@@ -64,12 +67,12 @@ import enum
 import re
 from dataclasses import dataclass
 
-from sqlalchemy import and_, func, literal, select, union_all, update
+from sqlalchemy import and_, exists, func, literal, select, union_all, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .models import (
-    Channel, ChannelReadPosition, Membership, Message, Retraction, User)
+from . import acl
+from .models import Channel, ChannelReadPosition, Message, Retraction, User
 
 # A CANONICAL ULID: uppercase Crockford base32 with a first character of 0-7 (26
 # chars x 5 bits is 130 bits for a 128-bit value). This is WIRE HYGIENE, not the
@@ -87,7 +90,7 @@ class Outcome(enum.StrEnum):
     """What happened to one entry. Closed set; the strings are the wire values."""
     APPLIED = "applied"    # the base matched; stored at base_seq + 1
     CONFLICT = "conflict"  # the base did not match; nothing written
-    SKIPPED = "skipped"    # the channel does not exist; nothing stored
+    SKIPPED = "skipped"    # no such channel, or one you can't read: nothing stored
 
 
 @dataclass(frozen=True)
@@ -148,33 +151,29 @@ async def _check_bounds(
     watermark stays valid forever, and checking it inside this transaction
     before the writes cannot go stale.
 
-    MEMBERS ONLY. The bound reads items the caller may not be able to see, so
-    whether it refuses leaks something. For a non-member it would leak a channel's
-    last-activity time to anyone who knows its id, so non-members skip it (their
-    position is inert until they rejoin). For a member the residual is that a
-    refusal can reveal that a hidden item (say, from someone they blocked) is
-    newer than anything visible: accepted by the operator, 2026-10-28.
+    READABLE CHANNELS ONLY, and that is not an exemption: a channel the caller
+    can't read is skipped by the write itself (module docstring), so there is no
+    stored value to bound. For a channel the caller CAN read, the residual is that
+    a refusal compares against items they may not see (a soft-deleted message, or
+    one from someone they blocked).
     """
     ids = [cid for cid, (last_read, _) in positions.items() if last_read]
     if not ids:
         return
-    member_of = set((await session.execute(
-        select(Membership.channel_id).where(
-            Membership.user_id == user_id, Membership.channel_id.in_(ids))
-    )).scalars())
-    if not member_of:
+    readable = set(await acl.filter_readable_ids(session, user_id, ids))
+    if not readable:
         return
     items = union_all(
         select(Message.channel_id.label("cid"), Message.id.label("item_id"))
-        .where(Message.channel_id.in_(member_of)),
+        .where(Message.channel_id.in_(readable)),
         select(Retraction.channel_id.label("cid"), Retraction.id.label("item_id"))
-        .where(Retraction.channel_id.in_(member_of)),
+        .where(Retraction.channel_id.in_(readable)),
     ).subquery()
     newest = dict((await session.execute(
         select(items.c.cid, func.max(items.c.item_id)).group_by(items.c.cid)
     )).all())
     for cid in ids:
-        if cid not in member_of:
+        if cid not in readable:
             continue
         last_read = positions[cid][0]
         bound = newest.get(cid)
@@ -202,7 +201,8 @@ async def _write(session: AsyncSession, *, user_id: str, channel_id: str,
             literal(1, cols.seq.type),
             literal(now, cols.updated_at.type),
         ).select_from(User).join(Channel, Channel.id == channel_id).where(
-            User.id == user_id)  # one row at most: both sides are pinned by PK
+            User.id == user_id,  # one row at most: both sides are pinned by PK
+            acl.readable_predicate(user_id))
         stmt = sqlite_insert(ChannelReadPosition).from_select(
             ['user_id', 'channel_id', 'last_read', 'seq', 'updated_at'], source
         ).on_conflict_do_nothing(
@@ -210,10 +210,14 @@ async def _write(session: AsyncSession, *, user_id: str, channel_id: str,
                             ChannelReadPosition.channel_id])
     else:
         # THE SWAP: only if the stored version is still the one the client saw.
+        # Readability is in the statement too: a caller who can't read the channel
+        # (left a private one, say) can't move their kept row while they're out.
         stmt = update(ChannelReadPosition).where(
             ChannelReadPosition.user_id == user_id,
             ChannelReadPosition.channel_id == channel_id,
             ChannelReadPosition.seq == base_seq,
+            exists(select(Channel.id).where(
+                Channel.id == channel_id, acl.readable_predicate(user_id))),
         ).values(last_read=last_read, seq=base_seq + 1, updated_at=now)
     await session.execute(stmt)
 
@@ -250,7 +254,7 @@ async def set_positions(
             .outerjoin(ChannelReadPosition, and_(
                 ChannelReadPosition.channel_id == Channel.id,
                 ChannelReadPosition.user_id == user_id))
-            .where(Channel.id == channel_id)
+            .where(Channel.id == channel_id, acl.readable_predicate(user_id))
         )).one_or_none()
         if row is None:
             results[channel_id] = EntryResult(Outcome.SKIPPED)

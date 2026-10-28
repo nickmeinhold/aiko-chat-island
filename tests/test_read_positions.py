@@ -14,7 +14,7 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import select, text
+from sqlalchemy import delete as sa_delete, select, text
 
 from aiko_gateway.domain import channels_service, security
 from aiko_gateway.domain import read_positions_service as svc
@@ -42,11 +42,27 @@ async def _user(session, name: str) -> User:
     return u
 
 
-async def _channel(session, name: str = "general") -> Channel:
+CEILING = "7" + "0" * 25  # the ceiling items' timestamp prefix; see _channel
+
+
+async def _channel(session, name: str = "general", *, private: bool = False,
+                   ceiling: bool = True) -> Channel:
+    """A channel; by default PUBLIC (readable by every signed-in user) with one
+    message at CEILING, so the position bound admits every test ULID. Tests about
+    the bound itself pass ceiling=False and seed their own items."""
     ch = Channel(id=new_ulid(), name=name, kind="standard",
-                 aiko_channel=name)
+                 aiko_channel=name, is_private=private)
     session.add(ch)
     await session.commit()
+    if ceiling:
+        session.add(Message(
+            # Message ids are unique across channels, so each ceiling keeps a fresh
+            # random tail under a fixed "7000000000" timestamp: still above every
+            # test ULID and every real one, still below "7"+"Z"*25.
+            id=CEILING[:10] + new_ulid()[10:],
+            channel_id=ch.id, sender_user_id=None, sender_kind="unknown", body="x",
+            created_at=dt.datetime(2026, 10, 1, tzinfo=dt.timezone.utc)))
+        await session.commit()
     return ch
 
 
@@ -232,7 +248,7 @@ async def test_a_member_cannot_store_a_position_past_the_newest_item(session):
     "a forward read wins" policy it would stick on every device. It's refused
     because it is past the channel's newest item, with no clock involved (#429
     r3: the clock window kept growing holes)."""
-    u, ch = await _user(session, "alice"), await _channel(session)
+    u, ch = await _user(session, "alice"), await _channel(session, ceiling=False)
     await _member(session, ch, u)
     await _msg(session, ch, 50)
     for past in ("7" + "Z" * 25, _ulid(51)):
@@ -242,7 +258,7 @@ async def test_a_member_cannot_store_a_position_past_the_newest_item(session):
 
 
 async def test_the_newest_item_itself_is_a_valid_position(session):
-    u, ch = await _user(session, "alice"), await _channel(session)
+    u, ch = await _user(session, "alice"), await _channel(session, ceiling=False)
     await _member(session, ch, u)
     newest = await _msg(session, ch, 50)
     r = await _put(session, u, {ch.id: (newest, 0)})
@@ -253,7 +269,7 @@ async def test_a_deleted_messages_id_is_still_a_valid_position(session):
     """App tab: a message read today can be soft-deleted or hidden tomorrow, and
     the watermark still names it. Bounding against the VISIBLE view would 422 an
     honest client and lose that user's place."""
-    u, ch = await _user(session, "alice"), await _channel(session)
+    u, ch = await _user(session, "alice"), await _channel(session, ceiling=False)
     await _member(session, ch, u)
     gone = await _msg(session, ch, 50, deleted=True)
     r = await _put(session, u, {ch.id: (gone, 0)})
@@ -263,7 +279,7 @@ async def test_a_deleted_messages_id_is_still_a_valid_position(session):
 async def test_a_retraction_can_be_the_newest_position(session):
     """The subscribe fence (`latest_ulid`) is the newest of visible messages AND
     retractions, so a baseline can be a retraction's ULID."""
-    u, ch = await _user(session, "alice"), await _channel(session)
+    u, ch = await _user(session, "alice"), await _channel(session, ceiling=False)
     await _member(session, ch, u)
     target = await _msg(session, ch, 50)
     rt = Retraction(target_msg_id=target, channel_id=ch.id)
@@ -275,21 +291,52 @@ async def test_a_retraction_can_be_the_newest_position(session):
 
 
 async def test_an_empty_channel_admits_only_the_floor(session):
-    u, ch = await _user(session, "alice"), await _channel(session)
+    u, ch = await _user(session, "alice"), await _channel(session, ceiling=False)
     await _member(session, ch, u)
     assert (await _put(session, u, {ch.id: ("", 0)}))[ch.id].outcome is APPLIED
     with pytest.raises(svc.InvalidReadPosition):
         await _put(session, u, {ch.id: (_ulid(1), 1)})
 
 
-async def test_a_non_member_skips_the_bound_so_it_cannot_probe(session):
-    """For a non-member the bound would leak the channel's last-activity time to
-    anyone who knows its id, so it is skipped: the outcome cannot depend on items
-    the caller can't see (operator's call, 2026-10-28)."""
-    u, ch = await _user(session, "alice"), await _channel(session)
-    await _msg(session, ch, 50)  # alice is NOT a member
-    r = await _put(session, u, {ch.id: (_ulid(99), 0)})
-    assert r[ch.id].outcome is APPLIED
+async def test_a_private_channel_you_cant_read_is_SKIPPED_like_no_channel(session):
+    """A channel you can't read doesn't exist for you (acl's existence-hiding): the
+    write is skipped with the same answer as an unknown id, nothing is stored, and
+    the outcome can't depend on anything inside the channel."""
+    u = await _user(session, "alice")
+    secret = await _channel(session, "secret", private=True)  # alice not a member
+    r = await _put(session, u, {secret.id: ("7" + "Z" * 25, 0),
+                                "no-such-channel": ("7" + "Z" * 25, 0)})
+    assert r[secret.id] == r["no-such-channel"] == svc.EntryResult(SKIPPED)
+    assert await svc.get_positions(session, user_id=u.id) == {}
+
+
+async def test_leave_poison_rejoin_cannot_serve_a_poisoned_watermark(session):
+    """The fresh-round hole (all four seats): leave a private channel, write a value
+    past its end while outside, rejoin, and the island would serve it to every
+    device. Now the write while outside is skipped, and the row you KEPT on leaving
+    is what you find on return."""
+    u = await _user(session, "alice")
+    ch = await _channel(session, "room", private=True)
+    await _member(session, ch, u)
+    await _put(session, u, {ch.id: (_ulid(10), 0)})            # honest, as a member
+    await session.execute(sa_delete(Membership).where(
+        Membership.channel_id == ch.id, Membership.user_id == u.id))
+    await session.commit()                                      # leaves
+    r = await _put(session, u, {ch.id: ("7" + "Z" * 25, 1)})   # poison while out
+    assert r[ch.id] == svc.EntryResult(SKIPPED)
+    await _member(session, ch, u)                               # rejoins
+    assert await svc.get_positions(session, user_id=u.id) == {ch.id: (_ulid(10), 1)}
+
+
+async def test_a_public_channel_reader_is_bounded_without_joining(session):
+    """Public channels are readable with no membership row, so the bound applies to
+    every reader, not just members: that is exactly the reader who could otherwise
+    store a value that sticks."""
+    u = await _user(session, "alice")
+    ch = await _channel(session, ceiling=False)  # public; alice never joins
+    await _msg(session, ch, 50)
+    with pytest.raises(svc.InvalidReadPosition):
+        await _put(session, u, {ch.id: ("7" + "Z" * 25, 0)})
 
 
 async def test_a_deleted_user_cannot_get_rows_recreated(session):
@@ -436,10 +483,13 @@ async def test_route_a_conflict_with_nothing_stored_is_version_0(client, session
 
 async def test_route_a_first_design_body_is_a_loud_422(client, session):
     """`seq` instead of `base_seq` must not be silently misread: an unknown key is
-    ignored, so the missing required base_seq is what makes this loud."""
+    ignored, so the missing base_seq is what makes this loud, and it names the
+    channel like every other refused entry."""
     u, ch = await _user(session, "alice"), await _channel(session)
     r = await _rput(client, u, {ch.id: {"last_read": "", "seq": 1}})
     assert r.status_code == 422, r.text
+    assert r.json()["error"] == "invalid_read_position"
+    assert r.json()["channel_id"] == ch.id
     assert await svc.get_positions(session, user_id=u.id) == {}
 
 
@@ -461,6 +511,13 @@ async def test_route_a_batch_with_the_empty_floor_is_applied(client, session):
     {"last_read": "0" * 27, "base_seq": 0},         # too long: NOT a pydantic 422
     {"last_read": "", "base_seq": 2**63},           # out of range: NOT a pydantic 422
     {"last_read": "", "base_seq": -1},
+    # Type errors too (Noether, Carnot): a typed pydantic model answered these in
+    # its own shape, with no channel_id for the healer.
+    {"last_read": None, "base_seq": 0},
+    {"last_read": "", "base_seq": "0"},
+    {"last_read": "", "base_seq": True},
+    {"last_read": ""},
+    "not-an-object",
 ])
 async def test_route_a_refused_value_is_ONE_structured_422(client, session, entry):
     """The app's healer drops the entry the 422 names and resends the rest
@@ -480,7 +537,7 @@ async def test_route_a_refused_value_is_ONE_structured_422(client, session, entr
 async def test_route_a_position_past_the_newest_item_is_a_structured_422(
     client, session,
 ):
-    u, ch = await _user(session, "alice"), await _channel(session)
+    u, ch = await _user(session, "alice"), await _channel(session, ceiling=False)
     await _member(session, ch, u)
     await _msg(session, ch, 50)
     r = await _rput(client, u, {ch.id: {"last_read": _ulid(51), "base_seq": 0}})
@@ -495,6 +552,10 @@ async def test_route_a_batch_over_the_cap_is_422(client, session):
     over = {f"c{i}": {"last_read": "", "base_seq": 0} for i in range(1001)}
     r = await _rput(client, u, over)
     assert r.status_code == 422, r.text
+    # Structured, with its OWN code: no entry is at fault, so the client splits
+    # the batch rather than dropping an entry (Noether).
+    assert r.json() == {"error": "too_many_read_positions",
+                        "detail": r.json()["detail"]}
 
 
 async def test_route_put_is_rate_limited_per_user(client, session, monkeypatch):

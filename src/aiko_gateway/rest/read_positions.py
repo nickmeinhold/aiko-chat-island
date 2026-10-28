@@ -31,13 +31,15 @@ because the door has only one room behind it.
 """
 from __future__ import annotations
 
+from typing import Any
+
 from fastapi import APIRouter
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from ..domain import read_positions_service
 from ..domain.rate_limit import rate_limit
 from .deps import CurrentUser, DbSession, rate_limit_user
-from .errors import InvalidReadPositionError
+from .errors import InvalidReadPositionError, TooManyReadPositionsError
 
 router = APIRouter(prefix="/v1", tags=["read-positions"])
 
@@ -48,31 +50,40 @@ router = APIRouter(prefix="/v1", tags=["read-positions"])
 _MAX_POSITIONS = 1000
 
 
-class ReadPositionWrite(BaseModel):
-    """One channel's write: a watermark, and the version the client last saw.
-
-    ``base_seq`` is NOT a version the client chooses. It names the version the
-    client is editing (0 = it has never seen one), and the island applies the
-    write only if that is still the version it holds (compare-and-swap; the
-    contract is PR #429's v2 comment). The field is deliberately not called
-    ``seq``: an unknown key is ignored, not rejected, so a body shaped for the
-    first design (``{last_read, seq}``) is a loud 422 for the missing
-    ``base_seq`` rather than a silent misreading."""
-
-    # NO length or range bounds here, deliberately: the service checks both, so
-    # every refused VALUE comes back as one structured 422 naming its channel
-    # (rest.errors.InvalidReadPositionError), which the app's healer keys on. A
-    # pydantic bound would answer the same refusal in a different shape.
-    last_read: str = Field(
-        description="Canonical ULID, or '' — the client's first-sight floor for a "
-                    "channel that was empty at settle time. '' is a VALUE, not a "
-                    "missing field.",
-    )
-    base_seq: int
-
-
 class SetReadPositionsReq(BaseModel):
-    positions: dict[str, ReadPositionWrite] = Field(max_length=_MAX_POSITIONS)
+    """``{"positions": {channel_id: {"last_read": str, "base_seq": int}}}``.
+
+    The ENTRIES are deliberately untyped here and checked in ``_entries`` below:
+    a typed pydantic model would refuse a bad entry (a null ``last_read``, a
+    string ``base_seq``, a missing field) in pydantic's own shape, with no
+    ``channel_id`` for the app's healer to drop. Every refusal about an entry is
+    one structured 422 naming its channel (``InvalidReadPositionError``); only a
+    body that isn't a ``positions`` object at all falls to pydantic.
+
+    ``base_seq`` is NOT a version the client chooses: it names the version the
+    client is editing (0 = none seen), and the island applies the write only if
+    that is still the version it holds (PR #429's v2 contract). It is not called
+    ``seq`` on purpose, so a body shaped for the first design fails loudly."""
+
+    positions: dict[str, Any]
+
+
+def _entries(req: SetReadPositionsReq) -> dict[str, tuple[str, int]]:
+    if len(req.positions) > _MAX_POSITIONS:
+        raise TooManyReadPositionsError(
+            f"at most {_MAX_POSITIONS} positions per request; split the batch")
+    out: dict[str, tuple[str, int]] = {}
+    for cid, entry in req.positions.items():
+        if not isinstance(entry, dict):
+            raise InvalidReadPositionError(cid, "entry must be an object")
+        last_read, base_seq = entry.get("last_read"), entry.get("base_seq")
+        if not isinstance(last_read, str):
+            raise InvalidReadPositionError(cid, "last_read must be a string")
+        # bool is an int subclass in Python; true/false is not a version.
+        if not isinstance(base_seq, int) or isinstance(base_seq, bool):
+            raise InvalidReadPositionError(cid, "base_seq must be an integer")
+        out[cid] = (last_read, base_seq)
+    return out
 
 
 @router.get("/read-positions")
@@ -123,12 +134,7 @@ async def set_read_positions(
     the channel, so the client can find and drop the bad entry."""
     try:
         results = await read_positions_service.set_positions(
-            session,
-            user_id=user.id,
-            positions={
-                cid: (p.last_read, p.base_seq) for cid, p in req.positions.items()
-            },
-        )
+            session, user_id=user.id, positions=_entries(req))
     except read_positions_service.InvalidReadPosition as exc:
         raise InvalidReadPositionError(exc.channel_id, str(exc)) from exc
     out: dict[str, dict] = {}
