@@ -426,6 +426,8 @@ class Settings(BaseSettings):
     # Minimum interval between HANDLE changes via PATCH /v1/me (#2631). Identity is
     # the KEY; the handle is a mutable label that @-mentions/DMs resolve against, so
     # rapid churn would destabilise resolution. 30 days (confirmed with Nick).
+    # The FIRST claim away from the handle register/finish assigned doesn't start
+    # it (Nick, 2026-10-28, #437; users_service.update_profile).
     # display_name edits are NOT rate-limited by this. Config so an island MAY tune
     # it (forwarded in docker-compose); the default is correct for every island.
     # ge=1: a trust-boundary throttle must not be silently disable-able by a
