@@ -111,7 +111,7 @@ def _fingerprint(value: object, n: int = 12) -> str:
 class Provider(StrEnum):
     """The closed set of supported identity providers. A StrEnum so it validates
     at the request boundary (a bad provider is a 422, not a 400 deep in verify)
-    while still comparing/​hashing as its string value everywhere downstream."""
+    while still comparing/hashing as its string value everywhere downstream."""
     apple = "apple"
     google = "google"
 

@@ -47,7 +47,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import secrets
-import unicodedata
+from typing import Literal
 
 import webauthn
 from cryptography.exceptions import InvalidSignature
@@ -70,6 +70,7 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import settings
+from . import users_service
 from .models import PasskeyChallenge, PasskeyCredential, PasskeyOperation
 
 
@@ -159,29 +160,38 @@ async def consume_challenge(
 
 # --- ceremony start (mint options + challenge) ----------------------------- #
 
-# The longest label a caller may put on its own passkey. Authenticators may truncate
-# user.name to 64 BYTES; a 64-character cap keeps the label recognisable where they do.
-_PASSKEY_LABEL_MAX = 64
-# Control characters, plus the bidi overrides and isolates (U+202A-202E, U+2066-2069),
-# which can make a label read differently from what it is. ZWJ (U+200D) is NOT here:
-# it is what joins emoji sequences, and a handle may be one.
-_LABEL_STRIP = frozenset(map(chr, [*range(0x202A, 0x202F), *range(0x2066, 0x206A)]))
+# CTAP2 bounds user.name and user.displayName at 64 BYTES, and an authenticator that
+# meets a longer one may truncate it mid-character or refuse it (Android's Credential
+# Manager already refused an over-limit user handle once: #1957). So the label is cut
+# to 64 UTF-8 bytes here, on a code-point boundary, never by the device.
+_PASSKEY_LABEL_MAX_BYTES = 64
+
+LabelStatus = Literal["given", "absent", "rejected"]
 
 
-def passkey_label(raw: object) -> str | None:
-    """The label a caller asked for on its passkey, cleaned, or None to use the random
-    default. Absent, non-string, empty after cleaning, or longer than
-    _PASSKEY_LABEL_MAX all answer None: the label is cosmetic, so a bad one falls back
-    rather than failing a ceremony that is also add-a-device's start."""
+def passkey_label(raw: object) -> tuple[str | None, LabelStatus]:
+    """The label a caller asked for on its passkey, and what became of it.
+
+    The label is the handle being chosen, so it obeys the handle's own repertoire
+    (`users_service.handle_text_problem`): a name a handle couldn't be is refused, NOT
+    rewritten. Stripping characters out would make a third string, neither what was
+    sent nor a valid handle. Refused, non-string or blank all answer None, and the
+    random default is used: the label is cosmetic, and this ceremony is also
+    add-a-device's start, so a bad label must never fail it. The status says which, so
+    the route can log why there was no label without logging the label."""
+    if raw is None:
+        return None, "absent"
     if not isinstance(raw, str):
-        return None
-    cleaned = "".join(
-        ch for ch in raw
-        if unicodedata.category(ch) != "Cc" and ch not in _LABEL_STRIP
-    ).strip()
-    if not cleaned or len(cleaned) > _PASSKEY_LABEL_MAX:
-        return None
-    return cleaned
+        return None, "rejected"
+    text = raw.strip()
+    if not text or users_service.handle_text_problem(text):
+        return None, "rejected"
+    encoded = text.encode("utf-8")  # safe: handle_text_problem refused lone surrogates
+    if len(encoded) > _PASSKEY_LABEL_MAX_BYTES:
+        # Longest whole-code-point prefix that fits, without a dangling joiner.
+        text = encoded[:_PASSKEY_LABEL_MAX_BYTES].decode("utf-8", errors="ignore")
+        text = text.rstrip("\u200d")
+    return text, "given"
 
 
 async def start_registration(session: AsyncSession, *, label: str | None = None) -> dict:

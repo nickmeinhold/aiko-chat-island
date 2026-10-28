@@ -210,3 +210,27 @@ async def test_social_claim_is_exempt_from_open_registration(client, monkeypatch
         "and reverses the 2026-06-27 decision")
     assert resp.status_code == 200, (
         f"expected the claim to succeed, got {resp.status_code}: {resp.text[:200]}")
+
+
+async def test_social_claim_cannot_choose_the_reserved_auto_shape(client, monkeypatch):
+    """Social claim is a handle door too: `aiko-<12 hex>` is the generator's, so a
+    claimed handle of that shape is refused as taken (it would otherwise read as
+    `handle_auto` forever)."""
+    from aiko_gateway.domain import security, users_service
+
+    monkeypatch.setattr(settings, "social_signin_enabled", True)
+    prov = security.issue_provisioning("google", "sub-reserved-check")
+    resp = await client.post("/v1/auth/social/claim", json={
+        "provisioning_token": prov, "handle": users_service._new_auto_handle()})
+    assert resp.status_code == 409, resp.text
+
+
+async def test_social_claim_refuses_a_handle_that_renders_as_another(client, monkeypatch):
+    """The same character repertoire as PATCH /v1/me and the passkey label."""
+    from aiko_gateway.domain import security
+
+    monkeypatch.setattr(settings, "social_signin_enabled", True)
+    prov = security.issue_provisioning("google", "sub-rlm-check")
+    resp = await client.post("/v1/auth/social/claim", json={
+        "provisioning_token": prov, "handle": "nick\u200f"})
+    assert resp.status_code == 422, resp.text

@@ -5,6 +5,7 @@ import datetime as dt
 import math
 import re
 import secrets
+import unicodedata
 
 from sqlalchemy import or_, select, update
 from sqlalchemy.exc import IntegrityError
@@ -32,14 +33,52 @@ def _new_auto_handle() -> str:
     return f"aiko-{secrets.token_hex(6)}"
 
 
+def is_reserved_handle(handle: str) -> bool:
+    """`aiko-<12 hex>` belongs to the generator. No person may choose it, at any door
+    that sets a handle (PATCH /v1/me, social claim, dev register): a chosen handle of
+    that shape would be indistinguishable from an assigned one, and `handle_is_auto`
+    would send its owner back to "choose a handle". Refused as HandleTaken (409), which
+    is what it is: the system holds that name space."""
+    return bool(_AUTO_HANDLE_RE.fullmatch(handle))
+
+
 def handle_is_auto(user: User) -> bool:
     """Whether `user` still carries the handle register/finish assigned: never changed,
-    and auto-shaped. Both halves are needed. Handles are free text, so someone can
-    CHOOSE an `aiko-<12 hex>` handle, and choosing it stamps handle_changed_at. And a
-    handle set at creation (social claim, password register) has a NULL
-    handle_changed_at without being auto. The app uses this to ask for a handle before
-    letting a user into chat, on every device, including accounts made before it asked."""
+    and auto-shaped. Since `is_reserved_handle` no door lets a person choose that
+    shape, so the shape alone now means "assigned". handle_changed_at stays in the test
+    for rows from before the reservation (a change TO the shape stamped it; measured on
+    enspyr 2026-10-28: 0 such rows). The app uses this to ask for a handle before letting
+    a user into chat, on every device, including accounts made before it asked."""
     return user.handle_changed_at is None and bool(_AUTO_HANDLE_RE.fullmatch(user.username))
+
+
+# ZWJ joins emoji sequences, and the tag characters (U+E0020-E007F) spell subdivision
+# flags. They are the only invisible formatting characters a handle may carry.
+_ZWJ = "\u200d"
+_JOINERS = frozenset({_ZWJ, *map(chr, range(0xE0020, 0xE0080))})
+
+
+def handle_text_problem(text: str) -> str | None:
+    """Why `text` can't be a handle, or None if it can. ONE repertoire for every door
+    that sets a handle AND for the passkey label (which is the handle being chosen), so
+    a label is either the handle or not used, never a third string.
+
+    Refused: control characters (Cc), lone surrogates (Cs, which can't even be encoded),
+    line and paragraph separators (Zl, Zp), and every invisible formatting character
+    (Cf: bidi overrides and isolates, LRM/RLM/ALM, zero-width space, soft hyphen, BOM)
+    except the joiners above. These make a handle render as something it is not:
+    `nick` followed by an RLM looks exactly like `nick`. A handle made only of
+    joiners is invisible, so it is refused too. Unassigned code points are allowed,
+    so emoji newer than this Python's Unicode tables still work."""
+    for ch in text:
+        category = unicodedata.category(ch)
+        if category in ("Cc", "Cs", "Zl", "Zp"):
+            return "control, surrogate or line-separator character"
+        if category == "Cf" and ch not in _JOINERS:
+            return "invisible formatting character"
+    if text and all(ch in _JOINERS for ch in text):
+        return "nothing visible"
+    return None
 
 
 class HandleAllocationExhausted(Exception):
@@ -79,6 +118,8 @@ def _sanitize_aiko_username(username: str) -> str:
 async def create_user(
     session: AsyncSession, *, username: str, display_name: str, password: str
 ) -> User:
+    if is_reserved_handle(username):
+        raise HandleTaken()
     user = User(
         id=new_ulid(),
         username=username,
@@ -143,7 +184,10 @@ async def create_social_user(
     """Create a local user for a verified federated identity and link it, in ONE
     transaction. password_hash stays None (social-only). Raises IntegrityError if
     the handle is taken (username/aiko_username UNIQUE) OR the (provider, sub) is
-    already claimed (uq_social_provider_sub) — the caller maps both to 409."""
+    already claimed (uq_social_provider_sub) — the caller maps both to 409. A reserved
+    (auto-shaped) handle raises HandleTaken, which the caller also maps to 409."""
+    if is_reserved_handle(handle):
+        raise HandleTaken()
     user = User(
         id=new_ulid(),
         username=handle,
@@ -379,7 +423,11 @@ async def update_profile(
         await session.refresh(user)
         return user
 
-    # Handle CHANGE — fold the cooldown predicate into the write.
+    # Handle CHANGE — fold the cooldown predicate into the write. A change TO the
+    # reserved auto shape is refused first, and only here: a DB-confirmed no-op (an
+    # auto user re-sending the handle they already have) took the branch above.
+    if is_reserved_handle(handle):
+        raise HandleTaken()
     cutoff = now - dt.timedelta(seconds=cooldown_seconds)
     values: dict = {
         "username": handle,

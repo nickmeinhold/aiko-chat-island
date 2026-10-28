@@ -11,6 +11,7 @@ username and any password and no client uses it.
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
 from typing import Literal
 
@@ -118,6 +119,8 @@ class PatchMeReq(BaseModel):
     def _handle_nonempty_after_strip(cls, v: str | None) -> str | None:
         if v is not None and not v:
             raise ValueError("handle must not be blank")
+        if v is not None and (problem := users_service.handle_text_problem(v)):
+            raise ValueError(f"handle contains a {problem}")
         return v
 
     @field_validator("display_name")
@@ -178,6 +181,8 @@ async def register(req: RegisterReq, session: DbSession) -> dict:
             session, username=req.username,
             display_name=req.display_name, password=req.password,
         )
+    except users_service.HandleTaken:  # the reserved auto shape (nothing was written)
+        raise HTTPException(status.HTTP_409_CONFLICT, "username already taken")
     except IntegrityError:
         # Roll back the failed transaction before reusing/closing the session
         # (a failed commit leaves it needing rollback).
@@ -230,6 +235,8 @@ class SocialClaimReq(BaseModel):
     def _handle_nonempty_after_strip(cls, v: str) -> str:
         if not v:
             raise ValueError("handle must not be blank")
+        if problem := users_service.handle_text_problem(v):
+            raise ValueError(f"handle contains a {problem}")
         return v
 
 
@@ -414,6 +421,9 @@ async def social_claim(req: SocialClaimReq, session: DbSession) -> dict:
             handle=req.handle, display_name=req.display_name,
             email=pending["email"],
         )
+    except users_service.HandleTaken:  # the reserved auto shape (nothing was written)
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "handle already taken or identity already claimed")
     except IntegrityError:
         # Handle already taken OR this identity was already claimed (race).
         await session.rollback()
@@ -546,26 +556,37 @@ def registration_open() -> bool:
     return bool(settings.open_registration)
 
 
-async def _passkey_label_from(request: Request) -> str | None:
-    """The optional `{"name": ...}` body of register/start, read LENIENTLY: absent,
-    empty, malformed JSON or a non-object all mean "no label". This route is also
-    add-a-device's start, so a cosmetic field must never give it a new way to fail
-    (a declared pydantic body would 422 on malformed JSON)."""
+async def _passkey_label_from(request: Request) -> tuple[str | None, str]:
+    """The optional `{"name": ...}` body of register/start, read LENIENTLY, and why
+    there is or isn't a label. Absent, empty, malformed or a non-object all mean "no
+    label": this route is also add-a-device's start, so a cosmetic field must never
+    give it a new way to fail (a declared pydantic body would 422 on malformed JSON).
+
+    RecursionError is caught beside ValueError because a deeply nested body (sixty
+    thousand `[`, inside the 64 KiB request cap) makes the JSON decoder raise it, and
+    it is not a ValueError: uncaught, it was an anonymous 500 on demand."""
+    raw = await request.body()
+    if not raw.strip():
+        return None, "absent"
     try:
-        body = await request.json()
-    except ValueError:  # JSONDecodeError and UnicodeDecodeError are both ValueErrors
-        return None
-    return passkey_service.passkey_label(body.get("name") if isinstance(body, dict) else None)
+        body = json.loads(raw)
+    except (ValueError, RecursionError):  # JSONDecodeError and UnicodeDecodeError are ValueErrors
+        return None, "malformed"
+    if not isinstance(body, dict):
+        return None, "malformed"
+    return passkey_service.passkey_label(body.get("name"))
 
 
 # Declared for the OpenAPI contract only; the route reads the body itself (above).
 _REGISTER_START_BODY = {"requestBody": {"required": False, "content": {"application/json": {
     "schema": {"type": "object", "properties": {"name": {
-        "type": "string", "maxLength": 64,
+        "type": "string",
         "description": "Label for the passkey in the phone's password manager (the "
                        "handle being chosen, or the signed-in user's handle when adding "
-                       "a device). Cosmetic; grants nothing. Invalid or absent means a "
-                       "random label."}}}}}}}
+                       "a device). Cosmetic; grants nothing. Obeys the handle's "
+                       "character rules; anything a handle couldn't be, a non-string, "
+                       "or an absent or malformed body means a random label, never an "
+                       "error. Cut to 64 UTF-8 bytes on a character boundary."}}}}}}}
 
 
 @router.post("/passkey/register/start", dependencies=[rate_limit("passkey")],
@@ -573,7 +594,8 @@ _REGISTER_START_BODY = {"requestBody": {"required": False, "content": {"applicat
 async def passkey_register_start(session: DbSession, request: Request) -> dict:
     """Begin registration for an ANONYMOUS caller (first-passkey-creates-account).
     Returns {state, options} — the raw WebAuthn-JSON the platform authenticator
-    parses. No body, no prior session.
+    parses. No prior session. An optional `{"name": ...}` body labels the passkey on
+    the caller's phone (`_passkey_label_from`); it never fails the request.
 
     DELIBERATELY UNGATED, and reverting that is a production outage — read this
     before "tightening" it. THIS ROUTE IS ALSO `add/start`: there is no such
@@ -593,12 +615,14 @@ async def passkey_register_start(session: DbSession, request: Request) -> dict:
     chokepoint — `create_passkey_account` is called from there and nowhere else —
     and it is gated before the challenge is consumed, so nothing an anonymous
     caller starts here can become an account."""
-    label = await _passkey_label_from(request)
+    label, label_status = await _passkey_label_from(request)
     result = await passkey_service.start_registration(session, label=label)
-    # Logs whether a label was given, never the label: it is a handle being chosen.
-    log.info("passkey.register.start: challenge issued state=%s ttl=%ss labelled=%s",
+    # Logs WHY there is or isn't a label (given / absent / malformed / rejected), never
+    # the label itself: it is a handle being chosen. "rejected" or "malformed" from a
+    # client that meant to send one is a client bug the operator can now see.
+    log.info("passkey.register.start: challenge issued state=%s ttl=%ss label=%s",
              _short(result.get("state")), settings.passkey_challenge_ttl_seconds,
-             label is not None)
+             label_status)
     return result
 
 

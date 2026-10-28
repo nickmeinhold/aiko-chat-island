@@ -243,8 +243,12 @@ async def test_register_finish_retries_on_handle_collision(client, session, monk
         session, handle="aiko-collide0", display_name="", email=None,
         material={"credential_id": "c2VlZC1jcmVk", "public_key": "cGs",
                   "sign_count": 0, "transports": None, "aaguid": None})
-    hexes = iter(["collide0", "fresh001"])  # attempt-1 collides; attempt-2 is free
-    monkeypatch.setattr(users_service.secrets, "token_hex", lambda n: next(hexes))
+    # Patch the GENERATOR, not `secrets.token_hex`: the stdlib module is shared, and
+    # register/start draws its random passkey label from it first, so an earlier
+    # version of this test handed "collide0" to the LABEL and never collided at all
+    # (Noether, cage-match #435). The assertion below now fails if the retry is removed.
+    handles = iter(["aiko-collide0", "aiko-fresh001"])  # attempt 1 collides; 2 is free
+    monkeypatch.setattr(users_service, "_new_auto_handle", lambda: next(handles))
 
     auth = SoftAuthenticator(credential_id=b"collision-retry-cred")
     start = (await client.post("/v1/auth/passkey/register/start")).json()
@@ -757,14 +761,18 @@ async def test_authenticate_finish_corrupt_stored_key_stays_loud(client, session
 _RANDOM_LABEL = re.compile(r"aiko-[0-9a-f]{8}")
 
 
+async def _start_label(client, **kwargs) -> str:
+    resp = await client.post("/v1/auth/passkey/register/start", **kwargs)
+    assert resp.status_code == 200, resp.text
+    user = resp.json()["options"]["user"]
+    assert user["displayName"] == user["name"]
+    return user["name"]
+
+
 async def test_register_start_labels_the_passkey_with_the_given_name(client):
     """The name becomes BOTH user.name and user.displayName, trimmed, so the phone's
     password manager shows the handle being chosen instead of `aiko-<hex>`."""
-    resp = await client.post("/v1/auth/passkey/register/start", json={"name": "  paul  "})
-    assert resp.status_code == 200, resp.text
-    user = resp.json()["options"]["user"]
-    assert user["name"] == "paul"
-    assert user["displayName"] == "paul"
+    assert await _start_label(client, json={"name": "  paul  "}) == "paul"
 
 
 @pytest.mark.parametrize("kwargs", [
@@ -773,33 +781,58 @@ async def test_register_start_labels_the_passkey_with_the_given_name(client):
     {"json": {"name": ""}},
     {"json": {"name": "   "}},
     {"json": {"name": 123}},
-    {"json": {"name": "x" * 65}},
     {"json": ["paul"]},
-    {"json": {"name": "‮\u0007"}},                   # nothing left once cleaned
+    {"json": {"name": "pa\u202eul"}},                     # bidi override
+    {"json": {"name": "nick\u200f"}},                     # RLM: looks exactly like nick
+    {"json": {"name": "\u200bpaul"}},                     # zero-width space
+    {"json": {"name": "pa\u0007ul"}},                     # control character
+    {"json": {"name": "\u200d\u200d"}},                   # nothing visible
+    {"content": b'{"name": "\\ud800"}', "headers": {"content-type": "application/json"}},
+    {"content": b"[" * 60000, "headers": {"content-type": "application/json"}},
     {"content": b"{not json", "headers": {"content-type": "application/json"}},
     {"content": b"\xff\xfe", "headers": {"content-type": "application/json"}},
-], ids=["absent", "empty-object", "empty", "blank", "non-string", "too-long",
-        "non-object", "only-stripped", "malformed", "not-utf8"])
+], ids=["absent", "empty-object", "empty", "blank", "non-string", "non-object",
+        "bidi-override", "rlm", "zwsp", "control", "only-joiners", "lone-surrogate",
+        "deeply-nested", "malformed", "not-utf8"])
 async def test_register_start_falls_back_to_a_random_label_never_an_error(client, kwargs):
     """register/start is ALSO add-a-device's start, so a cosmetic field must never
-    give it a new way to fail: every bad body is a 200 with today's random label."""
-    resp = await client.post("/v1/auth/passkey/register/start", **kwargs)
-    assert resp.status_code == 200, resp.text
-    user = resp.json()["options"]["user"]
-    assert _RANDOM_LABEL.fullmatch(user["name"]), user
-    assert user["displayName"] == user["name"]
+    give it a new way to fail: every bad body is a 200 with today's random label. A
+    name a handle couldn't be is refused, not rewritten (stripping would make a third
+    string). The lone surrogate and the deeply nested body were both anonymous 500s
+    (cage-match #435: Carnot, Maxwell)."""
+    assert _RANDOM_LABEL.fullmatch(await _start_label(client, **kwargs))
 
 
-@pytest.mark.parametrize("raw, cleaned", [
-    ("pa‮ul\u0007", "paul"),                         # bidi override + BEL stripped
-    ("⁦paul⁩", "paul"),                         # bidi isolates stripped
-    ("\U0001F469‍\U0001F4BBdev", "\U0001F469‍\U0001F4BBdev"),  # ZWJ kept
-    ("x" * 64, "x" * 64),                                 # the cap is inclusive
-])
-async def test_register_start_cleans_the_label(client, raw, cleaned):
-    resp = await client.post("/v1/auth/passkey/register/start", json={"name": raw})
-    assert resp.status_code == 200, resp.text
-    assert resp.json()["options"]["user"]["name"] == cleaned
+@pytest.mark.parametrize("raw, label", [
+    ("\U0001F469\u200d\U0001F4BBdev", "\U0001F469\u200d\U0001F4BBdev"),  # ZWJ kept
+    ("x" * 64, "x" * 64),                                 # exactly 64 bytes: whole
+    ("x" * 65, "x" * 64),                                 # cut to 64 bytes
+    ("\u6f22" * 22, "\u6f22" * 21),                       # 66 bytes: whole chars only
+    # 1 + 9 x (4 + 3) = 64 bytes ends exactly on a ZWJ, which must not be left dangling
+    ("a" + "\U0001F469\u200d" * 20, "a" + "\U0001F469\u200d" * 8 + "\U0001F469"),
+], ids=["zwj-emoji", "64-bytes", "65-bytes", "cjk-66-bytes", "no-dangling-zwj"])
+async def test_register_start_cuts_the_label_to_64_bytes(client, raw, label):
+    """CTAP bounds user.name at 64 BYTES, so the label is cut here, on a code-point
+    boundary and never leaving a dangling joiner, rather than by the device, which may
+    cut mid-character or refuse (cage-match #435: Tesla, Noether)."""
+    got = await _start_label(client, json={"name": raw})
+    assert got == label
+    assert len(got.encode("utf-8")) <= 64
+
+
+async def test_register_start_logs_why_there_is_no_label(client, caplog):
+    """A fallback must be able to report itself: the log says absent, malformed or
+    rejected (never the label), so a client bug isn't the same line as no label."""
+    import logging
+    with caplog.at_level(logging.INFO, logger="aiko_gateway.rest.auth"):
+        await _start_label(client)
+        await _start_label(client, json={"name": "nick\u200f"})
+        await _start_label(client, content=b"{", headers={"content-type": "application/json"})
+        await _start_label(client, json={"name": "paul"})
+    lines = [r.getMessage() for r in caplog.records if "passkey.register.start" in r.getMessage()]
+    assert [line.rsplit("label=", 1)[1] for line in lines] == [
+        "absent", "rejected", "malformed", "given"]
+    assert not any("paul" in line for line in lines)
 
 
 async def test_a_label_grants_nothing(client, monkeypatch):

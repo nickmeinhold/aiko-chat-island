@@ -119,7 +119,7 @@ def test_validate_mentions_keeps_same_target_distinct_offsets():
 
 @pytest.mark.parametrize("bad_id", [
     "has\nnewline", "tab\there", "ctrl\x00null", "esc\x1b[",
-    "bidi‮override", "zero​width",   # Cf category — printable but a spoof vector
+    "bidi\u202eoverride", "zero\u200bwidth",   # Cf category — printable but a spoof vector
 ])
 def test_validate_mentions_rejects_control_and_format_chars_in_target_id(bad_id):
     """target_id is opaque but not a smuggling channel — control (Cc) AND format
