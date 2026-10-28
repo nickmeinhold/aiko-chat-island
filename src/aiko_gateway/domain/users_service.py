@@ -23,6 +23,23 @@ _AIKO_USERNAME_RE = re.compile(r"[^A-Za-z0-9_]")
 # deliberate 503 rather than letting it escape as an uncategorised 500.
 _MAX_HANDLE_ATTEMPTS = 5
 
+def _new_auto_handle() -> str:
+    """The handle register/finish assigns: `aiko-` and twelve hex digits. Migration
+    0030's backfill matches this shape; change the format and that history still
+    describes the old one, which is fine because it ran once."""
+    return f"aiko-{secrets.token_hex(6)}"
+
+
+def handle_is_auto(user: User) -> bool:
+    """Whether `user` still carries the handle register/finish assigned. STORED, not
+    inferred: `handle_assigned` is set by create_passkey_account and cleared by the
+    first real handle change. An inference from the spelling misread a person who
+    chose an `aiko-<12 hex>` handle, and keeping it honest needed a refusal at every
+    door that sets a handle (cage-match #435: Carnot, Tesla). The app uses this to ask
+    for a handle before letting a user into chat, on every device, including accounts
+    made before it asked."""
+    return bool(user.handle_assigned)
+
 
 class HandleAllocationExhausted(Exception):
     """create_passkey_account could not find a free auto-handle within
@@ -203,7 +220,7 @@ async def create_passkey_account(
         raise CredentialAlreadyRegistered(existing)
 
     for _ in range(_MAX_HANDLE_ATTEMPTS):
-        handle = f"aiko-{secrets.token_hex(6)}"
+        handle = _new_auto_handle()
         user = User(
             id=new_ulid(),
             username=handle,
@@ -211,6 +228,7 @@ async def create_passkey_account(
             password_hash=None,
             aiko_username=_sanitize_aiko_username(handle),
             email=None,
+            handle_assigned=True,  # the user view's handle_auto, until they choose one
         )
         try:
             async with session.begin_nested():  # SAVEPOINT — isolates this attempt
@@ -367,6 +385,8 @@ async def update_profile(
         "username": handle,
         "aiko_username": _sanitize_aiko_username(handle),
         "handle_changed_at": now,
+        # A chosen handle: the account no longer carries the one it was assigned.
+        "handle_assigned": False,
     }
     if display_name is not None:  # atomic with the handle change (all-or-nothing)
         values["display_name"] = display_name

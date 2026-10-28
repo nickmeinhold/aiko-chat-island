@@ -17,7 +17,8 @@ Contract under test (mirrors HANDOFF-to-app-tab-v2-social-wire.md #2631):
     retry_after + Retry-After header); setting to the CURRENT handle is a no-op
     that does NOT trip the cooldown
   - display_name: editable anytime, never subject to cooldown
-  - 200 response is the MeView (user_id, username, display_name, aiko_username)
+  - 200 response is the MeView (user_id, username, display_name, aiko_username,
+    is_moderator, handle_auto)
 """
 from __future__ import annotations
 
@@ -83,9 +84,10 @@ async def test_me_view_shape_stable(client, session):
     # Exact CLOSED key set (not just membership) — response_model=MeView is the real
     # filter; the test must catch an accidental extra/removed field (append-only).
     assert set(body) == {"user_id", "username", "display_name", "aiko_username",
-                         "is_moderator"}
+                         "is_moderator", "handle_auto"}
     assert body["user_id"] == user.id
     assert body["username"] == "alice"
+    assert body["handle_auto"] is False  # a chosen handle, set at creation
 
 
 # --- display_name (free, no cooldown) ---------------------------------------
@@ -341,3 +343,79 @@ async def test_cooldown_predicate_beats_a_stale_read(session):
     # And the row was not mutated by the refused write.
     await session.refresh(user)
     assert user.username == "alice"
+
+
+# --- handle_auto (handle-first sign-up, app tab 2026-10-28) ---------------- #
+
+async def _make_auto_user(session):
+    """An account as register/finish makes it: an assigned `aiko-<12 hex>` handle with
+    handle_assigned set. (The register/finish path itself is covered end to end in
+    test_passkey_endpoints.)"""
+    user = await users_service.create_passkey_user(
+        session, handle=users_service._new_auto_handle(), display_name="", email=None,
+        material={"credential_id": users_service._new_auto_handle(), "public_key": "cGs",
+                  "sign_count": 0, "transports": None, "aaguid": None})
+    user.handle_assigned = True
+    await session.commit()
+    return user
+
+
+@pytest.mark.asyncio
+async def test_handle_auto_is_true_until_the_first_handle_change(client, session):
+    user = await _make_auto_user(session)
+    headers = _auth(user)
+    assert (await client.get("/v1/me", headers=headers)).json()["handle_auto"] is True
+    resp = await client.patch("/v1/me", json={"handle": "paul"}, headers=headers)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["handle_auto"] is False
+    assert (await client.get("/v1/me", headers=headers)).json()["handle_auto"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_taken_handle_leaves_handle_auto_true_and_the_retry_open(client, session):
+    """A 409 must not stamp the cooldown or clear the flag: the app answers it with
+    "pick again", and that second PATCH has to pass."""
+    await _make_user(session, username="paul")
+    user = await _make_auto_user(session)
+    # Headers built ONCE, before the 409: its rollback expires every instance in the
+    # session this test shares with the app, and re-reading `user` afterwards would
+    # be a lazy load outside the async context.
+    headers = _auth(user)
+    taken = await client.patch("/v1/me", json={"handle": "paul"}, headers=headers)
+    assert taken.status_code == 409, taken.text
+    assert (await client.get("/v1/me", headers=headers)).json()["handle_auto"] is True
+    retry = await client.patch("/v1/me", json={"handle": "paul2"}, headers=headers)
+    assert retry.status_code == 200, retry.text
+    assert retry.json()["handle_auto"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_handle_chosen_at_creation_that_looks_auto_is_not_auto(client, session):
+    """The case an inference from the spelling got wrong (cage-match #435, all four
+    seats): a person who CHOSE `aiko-<12 hex>` is not sent back to "choose a handle".
+    The flag is stored when the account is made, so the spelling decides nothing."""
+    user = await _make_user(session, username=users_service._new_auto_handle())
+    assert (await client.get("/v1/me", headers=_auth(user))).json()["handle_auto"] is False
+
+
+@pytest.mark.asyncio
+async def test_choosing_an_auto_shaped_handle_later_is_not_auto(client, session):
+    user = await _make_user(session, username="bob")
+    chosen = users_service._new_auto_handle()
+    resp = await client.patch("/v1/me", json={"handle": chosen}, headers=_auth(user))
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["username"] == chosen
+    assert resp.json()["handle_auto"] is False
+
+
+@pytest.mark.asyncio
+async def test_resending_your_own_auto_handle_is_a_no_op(client, session):
+    """A no-op handle write (with a display-name edit) neither clears the flag nor
+    stamps the cooldown."""
+    user = await _make_auto_user(session)
+    headers = _auth(user)
+    resp = await client.patch("/v1/me", json={"handle": user.username,
+                                              "display_name": "Paul"}, headers=headers)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["handle_auto"] is True
+    assert resp.json()["display_name"] == "Paul"

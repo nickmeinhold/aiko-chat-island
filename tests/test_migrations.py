@@ -1395,3 +1395,49 @@ def test_every_in_check_constraint_reached_the_db_and_matches_its_enum(
         assert not problems, "\n".join(problems)
     finally:
         con.close()
+
+
+def test_0030_backfills_handle_assigned_only_for_handles_register_finish_made(
+        tmp_path, monkeypatch) -> None:
+    """0030 marks a row assigned exactly when register/finish made it and nobody has
+    changed the handle since: never changed, auto-shaped, and with neither a password
+    nor a social identity. The spelling alone cannot tell an assigned handle from one a
+    person CHOSE at password register or social claim, and those two doors leave a
+    password or a social identity behind. One row per case, each of which a
+    spelling-only backfill would get wrong or right for the wrong reason."""
+    _, sync_url = _point_app_at(tmp_path, monkeypatch)
+    build_seed.create_empty(tmp_path / "mig.db")
+    command.upgrade(migrate._alembic_config(seed_build=True), "0029")
+    rows = {  # id -> (username, password_hash, handle_changed_at, has_social, expected)
+        "01ASSIGNEDAAAAAAAAAAAAAAAA": ("aiko-0123456789ab", None, None, False, 1),
+        "01PASSWORDAAAAAAAAAAAAAAAA": ("aiko-abcdefabcdef", "argon2-hash", None, False, 0),
+        "01SOCIALAAAAAAAAAAAAAAAAAA": ("aiko-111111111111", None, None, True, 0),
+        "01CHANGEDAAAAAAAAAAAAAAAAA": ("aiko-222222222222", None,
+                                       "2026-09-01T00:00:00+00:00", False, 0),
+        "01CHOSENAAAAAAAAAAAAAAAAAA": ("nick", None, None, False, 0),
+        "01UPPERAAAAAAAAAAAAAAAAAAA": ("AIKO-0123456789AB", None, None, False, 0),
+        "01SHORTAAAAAAAAAAAAAAAAAAA": ("aiko-0123456789a", None, None, False, 0),
+    }
+    engine = create_engine(sync_url)
+    try:
+        with engine.begin() as conn:
+            for uid, (username, pw, changed, social, _) in rows.items():
+                conn.exec_driver_sql(
+                    "INSERT INTO users (id, username, aiko_username, display_name, "
+                    "created_at, kind, password_hash, handle_changed_at) "
+                    "VALUES (?, ?, ?, '', '2026-10-01T00:00:00+00:00', 'human', ?, ?)",
+                    (uid, username, username.replace("-", "_"), pw, changed))
+                if social:
+                    conn.exec_driver_sql(
+                        "INSERT INTO social_identities (id, provider, provider_sub, user_id, "
+                        "created_at) VALUES (?, 'google', ?, ?, '2026-10-01T00:00:00+00:00')",
+                        ("01SI" + uid[4:], "sub-" + uid, uid))
+
+        command.upgrade(migrate._alembic_config(), "0030")
+
+        with engine.connect() as conn:
+            got = dict(conn.exec_driver_sql(
+                "SELECT id, handle_assigned FROM users").fetchall())
+    finally:
+        engine.dispose()
+    assert got == {uid: row[4] for uid, row in rows.items()}

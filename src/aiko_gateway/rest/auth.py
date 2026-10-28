@@ -11,6 +11,7 @@ username and any password and no client uses it.
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
 from typing import Literal
 
@@ -95,6 +96,11 @@ class MeView(BaseModel):
     display_name: str
     aiko_username: str
     is_moderator: bool
+    # True while the account still carries the handle register/finish assigned. Stored
+    # (users.handle_assigned, migration 0030), NOT read off the handle's spelling: a
+    # person may choose an aiko-shaped handle and reads false. The app asks for a
+    # handle before chat while it is true.
+    handle_auto: bool
 
 
 class PatchMeReq(BaseModel):
@@ -132,7 +138,8 @@ class PatchMeReq(BaseModel):
 
 def _user_view(u: User) -> dict:
     return {"user_id": u.id, "username": u.username,
-            "display_name": u.display_name, "aiko_username": u.aiko_username}
+            "display_name": u.display_name, "aiko_username": u.aiko_username,
+            "handle_auto": users_service.handle_is_auto(u)}
 
 
 def _me_view(u: User) -> dict:
@@ -542,11 +549,48 @@ def registration_open() -> bool:
     return bool(settings.open_registration)
 
 
-@router.post("/passkey/register/start", dependencies=[rate_limit("passkey")])
-async def passkey_register_start(session: DbSession) -> dict:
+async def _passkey_label_from(request: Request) -> tuple[str | None, passkey_service.LabelStatus]:
+    """The optional `{"name": ...}` body of register/start, read LENIENTLY, and why
+    there is or isn't a label. Absent, empty, malformed or a non-object all mean "no
+    label": this route is also add-a-device's start, so a cosmetic field must never
+    give it a new way to fail (a declared pydantic body would 422 on malformed JSON).
+
+    RecursionError is caught beside ValueError because a deeply nested body (sixty
+    thousand `[`, inside the 64 KiB request cap) makes the JSON decoder raise it, and
+    it is not a ValueError: uncaught, it was an anonymous 500 on demand."""
+    raw = await request.body()
+    if not raw.strip():
+        return None, "absent"
+    try:
+        body = json.loads(raw)
+    except (ValueError, RecursionError):  # JSONDecodeError and UnicodeDecodeError are ValueErrors
+        return None, "malformed"
+    if not isinstance(body, dict):
+        return None, "malformed"
+    return passkey_service.passkey_label(body.get("name"))
+
+
+# Declared for the OpenAPI contract only; the route reads the body itself (above).
+_REGISTER_START_BODY = {"requestBody": {"required": False, "content": {"application/json": {
+    "schema": {"type": "object", "properties": {"name": {
+        "type": "string",
+        "description": "Label for the passkey in the phone's password manager (the "
+                       "handle being chosen, or the signed-in user's handle when adding "
+                       "a device). Cosmetic; grants nothing. Sent through as given "
+                       "(trimmed), never rewritten; control, lone-surrogate and line-"
+                       "separator characters, nothing visible, a non-string, or an "
+                       "absent or malformed body mean a random label, never an error. "
+                       "Cut to 64 UTF-8 bytes on a character boundary. This is not a "
+                       "handle rule: a handle is validated by PATCH /v1/me."}}}}}}}
+
+
+@router.post("/passkey/register/start", dependencies=[rate_limit("passkey")],
+             openapi_extra=_REGISTER_START_BODY)
+async def passkey_register_start(session: DbSession, request: Request) -> dict:
     """Begin registration for an ANONYMOUS caller (first-passkey-creates-account).
     Returns {state, options} — the raw WebAuthn-JSON the platform authenticator
-    parses. No body, no prior session.
+    parses. No prior session. An optional `{"name": ...}` body labels the passkey on
+    the caller's phone (`_passkey_label_from`); it never fails the request.
 
     DELIBERATELY UNGATED, and reverting that is a production outage — read this
     before "tightening" it. THIS ROUTE IS ALSO `add/start`: there is no such
@@ -566,9 +610,14 @@ async def passkey_register_start(session: DbSession) -> dict:
     chokepoint — `create_passkey_account` is called from there and nowhere else —
     and it is gated before the challenge is consumed, so nothing an anonymous
     caller starts here can become an account."""
-    result = await passkey_service.start_registration(session)
-    log.info("passkey.register.start: challenge issued state=%s ttl=%ss",
-             _short(result.get("state")), settings.passkey_challenge_ttl_seconds)
+    label, label_status = await _passkey_label_from(request)
+    result = await passkey_service.start_registration(session, label=label)
+    # Logs WHY there is or isn't a label (given / absent / malformed / rejected), never
+    # the label itself: it is a handle being chosen. "rejected" or "malformed" from a
+    # client that meant to send one is a client bug the operator can now see.
+    log.info("passkey.register.start: challenge issued state=%s ttl=%ss label=%s",
+             _short(result.get("state")), settings.passkey_challenge_ttl_seconds,
+             label_status)
     return result
 
 

@@ -210,3 +210,17 @@ async def test_social_claim_is_exempt_from_open_registration(client, monkeypatch
         "and reverses the 2026-06-27 decision")
     assert resp.status_code == 200, (
         f"expected the claim to succeed, got {resp.status_code}: {resp.text[:200]}")
+
+
+async def test_a_social_claim_of_an_auto_shaped_handle_is_not_auto(client, monkeypatch):
+    """Social claim is a door where a person CHOOSES a handle. Choosing one shaped like
+    `aiko-<12 hex>` must not read as assigned (cage-match #435): handle_auto is stored at
+    creation, and only register/finish sets it."""
+    from aiko_gateway.domain import security, users_service
+
+    monkeypatch.setattr(settings, "social_signin_enabled", True)
+    prov = security.issue_provisioning("google", "sub-auto-shaped")
+    resp = await client.post("/v1/auth/social/claim", json={
+        "provisioning_token": prov, "handle": users_service._new_auto_handle()})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["user"]["handle_auto"] is False

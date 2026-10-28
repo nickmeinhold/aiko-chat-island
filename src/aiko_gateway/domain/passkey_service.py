@@ -47,6 +47,8 @@ from __future__ import annotations
 import datetime as dt
 import json
 import secrets
+import unicodedata
+from typing import Literal
 
 import webauthn
 from cryptography.exceptions import InvalidSignature
@@ -158,16 +160,73 @@ async def consume_challenge(
 
 # --- ceremony start (mint options + challenge) ----------------------------- #
 
-async def start_registration(session: AsyncSession) -> dict:
+# CTAP2 bounds user.name and user.displayName at 64 BYTES, and an authenticator that
+# meets a longer one may truncate it mid-character or refuse it (Android's Credential
+# Manager already refused an over-limit user handle once: #1957). So the label is cut
+# to 64 UTF-8 bytes here, on a code-point boundary, never by the device.
+_PASSKEY_LABEL_MAX_BYTES = 64
+
+LabelStatus = Literal["given", "absent", "malformed", "rejected"]
+
+# Characters a passkey dialog can't show sensibly: controls (a NUL or newline in the
+# phone's password list), lone surrogates (not even encodable, a 500 at serialization)
+# and line or paragraph separators. This is the LABEL's rule, about what can be put in
+# front of the platform's passkey UI. It is not a handle policy: which handles may
+# exist is decided where handles are set, and the label is only ever the handle the
+# caller is about to choose, or random.
+_LABEL_REFUSED_CATEGORIES = frozenset({"Cc", "Cs", "Zl", "Zp"})
+# Categories that put nothing on screen by themselves. A label must show at least one
+# character outside them, at any length: a name of only joiners is not a name.
+_LABEL_INVISIBLE_CATEGORIES = frozenset({"Cf", "Mn", "Me", "Zs"})
+
+
+def passkey_label(raw: object) -> tuple[str | None, LabelStatus]:
+    """The label a caller asked for on its passkey, and what became of it.
+
+    Refused, NOT rewritten: a label is what the caller sent (trimmed, as handles are)
+    or the random default, never a third string with characters taken out. The one
+    edit is the 64-byte cut, which keeps whole characters and never ENDS on a joiner it
+    created (a ZWJ the caller sent at the end is theirs). A label must show at least
+    one visible character, checked last, so a name of only joiners is refused at any
+    length and "given" always means the ceremony carries visible text from the caller. Non-string, blank, refused or emptied by the cut
+    all answer None and the random label is used: the label is cosmetic, and this
+    ceremony is also add-a-device's start, so a bad label must never fail it. The
+    status lets the route log why there was no label without logging the label."""
+    if raw is None:
+        return None, "absent"
+    if not isinstance(raw, str):
+        return None, "rejected"
+    text = raw.strip()
+    if not text or any(unicodedata.category(ch) in _LABEL_REFUSED_CATEGORIES for ch in text):
+        return None, "rejected"
+    encoded = text.encode("utf-8")  # safe: lone surrogates (Cs) were refused above
+    if len(encoded) > _PASSKEY_LABEL_MAX_BYTES:
+        # Longest whole-code-point prefix that fits, without a dangling joiner.
+        text = encoded[:_PASSKEY_LABEL_MAX_BYTES].decode("utf-8", errors="ignore")
+        text = text.rstrip("\u200d")
+    if all(unicodedata.category(ch) in _LABEL_INVISIBLE_CATEGORIES for ch in text):
+        return None, "rejected"
+    return text, "given"
+
+
+async def start_registration(session: AsyncSession, *, label: str | None = None) -> dict:
     """Mint a registration ceremony for an ANONYMOUS caller (first-passkey-creates-
     account). Returns {state, options} — options is the raw WebAuthn-JSON the
     platform authenticator parses. resident_key REQUIRED so the credential is
-    discoverable (usernameless authentication later)."""
+    discoverable (usernameless authentication later).
+
+    `label` (from `passkey_label`) names the passkey in the phone's password manager:
+    the handle a new user is about to choose, or a signed-in user's handle when adding
+    a device. It is a label on the caller's own device and grants nothing."""
     raw = secrets.token_bytes(32)
     # The WebAuthn user_name/display_name are COSMETIC ceremony metadata (shown in the
     # OS passkey list) — distinct from the account handle, which register/finish
-    # auto-generates when it creates the account (create_passkey_account). A random
-    # provisional name here just avoids collisions in that OS list.
+    # auto-generates when it creates the account (create_passkey_account). Without a
+    # caller label, a random provisional name just avoids collisions in that OS list.
+    # (That random name is `aiko-<8 hex>` and the account's auto handle is
+    # `aiko-<12 hex>`: they were never the same string, which is why a label is worth
+    # sending.)
+    name = label or f"aiko-{secrets.token_hex(4)}"
     #
     # user_id is the WebAuthn user HANDLE. It is EPHEMERAL here: we never persist it
     # and authenticate looks credentials up by credential_id, so its only constraint
@@ -178,7 +237,8 @@ async def start_registration(session: AsyncSession) -> dict:
     options = webauthn.generate_registration_options(
         rp_id=settings.passkey_rp_id,
         rp_name=settings.passkey_rp_name,
-        user_name=f"aiko-{secrets.token_hex(4)}",
+        user_name=name,
+        user_display_name=name,
         user_id=secrets.token_bytes(16),
         challenge=raw,
         authenticator_selection=AuthenticatorSelectionCriteria(

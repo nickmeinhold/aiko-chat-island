@@ -76,3 +76,14 @@ async def test_production_does_not_serve_register(
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         resp = await c.post("/v1/auth/register", json=_REG_BODY)
     assert resp.status_code == expected, resp.text
+
+
+async def test_a_dev_register_of_an_auto_shaped_username_is_not_auto(client, monkeypatch):
+    """The dev password door is the other place a person chooses a handle at creation."""
+    from aiko_gateway.domain import users_service
+
+    monkeypatch.setattr(settings, "open_registration", True)
+    resp = await client.post("/v1/auth/register", json={
+        **_REG_BODY, "username": users_service._new_auto_handle()})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["user"]["handle_auto"] is False
