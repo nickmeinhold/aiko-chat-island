@@ -354,24 +354,17 @@ async def update_profile(
         raise ValueError("update_profile requires handle and/or display_name")
     now = now or dt.datetime.now(dt.timezone.utc)
 
-    if handle is not None and handle == user.username:
-        # The in-memory username can be a STALE snapshot — a concurrent self-change
-        # may have moved the DB handle after CurrentUser loaded. Confirm the no-op
-        # against the DB (one altitude of truth) so a stale read can't route a REAL
-        # handle change down the no-op path and silently drop it while a combined
-        # display_name still commits — the partial-apply the atomic-combined contract
-        # forbids (cage-match #118, Carnot+Tesla). A DB-confirmed no-op drops to the
-        # cheap display-only path; a mismatch falls through to the atomic change path,
-        # where the cooldown/UNIQUE arbitrate it correctly.
-        db_username = (await session.execute(
-            select(User.username).where(User.id == user.id))).scalar_one_or_none()
-        if db_username == handle:
-            handle = None  # genuine no-op — does NOT stamp handle_changed_at
+    # A same-handle request is NOT spotted here from the loaded user. That snapshot can
+    # be stale either way: a concurrent change may have moved the handle away from it
+    # (cage-match #118) or onto the very handle requested (#438: two devices, or a
+    # double submit, both claiming `paul` from an assigned account, where the second
+    # would otherwise stamp the cooldown and spend the free fix while changing
+    # nothing). The UPDATE below refuses a write that wouldn't change the handle
+    # (`username != :handle`), and the rowcount == 0 branch returns it as a no-op,
+    # so the ROW decides.
 
     if handle is None:
-        # display_name-only, or a DB-confirmed same-handle no-op: no cooldown, no
-        # atomic gate (a no-op never stamps handle_changed_at, so the form-resubmit
-        # lockout footgun stays closed).
+        # display_name-only: no cooldown, no atomic gate.
         if display_name is not None:
             user.display_name = display_name
         await session.commit()
@@ -407,6 +400,9 @@ async def update_profile(
         update(User)
         .where(
             User.id == user.id,
+            # A write that wouldn't change the handle matches nothing, so it can never
+            # stamp the cooldown or clear handle_assigned (see the rowcount == 0 arm).
+            User.username != handle,
             or_(User.handle_changed_at.is_(None), User.handle_changed_at <= cutoff),
         )
         .values(**values)
@@ -426,10 +422,10 @@ async def update_profile(
         raise  # a non-handle constraint is NOT a taken handle — don't mislabel it
     if result.rowcount == 0:
         # The conditional UPDATE matched no row for one of two reasons: the cooldown
-        # predicate rejected it (handle_changed_at set AND newer than cutoff — a NULL
-        # would have matched the WHERE, so this is never the never-changed case), OR
-        # the row already holds the requested handle (concurrent winner / idempotent
-        # retry). Re-read the current handle + stamp to tell them apart. Capture the
+        # predicate rejected it (handle_changed_at set AND newer than cutoff), OR the
+        # row already holds the requested handle (a same-handle request, a concurrent
+        # winner, an idempotent retry: `username != :handle` refuses all three).
+        # Re-read the current handle + stamp to tell them apart. Capture the
         # id BEFORE rollback — rollback expires every instance unconditionally, so
         # reading user.id afterwards would lazy-load outside the async context
         # (MissingGreenlet).
@@ -445,10 +441,10 @@ async def update_profile(
             raise HandleChangeCooldown(cooldown_seconds)
         cur_username, last = row
         if cur_username == handle:
-            # The row ALREADY holds the requested handle (a concurrent winner set it,
-            # or an idempotent retry). "Set my handle to X" when it is already X is a
-            # no-op success, NOT a cooldown rejection (cage-match #118 r4, Carnot) —
-            # apply any display_name and return rather than a spurious 429.
+            # The row ALREADY holds the requested handle. "Set my handle to X" when it
+            # is already X is a no-op success, NOT a cooldown rejection (cage-match
+            # #118 r4, Carnot): no stamp, handle_assigned untouched; apply any
+            # display_name and return rather than a spurious 429.
             await session.refresh(user)
             if display_name is not None:
                 user.display_name = display_name

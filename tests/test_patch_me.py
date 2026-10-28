@@ -476,3 +476,28 @@ async def test_the_skip_reads_the_row_not_a_stale_user(session):
     await users_service.update_profile(
         session, user, handle="paul", cooldown_seconds=30 * 24 * 3600)
     assert await _stamp_of(session, user.id) is not None
+
+
+@pytest.mark.asyncio
+async def test_a_repeated_first_claim_of_the_same_handle_keeps_the_free_fix(session):
+    """Two devices (or a double submit) both claim `paul` from an assigned account.
+    The second request holds the snapshot from before the first landed: the auto
+    username and handle_assigned True. It must be a no-op, not a stamp: otherwise
+    it spends the free correction while changing nothing (cage-match #438, Carnot +
+    Tesla). The UPDATE's `username != :handle` makes the row decide."""
+    from sqlalchemy.orm.attributes import set_committed_value
+
+    cooldown = 30 * 24 * 3600
+    user = await _make_auto_user(session)
+    assigned_handle = user.username
+    await users_service.update_profile(session, user, handle="paul", cooldown_seconds=cooldown)
+    assert await _stamp_of(session, user.id) is None
+
+    set_committed_value(user, "username", assigned_handle)
+    set_committed_value(user, "handle_assigned", True)
+    await users_service.update_profile(session, user, handle="paul", cooldown_seconds=cooldown)
+    assert await _stamp_of(session, user.id) is None, "a same-handle repeat stamped"
+
+    await session.refresh(user)
+    await users_service.update_profile(session, user, handle="paul2", cooldown_seconds=cooldown)
+    assert await _stamp_of(session, user.id) is not None  # the free fix was still there
