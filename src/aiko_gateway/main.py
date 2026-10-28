@@ -340,8 +340,7 @@ from .rest import well_known as well_known_routes  # noqa: E402
 from .realtime import ws as ws_routes  # noqa: E402
 from .rest.errors import register_error_handlers  # noqa: E402
 register_error_handlers(app)  # structured ban-403 body (single door, mirrors tests)
-app.include_router(auth_routes.router)
-app.include_router(auth_routes.me_router)
+auth_routes.include_auth_routers(app)  # the one place that decides the auth surface
 app.include_router(capability_routes.router)
 app.include_router(channel_routes.router)
 app.include_router(community_routes.router)

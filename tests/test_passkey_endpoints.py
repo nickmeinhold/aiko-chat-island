@@ -388,36 +388,43 @@ async def test_creates_accounts_matches_what_register_finish_does(
 
 
 async def test_in_production_the_flag_opens_passkey_and_not_password(
-        client, monkeypatch):
+        session, monkeypatch):
     """ONE SETTING, TWO DOORS, OPPOSITE ANSWERS (Nick, 2026-10-28). Production with
-    OPEN_REGISTRATION=true lets a passkey create an account and still refuses
-    password /register, which takes any username and any password. Both requests
-    run under identical settings, so the password 403 cannot be "production
-    refuses everything": the passkey 200 beside it is the control."""
+    OPEN_REGISTRATION=true lets a passkey create an account, and does not serve
+    password /register at all: it takes any username and any password. The
+    surface is built by `include_auth_routers`, the function main.py mounts auth
+    through, so this is what production serves. Both requests run under identical
+    settings, so the password 404 cannot be "production refuses everything": the
+    passkey 200 beside it is the control."""
+    async def _override_session():
+        yield session
+
     monkeypatch.setattr(settings, "environment", "production")
     monkeypatch.setattr(settings, "passkey_enabled", True)
     monkeypatch.setattr(settings, "open_registration", True)
-    finish, _ = await _register_passkey(client)
-    assert finish.status_code == 200, finish.text
-    password = await client.post("/v1/auth/register", json={
-        "username": "admin", "display_name": "", "password": ""})
-    assert password.status_code == 403, password.text
-    assert password.json()["detail"] == "registration is closed"
+    app = FastAPI()
+    auth_routes.include_auth_routers(app)
+    app.dependency_overrides[get_session] = _override_session
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        finish, _ = await _register_passkey(c)
+        assert finish.status_code == 200, finish.text
+        password = await c.post("/v1/auth/register", json={
+            "username": "admin", "display_name": "", "password": ""})
+    assert password.status_code == 404, password.text
 
 
 def test_every_account_door_must_name_itself():
     """`door` has no default, and an unknown door raises instead of borrowing an
     answer. A new account-creating route that forgot to say which door it is
-    would otherwise inherit the passkey answer, which in production is the
-    permissive one."""
+    would otherwise inherit an answer by omission or by typo."""
     import inspect
 
-    from aiko_gateway.rest.auth import _require_may_provision_account, registration_open
+    from aiko_gateway.rest.auth import _require_may_provision_account
 
     door = inspect.signature(_require_may_provision_account).parameters["door"]
     assert door.default is inspect.Parameter.empty
     with pytest.raises(ValueError):
-        registration_open("pasword")
+        _require_may_provision_account(door="pasword")
 
 
 async def test_well_known_apple_app_site_association(client):

@@ -1,12 +1,12 @@
 """Auth endpoints: register (gated), login, refresh, me.
 
-Who may create an account is `registration_open`, per door. Passkey sign-up (the
-door the app ships) follows settings.open_registration: open in dev, closed by
-default in production, opened there by an explicit OPEN_REGISTRATION=true as the
-operator's choice. (That used to be impossible in production, "until I2
-membership lands": I2 landed 2026-06-24.) Password /register is DEV-ONLY: it
-follows the flag outside production and is closed in production whatever the
-flag says, because it takes any username and any password and no client uses it.
+Who may create an account is `registration_open`. Passkey sign-up (the door the
+app ships) follows settings.open_registration: open in dev, closed by default in
+production, opened there by an explicit OPEN_REGISTRATION=true as the operator's
+choice. (That used to be impossible in production, "until I2 membership lands":
+I2 landed 2026-06-24.) Password /register is DEV-ONLY: it lives on `dev_router`,
+which production never mounts (`include_auth_routers`), because it takes any
+username and any password and no client uses it.
 """
 from __future__ import annotations
 
@@ -40,6 +40,29 @@ from .deps import CurrentUser, DbSession
 from .errors import AccountSuspended
 
 router = APIRouter(prefix="/v1/auth", tags=["auth"])
+# DEV-ONLY: password /register. Never mounted in production (`include_auth_routers`),
+# so a production process does not serve it at all, whatever OPEN_REGISTRATION says.
+dev_router = APIRouter(prefix="/v1/auth", tags=["auth"])
+
+
+def include_auth_routers(app) -> None:
+    """Mount the auth surface this process serves. THE ONE PLACE that decides it:
+    main.py calls this and mounts no auth router itself, and the tests call it under
+    each environment to see exactly what production serves.
+
+    Password /register is mounted only outside production (Nick, 2026-10-28). It
+    accepts any username (`nick`, `admin`) and any password, empty included, and no
+    client uses it; only dev spikes and tests do. Until 2026-10-28 production refused
+    to boot with OPEN_REGISTRATION on, which kept this door shut there by accident.
+    Retiring that refusal so passkey sign-up could open would have opened this door
+    too, because both read one flag. Refusing it per request inside the shared
+    predicate was the first fix; a cage-match (Carnot + Tesla, independently) called
+    that a second guard on one invariant, one "make the flag mean the same on every
+    door" cleanup away from exposure. Not serving the route removes the producer."""
+    app.include_router(router)
+    app.include_router(me_router)
+    if not settings.is_production:
+        app.include_router(dev_router)
 
 log = logging.getLogger(__name__)
 
@@ -143,7 +166,7 @@ def _deny_if_banned(user: User) -> None:
         raise AccountSuspended()
 
 
-@router.post("/register", dependencies=[rate_limit("account")])
+@dev_router.post("/register", dependencies=[rate_limit("account")])
 async def register(req: RegisterReq, session: DbSession) -> dict:
     _require_may_provision_account(door="password")
     try:
@@ -448,7 +471,8 @@ def _require_may_provision_account(*, door: Literal["password", "passkey", "soci
     NOT AN OVERSIGHT — which is why this is a predicate with a parameter rather
     than one flag for everything. The two flags are independent operator
     choices: `open_registration` (closed by default in production) gates the
-    passkey door and the dev-only password door (see `registration_open`), and
+    passkey door and the dev-only password door (not served in production, see
+    `include_auth_routers`), and
     `social_signin_enabled` gates social provisioning (Nick, 2026-06-27).
 
     So collapsing both onto `open_registration`, which is what the panel
@@ -477,10 +501,14 @@ def _require_may_provision_account(*, door: Literal["password", "passkey", "soci
             raise HTTPException(
                 status.HTTP_403_FORBIDDEN, "social sign-in is disabled")
         return
-    _require_open_registration_flag(door)
+    if door in ("password", "passkey"):
+        _require_open_registration_flag()
+        return
+    # An unknown door raises rather than borrowing either answer.
+    raise ValueError(f"unknown account door: {door!r}")
 
 
-def _require_open_registration_flag(door: Literal["password", "passkey"]) -> None:
+def _require_open_registration_flag() -> None:
     """Refuse an account-CREATING request on an island with registration closed.
 
     ONE PREDICATE, TWO CALL SITES, and that is the whole point. `/v1/auth/register`
@@ -499,27 +527,17 @@ def _require_open_registration_flag(door: Literal["password", "passkey"]) -> Non
     keys and never no sign-in — conflating them would lock out the very users the
     island is for.
     """
-    if not registration_open(door):
+    if not registration_open():
         raise HTTPException(status.HTTP_403_FORBIDDEN, "registration is closed")
 
 
-def registration_open(door: Literal["password", "passkey"]) -> bool:
-    """May this door create a NEW account right now? The one predicate behind both
-    the refusal above and `/providers`' `creates_accounts`, so what the island
-    advertises can't drift from what it enforces.
-
-    PASSWORD IS CLOSED IN PRODUCTION WHATEVER `open_registration` SAYS (Nick,
-    2026-10-28). Until that day production refused to boot with the flag on, so
-    both doors were shut there. Lifting the refusal to let passkey sign-up open
-    would have opened this door too, which checks nothing: any username (`nick`,
-    `admin`), any password, empty included. No client uses it; only dev spikes do.
-    So the flag opens the passkey door in production, and password stays a dev
-    door. An unknown door raises rather than defaulting to either answer."""
-    if door == "passkey":
-        return bool(settings.open_registration)
-    if door == "password":
-        return bool(settings.open_registration) and not settings.is_production
-    raise ValueError(f"unknown account door: {door!r}")
+def registration_open() -> bool:
+    """May the password and passkey doors create a NEW account right now? The one
+    predicate behind both the refusal above and `/providers`' `creates_accounts`,
+    so what the island advertises can't drift from what it enforces. It has no
+    production branch: in production the password door is not served at all
+    (`include_auth_routers`), so this answers for the passkey door there."""
+    return bool(settings.open_registration)
 
 
 @router.post("/passkey/register/start", dependencies=[rate_limit("passkey")])
@@ -1065,7 +1083,7 @@ async def list_providers() -> dict:
         # Sign-in and add-a-device work either way. Additive: older apps ignore it.
         providers.append(
             {"slug": "passkey", "display_name": "Passkey", "kind": "passkey",
-             "creates_accounts": registration_open("passkey")})
+             "creates_accounts": registration_open()})
     if settings.social_signin_enabled:
         if settings.apple_client_ids:
             providers.append(

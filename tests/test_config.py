@@ -9,9 +9,11 @@ Invariants (all prod-only unless noted):
      IDs or a fully-configured broker); an empty allowlist would reject-all.
   4. An OAuth broker provider is both-or-neither: a half (id XOR secret) config
      refuses boot rather than failing opaquely mid-login.
-  5. At least one viable NEW-USER ingress (passkey ∨ social) must exist in prod —
+  5. At least one ENABLED sign-in ingress (passkey ∨ social) must exist in prod —
      otherwise the island can log in existing accounts but can never onboard
-     anyone (a locked, un-joinable deployment). #1927/#49.
+     anyone (a locked, un-joinable deployment). #1927/#49. Enabled is necessary,
+     not sufficient: passkey on with registration closed and social off is also
+     un-joinable, and is a boot WARNING rather than a refusal (2026-10-28).
   6. If passkey is enabled in prod, passkey_rp_id gets a BEST-EFFORT sanity check
      against the configured host (must be multi-label AND equal/registrable-parent
      per the WebAuthn rp_id rule). This catches an obviously-wrong rp_id but cannot
@@ -376,7 +378,7 @@ def test_prod_no_ingress_raises():
 
 def test_prod_open_registration_alone_is_not_an_ingress():
     """In production the flag opens the passkey door and nothing else (password
-    /register stays closed there), so with passkey and social both off it opens
+    /register is not served there), so with passkey and social both off it opens
     nothing, and the locked-island guard must still refuse. Built on the full
     prod baseline so the only thing missing is an ingress."""
     with pytest.raises(ValidationError, match="no viable sign-in ingress"):
@@ -385,7 +387,9 @@ def test_prod_open_registration_alone_is_not_an_ingress():
 
 
 def test_prod_passkey_only_boots():
-    # Passkey alone is a complete ingress (registration creates the account).
+    # Passkey alone is a valid ingress to BOOT on. It is not proof anyone can join:
+    # with registration closed and social off this boots with the nobody-can-join
+    # warning (see test_prod_warns_when_nobody_can_join).
     s = Settings(_env_file=None, environment="production", jwt_secret=_STRONG_SECRET,
                  passkey_enabled=True, social_signin_enabled=False, **_PROD_MOD)
     assert s.passkey_enabled is True

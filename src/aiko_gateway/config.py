@@ -1008,9 +1008,9 @@ class Settings(BaseSettings):
             # (a real user hit it 2026-10-28). A self-registered account now sees
             # what any signed-in user is meant to see: public channels, and the
             # private ones it is a member of (acl). In production the flag opens the
-            # PASSKEY door only: password /register stays closed there whatever it
-            # says (it takes any username and password, and no client uses it; see
-            # rest/auth.py `registration_open`).
+            # PASSKEY door only: production does not serve password /register at
+            # all (it takes any username and password, and no client uses it; see
+            # rest/auth.py `include_auth_routers`).
             # Social sign-in IS permitted in prod, but
             # enabling it with NO client-ID allowlist is a guaranteed-broken
             # config: the verifier would reject every token (empty aud allowlist
@@ -1078,8 +1078,8 @@ class Settings(BaseSettings):
             # enabled-check is itself complete and is the real value here.
             # open_registration became a legal prod setting on 2026-10-28; it does
             # NOT extend this predicate, because it is not an ingress of its own: in
-            # production it opens only the passkey door (password /register stays
-            # closed there). What it changes is whether passkey can ONBOARD, and
+            # production it opens only the passkey door (password /register is not
+            # served there). What it changes is whether passkey can ONBOARD, and
             # that is the "nobody can join" warning below.
             #
             # Passkey RP-ID SANITY (prod) — a BEST-EFFORT lint, NOT a guarantee the
@@ -1218,8 +1218,11 @@ class Settings(BaseSettings):
         # ingress, and passkey sign-up needs open_registration, so with
         # registration closed and social off no new account can be created at
         # all. Legal (a closed island is an operator's choice), but it must be
-        # audible: on 2026-10-28 it was true of both islands and nothing said so,
-        # and a real user met it as "We couldn't verify that passkey".
+        # audible: on 2026-10-28 it was true of enspyr and nothing said so, and a
+        # real user met it as "We couldn't verify that passkey". It does NOT see
+        # what the CLIENT can do: imagineering was just as unjoinable from the app
+        # (no social button), but its host still pinned SOCIAL_SIGNIN_ENABLED=true,
+        # so this condition was false there and the warning stayed quiet.
         if (self.is_production and self.passkey_enabled
                 and self.open_registration is False
                 and not self.social_signin_enabled):
@@ -1230,12 +1233,14 @@ class Settings(BaseSettings):
                 "add devices. To let new users join, set OPEN_REGISTRATION=true."
             )
         #
-        # PLACED HERE, AFTER THE DEFAULT IS RESOLVED, AND THAT IS LOAD-BEARING.
-        # An earlier revision put this inside the production branch above, where
-        # `open_registration` is still None — so `is False` was never true and the
-        # warning could not fire. Caught by its own test, which is the only reason
-        # it is not a warning that ships silently disabled: the exact class it was
-        # added to prevent.
+        # BOTH WARNINGS ABOVE ARE PLACED HERE, AFTER THE DEFAULT IS RESOLVED, AND
+        # THAT IS LOAD-BEARING: each tests `open_registration is False`, which is
+        # never true inside the production branch above, where the value is still
+        # None. An earlier revision put the SOCIAL warning there and it could not
+        # fire; its own test caught it, which is the only reason it did not ship
+        # silently disabled, the exact class it was added to prevent. The
+        # nobody-can-join warning has the same dependency and its own test
+        # (`test_prod_warns_when_nobody_can_join`). Move neither above this point.
 
         return self
 
