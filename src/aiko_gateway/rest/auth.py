@@ -96,8 +96,10 @@ class MeView(BaseModel):
     display_name: str
     aiko_username: str
     is_moderator: bool
-    # True while the account still carries the handle register/finish assigned (never
-    # changed, `aiko-<12 hex>`). The app asks for a handle before chat while it is.
+    # True while the account still carries the handle register/finish assigned. Stored
+    # (users.handle_assigned, migration 0030), NOT read off the handle's spelling: a
+    # person may choose an aiko-shaped handle and reads false. The app asks for a
+    # handle before chat while it is true.
     handle_auto: bool
 
 
@@ -574,10 +576,12 @@ _REGISTER_START_BODY = {"requestBody": {"required": False, "content": {"applicat
         "type": "string",
         "description": "Label for the passkey in the phone's password manager (the "
                        "handle being chosen, or the signed-in user's handle when adding "
-                       "a device). Cosmetic; grants nothing. Obeys the handle's "
-                       "character rules; anything a handle couldn't be, a non-string, "
-                       "or an absent or malformed body means a random label, never an "
-                       "error. Cut to 64 UTF-8 bytes on a character boundary."}}}}}}}
+                       "a device). Cosmetic; grants nothing. Sent through as given "
+                       "(trimmed), never rewritten; control, lone-surrogate and line-"
+                       "separator characters, nothing visible, a non-string, or an "
+                       "absent or malformed body mean a random label, never an error. "
+                       "Cut to 64 UTF-8 bytes on a character boundary. This is not a "
+                       "handle rule: a handle is validated by PATCH /v1/me."}}}}}}}
 
 
 @router.post("/passkey/register/start", dependencies=[rate_limit("passkey")],

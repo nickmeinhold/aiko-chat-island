@@ -1,11 +1,13 @@
 """No Python source here carries a LITERAL invisible character.
 
 A bidi override, zero-width space, RLM or ZWJ typed straight into a source file is
-invisible to the person reading it: a test input that looks like `"zero width"`, a
-`rstrip("")` that strips something, a docstring with a hole in it. Spell them as escapes
-(`"\\u200d"`), which say what they are. Found 2026-10-28 while building #435: three
-introduced by an editor that turned escapes into characters, two older. Five instances
-is a class, so this is a check, not a reminder.
+invisible to the person reading it. A test string with a zero-width space between two
+words reads as one with a plain space or none; an rstrip() of a ZWJ reads as an rstrip()
+of the empty string. Spell them as escapes (backslash-u-200d), which say what they are.
+(This docstring describes those cases in words on purpose: it is scanned too.)
+Found 2026-10-28 while building #435: three introduced by an editor that turned escapes
+into characters, two older. Five instances is a class, so this is a check, not a
+reminder.
 """
 from __future__ import annotations
 

@@ -175,6 +175,9 @@ LabelStatus = Literal["given", "absent", "malformed", "rejected"]
 # exist is decided where handles are set, and the label is only ever the handle the
 # caller is about to choose, or random.
 _LABEL_REFUSED_CATEGORIES = frozenset({"Cc", "Cs", "Zl", "Zp"})
+# Categories that put nothing on screen by themselves. A label must show at least one
+# character outside them, at any length: a name of only joiners is not a name.
+_LABEL_INVISIBLE_CATEGORIES = frozenset({"Cf", "Mn", "Me", "Zs"})
 
 
 def passkey_label(raw: object) -> tuple[str | None, LabelStatus]:
@@ -182,9 +185,10 @@ def passkey_label(raw: object) -> tuple[str | None, LabelStatus]:
 
     Refused, NOT rewritten: a label is what the caller sent (trimmed, as handles are)
     or the random default, never a third string with characters taken out. The one
-    edit is the 64-byte cut, which keeps whole characters and leaves no dangling ZWJ.
-    If the cut leaves nothing, that is refused too, so "given" always means the
-    ceremony carries the caller's text. Non-string, blank, refused or emptied by the cut
+    edit is the 64-byte cut, which keeps whole characters and never ENDS on a joiner it
+    created (a ZWJ the caller sent at the end is theirs). A label must show at least
+    one visible character, checked last, so a name of only joiners is refused at any
+    length and "given" always means the ceremony carries visible text from the caller. Non-string, blank, refused or emptied by the cut
     all answer None and the random label is used: the label is cosmetic, and this
     ceremony is also add-a-device's start, so a bad label must never fail it. The
     status lets the route log why there was no label without logging the label."""
@@ -200,8 +204,8 @@ def passkey_label(raw: object) -> tuple[str | None, LabelStatus]:
         # Longest whole-code-point prefix that fits, without a dangling joiner.
         text = encoded[:_PASSKEY_LABEL_MAX_BYTES].decode("utf-8", errors="ignore")
         text = text.rstrip("\u200d")
-        if not text.strip():
-            return None, "rejected"
+    if all(unicodedata.category(ch) in _LABEL_INVISIBLE_CATEGORIES for ch in text):
+        return None, "rejected"
     return text, "given"
 
 

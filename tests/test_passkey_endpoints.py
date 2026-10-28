@@ -785,12 +785,13 @@ async def test_register_start_labels_the_passkey_with_the_given_name(client):
     {"json": {"name": "pa\u0007ul"}},                     # control character
     {"json": {"name": "pa\u2028ul"}},                     # line separator
     {"json": {"name": "\u200d" * 21 + "\u00e9"}},          # the 64-byte cut leaves nothing
+    {"json": {"name": "\u200d" * 21}},                    # 63 bytes, no cut, nothing visible
     {"content": b'{"name": "\\ud800"}', "headers": {"content-type": "application/json"}},
     {"content": b"[" * 60000, "headers": {"content-type": "application/json"}},
     {"content": b"{not json", "headers": {"content-type": "application/json"}},
     {"content": b"\xff\xfe", "headers": {"content-type": "application/json"}},
 ], ids=["absent", "empty-object", "empty", "blank", "non-string", "non-object",
-        "control", "line-separator", "emptied-by-cut", "lone-surrogate",
+        "control", "line-separator", "emptied-by-cut", "only-joiners", "lone-surrogate",
         "deeply-nested", "malformed", "not-utf8"])
 async def test_register_start_falls_back_to_a_random_label_never_an_error(client, kwargs):
     """register/start is ALSO add-a-device's start, so a cosmetic field must never
