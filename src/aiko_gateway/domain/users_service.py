@@ -372,20 +372,17 @@ async def update_profile(
     with no second step there is no in between. The statement matches on the id
     alone and applies the cooldown inside its SET, so zero rows means only that the
     row is gone (AccountGone), and a refusal shows in the returned row itself: its
-    username is not the one requested. No outcome needs a second read."""
+    username is not the one requested. No outcome needs a second read, and one commit
+    follows the statement whatever it decided: nothing it writes needs undoing."""
     if handle is None and display_name is None:
         raise ValueError("update_profile requires handle and/or display_name")
     now = now or dt.datetime.now(dt.timezone.utc)
-    # Captured up front: a rollback expires the instance, and reading user.id after
-    # one would lazy-load outside the async context (MissingGreenlet).
-    uid = user.id
 
     if handle is None:
         # display_name-only: no cooldown, no handle columns. Still one statement with
         # RETURNING, so a deleted row is a named refusal (AccountGone) rather than the
         # ORM failing to flush or refresh it, a 500.
         values: dict = {"display_name": display_name}
-        gate = User.id == uid
     else:
         cutoff = now - dt.timedelta(seconds=cooldown_seconds)
         # THE ROW DECIDES whether this is a change. Every SET expression here reads the
@@ -428,14 +425,15 @@ async def update_profile(
                 else_=User.handle_assigned),
         }
         if display_name is not None:
-            # All-or-nothing with the handle, by the ROLLBACK, not by a CASE: a refused
-            # change rolls the whole statement back below, so the name never lands
-            # without its handle. (A CASE here would be a second guard on that, and a
-            # mutant removing it survived the suite, #443 r2.)
-            values["display_name"] = display_name
-        gate = User.id == uid
+            # All-or-nothing with the handle, decided IN the statement: the name lands
+            # with a change or a same-handle no-op, never with a refused change. There
+            # is no rollback behind it to lean on (Carnot, #443 r2: a write that only a
+            # rollback undoes is a barrier someone deletes as redundant teardown).
+            values["display_name"] = case(
+                (or_(same, change), literal(display_name, cols.display_name.type)),
+                else_=User.display_name)
     stmt = (
-        update(User).where(gate).values(**values)
+        update(User).where(User.id == user.id).values(**values)
         .returning(*_PROFILE_COLUMNS)
         # synchronize_session=False: the CASEs must be evaluated by the DB against the
         # row as it is (the whole point of folding the rule into the write), never
@@ -449,16 +447,19 @@ async def update_profile(
         if _is_handle_conflict(e):
             raise HandleTaken() from e
         raise  # a non-handle constraint is NOT a taken handle — don't mislabel it
+    # ONE COMMIT, WHATEVER THE OUTCOME. Every column was decided inside the statement, so
+    # a refused change wrote back exactly what was there and a vanished row wrote nothing:
+    # no provisional write exists for a rollback to undo, and the teardown does not depend
+    # on how the outcome is classified below (Carnot, #443 r2).
+    await session.commit()
     if row is None:
-        # The gate is the id alone, so zero rows has one meaning: the row is gone, a
-        # deletion (its own, from another device) committed before this statement.
-        await session.rollback()
+        # The statement matches on the id alone, so zero rows has one meaning: the row is
+        # gone, a deletion (its own, from another device) committed before this statement.
         raise AccountGone()
     if handle is not None and row.username != handle:
         # REFUSED BY THE COOLDOWN: the statement left the row as it was, so the returned
         # stamp is the one that refused it, read by the same statement that applied the
-        # rule, never a NULL (a NULL stamp is `change`). Nothing to keep: roll back.
-        await session.rollback()
+        # rule, never a NULL (a NULL stamp is `change`).
         last = row.handle_changed_at
         if last.tzinfo is None:
             last = last.replace(tzinfo=dt.timezone.utc)
@@ -469,7 +470,6 @@ async def update_profile(
         elapsed = (dt.datetime.now(dt.timezone.utc) - last).total_seconds()
         raise HandleChangeCooldown(
             max(1, min(cooldown_seconds, math.ceil(cooldown_seconds - elapsed))))
-    await session.commit()
     # The RETURNED values ARE the outcome: put them on the instance as committed
     # state, after the commit so an expire_on_commit session can't discard them. No
     # refresh: re-reading the row after the commit is the window a concurrent

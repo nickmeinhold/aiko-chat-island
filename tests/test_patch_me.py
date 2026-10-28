@@ -199,7 +199,7 @@ async def test_combined_body_is_atomic_under_cooldown(client, session):
     """A combined {handle, display_name} body is all-or-nothing: if the handle change
     is refused by the cooldown, the display_name edit is NOT applied either."""
     user = await _make_user(session, username="alice", display_name="Alice")
-    hdr = _auth(user)  # capture once — a 429 rollback expires `user` in the shared
+    hdr = _auth(user)  # capture once — a refusal used to roll back and expire `user` in the shared
     # test session, so re-reading user.id afterwards (as _auth does) would lazy-load.
     r1 = await client.patch("/v1/me", json={"handle": "alice2"}, headers=hdr)
     assert r1.status_code == 200
@@ -439,12 +439,15 @@ async def test_success_never_reads_the_row_after_its_commit(session, monkeypatch
     pytest.param("deleted", {"handle": "alice2"}, users_service.AccountGone, id="gone"),
 ])
 @pytest.mark.asyncio
-async def test_every_outcome_is_one_statement(session, monkeypatch, setup, change, outcome):
+async def test_every_outcome_is_one_statement(session, setup, change, outcome):
     """The title of #439, made checkable: each outcome is decided by ONE statement and
     nothing reads the row a second time. A refused change used to cost a second read to
     tell it from a vanished row, and that read was only as good as the lock it ran under
-    (Tesla, #443 r1). Counted at the session: exactly one execute, whatever the outcome."""
+    (Tesla, #443 r1). Counted at the ENGINE, where every SQL statement passes: a
+    session-level count missed `refresh()`, which loads through the sync session and
+    never calls `AsyncSession.execute` (Maxwell, #443 r2)."""
     from sqlalchemy import delete as _delete
+    from sqlalchemy import event
     from sqlalchemy import update as _update
 
     from aiko_gateway.domain.models import User
@@ -457,20 +460,23 @@ async def test_every_outcome_is_one_statement(session, monkeypatch, setup, chang
     elif setup == "deleted":
         await session.execute(_delete(User).where(User.id == user.id))
         await session.commit()
-    real_execute, calls = session.execute, []
+    engine, calls = session.bind.sync_engine, []
 
-    async def counting_execute(*args, **kwargs):
-        calls.append(args[0])
-        return await real_execute(*args, **kwargs)
+    def count(conn, cursor, statement, *_):
+        calls.append(statement)
 
-    monkeypatch.setattr(session, "execute", counting_execute)
-    if outcome is None:
-        await users_service.update_profile(session, user, cooldown_seconds=30 * 24 * 3600, **change)
-    else:
-        with pytest.raises(outcome):
+    event.listen(engine, "before_cursor_execute", count)
+    try:
+        if outcome is None:
             await users_service.update_profile(
                 session, user, cooldown_seconds=30 * 24 * 3600, **change)
-    assert len(calls) == 1, f"{len(calls)} statements: {[str(c)[:40] for c in calls]}"
+        else:
+            with pytest.raises(outcome):
+                await users_service.update_profile(
+                    session, user, cooldown_seconds=30 * 24 * 3600, **change)
+    finally:
+        event.remove(engine, "before_cursor_execute", count)
+    assert len(calls) == 1, f"{len(calls)} statements: {[s[:40] for s in calls]}"
 
 
 @pytest.mark.asyncio
