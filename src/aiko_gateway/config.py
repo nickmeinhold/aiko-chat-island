@@ -380,9 +380,11 @@ class Settings(BaseSettings):
     # --- social sign-in (#13: Apple + Google native ID-token flow) ---
     # Explicit on/off, default False, LOUD in prod (mirror open_registration's
     # explicit-default posture). Enabled in production by Nick's decision
-    # 2026-06-27, while #36 (I2 membership) was still unenforced; I2 landed the
-    # next day (f0fb48a), so that risk is gone. Like open_registration, it is an
-    # operator's choice of who may create an account.
+    # 2026-06-27, whose comment accepted the I2 risk (#36) as live. It was not:
+    # I2 had landed three days earlier (f0fb48a, 2026-06-24). Like
+    # open_registration, it is an operator's choice of who may create an account.
+    # Social sign-in has since been retired (Design 04); imagineering's host .env
+    # still pinned it on as of 2026-10-28.
     social_signin_enabled: bool = False
     # Replay defense (#13). This flag is the SINGLE SWITCH for option-a (the
     # server-ISSUED single-use nonce). When True, /v1/auth/social (a) REFUSES a
