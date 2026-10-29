@@ -16,7 +16,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..aiko.payload import InboundMessage
 from . import (acl, call_hold, channels_service, dm_service, moderation_service,
                reactions_service, signing_keys_service)
-from .ids import new_ulid
+from . import ids
+from .ids import next_axis_ulid
 from .models import Channel, ChannelKind, Message, Retraction, SenderKind, User
 
 
@@ -175,7 +176,7 @@ async def create_outbound(
             session, user_id=user.id,
             pubkey=origin["sender_pubkey"], key_version=origin["key_version"])
     row = Message(
-        id=new_ulid(),
+        id=next_axis_ulid(),
         channel_id=channel.id,
         sender_user_id=user.id,
         # The sender's OWN kind, never a hardcoded "human" (#3096). This is the
@@ -312,7 +313,7 @@ async def persist_inbound(session: AsyncSession, msg: InboundMessage) -> Message
         if msg.timestamp else dt.datetime.now(dt.timezone.utc)
     )
     row = Message(
-        id=new_ulid(),
+        id=next_axis_ulid(),
         channel_id=channel.id,
         sender_user_id=sender_user.id if sender_user else None,
         sender_kind=_kind_for(channel, sender_user),
@@ -633,8 +634,8 @@ async def message_views(session: AsyncSession, msgs: list[Message],
 
 async def subscribe_view(
     session: AsyncSession, channel_ids: list[str], viewer_id: str
-) -> dict[str, tuple[str, list[Message]]]:
-    """{channel_id: (fence, messages to replay live)} for a subscribe.
+) -> dict[str, tuple[str, list[Message | Retraction]]]:
+    """{channel_id: (fence, items to replay live)} for a subscribe.
 
     WITHOUT A HELD INVITE the fence is `latest_ulids`' value and nothing is replayed,
     exactly as before.
@@ -655,12 +656,15 @@ async def subscribe_view(
     THE CAP HIDES WHAT IS ABOVE IT, SO THAT IS REPLAYED, ALL OF IT. The client treats
     everything above the fence as live, so a device that missed L while offline would
     not page it either; in first contact the cap is "" and nothing is paged at all.
-    Every visible MESSAGE above the cap (L, never a held I) is returned for the route
-    to send as ordinary live frames, drained to the end rather than counted (Tesla,
-    #445 r1: a fixed count let a stranger push the tail past it). The hold window
-    bounds it. The app inserts a live frame by id whatever the fence says and dedups
-    on the id (app tab, 2026-10-29). Retractions are not replayed: they reach the
-    client on its next history walk, and a live one only removes.
+    Everything history would serve above the cap (L and any retraction, never a held
+    I) is returned for the route to send as ordinary live frames, drained to the end
+    rather than counted (Tesla, #445 r1: a fixed count let a stranger push the tail
+    past it). The hold window bounds it. RETRACTIONS INCLUDED (Carnot + Noether, #445
+    r2): a takedown above the cap is otherwise on no door until the next reconnect,
+    and the deleted text stays on the device. A live retraction frame never moves the
+    client's watermark (app tab, read from its code 2026-10-29), so replaying one
+    cannot walk it past the invite. The app inserts a live frame by id whatever the
+    fence says and dedups on the id.
 
     The cap is a row this viewer can see (or ""), so the pager's `cursor >= fence`
     end condition stays reachable. Only the subscribe fence is capped: the
@@ -689,22 +693,30 @@ async def subscribe_view(
                      for cid, (_, held) in per_channel.items())))
         .group_by(Retraction.channel_id)
     )).all()) if per_channel else {}
-    view: dict[str, tuple[str, list[Message]]] = {}
+    view: dict[str, tuple[str, list[Message | Retraction]]] = {}
     for cid in channel_ids:
         fence, held = per_channel.get(cid, ("", None))
         fence = max(fence, ret_fence.get(cid) or "")
-        replay: list[Message] = []
+        replay: list[Message | Retraction] = []
         if held is not None:
+            # The same stream history serves, through `get_history` itself, so the
+            # replay cannot filter differently from the walk it stands in for.
             cursor = fence
             while True:
-                page = list((await session.execute(
-                    select(Message).where(
-                        Message.channel_id == cid, Message.id > cursor,
-                        Message.deleted_at.is_(None), _visible(viewer_id, at_ms=at))
-                    .order_by(Message.id).limit(_DRAIN_PAGE))).scalars())
+                page = await get_history(session, cid, viewer_id, after=cursor,
+                                         limit=_DRAIN_PAGE, at_ms=at)
                 replay.extend(page)
                 if len(page) < _DRAIN_PAGE:
                     break
                 cursor = page[-1].id
         view[cid] = (fence, replay)
     return view
+
+
+async def seed_message_axis(session: AsyncSession) -> None:
+    """Start the monotonic message axis (`ids.next_axis_ulid`) above the newest stored
+    message or retraction id, so a wall clock that stepped back across a restart cannot
+    mint a reply that sorts before an invite it followed (design 21)."""
+    newest_msg = await session.scalar(select(func.max(Message.id)))
+    newest_ret = await session.scalar(select(func.max(Retraction.id)))
+    ids.seed_axis(max(newest_msg or "", newest_ret or ""))

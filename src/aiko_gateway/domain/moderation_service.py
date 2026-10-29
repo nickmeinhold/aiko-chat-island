@@ -36,7 +36,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import settings
 from . import acl
-from .ids import new_ulid
+from .ids import new_ulid, next_axis_ulid
 from .models import (
     Message, MessageReport, ReportReason, ReportResolution, Retraction, User,
     UserBlock)
@@ -447,11 +447,13 @@ async def take_down_message(
     retraction: Retraction | None = None
     if existing is None:
         # Mint the id explicitly so the forward-ordering invariant is EXECUTABLE
-        # (cage-match Carnot + Wu). new_ulid() is time-forward across MILLISECONDS, but
-        # intra-millisecond ordering is the random tail, so the guard is load-bearing,
-        # not decorative. Fail closed rather than emit a retraction the forward cursor
-        # would never carry. Checked HERE, before any mutation.
-        rid = new_ulid()
+        # (cage-match Carnot + Wu). Minted on the monotonic message axis (`ids.
+        # next_axis_ulid`, design 21), which makes `rid > message.id` true by
+        # construction for a message minted in this process; the guard stays for a
+        # target minted by an earlier process (`seed_axis` covers that at boot) and
+        # fails closed rather than emit a retraction the forward cursor would never
+        # carry. Checked HERE, before any mutation.
+        rid = next_axis_ulid()
         if rid <= message.id:
             raise RetractionOrderingError(
                 f"retraction id {rid} not > target {message.id} — ULID axis regressed")

@@ -230,6 +230,10 @@ async def lifespan(app: FastAPI):
         from .domain import push_service as _push  # lazy: see the aclose() note
         async with SessionLocal() as _session:
             await _push.warn_if_unreachable(_session)
+            # The message axis must start above what is stored (design 21: id order is
+            # conduct order, and a clock that stepped back across this restart would
+            # otherwise mint below it).
+            await messages_service.seed_message_axis(_session)
         # No independent seeding: channels are reconciled from the ChatServer
         # `channel_list` EC share once the bus client discovers it. An inbound
         # message for a not-yet-reconciled channel is upserted by persist_inbound

@@ -351,7 +351,7 @@ async def test_without_a_hold_the_subscribe_is_unchanged(session, dm, clock):
 
 # ------------------------- one statement classifies its rows ------------------------ #
 
-def _commit_invite_before_statement(session, dm, n: int):
+def _commit_invite_before_statement(session, dm, n: int) -> dict:
     """Make the session commit a stranger's invite just before its n-th statement.
 
     Carnot, cage-match #445 round 1: the hold was computed by one SELECT and applied by
@@ -367,27 +367,33 @@ def _commit_invite_before_statement(session, dm, n: int):
     async def execute(*args, **kwargs):
         calls["n"] += 1
         if calls["n"] == n:
+            calls["fired"] = True
             await _post(session, dm, dm.alice, INVITE, T0)
         return await real(*args, **kwargs)
 
     session.execute = execute
+    return calls
 
 
-@pytest.mark.parametrize("n", [2, 3])
+# Both reads run exactly two statements (messages, then retractions), so the commit
+# lands before the second. Round 2 found an n=3 arm here that never fired and so passed
+# against anything (Noether); every arm now asserts its injection happened.
+
 async def test_history_never_serves_an_invite_committed_between_its_statements(
-        session, dm, clock, n):
-    _commit_invite_before_statement(session, dm, n)
+        session, dm, clock):
+    calls = _commit_invite_before_statement(session, dm, 2)
     rows = await messages_service.get_history(session, dm.channel.id, dm.bob.id, limit=50)
+    assert calls.get("fired"), "the injection never ran, so this proved nothing"
     assert [r.body for r in rows if isinstance(r, Message)] == [], (
         "a stranger's fresh invite reached history: the hold was decided by a different "
         "statement from the one that returned the row")
 
 
-@pytest.mark.parametrize("n", [2, 3])
 async def test_the_fence_never_counts_an_invite_committed_between_its_statements(
-        session, dm, clock, n):
-    _commit_invite_before_statement(session, dm, n)
+        session, dm, clock):
+    calls = _commit_invite_before_statement(session, dm, 2)
     fence = await messages_service.latest_ulid(session, dm.channel.id, dm.bob.id)
+    assert calls.get("fired"), "the injection never ran, so this proved nothing"
     assert fence == "", f"the fence counted a held invite: {fence!r}"
 
 
@@ -413,11 +419,31 @@ async def test_the_glob_is_the_parser(session, body):
 
 def test_the_clock_never_runs_backwards(monkeypatch):
     """An NTP step back must not re-hold a released invite (Tesla, #445 r1)."""
+    from aiko_gateway.domain import ids
     wall = iter([2_000_000.0, 1_000_000.0, 3_000_000.0])
-    monkeypatch.setattr(call_hold.time, "time", lambda: next(wall))
-    monkeypatch.setattr(call_hold, "_high_water_ms", 0)
+    monkeypatch.setattr(ids.time, "time", lambda: next(wall))
+    monkeypatch.setattr(ids, "_axis_clock_ms", 0)
     readings = [call_hold.now_ms() for _ in range(3)]
     assert readings == [2_000_000_000, 2_000_000_000, 3_000_000_000]
+
+
+async def test_a_clock_step_back_cannot_release_a_fresh_invite(session, dm, monkeypatch):
+    """Tesla, #445 r2: the hold read a monotonic clock while ids were stamped from raw
+    wall time, so after a step back of more than two minutes a just-sent stranger's
+    invite was classified released and rang. Through the real mutator, wall clock ten
+    minutes behind the high-water mark: it must still be held."""
+    from aiko_gateway.domain import ids
+    high = call_hold.now_ms()
+    # ALL of the axis's process state is pinned: a recent id left in `_axis_last` by an
+    # earlier test makes the monotonic branch mint at the high-water mark anyway, and
+    # this test then passes against ids stamped from raw wall time (found by mutation).
+    monkeypatch.setattr(ids, "_axis_last", (0, 0))
+    monkeypatch.setattr(ids, "_axis_clock_ms", high)
+    monkeypatch.setattr(ids.time, "time", lambda: (high - 600_000) / 1000)
+    invite, _ = await messages_service.create_outbound(
+        session, user=dm.alice, channel=dm.channel, body=INVITE, client_msg_id="c1")
+    assert await call_hold.held_viewers(session, invite) == {dm.bob.id}
+    assert not (await _doors(session, dm, dm.bob, invite))["history"]
 
 
 async def test_the_replay_drains_past_a_page(session, dm, clock):
@@ -468,3 +494,73 @@ def test_the_hold_outlasts_the_apps_freshness_with_the_documented_margin():
     assert call_hold.HOLD_MS >= RING_CEILING_SECONDS * 1000
     # The ingest cap must not refuse what the app would still ring.
     assert call_hold.FUTURE_CAP_MS >= APP_CALL_INVITE_SKEW_TOLERANCE_MS
+
+
+async def test_a_reaction_on_a_held_invite_does_not_reach_the_held_recipient(
+        session, dm, clock):
+    """Maxwell, #445 r2: the reaction frame's exclusion knew blocks ("can't see the
+    message") but not the hold, so a caller reacting to their own held invite told the
+    recipient a hidden row existed. The control: alice's own socket still gets it."""
+    from aiko_gateway.rest import reactions as reaction_routes
+    invite = await _post(session, dm, dm.alice, INVITE, T0)
+    hub = Hub()
+    bob = _Conn(dm.bob.id, {dm.channel.id})
+    alice = _Conn(dm.alice.id, {dm.channel.id})
+    hub.register(bob)
+    hub.register(alice)
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(
+        gw=SimpleNamespace(hub=hub))))
+    await reaction_routes._fanout(
+        request, session, channel_id=dm.channel.id, msg_id=invite.id, emoji="👋",
+        action=reaction_routes.ReactionAction.ADD, actor_id=dm.alice.id,
+        author_id=dm.alice.id, origin=None)
+    assert [f["type"] for f in alice.sent] == ["reaction"], "control: the caller's socket"
+    assert bob.sent == [], "the held recipient learned a hidden row exists"
+
+
+# ------------------------------- round-2 fixes ------------------------------- #
+
+async def test_a_takedown_above_the_cap_is_replayed(session, dm, clock):
+    """Carnot + Noether, #445 r2: a retraction above the capped fence was on no door
+    until the next reconnect, so taken-down text stayed on the device."""
+    from aiko_gateway.domain.ids import new_ulid as _mint
+    from aiko_gateway.domain.models import Retraction
+    await _post(session, dm, dm.alice, INVITE, T0)
+    later = await _post(session, dm, dm.alice, "something regrettable", T0 + 500)
+    later.deleted_at = dt.datetime.now(dt.timezone.utc)
+    session.add(Retraction(id=_mint(T0 + 900), target_msg_id=later.id,
+                           channel_id=dm.channel.id))
+    await session.commit()
+    conn = _Conn(dm.bob.id)
+    await _handle_subscribe(conn, {"type": "subscribe", "channel_ids": [dm.channel.id]},
+                            session)
+    assert [f["target_msg_id"] for f in conn.sent if f["type"] == "retraction"] == [later.id]
+    assert conn.message_ids() == [], "the taken-down message itself must not be replayed"
+
+
+def test_the_message_axis_is_strictly_increasing_under_a_stuck_or_falling_clock(monkeypatch):
+    """Carnot, #445 r2: a reply minted in the invite's millisecond, or after a clock
+    step back, must still sort AFTER it, or it counts as conduct before it."""
+    from aiko_gateway.domain import ids
+    wall = iter([5_000.0] * 3 + [4_000.0] * 2 + [6_000.0])
+    monkeypatch.setattr(ids.time, "time", lambda: next(wall))
+    monkeypatch.setattr(ids, "_axis_last", (0, 0))
+    monkeypatch.setattr(ids, "_axis_clock_ms", 0)
+    minted = [ids.next_axis_ulid() for _ in range(6)]
+    assert minted == sorted(minted) and len(set(minted)) == 6, minted
+
+
+def test_the_axis_seed_survives_a_clock_behind_the_store(monkeypatch):
+    from aiko_gateway.domain import ids
+    stored = ids.new_ulid(9_000_000)
+    monkeypatch.setattr(ids, "_axis_last", (0, 0))
+    monkeypatch.setattr(ids, "_axis_clock_ms", 0)   # else real time from earlier tests hides the seed
+    monkeypatch.setattr(ids.time, "time", lambda: 1_000.0)   # far behind the store
+    ids.seed_axis(stored)
+    assert ids.next_axis_ulid() > stored
+
+
+def test_the_cap_fails_closed_on_a_non_integer_signature():
+    with pytest.raises(call_hold.FutureDatedInvite):
+        call_hold.refuse_future_dated(channel_kind="dm", body=INVITE,
+                                      origin={"signed_at_ms": "9999999999999"}, at_ms=T0)

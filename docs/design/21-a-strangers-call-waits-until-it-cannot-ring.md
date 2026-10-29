@@ -1,11 +1,13 @@
 # Design 21: a stranger's call waits until it can't ring
 
-**Status: v3, BUILT, cage-match round 2 pending.** v1 was written 2026-10-29 before
-any code. v2 folded in the app tab's answers to the three questions v1 asked (same
+**Status: v4, BUILT, cage-match round 3 (the last under the cap) pending.** v1 was
+written 2026-10-29 before any code. v2 folded in the app tab's answers to the three questions v1 asked (same
 day, read from its main); answer 1 corrected v1's model of the residual and supplied
 the fence cap. v3 folds round 1 of the PR's cage-match (#445: 3/3 REQUEST_CHANGES, ten
 findings, eight real), most importantly that the hold is decided **inside the statement
-that reads the row** (below).
+that reads the row** (below). v4 folds round 2 (3/3 REQUEST_CHANGES, seven real): **one
+clock and one monotonic id axis** for the whole hold, the fail-open primary-key floor
+removed, retractions replayed, and the reaction frame added to the doors.
 It answers the island half of the app tab's design 25 temper (aiko_chat_app#444,
 `docs/design/25-TEMPER.md`, Disposition), which moved this fix here from the app.
 
@@ -77,21 +79,31 @@ and `kCallInviteFreshness`). Both are judged on the **recipient's** clock agains
   `signed_at_ms` is more than **F = 60 s** ahead of the island's clock gets the existing
   `bad_origin` error. That is the existing code with a new trigger, and no new wire
   vocabulary. Two reasons:
-  - Without the cap, a stranger could sign an invite a day ahead. Released early, it
-    would ring whenever the recipient's app re-read history near the signed time. Held
-    until then, it would sit outside any bounded scan.
+  - It bounds how long any hold lasts: `max(signed, receipt) + HOLD <= receipt + 2 min`.
+    Without it, a stranger could sign an invite a day ahead and hold it for a day, and
+    for that day the recipient's subscribe fence would stay capped below it, with every
+    subscribe replaying everything after it. (v2 also used it to make a primary-key
+    floor complete; v4 removed that floor, below.)
   - The refusal applies to **every** caller, friend or stranger, so it reveals nothing
     about the recipient's conduct. An honest caller whose clock is a minute fast already
     fails every ring (the app refuses it as `clockSkew`); now they get an error instead.
-- **The scan is a primary-key range.** A ULID's first 48 bits are its arrival time. So
-  with the cap in place, every invite that could still be held satisfies
-  `id > ulid_floor(now − HOLD − F)`: two minutes of rows, using the index the table
-  already has.
+  - A non-integer `signed_at_ms` is refused too (v4). `signing.validate_origin` already
+    rejects one at the WS door, but the SQL clause casts the stored value, so the two
+    readers must agree whatever writer comes next (Noether, round 2).
+- **No primary-key floor in the hold (v4).** v2 and v3 carried `id >= ulid_floor(now −
+  HOLD − F)` inside the hold clause as an index bound. It was a second answer to the
+  question the time term already answers, and it failed OPEN: whenever the two
+  disagreed, a still-ringable invite was released (Tesla, round 2). The clause now leads
+  with its cheapest terms (the GLOB first), so an ordinary message costs one string
+  match. The floor survives only as the sweeper's candidate bound, where a row it misses
+  just isn't released live (history carries it) and never rings.
 
 ## The doors
 
 Built by grepping every caller of `message_view`, `message_frame`, `get_history`,
 `latest_ulid(s)`, `last_visible_message(s)` and `visible_message`, not from memory.
+v3 adds a second grep, every `hub.fanout(` site, because a frame that NAMES a message
+is a door even when it carries no row; v2's grep missed the reaction frame.
 
 | Door | Code | Can ring the app? | What the hold does |
 |---|---|---|---|
@@ -103,6 +115,8 @@ Built by grepping every caller of `message_view`, `message_frame`, `get_history`
 | DM list preview | `rest/dm.list_dms` → `last_visible_messages` | no | shared visibility predicate |
 | Fetch by id | `rest/messages.get_message` → `visible_message` | no | 404 while held |
 | Reactions | `rest/reactions` → `visible_message` | no | 404 while held |
+| Live reaction frame | `rest/reactions._fanout` | no | held viewers excluded (v3; missed by v2's table, found in round 2: a caller reacting to their own held invite told the recipient a hidden row existed) |
+| Live retraction frame | `rest/moderation` → `hub.fanout` | no | **unfiltered, by design**: a retraction carries no content and only removes (the add/remove asymmetry) |
 | Wake (push) | `push_service.wake_for_message` | rings a **locked** phone | already gated; moves to condition 4's bound |
 | Subscribe replay | **new**: only when the fence is capped | yes (live frames) | replays the visible rows above the cap; never the held one |
 
@@ -136,10 +150,24 @@ write") holds for a read that *is* the boundary. So the hold is one SQL clause,
 The send exclusion (`held_viewers`) and the sweeper (`due_releases`) ask the same
 clause, so there is one definition of "held", not a SQL one and a Python one.
 
-**The clock never runs backwards (v3).** Expiry is an absolute instant. A backward
-step of the wall clock (an NTP correction) would re-hold a released invite, which
-would *shrink* visibility and hang a pager whose fence already names it (Tesla, round
-1). `call_hold.now_ms` is a process-wide high-water mark of wall time.
+**One clock, one monotonic axis (v3, v4).** The hold compares a row's receipt time
+(read off its id) with "now", and conduct compares two ids. So both depend on how ids
+and "now" are made.
+- `ids.axis_now_ms` is a high-water mark of wall time, and it is the hold's clock. A
+  backward wall-clock step (an NTP correction) can't re-hold a released invite, which
+  would *shrink* visibility and hang a pager whose fence already names it (Tesla, round
+  1).
+- Message and retraction ids are minted from **that same clock** by `ids.next_axis_ulid`,
+  which is strictly increasing within the process: same or earlier millisecond means
+  the last tail plus one. v3 had the hold on the high-water clock and ids on raw wall
+  time. After a step back of more than two minutes they disagreed, and a just-sent
+  stranger's invite was classified released (Tesla, round 2). And `new_ulid`'s random
+  tail let a reply minted in the invite's own millisecond sort before it and count as
+  conduct (Carnot, round 2).
+- At boot the axis is seeded above the newest stored id, so a clock that stepped back
+  across a restart can't mint below what exists.
+- Ids not on the axis (users, reports, recovery rows) keep `new_ulid`: there, an
+  incrementing tail would only make the next id guessable.
 
 ## Delivering it late (the missed call)
 
@@ -194,12 +222,14 @@ ordinary `message` frames, **all of them, drained page by page with no count lim
 (Tesla, round 1: a fixed count let a stranger push the tail past it; the hold window
 already bounds it), each carrying the reaction aggregate a history read would (the
 same `message_views` builder history uses). The app inserts a live frame by id
-whatever the fence says, and dedups on the id (app tab, answer 3). **Messages only.**
-v2 justified that by `envelopes.retraction_frame`'s claim that a retraction's id
-advances the watermark. The app tab read its code: a live retraction never moves the
-watermark, which only ever becomes the subscribe fence. So the justification was
-wrong, and that docstring is corrected. Retractions stay out because they heal on the
-next history walk and a live one only removes.
+whatever the fence says, and dedups on the id (app tab, answer 3). **Retractions too
+(v4).** v2 and v3 left them out, on `envelopes.retraction_frame`'s claim that a
+retraction's id advances the watermark. The app tab read its code: a live retraction
+never moves the watermark, which only ever becomes the subscribe fence, so that
+docstring was wrong and is corrected. Leaving them out had a cost: a takedown above the
+cap reached a reconnecting device on no door, and the deleted text stayed (Carnot and
+Noether, round 2). The drain is `get_history` itself, so it serves exactly the stream a
+walk would.
 
 **One statement decides both the fence and the cap** (v3), per channel. So the cap
 cannot be computed against a different snapshot from the fence it caps (the same

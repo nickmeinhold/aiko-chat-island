@@ -383,7 +383,7 @@ async def test_resolve_route_maps_ordering_violation_to_500(client, session, mon
     ch = await _channel(session)
     msg = await _msg(session, mid=5, channel=ch, sender=author)
     rep = await _report(session, rid=100, message=msg, reporter=author)
-    monkeypatch.setattr(moderation_service, "new_ulid", lambda: _ulid(1))  # < target(5)
+    monkeypatch.setattr(moderation_service, "next_axis_ulid", lambda: _ulid(1))  # < target(5)
 
     resp = await client.post(f"/v1/reports/{rep.id}/resolve", headers=_auth(mod))
     assert resp.status_code == 500
@@ -394,13 +394,13 @@ async def test_ordering_violation_fails_clean_with_no_partial_mutation(session, 
     must leave NO partial mutation, so a LATER commit on the same session cannot
     persist a `taken_down` resolution with no retraction (the exact un-catch-uppable
     split the PR exists to prevent). RED-proves the validate-before-mutate ordering:
-    force new_ulid() below the target, then commit and assert nothing stuck."""
+    force next_axis_ulid() below the target, then commit and assert nothing stuck."""
     mod = await _user(session, "mod")
     author = await _user(session, "author")
     ch = await _channel(session)
     msg = await _msg(session, mid=5, channel=ch, sender=author)
     rep = await _report(session, rid=100, message=msg, reporter=author)
-    monkeypatch.setattr(moderation_service, "new_ulid", lambda: _ulid(1))  # id < target(5)
+    monkeypatch.setattr(moderation_service, "next_axis_ulid", lambda: _ulid(1))  # id < target(5)
 
     with pytest.raises(moderation_service.RetractionOrderingError):
         await moderation_service.take_down_message(

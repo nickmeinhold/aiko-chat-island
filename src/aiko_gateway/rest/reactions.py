@@ -37,7 +37,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from ..domain import (
-    messages_service, moderation_service, reactions_service, signing,
+    call_hold, messages_service, moderation_service, reactions_service, signing,
 )
 from ..domain.models import Message
 from ..domain.rate_limit import rate_limit
@@ -99,6 +99,12 @@ async def _fanout(
     if author_id is not None and author_id != actor_id:
         exclude = exclude | await moderation_service.blocked_pair_user_ids(
             session, author_id)
+    # A HELD call invite is the other way a subscriber "can't see the message" (design
+    # 21): a caller reacting to their own held invite would otherwise tell the person
+    # it is held from that a hidden row exists. Maxwell, cage-match #445 r2.
+    target = await session.get(Message, msg_id)
+    if target is not None:
+        exclude = exclude | await call_hold.held_viewers(session, target)
     await gw.hub.fanout(
         channel_id,
         envelopes.reaction_frame(channel_id, msg_id, emoji, action, actor_id, origin),

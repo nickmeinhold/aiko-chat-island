@@ -17,6 +17,7 @@ from ..domain import (
     moderation_service, push_service, signing,
 )
 from . import envelopes
+from ..domain.models import Message
 from .hub import Connection
 
 log = logging.getLogger("aiko_gateway.ws")
@@ -95,15 +96,20 @@ async def _handle_subscribe(conn: Connection, frame: dict, session) -> None:
     # never points at a row history would refuse (→ reconnect-loop hang).
     view = await messages_service.subscribe_view(session, accessible, conn.user_id)
     await conn.send(envelopes.suback({cid: fence for cid, (fence, _) in view.items()}))
-    # (3) A fence capped below a held call invite (design 21) leaves visible messages
-    # above it that the pager will not fetch, so they go out live, after the suback,
-    # with the reactions a history read of them would carry. Empty unless something
-    # is held from this viewer; a duplicate of a row already delivered live is
-    # dedup'd by the client on its id. Retractions are not replayed (see
-    # `subscribe_view`): the next history walk delivers them.
+    # (3) A fence capped below a held call invite (design 21) leaves items above it
+    # that the pager will not fetch, so they go out live after the suback, in id order:
+    # messages with the reactions a history read of them would carry, and retractions
+    # (a live one never moves the client's watermark). Empty unless something is held
+    # from this viewer; a duplicate of an item already delivered is dedup'd on its id.
     for _, replay in view.values():
-        for msg_view in await messages_service.message_views(session, replay, conn.user_id):
-            await conn.send(envelopes.message_frame(msg_view))
+        msgs = [r for r in replay if isinstance(r, Message)]
+        views = {v["msg_id"]: v for v in await messages_service.message_views(
+            session, msgs, conn.user_id)}
+        for item in replay:
+            await conn.send(envelopes.message_frame(views[item.id])
+                            if isinstance(item, Message)
+                            else envelopes.retraction_frame(
+                                item.channel_id, item.id, item.target_msg_id))
 
 
 async def _handle_send(gw, conn: Connection, user, frame: dict) -> None:
