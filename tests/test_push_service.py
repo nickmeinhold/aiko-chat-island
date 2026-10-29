@@ -212,11 +212,18 @@ async def dm(session, monkeypatch):
     return alice, bob
 
 
+# The conduct gate is bounded by the invite's own id (design 21): only posts BELOW it
+# count. `_wake` describes an invite that arrived after every row a fixture wrote,
+# so its bound sorts above any ULID ('Z' is the top of the Crockford alphabet).
+AFTER_EVERY_ROW = "Z" * 26
+
+
 async def _wake(body: str = V2_INVITE, *, sender_id: str,
-                kind: str = "dm", exclude: set[str] | None = None):
+                kind: str = "dm", exclude: set[str] | None = None,
+                msg_id: str = AFTER_EVERY_ROW):
     await push_service.wake_for_message(
         channel_id=CHANNEL, channel_kind=kind, sender_id=sender_id,
-        body=body, exclude_user_ids=exclude or set())
+        body=body, msg_id=msg_id, exclude_user_ids=exclude or set())
 
 
 # --------------------------------------------------------------------------
@@ -1359,7 +1366,7 @@ def test_schedule_wake_never_raises_without_a_loop(configured):
     context, which is exactly the no-running-loop case."""
     push_service.schedule_wake(
         channel_id=CHANNEL, channel_kind="dm",
-        body=V2_INVITE,
+        body=V2_INVITE, msg_id=AFTER_EVERY_ROW,
         sender_id="someone", exclude_user_ids=set(),
     )  # must not raise
 
@@ -1704,7 +1711,8 @@ async def test_the_predicate_filters_a_mixed_recipient_list(session, dm):
     silent = await users_service.create_user(
         session, username="carol", display_name="Carol", password="pw")
     kept = await push_service._spoken_here(
-        session, channel_id=CHANNEL, user_ids=[bob.id, silent.id])
+        session, channel_id=CHANNEL, user_ids=[bob.id, silent.id],
+        before_id=AFTER_EVERY_ROW)
     assert kept == [bob.id], (
         f"the predicate must keep only the recipient who has posted here; "
         f"got {kept}")
@@ -1871,7 +1879,7 @@ async def test_one_recipients_fault_does_not_abandon_the_others(
 
     monkeypatch.setattr(push_service, "_wake_user", _explode_for_the_first)
     monkeypatch.setattr(push_service, "_spoken_here",
-                        lambda s, *, channel_id, user_ids: _identity(user_ids))
+                        lambda s, *, channel_id, user_ids, before_id: _identity(user_ids))
     monkeypatch.setattr(push_service, "_recipients",
                         lambda s, *, channel_id, sender_id, exclude_user_ids:
                         _identity(["recipient-one", "recipient-two", "recipient-three"]))
@@ -1939,7 +1947,7 @@ async def test_a_recipient_whose_fault_POISONS_THE_SESSION_does_not_cost_the_oth
 
     monkeypatch.setattr(push_service, "_wake_user", _poison_then_wake)
     monkeypatch.setattr(push_service, "_spoken_here",
-                        lambda s, *, channel_id, user_ids: _identity(user_ids))
+                        lambda s, *, channel_id, user_ids, before_id: _identity(user_ids))
     monkeypatch.setattr(push_service, "_recipients",
                         lambda s, *, channel_id, sender_id, exclude_user_ids:
                         _identity(["poisoner", "victim-one", "victim-two"]))

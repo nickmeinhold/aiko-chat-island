@@ -35,8 +35,7 @@ from . import build_info, log_redaction
 from .config import settings
 from .db import SessionLocal, verify_schema
 from .worker_guard import acquire_single_worker_lock, release_single_worker_lock
-from .domain import (apns, channels_service, echo, messages_service,
-                     moderation_service)
+from .domain import apns, channels_service, echo, messages_service
 from .realtime.hub import Hub
 
 logging.basicConfig(level=logging.INFO)
@@ -82,9 +81,13 @@ class GatewayState:
                 # user (sender_user_id set) — that human's blocks apply to live
                 # delivery just as on the send path. An external actor (NULL
                 # sender) has no block relationships, so the set is empty.
+                #
+                # Through the same exclusion function as the WS send path, so a held
+                # call invite (design 21) is excluded here too. A DM never rides the
+                # bus, so today that half is always empty: one door, not a live gate.
                 exclude = (
-                    await moderation_service.blocked_pair_user_ids(session, row.sender_user_id)
-                    if row and row.sender_user_id else set()
+                    await messages_service.live_exclusions(session, row)
+                    if row else set()
                 )
             if row:
                 log.info("ingest %s in %s: %s", row.id, msg.channel, msg.message)
@@ -215,6 +218,7 @@ async def lifespan(app: FastAPI):
     # a non-exiting host (a test harness / embedded server). Kelvin+Carnot, PR#111.
     gossip_task: "asyncio.Task | None" = None
     nudge_task: "asyncio.Task | None" = None
+    release_task: "asyncio.Task | None" = None
     try:
         # Alembic (run by the container entrypoint before uvicorn) owns schema
         # creation/evolution; here we only VERIFY the live schema is migrated +
@@ -270,6 +274,11 @@ async def lifespan(app: FastAPI):
                          settings.island_update_nudge.value, ui)
             else:
                 log.info("operator update nudge off — this island will not check for releases")
+            # Deliver held call invites once they can no longer ring (design 21).
+            # Always on: the hold itself is unconditional, and without this a missed
+            # call would wait for the recipient's next reconnect.
+            from .realtime.call_release import release_loop
+            release_task = asyncio.create_task(release_loop(state.hub))
             yield
         finally:
             if state.bus is not None:
@@ -286,6 +295,10 @@ async def lifespan(app: FastAPI):
                 nudge_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await nudge_task
+            if release_task is not None:
+                release_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await release_task
             # Push shutdown, IN THIS ORDER (#3267; cage-match #139 Maxwell+Carnot).
             # DRAIN the in-flight wake tasks FIRST, THEN close the transport's
             # pooled connection — closing a shared client while a wake is mid-send

@@ -61,7 +61,8 @@ class Hub:
         return len(targets)
 
     async def fanout(
-        self, channel_id: str, frame: dict, *, exclude_user_ids: set[str] | None = None
+        self, channel_id: str, frame: dict, *, exclude_user_ids: set[str] | None = None,
+        only_user_ids: set[str] | None = None,
     ) -> None:
         """Deliver `frame` to every connection subscribed to `channel_id`, except
         connections owned by a user in `exclude_user_ids`.
@@ -74,11 +75,16 @@ class Hub:
         window between the caller computing the set and this fanout is not reflected
         for the in-flight frame (cage-match Carnot LOW); the next send recomputes,
         and the history path hides it on reload. Empty / None means "no exclusions"
-        (the common case)."""
+        (the common case).
+
+        `only_user_ids`, when given, narrows delivery to those users' connections:
+        the release of a held call invite (design 21) goes to the people it was held
+        from, not again to the caller. Exclusion still wins over inclusion."""
         excluded = exclude_user_ids or frozenset()
         targets = [
             c for c in self._conns
             if channel_id in c.subscribed and c.user_id not in excluded
+            and (only_user_ids is None or c.user_id in only_user_ids)
         ]
         if not targets:
             return

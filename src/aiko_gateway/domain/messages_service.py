@@ -9,11 +9,12 @@ from __future__ import annotations
 
 import datetime as dt
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..aiko.payload import InboundMessage
-from . import acl, channels_service, dm_service, moderation_service, signing_keys_service
+from . import (acl, call_hold, channels_service, dm_service, moderation_service,
+               signing_keys_service)
 from .ids import new_ulid
 from .models import Channel, ChannelKind, Message, Retraction, SenderKind, User
 
@@ -164,6 +165,10 @@ async def create_outbound(
             blocked = await moderation_service.blocked_pair_user_ids(session, user.id)
             if any(p in blocked for p in peer_ids):
                 raise BlockedDmSend()
+    # A DM invite signed too far in the island's future is refused (design 21): it is
+    # what keeps every holdable row inside the hold's primary-key scan. After the block
+    # gate, so a blocked sender still gets the existence-hiding refusal first.
+    call_hold.refuse_future_dated(channel_kind=channel.kind, body=body, origin=origin)
     if origin is not None:
         await signing_keys_service.record_signing_key(
             session, user_id=user.id,
@@ -328,6 +333,23 @@ async def get_message(session: AsyncSession, message_id: str) -> Message | None:
     return await session.get(Message, message_id)
 
 
+async def _visible(session: AsyncSession, viewer_id: str, channel_ids: list[str], *,
+                   at_ms: int | None = None):
+    """The ONE content-visibility predicate for a viewer's reads: not hidden by a block
+    (`moderation_service.not_blocked_predicate`) and not a call invite currently held
+    from this viewer (`call_hold`, design 21). History, the fence, the read-position
+    bound and the DM preview all filter through it, so the id axis they share stays
+    one axis. Soft-delete stays at each call site, as it was.
+
+    THE HOLD ONLY EVER GROWS VISIBILITY: a held row becomes visible and never the
+    reverse, so it adds no case to the fence/pager shrink race `latest_ulid`
+    documents.
+    """
+    not_blocked = moderation_service.not_blocked_predicate(viewer_id)
+    held = await call_hold.held_ids(session, viewer_id, channel_ids, at_ms=at_ms)
+    return and_(not_blocked, Message.id.not_in(held)) if held else not_blocked
+
+
 async def visible_message(
     session: AsyncSession, viewer_id: str, message_id: str
 ) -> Message | None:
@@ -351,6 +373,8 @@ async def visible_message(
         blocked = await moderation_service.blocked_pair_user_ids(session, viewer_id)
         if msg.sender_user_id in blocked:
             return None
+    if msg.id in await call_hold.held_ids(session, viewer_id, [msg.channel_id]):
+        return None
     return msg
 
 
@@ -376,7 +400,7 @@ async def last_visible_message(
         .where(
             Message.channel_id == channel_id,
             Message.deleted_at.is_(None),
-            moderation_service.not_blocked_predicate(viewer_id),
+            await _visible(session, viewer_id, [channel_id]),
         )
         .order_by(Message.id.desc())
         .limit(1)
@@ -402,7 +426,7 @@ async def last_visible_messages(
         .where(
             Message.channel_id.in_(channel_ids),
             Message.deleted_at.is_(None),
-            moderation_service.not_blocked_predicate(viewer_id),
+            await _visible(session, viewer_id, channel_ids),
         )
         .group_by(Message.channel_id)
     )).all() if mid is not None]
@@ -467,7 +491,8 @@ async def latest_ulid(session: AsyncSession, channel_id: str, viewer_id: str) ->
 
 
 async def latest_ulids(
-    session: AsyncSession, channel_ids: list[str], viewer_id: str
+    session: AsyncSession, channel_ids: list[str], viewer_id: str, *,
+    at_ms: int | None = None,
 ) -> dict[str, str]:
     """``latest_ulid`` for many channels in two grouped queries: the ONE
     implementation of the fence, so the subscribe fence and the read-position
@@ -480,7 +505,7 @@ async def latest_ulids(
         select(Message.channel_id, func.max(Message.id)).where(
             Message.channel_id.in_(channel_ids),
             Message.deleted_at.is_(None),
-            moderation_service.not_blocked_predicate(viewer_id),
+            await _visible(session, viewer_id, channel_ids, at_ms=at_ms),
         ).group_by(Message.channel_id)
     )).all())
     rets = dict((await session.execute(
@@ -502,6 +527,7 @@ async def get_history(
     before: str | None = None,
     after: str | None = None,
     limit: int,
+    at_ms: int | None = None,
 ) -> list[Message | Retraction]:
     """A page of channel history visible to `viewer_id`, **always returned
     ascending** (oldest first) for display. The stream is HETEROGENEOUS: `Message`
@@ -541,7 +567,7 @@ async def get_history(
     msg_stmt = select(Message).where(
         Message.channel_id == channel_id,
         Message.deleted_at.is_(None),
-        moderation_service.not_blocked_predicate(viewer_id),
+        await _visible(session, viewer_id, [channel_id], at_ms=at_ms),
     )
     ret_stmt = select(Retraction).where(Retraction.channel_id == channel_id)
     if after is not None:
@@ -563,3 +589,71 @@ async def get_history(
     rows = sorted([*msgs, *rets], key=lambda r: r.id, reverse=True)[:limit]
     rows.reverse()
     return rows
+
+
+async def live_exclusions(session: AsyncSession, row: Message) -> set[str]:
+    """Who must NOT receive `row` over a live socket: everyone in a block relationship
+    with its sender, plus anyone it is held from (design 21). The ONE exclusion both
+    fanout sites (the WS send path and bus ingest) pass to `hub.fanout`, so the live
+    twin of the history predicate cannot lose half of itself at a second door."""
+    excluded: set[str] = set()
+    if row.sender_user_id is not None:
+        excluded |= await moderation_service.blocked_pair_user_ids(session, row.sender_user_id)
+    return excluded | await call_hold.held_viewers(session, row)
+
+
+# How many rows a capped subscribe replays (see `subscribe_view`). Rows above the cap
+# all arrived after a held invite, which is at most a couple of minutes old.
+SUBSCRIBE_REPLAY_LIMIT = 100
+
+
+async def subscribe_view(
+    session: AsyncSession, channel_ids: list[str], viewer_id: str
+) -> dict[str, tuple[str, list[Message | Retraction]]]:
+    """{channel_id: (fence, rows to replay live)} for a subscribe.
+
+    WITHOUT A HELD INVITE this is `latest_ulids` and nothing to replay, exactly as
+    before.
+
+    WITH ONE, THE FENCE IS CAPPED JUST BELOW THE OLDEST HELD INVITE (design 21; the
+    app tab's proposal, 2026-10-29). The app's forward pager is the only writer of its
+    watermark, and it pages up to the fence. A fence that counted a later message L
+    but not the held invite I would walk the watermark past I, and once I is released
+    every later forward page would start above it: on a device offline at release,
+    the missed call would never appear. A fence below I keeps the watermark below I,
+    and the first page after release reads through it.
+
+    THE CAP HIDES WHAT IS ABOVE IT, SO THAT IS REPLAYED. The client treats everything
+    above the fence as live, so a device that missed L while offline would not page
+    it either. In first contact the cap is often empty (the call is the DM's first
+    row), and then nothing is paged at all. The rows above the cap that this viewer
+    can see (L, never the held I) are returned here for the route to send as ordinary
+    live frames. The app inserts a live frame by id whatever the fence says, and
+    dedups on the id (confirmed against its code by the app tab, 2026-10-29).
+
+    The cap is a row this viewer can see (or ""), so the pager's `cursor >= fence`
+    end condition stays reachable by visible rows. Only the subscribe fence is capped:
+    the read-position bound still uses `latest_ulids`, so reading L marks L read.
+    """
+    at = call_hold.now_ms()
+    fences = await latest_ulids(session, channel_ids, viewer_id, at_ms=at)
+    held = await call_hold.held_ids_by_channel(session, viewer_id, channel_ids, at_ms=at)
+    view: dict[str, tuple[str, list[Message | Retraction]]] = {
+        cid: (fences[cid], []) for cid in channel_ids}
+    for cid, ids in held.items():
+        oldest = min(ids)
+        below_msg = (await session.execute(
+            select(func.max(Message.id)).where(
+                Message.channel_id == cid,
+                Message.id < oldest,
+                Message.deleted_at.is_(None),
+                moderation_service.not_blocked_predicate(viewer_id),
+            ))).scalar()
+        below_ret = (await session.execute(
+            select(func.max(Retraction.id)).where(
+                Retraction.channel_id == cid, Retraction.id < oldest))).scalar()
+        cap = max(below_msg or "", below_ret or "")
+        replay = await get_history(session, cid, viewer_id, after=cap,
+                                   limit=SUBSCRIBE_REPLAY_LIMIT, at_ms=at)
+        view[cid] = (cap, replay)
+    return view

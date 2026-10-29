@@ -1,7 +1,10 @@
 # Design 21: a stranger's call waits until it can't ring
 
-**Status: v1, UN-TEMPERED.** Written 2026-10-29 before any code. It answers the
-island half of the app tab's design 25 temper (aiko_chat_app#444,
+**Status: v2, BUILT, UN-TEMPERED.** v1 was written 2026-10-29 before any code. v2
+folds in the app tab's answers to the three questions v1 asked (same day, read from
+its main). Answer 1 corrected v1's model of the residual and supplied the fence cap.
+The independent strike is the PR's cage-match, which this trust boundary requires.
+It answers the island half of the app tab's design 25 temper (aiko_chat_app#444,
 `docs/design/25-TEMPER.md`, Disposition), which moved this fix here from the app.
 
 **The decision this builds (Nick, 2026-10-29 14:16):** *"withhold, and keep the missed
@@ -93,13 +96,13 @@ Built by grepping every caller of `message_view`, `message_frame`, `get_history`
 | WS send fanout | `ws._handle_send` → `hub.fanout` | **yes** | held recipients join `exclude_user_ids` |
 | WS bus-ingest fanout | `main._ingest` → `hub.fanout` | no (a DM never rides the bus; `persist_inbound` drops `dm:`) | same exclusion function, one door |
 | REST history | `rest/messages.history` → `get_history` | **yes** | shared visibility predicate |
-| Subscribe fence | `ws._handle_subscribe` → `latest_ulid` | no rows, but history must agree with it | shared visibility predicate |
+| Subscribe fence | `ws._handle_subscribe` → `subscribe_view` | no rows, but history must agree with it | shared predicate, and **capped below a held invite** (below) |
 | Read-position bound | `read_positions_service` → `latest_ulids` | no | shared visibility predicate |
 | DM list preview | `rest/dm.list_dms` → `last_visible_messages` | no | shared visibility predicate |
 | Fetch by id | `rest/messages.get_message` → `visible_message` | no | 404 while held |
 | Reactions | `rest/reactions` → `visible_message` | no | 404 while held |
 | Wake (push) | `push_service.wake_for_message` | rings a **locked** phone | already gated; moves to condition 4's bound |
-| Subscribe replay | none: `_handle_subscribe` sends only the `suback` | n/a | n/a |
+| Subscribe replay | **new**: only when the fence is capped | yes (live frames) | replays the visible rows above the cap; never the held one |
 
 The app tab read its own main on 2026-10-29 14:22: **only two of these can ring the app**,
 WS message frames and REST history. The others stay on the list for visibility to other
@@ -123,12 +126,11 @@ the viewer's DMs, and it's almost always empty.
 ## Delivering it late (the missed call)
 
 History alone isn't enough. A connected client treats every id above its subscribe
-fence as live, and its forward pager asks only for ids above its watermark. A held
-invite becomes visible at an id **below** anything newer the client has since received.
-With no live frame, any later message in the DM pushes the watermark past it, and the
-missed call is stranded on that device. The app tab voted for a **delayed live send**:
-a late frame with an older id slots into place by id order, and the app refuses to ring
-it as `stale`.
+fence as live and pages only on (re)subscribe, so a released invite would wait unseen
+until the next reconnect. The app tab voted for a **delayed live send**: a late frame
+with an older id slots into place by id order, and the app refuses to ring it as
+`stale`. (What keeps a *reconnect* from stranding it is the fence cap, in the next
+section.)
 
 **A release sweeper, not a timer per invite.** One background task runs every 2 s. It
 re-runs the candidate query for invites whose `release_at` falls in `(last_sweep, now]`
@@ -145,14 +147,41 @@ during the hold wins.
 - **Hub change:** `fanout(..., only_user_ids=...)`, so the release reaches the recipient
   and not the caller, who already has it.
 
+## The subscribe fence is capped below a held invite (v2)
+
+v1 named a residual: a device whose watermark passed the held invite would page forward
+from above it forever and never show the missed call. It got the mechanism wrong. The
+app tab read its code (2026-10-29): **a live frame never moves the watermark.** Only the
+forward pager writes it (`advanceHistoryContiguous`), and only up to the subscribe
+fence. Nothing ever reads the newest page backwards (`getHistory` has one caller, the
+forward pager). So the real path is a **reconnect during the hold**: the new fence
+counts a later message L but not the held invite I, the pager walks the watermark past
+I, and if the device is then offline at release, I never appears on it.
+
+**The app tab's fix, adopted: cap R's subscribe fence just below the oldest invite held
+from R in that channel.** Then the watermark can't pass I, and the first reconnect after
+release pages forward through it. The cap is the newest row R can see below I, or `""`,
+so the pager's `cursor >= fence` end condition stays reachable. Only the *subscribe*
+fence is capped. The read-position bound keeps `latest_ulids`, so reading L still marks
+L read.
+
+**The cap hides what's above it, so the island replays that.** The client treats
+everything above the fence as live and never pages it. So a device that missed L while
+offline would not get L from the pager either. In first contact the call is the DM's
+first row, the cap is `""`, and nothing is paged at all. Right after the `suback`, the
+subscribe sends this connection the rows above the cap that R can see (L, never I) as
+ordinary `message` frames. The app inserts a live frame by id whatever the fence says,
+and dedups on the id (app tab, answer 3). **Messages only:** `envelopes.retraction_frame`
+says a retraction's id advances the watermark. Replaying one above the cap would then
+walk the watermark past I, which is the exact stranding the cap prevents. A retraction
+heals on the next forward catch-up anyway.
+
 ## Residuals, named
 
-- **A device that was online during the hold and offline at release.** It received a
-  *later* message, so its watermark is past the invite. It missed the release frame,
-  then forward paging skips it. The missed call is absent **on that device** until
-  something reads the newest page backwards. Whether opening a DM does that is the app
-  tab's question (below). It needs a later message within 60 s **and** a disconnect at
-  release.
+- **More than 100 visible rows above the cap** (`SUBSCRIBE_REPLAY_LIMIT`), all within a
+  couple of minutes of a held invite. The excess reaches that device on its first
+  reconnect after release, because the watermark is still below I. That's delayed, not
+  lost.
 - **A recipient whose clock runs more than 50 s behind the island's** can still be rung
   by the release frame. The app already accepts the mirror tradeoff for senders ("a peer
   whose clock is >10 s off never rings us").
@@ -183,14 +212,21 @@ Plus:
 - The wake gate and the hold agree when `R` posts between write and wake.
 - Restart: a hold spanning a sweeper restart is still released.
 
-## Questions for the app tab
+## The app tab's answers (2026-10-29, read from aiko_chat_app main)
 
-1. Does opening a DM, or a cold start, fetch the **newest page backwards**
-   (`before=None`)? If so, the first residual heals when the user opens the DM.
-2. A call/2 invite more than 60 s ahead of the island's clock now gets `bad_origin`. Is
-   that acceptable on the caller's side, and what does the user see?
-3. Confirm that a live `message` frame whose id is below both the fence and the
-   watermark is inserted by order and run through `admitRing` (expected: refused as `stale`).
+1. **No backwards read anywhere**, and v1's residual mechanism was wrong. See "The
+   subscribe fence is capped" above, which is the app tab's proposal.
+2. **The cap is acceptable.** A per-message error goes `_onError` →
+   `_cache.markFailed(refClientMsgId)`, so the caller sees the "started a call" line
+   marked failed, with the usual retry. Every receiver already refuses an invite signed
+   more than 5 s in its future (0.0.7 allows 0 s), so the cap turns away only calls
+   that could never ring.
+3. **Confirmed.** `MessageFrame` → `_onMessage` → `_persistInbound` → `verifyOrigin` →
+   `_cache.upsertInbound`, which dedups by island id and never compares against the
+   fence. On insert, `admitRing` refuses an invite signed more than 10 s earlier as
+   `stale`. Rows are ordered by island id, so a late older id slots into place.
+
+Also agreed: agents aren't held, and the END isn't held.
 
 ## Out of scope
 
