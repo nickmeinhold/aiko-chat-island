@@ -717,6 +717,13 @@ async def seed_message_axis(session: AsyncSession) -> None:
     """Start the monotonic message axis (`ids.next_axis_ulid`) above the newest stored
     message or retraction id, so a wall clock that stepped back across a restart cannot
     mint a reply that sorts before an invite it followed (design 21)."""
-    newest_msg = await session.scalar(select(func.max(Message.id)))
-    newest_ret = await session.scalar(select(func.max(Retraction.id)))
+    # ONLY IDS THAT ARE ULIDS. `MAX` over the TEXT column would pick a lowercase or
+    # legacy id first (it sorts above every capital), `seed_axis` can't decode one, and
+    # this runs before the lifespan yields, so a single such row would stop the island
+    # booting (Maxwell, #445 r3). Measured 2026-10-29: both live stores hold 0 such
+    # ids; the filter is so a deploy never depends on that staying true.
+    newest_msg = await session.scalar(
+        select(func.max(Message.id)).where(Message.id.op("GLOB")(ids.ULID_GLOB)))
+    newest_ret = await session.scalar(
+        select(func.max(Retraction.id)).where(Retraction.id.op("GLOB")(ids.ULID_GLOB)))
     ids.seed_axis(max(newest_msg or "", newest_ret or ""))

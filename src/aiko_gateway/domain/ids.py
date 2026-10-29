@@ -14,6 +14,8 @@ import threading
 import time
 
 _CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"  # excludes I, L, O, U
+# A ULID as a SQLite GLOB (case-sensitive, whole-string): what `seed_axis` can decode.
+ULID_GLOB = "[0-7]" + "[0-9A-HJKMNP-TV-Z]" * 25
 
 
 def _encode(value: int, length: int) -> str:

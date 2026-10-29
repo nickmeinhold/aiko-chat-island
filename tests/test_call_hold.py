@@ -564,3 +564,18 @@ def test_the_cap_fails_closed_on_a_non_integer_signature():
     with pytest.raises(call_hold.FutureDatedInvite):
         call_hold.refuse_future_dated(channel_kind="dm", body=INVITE,
                                       origin={"signed_at_ms": "9999999999999"}, at_ms=T0)
+
+
+async def test_the_boot_seed_skips_an_id_it_cannot_decode(session, dm, monkeypatch):
+    """Maxwell, #445 r3: a lowercase or legacy id sorts above every ULID, so MAX picks
+    it, and decoding it raised before the lifespan yielded: the island would not boot."""
+    from aiko_gateway.domain import ids
+    real = await _post(session, dm, dm.alice, "hi", T0)
+    session.add(Message(id="zzz-legacy-row", channel_id=dm.channel.id,
+                        sender_user_id=dm.alice.id, sender_kind="human", body="old",
+                        aiko_origin=False))
+    await session.commit()
+    monkeypatch.setattr(ids, "_axis_last", (0, 0))
+    monkeypatch.setattr(ids, "_axis_clock_ms", 0)
+    await messages_service.seed_message_axis(session)
+    assert ids._axis_last[0] == T0, f"the seed must come from the newest real ULID {real.id}"
