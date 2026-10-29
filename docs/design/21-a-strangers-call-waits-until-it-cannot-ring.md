@@ -98,7 +98,12 @@ and `kCallInviteFreshness`). Both are judged on the **recipient's** clock agains
   question the time term already answers, and it failed OPEN: whenever the two
   disagreed, a still-ringable invite was released (Tesla, round 2). The clause now leads
   with its cheapest terms (the GLOB first), so an ordinary message costs one string
-  match.
+  match. **No id floor anywhere (v5).** The same floor came back as a "candidate bound"
+  on the cap and forward-stop lookup (`_oldest_held`), which read time off an id and
+  failed open the same way: a held invite whose id sorted below it escaped the cap and
+  the stop, and a walk could pass the missed call (3/3 seats, recast round 3). It is
+  gone. The lookup's cost is met by scope instead: only a DM can hold a call, so other
+  channels answer without scanning.
 
 ## The doors
 

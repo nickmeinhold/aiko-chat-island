@@ -631,3 +631,30 @@ async def test_a_forward_page_never_crosses_a_held_invite(session, dm, clock):
         session, dm.channel.id, dm.bob.id, after=before.id, limit=50, cross_held=True)
     assert [r.id for r in crossing] == [later.id], (
         f"the replay must still see above the held invite {invite.id}")
+
+
+async def test_an_id_far_behind_its_receipt_still_caps_the_fence_and_stops_the_page(
+        session, dm, clock):
+    """Carnot, Noether, Tesla (3/3), #445 recast round 3: a candidate floor read off the
+    id let an invite whose id sorts far below its `created_at` (a backward step inside
+    the mint's await, on a quiet island) escape the fence cap and the forward stop while
+    `held_clause` still held it. A later message then set the watermark past it for
+    good. Asked of the fence and the page, not only of the hold."""
+    invite = Message(
+        id=new_ulid(T0 - 3_600_000), channel_id=dm.channel.id,
+        sender_user_id=dm.alice.id, sender_kind="human", sender_label="Alice",
+        body=INVITE, aiko_origin=False,
+        created_at=dt.datetime.fromtimestamp(T0 / 1000, dt.timezone.utc))
+    session.add(invite)
+    await session.commit()
+    later = await _post(session, dm, dm.alice, "pick up!", T0 + 500)
+    v = (await messages_service.subscribe_view(session, [dm.channel.id], dm.bob.id))[
+        dm.channel.id]
+    assert v.fence < invite.id and v.replay_after is not None, f"fence not capped: {v}"
+    page = await messages_service.get_history(session, dm.channel.id, dm.bob.id,
+                                              after="", limit=50)
+    assert page == [], f"the forward page crossed the held invite: {[r.id for r in page]}"
+    replay = [item async for p in messages_service.replay_pages(
+        session, dm.channel.id, dm.bob.id, after=v.replay_after, upto=v.replay_upto,
+        at_ms=v.at_ms) for item in p]
+    assert [r.id for r in replay] == [later.id]

@@ -11,7 +11,7 @@ import datetime as dt
 
 from typing import NamedTuple
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, case, exists, func, null, or_, select
 from sqlalchemy.orm import aliased
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -544,21 +544,23 @@ def _oldest_held(channel_id, viewer_id: str, at_ms: int):
     fence cap and the forward pager's stop use, so the two can't disagree about where
     the hole is.
 
-    CANDIDATE FLOOR, NOT A DEFINITION (Carnot, #445 recast round 1: unbounded, this
-    scanned a channel's whole history). An axis id's millisecond is never earlier than
-    the wall clock when it was minted (`ids.next_axis_ulid`), and minting precedes the
-    `created_at` default by at most one request; the ingest cap keeps a signature within
-    FUTURE_CAP of that. So every row the mutator writes that is still held sits above
-    this two-minute floor. A row written another way that sorts below it (a fixture, a
-    future writer) only escapes the cap and the stop; the reads still evaluate the full
-    clause with no bound, so it can never ring.
+    COMPLETE: no id-derived bound. Recast rounds 1-3 carried a candidate floor taken off
+    the id axis, which read time off an id (the thing the recast forbids) and failed
+    open: an id that sorted below it while `held_clause` still held the row escaped the
+    cap and the stop, and a walk could pass the missed call for good (Carnot, Noether,
+    Tesla, 3/3 in round 3; Tesla traced a backward step inside the await between the
+    ingest cap and the mint, on a quiet island). The cost that brought the floor in
+    (Carnot, round 1: a scan of a channel's history on every subscribe) is met by
+    scope instead: only a DM can hold a call, so any other channel answers NULL without
+    scanning (SQLite's CASE doesn't evaluate the untaken branch). Within a DM,
+    `held_clause` leads with a GLOB, so an ordinary row costs one string match.
     """
-    h = aliased(Message)
-    floor = ids.ulid_floor(at_ms - call_hold.HOLD_MS - call_hold.FUTURE_CAP_MS)
-    return (select(func.min(h.id))
-            .where(h.channel_id == channel_id, h.id >= floor,
-                   call_hold.held_clause(h, viewer_id, at_ms))
-            .scalar_subquery())
+    h, c = aliased(Message), aliased(Channel)
+    oldest = (select(func.min(h.id))
+              .where(h.channel_id == channel_id, call_hold.held_clause(h, viewer_id, at_ms))
+              .scalar_subquery())
+    is_dm = exists().where(c.id == channel_id, c.kind == ChannelKind.DM)
+    return case((is_dm, oldest), else_=null())
 
 
 async def get_history(
@@ -738,7 +740,7 @@ async def subscribe_view(
         return {}
     at = call_hold.now_ms()
     v = aliased(Message)
-    oldest_held = _oldest_held(Channel.id, viewer_id, at).correlate(Channel)
+    oldest_held = _oldest_held(Channel.id, viewer_id, at)
     msg_fence = (select(func.max(v.id))
                  .where(v.channel_id == Channel.id, v.deleted_at.is_(None),
                         _visible(viewer_id, at_ms=at, m=v),
