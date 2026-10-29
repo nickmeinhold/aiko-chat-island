@@ -36,6 +36,14 @@ def new_ulid(ts_ms: int | None = None) -> str:
 
 
 
+
+def ulid_floor(ts_ms: int) -> str:
+    """The smallest ULID minted at `ts_ms`, so `id >= ulid_floor(t)` selects every row
+    minted at or after `t` using the primary key alone. A CANDIDATE bound only (the
+    subscribe cap's `oldest_held`); the hold itself never reads time off an id."""
+    return _encode(max(ts_ms, 0), 10) + "0" * 16
+
+
 # THE MESSAGE AXIS IS MONOTONIC, AND IT IS ONLY AN ORDER. Messages and retractions
 # share one id axis (cursors, fences, watermarks), and since design 21 the axis is also
 # CAUSAL ORDER: "the recipient had posted before this invite" is `prior.id < invite.id`.

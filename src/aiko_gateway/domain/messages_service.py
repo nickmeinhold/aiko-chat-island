@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import datetime as dt
 
+from typing import NamedTuple
+
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import aliased
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -346,9 +348,16 @@ def _visible(viewer_id: str, *, at_ms: int | None = None, m=Message):
     of cage-match #445 precomputed the held set in an earlier SELECT; under pysqlite
     that is a different read, and an invite committed between them was served fresh.
 
-    THE HOLD ONLY EVER GROWS VISIBILITY: a held row becomes visible and never the
-    reverse (`call_hold.now_ms` never runs backwards), so it adds no case to the
-    fence/pager shrink race `latest_ulid` documents.
+    THE HOLD ADDS ONE SMALL CASE TO THE FENCE/PAGER SHRINK RACE `latest_ulid`
+    documents. Its clock is the raw wall clock on purpose (`call_hold.now_ms` says why:
+    a high-water mark would release fresh invites early after a correcting step), so a
+    backward wall step can make a just-released invite held again for at most the size
+    of the step. It can't ring anyone. It usually heals like a block or a takedown
+    does, but a walk inside that window can strand the missed call on that device
+    (`call_hold.now_ms` has the case; it's within the accepted clock-fault residual).
+    (This said "the hold only ever grows visibility" until the design 21 recast made
+    the clock raw: Maxwell, #445 recast round 1; then "self-healing", until Tesla
+    showed the walk case the same round.)
     """
     at = call_hold.now_ms() if at_ms is None else at_ms
     return and_(moderation_service.not_blocked_predicate(viewer_id, m),
@@ -632,10 +641,23 @@ async def message_views(session: AsyncSession, msgs: list[Message],
     return [message_view(m, reactions=reactions.get(m.id)) for m in msgs]
 
 
+class SubscribeView(NamedTuple):
+    """One channel's subscribe answer. `replay_after` is None when nothing is held from
+    the viewer (no replay); otherwise `replay_pages(after=replay_after, upto=
+    replay_upto, at_ms=at_ms)` streams what the capped fence hides."""
+    fence: str
+    replay_after: str | None
+    replay_upto: str
+    at_ms: int
+
+
 async def subscribe_view(
     session: AsyncSession, channel_ids: list[str], viewer_id: str
-) -> dict[str, tuple[str, list[Message | Retraction]]]:
-    """{channel_id: (fence, items to replay live)} for a subscribe.
+) -> dict[str, SubscribeView]:
+    """{channel_id: SubscribeView} for a subscribe: the fence, and the bounds of what to
+    replay. The replay itself is streamed by `replay_pages`, after the suback, one
+    bounded page at a time (Carnot, #445 recast round 1: building the whole replay
+    first held the suback and every row in memory, with no send rate limit to bound it).
 
     WITHOUT A HELD INVITE the fence is `latest_ulids`' value and nothing is replayed,
     exactly as before.
@@ -657,9 +679,9 @@ async def subscribe_view(
     everything above the fence as live, so a device that missed L while offline would
     not page it either; in first contact the cap is "" and nothing is paged at all.
     Everything history would serve above the cap (L and any retraction, never a held
-    I) is returned for the route to send as ordinary live frames, drained to the end
-    rather than counted (Tesla, #445 r1: a fixed count let a stranger push the tail
-    past it). The hold window bounds it. RETRACTIONS INCLUDED (Carnot + Noether, #445
+    I) is streamed by `replay_pages` for the route to send as ordinary live frames,
+    after the suback, page by page to a terminal cursor rather than a count (Tesla,
+    #445 r1: a fixed count let a stranger push the tail past it). The hold window bounds it. RETRACTIONS INCLUDED (Carnot + Noether, #445
     r2): a takedown above the cap is otherwise on no door until the next reconnect,
     and the deleted text stays on the device. A live retraction frame never moves the
     client's watermark (app tab, read from its code 2026-10-29), so replaying one
@@ -674,8 +696,16 @@ async def subscribe_view(
         return {}
     at = call_hold.now_ms()
     h, v = aliased(Message), aliased(Message)
+    # CANDIDATE BOUND, NOT A DEFINITION (Carnot, #445 recast round 1: without it this
+    # scanned a channel's whole history on every subscribe). An axis id is minted at or
+    # after the wall reading its `created_at` takes, and the ingest cap keeps a signature
+    # within FUTURE_CAP of that, so every row the cap admitted that is still held sits
+    # above this floor. A row it misses (one the cap never saw: none exist on either live
+    # island, measured 2026-10-29) only goes uncapped here; the reads evaluate the full
+    # clause with no bound, so it can never ring.
+    candidate_floor = ids.ulid_floor(at - call_hold.HOLD_MS - call_hold.FUTURE_CAP_MS)
     oldest_held = (select(func.min(h.id))
-                   .where(h.channel_id == Channel.id,
+                   .where(h.channel_id == Channel.id, h.id >= candidate_floor,
                           call_hold.held_clause(h, viewer_id, at))
                    .correlate(Channel).scalar_subquery())
     msg_fence = (select(func.max(v.id))
@@ -705,25 +735,33 @@ async def subscribe_view(
                      for cid, (_, held, _top) in per_channel.items())))
         .group_by(Retraction.channel_id)
     )).all()) if per_channel else {}
-    view: dict[str, tuple[str, list[Message | Retraction]]] = {}
+    view: dict[str, SubscribeView] = {}
     for cid in channel_ids:
         fence, held, top = per_channel.get(cid, ("", None, ""))
         fence = max(fence, ret_fence.get(cid) or "")
-        replay: list[Message | Retraction] = []
-        if held is not None:
-            # The same stream history serves, through `get_history` itself, so the
-            # replay cannot filter differently from the walk it stands in for. It stops
-            # at `top`; retractions minted on the axis after it come live as well.
-            cursor = fence
-            while True:
-                page = await get_history(session, cid, viewer_id, after=cursor,
-                                         limit=_DRAIN_PAGE, at_ms=at)
-                replay.extend(item for item in page if item.id <= top)
-                if len(page) < _DRAIN_PAGE or page[-1].id >= top:
-                    break
-                cursor = page[-1].id
-        view[cid] = (fence, replay)
+        view[cid] = SubscribeView(fence, fence if held is not None else None, top, at)
     return view
+
+
+async def replay_pages(session: AsyncSession, channel_id: str, viewer_id: str, *,
+                       after: str, upto: str, at_ms: int):
+    """Yield what a capped fence hides, one page at a time, up to `upto` and no further.
+
+    The same stream history serves, through `get_history` itself, so the replay can't
+    filter differently from the walk it stands in for. It stops at `upto` (the newest id
+    on the axis when the fence was decided); anything minted after that reaches the
+    connection live, so the replay never chases a growing tail.
+    """
+    cursor = after
+    while True:
+        page = await get_history(session, channel_id, viewer_id, after=cursor,
+                                 limit=_DRAIN_PAGE, at_ms=at_ms)
+        kept = [item for item in page if item.id <= upto]
+        if kept:
+            yield kept
+        if len(page) < _DRAIN_PAGE or page[-1].id >= upto:
+            return
+        cursor = page[-1].id
 
 
 async def seed_message_axis(session: AsyncSession) -> None:

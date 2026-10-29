@@ -356,13 +356,16 @@ def _commit_invite_before_statement(session, dm, n: int) -> dict:
     return calls
 
 
-# Both reads run exactly two statements (messages, then retractions), so the commit
-# lands before the second. Round 2 found an n=3 arm here that never fired and so passed
-# against anything (Noether); every arm now asserts its injection happened.
+# Both reads run exactly two statements (messages, then retractions). n=2 commits
+# between them: red on round-1 code, where an earlier statement decided the hold. n=1
+# commits before the rows statement, so it also reddens if the hold ever leaves that
+# statement (Noether, #445 recast round 1). Round 2 found an n=3 arm that never fired;
+# every arm asserts its injection happened.
 
+@pytest.mark.parametrize("n", [1, 2], ids=["before-the-rows", "between-statements"])
 async def test_history_never_serves_an_invite_committed_between_its_statements(
-        session, dm, clock):
-    calls = _commit_invite_before_statement(session, dm, 2)
+        session, dm, clock, n):
+    calls = _commit_invite_before_statement(session, dm, n)
     rows = await messages_service.get_history(session, dm.channel.id, dm.bob.id, limit=50)
     assert calls.get("fired"), "the injection never ran, so this proved nothing"
     assert [r.body for r in rows if isinstance(r, Message)] == [], (
@@ -370,9 +373,10 @@ async def test_history_never_serves_an_invite_committed_between_its_statements(
         "statement from the one that returned the row")
 
 
+@pytest.mark.parametrize("n", [1, 2], ids=["before-the-rows", "between-statements"])
 async def test_the_fence_never_counts_an_invite_committed_between_its_statements(
-        session, dm, clock):
-    calls = _commit_invite_before_statement(session, dm, 2)
+        session, dm, clock, n):
+    calls = _commit_invite_before_statement(session, dm, n)
     fence = await messages_service.latest_ulid(session, dm.channel.id, dm.bob.id)
     assert calls.get("fired"), "the injection never ran, so this proved nothing"
     assert fence == "", f"the fence counted a held invite: {fence!r}"
@@ -558,16 +562,19 @@ async def test_the_drain_stops_at_the_axis_as_the_fence_saw_it(session, dm, cloc
     async def execute(*args, **kwargs):
         calls["n"] += 1
         # Statement 1 decides fence, cap and the terminal cursor; 2 is the retraction
-        # bound; 3 is the first page of the drain.
+        # bound; 3 is the first page of the replay.
         if calls["n"] == 3:
             calls["fired"] = True
             await _post(session, dm, dm.alice, "minted mid-drain", T0 + 900)
         return await real(*args, **kwargs)
 
     session.execute = execute
-    view = await messages_service.subscribe_view(session, [dm.channel.id], dm.bob.id)
+    v = (await messages_service.subscribe_view(
+        session, [dm.channel.id], dm.bob.id))[dm.channel.id]
+    replay = [item async for page in messages_service.replay_pages(
+        session, dm.channel.id, dm.bob.id, after=v.replay_after, upto=v.replay_upto,
+        at_ms=v.at_ms) for item in page]
     assert calls.get("fired"), "the injection never ran, so this proved nothing"
-    (_fence, replay) = view[dm.channel.id]
     assert [r.id for r in replay] == [before.id]
 
 

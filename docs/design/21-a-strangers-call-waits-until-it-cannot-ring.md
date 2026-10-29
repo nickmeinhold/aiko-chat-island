@@ -243,8 +243,11 @@ class as above).
   (Nick accepted this, 2026-10-29; see "Two instruments"). The app already accepts the
   mirror tradeoff for senders ("a peer whose clock is >10 s off never rings us").
 - **A hold lasts `HOLD + FUTURE_CAP` (two minutes) on a clock that doesn't step**, plus at
-  most the size of a backward step, which can also re-hold a just-released invite briefly
-  (it self-heals, like a block, and can't ring).
+  most the size of a backward step. That step can also re-hold a just-released invite. It
+  can't ring, but a history walk inside that window can set a device's watermark past the
+  invite and strand that device's missed call (Tesla, recast round 1). This is part of the
+  clock-fault residual. The closing fix is recorded and not built: forward history pages
+  stop below an invite currently held from the viewer, so no cursor can cross one.
 - **Single process.** The ordering axis is per process; a shared axis comes before the
   single-worker guard is lifted (#46).
 - **No WebSocket send rate limit** (pre-existing). It bounds live delivery and the
