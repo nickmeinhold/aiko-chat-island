@@ -130,9 +130,16 @@ clients, and for federation later.
 variants already share `moderation_service.not_blocked_predicate`, and the fence's
 docstring explains why they must: the reconnect pager runs until `cursor >= fence`.
 The hold becomes part of that shared predicate (`messages_service._visible`), and
-`visible_message` reads through the same predicate in one statement. **Visibility only
-grows over time under the hold** (held → released, never the reverse), so the
-documented shrink race between fence and pager gets no new case.
+`visible_message` reads through the same predicate in one statement. **The hold adds
+one case to the documented fence/pager shrink race** (v5; this paragraph said the
+opposite until Tesla, recast round 2). The hold's clock is the raw wall clock, so a
+backward step can make a released invite held again. If a subscribe fence already
+names it (first contact: the invite was the DM's only row), the walk gets an empty
+page before the fence: design 04's guard, which heals on the next reconnect, exactly
+as for a block or a takedown. It can't ring, and it can't strand the missed call,
+because forward pages never cross a held invite. A one-way latch would remove it, but
+a latch is a high-water mark by another name, and that releases fresh invites early
+after a correcting step (see "Two instruments").
 
 **The statement that returns a row decides whether it is held (v3).** v2 computed
 the held set in one SELECT and applied it as `NOT IN (held)` in the next. Under
@@ -244,10 +251,13 @@ class as above).
   mirror tradeoff for senders ("a peer whose clock is >10 s off never rings us").
 - **A hold lasts `HOLD + FUTURE_CAP` (two minutes) on a clock that doesn't step**, plus at
   most the size of a backward step. That step can also re-hold a just-released invite. It
-  can't ring, but a history walk inside that window can set a device's watermark past the
-  invite and strand that device's missed call (Tesla, recast round 1). This is part of the
-  clock-fault residual. The closing fix is recorded and not built: forward history pages
-  stop below an invite currently held from the viewer, so no cursor can cross one.
+  can't ring, and it can't strand the missed call: **forward history pages stop below an
+  invite currently held from the viewer**, so no walk can set a watermark past one (Tesla
+  and Carnot, recast rounds 1–2; first recorded as an accepted residual, then built,
+  because the producer is a page crossing the hole, not the clock). The subscribe replay
+  opts out (`cross_held`), because its frames never move the watermark. What remains is
+  an **empty page before the fence** when a fence named the invite before the step: design
+  04's guard, healed by the next reconnect.
 - **Single process.** The ordering axis is per process; a shared axis comes before the
   single-worker guard is lifted (#46).
 - **No WebSocket send rate limit** (pre-existing). It bounds live delivery and the

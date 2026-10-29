@@ -106,13 +106,11 @@ def now_ms() -> int:
     freeze would be judged against a "now" from the future and released while still
     ringable: a correcting step turned into a ring window. The cost of the raw clock is
     Tesla's #445 r1 finding: a backward step can make a just-released invite held
-    again for at most the step. It can't ring anyone. Usually it only delays the
-    invite, but NOT always harmlessly (Tesla, #445 recast round 1): a history walk
-    that runs inside that window can return later rows without the re-held invite and
-    set the device's watermark past it, stranding that device's missed call. That is
-    part of the clock-fault residual Nick accepted 2026-10-29 (design 21, "Two
-    instruments"); the closing fix, forward pages that stop at a held invite, is
-    recorded there and not built."""
+    again for at most the step. It can't ring anyone, and it can't strand the missed
+    call either: a walk inside that window would otherwise return later rows without
+    the re-held invite and set the device's watermark past it (Tesla + Carnot, #445
+    recast rounds 1-2), so forward history pages stop below any invite held from the
+    viewer (`messages_service.get_history`). The re-hold only delays it."""
     return int(time.time() * 1000)
 
 

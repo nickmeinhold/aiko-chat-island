@@ -352,12 +352,13 @@ def _visible(viewer_id: str, *, at_ms: int | None = None, m=Message):
     documents. Its clock is the raw wall clock on purpose (`call_hold.now_ms` says why:
     a high-water mark would release fresh invites early after a correcting step), so a
     backward wall step can make a just-released invite held again for at most the size
-    of the step. It can't ring anyone. It usually heals like a block or a takedown
-    does, but a walk inside that window can strand the missed call on that device
-    (`call_hold.now_ms` has the case; it's within the accepted clock-fault residual).
+    of the step. It can't ring anyone, and a forward page never crosses a held invite
+    (`get_history`), so a walk inside that window can't strand the missed call either.
+    If a fence already names the re-held invite (first contact), that walk gets an
+    empty page before the fence, which design 04's guard heals on the next reconnect.
     (This said "the hold only ever grows visibility" until the design 21 recast made
-    the clock raw: Maxwell, #445 recast round 1; then "self-healing", until Tesla
-    showed the walk case the same round.)
+    the clock raw: Maxwell, #445 recast round 1; then that a walk could strand it,
+    until forward pages learned to stop: Tesla + Carnot, rounds 1-2.)
     """
     at = call_hold.now_ms() if at_ms is None else at_ms
     return and_(moderation_service.not_blocked_predicate(viewer_id, m),
@@ -537,6 +538,29 @@ async def latest_ulids(
     return {cid: max(msgs.get(cid) or "", rets.get(cid) or "") for cid in channel_ids}
 
 
+def _oldest_held(channel_id, viewer_id: str, at_ms: int):
+    """SQL scalar: the oldest message in `channel_id` (a value or a correlated column)
+    held from `viewer_id` at `at_ms`, or NULL. The ONE definition both the subscribe
+    fence cap and the forward pager's stop use, so the two can't disagree about where
+    the hole is.
+
+    CANDIDATE FLOOR, NOT A DEFINITION (Carnot, #445 recast round 1: unbounded, this
+    scanned a channel's whole history). An axis id's millisecond is never earlier than
+    the wall clock when it was minted (`ids.next_axis_ulid`), and minting precedes the
+    `created_at` default by at most one request; the ingest cap keeps a signature within
+    FUTURE_CAP of that. So every row the mutator writes that is still held sits above
+    this two-minute floor. A row written another way that sorts below it (a fixture, a
+    future writer) only escapes the cap and the stop; the reads still evaluate the full
+    clause with no bound, so it can never ring.
+    """
+    h = aliased(Message)
+    floor = ids.ulid_floor(at_ms - call_hold.HOLD_MS - call_hold.FUTURE_CAP_MS)
+    return (select(func.min(h.id))
+            .where(h.channel_id == channel_id, h.id >= floor,
+                   call_hold.held_clause(h, viewer_id, at_ms))
+            .scalar_subquery())
+
+
 async def get_history(
     session: AsyncSession,
     channel_id: str,
@@ -546,6 +570,7 @@ async def get_history(
     after: str | None = None,
     limit: int,
     at_ms: int | None = None,
+    cross_held: bool = False,
 ) -> list[Message | Retraction]:
     """A page of channel history visible to `viewer_id`, **always returned
     ascending** (oldest first) for display. The stream is HETEROGENEOUS: `Message`
@@ -582,16 +607,33 @@ async def get_history(
     ``limit`` smallest (or largest) qualifying ids, no item that belongs inside the
     page can hide beyond position ``limit`` of the union.
     """
+    at = call_hold.now_ms() if at_ms is None else at_ms
     msg_stmt = select(Message).where(
         Message.channel_id == channel_id,
         Message.deleted_at.is_(None),
-        _visible(viewer_id, at_ms=at_ms),
+        _visible(viewer_id, at_ms=at),
     )
     ret_stmt = select(Retraction).where(Retraction.channel_id == channel_id)
     if after is not None:
         # Forward: oldest-above-cursor first from each stream, merge ascending.
-        msg_stmt = msg_stmt.where(Message.id > after).order_by(Message.id.asc()).limit(limit)
-        ret_stmt = ret_stmt.where(Retraction.id > after).order_by(Retraction.id.asc()).limit(limit)
+        msg_stmt = msg_stmt.where(Message.id > after)
+        ret_stmt = ret_stmt.where(Retraction.id > after)
+        if not cross_held:
+            # A FORWARD PAGE NEVER CROSSES AN INVITE HELD FROM THIS VIEWER (design 21;
+            # Tesla + Carnot, #445 recast rounds 1-2). The forward pager is the only
+            # writer of the client's watermark. A page that returned rows above a held
+            # invite would let a walk set the watermark past it, and nothing would ever
+            # read it again: the missed call stranded on that device. The subscribe fence
+            # is capped below the same invite, so on the ordinary path this never bites;
+            # it closes the case where the fence was decided while the invite was
+            # visible and it was held again by the time the page was read (a backward
+            # wall-clock step). The subscribe replay passes `cross_held=True`: its whole
+            # job is the rows above the cap, and its frames never move the watermark.
+            stop = func.coalesce(_oldest_held(channel_id, viewer_id, at), _ID_CEILING)
+            msg_stmt = msg_stmt.where(Message.id < stop)
+            ret_stmt = ret_stmt.where(Retraction.id < stop)
+        msg_stmt = msg_stmt.order_by(Message.id.asc()).limit(limit)
+        ret_stmt = ret_stmt.order_by(Retraction.id.asc()).limit(limit)
         msgs = list((await session.execute(msg_stmt)).scalars())
         rets = list((await session.execute(ret_stmt)).scalars())
         return sorted([*msgs, *rets], key=lambda r: r.id)[:limit]
@@ -695,19 +737,8 @@ async def subscribe_view(
     if not channel_ids:
         return {}
     at = call_hold.now_ms()
-    h, v = aliased(Message), aliased(Message)
-    # CANDIDATE BOUND, NOT A DEFINITION (Carnot, #445 recast round 1: without it this
-    # scanned a channel's whole history on every subscribe). An axis id is minted at or
-    # after the wall reading its `created_at` takes, and the ingest cap keeps a signature
-    # within FUTURE_CAP of that, so every row the cap admitted that is still held sits
-    # above this floor. A row it misses (one the cap never saw: none exist on either live
-    # island, measured 2026-10-29) only goes uncapped here; the reads evaluate the full
-    # clause with no bound, so it can never ring.
-    candidate_floor = ids.ulid_floor(at - call_hold.HOLD_MS - call_hold.FUTURE_CAP_MS)
-    oldest_held = (select(func.min(h.id))
-                   .where(h.channel_id == Channel.id, h.id >= candidate_floor,
-                          call_hold.held_clause(h, viewer_id, at))
-                   .correlate(Channel).scalar_subquery())
+    v = aliased(Message)
+    oldest_held = _oldest_held(Channel.id, viewer_id, at).correlate(Channel)
     msg_fence = (select(func.max(v.id))
                  .where(v.channel_id == Channel.id, v.deleted_at.is_(None),
                         _visible(viewer_id, at_ms=at, m=v),
@@ -755,7 +786,7 @@ async def replay_pages(session: AsyncSession, channel_id: str, viewer_id: str, *
     cursor = after
     while True:
         page = await get_history(session, channel_id, viewer_id, after=cursor,
-                                 limit=_DRAIN_PAGE, at_ms=at_ms)
+                                 limit=_DRAIN_PAGE, at_ms=at_ms, cross_held=True)
         kept = [item for item in page if item.id <= upto]
         if kept:
             yield kept

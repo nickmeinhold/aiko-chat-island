@@ -87,14 +87,24 @@ async def _post(session, dm, sender, body: str, at_ms: int, *,
 
 async def _doors(session, dm, viewer, msg) -> dict[str, bool]:
     """Can `viewer` see `msg` through each read door? One dict, so an assertion names
-    the door that leaked."""
+    the door that leaked.
+
+    PRECONDITION, CHECKED: `msg` is the channel's newest row. "fence" and "read_bound"
+    can only say whether `msg` counts when nothing later exists to stand in for it
+    (Noether, #445 recast round 2: the old "fence" key read `latest_ulid`, the
+    read-position bound, and any later message made it true for a held invite)."""
+    from sqlalchemy import func, select
     cid = dm.channel.id
+    newest = await session.scalar(select(func.max(Message.id)).where(Message.channel_id == cid))
+    assert newest == msg.id, "_doors needs msg to be the channel's newest row"
     history = await messages_service.get_history(session, cid, viewer.id, limit=50)
     last = await messages_service.last_visible_message(session, cid, viewer.id)
     lasts = await messages_service.last_visible_messages(session, [cid], viewer.id)
+    view = (await messages_service.subscribe_view(session, [cid], viewer.id))[cid]
     return {
         "history": msg.id in {r.id for r in history},
-        "fence": await messages_service.latest_ulid(session, cid, viewer.id) >= msg.id,
+        "fence": view.fence >= msg.id,                       # the subscribe fence
+        "read_bound": await messages_service.latest_ulid(session, cid, viewer.id) == msg.id,
         "dm_preview": last is not None and last.id == msg.id,
         "dm_list": cid in lasts and lasts[cid].id == msg.id,
         "by_id": await messages_service.visible_message(session, viewer.id, msg.id)
@@ -135,7 +145,9 @@ async def test_a_reply_during_the_hold_does_not_release_it(session, dm, clock):
     through, and this one stays a missed call."""
     invite = await _post(session, dm, dm.alice, INVITE, T0)
     await _post(session, dm, dm.bob, "who is this?", T0 + 500)
-    assert not (await _doors(session, dm, dm.bob, invite))["history"]
+    # Read history directly: `_doors` requires the invite to be the newest row.
+    history = await messages_service.get_history(session, dm.channel.id, dm.bob.id, limit=50)
+    assert invite.id not in {r.id for r in history}
 
 
 async def test_an_agent_is_not_held(session, dm, clock):
@@ -597,3 +609,25 @@ async def test_an_unparseable_dm_key_holds_from_the_members_instead(session, dm,
     await session.commit()
     assert dm_service.canonical_peer_ids(odd.aiko_channel, dm.alice.id) is None
     assert await call_hold.held_viewers(session, invite) == {dm.bob.id}
+
+
+async def test_a_forward_page_never_crosses_a_held_invite(session, dm, clock):
+    """Tesla + Carnot, #445 recast rounds 1-2: the fence was decided while the invite
+    was visible, the wall clock then stepped back and re-held it, and the forward page
+    returned the later row without it. The walk set the watermark past the invite and
+    nothing read it again. A forward page now stops below any invite held from the
+    viewer; the replay, whose frames never move the watermark, still crosses it."""
+    before = await _post(session, dm, dm.alice, "hey", T0 - 2_000)
+    invite = await _post(session, dm, dm.alice, INVITE, T0)
+    later = await _post(session, dm, dm.alice, "pick up!", T0 + 500)
+    clock["ms"] = RELEASED                      # the walk's fence saw it released...
+    fence = await messages_service.latest_ulid(session, dm.channel.id, dm.bob.id)
+    assert fence == later.id
+    clock["ms"] = HELD                          # ...then the wall clock stepped back
+    page = await messages_service.get_history(
+        session, dm.channel.id, dm.bob.id, after=before.id, limit=50)
+    assert page == [], f"the page crossed the re-held invite: {[r.id for r in page]}"
+    crossing = await messages_service.get_history(
+        session, dm.channel.id, dm.bob.id, after=before.id, limit=50, cross_held=True)
+    assert [r.id for r in crossing] == [later.id], (
+        f"the replay must still see above the held invite {invite.id}")
