@@ -61,9 +61,8 @@ class Hub:
         return len(targets)
 
     async def fanout(
-        self, channel_id: str, frame: dict, *, exclude_user_ids: set[str] | None = None,
-        only_user_ids: set[str] | None = None,
-    ) -> int:
+        self, channel_id: str, frame: dict, *, exclude_user_ids: set[str] | None = None
+    ) -> None:
         """Deliver `frame` to every connection subscribed to `channel_id`, except
         connections owned by a user in `exclude_user_ids`.
 
@@ -75,30 +74,18 @@ class Hub:
         window between the caller computing the set and this fanout is not reflected
         for the in-flight frame (cage-match Carnot LOW); the next send recomputes,
         and the history path hides it on reload. Empty / None means "no exclusions"
-        (the common case).
-
-        `only_user_ids`, when given, narrows delivery to those users' connections:
-        the release of a held call invite (design 21) goes to the people it was held
-        from, not again to the caller. Exclusion still wins over inclusion.
-
-        Returns how many connections the frame was written to, so a caller that needs
-        to tell "delivered" from "nobody was listening" can (Noether, #445 r1)."""
+        (the common case)."""
         excluded = exclude_user_ids or frozenset()
         targets = [
             c for c in self._conns
             if channel_id in c.subscribed and c.user_id not in excluded
-            and (only_user_ids is None or c.user_id in only_user_ids)
         ]
         if not targets:
-            return 0
+            return
         results = await asyncio.gather(
             *(c.send(frame) for c in targets), return_exceptions=True
         )
-        delivered = 0
         for conn, res in zip(targets, results):
             if isinstance(res, Exception):
                 log.debug("fanout drop (dead conn?): %s", res)
                 self.unregister(conn)
-            else:
-                delivered += 1
-        return delivered

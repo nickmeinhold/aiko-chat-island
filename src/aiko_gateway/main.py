@@ -218,7 +218,6 @@ async def lifespan(app: FastAPI):
     # a non-exiting host (a test harness / embedded server). Kelvin+Carnot, PR#111.
     gossip_task: "asyncio.Task | None" = None
     nudge_task: "asyncio.Task | None" = None
-    release_task: "asyncio.Task | None" = None
     try:
         # Alembic (run by the container entrypoint before uvicorn) owns schema
         # creation/evolution; here we only VERIFY the live schema is migrated +
@@ -278,11 +277,6 @@ async def lifespan(app: FastAPI):
                          settings.island_update_nudge.value, ui)
             else:
                 log.info("operator update nudge off — this island will not check for releases")
-            # Deliver held call invites once they can no longer ring (design 21).
-            # Always on: the hold itself is unconditional, and without this a missed
-            # call would wait for the recipient's next reconnect.
-            from .realtime.call_release import release_loop
-            release_task = asyncio.create_task(release_loop(state.hub))
             yield
         finally:
             if state.bus is not None:
@@ -299,10 +293,6 @@ async def lifespan(app: FastAPI):
                 nudge_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await nudge_task
-            if release_task is not None:
-                release_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await release_task
             # Push shutdown, IN THIS ORDER (#3267; cage-match #139 Maxwell+Carnot).
             # DRAIN the in-flight wake tasks FIRST, THEN close the transport's
             # pooled connection — closing a shared client while a wake is mid-send

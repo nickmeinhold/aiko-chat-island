@@ -85,8 +85,10 @@ instrument:
 
 **v2: two instruments, each asked only its own question.**
 - **Time** (is this invite still ringable? is this signature too far ahead?) is answered by
-  the **wall high-water clock**, `call_hold.now_ms`: wall time that never runs backwards in
-  this process. The hold's expiry is `max(signed_at, created_at) + HOLD > now`, where
+  the **raw wall clock**, `call_hold.now_ms`. *(v2 said "wall high-water clock". Found
+  while building: a high-water freezes ahead of real time after a step that CORRECTS a
+  fast clock, and judges every invite received during the freeze against a future "now",
+  releasing it while still ringable. The raw clock is exactly the residual Nick accepted.)* The hold's expiry is `max(signed_at, created_at) + HOLD > now`, where
   `created_at` is the wall clock at insert. **The hold never reads time off an id.** The
   ingest cap compares the signature with the same clock, so it can never lag an honest
   signature unless the island's own wall clock does.
@@ -95,9 +97,9 @@ instrument:
   timestamp is a sort key, not a clock anyone reads. Carnot r2's same-millisecond
   misordering stays fixed, and Tesla r2's detune can't recur, because nothing compares the
   two.
-- **Backward wall step:** the high-water freezes, so visibility never shrinks (Tesla r1). A
-  hold lasts at most `HOLD + FUTURE_CAP + (the step)`, which fails toward later, never
-  earlier. That restates design 21's "≤ 2 min" bound, which is only true without a step.
+- **Backward wall step:** a hold lasts at most `HOLD + FUTURE_CAP + (the step)`, which
+  fails toward later, never earlier. A just-released invite can be re-held for at most the
+  step (Tesla r1's shrink): self-healing like a block, and it can't ring.
 
 **The one residual, stated without a false claim:** the hold is exactly as good as the
 island's wall clock against the recipient's, within 50 s. A step that makes the island's
@@ -139,8 +141,8 @@ hold-specific throttle.
 ## What the recast PR will contain
 
 1. Delete the sweeper (class 1).
-2. Two instruments (class 2, v2): `call_hold.now_ms` is a wall high-water owned by
-   `call_hold`, read by the hold and the cap; the hold's receipt term reads `created_at`;
+2. Two instruments (class 2, v2): `call_hold.now_ms` is the raw wall clock, read by the
+   hold and the cap; the hold's receipt term reads `created_at`;
    `ids.next_axis_ulid` keeps its own monotonic state for ordering only, and
    `ids.axis_now_ms` is deleted.
 3. `held_viewers`: canonical pair, with a membership fallback only on an unparseable key.

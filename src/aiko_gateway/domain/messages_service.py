@@ -683,30 +683,43 @@ async def subscribe_view(
                         _visible(viewer_id, at_ms=at, m=v),
                         v.id < func.coalesce(oldest_held, _ID_CEILING))
                  .correlate(Channel).scalar_subquery())
-    per_channel = {cid: (fence or "", held) for cid, fence, held in (await session.execute(
-        select(Channel.id, msg_fence, oldest_held).where(Channel.id.in_(channel_ids))
-    )).all()}
+    # The drain's TERMINAL cursor: the newest id on the axis as this statement sees it.
+    # Anything minted later reaches this connection live (it is already subscribed), so
+    # the drain never chases a growing tail (Carnot, design 21 temper).
+    # Both streams: a retraction minted after the newest message but before this
+    # subscribe was fanned out before the socket could hear it.
+    u = aliased(Message)
+    newest_msg = (select(func.max(u.id)).where(u.channel_id == Channel.id)
+                  .correlate(Channel).scalar_subquery())
+    newest_ret = (select(func.max(Retraction.id)).where(Retraction.channel_id == Channel.id)
+                  .correlate(Channel).scalar_subquery())
+    per_channel = {cid: (fence or "", held, max(top_msg or "", top_ret or ""))
+                   for cid, fence, held, top_msg, top_ret in (await session.execute(
+                       select(Channel.id, msg_fence, oldest_held, newest_msg, newest_ret)
+                       .where(Channel.id.in_(channel_ids))
+                   )).all()}
     ret_fence = dict((await session.execute(
         select(Retraction.channel_id, func.max(Retraction.id))
         .where(or_(*(and_(Retraction.channel_id == cid,
                           Retraction.id < (held or _ID_CEILING))
-                     for cid, (_, held) in per_channel.items())))
+                     for cid, (_, held, _top) in per_channel.items())))
         .group_by(Retraction.channel_id)
     )).all()) if per_channel else {}
     view: dict[str, tuple[str, list[Message | Retraction]]] = {}
     for cid in channel_ids:
-        fence, held = per_channel.get(cid, ("", None))
+        fence, held, top = per_channel.get(cid, ("", None, ""))
         fence = max(fence, ret_fence.get(cid) or "")
         replay: list[Message | Retraction] = []
         if held is not None:
             # The same stream history serves, through `get_history` itself, so the
-            # replay cannot filter differently from the walk it stands in for.
+            # replay cannot filter differently from the walk it stands in for. It stops
+            # at `top`; retractions minted on the axis after it come live as well.
             cursor = fence
             while True:
                 page = await get_history(session, cid, viewer_id, after=cursor,
                                          limit=_DRAIN_PAGE, at_ms=at)
-                replay.extend(page)
-                if len(page) < _DRAIN_PAGE:
+                replay.extend(item for item in page if item.id <= top)
+                if len(page) < _DRAIN_PAGE or page[-1].id >= top:
                     break
                 cursor = page[-1].id
         view[cid] = (fence, replay)

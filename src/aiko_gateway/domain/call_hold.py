@@ -14,7 +14,7 @@ THE RULE. A message is held from viewer R while:
      for non-persons, conduct for persons, 25-TEMPER "What holds");
   4. R is not the sender and R had not posted in the DM before it
      (`push_service.prior_post`, the one definition the wake gate also asks);
-  5. now < max(signed_at, receipt) + HOLD_MS.
+  5. now < max(signed_at, created_at) + HOLD_MS, all three on the island's WALL clock.
 
 ONE SQL CLAUSE, EVALUATED BY THE STATEMENT THAT RETURNS THE ROW (`held_clause`).
 Round 1 of cage-match #445 computed the held set in one SELECT and applied it in the
@@ -23,12 +23,25 @@ was absent from the set and present in the rows, and REST history served it fres
 (Carnot; measured red by `test_history_never_serves_an_invite_committed_between_its_
 statements`). This repo's rule for writes ("fold the predicate into the statement, do
 not observe-then-act") holds for a read that is itself the boundary. The send-path
-exclusion and the release sweeper ask the same clause, so there is one definition of
-"held", not a SQL one and a Python one that could drift.
+exclusion asks the same clause, so there is one definition of "held", not a SQL one
+and a Python one that could drift.
+
+TWO INSTRUMENTS, EACH ASKED ONE QUESTION (design 21 recast). Time (is this still
+ringable? is this signature too far ahead?) is the island's raw wall clock against
+wall-clock readings (`signed_at_ms`, `created_at`), because that is what the app does
+with the recipient's wall clock. Ordering (did R post before this?) is the monotonic
+message axis (`ids.next_axis_ulid`), and the hold never reads time off an id. Fusing
+the two produced every clock finding in #445 rounds 1-3 and, in the recast's first
+draft, an outage of calling (21-TEMPER.md). The hold is therefore exactly as good as
+the island's wall clock against the recipient's, within 50 s: the residual Nick
+accepted 2026-10-29.
 
 Conditions 1-4 are facts about rows that already exist, so the hold is RE-DERIVABLE:
 nothing records who was held, and the caller is never told (the no-refused-ring-record
-ruling, Nick 2026-09-01). Only 5 moves, and it moves one way, which `now_ms` guarantees.
+ruling, Nick 2026-09-01). A held invite is RELEASED by time alone and reaches each
+device on its next history walk; there is no release push (Nick, 2026-10-29: the
+sweeper produced four defects, and the capped subscribe fence makes its absence
+lossless).
 
 EVERY FACT IS READ FROM THE ROW. The kind, the channel and the pair come from the
 database, never from a caller's word for them: the lesson `push_service._recipients`
@@ -38,14 +51,15 @@ from __future__ import annotations
 
 import re
 
+import datetime as dt
+import time
+
 from sqlalchemy import and_, case, exists, false, func, or_, select, true
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
-from . import dm_service, moderation_service, push_service
-from . import ids
-from .ids import ulid_floor
-from .models import Channel, ChannelKind, Message, SenderKind
+from . import dm_service, push_service
+from .models import Channel, ChannelKind, Membership, Message, SenderKind
 from .push_result import CALL_ID_PATTERN, WakeKind
 
 # How long past its anchor an invite is held. The app rings an invite with no
@@ -59,12 +73,12 @@ HOLD_MS = 60_000
 
 # How far ahead of the island's clock a DM invite may be signed and still be
 # accepted. Further than this is refused at ingest (`refuse_future_dated`), which
-# bounds how long any hold lasts (max(signed, receipt) + HOLD_MS <= receipt + 2 min).
-# Without it, an invite signed a day ahead would be held for a day, and for that day
-# the recipient's subscribe fence would stay capped below it and every subscribe would
-# replay everything after it. It also keeps the sweeper's candidate scan a short
-# primary-key range. The app already refuses anything more than 5 s in its future, so
-# this only turns away calls that could never ring anyone.
+# bounds how long any hold lasts (max(signed, created_at) + HOLD_MS <= created_at +
+# 2 min, on a wall clock that doesn't step). Without it, an invite signed a day ahead
+# would be held for a day, and for that day the recipient's subscribe fence would stay
+# capped below it and every subscribe would replay everything after it. The app
+# already refuses anything more than 5 s in its future, so this only turns away calls
+# that could never ring anyone.
 FUTURE_CAP_MS = 60_000
 
 
@@ -84,13 +98,22 @@ def _glob_for(pattern: str) -> str:
 INVITE_GLOB = f"aiko:call/2 {_glob_for(CALL_ID_PATTERN)} \u00b7 \U0001F4DE started a call"
 
 def now_ms() -> int:
-    """The hold's clock IS the message axis's clock (`ids.axis_now_ms`): monotonic, and
-    the clock every message id is minted from. Two consequences, both load-bearing:
-    a released invite never becomes held again (a backward wall-clock step would
-    otherwise SHRINK visibility and hang a pager whose fence names it, Tesla #445 r1),
-    and a row's receipt time can never be ahead of the "now" the hold judges it by
-    (the two-clock detune, Tesla #445 r2)."""
-    return ids.axis_now_ms()
+    """The hold's clock: the island's RAW wall clock, the same clock `created_at` was
+    read from and the kind of clock `signed_at_ms` and the app's own check use.
+
+    Not a high-water mark, deliberately. A high-water mark freezes ahead of real time
+    after a step that CORRECTS a fast clock, and every invite received during the
+    freeze would be judged against a "now" from the future and released while still
+    ringable: a correcting step turned into a ring window. The cost of the raw clock is
+    Tesla's #445 r1 finding: a backward step can make a just-released invite held
+    again for at most the step. That is a visibility shrink of the same self-healing
+    class a block or a takedown causes (see `messages_service.latest_ulid`), and it
+    can't ring anyone."""
+    return int(time.time() * 1000)
+
+
+def _instant(ms: int) -> dt.datetime:
+    return dt.datetime.fromtimestamp(ms / 1000, dt.timezone.utc)
 
 
 class FutureDatedInvite(Exception):
@@ -112,7 +135,7 @@ def refuse_future_dated(*, channel_kind: push_service.ChannelKindStr, body: str,
         return
     signed = origin.get("signed_at_ms")
     # Fail CLOSED on a non-int: `held_clause` casts the stored value to an integer,
-    # so a value this check skipped would still anchor the hold, outside the scan
+    # so a value this check skipped would still anchor the hold, past the two-minute
     # bound the cap exists to keep (Noether, #445 r2). `signing.validate_origin`
     # already refuses one at the WS door; this keeps the two readers of the field in
     # agreement whatever writer comes next.
@@ -126,9 +149,9 @@ def held_clause(m, viewer_id: str, at_ms: int):
 
     Every term reads `m`'s own columns or a correlated subquery on them, so the
     statement that selects `m` decides its hold from the same snapshot it reads `m`
-    from. The time term is a string comparison on the ULID id: a ULID's first 10
-    characters are its millisecond, so "received after t" is `id >= ulid_floor(t+1)`
-    and nothing is decoded (no error path on a malformed id).
+    from. The time term reads `created_at` and the signature, both wall-clock
+    readings, and NEVER the id: the id is the ordering axis, and its timestamp is a
+    sort key that may run ahead of the wall (design 21 recast, class 2).
 
     NO PRIMARY-KEY FLOOR HERE. Round 2 carried `id >= ulid_floor(now - HOLD - CAP)` as
     an index bound, a second answer to the question the time term answers, and it
@@ -145,8 +168,8 @@ def held_clause(m, viewer_id: str, at_ms: int):
         m.sender_user_id.is_not(None),
         m.sender_user_id != viewer_id,
         exists().where(c.id == m.channel_id, c.kind == ChannelKind.DM),
-        # Condition 5: max(signed, receipt) + HOLD > now.
-        or_(m.id >= ulid_floor(window + 1), signed > window),
+        # Condition 5: max(signed, created_at) + HOLD > now.
+        or_(m.created_at > _instant(window), signed > window),
         ~push_service.prior_post(channel_id=m.channel_id, author_id=viewer_id,
                                  before_id=m.id),
     )
@@ -167,12 +190,15 @@ async def _held(session: AsyncSession, msg_id: str, viewer_id: str, at_ms: int) 
 async def held_viewers(session: AsyncSession, msg: Message, *,
                        at_ms: int | None = None) -> set[str]:
     """Who `msg` is held from right now: the live-fanout exclusion at the send door.
-    Asks `held_clause` per DM peer, so it is the same definition the reads use. A
+    Asks `held_clause` per candidate, so it is the same definition the reads use. A
     non-invite costs a parse and no query.
 
-    The pair comes from the CANONICAL `dm:` key, not live membership (the same reason
-    `create_outbound`'s block gate reads it there). A malformed key yields nobody;
-    `create_outbound` already refuses to write into one.
+    Candidates are the CANONICAL `dm:` pair, not live membership (the same reason
+    `create_outbound`'s block gate reads it there). If the key does not parse, the
+    candidates are the channel's raw `Membership` rows instead: an empty answer there
+    would read as "nobody is held" and the live door would deliver what every read door
+    holds (Noether, #445 r3). `create_outbound` refuses to write into such a channel,
+    so this branch is for whatever writer comes next.
     """
     if not is_invite(msg.body) or msg.sender_user_id is None:
         return set()
@@ -180,42 +206,10 @@ async def held_viewers(session: AsyncSession, msg: Message, *,
     channel = await session.get(Channel, msg.channel_id)
     if channel is None or channel.kind != ChannelKind.DM:
         return set()
-    peers = dm_service.canonical_peer_ids(channel.aiko_channel, msg.sender_user_id) or []
+    peers = dm_service.canonical_peer_ids(channel.aiko_channel, msg.sender_user_id)
+    if peers is None:
+        peers = list((await session.execute(
+            select(Membership.user_id).where(Membership.channel_id == msg.channel_id)
+        )).scalars())
     return {p for p in peers if await _held(session, msg.id, p, at)}
 
-
-async def due_releases(session: AsyncSession, *, after_ms: int,
-                       upto_ms: int) -> list[tuple[Message, set[str]]]:
-    """Invites held from someone at `after_ms` and no longer at `upto_ms`, each with the
-    users it now reaches. The release sweeper's input.
-
-    Asked from the DATABASE AND THE CLOCK ONLY, so a hold that spans a restart is found
-    again with nothing to re-arm. The block re-check is point-in-time, like the send
-    path's own fanout exclusion: a block made during the hold wins over the release.
-
-    The primary-key floor here is a CANDIDATE bound, not a definition: the decision is
-    `held_clause` at two instants. A row it missed is not released live, and reaches
-    its recipient through history once the clause says it is visible; it never rings.
-    """
-    rows = (await session.execute(
-        select(Message, Channel)
-        .join(Channel, Channel.id == Message.channel_id)
-        .where(Message.id >= ulid_floor(after_ms - HOLD_MS - FUTURE_CAP_MS),
-               Channel.kind == ChannelKind.DM,
-               Message.sender_kind == SenderKind.HUMAN,
-               Message.sender_user_id.is_not(None),
-               Message.deleted_at.is_(None),
-               Message.body.op("GLOB")(INVITE_GLOB))
-        .order_by(Message.id)
-    )).all()
-    due = []
-    for msg, channel in rows:
-        peers = dm_service.canonical_peer_ids(channel.aiko_channel, msg.sender_user_id) or []
-        recipients = {p for p in peers
-                      if await _held(session, msg.id, p, after_ms)
-                      and not await _held(session, msg.id, p, upto_ms)}
-        recipients -= await moderation_service.blocked_pair_user_ids(
-            session, msg.sender_user_id)
-        if recipients:
-            due.append((msg, recipients))
-    return due

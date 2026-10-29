@@ -1,6 +1,9 @@
 # Design 21: a stranger's call waits until it can't ring
 
-**Status: v4, BUILT, cage-match round 3 (the last under the cap) pending.** v1 was
+**Status: v5, BUILT, fresh cage-match round 1 pending.** #445 hit the three-round cap; the
+design pass is `21-RECAST.md` (opened with the producers of the two repeating classes) and
+`21-TEMPER.md` (RECAST 4/4). v5 is the recast as built, with one correction found while
+building it (the time clock is the raw wall clock, not a high-water mark; below). v1 was
 written 2026-10-29 before any code. v2 folded in the app tab's answers to the three questions v1 asked (same
 day, read from its main); answer 1 corrected v1's model of the residual and supplied
 the fence cap. v3 folds round 1 of the PR's cage-match (#445: 3/3 REQUEST_CHANGES, ten
@@ -95,8 +98,7 @@ and `kCallInviteFreshness`). Both are judged on the **recipient's** clock agains
   question the time term already answers, and it failed OPEN: whenever the two
   disagreed, a still-ringable invite was released (Tesla, round 2). The clause now leads
   with its cheapest terms (the GLOB first), so an ordinary message costs one string
-  match. The floor survives only as the sweeper's candidate bound, where a row it misses
-  just isn't released live (history carries it) and never rings.
+  match.
 
 ## The doors
 
@@ -143,57 +145,56 @@ write") holds for a read that *is* the boundary. So the hold is one SQL clause,
 - the body matches `INVITE_GLOB`, a case-sensitive whole-string GLOB derived from
   `CALL_ID_PATTERN` and pinned against `parse_call_body` by a test corpus;
 - conduct is `push_service.prior_post`, the same SQL fragment the wake gate asks;
-- the time is pure string comparison on the ULID id. `receipt + HOLD > now` is
-  `id >= ulid_floor(now − HOLD + 1)`, and `signed + HOLD > now` reads the JSON field.
-  Nothing is decoded, so nothing can raise on a malformed id.
+- time reads `created_at` and the signature's JSON field, both wall-clock readings, and
+  never the id (v5; see "Two instruments").
 
-The send exclusion (`held_viewers`) and the sweeper (`due_releases`) ask the same
-clause, so there is one definition of "held", not a SQL one and a Python one.
+The send exclusion (`held_viewers`) asks the same clause, so there is one definition of
+"held", not a SQL one and a Python one.
 
-**One clock, one monotonic axis (v3, v4).** The hold compares a row's receipt time
-(read off its id) with "now", and conduct compares two ids. So both depend on how ids
-and "now" are made.
-- `ids.axis_now_ms` is a high-water mark of wall time, and it is the hold's clock. A
-  backward wall-clock step (an NTP correction) can't re-hold a released invite, which
-  would *shrink* visibility and hang a pager whose fence already names it (Tesla, round
-  1).
-- Message and retraction ids are minted from **that same clock** by `ids.next_axis_ulid`,
-  which is strictly increasing within the process: same or earlier millisecond means
-  the last tail plus one. v3 had the hold on the high-water clock and ids on raw wall
-  time. After a step back of more than two minutes they disagreed, and a just-sent
-  stranger's invite was classified released (Tesla, round 2). And `new_ulid`'s random
-  tail let a reply minted in the invite's own millisecond sort before it and count as
-  conduct (Carnot, round 2).
-- At boot the axis is seeded above the newest stored id, so a clock that stepped back
-  across a restart can't mint below what exists.
-- Ids not on the axis (users, reports, recovery rows) keep `new_ulid`: there, an
-  incrementing tail would only make the next id guessable.
+**Two instruments, each asked one question (v5).** Rounds 1–3 kept finding clock faults
+(a re-hold on a backward step, a hold clock detuned from the id clock, a same-millisecond
+misorder, a forward step counted as elapsed time), and the recast's first draft fused
+everything into one clock that would have refused every DM call whenever it lagged real
+time by more than 60 s (21-TEMPER). The questions are different and get different
+instruments:
+- **Time** (still ringable? signature too far ahead?) is the island's **raw wall clock**,
+  `call_hold.now_ms`, against wall-clock readings: `signed_at_ms` and `created_at`. That
+  is what the app does with the recipient's wall clock. **Not a high-water mark:** found
+  while building v5. A high-water freezes ahead of real time after a step that *corrects*
+  a fast clock, and every invite received during the freeze would be judged against a
+  future "now" and released while still ringable. The raw clock costs Tesla's round-1
+  finding: a backward step can re-hold a just-released invite for at most the step. That
+  is a visibility shrink of the same self-healing class as a block or a takedown, and it
+  can't ring.
+- **Ordering** (did R post before this invite?) is the **monotonic message axis**,
+  `ids.next_axis_ulid`: strictly increasing within the process (same or earlier
+  millisecond means the last tail plus one, Carnot round 2), seeded at boot above the
+  newest stored id that is a ULID (Maxwell round 3). Its timestamp is a sort key that may
+  run ahead of the wall; **nothing reads time off it.** Ids not on the axis keep
+  `new_ulid`.
+- **The residual, accepted by Nick 2026-10-29:** the hold is exactly as good as the
+  island's wall clock against the recipient's, within 50 s. A step that makes the
+  island's clock wrong is an instance of it, in either direction, inside a process or
+  across a restart. A step that corrects it is not. No island clock can tell the two
+  apart.
+- **Precondition:** ordering is causal only while one process mints. `worker_guard` plans
+  to lift single-worker for #46; a shared axis goes on that list.
 
-## Delivering it late (the missed call)
+## Delivering it late (the missed call): no push (v5)
 
-History alone isn't enough. A connected client treats every id above its subscribe
-fence as live and pages only on (re)subscribe, so a released invite would wait unseen
-until the next reconnect. The app tab voted for a **delayed live send**: a late frame
-with an older id slots into place by id order, and the app refuses to ring it as
-`stale`. (What keeps a *reconnect* from stranding it is the fence cap, in the next
-section.)
+v2–v4 pushed the released invite from a background sweeper. It produced four of the
+fifteen real findings (a delivery count that read "nobody listening" as delivered, an
+unbounded retry window, a clamp that then dropped releases, and one stalled socket
+freezing every release on the island). **Nick deleted it, 2026-10-29.** The capped
+subscribe fence (next section) is what makes that lossless: no device's watermark can pass
+a held invite, so its first history walk after the release reads it, as a missed call.
 
-**A release sweeper, not a timer per invite.** One background task runs every 2 s. It
-finds invites held from someone at the last tick and not at this one (the same
-`held_clause` at two instants) and sends each recipient their own view, reactions
-included, on their connections subscribed to that channel. A block made during the
-hold wins. It returns, and logs, the number of **connections** reached, so "nobody was
-listening" never reads as a delivery (Noether, round 1). A failing tick retries its
-window, clamped to five minutes so it can't grow without bound.
-- **Restart-safe by construction.** Its input is the database and the clock, so a hold
-  that spans a restart is found again; there are no timers to lose. On boot it starts at
-  `now`, because no socket is connected yet to receive what fell due while the island
-  was down. Those clients reconnect and read history, where the invite is now visible.
-- **A duplicate is harmless.** The app's cache is UNIQUE on the server id
-  (`_handle_subscribe`'s docstring relies on the same fact), and a duplicate is stale
-  anyway.
-- **Hub change:** `fanout(..., only_user_ids=...)`, so the release reaches the recipient
-  and not the caller, who already has it.
+**The latency bound is the next socket loss** (the app tab, from its code: a live socket
+ignores resume kicks, and the island closes one only on revocation). On iOS that's roughly
+the next real foreground; on Android a quick background may not drop it; on an always-on
+desktop it's **days**, bounded in practice by island redeploys. Nick accepted the corrected
+bound. The late row lands at its own id, below anything the viewer has read, so it never
+counts as unread. A future app release could re-walk on resume (app-only).
 
 ## The subscribe fence is capped below a held invite (v2)
 
@@ -237,9 +238,18 @@ class as above).
 
 ## Residuals, named
 
-- **A recipient whose clock runs more than 50 s behind the island's** can still be rung
-  by the release frame. The app already accepts the mirror tradeoff for senders ("a peer
-  whose clock is >10 s off never rings us").
+- **The island's wall clock against the recipient's, beyond 50 s,** in either direction:
+  a recipient whose clock lags the island's, or an island clock that a step made wrong
+  (Nick accepted this, 2026-10-29; see "Two instruments"). The app already accepts the
+  mirror tradeoff for senders ("a peer whose clock is >10 s off never rings us").
+- **A hold lasts `HOLD + FUTURE_CAP` (two minutes) on a clock that doesn't step**, plus at
+  most the size of a backward step, which can also re-hold a just-released invite briefly
+  (it self-heals, like a block, and can't ring).
+- **Single process.** The ordering axis is per process; a shared axis comes before the
+  single-worker guard is lifted (#46).
+- **No WebSocket send rate limit** (pre-existing). It bounds live delivery and the
+  subscribe replay alike: the replay re-sends at most the DM's traffic between the oldest
+  held invite and the fence statement's cursor.
 - **Invites persisted before deploy** aren't covered by the ingest cap. A pre-deploy row
   more than two minutes old is outside the scan and visible, exactly as it is today.
   Deploy check: count DM call/2 invites with `signed_at_ms > created_at + 60 s` on both
@@ -255,17 +265,18 @@ Each arm fails if exactly one conjunct is removed:
   DM preview, 404 by id, excluded from the live fanout. Fails if the hold is deleted.
 - **Control: `R` posted first → visible immediately, on every door.** Fails against a gate
   that holds every invite, which would be an outage of calling, not a stranger gate.
-- **Stranger + past `release_at` → visible, and the sweeper sends it to `R` only.** Fails
-  against a gate that withholds forever, which would contradict "keep the missed call".
+- **Stranger + past `release_at` → visible on every door.** Fails against a gate that
+  withholds forever, which would contradict "keep the missed call".
 
 Plus:
 - `R` posts *during* the hold → still held (order, not time).
 - An agent sender → not held.
 - An END → not held.
-- A block made during the hold → not released.
 - A future-dated invite → `bad_origin` for a friend and a stranger alike.
 - The wake gate and the hold agree when `R` posts between write and wake.
-- Restart: a hold spanning a sweeper restart is still released.
+- The hold never reads time off an id (an id an hour off either way changes nothing).
+- The drain stops at the fence statement's cursor; an unparseable `dm:` key holds from
+  the membership.
 
 ## The app tab's answers (2026-10-29, read from aiko_chat_app main)
 

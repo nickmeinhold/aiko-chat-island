@@ -38,7 +38,11 @@ SCOPE / failure model (cage-match PR#111, Kelvin+Carnot+Tesla):
   Linux container and macOS dev; there is no Windows serving target.
 
 Lift the guard with ``GATEWAY_ALLOW_MULTIWORKER=true`` once #46 is live
-(docs/crucible/46-cross-worker-disconnect/CAST.md).
+(docs/crucible/46-cross-worker-disconnect/CAST.md) AND the message id axis is shared
+across workers. ``ids.next_axis_ulid`` is strictly increasing per PROCESS, and the
+stranger's-call hold reads conduct off that order (design 21): with two minting
+processes, a reply minted on one worker can sort below an invite minted on the other
+and release it while it can still ring.
 """
 from __future__ import annotations
 

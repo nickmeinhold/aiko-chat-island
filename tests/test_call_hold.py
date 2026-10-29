@@ -7,8 +7,9 @@ each arm reddens if exactly one conjunct of the rule is removed:
   * a stranger's FRESH invite is hidden on every door (fails if the hold is deleted);
   * THE CONTROL: once the recipient has posted, it is visible at once (fails against
     a gate that holds every invite, which would be an outage of calling);
-  * a stranger's invite PAST its release is visible and is sent to the recipient
-    (fails against a gate that withholds forever, which drops the missed call).
+  * a stranger's invite PAST its release is visible on every door (fails against a gate
+    that withholds forever, which drops the missed call). There is no release push
+    (Nick, 2026-10-29): the next history walk delivers it.
 
 REAL ULIDS, PINNED CLOCK. Other suites mint ids as zero-padded integers, which decode
 to a time near 1970: the hold reads arrival time off the id, so such a row is always
@@ -29,7 +30,6 @@ from aiko_gateway.domain import (
 )
 from aiko_gateway.domain.ids import new_ulid
 from aiko_gateway.domain.models import Message
-from aiko_gateway.realtime.call_release import release_once
 from aiko_gateway.realtime.hub import Connection, Hub
 from aiko_gateway.realtime.ws import _handle_send, _handle_subscribe
 
@@ -121,20 +121,11 @@ async def test_the_control_once_the_recipient_has_posted_it_is_visible(session, 
     assert await call_hold.held_viewers(session, invite) == set()
 
 
-async def test_past_its_release_the_missed_call_is_visible_and_is_sent(session, dm, clock):
+async def test_past_its_release_the_missed_call_is_visible(session, dm, clock):
     invite = await _post(session, dm, dm.alice, INVITE, T0)
     clock["ms"] = RELEASED
     doors = await _doors(session, dm, dm.bob, invite)
     assert all(doors.values()), f"the missed call was withheld for good: {doors}"
-
-    hub = Hub()
-    bob = _Conn(dm.bob.id, {dm.channel.id})
-    alice = _Conn(dm.alice.id, {dm.channel.id})
-    hub.register(bob)
-    hub.register(alice)
-    sent = await release_once(hub, session, after_ms=HELD, upto_ms=RELEASED)
-    assert sent == 1 and bob.message_ids() == [invite.id], "the release must reach bob"
-    assert alice.message_ids() == [], "the caller already has it; it goes only to bob"
 
 
 # ------------------------------ the rule's edges ----------------------------- #
@@ -170,16 +161,6 @@ async def test_an_ordinary_message_from_a_stranger_is_not_held(session, dm, cloc
 async def test_the_caller_always_sees_their_own_invite(session, dm, clock):
     invite = await _post(session, dm, dm.alice, INVITE, T0)
     assert all((await _doors(session, dm, dm.alice, invite)).values())
-
-
-async def test_a_block_made_during_the_hold_wins_over_the_release(session, dm, clock):
-    invite = await _post(session, dm, dm.alice, INVITE, T0)
-    await moderation_service.block_user(session, dm.bob.id, dm.alice.id)
-    assert await call_hold.due_releases(
-        session, after_ms=HELD, upto_ms=RELEASED) == [], (
-        "a release must not deliver a call the recipient blocked in the meantime")
-    clock["ms"] = RELEASED
-    assert not (await _doors(session, dm, dm.bob, invite))["history"]
 
 
 @pytest.mark.parametrize("signed_ahead_ms", [None, 0, 30_000, -30_000],
@@ -417,33 +398,25 @@ async def test_the_glob_is_the_parser(session, body):
     assert bool(matched) is call_hold.is_invite(body), body
 
 
-def test_the_clock_never_runs_backwards(monkeypatch):
-    """An NTP step back must not re-hold a released invite (Tesla, #445 r1)."""
-    from aiko_gateway.domain import ids
-    wall = iter([2_000_000.0, 1_000_000.0, 3_000_000.0])
-    monkeypatch.setattr(ids.time, "time", lambda: next(wall))
-    monkeypatch.setattr(ids, "_axis_clock_ms", 0)
-    readings = [call_hold.now_ms() for _ in range(3)]
-    assert readings == [2_000_000_000, 2_000_000_000, 3_000_000_000]
-
-
-async def test_a_clock_step_back_cannot_release_a_fresh_invite(session, dm, monkeypatch):
-    """Tesla, #445 r2: the hold read a monotonic clock while ids were stamped from raw
-    wall time, so after a step back of more than two minutes a just-sent stranger's
-    invite was classified released and rang. Through the real mutator, wall clock ten
-    minutes behind the high-water mark: it must still be held."""
-    from aiko_gateway.domain import ids
-    high = call_hold.now_ms()
-    # ALL of the axis's process state is pinned: a recent id left in `_axis_last` by an
-    # earlier test makes the monotonic branch mint at the high-water mark anyway, and
-    # this test then passes against ids stamped from raw wall time (found by mutation).
-    monkeypatch.setattr(ids, "_axis_last", (0, 0))
-    monkeypatch.setattr(ids, "_axis_clock_ms", high)
-    monkeypatch.setattr(ids.time, "time", lambda: (high - 600_000) / 1000)
-    invite, _ = await messages_service.create_outbound(
-        session, user=dm.alice, channel=dm.channel, body=INVITE, client_msg_id="c1")
+@pytest.mark.parametrize("id_offset_ms", [-3_600_000, 3_600_000],
+                         ids=["id-an-hour-behind", "id-an-hour-ahead"])
+async def test_the_hold_never_reads_time_off_an_id(session, dm, clock, id_offset_ms):
+    """Design 21 recast: the id axis is an ORDER, and its timestamp runs ahead of the wall
+    after a backward step (and the round-2 code detuned the two: Tesla). The hold must
+    judge by `created_at` and the signature alone, so an id an hour off either way
+    changes nothing: held one millisecond before created_at + HOLD, visible at it."""
+    invite = Message(
+        id=new_ulid(T0 + id_offset_ms), channel_id=dm.channel.id,
+        sender_user_id=dm.alice.id, sender_kind="human", sender_label="Alice",
+        body=INVITE, aiko_origin=False,
+        created_at=dt.datetime.fromtimestamp(T0 / 1000, dt.timezone.utc))
+    session.add(invite)
+    await session.commit()
+    clock["ms"] = T0 + call_hold.HOLD_MS - 1
+    assert not (await _doors(session, dm, dm.bob, invite))["history"], "released early"
     assert await call_hold.held_viewers(session, invite) == {dm.bob.id}
-    assert not (await _doors(session, dm, dm.bob, invite))["history"]
+    clock["ms"] = T0 + call_hold.HOLD_MS
+    assert (await _doors(session, dm, dm.bob, invite))["history"], "held past its release"
 
 
 async def test_the_replay_drains_past_a_page(session, dm, clock):
@@ -468,13 +441,6 @@ async def test_the_replay_carries_the_reactions_history_would(session, dm, clock
                             session)
     (frame,) = [f for f in conn.sent if f.get("type") == "message"]
     assert [r["emoji"] for r in frame["msg"]["reactions"]] == ["👋"], frame
-
-
-async def test_a_release_nobody_hears_reports_zero(session, dm, clock):
-    """Noether, #445 r1: a release reached by no socket must not read as a delivery."""
-    await _post(session, dm, dm.alice, INVITE, T0)
-    clock["ms"] = RELEASED
-    assert await release_once(Hub(), session, after_ms=HELD, upto_ms=RELEASED) == 0
 
 
 # GOLDEN, SHARED WITH aiko_chat_app (`call_invite.dart`), the way test_call_wire_v2's
@@ -545,7 +511,6 @@ def test_the_message_axis_is_strictly_increasing_under_a_stuck_or_falling_clock(
     wall = iter([5_000.0] * 3 + [4_000.0] * 2 + [6_000.0])
     monkeypatch.setattr(ids.time, "time", lambda: next(wall))
     monkeypatch.setattr(ids, "_axis_last", (0, 0))
-    monkeypatch.setattr(ids, "_axis_clock_ms", 0)
     minted = [ids.next_axis_ulid() for _ in range(6)]
     assert minted == sorted(minted) and len(set(minted)) == 6, minted
 
@@ -554,7 +519,6 @@ def test_the_axis_seed_survives_a_clock_behind_the_store(monkeypatch):
     from aiko_gateway.domain import ids
     stored = ids.new_ulid(9_000_000)
     monkeypatch.setattr(ids, "_axis_last", (0, 0))
-    monkeypatch.setattr(ids, "_axis_clock_ms", 0)   # else real time from earlier tests hides the seed
     monkeypatch.setattr(ids.time, "time", lambda: 1_000.0)   # far behind the store
     ids.seed_axis(stored)
     assert ids.next_axis_ulid() > stored
@@ -576,6 +540,53 @@ async def test_the_boot_seed_skips_an_id_it_cannot_decode(session, dm, monkeypat
                         aiko_origin=False))
     await session.commit()
     monkeypatch.setattr(ids, "_axis_last", (0, 0))
-    monkeypatch.setattr(ids, "_axis_clock_ms", 0)
     await messages_service.seed_message_axis(session)
     assert ids._axis_last[0] == T0, f"the seed must come from the newest real ULID {real.id}"
+
+
+# ------------------------------- recast (design 21) ------------------------------- #
+
+async def test_the_drain_stops_at_the_axis_as_the_fence_saw_it(session, dm, clock):
+    """Carnot, design 21 temper: the drain had no terminal cursor, so a flood could keep
+    it chasing new rows. A row minted after the fence statement reaches the connection
+    live (it is already subscribed); the drain must not chase it."""
+    await _post(session, dm, dm.alice, INVITE, T0)
+    before = await _post(session, dm, dm.alice, "already here", T0 + 500)
+    real = session.execute
+    calls = {"n": 0}
+
+    async def execute(*args, **kwargs):
+        calls["n"] += 1
+        # Statement 1 decides fence, cap and the terminal cursor; 2 is the retraction
+        # bound; 3 is the first page of the drain.
+        if calls["n"] == 3:
+            calls["fired"] = True
+            await _post(session, dm, dm.alice, "minted mid-drain", T0 + 900)
+        return await real(*args, **kwargs)
+
+    session.execute = execute
+    view = await messages_service.subscribe_view(session, [dm.channel.id], dm.bob.id)
+    assert calls.get("fired"), "the injection never ran, so this proved nothing"
+    (_fence, replay) = view[dm.channel.id]
+    assert [r.id for r in replay] == [before.id]
+
+
+async def test_an_unparseable_dm_key_holds_from_the_members_instead(session, dm, clock):
+    """Noether, #445 r3: an unparseable `dm:` key gave the live door nobody to hold from,
+    while every read door held, so the open app would ring. The fallback is the raw
+    membership; `create_outbound` refuses such a channel, so the row is written here."""
+    from sqlalchemy import null
+    from aiko_gateway.domain.models import Channel, Membership
+    odd = Channel(id=new_ulid(T0 - 10_000), name="odd", aiko_channel="dm:not-a-pair", kind="dm", community_id=null(),
+                  is_private=True)
+    session.add(odd)
+    session.add_all([Membership(channel_id=odd.id, user_id=dm.alice.id),
+                     Membership(channel_id=odd.id, user_id=dm.bob.id)])
+    invite = Message(id=new_ulid(T0), channel_id=odd.id, sender_user_id=dm.alice.id,
+                     sender_kind="human", sender_label="Alice", body=INVITE,
+                     aiko_origin=False,
+                     created_at=dt.datetime.fromtimestamp(T0 / 1000, dt.timezone.utc))
+    session.add(invite)
+    await session.commit()
+    assert dm_service.canonical_peer_ids(odd.aiko_channel, dm.alice.id) is None
+    assert await call_hold.held_viewers(session, invite) == {dm.bob.id}
