@@ -13,10 +13,11 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
 
 from ..db import SessionLocal
 from ..domain import (
-    acl, auth_session, echo, mentions, messages_service,
+    acl, auth_session, call_hold, echo, mentions, messages_service,
     moderation_service, push_service, signing,
 )
 from . import envelopes
+from ..domain.models import Message
 from .hub import Connection
 
 log = logging.getLogger("aiko_gateway.ws")
@@ -90,14 +91,36 @@ async def _handle_subscribe(conn: Connection, frame: dict, session) -> None:
     """
     accessible = await acl.filter_readable_ids(session, conn.user_id, frame["channel_ids"])
     conn.subscribed |= set(accessible)  # (1) subscribed FIRST (accessible only)
-    fences = {  # (2) fence AFTER — every gap message is now live or <= fence
-        # Per-viewer fence: latest_ulid applies the same block-visibility filter
-        # get_history does, so the fence never points at a message blocked from
-        # this viewer (which history would never return → reconnect-loop hang).
-        cid: await messages_service.latest_ulid(session, cid, conn.user_id)
-        for cid in accessible
-    }
-    await conn.send(envelopes.suback(fences))
+    # (2) fence AFTER — every gap message is now live or <= fence. Per-viewer: the
+    # fence filters through the same visibility predicate get_history does, so it
+    # never points at a row history would refuse (→ reconnect-loop hang).
+    view = await messages_service.subscribe_view(session, accessible, conn.user_id)
+    # Hand the pooled connection back before any socket write: a slow client must not
+    # sit on it while frames drain (Tesla, #445 recast round 1). A read-only commit.
+    # (No snapshot is pinned either way: pysqlite opens no transaction for a SELECT.)
+    await session.commit()
+    await conn.send(envelopes.suback({cid: v.fence for cid, v in view.items()}))
+    # (3) A fence capped below a held call invite (design 21) leaves items above it
+    # that the pager will not fetch, so they go out live AFTER the suback, in id order,
+    # one bounded page at a time: messages with the reactions a history read of them
+    # would carry, and retractions (a live one never moves the client's watermark).
+    # Nothing is replayed unless something is held from this viewer; a duplicate of an
+    # item already delivered is dedup'd by the client on its id.
+    for cid, v in view.items():
+        if v.replay_after is None:
+            continue
+        async for page in messages_service.replay_pages(
+                session, cid, conn.user_id, after=v.replay_after, upto=v.replay_upto,
+                at_ms=v.at_ms):
+            msgs = [r for r in page if isinstance(r, Message)]
+            views = {mv["msg_id"]: mv for mv in await messages_service.message_views(
+                session, msgs, conn.user_id)}
+            await session.commit()   # the page is built; release before writing it
+            for item in page:
+                await conn.send(envelopes.message_frame(views[item.id])
+                                if isinstance(item, Message)
+                                else envelopes.retraction_frame(
+                                    item.channel_id, item.id, item.target_msg_id))
 
 
 async def _handle_send(gw, conn: Connection, user, frame: dict) -> None:
@@ -194,6 +217,14 @@ async def _handle_send(gw, conn: Connection, user, frame: dict) -> None:
                 body=frame["body"], client_msg_id=frame["client_msg_id"],
                 reply_to=reply_to, origin=origin, mentions=spans,
             )
+        except call_hold.FutureDatedInvite:
+            # An existing code with one new cause (design 21), so no new wire
+            # vocabulary: the app marks the send failed with its usual retry. Refused
+            # for every caller, so it says nothing about the recipient.
+            await conn.send(envelopes.error(
+                "bad_origin", "origin.signed_at_ms is too far in the future",
+                frame["client_msg_id"]))
+            return
         except messages_service.BlockedDmSend:
             # DM send refused under a block (design 11 §Decision 5, enforced at the mutator
             # door). Collapse into the SAME existence-hiding no_channel as a missing /
@@ -207,7 +238,10 @@ async def _handle_send(gw, conn: Connection, user, frame: dict) -> None:
         # sender must NOT receive this frame (the live twin of the history visibility
         # filter). Computed inside the session; applied in-memory by the hub so
         # fanout stays one query, not one-per-connection.
-        exclude = await moderation_service.blocked_pair_user_ids(session, user.id)
+        blocked = await moderation_service.blocked_pair_user_ids(session, user.id)
+        # ...and anyone a stranger's call invite is HELD from (design 21): the live
+        # door that rang an open app. One function for both fanout sites.
+        exclude = await messages_service.live_exclusions(session, row)
         # SNAPSHOT the values the wake needs, INSIDE the session (cage-match #139
         # round 5, Carnot). The scheduling call below happens after this block
         # exits, and reading `channel.id` / `channel.kind` there is an attribute
@@ -250,7 +284,12 @@ async def _handle_send(gw, conn: Connection, user, frame: dict) -> None:
         #
         # Plain values, not `channel`/`row`: this outlives the `async with` session
         # above, and a detached ORM instance raises on attribute access.
+        #
+        # The wake gets the BLOCK set, not the hold's exclusion: its own conduct gate
+        # asks the same `spoke_before` with the same bound (`msg_id`), refuses the
+        # stranger itself, and logs `reason=no_prior_conduct` as it always has.
         push_service.schedule_wake(
             channel_id=wake_channel_id, channel_kind=wake_channel_kind,
-            sender_id=user.id, body=frame["body"], exclude_user_ids=exclude,
+            sender_id=user.id, body=frame["body"], msg_id=row.id,
+            exclude_user_ids=blocked,
         )

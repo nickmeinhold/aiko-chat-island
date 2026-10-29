@@ -36,9 +36,11 @@ def message_frame(msg_view: dict) -> dict:
 
 def retraction_frame(channel_id: str, retraction_id: str, target_msg_id: str) -> dict:
     """Server->client takedown retraction (#7): tells a live subscriber to suppress +
-    remove ``target_msg_id``. ``id`` advances the client's forward watermark exactly
-    like a message id, so a client that later reconnects and catches up via
-    ``get_history`` won't re-request work already applied. Best-effort over the wire —
+    remove ``target_msg_id``. A LIVE retraction frame does not move the client's
+    watermark. A retraction's id advances the client's paging cursor within one
+    history walk; the persisted watermark only ever becomes the subscribe fence (the
+    app tab, read from `chat_repository.dart` 2026-10-29; this said "advances the
+    watermark exactly like a message id" until then). Best-effort over the wire —
     a missed/unsubscribed socket self-heals on the next forward catch-up, because the
     Retraction row is the durable system of record this frame merely mirrors. Same
     shape as the history `retraction` item (messages_service.retraction_view)."""
