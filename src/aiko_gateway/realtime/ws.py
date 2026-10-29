@@ -16,7 +16,6 @@ from ..domain import (
     acl, auth_session, call_hold, echo, mentions, messages_service,
     moderation_service, push_service, signing,
 )
-from ..domain.models import Retraction
 from . import envelopes
 from .hub import Connection
 
@@ -96,21 +95,15 @@ async def _handle_subscribe(conn: Connection, frame: dict, session) -> None:
     # never points at a row history would refuse (→ reconnect-loop hang).
     view = await messages_service.subscribe_view(session, accessible, conn.user_id)
     await conn.send(envelopes.suback({cid: fence for cid, (fence, _) in view.items()}))
-    # (3) A fence capped below a held call invite (design 21) leaves visible rows
-    # above it that the pager will not fetch, so they go out live, after the suback.
-    # Empty unless something is held from this viewer. A duplicate of a row already
-    # delivered live is dedup'd by the client on its id.
-    #
-    # MESSAGES ONLY. `envelopes.retraction_frame` says a retraction's id advances the
-    # client's watermark; a replayed one above the cap would then walk it past the
-    # held invite, which is the stranding the cap exists to prevent. A retraction
-    # also self-heals on the next forward catch-up, so leaving it to the pager costs
-    # nothing.
+    # (3) A fence capped below a held call invite (design 21) leaves visible messages
+    # above it that the pager will not fetch, so they go out live, after the suback,
+    # with the reactions a history read of them would carry. Empty unless something
+    # is held from this viewer; a duplicate of a row already delivered live is
+    # dedup'd by the client on its id. Retractions are not replayed (see
+    # `subscribe_view`): the next history walk delivers them.
     for _, replay in view.values():
-        for row in replay:
-            if not isinstance(row, Retraction):
-                await conn.send(envelopes.message_frame(
-                    messages_service.message_view(row)))
+        for msg_view in await messages_service.message_views(session, replay, conn.user_id):
+            await conn.send(envelopes.message_frame(msg_view))
 
 
 async def _handle_send(gw, conn: Connection, user, frame: dict) -> None:

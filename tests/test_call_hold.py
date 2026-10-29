@@ -151,10 +151,9 @@ async def test_an_agent_is_not_held(session, dm, clock):
     """Conduct is asked of persons; a non-person needs the handset's consent."""
     invite = await _post(session, dm, dm.alice, INVITE, T0, kind="agent")
     assert all((await _doors(session, dm, dm.bob, invite)).values())
-    # The LIVE door separately: the read doors' candidate query also filters on
-    # kind, so they cannot see `_holdable` lose its person check, and the send
-    # path's `held_viewers` has no other guard (found by mutation: the read arm
-    # alone let "persons-only dropped" survive).
+    # The LIVE door separately (the send path's `held_viewers`), so a regression that
+    # only reached one door could not hide behind the other (round 1 found the person
+    # check double-guarded on reads and single on send by mutation).
     assert await call_hold.held_viewers(session, invite) == set()
 
 
@@ -183,19 +182,20 @@ async def test_a_block_made_during_the_hold_wins_over_the_release(session, dm, c
     assert not (await _doors(session, dm, dm.bob, invite))["history"]
 
 
-async def test_the_release_is_anchored_on_a_future_signature(session, dm, clock):
-    """Signed 30 s ahead (inside the cap): the app would ring it until signedAt + 10 s,
-    so the hold runs from the signature, not from arrival."""
-    signed = T0 + 30_000
-    invite = await _post(session, dm, dm.alice, INVITE, T0, origin={"signed_at_ms": signed})
-    assert call_hold.release_at_ms(invite) == signed + call_hold.HOLD_MS
-    clock["ms"] = T0 + call_hold.HOLD_MS + 1   # past arrival + HOLD, before signed + HOLD
-    assert not (await _doors(session, dm, dm.bob, invite))["history"]
-
-
-async def test_an_unsigned_invite_is_anchored_on_arrival(session, dm, clock):
-    invite = await _post(session, dm, dm.alice, INVITE, T0)
-    assert call_hold.release_at_ms(invite) == T0 + call_hold.HOLD_MS
+@pytest.mark.parametrize("signed_ahead_ms", [None, 0, 30_000, -30_000],
+                         ids=["unsigned", "signed-at-arrival", "signed-ahead", "signed-behind"])
+async def test_the_hold_ends_exactly_at_max_signature_receipt_plus_hold(
+        session, dm, clock, signed_ahead_ms):
+    """Held one millisecond before max(signed, receipt) + HOLD, visible at it. Signed
+    ahead (inside the cap), the app would ring until signedAt + 10 s, so the hold runs
+    from the signature; signed behind, from arrival."""
+    origin = None if signed_ahead_ms is None else {"signed_at_ms": T0 + signed_ahead_ms}
+    invite = await _post(session, dm, dm.alice, INVITE, T0, origin=origin)
+    release = max(T0, T0 + (signed_ahead_ms or 0)) + call_hold.HOLD_MS
+    clock["ms"] = release - 1
+    assert not (await _doors(session, dm, dm.bob, invite))["history"], "released early"
+    clock["ms"] = release
+    assert (await _doors(session, dm, dm.bob, invite))["history"], "held past its release"
 
 
 # ------------------------------ the ingest cap ------------------------------- #
@@ -347,3 +347,124 @@ async def test_without_a_hold_the_subscribe_is_unchanged(session, dm, clock):
     assert suback["channel_fences"][dm.channel.id] == invite.id
     assert conn.message_ids() == [], "nothing is replayed when nothing is held"
 
+
+
+# ------------------------- one statement classifies its rows ------------------------ #
+
+def _commit_invite_before_statement(session, dm, n: int):
+    """Make the session commit a stranger's invite just before its n-th statement.
+
+    Carnot, cage-match #445 round 1: the hold was computed by one SELECT and applied by
+    the next, and SQLite under pysqlite runs each SELECT as its own read. An invite that
+    commits between the two is absent from the held set and present in the rows, so
+    REST history (a door that rings the app) served it fresh. The fix is that the
+    statement returning a row also decides whether it is held; this injects the commit
+    between statements to prove no read depends on an earlier one's view.
+    """
+    real = session.execute
+    calls = {"n": 0}
+
+    async def execute(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == n:
+            await _post(session, dm, dm.alice, INVITE, T0)
+        return await real(*args, **kwargs)
+
+    session.execute = execute
+
+
+@pytest.mark.parametrize("n", [2, 3])
+async def test_history_never_serves_an_invite_committed_between_its_statements(
+        session, dm, clock, n):
+    _commit_invite_before_statement(session, dm, n)
+    rows = await messages_service.get_history(session, dm.channel.id, dm.bob.id, limit=50)
+    assert [r.body for r in rows if isinstance(r, Message)] == [], (
+        "a stranger's fresh invite reached history: the hold was decided by a different "
+        "statement from the one that returned the row")
+
+
+@pytest.mark.parametrize("n", [2, 3])
+async def test_the_fence_never_counts_an_invite_committed_between_its_statements(
+        session, dm, clock, n):
+    _commit_invite_before_statement(session, dm, n)
+    fence = await messages_service.latest_ulid(session, dm.channel.id, dm.bob.id)
+    assert fence == "", f"the fence counted a held invite: {fence!r}"
+
+
+# ------------------------------- round-1 fixes ------------------------------- #
+
+@pytest.mark.parametrize("body", [
+    INVITE, END, "hello", INVITE.lower(), INVITE + " ", " " + INVITE,
+    INVITE.replace(CALL_ID, "81JABCDEFGHJKMNPQRSTVWXYZ0"),   # first char above 7
+    INVITE.replace(CALL_ID, "01JABCDEFGHIKMNPQRSTVWXYZ0"),   # I is not Crockford
+    INVITE.replace(CALL_ID, "01JABCDEFGHJKLNPQRSTVWXYZ0"),   # L is not Crockford
+    INVITE.replace(CALL_ID, "01JABCDEFGHJKMNPQRSTVWXYZ"),    # 25 chars
+    INVITE.replace(CALL_ID, "01JABCDEFGHJKMNPQRSTVWXYZ00"),  # 27 chars
+    INVITE.replace(CALL_ID, "01jabcdefghjkmnpqrstvwxyz0"),   # lowercase id
+    "aiko:call/1 · 📞 started a call",
+])
+async def test_the_glob_is_the_parser(session, body):
+    """The SQL hold matches a body by GLOB and the Python door by `parse_call_body`; two
+    encodings of one sentinel must accept exactly the same bytes."""
+    from sqlalchemy import literal, select
+    matched = await session.scalar(select(literal(body).op("GLOB")(call_hold.INVITE_GLOB)))
+    assert bool(matched) is call_hold.is_invite(body), body
+
+
+def test_the_clock_never_runs_backwards(monkeypatch):
+    """An NTP step back must not re-hold a released invite (Tesla, #445 r1)."""
+    wall = iter([2_000_000.0, 1_000_000.0, 3_000_000.0])
+    monkeypatch.setattr(call_hold.time, "time", lambda: next(wall))
+    monkeypatch.setattr(call_hold, "_high_water_ms", 0)
+    readings = [call_hold.now_ms() for _ in range(3)]
+    assert readings == [2_000_000_000, 2_000_000_000, 3_000_000_000]
+
+
+async def test_the_replay_drains_past_a_page(session, dm, clock):
+    """Tesla, #445 r1: a fixed count let a stranger push the tail past the replay."""
+    await _post(session, dm, dm.alice, INVITE, T0)
+    flood = [await _post(session, dm, dm.alice, f"msg {i}", T0 + 10 + i) for i in range(450)]
+    conn = _Conn(dm.bob.id)
+    await _handle_subscribe(conn, {"type": "subscribe", "channel_ids": [dm.channel.id]},
+                            session)
+    assert conn.message_ids() == [m.id for m in flood]
+
+
+async def test_the_replay_carries_the_reactions_history_would(session, dm, clock):
+    from aiko_gateway.domain import reactions_service
+    await _post(session, dm, dm.alice, INVITE, T0)
+    later = await _post(session, dm, dm.alice, "pick up!", T0 + 500)
+    await reactions_service.add_reaction(session, user_id=dm.alice.id,
+                                         message_id=later.id, emoji="👋")
+    await session.commit()
+    conn = _Conn(dm.bob.id)
+    await _handle_subscribe(conn, {"type": "subscribe", "channel_ids": [dm.channel.id]},
+                            session)
+    (frame,) = [f for f in conn.sent if f.get("type") == "message"]
+    assert [r["emoji"] for r in frame["msg"]["reactions"]] == ["👋"], frame
+
+
+async def test_a_release_nobody_hears_reports_zero(session, dm, clock):
+    """Noether, #445 r1: a release reached by no socket must not read as a delivery."""
+    await _post(session, dm, dm.alice, INVITE, T0)
+    clock["ms"] = RELEASED
+    assert await release_once(Hub(), session, after_ms=HELD, upto_ms=RELEASED) == 0
+
+
+# GOLDEN, SHARED WITH aiko_chat_app (`call_invite.dart`), the way test_call_wire_v2's
+# vectors are: the repos cannot import each other, so both suites pin the same numbers.
+# If the app widens its freshness window, this hold can silently become too short to
+# outlast it; change them only together.
+APP_CALL_INVITE_FRESHNESS_MS = 10_000      # kCallInviteFreshness
+APP_CALL_INVITE_SKEW_TOLERANCE_MS = 5_000  # kCallInviteClockSkewTolerance
+
+
+def test_the_hold_outlasts_the_apps_freshness_with_the_documented_margin():
+    """Released at signedAt + HOLD, an invite rings an app whose clock lags the
+    island's by more than HOLD - freshness. Design 21 promises 50 s of that margin
+    and a release after the 30 s ring ceiling."""
+    from aiko_gateway.domain.push_result import RING_CEILING_SECONDS
+    assert call_hold.HOLD_MS - APP_CALL_INVITE_FRESHNESS_MS >= 50_000
+    assert call_hold.HOLD_MS >= RING_CEILING_SECONDS * 1000
+    # The ingest cap must not refuse what the app would still ring.
+    assert call_hold.FUTURE_CAP_MS >= APP_CALL_INVITE_SKEW_TOLERANCE_MS

@@ -180,8 +180,9 @@ import re
 from collections.abc import Callable, Sequence
 from typing import Literal, assert_never
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, exists, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from ..config import settings
 from ..db import SessionLocal
@@ -1201,12 +1202,22 @@ async def _wake_user(session: AsyncSession, user_id: str, *, wake: WakeKind,
         await session.commit()
 
 
+def prior_post(*, channel_id, author_id, before_id):
+    """SQL: `author_id` has a message row in `channel_id` whose id is below
+    `before_id`. THE ONE DEFINITION OF PRIOR CONDUCT: the wake gate (`spoke_before`,
+    below) and the invite hold (`call_hold.held_clause`, design 21) both ask this
+    fragment, so they cannot disagree about who is a stranger. Arguments may be
+    values or columns; the hold passes the candidate row's own columns, so the
+    statement that reads the row also decides its conduct.
+    """
+    p = aliased(Message)
+    return exists().where(p.channel_id == channel_id, p.sender_user_id == author_id,
+                          p.id < before_id)
+
+
 async def spoke_before(session: AsyncSession, *, channel_id: str,
                        user_ids: list[str], before_id: str) -> set[str]:
-    """Of these users, the ones with a message row in this channel whose id is
-    below `before_id`. The ONE definition of prior conduct: the wake gate below
-    and the invite hold (`call_hold`, design 21) both ask it, so they cannot
-    disagree about who is a stranger.
+    """Of these users, the ones `prior_post` says had posted here before `before_id`.
 
     BOUNDED BY THE INVITE'S OWN ID, not by the moment of asking. The wake runs on
     a background task a few milliseconds after the write; "has this user ever
@@ -1214,19 +1225,12 @@ async def spoke_before(session: AsyncSession, *, channel_id: str,
     wake would ring a handset whose history then holds the invite. Order is also
     what makes the hold re-derivable: a reply AFTER the invite never releases it.
 
-    Soft-deleted rows count (see `_spoken_here`). No logging: this is a predicate,
-    and the read paths call it on every history page.
+    Soft-deleted rows count (see `_spoken_here`). No logging: this is a predicate;
+    `_spoken_here` logs for the wake. The read paths don't call this, they put
+    `prior_post` inside their own statement (`call_hold.held_clause`).
     """
-    if not user_ids:
-        return set()
-    rows = (await session.execute(
-        select(Message.sender_user_id)
-        .where(Message.channel_id == channel_id,
-               Message.sender_user_id.in_(user_ids),
-               Message.id < before_id)
-        .distinct()
-    )).scalars().all()
-    return {r for r in rows if r is not None}
+    return {u for u in user_ids if await session.scalar(select(prior_post(
+        channel_id=channel_id, author_id=u, before_id=before_id)))}
 
 
 async def _spoken_here(session: AsyncSession, *, channel_id: str,

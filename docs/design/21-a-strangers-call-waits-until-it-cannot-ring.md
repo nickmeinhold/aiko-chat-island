@@ -1,9 +1,11 @@
 # Design 21: a stranger's call waits until it can't ring
 
-**Status: v2, BUILT, UN-TEMPERED.** v1 was written 2026-10-29 before any code. v2
-folds in the app tab's answers to the three questions v1 asked (same day, read from
-its main). Answer 1 corrected v1's model of the residual and supplied the fence cap.
-The independent strike is the PR's cage-match, which this trust boundary requires.
+**Status: v3, BUILT, cage-match round 2 pending.** v1 was written 2026-10-29 before
+any code. v2 folded in the app tab's answers to the three questions v1 asked (same
+day, read from its main); answer 1 corrected v1's model of the residual and supplied
+the fence cap. v3 folds round 1 of the PR's cage-match (#445: 3/3 REQUEST_CHANGES, ten
+findings, eight real), most importantly that the hold is decided **inside the statement
+that reads the row** (below).
 It answers the island half of the app tab's design 25 temper (aiko_chat_app#444,
 `docs/design/25-TEMPER.md`, Disposition), which moved this fix here from the app.
 
@@ -111,17 +113,33 @@ clients, and for federation later.
 **One predicate.** `get_history`, `latest_ulids` and both `last_visible_message`
 variants already share `moderation_service.not_blocked_predicate`, and the fence's
 docstring explains why they must: the reconnect pager runs until `cursor >= fence`.
-The hold becomes part of that shared predicate (one `visible_predicate(viewer,
-channel_ids, now)`), and `visible_message` applies the same rule. **Visibility only
+The hold becomes part of that shared predicate (`messages_service._visible`), and
+`visible_message` reads through the same predicate in one statement. **Visibility only
 grows over time under the hold** (held → released, never the reverse), so the
 documented shrink race between fence and pager gets no new case.
 
-The predicate is built in two steps, deliberately. First, one candidate query over the
-PK range picks out human-sent DM rows that `R` didn't author, with no earlier post by
-`R`. Then the **one parser** (`parse_call_body`) and `release_at` refine those
-candidates in Python, and the read applies `Message.id NOT IN (held)`. A SQL `LIKE`
-could only approximate the call/2 regex. The extra query is a two-minute PK range over
-the viewer's DMs, and it's almost always empty.
+**The statement that returns a row decides whether it is held (v3).** v2 computed
+the held set in one SELECT and applied it as `NOT IN (held)` in the next. Under
+pysqlite each SELECT is its own read, so an invite that committed between the two
+was missing from the set and present in the rows. REST history, a door that rings
+the app, served it fresh (Carnot, round 1; measured red by injecting the commit
+between statements). This repo's rule for writes ("fold the predicate into the
+write") holds for a read that *is* the boundary. So the hold is one SQL clause,
+`call_hold.held_clause`, correlated on the row being read:
+- the body matches `INVITE_GLOB`, a case-sensitive whole-string GLOB derived from
+  `CALL_ID_PATTERN` and pinned against `parse_call_body` by a test corpus;
+- conduct is `push_service.prior_post`, the same SQL fragment the wake gate asks;
+- the time is pure string comparison on the ULID id. `receipt + HOLD > now` is
+  `id >= ulid_floor(now − HOLD + 1)`, and `signed + HOLD > now` reads the JSON field.
+  Nothing is decoded, so nothing can raise on a malformed id.
+
+The send exclusion (`held_viewers`) and the sweeper (`due_releases`) ask the same
+clause, so there is one definition of "held", not a SQL one and a Python one.
+
+**The clock never runs backwards (v3).** Expiry is an absolute instant. A backward
+step of the wall clock (an NTP correction) would re-hold a released invite, which
+would *shrink* visibility and hang a pager whose fence already names it (Tesla, round
+1). `call_hold.now_ms` is a process-wide high-water mark of wall time.
 
 ## Delivering it late (the missed call)
 
@@ -133,10 +151,12 @@ with an older id slots into place by id order, and the app refuses to ring it as
 section.)
 
 **A release sweeper, not a timer per invite.** One background task runs every 2 s. It
-re-runs the candidate query for invites whose `release_at` falls in `(last_sweep, now]`
-and sends each one's `message_frame` to the held recipients' connections that are
-subscribed to that channel. Before sending, it re-checks visibility, so a block made
-during the hold wins.
+finds invites held from someone at the last tick and not at this one (the same
+`held_clause` at two instants) and sends each recipient their own view, reactions
+included, on their connections subscribed to that channel. A block made during the
+hold wins. It returns, and logs, the number of **connections** reached, so "nobody was
+listening" never reads as a delivery (Noether, round 1). A failing tick retries its
+window, clamped to five minutes so it can't grow without bound.
 - **Restart-safe by construction.** Its input is the database and the clock, so a hold
   that spans a restart is found again; there are no timers to lose. On boot it starts at
   `now`, because no socket is connected yet to receive what fell due while the island
@@ -170,18 +190,23 @@ everything above the fence as live and never pages it. So a device that missed L
 offline would not get L from the pager either. In first contact the call is the DM's
 first row, the cap is `""`, and nothing is paged at all. Right after the `suback`, the
 subscribe sends this connection the rows above the cap that R can see (L, never I) as
-ordinary `message` frames. The app inserts a live frame by id whatever the fence says,
-and dedups on the id (app tab, answer 3). **Messages only:** `envelopes.retraction_frame`
-says a retraction's id advances the watermark. Replaying one above the cap would then
-walk the watermark past I, which is the exact stranding the cap prevents. A retraction
-heals on the next forward catch-up anyway.
+ordinary `message` frames, **all of them, drained page by page with no count limit**
+(Tesla, round 1: a fixed count let a stranger push the tail past it; the hold window
+already bounds it), each carrying the reaction aggregate a history read would (the
+same `message_views` builder history uses). The app inserts a live frame by id
+whatever the fence says, and dedups on the id (app tab, answer 3). **Messages only.**
+v2 justified that by `envelopes.retraction_frame`'s claim that a retraction's id
+advances the watermark. The app tab read its code: a live retraction never moves the
+watermark, which only ever becomes the subscribe fence. So the justification was
+wrong, and that docstring is corrected. Retractions stay out because they heal on the
+next history walk and a live one only removes.
+
+**One statement decides both the fence and the cap** (v3), per channel. So the cap
+cannot be computed against a different snapshot from the fence it caps (the same
+class as above).
 
 ## Residuals, named
 
-- **More than 100 visible rows above the cap** (`SUBSCRIBE_REPLAY_LIMIT`), all within a
-  couple of minutes of a held invite. The excess reaches that device on its first
-  reconnect after release, because the watermark is still below I. That's delayed, not
-  lost.
 - **A recipient whose clock runs more than 50 s behind the island's** can still be rung
   by the release frame. The app already accepts the mirror tradeoff for senders ("a peer
   whose clock is >10 s off never rings us").

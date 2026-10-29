@@ -180,8 +180,9 @@ async def list_blocks(session: AsyncSession, blocker_id: str) -> list[dict]:
 # --- blocks: enforcement helpers --------------------------------------------
 
 
-def not_blocked_predicate(viewer_id: str):
-    """SQL predicate: this `Message` is NOT hidden from `viewer_id` by a block.
+def not_blocked_predicate(viewer_id: str, m=Message):
+    """SQL predicate: this `Message` (or the alias `m` of it) is NOT hidden from
+    `viewer_id` by a block.
 
     Mutual: a message authored by S is hidden from viewer V if a block exists in
     EITHER direction between V and S. A correlated NOT EXISTS so it composes into
@@ -194,11 +195,11 @@ def not_blocked_predicate(viewer_id: str):
         or_(
             and_(
                 UserBlock.blocker_user_id == viewer_id,
-                UserBlock.blocked_user_id == Message.sender_user_id,
+                UserBlock.blocked_user_id == m.sender_user_id,
             ),
             and_(
                 UserBlock.blocked_user_id == viewer_id,
-                UserBlock.blocker_user_id == Message.sender_user_id,
+                UserBlock.blocker_user_id == m.sender_user_id,
             ),
         )
     )

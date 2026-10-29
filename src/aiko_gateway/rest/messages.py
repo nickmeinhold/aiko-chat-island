@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Query
 
-from ..domain import acl, messages_service, moderation_service, reactions_service
+from ..domain import acl, messages_service
 from ..domain.models import Message
 from .deps import CurrentUser, DbSession
 
@@ -31,10 +31,8 @@ async def get_message(
     msg = await messages_service.visible_message(session, user.id, message_id)
     if msg is None:
         raise HTTPException(404, "message not found")
-    blocked = await moderation_service.blocked_pair_user_ids(session, user.id)
-    aggregate = await reactions_service.aggregate_for_messages(
-        session, [msg.id], user.id, blocked_user_ids=blocked)
-    return messages_service.message_view(msg, reactions=aggregate.get(msg.id))
+    (view,) = await messages_service.message_views(session, [msg], user.id)
+    return view
 
 
 @router.get("/channels/{channel_id}/messages")
@@ -63,10 +61,10 @@ async def history(
     # message_view. The SAME block predicate that gates the live `reaction` frame's
     # fanout, so history and live agree (no count oracle). Retraction items are
     # content-less events with no reactions.
-    msg_ids = [r.id for r in rows if isinstance(r, Message)]
-    blocked = await moderation_service.blocked_pair_user_ids(session, user.id)
-    reactions = await reactions_service.aggregate_for_messages(
-        session, msg_ids, user.id, blocked_user_ids=blocked)
+    # Built by `messages_service.message_views`, the one builder the subscribe replay
+    # and the call release also use, so a row reads the same through every door.
+    views = {v["msg_id"]: v for v in await messages_service.message_views(
+        session, [r for r in rows if isinstance(r, Message)], user.id)}
     # Heterogeneous stream (#7): message items AND takedown `retraction` items,
     # interleaved in ULID order. Both advance next_before/next_after (each row has an
     # `id` on the shared axis), so a client paging forward from its watermark receives
@@ -74,8 +72,7 @@ async def history(
     # (wire contract option A) so the app disambiguates by a single `type` field;
     # message_view stays untyped, keeping the WS/bus fanout shape unchanged.
     items = [
-        {"type": "message",
-         **messages_service.message_view(r, reactions=reactions.get(r.id))}
+        {"type": "message", **views[r.id]}
         if isinstance(r, Message)
         else messages_service.retraction_view(r)
         for r in rows
