@@ -180,8 +180,9 @@ import re
 from collections.abc import Callable, Sequence
 from typing import Literal, assert_never
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, exists, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from ..config import settings
 from ..db import SessionLocal
@@ -1201,9 +1202,41 @@ async def _wake_user(session: AsyncSession, user_id: str, *, wake: WakeKind,
         await session.commit()
 
 
+def prior_post(*, channel_id, author_id, before_id):
+    """SQL: `author_id` has a message row in `channel_id` whose id is below
+    `before_id`. THE ONE DEFINITION OF PRIOR CONDUCT: the wake gate (`spoke_before`,
+    below) and the invite hold (`call_hold.held_clause`, design 21) both ask this
+    fragment, so they cannot disagree about who is a stranger. Arguments may be
+    values or columns; the hold passes the candidate row's own columns, so the
+    statement that reads the row also decides its conduct.
+    """
+    p = aliased(Message)
+    return exists().where(p.channel_id == channel_id, p.sender_user_id == author_id,
+                          p.id < before_id)
+
+
+async def spoke_before(session: AsyncSession, *, channel_id: str,
+                       user_ids: list[str], before_id: str) -> set[str]:
+    """Of these users, the ones `prior_post` says had posted here before `before_id`.
+
+    BOUNDED BY THE INVITE'S OWN ID, not by the moment of asking. The wake runs on
+    a background task a few milliseconds after the write; "has this user ever
+    posted?" asked there would count a reply that landed inside that gap, and the
+    wake would ring a handset whose history then holds the invite. Order is also
+    what makes the hold re-derivable: a reply AFTER the invite never releases it.
+
+    Soft-deleted rows count (see `_spoken_here`). No logging: this is a predicate;
+    `_spoken_here` logs for the wake. The read paths don't call this, they put
+    `prior_post` inside their own statement (`call_hold.held_clause`).
+    """
+    return {u for u in user_ids if await session.scalar(select(prior_post(
+        channel_id=channel_id, author_id=u, before_id=before_id)))}
+
+
 async def _spoken_here(session: AsyncSession, *, channel_id: str,
-                       user_ids: list[str]) -> list[str]:
-    """Of these recipients, the ones who have POSTED in this channel before.
+                       user_ids: list[str], before_id: str) -> list[str]:
+    """Of these recipients, the ones who had POSTED in this channel before the
+    message `before_id` (`spoke_before`).
 
     Gate 7. A wake reaches only someone who has already spoken here
     (claude-tasks#4216) — before it, any authenticated user could open a DM with
@@ -1223,8 +1256,11 @@ async def _spoken_here(session: AsyncSession, *, channel_id: str,
     channel. Consequence worth knowing: Nick messages Dreamfinder, so Dreamfinder
     may ring Nick — an agent need never have posted.
 
-    IT GATES THE WAKE, NEVER THE INVITE. A connected recipient still receives the
-    invite frame; what stops is the cold-start ring, which is the harm.
+    IT GATES THE WAKE; THE INVITE IS HELD ELSEWHERE. This used to read "never the
+    invite": a connected recipient still received the frame, and an open app rang
+    it. Since design 21 the invite itself is held from a stranger on every door
+    until it is too old to ring (`call_hold`), asking `spoke_before` with the same
+    bound, so the wake and the hold share one definition of a stranger.
 
     IT SURVIVES E2EE AND `should_wake` DOES NOT — this reads who posted where,
     never content, which the island still knows once MLS lands (#1962).
@@ -1239,13 +1275,8 @@ async def _spoken_here(session: AsyncSession, *, channel_id: str,
     """
     if not user_ids:
         return []
-    rows = (await session.execute(
-        select(Message.sender_user_id)
-        .where(Message.channel_id == channel_id,
-               Message.sender_user_id.in_(user_ids))
-        .distinct()
-    )).scalars().all()
-    spoken = {r for r in rows if r is not None}
+    spoken = await spoke_before(session, channel_id=channel_id, user_ids=user_ids,
+                                before_id=before_id)
     for user_id in user_ids:
         if user_id not in spoken:
             # INFO, not WARNING: this is the gate working, not a fault. It names
@@ -1256,8 +1287,16 @@ async def _spoken_here(session: AsyncSession, *, channel_id: str,
 
 
 async def wake_for_message(*, channel_id: str, channel_kind: ChannelKindStr, sender_id: str,
-                           body: str, exclude_user_ids: set[str]) -> None:
+                           body: str, msg_id: str, exclude_user_ids: set[str]) -> None:
     """Wake the other DM member's devices for an accepted call invitation.
+
+    `msg_id` is the persisted invite's own id: the conduct gate's bound
+    (`spoke_before`). It is caller-supplied, so here is what a wrong one costs.
+    A LATER id widens the gate back toward "ever posted" (the rule before design
+    21), which reopens only the write-to-wake race the bound exists to close: a
+    reply inside that gap would ring a handset whose history holds the invite. An
+    EARLIER id narrows it, which fails closed. The one caller passes the row it
+    just wrote.
 
     Takes PLAIN VALUES, never ORM instances. The caller's session is already
     closed by the time this runs, and a detached instance would raise on the
@@ -1302,7 +1341,8 @@ async def wake_for_message(*, channel_id: str, channel_kind: ChannelKindStr, sen
             # silent recipient has to remove this line deliberately, which is a
             # decision someone makes rather than one they inherit.
             recipients = await _spoken_here(
-                session, channel_id=channel_id, user_ids=recipients)
+                session, channel_id=channel_id, user_ids=recipients,
+                before_id=msg_id)
             # The call id comes from the SAME parser the gate just used; `wake` is
             # not None here, so the body parsed.
             payload = WakePayload(channel_id=channel_id, kind=wake,
@@ -1335,7 +1375,7 @@ async def wake_for_message(*, channel_id: str, channel_kind: ChannelKindStr, sen
 
 
 def schedule_wake(*, channel_id: str, channel_kind: ChannelKindStr, sender_id: str,
-                  body: str, exclude_user_ids: set[str]) -> None:
+                  body: str, msg_id: str, exclude_user_ids: set[str]) -> None:
     """Fire-and-forget the wake. THE SEND PATH MUST NOT WAIT ON APPLE.
 
     A push is a round trip to Apple's servers. Awaiting it inline would put that
@@ -1368,7 +1408,7 @@ def schedule_wake(*, channel_id: str, channel_kind: ChannelKindStr, sender_id: s
         return
     coro = wake_for_message(
         channel_id=channel_id, channel_kind=channel_kind, sender_id=sender_id,
-        body=body, exclude_user_ids=exclude_user_ids)
+        body=body, msg_id=msg_id, exclude_user_ids=exclude_user_ids)
     try:
         task = asyncio.create_task(coro)
     except RuntimeError:

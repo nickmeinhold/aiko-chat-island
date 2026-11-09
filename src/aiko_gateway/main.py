@@ -35,8 +35,7 @@ from . import build_info, log_redaction
 from .config import settings
 from .db import SessionLocal, verify_schema
 from .worker_guard import acquire_single_worker_lock, release_single_worker_lock
-from .domain import (apns, channels_service, echo, messages_service,
-                     moderation_service)
+from .domain import apns, channels_service, echo, messages_service
 from .realtime.hub import Hub
 
 logging.basicConfig(level=logging.INFO)
@@ -82,9 +81,13 @@ class GatewayState:
                 # user (sender_user_id set) — that human's blocks apply to live
                 # delivery just as on the send path. An external actor (NULL
                 # sender) has no block relationships, so the set is empty.
+                #
+                # Through the same exclusion function as the WS send path, so a held
+                # call invite (design 21) is excluded here too. A DM never rides the
+                # bus, so today that half is always empty: one door, not a live gate.
                 exclude = (
-                    await moderation_service.blocked_pair_user_ids(session, row.sender_user_id)
-                    if row and row.sender_user_id else set()
+                    await messages_service.live_exclusions(session, row)
+                    if row else set()
                 )
             if row:
                 log.info("ingest %s in %s: %s", row.id, msg.channel, msg.message)
@@ -226,6 +229,10 @@ async def lifespan(app: FastAPI):
         from .domain import push_service as _push  # lazy: see the aclose() note
         async with SessionLocal() as _session:
             await _push.warn_if_unreachable(_session)
+            # The message axis must start above what is stored (design 21: id order is
+            # conduct order, and a clock that stepped back across this restart would
+            # otherwise mint below it).
+            await messages_service.seed_message_axis(_session)
         # No independent seeding: channels are reconciled from the ChatServer
         # `channel_list` EC share once the bus client discovers it. An inbound
         # message for a not-yet-reconciled channel is upserted by persist_inbound

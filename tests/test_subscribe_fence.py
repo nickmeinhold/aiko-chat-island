@@ -181,10 +181,15 @@ async def test_no_message_lost_in_the_subscribe_effectiveness_gap(session, monke
     conn = _RecordingConn()
     hub.register(conn)
 
-    real_latest = messages_service.latest_ulid
+    # THE SEAM IS THE FENCE READ, wherever the route does it. It was `latest_ulid`
+    # until design 21 routed the subscribe through `subscribe_view` (the fence can be
+    # capped below a held call invite); patching a function the route no longer
+    # calls would inject nothing and test nothing.
+    real_view = messages_service.subscribe_view
 
-    async def latest_then_inject(sess, channel_id, viewer_id):
-        fence = await real_latest(sess, channel_id, viewer_id)  # fence read (..3)
+    async def view_then_inject(sess, channel_ids, viewer_id):
+        view = await real_view(sess, channel_ids, viewer_id)  # fence read (..3)
+        (channel_id,) = channel_ids
         # A brand-new message arrives AFTER the fence read — the racy window.
         row = Message(id=_ulid(4), channel_id=channel_id, sender_kind="human",
                       body="msg 4", created_at=_now() + dt.timedelta(seconds=4))
@@ -192,9 +197,9 @@ async def test_no_message_lost_in_the_subscribe_effectiveness_gap(session, monke
         await sess.commit()
         await hub.fanout(channel_id, envelopes.message_frame(
             messages_service.message_view(row)))
-        return fence
+        return view
 
-    monkeypatch.setattr(messages_service, "latest_ulid", latest_then_inject)
+    monkeypatch.setattr(messages_service, "subscribe_view", view_then_inject)
 
     await _handle_subscribe(conn, {"type": "subscribe", "channel_ids": [cid]}, session)
 
