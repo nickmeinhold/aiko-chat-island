@@ -1,0 +1,97 @@
+{
+  "GET /.well-known/apple-app-site-association": {
+    "webcredentials": {
+      "apps": {
+        "list of": [
+          "string"
+        ]
+      }
+    }
+  },
+  "GET /.well-known/assetlinks.json": {
+    "list of": [
+      {
+        "relation": {
+          "list of": [
+            "string"
+          ]
+        },
+        "target": {
+          "namespace": "string",
+          "package_name": "string",
+          "sha256_cert_fingerprints": {
+            "list of": [
+              "string"
+            ]
+          }
+        }
+      }
+    ]
+  },
+  "GET /capabilities": {
+    "carriage": {
+      "origin": "bool"
+    }
+  },
+  "GET /health": {
+    "aiko_connected": "bool",
+    "build": {
+      "aiko_chat_ref": "null",
+      "aiko_services_ref": "null",
+      "built_at": "null",
+      "git_sha": "null",
+      "ref": "null"
+    },
+    "push": {
+      "configured": "bool",
+      "devices_unreachable": "bool"
+    },
+    "status": "string"
+  },
+  "GET /v1/auth/providers": {
+    "providers": {
+      "list of": [
+        {
+          "creates_accounts": "bool",
+          "display_name": "string",
+          "kind": "string",
+          "slug": "string"
+        }
+      ]
+    }
+  },
+  "GET /v1/gateways": {
+    "gateways": {
+      "list of": [
+        {
+          "base_url": "string",
+          "display_name": "string",
+          "id": "string"
+        }
+      ]
+    }
+  },
+  "GET /v1/island": {
+    "alg": "string",
+    "base_url": "string",
+    "display_name": "string",
+    "id": "string",
+    "island_pubkey": "string",
+    "key_version": "number",
+    "mode": "string",
+    "signature": "string",
+    "signed_at_ms": "number",
+    "v": "number"
+  },
+  "GET /v1/islands": {
+    "islands": {
+      "list of": [
+        {
+          "base_url": "string",
+          "display_name": "string",
+          "id": "string"
+        }
+      ]
+    }
+  }
+}

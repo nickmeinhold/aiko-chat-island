@@ -42,6 +42,14 @@ expressed via behaviour, robust to FastAPI internal refactors.
 """
 from __future__ import annotations
 
+import base64
+import json
+import os
+import secrets
+import subprocess
+import sys
+from pathlib import Path
+
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
@@ -175,3 +183,93 @@ def test_main_mounts_auth_only_through_include_auth_routers():
     for line in source.splitlines():
         if "include_router(" in line:
             assert "auth" not in line, f"main.py mounts an auth router directly: {line.strip()}"
+
+
+# --- the frozen wire contract (Dart port step 1, docs/crucible/dart-port §2.6) -- #
+
+CONTRACT_DIR = Path(__file__).resolve().parent.parent / "contract"
+
+# What PRODUCTION serves, asked of production itself. Every value is a throwaway that
+# satisfies one of the production boot guards, not a setting under test: this suite
+# imports `main` once under ENVIRONMENT=test, which mounts the dev-only password door,
+# so the only honest way to see production's route table is a process that IS
+# production. The bus points at a dead port and the update nudge is off, so the child
+# never reaches the network. A new guard fails this test loudly, with its own refusal.
+_PRODUCTION_ENV = {
+    "ENVIRONMENT": "production",
+    "PASSKEY_ENABLED": "true",
+    "MODERATOR_USER_IDS": '["contract-placeholder"]',
+    "CSAM_RUNBOOK_ACKNOWLEDGED": "true",
+    "ISLAND_UPDATE_NUDGE": "off",
+    "AIKO_MQTT_HOST": "127.0.0.1",
+    "AIKO_MQTT_PORT": "9",
+}
+
+_DUMP_CONTRACT = """
+import json, sys
+from aiko_gateway.main import app
+
+def flat(routes):
+    # FastAPI >= 0.116 mounts an included router lazily (`_IncludedRouter`, real
+    # routes under `.original_router`), so the parent's list is not flat.
+    for r in routes:
+        inner = getattr(getattr(r, "original_router", None), "routes", None)
+        if inner is not None:
+            yield from flat(inner)
+        else:
+            yield r
+
+json.dump({
+    "openapi": app.openapi(),
+    "websockets": sorted({r.path for r in flat(app.routes)
+                          if type(r).__name__ in ("WebSocketRoute", "APIWebSocketRoute")}),
+}, sys.stdout)
+"""
+
+
+def _serialise(obj) -> str:
+    return json.dumps(obj, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+
+
+def test_the_frozen_contract_is_what_production_serves(tmp_path):
+    """`contract/openapi.json` is the cross-tab wire contract and the Dart gateway's
+    target (§2.6), so it must be exactly what production serves today. FastAPI does
+    not document WebSocket routes, so they are frozen beside it in
+    `contract/websockets.json`: without that file a new socket route would be
+    invisible to the journeys' orphan check.
+
+    Regenerate after a deliberate wire change with
+    `UPDATE_CONTRACT=1 pytest tests/test_main_routes.py -k frozen_contract`, and tell
+    the app tab: the diff IS the wire change. Checked against both live islands on
+    2026-11-10 (59 paths, byte-equal as JSON)."""
+    env = {"PATH": os.environ.get("PATH", ""), **_PRODUCTION_ENV,
+           "JWT_SECRET": secrets.token_hex(32),
+           "ISLAND_SIGNING_SEED": base64.urlsafe_b64encode(
+               secrets.token_bytes(32)).rstrip(b"=").decode()}
+    # cwd=tmp_path: Settings reads `.env` from the working directory, and a
+    # developer's dev `.env` must not leak into what "production" means.
+    proc = subprocess.run([sys.executable, "-c", _DUMP_CONTRACT], env=env,
+                          cwd=tmp_path, capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, f"production refused to build its app:\n{proc.stderr[-3000:]}"
+    served = json.loads(proc.stdout)
+
+    files = {"openapi.json": served["openapi"], "websockets.json": served["websockets"]}
+    if os.environ.get("UPDATE_CONTRACT") == "1":
+        CONTRACT_DIR.mkdir(exist_ok=True)
+        for name, obj in files.items():
+            (CONTRACT_DIR / name).write_text(_serialise(obj), encoding="utf-8")
+        return
+
+    for name, obj in files.items():
+        frozen = (CONTRACT_DIR / name).read_text(encoding="utf-8")
+        if frozen == _serialise(obj):
+            continue
+        detail = ""
+        if name == "openapi.json":
+            old, new = json.loads(frozen)["paths"], obj["paths"]
+            detail = (f"\n  added:   {sorted(set(new) - set(old))}"
+                      f"\n  removed: {sorted(set(old) - set(new))}"
+                      f"\n  changed: {sorted(p for p in set(old) & set(new) if old[p] != new[p])}")
+        pytest.fail(f"contract/{name} is not what production serves.{detail}\n"
+                    "If the change is deliberate, regenerate with UPDATE_CONTRACT=1 "
+                    "(see this test's docstring) and tell the app tab.")

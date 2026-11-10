@@ -1,0 +1,4 @@
+tags:
+  gateway:
+    # Boots a real Python gateway: needs the island package and aiko_services importable.
+    timeout: 3x
