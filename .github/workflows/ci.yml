@@ -56,6 +56,52 @@ jobs:
         run: dart format --output=none --set-exit-if-changed .
         working-directory: deploy/dart
 
+  # The Dart port's oracle (docs/crucible/dart-port/DESIGN.md §2.2, step 1): journeys
+  # driven over the real wire against a real gateway, born from the seed and booted
+  # under production settings the way the image does it. The bus libraries are
+  # installed at the IMAGE's pins (Dockerfile ARGs), because the oracle's job is to
+  # say what production does; bus-e2e's unpinned checkouts are step 0(a)'s to fix.
+  journeys:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: gateway
+      - name: Checkout aiko_services at the image's pin
+        uses: actions/checkout@v4
+        with:
+          repository: geekscape/aiko_services
+          ref: a66424db76c5bf8f11adfed456cf3a135baf7494 # Dockerfile AIKO_SERVICES_REF
+          path: aiko_services
+      - name: Checkout aiko_chat at the image's pin
+        uses: actions/checkout@v4
+        with:
+          repository: nickmeinhold/aiko_chat
+          ref: 3e4e822b65b7e222920642c420661fb0c1e93bb6 # Dockerfile AIKO_CHAT_REF
+          path: aiko_chat
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: |
+          pip install -e ./aiko_services
+          pip install -e ./aiko_chat
+          pip install -e ./gateway
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: '3.13.0'
+      - run: dart pub get
+        working-directory: gateway/journeys
+      - run: dart analyze --fatal-infos
+        working-directory: gateway/journeys
+      - name: Journeys
+        working-directory: gateway/journeys
+        env:
+          ISLAND_PYTHON: python
+        run: dart test
+      - name: Formatting
+        run: dart format --output=none --set-exit-if-changed .
+        working-directory: gateway/journeys
+
   # Key-free verification of the committed encrypted island config. Runs on every push
   # because the artifacts sit in a PUBLIC repo permanently: a dropped recipient or an
   # added one is invisible in a binary diff, and a plaintext slip cannot be un-pushed.

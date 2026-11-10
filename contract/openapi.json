@@ -1,0 +1,3743 @@
+{
+  "components": {
+    "schemas": {
+      "AddMemberReq": {
+        "properties": {
+          "can_post": {
+            "default": true,
+            "title": "Can Post",
+            "type": "boolean"
+          },
+          "role": {
+            "$ref": "#/components/schemas/Role",
+            "default": "member"
+          },
+          "user_id": {
+            "title": "User Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id"
+        ],
+        "title": "AddMemberReq",
+        "type": "object"
+      },
+      "ApnsEnvironment": {
+        "description": "Closed set of APNs environments (#3386) — which WORLD a push credential\nbelongs to. Same single-source-of-truth pattern as Platform: drives the DB\nCHECK on device_tokens.apns_environment via _in_check.\n\nApple runs two independent push services. A token minted by a development\nbuild is valid ONLY against api.sandbox.push.apple.com; a TestFlight or App\nStore build's token ONLY against api.push.apple.com. The same token string\nagainst the wrong host is a 400 BadDeviceToken and nothing else — and a token\ncarries no marking that distinguishes them (see apns._verdict), so this can\nnever be inferred server-side. The CLIENT declares it; the island stores it.\n\nNAMED apns_environment on two independent grounds. It is what #3386's body\nspecified, and that is the controlling authority (v0.8.0 shipped\n`push_environment` off a later ticket COMMENT; migration 0024 reconciles it —\nNick's ruling 2026-08-26). It is also the more honest of the two: the split is\nan APNs fact, not a push fact — the `.p8` is environment-agnostic and FCM has\nno such division at all, so a name claiming the whole push domain describes\nsomething no other transport has. aiko_chat_app carries the same name end to\nend — wire key, enum (`ApnsEnvironment`), and file — as of their PR#162, merged\n2026-08-29 (`47bc2ec`). Recorded as a FACT rather than the agreement this\nsentence used to hedge, because they renamed against this island's live\n/openapi.json rather than either side's recollection, and both halves have now\nverified the served contract independently.\n\nNOT shortened to `environment`: Settings.environment is the DEPLOYMENT\nenvironment and shares the literal value 'production' with this closed set\nwhile meaning something entirely unrelated. Two meanings and one word,\ncolliding in a send path that already imports settings, is a bug waiting for a\ntired reader.\n\nINERT FOR FCM. The column is NOT NULL for every platform because a CHECK\nalone cannot close a set against NULL, but Firebase has no environment split\n— an 'fcm' row simply carries whichever default it registered under and no\ncode reads it. A conditional constraint would be machinery bought to express\n\"this field means nothing over here\"; the sentence does the job.",
+        "enum": [
+          "sandbox",
+          "production"
+        ],
+        "title": "ApnsEnvironment",
+        "type": "string"
+      },
+      "Approval": {
+        "properties": {
+          "approver_pubkey": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Approver Pubkey",
+            "type": "string"
+          },
+          "sig": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Sig",
+            "type": "string"
+          }
+        },
+        "required": [
+          "approver_pubkey",
+          "sig"
+        ],
+        "title": "Approval",
+        "type": "object"
+      },
+      "CallOccupancyResponse": {
+        "description": "Present-tense truth about a channel's call (#3159).\n\nCOUNT ONLY, deliberately: the ring needs \"is this call still happening\", not \"who is\nin it\". Returning identities would make this a presence probe for any channel member\n— a strictly larger disclosure than the ring requires, on an endpoint the app polls\nonce a second. The app tab specified it this way and the island agrees.",
+        "properties": {
+          "live": {
+            "title": "Live",
+            "type": "boolean"
+          },
+          "participants": {
+            "title": "Participants",
+            "type": "integer"
+          },
+          "since": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Since"
+          }
+        },
+        "required": [
+          "live",
+          "participants"
+        ],
+        "title": "CallOccupancyResponse",
+        "type": "object"
+      },
+      "CreateChannelReq": {
+        "properties": {
+          "is_private": {
+            "default": false,
+            "title": "Is Private",
+            "type": "boolean"
+          },
+          "join_policy": {
+            "$ref": "#/components/schemas/JoinPolicy",
+            "default": "invite_only"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "CreateChannelReq",
+        "type": "object"
+      },
+      "EnrollReq": {
+        "properties": {
+          "approver_pubkeys": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 32,
+            "minItems": 1,
+            "title": "Approver Pubkeys",
+            "type": "array"
+          },
+          "k": {
+            "maximum": 32.0,
+            "minimum": 1.0,
+            "title": "K",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "approver_pubkeys",
+          "k"
+        ],
+        "title": "EnrollReq",
+        "type": "object"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "title": "Detail",
+            "type": "array"
+          }
+        },
+        "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "JoinPolicy": {
+        "description": "Closed set of private-channel self-join policies (see Channel.join_policy).\n'invite_only' = admin-add only; 'open' = any authed user may self-join.",
+        "enum": [
+          "invite_only",
+          "open"
+        ],
+        "title": "JoinPolicy",
+        "type": "string"
+      },
+      "KeyView": {
+        "properties": {
+          "first_seen_at": {
+            "title": "First Seen At",
+            "type": "string"
+          },
+          "key_version": {
+            "title": "Key Version",
+            "type": "integer"
+          },
+          "last_seen_at": {
+            "title": "Last Seen At",
+            "type": "string"
+          },
+          "pubkey": {
+            "title": "Pubkey",
+            "type": "string"
+          }
+        },
+        "required": [
+          "pubkey",
+          "key_version",
+          "first_seen_at",
+          "last_seen_at"
+        ],
+        "title": "KeyView",
+        "type": "object"
+      },
+      "LoginReq": {
+        "properties": {
+          "password": {
+            "title": "Password",
+            "type": "string"
+          },
+          "username": {
+            "title": "Username",
+            "type": "string"
+          }
+        },
+        "required": [
+          "username",
+          "password"
+        ],
+        "title": "LoginReq",
+        "type": "object"
+      },
+      "MeView": {
+        "description": "The profile view served by GET /v1/me and PATCH /v1/me (#2631). Declaring it\nas the endpoints' response_model makes it the SINGLE source of the /me wire\nshape in the emitted OpenAPI schema (response side, not just requests) — a\nconsumer reads exactly these fields, and a snapshot-diff of openapi.json catches\nan accidental rename/removal (append-only /v1 discipline). `username` is the\nhandle; `aiko_username` is the derived bus-wire token; `is_moderator` is UI-only\n(enforcement stays server-side in require_moderator).",
+        "properties": {
+          "aiko_username": {
+            "title": "Aiko Username",
+            "type": "string"
+          },
+          "display_name": {
+            "title": "Display Name",
+            "type": "string"
+          },
+          "handle_auto": {
+            "title": "Handle Auto",
+            "type": "boolean"
+          },
+          "is_moderator": {
+            "title": "Is Moderator",
+            "type": "boolean"
+          },
+          "user_id": {
+            "title": "User Id",
+            "type": "string"
+          },
+          "username": {
+            "title": "Username",
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id",
+          "username",
+          "display_name",
+          "aiko_username",
+          "is_moderator",
+          "handle_auto"
+        ],
+        "title": "MeView",
+        "type": "object"
+      },
+      "NonceResp": {
+        "properties": {
+          "nonce": {
+            "title": "Nonce",
+            "type": "string"
+          }
+        },
+        "required": [
+          "nonce"
+        ],
+        "title": "NonceResp",
+        "type": "object"
+      },
+      "OAuthExchangeReq": {
+        "properties": {
+          "app_verifier": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "App Verifier"
+          },
+          "code": {
+            "minLength": 1,
+            "title": "Code",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code"
+        ],
+        "title": "OAuthExchangeReq",
+        "type": "object"
+      },
+      "OpenDmReq": {
+        "properties": {
+          "target_user_id": {
+            "title": "Target User Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "target_user_id"
+        ],
+        "title": "OpenDmReq",
+        "type": "object"
+      },
+      "PasskeyFinishReq": {
+        "properties": {
+          "credential": {
+            "additionalProperties": true,
+            "title": "Credential",
+            "type": "object"
+          },
+          "state": {
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state",
+          "credential"
+        ],
+        "title": "PasskeyFinishReq",
+        "type": "object"
+      },
+      "PatchMeReq": {
+        "description": "Body for PATCH /v1/me — handle and/or display_name, both optional (at least\none required, enforced in the handler as a 400). handle rules mirror\nSocialClaimReq exactly (same charset/length/strip), so claim and mutate can't\ndrift apart.",
+        "properties": {
+          "display_name": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Display Name"
+          },
+          "handle": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Handle"
+          }
+        },
+        "title": "PatchMeReq",
+        "type": "object"
+      },
+      "Platform": {
+        "description": "Closed set of push-notification platforms (#16). 'apns' = Apple Push\nNotification service; 'fcm' = Firebase Cloud Messaging (Android). Same\nsingle-source-of-truth pattern as Role/JoinPolicy: the enum drives the DB\nCHECK on device_tokens.platform via _in_check, so the constraint can't drift\nfrom the Python closed set.",
+        "enum": [
+          "apns",
+          "fcm"
+        ],
+        "title": "Platform",
+        "type": "string"
+      },
+      "Provider": {
+        "description": "The closed set of supported identity providers. A StrEnum so it validates\nat the request boundary (a bad provider is a 422, not a 400 deep in verify)\nwhile still comparing/hashing as its string value everywhere downstream.",
+        "enum": [
+          "apple",
+          "google"
+        ],
+        "title": "Provider",
+        "type": "string"
+      },
+      "ReactionBody": {
+        "properties": {
+          "client_msg_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Client Msg Id"
+          },
+          "emoji": {
+            "title": "Emoji",
+            "type": "string"
+          },
+          "origin": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Origin"
+          }
+        },
+        "required": [
+          "emoji"
+        ],
+        "title": "ReactionBody",
+        "type": "object"
+      },
+      "RecoverFinalizeReq": {
+        "properties": {
+          "finalize_token": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Finalize Token",
+            "type": "string"
+          },
+          "recovery_id": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Recovery Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "recovery_id",
+          "finalize_token"
+        ],
+        "title": "RecoverFinalizeReq",
+        "type": "object"
+      },
+      "RecoverFinishReq": {
+        "properties": {
+          "account_handle": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Account Handle",
+            "type": "string"
+          },
+          "approvals": {
+            "items": {
+              "$ref": "#/components/schemas/Approval"
+            },
+            "maxItems": 32,
+            "minItems": 1,
+            "title": "Approvals",
+            "type": "array"
+          },
+          "new_credential_attestation": {
+            "additionalProperties": true,
+            "title": "New Credential Attestation",
+            "type": "object"
+          },
+          "server_nonce": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Server Nonce",
+            "type": "string"
+          }
+        },
+        "required": [
+          "account_handle",
+          "server_nonce",
+          "new_credential_attestation",
+          "approvals"
+        ],
+        "title": "RecoverFinishReq",
+        "type": "object"
+      },
+      "RecoverStartReq": {
+        "properties": {
+          "account_handle": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Account Handle",
+            "type": "string"
+          }
+        },
+        "required": [
+          "account_handle"
+        ],
+        "title": "RecoverStartReq",
+        "type": "object"
+      },
+      "RefreshReq": {
+        "properties": {
+          "refresh_token": {
+            "title": "Refresh Token",
+            "type": "string"
+          }
+        },
+        "required": [
+          "refresh_token"
+        ],
+        "title": "RefreshReq",
+        "type": "object"
+      },
+      "RegisterDeviceReq": {
+        "properties": {
+          "apns_environment": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ApnsEnvironment"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "install_id": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 1,
+                "pattern": "^[A-Za-z0-9_.:-]+$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Install Id"
+          },
+          "platform": {
+            "$ref": "#/components/schemas/Platform"
+          },
+          "token": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Token",
+            "type": "string"
+          },
+          "token_kind": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TokenKind"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "platform",
+          "token"
+        ],
+        "title": "RegisterDeviceReq",
+        "type": "object"
+      },
+      "RegisterDeviceResp": {
+        "description": "The 201 body, TYPED — because the echo is a CROSS-REPO CONTRACT, not a\nconvenience.\n\nAn untyped `-> dict` echoes the resolved kind at runtime and describes NOTHING\nin `openapi.json`. That was measured on this branch: the generated 201 was\n`{\"additionalProperties\": true, \"type\": \"object\"}`, and `RegisterDeviceReq` was\nthe only schema in the entire document carrying `token_kind`.\n\nWhy that is a defect rather than a style point: the app tab has stated it will\nverify against `openapi.json` BEFORE wiring its first VoIP registration, and\nthat the echo is the instrument it will use. Untyped, the document can tell it\nthe island ACCEPTS `token_kind` and cannot tell it the island RESOLVES and\nRETURNS one — so the consumer's stated verification silently checks half of\nwhat it believes it checks, and its fallback is a live POST against production.\n\nAnd for us: with the response untyped, a future change that drops the echo\nbreaks no schema and no test. A desync detector whose own presence is\nundetectable is not a detector. Typing it makes the contract assertable.",
+        "properties": {
+          "apns_environment": {
+            "$ref": "#/components/schemas/ApnsEnvironment"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "install_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Install Id"
+          },
+          "platform": {
+            "$ref": "#/components/schemas/Platform"
+          },
+          "token_kind": {
+            "$ref": "#/components/schemas/TokenKind"
+          }
+        },
+        "required": [
+          "id",
+          "platform",
+          "apns_environment",
+          "token_kind"
+        ],
+        "title": "RegisterDeviceResp",
+        "type": "object"
+      },
+      "RegisterKeyReq": {
+        "properties": {
+          "key_version": {
+            "default": 1,
+            "minimum": 1.0,
+            "title": "Key Version",
+            "type": "integer"
+          },
+          "pubkey": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Pubkey",
+            "type": "string"
+          }
+        },
+        "required": [
+          "pubkey"
+        ],
+        "title": "RegisterKeyReq",
+        "type": "object"
+      },
+      "ReportReason": {
+        "description": "Closed set of report reasons for a message (#7).",
+        "enum": [
+          "spam",
+          "harassment",
+          "hate",
+          "violence",
+          "sexual",
+          "other"
+        ],
+        "title": "ReportReason",
+        "type": "string"
+      },
+      "ReportReq": {
+        "properties": {
+          "reason": {
+            "$ref": "#/components/schemas/ReportReason"
+          }
+        },
+        "required": [
+          "reason"
+        ],
+        "title": "ReportReq",
+        "type": "object"
+      },
+      "Role": {
+        "description": "Closed set of membership roles. StrEnum (3.12) so the value IS the string\nstored in the column. Defined here (the persistence layer) so it is the single\nsource of truth for BOTH the column default and the DB CHECK constraint below;\nre-exported from memberships_service for the call sites (cage-match PR#10/#23).",
+        "enum": [
+          "admin",
+          "member"
+        ],
+        "title": "Role",
+        "type": "string"
+      },
+      "SetReadPositionsReq": {
+        "description": "``{\"positions\": {channel_id: {\"last_read\": str, \"base_seq\": int}}}``.\n\nThe ENTRIES are deliberately untyped here and checked in ``_entries`` below:\na typed pydantic model would refuse a bad entry (a null ``last_read``, a\nstring ``base_seq``, a missing field) in pydantic's own shape, with no\n``channel_id`` for the app's healer to drop. Every refusal about an entry is\none structured 422 naming its channel (``InvalidReadPositionError``); only a\nbody that isn't a ``positions`` object at all falls to pydantic.\n\n``base_seq`` is NOT a version the client chooses: it names the version the\nclient is editing (0 = none seen), and the island applies the write only if\nthat is still the version it holds (PR #429's v2 contract). It is not called\n``seq`` on purpose, so a body shaped for the first design fails loudly.",
+        "properties": {
+          "positions": {
+            "additionalProperties": true,
+            "title": "Positions",
+            "type": "object"
+          }
+        },
+        "required": [
+          "positions"
+        ],
+        "title": "SetReadPositionsReq",
+        "type": "object"
+      },
+      "SocialClaimReq": {
+        "properties": {
+          "display_name": {
+            "default": "",
+            "maxLength": 128,
+            "title": "Display Name",
+            "type": "string"
+          },
+          "handle": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Handle",
+            "type": "string"
+          },
+          "provisioning_token": {
+            "title": "Provisioning Token",
+            "type": "string"
+          }
+        },
+        "required": [
+          "provisioning_token",
+          "handle"
+        ],
+        "title": "SocialClaimReq",
+        "type": "object"
+      },
+      "SocialReq": {
+        "properties": {
+          "id_token": {
+            "title": "Id Token",
+            "type": "string"
+          },
+          "nonce": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Nonce"
+          },
+          "provider": {
+            "$ref": "#/components/schemas/Provider"
+          }
+        },
+        "required": [
+          "provider",
+          "id_token"
+        ],
+        "title": "SocialReq",
+        "type": "object"
+      },
+      "TokenKind": {
+        "description": "Closed set of push-token DELIVERY SEMANTICS — what a token is FOR (design\n12 Decision 2). Same single-source-of-truth pattern as Platform: drives the\nDB CHECK on device_tokens.token_kind via _in_check.\n\nTHE AXIS, because getting it wrong is the whole risk. `platform` says which\ntransport FAMILY a token belongs to (Apple vs Google); `token_kind` says\nwhich delivery semantics it carries (a banner vs a ring). An `apns_voip`\nPLATFORM value would be the WRONG axis — Android could never hold it, and the\ntwo questions would collapse into one field that answers neither.\n\nTWO REGISTRIES, TWO STRINGS, TWO ROWS. An alert token comes from UIKit\n(`registerForRemoteNotifications`) and is valid only against the bare bundle\ntopic; a VoIP token comes from PushKit (`PKPushRegistry`) and only against\n`<bundle>.voip`. They rotate independently and neither is derivable from the\nother, so one handset holding both is TWO rows — which is why UNIQUE(token)\nneeds no change to accommodate this.\n\nPARTIAL IS THE DEFAULT, and one arm is permanent. A PushKit VoIP token needs\nno user permission at all, while a handset that declined notifications cannot\nbe RUNG by an alert push. (Precisely: an app can obtain an alert device token\nwithout notification authorization — authorization gates DISPLAY — so the\nclaim is about being rung, not about holding.) So \"holds voip and never\nalert\" is a normal, permanent population rather than a half-registered edge\ncase, and nothing in this model may imply both-required.\n\nTHE VALUES ARE APPLE'S OWN `apns-push-type` SPELLINGS, sent verbatim as a\nheader. Renaming a member silently changes the wire — an unknown push type is\na 400, which is REJECTED, which never reaps: one WARNING line and a phone\nthat does not ring.\n\nTHE NAME IS UNPREFIXED ON PURPOSE, and the contrast with `apns_environment`\none class up is the argument. That one is prefixed because the split is an\nAPNs-only fact — the `.p8` is environment-agnostic and no other transport has\nsuch a division. A delivery semantic is something a second transport could\nplausibly grow, so the unprefixed name is the forward-compatible one. Two\nindependent records already say `token_kind` (design 12 Decision 2; the app\ntab's design 16 §5), so this is a reason written down rather than a choice\nbeing made.\n\nINERT FOR FCM. The column is NOT NULL for every platform because a CHECK\nalone cannot close a set against NULL, but Firebase has one registry and no\nVoIP equivalent — an 'fcm' row simply carries whichever kind it registered\nunder and the FCM send path never reads it. Ring-ness on Android is a\nproperty of the MESSAGE (data-only at HIGH priority), not of the token. A\nconditional constraint would be machinery bought to express \"this field means\nnothing over here\"; the sentence does the job, exactly as it does for\napns_environment above.",
+        "enum": [
+          "alert",
+          "voip"
+        ],
+        "title": "TokenKind",
+        "type": "string"
+      },
+      "UnregisterDeviceReq": {
+        "properties": {
+          "token": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Token",
+            "type": "string"
+          }
+        },
+        "required": [
+          "token"
+        ],
+        "title": "UnregisterDeviceReq",
+        "type": "object"
+      },
+      "ValidationError": {
+        "properties": {
+          "ctx": {
+            "title": "Context",
+            "type": "object"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Location",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "title": "Error Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError",
+        "type": "object"
+      },
+      "VideoTokenResponse": {
+        "description": "The minted join token + where to use it. Typed so the wire contract with the\napp tab (#2726) is explicit and can't silently drift (cage-match #122).",
+        "properties": {
+          "can_publish": {
+            "title": "Can Publish",
+            "type": "boolean"
+          },
+          "room": {
+            "title": "Room",
+            "type": "string"
+          },
+          "token": {
+            "title": "Token",
+            "type": "string"
+          },
+          "url": {
+            "title": "Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "token",
+          "url",
+          "room",
+          "can_publish"
+        ],
+        "title": "VideoTokenResponse",
+        "type": "object"
+      }
+    },
+    "securitySchemes": {
+      "HTTPBearer": {
+        "scheme": "bearer",
+        "type": "http"
+      }
+    }
+  },
+  "info": {
+    "title": "Aiko Chat Gateway",
+    "version": "0.0.1"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/.well-known/apple-app-site-association": {
+      "get": {
+        "description": "iOS associated-domains (webcredentials) so the app may use passkeys scoped to\nthis domain. application/json, NO redirect — iOS fetches it directly and rejects\na redirect.",
+        "operationId": "apple_app_site_association__well_known_apple_app_site_association_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Apple App Site Association  Well Known Apple App Site Association Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Apple App Site Association",
+        "tags": [
+          "well-known"
+        ]
+      }
+    },
+    "/.well-known/assetlinks.json": {
+      "get": {
+        "description": "Android Digital Asset Links for passkeys. The sha256 fingerprint is the\nPlay App Signing cert (app task #20). Until it is configured we serve an EMPTY\ndocument rather than a target with no fingerprints — a fingerprint-less target\ncan never verify, so publishing it is a negative/malformed association artifact\nthat a client might cache (cage-match #38, Carnot). Once configured, the target\nappears.\n\nBOTH relations are required. `get_login_creds` alone passes Google's\n`assetlinks:check` API (so the association *looks* valid), but GMS's on-device\npasskey `ValidateRpIdOperation` ADDITIONALLY requires `handle_all_urls` — its\nabsence fails registration with `[50152] RP ID cannot be validated` on every\ndevice, even a certified one, even though every other input is correct. This\nwas the root cause of the Android passkey-create block (2026-07-28); Google's\nown \"seamless credential sharing\" codelab documents `handle_all_urls` as a\n\"strict requirement\" for cross-platform passkeys.",
+        "operationId": "android_asset_links__well_known_assetlinks_json_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "additionalProperties": true,
+                    "type": "object"
+                  },
+                  "title": "Response Android Asset Links  Well Known Assetlinks Json Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Android Asset Links",
+        "tags": [
+          "well-known"
+        ]
+      }
+    },
+    "/capabilities": {
+      "get": {
+        "description": "This island's wire capabilities. Public, token-less, no side effects —\na sibling of `/health`, fetched by the app on every (re)connect.",
+        "operationId": "get_capabilities_capabilities_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Capabilities Capabilities Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Capabilities",
+        "tags": [
+          "capabilities"
+        ]
+      }
+    },
+    "/health": {
+      "get": {
+        "description": "Liveness plus the two things that are silently wrong more often than the\nprocess is down.\n\n`push` is READ LIVE on every call, never cached at boot (#3397). The standing\ncomplaint about this endpoint is that it reports config INTENT rather than\nreality (#3193) — a boot-time snapshot would answer \"at startup\" while the\noperator is asking \"now\", and a device registered five minutes ago is exactly\nthe case worth surfacing. It costs one COUNT against a table that holds single\ndigits, which is cheaper than the four hours the silence cost once.",
+        "operationId": "health_health_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Health Health Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Health"
+      }
+    },
+    "/privacy": {
+      "get": {
+        "description": "The Privacy Policy (public).",
+        "operationId": "privacy_privacy_get",
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Privacy",
+        "tags": [
+          "legal"
+        ]
+      }
+    },
+    "/terms": {
+      "get": {
+        "description": "The Terms of Use & Community Guidelines (public).",
+        "operationId": "terms_terms_get",
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Terms",
+        "tags": [
+          "legal"
+        ]
+      }
+    },
+    "/v1/_debug/send": {
+      "post": {
+        "description": "Dev-only (pre-auth): publish onto the bus. The echo is what gets persisted.\n\nGated to non-production: this endpoint has NO auth and would let anyone\ninject bus messages, so it 404s in production (fail-closed alongside the\njwt_secret + registration guards).",
+        "operationId": "debug_send_v1__debug_send_post",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "channel",
+            "required": true,
+            "schema": {
+              "title": "Channel",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "username",
+            "required": true,
+            "schema": {
+              "title": "Username",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "message",
+            "required": true,
+            "schema": {
+              "title": "Message",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Debug Send V1  Debug Send Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Debug Send"
+      }
+    },
+    "/v1/account": {
+      "delete": {
+        "description": "Permanently delete the authenticated user's account (Apple 5.1.1(v)).\n\nHard-deletes the user row + federated identities + channel memberships and\nanonymizes the user's authored messages (the conversation survives, the\naccount link does not). 409 if the user is the sole admin of any channel —\nthey must hand those over or leave them first.",
+        "operationId": "delete_account_v1_account_delete",
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Delete Account",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/v1/auth/login": {
+      "post": {
+        "operationId": "login_v1_auth_login_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoginReq"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Login V1 Auth Login Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Login",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/v1/auth/nonce": {
+      "post": {
+        "description": "Mint a server-ISSUED single-use nonce for the native social sign-in flow\n(#13 option (a)). The app calls this FIRST, feeds the nonce (hashed, for Apple)\ninto the Sign-in-with-Apple/Google request, then echoes it to /social with the\nid_token, where the gateway redeems it exactly once — so a captured /social\nrequest can't be replayed (the nonce is already burned). Pre-auth (the user\nisn't signed in yet), gated only by the social-sign-in kill switch.\n\nNAMED TRADEOFF: issuance is unauthenticated and unthrottled. Nonces are tiny\nand self-expire on a short TTL (same posture as the broker /start), so a flood\nis bounded by the TTL; a sweeper / rate-limit is a follow-up if the table grows.",
+        "operationId": "issue_nonce_v1_auth_nonce_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NonceResp"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Issue Nonce",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/v1/auth/oauth/exchange": {
+      "post": {
+        "description": "Redeem a single-use handoff code for the final session JSON. Missing /\nexpired / already-consumed → 401. The redemption is atomic (single-use, the\ndouble-spend guard lives in handoff_service.consume_handoff).",
+        "operationId": "oauth_exchange_v1_auth_oauth_exchange_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OAuthExchangeReq"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Oauth Exchange V1 Auth Oauth Exchange Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Oauth Exchange",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/v1/auth/oauth/{provider}/callback": {
+      "get": {
+        "description": "The provider redirects here. ANY failure → 302 to the app callback with an\nerror indicator (never a raw 500 to a browser). Success → store a minimal\nhandoff payload and 302 to the app callback with ?code=<handoff_code>.\n\nNOTE on open-redirect: the redirect target is ALWAYS\nsettings.app_oauth_callback_url (a fixed config value). No request parameter\n— not `state`, not anything — influences WHERE we redirect; params only carry\nthe handoff code or an error class.",
+        "operationId": "oauth_callback_v1_auth_oauth__provider__callback_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "provider",
+            "required": true,
+            "schema": {
+              "title": "Provider",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "code",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Code"
+            }
+          },
+          {
+            "in": "query",
+            "name": "state",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "State"
+            }
+          },
+          {
+            "in": "query",
+            "name": "error",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Error"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Oauth Callback",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/v1/auth/oauth/{provider}/start": {
+      "get": {
+        "description": "Begin the broker flow: mint a SERVER-SIDE single-use state nonce (storing\nthe PKCE code_verifier server-side when supported), and 302 to the provider's\nauthorize URL with ONLY the opaque nonce as `state`. 404 if the provider isn't\na configured broker provider.\n\nThe `state` sent to the provider is the opaque nonce — NOT a signed token —\nso it carries no secret. For PKCE providers the code_verifier stays in the\nstate row and ONLY the code_challenge crosses the wire; the verifier never\nleaves the server (cage-match #30, Finding 1).\n\n`app_challenge` is the APP's S256 challenge base64url(sha256(app_verifier))\n(cage-match #37). REQUIRED and fail-closed: it binds the eventual handoff to\nthe originating app so a handoff code intercepted via a hijacked custom scheme\ncannot be redeemed without the app-held verifier. The only legitimate caller\nis the app, which always sends it; a missing/short value is a misuse → 400.",
+        "operationId": "oauth_start_v1_auth_oauth__provider__start_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "provider",
+            "required": true,
+            "schema": {
+              "title": "Provider",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "app_challenge",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "App Challenge"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Oauth Start",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/v1/auth/passkey/add/finish": {
+      "post": {
+        "description": "Add a passkey to the AUTHENTICATED user's account (#1727 — link-to-existing).\n\nDistinct from register/finish, which PROVISIONS a new account: here the user\nalready exists (typically a social sign-in that now wants a passkey), so the\nverified credential is persisted DIRECTLY against their user_id — no\nprovisioning token, no handle claim, no create-account. This is the path that\nwas missing: without it an existing user was forced through register→claim,\nwhere a handle conflict with their OWN account (a rejected claim) orphaned the\ndevice credential permanently and left passkey_credentials empty (#1727).\n\nReuses /passkey/register/start for the challenge (identity-agnostic); the\nAuthorization bearer is what distinguishes an add from a first-passkey register.",
+        "operationId": "passkey_add_finish_v1_auth_passkey_add_finish_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PasskeyFinishReq"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Passkey Add Finish V1 Auth Passkey Add Finish Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Passkey Add Finish",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/v1/auth/passkey/authenticate/finish": {
+      "post": {
+        "description": "Verify the assertion against the STORED public key and issue a session\n(authenticated outcome — a known credential is never provisioning).",
+        "operationId": "passkey_authenticate_finish_v1_auth_passkey_authenticate_finish_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PasskeyFinishReq"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Passkey Authenticate Finish V1 Auth Passkey Authenticate Finish Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Passkey Authenticate Finish",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/v1/auth/passkey/authenticate/start": {
+      "post": {
+        "description": "Begin usernameless/discoverable authentication (empty allowCredentials).\nReturns {state, options}.",
+        "operationId": "passkey_authenticate_start_v1_auth_passkey_authenticate_start_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Passkey Authenticate Start V1 Auth Passkey Authenticate Start Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Passkey Authenticate Start",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/v1/auth/passkey/recover/cancel": {
+      "post": {
+        "description": "Owner veto from a live authenticated device: delete the pending recovery for\nthe authenticated user. A cancel that lands before finalize makes finalize's\nguarded DELETE match 0 rows (owner provably wins the race, §7). Returns\n{cancelled: bool}.",
+        "operationId": "recover_cancel_v1_auth_passkey_recover_cancel_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Recover Cancel V1 Auth Passkey Recover Cancel Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Recover Cancel",
+        "tags": [
+          "recovery"
+        ]
+      }
+    },
+    "/v1/auth/passkey/recover/finalize": {
+      "post": {
+        "description": "Poll to finalize a recovery whose veto window has passed. The guarded DELETE\n(deadline + token hash in the WHERE) either wins (issues a session, re-keys) or\nmatches nothing (cancelled / too-early / wrong-token / already-finalized) → a\nclean terminal 409. Idempotent: a double poll yields one session, one credential,\nno IntegrityError.",
+        "operationId": "recover_finalize_v1_auth_passkey_recover_finalize_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecoverFinalizeReq"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Recover Finalize V1 Auth Passkey Recover Finalize Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Recover Finalize",
+        "tags": [
+          "recovery"
+        ]
+      }
+    },
+    "/v1/auth/passkey/recover/finish": {
+      "post": {
+        "description": "Verify the new passkey attestation + a guardian quorum bound to it, then open\na pending recovery (veto window). Returns {status:'pending', recovery_id,\nveto_deadline, finalize_token} — NO session yet.",
+        "operationId": "recover_finish_v1_auth_passkey_recover_finish_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecoverFinishReq"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Recover Finish V1 Auth Passkey Recover Finish Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Recover Finish",
+        "tags": [
+          "recovery"
+        ]
+      }
+    },
+    "/v1/auth/passkey/recover/start": {
+      "post": {
+        "description": "Issue a single-use server nonce for a recovery of `account_handle`. Returns\n{server_nonce, threshold_k}. Reveals only the threshold — never approver\nidentities. A missing account or no-policy account gets the SAME 404 (no\nenumeration difference beyond what login already exposes).",
+        "operationId": "recover_start_v1_auth_passkey_recover_start_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecoverStartReq"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Recover Start V1 Auth Passkey Recover Start Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Recover Start",
+        "tags": [
+          "recovery"
+        ]
+      }
+    },
+    "/v1/auth/passkey/register/finish": {
+      "post": {
+        "description": "Verify the attestation and CREATE the account directly (Design 04 Step 1 /\n#1728). No provisioning token, no /social/claim: a device that proves an\nattestation gets its OWN passkey-only account with an auto-assigned handle and a\nsession. Account creation is atomic with the challenge burn, so a credential can\nnever be orphaned by a rejected handle claim (the #1728 root cause — persistence\nwas gated on a handle claim that collided with a pre-existing account). Returns\nthe SAME authenticated shape as authenticate/finish + the social/broker door.\n\nTHE CHOKEPOINT. Gated before the challenge is consumed, so a caller that\nskipped `start` — or held a challenge from before registration was closed —\nstill meets the gate, and a refused request burns nothing.",
+        "operationId": "passkey_register_finish_v1_auth_passkey_register_finish_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PasskeyFinishReq"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Passkey Register Finish V1 Auth Passkey Register Finish Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Passkey Register Finish",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/v1/auth/passkey/register/start": {
+      "post": {
+        "description": "Begin registration for an ANONYMOUS caller (first-passkey-creates-account).\nReturns {state, options} — the raw WebAuthn-JSON the platform authenticator\nparses. No prior session. An optional `{\"name\": ...}` body labels the passkey on\nthe caller's phone (`_passkey_label_from`); it never fails the request.\n\nDELIBERATELY UNGATED, and reverting that is a production outage — read this\nbefore \"tightening\" it. THIS ROUTE IS ALSO `add/start`: there is no such\nendpoint, and `passkey/add/finish` consumes a challenge issued HERE (\"reuses\n/passkey/register/start for the challenge (identity-agnostic); the\nAuthorization bearer is what distinguishes an add from a first-passkey\nregister\"). One hallway, two rooms.\n\nSo a gate here is not \"refuse early\" — it is a PERMANENT LOCKOUT of\ndevice-add on every production island whose `open_registration` is closed,\nwhich is the production default. An existing user could never add a second\npasskey again. An earlier revision of this change did exactly that, and its\nown test asserted the lockout as correct; Tesla caught it in cage-match round\n1 while two other families approved of the gate's placement.\n\nA challenge on its own provisions nothing. `register/finish` is the real\nchokepoint — `create_passkey_account` is called from there and nowhere else —\nand it is gated before the challenge is consumed, so nothing an anonymous\ncaller starts here can become an account.",
+        "operationId": "passkey_register_start_v1_auth_passkey_register_start_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "name": {
+                    "description": "Label for the passkey in the phone's password manager (the handle being chosen, or the signed-in user's handle when adding a device). Cosmetic; grants nothing. Sent through as given (trimmed), never rewritten; control, lone-surrogate and line-separator characters, nothing visible, a non-string, or an absent or malformed body mean a random label, never an error. Cut to 64 UTF-8 bytes on a character boundary. This is not a handle rule: a handle is validated by PATCH /v1/me.",
+                    "type": "string"
+                  }
+                },
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Passkey Register Start V1 Auth Passkey Register Start Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Passkey Register Start",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/v1/auth/providers": {
+      "get": {
+        "description": "List the sign-in providers the client may offer.\n\nNative providers (apple/google — kind:\"native\") are included when their\nclient_ids are configured (the native flow needs no client secret). Broker\nproviders (kind:\"broker\") are the configured server-side ones (both id +\nsecret set). Fail-closed: an unconfigured provider is simply absent.\n\nWhen social sign-in is administratively disabled, the social providers show\nnothing (consistent with the native + broker gates returning 403 in that\nstate). Passkey (#1471) is an INDEPENDENT feature gated on its own\npasskey_enabled flag — flipped on LAST, after the endpoints + .well-known are\nlive, so it can deploy dark.",
+        "operationId": "list_providers_v1_auth_providers_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Providers V1 Auth Providers Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Providers",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/v1/auth/recovery/enroll": {
+      "post": {
+        "description": "Enroll a recovery policy (k-of-n guardians) for the authenticated user. FIRST\nenrollment is immediate; a replacement must go through the (not-yet-online) veto\nrotation flow — a silent guardian swap is refused (409), never applied.",
+        "operationId": "recovery_enroll_v1_auth_recovery_enroll_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EnrollReq"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Recovery Enroll V1 Auth Recovery Enroll Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Recovery Enroll",
+        "tags": [
+          "recovery"
+        ]
+      }
+    },
+    "/v1/auth/recovery/policy": {
+      "get": {
+        "description": "The authenticated user's current recovery policy (threshold + approver\nlabels/pubkeys), or {enrolled:false}. Own-account only (CurrentUser).",
+        "operationId": "recovery_policy_v1_auth_recovery_policy_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Recovery Policy V1 Auth Recovery Policy Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Recovery Policy",
+        "tags": [
+          "recovery"
+        ]
+      }
+    },
+    "/v1/auth/recovery/status": {
+      "get": {
+        "description": "Whether a recovery is pending for the authenticated user (the veto-\nnotification floor, §7). A live device polls this to learn it must veto.",
+        "operationId": "recovery_status_endpoint_v1_auth_recovery_status_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Recovery Status Endpoint V1 Auth Recovery Status Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Recovery Status Endpoint",
+        "tags": [
+          "recovery"
+        ]
+      }
+    },
+    "/v1/auth/refresh": {
+      "post": {
+        "operationId": "refresh_v1_auth_refresh_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RefreshReq"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Refresh V1 Auth Refresh Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Refresh",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/v1/auth/social": {
+      "post": {
+        "description": "Verify a provider ID token. Known identity → real tokens. Brand-new\nidentity → a short-lived provisioning token to carry the verified identity\ninto /social/claim (no DB row until the user picks a handle).",
+        "operationId": "social_v1_auth_social_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SocialReq"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Social V1 Auth Social Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Social",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/v1/auth/social/claim": {
+      "post": {
+        "description": "Complete social provisioning: verify the provisioning token (OUR token, so the\nidentity it carries cannot be forged), create the user atomically, and return\nreal tokens. Social-only: passkeys create their account directly at\nregister/finish (Design 04 Step 1) and never round-trip through a handle claim.",
+        "operationId": "social_claim_v1_auth_social_claim_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SocialClaimReq"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Social Claim V1 Auth Social Claim Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Social Claim",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/v1/blocks": {
+      "get": {
+        "description": "The users the caller has blocked (most recent first) — backs the Settings\n'Blocked users' list with display names so unblock needs no extra lookup.",
+        "operationId": "list_blocks_v1_blocks_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Blocks V1 Blocks Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "List Blocks",
+        "tags": [
+          "moderation"
+        ]
+      }
+    },
+    "/v1/channels": {
+      "get": {
+        "operationId": "list_channels_v1_channels_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Channels V1 Channels Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "List Channels",
+        "tags": [
+          "channels"
+        ]
+      },
+      "post": {
+        "operationId": "create_channel_v1_channels_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateChannelReq"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Create Channel V1 Channels Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Create Channel",
+        "tags": [
+          "members"
+        ]
+      }
+    },
+    "/v1/channels/{channel_id}/call": {
+      "get": {
+        "description": "Is a call happening in this channel RIGHT NOW? (#3159)\n\nA signed call invitation is a permanent claim about the PAST; call liveness is a fact\nabout the PRESENT, and nothing in the message layer reconciles them. Without this, a\ncaller who hangs up three seconds in leaves the callee ringing, answering, and landing\nalone in an empty room. This is the present-tense half.\n\nTHE GATE ORDER IS video-token's, DELIBERATELY AND IDENTICALLY. Both endpoints answer\nquestions about the same object, so if their gates ever diverge the weaker one becomes\nthe way to learn what the stronger one hides — a caller blocked from minting a token\ncould still watch a DM's occupancy and infer when two people are talking. Any change\nto one gate is a change to both.",
+        "operationId": "get_call_occupancy_v1_channels__channel_id__call_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CallOccupancyResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Get Call Occupancy",
+        "tags": [
+          "video"
+        ]
+      }
+    },
+    "/v1/channels/{channel_id}/join": {
+      "post": {
+        "operationId": "join_channel_v1_channels__channel_id__join_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Join Channel V1 Channels  Channel Id  Join Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Join Channel",
+        "tags": [
+          "members"
+        ]
+      }
+    },
+    "/v1/channels/{channel_id}/leave": {
+      "delete": {
+        "operationId": "leave_channel_v1_channels__channel_id__leave_delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Leave Channel",
+        "tags": [
+          "members"
+        ]
+      }
+    },
+    "/v1/channels/{channel_id}/members": {
+      "get": {
+        "operationId": "list_members_v1_channels__channel_id__members_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Members V1 Channels  Channel Id  Members Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "List Members",
+        "tags": [
+          "members"
+        ]
+      },
+      "post": {
+        "operationId": "add_member_v1_channels__channel_id__members_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddMemberReq"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Add Member V1 Channels  Channel Id  Members Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Add Member",
+        "tags": [
+          "members"
+        ]
+      }
+    },
+    "/v1/channels/{channel_id}/members/{user_id}": {
+      "delete": {
+        "operationId": "remove_member_v1_channels__channel_id__members__user_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "user_id",
+            "required": true,
+            "schema": {
+              "title": "User Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Remove Member",
+        "tags": [
+          "members"
+        ]
+      }
+    },
+    "/v1/channels/{channel_id}/messages": {
+      "get": {
+        "description": "Channel history, ascending. `before` = scroll-up (older); `after` =\nforward catch-up (B4 reconnect). Both cursors returned so either direction\ncan page: `next_before` = oldest in batch, `next_after` = newest in batch.",
+        "operationId": "history_v1_channels__channel_id__messages_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "before",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Before"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response History V1 Channels  Channel Id  Messages Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "History",
+        "tags": [
+          "messages"
+        ]
+      }
+    },
+    "/v1/channels/{channel_id}/video-token": {
+      "post": {
+        "operationId": "create_video_token_v1_channels__channel_id__video_token_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VideoTokenResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Create Video Token",
+        "tags": [
+          "video"
+        ]
+      }
+    },
+    "/v1/communities": {
+      "get": {
+        "description": "The communities the caller belongs to (replaces the role GET /v1/channels\nplays today, app-side).",
+        "operationId": "list_my_communities_v1_communities_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List My Communities V1 Communities Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "List My Communities",
+        "tags": [
+          "communities"
+        ]
+      }
+    },
+    "/v1/communities/discover": {
+      "get": {
+        "description": "The public directory. Cursor-paginated; ``next_cursor`` is null at the end.",
+        "operationId": "discover_communities_v1_communities_discover_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Q"
+            }
+          },
+          {
+            "in": "query",
+            "name": "category",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Category"
+            }
+          },
+          {
+            "in": "query",
+            "name": "sort",
+            "required": false,
+            "schema": {
+              "default": "members",
+              "title": "Sort",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Discover Communities V1 Communities Discover Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Discover Communities",
+        "tags": [
+          "communities"
+        ]
+      }
+    },
+    "/v1/communities/{community_id}": {
+      "get": {
+        "description": "Detail + the channels in it the caller may see. 404 (fail closed) for a\ncommunity that does not exist or the caller may not see.",
+        "operationId": "get_community_v1_communities__community_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "community_id",
+            "required": true,
+            "schema": {
+              "title": "Community Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Community V1 Communities  Community Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Get Community",
+        "tags": [
+          "communities"
+        ]
+      }
+    },
+    "/v1/communities/{community_id}/join": {
+      "post": {
+        "description": "Join the community; returns it + the channels to subscribe + ``joined``\n(false for an idempotent re-join). 404 (fail closed) if it is no longer\nvisible/joinable at join time (concurrent shrink).",
+        "operationId": "join_community_v1_communities__community_id__join_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "community_id",
+            "required": true,
+            "schema": {
+              "title": "Community Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Join Community V1 Communities  Community Id  Join Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Join Community",
+        "tags": [
+          "communities"
+        ]
+      }
+    },
+    "/v1/devices": {
+      "delete": {
+        "description": "Unregister a device token (app logout). 204 whether or not the token was\npresent — unregistering an unknown token is not an error (idempotent), and a\n404 would leak whether a given token is registered.",
+        "operationId": "unregister_device_v1_devices_delete",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UnregisterDeviceReq"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Unregister Device",
+        "tags": [
+          "devices"
+        ]
+      },
+      "post": {
+        "description": "Register (or re-register) this device's push token for the current user.\nIdempotent: re-registering the same token is a no-op reassign, still 201.",
+        "operationId": "register_device_v1_devices_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RegisterDeviceReq"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RegisterDeviceResp"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Register Device",
+        "tags": [
+          "devices"
+        ]
+      }
+    },
+    "/v1/dm": {
+      "get": {
+        "description": "My DM channels for the switcher. Each carries ``last_message`` — the newest\nmessage VISIBLE to me (not soft-deleted, author not blocked), or ``null`` if none\nyet. NO ``unread`` (client-side per the contract — the island has no read-position\nstore). ``last_message`` is a ``MessageView`` (block/soft-delete-filtered, no\nreaction aggregate — a switcher preview needs the line, not its reactions) so the\nclient renders it like a history row.\n\nBATCHED (cage-match PR#124): members + last-message are resolved for ALL my DM\nchannels in a constant number of queries (``members_of_many`` + the two-query\n``last_visible_messages``), not per-channel — no N+1 on the switcher endpoint. Both\nbatch reads are scoped to my OWN DM channels, which satisfies the ACL precondition\nthe ``last_visible_messages`` content filter carries.",
+        "operationId": "list_dms_v1_dm_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Dms V1 Dm Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "List Dms",
+        "tags": [
+          "dm"
+        ]
+      },
+      "post": {
+        "description": "Find-or-create the 1:1 DM channel for ``{me, target}`` (idempotent — the same\npair always resolves to the same channel). 404 if ``target_user_id`` is not a real\nuser. Self-DM (target == me) is ALLOWED (notes-to-self). Rate-limited (mild\nchannel-creation abuse vector). Returns the channel view; ``members`` is an ARRAY.",
+        "operationId": "open_dm_v1_dm_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OpenDmReq"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Open Dm V1 Dm Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Open Dm",
+        "tags": [
+          "dm"
+        ]
+      }
+    },
+    "/v1/gateways": {
+      "get": {
+        "deprecated": true,
+        "description": "DEPRECATED alias of ``GET /v1/islands`` (see module docstring). Same data,\nlegacy envelope key ``gateways`` so pre-taxonomy app builds and gossip peers\nkeep working through the compat window. Prefer ``/v1/islands``.",
+        "operationId": "list_gateways_v1_gateways_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Gateways V1 Gateways Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Gateways",
+        "tags": [
+          "islands"
+        ]
+      }
+    },
+    "/v1/island": {
+      "get": {
+        "description": "THIS island's signed self-manifest:\n``{v, alg, id, display_name, base_url, mode, key_version, signed_at_ms,\nisland_pubkey, signature}``. ``mode`` is the operator's elected moderation posture\n(Phase A: always ``moderator``); ``signed_at_ms`` is the per-request freshness\nstamp (v2, #2452); ``island_pubkey`` is a ``z…`` ed25519 Multikey; the signature\ncovers the whole identity tuple INCLUDING ``signed_at_ms`` (see\ndomain/island_identity.py).\n\n503 if the island has no valid self identity configured (a broken\ngateway_base_url/id) — there is nothing authentic to sign, so fail closed rather\nthan emit an unsigned or partial manifest.",
+        "operationId": "get_island_v1_island_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Island V1 Island Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Island",
+        "tags": [
+          "island"
+        ]
+      }
+    },
+    "/v1/islands": {
+      "get": {
+        "description": "The known island set: ``{\"islands\": [{\"id\", \"display_name\", \"base_url\"}, ...]}``\n— snake_case to match the app's reader. Each entry is a peer island; `base_url`\nis that island's gateway edge. Always includes this node's own entry (when a\nvalid self identity is configured).",
+        "operationId": "list_islands_v1_islands_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Islands V1 Islands Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Islands",
+        "tags": [
+          "islands"
+        ]
+      }
+    },
+    "/v1/keys": {
+      "get": {
+        "description": "The current user's registered/observed signing keys. Scoped to the\nauthenticated user — never another account's roster.",
+        "operationId": "list_keys_v1_keys_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/KeyView"
+                  },
+                  "title": "Response List Keys V1 Keys Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "List Keys",
+        "tags": [
+          "keys"
+        ]
+      },
+      "post": {
+        "description": "Register (or re-observe) the current user's signing public key. Idempotent:\nre-registering the same key is a no-op bump of last_seen_at, still 201.\n\nBound to the authenticated user — a body ``user_id`` is neither accepted nor\nconsulted. A malformed pubkey (not a well-formed ed25519 Multikey) is a 400,\nrejected before any row is written. Over the per-user cap (a genuinely new key)\nis a 429; the cap is enforced atomically inside the write (no TOCTOU).",
+        "operationId": "register_key_v1_keys_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RegisterKeyReq"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Register Key V1 Keys Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Register Key",
+        "tags": [
+          "keys"
+        ]
+      }
+    },
+    "/v1/keys/{pubkey}": {
+      "delete": {
+        "description": "Revoke (forget) one of the caller's signing keys. 204 whether or not the key\nwas present — revoking an unknown key is not an error (idempotent), and a 404\nwould leak whether a given key is on file. Scoped to the authenticated user, so\na caller can never revoke another account's binding (the pubkey is public).\n\nNo shape validation: a malformed pubkey simply matches no row and 204s — the\nsame leak-free idempotent behavior as devices' unregister.",
+        "operationId": "revoke_key_v1_keys__pubkey__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "pubkey",
+            "required": true,
+            "schema": {
+              "title": "Pubkey",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Revoke Key",
+        "tags": [
+          "keys"
+        ]
+      }
+    },
+    "/v1/me": {
+      "get": {
+        "operationId": "me_v1_me_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MeView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Me",
+        "tags": [
+          "auth"
+        ]
+      },
+      "patch": {
+        "description": "Mutate the authenticated user's own handle and/or display_name (#2631).\n\nThe app's \"change handle\" + \"edit display name\" path (#2513). Identity is the\nKEY (user.id); this rewrites only the mutable labels, so a rename never orphans\nan @-mention or DM bound to the key. All mutation funnels through the single\nusers_service.update_profile door (route/in-process/test share one gate).\n\n  * 400 if neither field is provided.\n  * 409 if the requested handle is already taken.\n  * 429 (+ retry_after + Retry-After header) if the handle changed within the\n    cooldown window (settings.handle_change_cooldown_seconds). A no-op\n    same-handle write and any display_name edit never trip the cooldown.\n  * 401 if the account was deleted while this request ran: the same opaque\n    answer the auth door gives a token whose user is gone (#439).",
+        "operationId": "patch_me_v1_me_patch",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PatchMeReq"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MeView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "neither handle nor display_name provided"
+          },
+          "401": {
+            "description": "invalid or expired token, including an account deleted while this request ran"
+          },
+          "409": {
+            "description": "handle already taken"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "code": {
+                      "description": "distinguishes this 429 from the rate-limit 429",
+                      "enum": [
+                        "handle_change_cooldown"
+                      ],
+                      "type": "string"
+                    },
+                    "detail": {
+                      "type": "string"
+                    },
+                    "retry_after": {
+                      "description": "whole seconds until the cooldown lifts",
+                      "type": "integer"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "handle changed within the cooldown window"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Patch Me",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/v1/messages/{message_id}": {
+      "get": {
+        "description": "One message by id — reply-parent resolution, deep-links, jump-to-message\n(#2633). Applies the SAME visibility predicate as history\n(``messages_service.visible_message``): a missing / soft-deleted / unreadable /\nblocked-author message all 404 IDENTICALLY (existence-hiding), and a taken-down\nparent is a 404 (its body is never resurrected — no retraction leak). Returns the\nSAME enriched ``MessageView`` as the history read (the reaction aggregate injected\nwith the SAME block-filter), so there is no new wire shape.",
+        "operationId": "get_message_v1_messages__message_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "message_id",
+            "required": true,
+            "schema": {
+              "title": "Message Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Message V1 Messages  Message Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Get Message",
+        "tags": [
+          "messages"
+        ]
+      }
+    },
+    "/v1/messages/{message_id}/reactions": {
+      "delete": {
+        "description": "Remove the caller's ``emoji`` reaction (idempotent). 422 if the emoji is\nmalformed.\n\nTHREE audiences, THREE gates:\n* MUTATION → OWNERSHIP. Un-reacting your OWN row is a strictly-reducing self-owned\n  action, allowed even after you lose sight of the message (takedown / kick / a new\n  block) — otherwise your reaction is an un-deletable scar.\n* FANOUT → the MESSAGE being a live target (exists + not soft-deleted), NOT the\n  caller's visibility. The frame serves OTHER subscribers, who can still see the\n  message; their view must move on your removal even if YOU no longer see it.\n* RESPONSE count → the CALLER's visibility. A caller who removed a row while no\n  longer able to see the message gets ``count: null`` — no post-revocation count\n  oracle for a channel they've lost.\nIf NO row was removed, fall back to the existence-hiding 404 ``add`` uses, so a\ncaller with no row can't probe a message they can't see.",
+        "operationId": "remove_reaction_v1_messages__message_id__reactions_delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "message_id",
+            "required": true,
+            "schema": {
+              "title": "Message Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "the reaction emoji to remove",
+            "in": "query",
+            "name": "emoji",
+            "required": true,
+            "schema": {
+              "description": "the reaction emoji to remove",
+              "title": "Emoji",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Remove Reaction V1 Messages  Message Id  Reactions Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Remove Reaction",
+        "tags": [
+          "reactions"
+        ]
+      },
+      "post": {
+        "description": "Add the caller's ``emoji`` reaction (idempotent — re-adding the same emoji is a\nno-op returning the unchanged count and firing no frame; the first signature wins).\n422 if the emoji or ``origin`` envelope is malformed (checked BEFORE resolution, so\nit can't probe existence); 404 if the message isn't visible; 429 at the per-message\nreaction cap. ``count`` in the response is the caller's block-filtered tally, the\nsame one a subsequent history read shows.",
+        "operationId": "add_reaction_v1_messages__message_id__reactions_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "message_id",
+            "required": true,
+            "schema": {
+              "title": "Message Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReactionBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Add Reaction V1 Messages  Message Id  Reactions Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Add Reaction",
+        "tags": [
+          "reactions"
+        ]
+      }
+    },
+    "/v1/messages/{message_id}/report": {
+      "post": {
+        "description": "Report ``message_id`` as objectionable. Idempotent per (message, reporter):\na re-report returns the existing report id. 404 if the message does not exist\nOR sits in a channel the reporter cannot READ (existence-hiding for private\nchannels the caller isn't in). NOTE: the gate is channel readability, not\nper-message visibility — a soft-deleted or block-hidden message in a readable\nchannel is still reportable on purpose (report-then-block / report-a-tombstone\nare valid ops flows); see get_reportable_message.",
+        "operationId": "report_message_v1_messages__message_id__report_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "message_id",
+            "required": true,
+            "schema": {
+              "title": "Message Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReportReq"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Report Message V1 Messages  Message Id  Report Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Report Message",
+        "tags": [
+          "moderation"
+        ]
+      }
+    },
+    "/v1/read-positions": {
+      "get": {
+        "description": "The caller's read positions, ``{channel_id: {last_read, seq}}``.\n\nReturns every stored position, including ones for channels the caller can no\nlonger read. A position is a private note about where they got to, not a\nclaim about access — dropping it would silently lose a place they can return\nto, while keeping it reveals nothing (they supplied the channel id in the\nfirst place).",
+        "operationId": "get_read_positions_v1_read_positions_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Read Positions V1 Read Positions Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Get Read Positions",
+        "tags": [
+          "read-positions"
+        ]
+      },
+      "put": {
+        "description": "Apply the caller's writes by compare-and-swap; reply per channel.\n\n200 with ``{\"positions\": {channel_id: {\"status\", \"last_read\", \"seq\"}}}``.\n``status`` is ``applied``, ``conflict`` or ``skipped``. On ``applied`` and\n``conflict`` the pair is the value the island NOW holds, so a device that lost\nlearns the winner in the same round trip instead of believing it synced (the\nfirst design's 204 hid that). On a conflict with nothing stored, ``seq`` is 0\nand ``last_read`` is null: resend from base 0. ``skipped`` (no such channel)\ncarries neither.\n\nA batch containing one MALFORMED entry stores none of it, and the 422 names\nthe channel, so the client can find and drop the bad entry.",
+        "operationId": "set_read_positions_v1_read_positions_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetReadPositionsReq"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Set Read Positions V1 Read Positions Put",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Set Read Positions",
+        "tags": [
+          "read-positions"
+        ]
+      }
+    },
+    "/v1/reports": {
+      "get": {
+        "description": "The moderator triage queue. Only ``status=pending`` (unresolved) is served\ntoday — the queue behind the EULA's 24h-action commitment. The closed set is a\n``Literal`` so FastAPI validates it at the boundary (422 + OpenAPI-documented)\nrather than a hand-rolled check. ``limit`` is a validated page size (1..500,\ndefault 100) so a backlog past the default can't leave the oldest pending\nreports permanently unreachable through the API (cage-match Carnot); full\ncursor pagination is deferred to #44. Privileged read: shows already-soft-\ndeleted / block-hidden context (no visibility filter).",
+        "operationId": "list_reports_v1_reports_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "const": "pending",
+              "default": "pending",
+              "title": "Status",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 500,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Reports V1 Reports Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "List Reports",
+        "tags": [
+          "moderation"
+        ]
+      }
+    },
+    "/v1/reports/{report_id}/dismiss": {
+      "post": {
+        "description": "Dismiss a frivolous report (mark ``dismissed``, leave the message). Idempotent.\n404 for an unknown report.",
+        "operationId": "dismiss_report_v1_reports__report_id__dismiss_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "report_id",
+            "required": true,
+            "schema": {
+              "title": "Report Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Dismiss Report",
+        "tags": [
+          "moderation"
+        ]
+      }
+    },
+    "/v1/reports/{report_id}/resolve": {
+      "post": {
+        "description": "Act on a report by taking the reported message down (soft-delete) and\nmarking the report ``taken_down``. Idempotent. 404 for an unknown report.\n\nPropagation (#7): the soft-delete + its forward-ULID retraction commit together\nin take_down_message; here we additionally fan the retraction to live\nsubscribers so a connected client removes the message immediately. Best-effort\nover the wire — the Retraction row is the durable record, so an offline or\nsingle-worker-missed client self-heals on its next forward get_history catch-up.\nSingle-process hub scope, identical to the ban active-disconnect (see\n``ban_user``).",
+        "operationId": "resolve_report_v1_reports__report_id__resolve_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "report_id",
+            "required": true,
+            "schema": {
+              "title": "Report Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Resolve Report",
+        "tags": [
+          "moderation"
+        ]
+      }
+    },
+    "/v1/users/{user_id}/ban": {
+      "delete": {
+        "description": "Lift ``user_id``'s ban. Idempotent. 404 for an unknown target.",
+        "operationId": "unban_user_v1_users__user_id__ban_delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "user_id",
+            "required": true,
+            "schema": {
+              "title": "User Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Unban User",
+        "tags": [
+          "moderation"
+        ]
+      },
+      "post": {
+        "description": "Suspend ``user_id`` from this island. Per-island, reversible, forward-looking.\n400 for a self-ban, 404 for an unknown target. Active-disconnect (option a): after\nthe ban commits, drop the banned user's live socket(s) so they can't keep posting\non an already-open connection — the auth gates already refuse every new request,\nreconnect, and refresh.",
+        "operationId": "ban_user_v1_users__user_id__ban_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "user_id",
+            "required": true,
+            "schema": {
+              "title": "User Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Ban User",
+        "tags": [
+          "moderation"
+        ]
+      }
+    },
+    "/v1/users/{user_id}/block": {
+      "delete": {
+        "description": "Remove the caller's block of ``user_id``. Idempotent (unblocking a pair\nthat was never blocked is a silent no-op).",
+        "operationId": "unblock_user_v1_users__user_id__block_delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "user_id",
+            "required": true,
+            "schema": {
+              "title": "User Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Unblock User",
+        "tags": [
+          "moderation"
+        ]
+      },
+      "post": {
+        "description": "Block ``user_id`` for the caller. Idempotent (re-block is a no-op).\nMutual effect: neither party sees the other's messages nor may reply to\nthem, enforced in the history/fence/fanout/reply paths.",
+        "operationId": "block_user_v1_users__user_id__block_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "user_id",
+            "required": true,
+            "schema": {
+              "title": "User Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Block User",
+        "tags": [
+          "moderation"
+        ]
+      }
+    }
+  }
+}
