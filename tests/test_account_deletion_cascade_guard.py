@@ -47,7 +47,8 @@ from aiko_gateway.domain.models import (
     DEFAULT_COMMUNITY_ID, Channel, Community, CommunityMembership, Membership,
     ChannelReadPosition, Message, MessageReaction, MessageReport,
     PasskeyCredential, PendingRecovery,
-    RecoveryApprover, RecoveryPolicy, SigningKey, SocialIdentity, User)
+    RecoveryApprover, RecoveryPolicy, RefreshSession, SigningKey, SocialIdentity,
+    User)
 from aiko_gateway.domain.ids import new_ulid
 
 
@@ -100,6 +101,7 @@ EXPECTED_USERS_FK_COLUMNS: set[tuple[str, str]] = {
     ("pending_recovery", "user_id"),          # delete (Design 05)
     ("message_reactions", "user_id"),         # delete (#2634)
     ("channel_read_positions", "user_id"),    # delete (#4834a)
+    ("refresh_sessions", "user_id"),          # delete (#420)
 }
 
 
@@ -166,6 +168,12 @@ async def _seed_full_user_graph(session):
     session.add(PasskeyCredential(
         credential_id="cred-primary", user_id=user.id,
         public_key="cHVibGlj", sign_count=0))
+    # refresh_sessions.user_id (#420): a rotation chain, deleted with the account.
+    now = dt.datetime.now(dt.timezone.utc)
+    session.add(RefreshSession(
+        id="sid-primary", user_id=user.id, current_jti="j1",
+        current_issued_at=now, previous_jti="j0",
+        expires_at=now + dt.timedelta(days=30)))
     # communities.owner_id (anonymized on delete) + community_memberships.user_id
     # (deleted on delete) — the two FK-to-users columns added in #32. The owned
     # community must survive deletion with owner_id NULLed, not vanish.

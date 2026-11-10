@@ -27,10 +27,12 @@ import jwt
 import pytest
 from fastapi import HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials
+from sqlalchemy import update
 from starlette.websockets import WebSocketDisconnect
 
 from aiko_gateway.config import settings
-from aiko_gateway.domain import security, users_service
+from aiko_gateway.domain import auth_session, security, users_service
+from aiko_gateway.domain.models import RefreshSession
 from aiko_gateway.realtime import ws as ws_module
 from aiko_gateway.realtime.hub import Hub
 from aiko_gateway.rest import auth as auth_routes
@@ -170,3 +172,234 @@ async def test_ws_handshake_rejects_stale_generation(session, monkeypatch):
     fresh = security.issue_access(user.id, gen=1)
     accepted, code = await _run_handshake(session, monkeypatch, fresh)
     assert accepted is True and code is None
+
+
+# -- 5. refresh rotation (#420): a session slides; a copy ends it ------------- #
+#
+# The rule (auth_session.rotate_refresh): presenting the CURRENT token rotates;
+# the PREVIOUS one is a retry (a lost response), re-issuing the current one inside
+# the concurrency window and replacing it after; anything older is a second holder
+# and ends the session. `beyond_window` zeroes the window so a retry is judged as
+# one that comes hours later.
+
+async def _refresh(session, token: str) -> dict:
+    return await auth_routes.refresh(
+        auth_routes.RefreshReq(refresh_token=token), session)
+
+
+async def _refused(session, token: str) -> None:
+    with pytest.raises(HTTPException) as ei:
+        await _refresh(session, token)
+    assert ei.value.status_code == status.HTTP_401_UNAUTHORIZED
+
+
+def _jti(token: str) -> str:
+    return security.refresh_ids(token)[1]
+
+
+@pytest.fixture
+def beyond_window(monkeypatch):
+    monkeypatch.setattr(auth_session, "CONCURRENCY_WINDOW", dt.timedelta(0))
+
+
+async def test_refresh_returns_a_successor_with_a_fresh_expiry(session):
+    """The bug: the refresh token's 30 days were fixed at sign-in. Now each refresh
+    returns a successor whose expiry is counted from the refresh, not the sign-in."""
+    user = await _user(session)
+    signed_in = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=10)
+    t0 = security.issue_refresh(user.id, gen=0, now=signed_in)
+    out = await _refresh(session, t0)
+    old_exp = jwt.decode(t0, options={"verify_signature": False})["exp"]
+    new_exp = jwt.decode(out["refresh_token"], options={"verify_signature": False})["exp"]
+    assert new_exp - old_exp >= 10 * 24 * 3600 - 5
+    assert security.refresh_ids(out["refresh_token"])[0] == security.refresh_ids(t0)[0]
+    assert (await _refresh(session, out["refresh_token"]))["refresh_token"]
+
+
+async def test_a_chain_of_successors_each_refreshes(session):
+    user = await _user(session)
+    token = security.issue_refresh(user.id, gen=0)
+    seen = {_jti(token)}
+    for _ in range(4):
+        token = (await _refresh(session, token))["refresh_token"]
+        assert _jti(token) not in seen
+        seen.add(_jti(token))
+
+
+async def test_an_app_that_ignores_the_new_field_keeps_working(session, beyond_window):
+    """Every installed app before aiko_chat_app#427 keeps presenting the token it
+    signed in with. That token stays the session's PREVIOUS one, so each refresh is
+    a retry, and the island can deploy first."""
+    user = await _user(session)
+    t0 = security.issue_refresh(user.id, gen=0)
+    for _ in range(3):
+        assert (await _refresh(session, t0))["access_token"]
+
+
+async def test_a_lost_response_is_a_retry_hours_later(session, beyond_window):
+    user = await _user(session)
+    t0 = security.issue_refresh(user.id, gen=0)
+    lost = (await _refresh(session, t0))["refresh_token"]
+    kept = (await _refresh(session, t0))["refresh_token"]       # the retry
+    assert _jti(kept) != _jti(lost)
+    t2 = (await _refresh(session, kept))["refresh_token"]
+    assert t2
+
+
+async def test_two_holders_end_the_session(session, beyond_window, caplog):
+    """A thief and the owner both hold T0. Whoever refreshes second replaces the
+    first one's successor, so the first one's next refresh presents a token older
+    than the previous one: the session ends for both, and the island says so
+    without naming whose session it was."""
+    user = await _user(session)
+    t0 = security.issue_refresh(user.id, gen=0)
+    owner = (await _refresh(session, t0))["refresh_token"]
+    thief = (await _refresh(session, t0))["refresh_token"]
+    await _refused(session, owner)
+    await _refused(session, thief)
+    await _refused(session, t0)
+    ended = [r for r in caplog.records if "session has ended" in r.getMessage()]
+    assert len(ended) == 1
+    assert user.id not in ended[0].getMessage()
+
+
+async def test_a_copy_used_after_its_successor_ends_the_session(session):
+    user = await _user(session)
+    t0 = security.issue_refresh(user.id, gen=0)
+    t1 = (await _refresh(session, t0))["refresh_token"]
+    t2 = (await _refresh(session, t1))["refresh_token"]
+    await _refused(session, t0)          # older than the previous one (t1)
+    await _refused(session, t2)          # and the session is over
+
+
+async def test_overlapping_refreshes_inside_the_window_share_one_successor(session):
+    """The app tab's caveat: a rebuilt token provider can overlap the old one's
+    in-flight refresh with the same token. Inside the window both get the SAME
+    successor, so whichever response the app keeps still works."""
+    user = await _user(session)
+    t0 = security.issue_refresh(user.id, gen=0)
+    first = (await _refresh(session, t0))["refresh_token"]
+    second = (await _refresh(session, t0))["refresh_token"]
+    assert _jti(first) == _jti(second)
+    assert (await _refresh(session, first))["refresh_token"]
+
+
+async def test_overlap_keeping_the_other_response_also_works(session):
+    user = await _user(session)
+    t0 = security.issue_refresh(user.id, gen=0)
+    await _refresh(session, t0)
+    second = (await _refresh(session, t0))["refresh_token"]
+    assert (await _refresh(session, second))["refresh_token"]
+
+
+async def test_a_pre_420_refresh_token_upgrades_and_cannot_be_reused(session):
+    """A token minted before rotation has no sid/jti. It still works (no mass-logout
+    on deploy), its first refresh starts a rotating session, and presenting it after
+    its successor was used ends that session like any other copy."""
+    user = await _user(session)
+    now = dt.datetime.now(dt.timezone.utc)
+    legacy = jwt.encode(
+        {"sub": user.id, "type": "refresh", "gen": 0, "iat": int(now.timestamp()),
+         "exp": int((now + dt.timedelta(days=30)).timestamp())},
+        settings.jwt_secret, algorithm=settings.jwt_algorithm)
+    t1 = (await _refresh(session, legacy))["refresh_token"]
+    assert security.refresh_ids(t1)[0] == security.refresh_ids(legacy)[0]
+    await _refresh(session, t1)
+    await _refused(session, legacy)
+
+
+async def test_ending_one_session_leaves_the_others(session, beyond_window):
+    user = await _user(session)
+    phone = security.issue_refresh(user.id, gen=0)
+    desktop = security.issue_refresh(user.id, gen=0)
+    a = (await _refresh(session, phone))["refresh_token"]
+    await _refresh(session, phone)                   # replaces `a`
+    await _refused(session, a)                       # phone's session ends
+    assert (await _refresh(session, desktop))["refresh_token"]
+
+
+async def test_a_rotated_token_still_dies_with_its_generation(session):
+    user = await _user(session)
+    t1 = (await _refresh(session, security.issue_refresh(user.id, gen=0)))["refresh_token"]
+    await _bump_generation(session, user, to=1)
+    await _refused(session, t1)
+
+
+async def test_a_malformed_session_claim_is_a_401_not_a_500(session):
+    user = await _user(session)
+    now = dt.datetime.now(dt.timezone.utc)
+    bad = jwt.encode(
+        {"sub": user.id, "type": "refresh", "gen": 0, "sid": 7, "jti": "",
+         "iat": int(now.timestamp()),
+         "exp": int((now + dt.timedelta(days=30)).timestamp())},
+        settings.jwt_secret, algorithm=settings.jwt_algorithm)
+    await _refused(session, bad)
+
+
+async def test_an_ended_session_stays_ended_until_its_tokens_expire(session):
+    """The row of an ended session is a tombstone. Pruned while any of its tokens
+    could still verify, a copy's next refresh would look like a FIRST refresh and
+    bring the session back. Pruning waits for the newest token's expiry plus slack,
+    and only then removes it."""
+    user = await _user(session)
+    t0 = security.issue_refresh(user.id, gen=0)
+    t1 = (await _refresh(session, t0))["refresh_token"]
+    await _refresh(session, t1)
+    await _refused(session, t0)
+    sid = security.refresh_ids(t0)[0]
+
+    other = (await _refresh(session, security.issue_refresh(user.id, gen=0)))
+    assert other["refresh_token"]                    # a refresh that prunes
+    row = await session.get(RefreshSession, sid, populate_existing=True)
+    assert row is not None and row.revoked_at is not None
+
+    row.expires_at = (dt.datetime.now(dt.timezone.utc)
+                      - auth_session._PRUNE_SLACK - dt.timedelta(minutes=1))
+    await session.commit()
+    await _refresh(session, other["refresh_token"])
+    assert await session.get(RefreshSession, sid, populate_existing=True) is None
+
+
+async def test_a_row_inside_the_slack_is_not_pruned(session):
+    user = await _user(session)
+    t0 = security.issue_refresh(user.id, gen=0)
+    await _refresh(session, t0)
+    sid = security.refresh_ids(t0)[0]
+    row = await session.get(RefreshSession, sid)
+    row.expires_at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=1)
+    await session.commit()
+    await _refresh(session, security.issue_refresh(user.id, gen=0))
+    assert await session.get(RefreshSession, sid, populate_existing=True) is not None
+
+
+async def test_a_lost_race_rereads_and_judges_the_new_state(session, monkeypatch):
+    """Between this refresh's read and its write, another request rotated the
+    session. The compare-and-swap misses, the row is read again, and the token is
+    judged against the new state (now the PREVIOUS one, inside the window), so it
+    gets the other request's successor instead of a second one."""
+    user = await _user(session)
+    t0 = security.issue_refresh(user.id, gen=0)
+    t1 = (await _refresh(session, t0))["refresh_token"]   # the row exists; t1 current
+    sid = security.refresh_ids(t0)[0]
+
+    real_swap = auth_session._swap
+    fired = []
+
+    async def racing_swap(sess, row, **values):
+        if not fired:
+            fired.append(True)
+            # synchronize_session=False: the rival is ANOTHER request, on another
+            # connection, so it must not touch this request's in-memory row. With
+            # the default, the ORM syncs `row` to the rival's state and the swap
+            # compares against it and wins: a race test that cannot lose the race.
+            await sess.execute(
+                update(RefreshSession).where(RefreshSession.id == sid)
+                .values(previous_jti=row.current_jti, current_jti="rival",
+                        current_issued_at=dt.datetime.now(dt.timezone.utc))
+                .execution_options(synchronize_session=False))
+        return await real_swap(sess, row, **values)
+
+    monkeypatch.setattr(auth_session, "_swap", racing_swap)
+    out = await _refresh(session, t1)
+    assert fired, "the race injection never ran"
+    assert _jti(out["refresh_token"]) == "rival"

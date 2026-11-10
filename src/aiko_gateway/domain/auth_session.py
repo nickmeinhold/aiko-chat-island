@@ -21,13 +21,20 @@ the current generation; their ban gate is `auth._deny_if_banned`.
 """
 from __future__ import annotations
 
+import datetime as dt
+import logging
 from typing import Literal
 
 import jwt
+from sqlalchemy import delete, select, update
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ..config import settings
 from . import security, users_service
-from .models import User
+from .models import RefreshSession, User
+
+log = logging.getLogger(__name__)
 
 
 class InvalidSession(Exception):
@@ -62,3 +69,135 @@ async def resolve_session_user(
     if users_service.is_banned(user):
         raise SessionBanned
     return user
+
+
+# --- refresh-token rotation (#420) ------------------------------------------ #
+
+class RefreshReused(InvalidSession):
+    """A refresh token older than the session's previous one was presented: two
+    holders, so the session has ended. Rendered exactly as any InvalidSession (the
+    same opaque 401), so the wire gains no new code and an old app's existing
+    sign-out path is the whole client behaviour."""
+
+
+# A PREVIOUS token presented this soon after the current one was minted is the
+# same device's overlapping request (an app rebuilding its token provider mid-
+# refresh: app tab, aiko_chat_app#427), not a lost response, so it gets the current
+# token re-issued rather than discarded. Later, it is a retry. Both readings keep
+# the session; only which token survives differs.
+CONCURRENCY_WINDOW = dt.timedelta(seconds=30)
+
+# Tombstones are pruned only this long after their newest token's `exp`. Expiry is
+# checked by PyJWT against the wall clock, the same clock as `expires_at`; the
+# slack is for a backward step of that clock, which would otherwise let a token of
+# a pruned (possibly revoked) session verify again with no row to stop it.
+_PRUNE_SLACK = dt.timedelta(days=1)
+
+_MAX_ATTEMPTS = 3
+
+
+async def rotate_refresh(session: AsyncSession, token: str, user: User) -> str:
+    """Rotate a refresh token that `resolve_session_user` has already accepted, and
+    return its successor. Owns its transaction: commits on success AND when it ends
+    a session (the revocation must persist while the 401 is raised).
+
+    The session's row names two tokens. Presenting:
+      * the CURRENT one → it becomes previous, and a new current is minted;
+      * the PREVIOUS one → a retry: the device never kept the current one (a lost
+        response, a locked keychain). The current one is discarded and a
+        replacement minted, or, inside CONCURRENCY_WINDOW, re-issued;
+      * any other → a second holder: the session ends (RefreshReused).
+    No timer decides a retry: a phone that dozes for hours after a lost response
+    still holds the previous token, and that works. What it cannot survive is
+    presenting a token OLDER than the previous one, which only a copy can do.
+
+    A session's first refresh writes its row: a sign-in writes nothing, so every
+    mint path stays a pure function and only this door stores session state.
+    Every write is a compare-and-swap on the state it read; a lost race re-reads."""
+    try:
+        sid, jti = security.refresh_ids(token)
+    except jwt.InvalidTokenError as exc:
+        raise InvalidSession from exc   # a malformed claim is a 401, never a 500
+    for _ in range(_MAX_ATTEMPTS):
+        now = dt.datetime.now(dt.timezone.utc)
+        expires_at = now + dt.timedelta(seconds=settings.jwt_refresh_ttl_seconds)
+        await session.execute(delete(RefreshSession).where(
+            RefreshSession.user_id == user.id,
+            RefreshSession.expires_at < now - _PRUNE_SLACK))
+        row = (await session.execute(
+            select(RefreshSession).where(RefreshSession.id == sid)
+            .execution_options(populate_existing=True))).scalar_one_or_none()
+
+        if row is None:
+            new_jti = security.new_token_id()
+            inserted = (await session.execute(
+                sqlite_insert(RefreshSession).values(
+                    id=sid, user_id=user.id, current_jti=new_jti,
+                    current_issued_at=now, previous_jti=jti,
+                    expires_at=expires_at, revoked_at=None)
+                .on_conflict_do_nothing())).rowcount
+            if inserted == 1:
+                return await _commit_and_mint(session, user, sid, new_jti, now)
+            continue  # a concurrent first refresh made the row: judge against it
+
+        if row.user_id != user.id or row.revoked_at is not None:
+            await session.commit()
+            raise InvalidSession
+
+        if jti == row.current_jti:
+            new_jti = security.new_token_id()
+            moved = await _swap(session, row, current_jti=new_jti,
+                                current_issued_at=now, previous_jti=jti,
+                                expires_at=expires_at)
+        elif jti == row.previous_jti:
+            if now - row.current_issued_at < CONCURRENCY_WINDOW:
+                new_jti = row.current_jti
+                moved = await _swap(session, row, expires_at=max(
+                    row.expires_at, expires_at))
+            else:
+                new_jti = security.new_token_id()
+                moved = await _swap(session, row, current_jti=new_jti,
+                                    current_issued_at=now, expires_at=expires_at)
+        else:
+            ended = (await session.execute(
+                update(RefreshSession)
+                .where(RefreshSession.id == sid, RefreshSession.revoked_at.is_(None))
+                .values(revoked_at=now))).rowcount
+            await session.commit()
+            if ended:
+                # No ids: the island declines to know whose session it was.
+                log.warning("refresh token presented after its successor was used; "
+                            "that session has ended")
+            raise RefreshReused
+
+        if moved:
+            return await _commit_and_mint(session, user, sid, new_jti, now)
+    await session.rollback()
+    raise InvalidSession
+
+
+async def _swap(session: AsyncSession, row: RefreshSession, **values) -> bool:
+    """UPDATE the row only if it is still exactly the state this refresh read."""
+    result = await session.execute(
+        update(RefreshSession).where(
+            RefreshSession.id == row.id,
+            RefreshSession.current_jti == row.current_jti,
+            RefreshSession.previous_jti == row.previous_jti,
+            RefreshSession.revoked_at.is_(None),
+        ).values(**values))
+    return result.rowcount == 1
+
+
+async def _commit_and_mint(session: AsyncSession, user: User, sid: str,
+                           jti: str, now: dt.datetime) -> str:
+    # Mint from values read BEFORE commit (expire_on_commit would lazy-reload `user`).
+    user_id, gen = user.id, user.token_generation
+    await session.commit()
+    return security.issue_refresh(user_id, gen=gen, sid=sid, jti=jti, now=now)
+
+
+async def purge_user_refresh_sessions(session: AsyncSession, user_id: str) -> None:
+    """Account deletion's teardown of this FK child of `users` (no commit: the
+    deletion transaction owns it)."""
+    await session.execute(
+        delete(RefreshSession).where(RefreshSession.user_id == user_id))

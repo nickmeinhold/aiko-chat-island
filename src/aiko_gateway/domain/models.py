@@ -1404,6 +1404,41 @@ class PasskeyChallenge(Base):
         UtcDateTime, default=_utcnow)
 
 
+class RefreshSession(Base):
+    """One signed-in session's refresh-token chain (#420), so a session slides
+    instead of ending 30 days after sign-in, and a copied refresh token is noticed.
+
+    Written only by `auth_session.rotate_refresh`, at a session's FIRST refresh: a
+    sign-in mints a token naming a new `sid` and writes nothing. The row holds the
+    ids of the two tokens that may still be presented: `current_jti` (the newest)
+    and `previous_jti` (the one it replaced, honoured only as a retry). Any other
+    token of the session is a second holder, and the session ends (`revoked_at`).
+
+    A revoked row is a TOMBSTONE and must outlive every token it names: deleted
+    early, a dead token's next refresh would look like a first refresh and bring the
+    session back. `expires_at` is the newest token's `exp`; rows are pruned only
+    after it (plus slack for a backward wall step), when no token of the session can
+    verify any more.
+
+    No ON DELETE CASCADE (codebase convention): account deletion tears these down
+    via auth_session.purge_user_refresh_sessions; the cascade guard requires it.
+    """
+    __tablename__ = "refresh_sessions"
+    # "legacy:" + 64 hex for a pre-#420 token (security.refresh_ids); else 22 chars.
+    id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id"), nullable=False, index=True)
+    current_jti: Mapped[str] = mapped_column(String(80), nullable=False)
+    # When `current_jti` was minted: a retry inside the concurrency window gets the
+    # current token re-issued rather than discarded (auth_session.rotate_refresh).
+    current_issued_at: Mapped[dt.datetime] = mapped_column(
+        UtcDateTime, nullable=False)
+    previous_jti: Mapped[str] = mapped_column(String(80), nullable=False)
+    expires_at: Mapped[dt.datetime] = mapped_column(UtcDateTime, nullable=False)
+    revoked_at: Mapped[dt.datetime | None] = mapped_column(
+        UtcDateTime, nullable=True)
+
+
 class RecoveryPolicy(Base):
     """A user's social-recovery policy — the k-of-n quorum threshold (Design 05).
 
