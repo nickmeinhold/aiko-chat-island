@@ -87,13 +87,6 @@ class RefreshContended(Exception):
     retry."""
 
 
-# A PREVIOUS token presented this soon after the current one was minted is the
-# same device's overlapping request (an app rebuilding its token provider mid-
-# refresh: app tab, aiko_chat_app#427), not a lost response, so it gets the current
-# token re-issued rather than discarded. Later, it is a retry. Both readings keep
-# the session; only which token survives differs.
-CONCURRENCY_WINDOW = dt.timedelta(seconds=30)
-
 # Tombstones are pruned only this long after their newest token's `exp`. Expiry is
 # checked by PyJWT against the wall clock, the same clock as `expires_at`; the
 # slack is for a backward step of that clock, which would otherwise let a token of
@@ -112,11 +105,19 @@ async def rotate_refresh(session: AsyncSession, token: str, user: User) -> str:
       * the CURRENT one → it becomes previous, and a new current is minted;
       * the PREVIOUS one → a retry: the device never kept the current one (a lost
         response, a locked keychain). The current one is discarded and a
-        replacement minted, or, inside CONCURRENCY_WINDOW, re-issued;
+        replacement minted;
       * any other → a second holder: the session ends (RefreshReused).
     No timer decides a retry: a phone that dozes for hours after a lost response
     still holds the previous token, and that works. What it cannot survive is
     presenting a token OLDER than the previous one, which only a copy can do.
+
+    A retry is never handed the current token back. Two holders of one token would
+    then converge on one chain and each one's refresh would look like the other's
+    retry, so a copy would never show. Replacing the current token forks them, and
+    the holder left behind presents a token older than previous: the fork is the
+    alarm. (A 30 s re-issue window once sat here; it let two holders refreshing in
+    step stay converged forever. The app keeps one refresh in flight, so nothing
+    needs it: aiko_chat_app#427.)
 
     A session's first refresh writes its row: a sign-in writes nothing, so every
     mint path stays a pure function and only this door stores session state.
@@ -140,8 +141,7 @@ async def rotate_refresh(session: AsyncSession, token: str, user: User) -> str:
             inserted = (await session.execute(
                 sqlite_insert(RefreshSession).values(
                     id=sid, user_id=user.id, current_jti=new_jti,
-                    current_issued_at=now, previous_jti=jti,
-                    expires_at=expires_at, revoked_at=None)
+                    previous_jti=jti, expires_at=expires_at, revoked_at=None)
                 .on_conflict_do_nothing())).rowcount
             if inserted == 1:
                 return await _commit_and_mint(session, user, sid, new_jti, now)
@@ -154,17 +154,11 @@ async def rotate_refresh(session: AsyncSession, token: str, user: User) -> str:
         if jti == row.current_jti:
             new_jti = security.new_token_id()
             moved = await _swap(session, row, current_jti=new_jti,
-                                current_issued_at=now, previous_jti=jti,
-                                expires_at=expires_at)
+                                previous_jti=jti, expires_at=expires_at)
         elif jti == row.previous_jti:
-            if now - row.current_issued_at < CONCURRENCY_WINDOW:
-                new_jti = row.current_jti
-                moved = await _swap(session, row, expires_at=max(
-                    row.expires_at, expires_at))
-            else:
-                new_jti = security.new_token_id()
-                moved = await _swap(session, row, current_jti=new_jti,
-                                    current_issued_at=now, expires_at=expires_at)
+            new_jti = security.new_token_id()
+            moved = await _swap(session, row, current_jti=new_jti,
+                                expires_at=expires_at)
         else:
             ended = (await session.execute(
                 update(RefreshSession)

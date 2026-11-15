@@ -1429,10 +1429,6 @@ class RefreshSession(Base):
     user_id: Mapped[str] = mapped_column(
         ForeignKey("users.id"), nullable=False, index=True)
     current_jti: Mapped[str] = mapped_column(String(80), nullable=False)
-    # When `current_jti` was minted: a retry inside the concurrency window gets the
-    # current token re-issued rather than discarded (auth_session.rotate_refresh).
-    current_issued_at: Mapped[dt.datetime] = mapped_column(
-        UtcDateTime, nullable=False)
     previous_jti: Mapped[str] = mapped_column(String(80), nullable=False)
     expires_at: Mapped[dt.datetime] = mapped_column(UtcDateTime, nullable=False)
     revoked_at: Mapped[dt.datetime | None] = mapped_column(

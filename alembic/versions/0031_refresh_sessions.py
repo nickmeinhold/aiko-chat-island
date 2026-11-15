@@ -7,8 +7,6 @@ ending 30 days after sign-in, and a copied refresh token is noticed:
     hex for a pre-#420 token (security.refresh_ids), else 22 chars; String(80).
   * current_jti / previous_jti — the only two tokens of the session that may still
     be presented: the newest, and the one it replaced (honoured only as a retry).
-  * current_issued_at — when current_jti was minted; a retry inside the concurrency
-    window gets the current token re-issued rather than discarded.
   * expires_at — the newest token's `exp`. A revoked row is a TOMBSTONE and is
     pruned only after this (plus slack), when no token of the session can verify.
   * revoked_at — NULL while the session lives; set when a second holder shows.
@@ -48,7 +46,6 @@ def upgrade() -> None:
         sa.Column("id", sa.String(length=80), nullable=False),
         sa.Column("user_id", sa.String(length=26), nullable=False),
         sa.Column("current_jti", sa.String(length=80), nullable=False),
-        sa.Column("current_issued_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("previous_jti", sa.String(length=80), nullable=False),
         sa.Column("expires_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("revoked_at", sa.DateTime(timezone=True), nullable=True),

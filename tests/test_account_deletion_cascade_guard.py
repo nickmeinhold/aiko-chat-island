@@ -171,8 +171,7 @@ async def _seed_full_user_graph(session):
     # refresh_sessions.user_id (#420): a rotation chain, deleted with the account.
     now = dt.datetime.now(dt.timezone.utc)
     session.add(RefreshSession(
-        id="sid-primary", user_id=user.id, current_jti="j1",
-        current_issued_at=now, previous_jti="j0",
+        id="sid-primary", user_id=user.id, current_jti="j1", previous_jti="j0",
         expires_at=now + dt.timedelta(days=30)))
     # communities.owner_id (anonymized on delete) + community_memberships.user_id
     # (deleted on delete) — the two FK-to-users columns added in #32. The owned
