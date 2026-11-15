@@ -835,15 +835,29 @@ async def refresh(req: RefreshReq, session: DbSession) -> dict:
     # ingress that most needs it (30d refresh TTL). InvalidSession renders as the
     # opaque "invalid refresh token"; a ban renders as the structured 403. On
     # success the new access token carries the user's CURRENT generation.
+    #
+    # The refresh token ROTATES (#420): the response carries its successor, with a
+    # fresh 30 days, so a session in use slides instead of ending 30 days after
+    # sign-in. A copy presented after its successor was used ends that session
+    # (auth_session.rotate_refresh), rendered as the same opaque 401. The field is
+    # additive: an app that ignores it keeps presenting the token it holds, which
+    # stays valid as a retry (aiko_chat_app#427 adopts it).
     try:
         user = await auth_session.resolve_session_user(
             session, req.refresh_token, expected_type="refresh")
+        access = security.issue_access(user.id, gen=user.token_generation)
+        refresh_token = await auth_session.rotate_refresh(
+            session, req.refresh_token, user)
     except auth_session.InvalidSession:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid refresh token")
+    except auth_session.RefreshContended:
+        # The token was never judged: a 401 here would sign out a live session.
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "refresh contended, retry",
+            headers={"Retry-After": "1"})
     except auth_session.SessionBanned:
         raise AccountSuspended()
-    return {"access_token": security.issue_access(
-        user.id, gen=user.token_generation)}
+    return {"access_token": access, "refresh_token": refresh_token}
 
 
 # --- OAuth broker (server-side authorization-code flow, #21) ---------------- #
