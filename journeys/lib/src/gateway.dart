@@ -20,10 +20,24 @@ import 'dart:io';
 import 'dart:math';
 
 final class PythonGateway {
-  PythonGateway._(this.base, this._process, this._dir, this._log);
+  PythonGateway._(
+    this.base,
+    this.jwtSecret,
+    this.database,
+    this._process,
+    this._dir,
+    this._log,
+  );
 
   /// Where the gateway listens, e.g. `http://127.0.0.1:53211`.
   final Uri base;
+
+  /// The secret it signs tokens with. The harness chose it, so a journey can
+  /// mint the tokens a sign-in would have (see `accounts.dart`).
+  final String jwtSecret;
+
+  /// Its SQLite file.
+  final String database;
   final Process _process;
   final Directory _dir;
   final StringBuffer _log;
@@ -90,6 +104,8 @@ final class PythonGateway {
 
     final gateway = PythonGateway._(
       Uri.parse('http://127.0.0.1:$port'),
+      env['JWT_SECRET']!,
+      '${dir.path}/aiko.db',
       process,
       dir,
       log,
