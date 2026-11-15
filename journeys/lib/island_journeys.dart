@@ -13,6 +13,7 @@ library;
 
 import 'dart:io';
 
+export 'src/accounts.dart';
 export 'src/contract.dart';
 export 'src/gateway.dart';
 export 'src/journey_map.dart';

@@ -1,0 +1,6 @@
+{
+  "POST /v1/auth/refresh": {
+    "access_token": "string",
+    "refresh_token": "string"
+  }
+}
