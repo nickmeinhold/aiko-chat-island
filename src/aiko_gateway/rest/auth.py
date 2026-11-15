@@ -850,6 +850,11 @@ async def refresh(req: RefreshReq, session: DbSession) -> dict:
             session, req.refresh_token, user)
     except auth_session.InvalidSession:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid refresh token")
+    except auth_session.RefreshContended:
+        # The token was never judged: a 401 here would sign out a live session.
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "refresh contended, retry",
+            headers={"Retry-After": "1"})
     except auth_session.SessionBanned:
         raise AccountSuspended()
     return {"access_token": access, "refresh_token": refresh_token}

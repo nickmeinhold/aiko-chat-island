@@ -80,6 +80,13 @@ class RefreshReused(InvalidSession):
     sign-out path is the whole client behaviour."""
 
 
+class RefreshContended(Exception):
+    """Every compare-and-swap attempt lost to a concurrent refresh of the same
+    session. NOT an InvalidSession: the presented token was never judged, so it must
+    not render as the 401 a client answers by signing out. Rendered as a 503 to
+    retry."""
+
+
 # A PREVIOUS token presented this soon after the current one was minted is the
 # same device's overlapping request (an app rebuilding its token provider mid-
 # refresh: app tab, aiko_chat_app#427), not a lost response, so it gets the current
@@ -173,7 +180,7 @@ async def rotate_refresh(session: AsyncSession, token: str, user: User) -> str:
         if moved:
             return await _commit_and_mint(session, user, sid, new_jti, now)
     await session.rollback()
-    raise InvalidSession
+    raise RefreshContended
 
 
 async def _swap(session: AsyncSession, row: RefreshSession, **values) -> bool:

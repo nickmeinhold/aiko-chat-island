@@ -403,3 +403,29 @@ async def test_a_lost_race_rereads_and_judges_the_new_state(session, monkeypatch
     out = await _refresh(session, t1)
     assert fired, "the race injection never ran"
     assert _jti(out["refresh_token"]) == "rival"
+
+
+async def test_losing_every_race_is_a_retry_not_a_sign_out(session, monkeypatch):
+    """A refresh that loses every compare-and-swap never judged its token, so it
+    must not answer with the 401 a client signs out on: it is a 503 to retry, and
+    the token still works afterwards."""
+    user = await _user(session)
+    t0 = security.issue_refresh(user.id, gen=0)
+    t1 = (await _refresh(session, t0))["refresh_token"]
+
+    real_swap = auth_session._swap
+    lost = []
+
+    async def always_loses(sess, row, **values):
+        lost.append(True)
+        return False
+
+    monkeypatch.setattr(auth_session, "_swap", always_loses)
+    with pytest.raises(HTTPException) as ei:
+        await _refresh(session, t1)
+    assert len(lost) == auth_session._MAX_ATTEMPTS, "the lost-race injection never ran"
+    assert ei.value.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+    assert ei.value.headers == {"Retry-After": "1"}
+
+    monkeypatch.setattr(auth_session, "_swap", real_swap)
+    assert (await _refresh(session, t1))["refresh_token"]
