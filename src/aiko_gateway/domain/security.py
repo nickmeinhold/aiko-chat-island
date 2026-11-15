@@ -79,26 +79,35 @@ def new_token_id() -> str:
     return secrets.token_urlsafe(16)
 
 
-def refresh_ids(token: str) -> tuple[str, str]:
-    """(session id, token id) of a refresh token the caller has ALREADY verified
-    (`decode_token(..., expected_type="refresh")`).
+def refresh_ids(token: str) -> tuple[str, str, dt.datetime]:
+    """(session id, token id, expiry) of a refresh token the caller has ALREADY
+    verified (`decode_token(..., expected_type="refresh")`).
 
     A refresh token minted before #420 carries neither claim. It reads as a session
-    of its own whose one token is itself, both ids derived from the token's bytes, so
-    its first refresh upgrades it into a rotating session and presenting it again
-    afterwards is judged by the same rule as any other (no mass-logout on deploy, and
-    no way to reuse it forever). A claim that is present must be a non-empty string:
+    of its own whose one token is itself, both ids derived from the token, so its
+    first refresh upgrades it into a rotating session and presenting it again
+    afterwards is judged by the same rule as any other (no mass-logout on deploy).
+    The derived id is a hash of the decoded SIGNATURE, not of the token's text: a
+    JWT has more than one spelling (PyJWT accepts trailing base64 padding), and a
+    hash of the text would make each spelling a separate session, so a copy could
+    be refreshed into a chain of its own that the owner's never revokes. The
+    signature bytes are the same for every spelling, and changing anything they
+    cover fails verification. A claim that is present must be a non-empty string:
     a malformed one is an invalid token, never a server error (decode_token's
     fail-closed posture)."""
-    payload = jwt.decode(
+    decoded = jwt.decode_complete(
         token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
+    payload = decoded["payload"]
+    if not isinstance(payload.get("exp"), int):
+        raise jwt.InvalidTokenError("refresh token without an integer exp")
+    exp = dt.datetime.fromtimestamp(payload["exp"], dt.timezone.utc)
     sid, jti = payload.get("sid"), payload.get("jti")
     if sid is None and jti is None:
-        legacy = "legacy:" + hashlib.sha256(token.encode()).hexdigest()
-        return legacy, legacy
+        legacy = "legacy:" + hashlib.sha256(decoded["signature"]).hexdigest()
+        return legacy, legacy, exp
     if not (isinstance(sid, str) and sid and isinstance(jti, str) and jti):
         raise jwt.InvalidTokenError("invalid sid/jti claim")
-    return sid, jti
+    return sid, jti, exp
 
 
 def decode_token(token: str, *, expected_type: str) -> tuple[str, int]:

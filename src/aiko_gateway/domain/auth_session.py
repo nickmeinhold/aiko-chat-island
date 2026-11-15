@@ -121,14 +121,21 @@ async def rotate_refresh(session: AsyncSession, token: str, user: User) -> str:
 
     A session's first refresh writes its row: a sign-in writes nothing, so every
     mint path stays a pure function and only this door stores session state.
-    Every write is a compare-and-swap on the state it read; a lost race re-reads."""
+    Every write is a compare-and-swap on the state it read; a lost race re-reads.
+
+    `expires_at` only ever moves later, and starts at or after the presented
+    token's own `exp`: every token the session has named was minted with an `exp`
+    at most the horizon at that moment, so the row outlives all of them even if
+    `jwt_refresh_ttl_seconds` is lowered. Recomputing it from the setting alone let a
+    shorter TTL prune a tombstone while an older, longer-lived token still verified,
+    and that token's next refresh would then start the session afresh."""
     try:
-        sid, jti = security.refresh_ids(token)
+        sid, jti, presented_exp = security.refresh_ids(token)
     except jwt.InvalidTokenError as exc:
         raise InvalidSession from exc   # a malformed claim is a 401, never a 500
     for _ in range(_MAX_ATTEMPTS):
         now = dt.datetime.now(dt.timezone.utc)
-        expires_at = now + dt.timedelta(seconds=settings.jwt_refresh_ttl_seconds)
+        minted_exp = now + dt.timedelta(seconds=settings.jwt_refresh_ttl_seconds)
         await session.execute(delete(RefreshSession).where(
             RefreshSession.user_id == user.id,
             RefreshSession.expires_at < now - _PRUNE_SLACK))
@@ -141,7 +148,8 @@ async def rotate_refresh(session: AsyncSession, token: str, user: User) -> str:
             inserted = (await session.execute(
                 sqlite_insert(RefreshSession).values(
                     id=sid, user_id=user.id, current_jti=new_jti,
-                    previous_jti=jti, expires_at=expires_at, revoked_at=None)
+                    previous_jti=jti, expires_at=max(minted_exp, presented_exp),
+                    revoked_at=None)
                 .on_conflict_do_nothing())).rowcount
             if inserted == 1:
                 return await _commit_and_mint(session, user, sid, new_jti, now)
@@ -151,14 +159,15 @@ async def rotate_refresh(session: AsyncSession, token: str, user: User) -> str:
             await session.commit()
             raise InvalidSession
 
+        horizon = max(row.expires_at, minted_exp)
         if jti == row.current_jti:
             new_jti = security.new_token_id()
             moved = await _swap(session, row, current_jti=new_jti,
-                                previous_jti=jti, expires_at=expires_at)
+                                previous_jti=jti, expires_at=horizon)
         elif jti == row.previous_jti:
             new_jti = security.new_token_id()
             moved = await _swap(session, row, current_jti=new_jti,
-                                expires_at=expires_at)
+                                expires_at=horizon)
         else:
             ended = (await session.execute(
                 update(RefreshSession)

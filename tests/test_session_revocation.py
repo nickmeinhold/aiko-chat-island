@@ -303,6 +303,76 @@ async def test_a_pre_420_refresh_token_upgrades_and_cannot_be_reused(session):
     await _refused(session, legacy)
 
 
+async def test_a_respelled_pre_420_token_is_the_same_session(session):
+    """Carnot, cage-match round 2: PyJWT accepts a token with trailing base64
+    padding, so one legacy token has several spellings. Its session id comes from
+    the decoded signature, which every spelling shares, so a respelled copy is
+    judged in the owner's chain instead of starting one of its own."""
+    user = await _user(session)
+    now = dt.datetime.now(dt.timezone.utc)
+    legacy = jwt.encode(
+        {"sub": user.id, "type": "refresh", "gen": 0, "iat": int(now.timestamp()),
+         "exp": int((now + dt.timedelta(days=30)).timestamp())},
+        settings.jwt_secret, algorithm=settings.jwt_algorithm)
+    respelled = legacy + "="
+    assert security.refresh_ids(respelled)[0] == security.refresh_ids(legacy)[0]
+    t1 = (await _refresh(session, legacy))["refresh_token"]
+    await _refresh(session, t1)                      # legacy is now older than previous
+    await _refused(session, respelled)
+
+
+async def test_a_lowered_ttl_never_shortens_a_sessions_horizon(session, monkeypatch):
+    """Noether + Carnot, cage-match round 2: the row's `expires_at` must outlive
+    every token it names. A token minted under a 30-day TTL still verifies for 30
+    days after the TTL is lowered, so a row recomputed from the new setting would be
+    pruned early and that token's next refresh would start the session again."""
+    user = await _user(session)
+    t0 = security.issue_refresh(user.id, gen=0)       # 30-day exp
+    t0_exp = security.refresh_ids(t0)[2]
+    sid = security.refresh_ids(t0)[0]
+    monkeypatch.setattr(settings, "jwt_refresh_ttl_seconds", 24 * 3600)
+    t1 = (await _refresh(session, t0))["refresh_token"]
+    row = await session.get(RefreshSession, sid, populate_existing=True)
+    assert row.expires_at >= t0_exp
+    await _refresh(session, t1)                       # a rotation under the short TTL
+    row = await session.get(RefreshSession, sid, populate_existing=True)
+    assert row.expires_at >= t0_exp
+
+
+async def test_a_concurrent_first_refresh_is_judged_against_the_rivals_row(session):
+    """Noether, cage-match round 2: two first refreshes of one session race to
+    create its row. The loser's insert does nothing and it must judge its token
+    against the winner's row. If the skipped insert were reported as a success, it
+    would return a token the row never names, and that token's next refresh would
+    end the session: the final assertion is what would catch it."""
+    from sqlalchemy.sql.dml import Insert
+
+    user = await _user(session)
+    t0 = security.issue_refresh(user.id, gen=0)
+    sid, t0_jti, t0_exp = security.refresh_ids(t0)
+    real_execute = session.execute
+    fired = []
+
+    async def rival_first(stmt, *args, **kwargs):
+        if (not fired and isinstance(stmt, Insert)
+                and stmt.table.name == RefreshSession.__tablename__):
+            fired.append(True)
+            await real_execute(Insert(RefreshSession).values(
+                id=sid, user_id=user.id, current_jti="rival",
+                previous_jti=t0_jti, expires_at=t0_exp))
+        return await real_execute(stmt, *args, **kwargs)
+
+    session.execute = rival_first
+    try:
+        out = await _refresh(session, t0)
+    finally:
+        del session.execute
+    assert fired, "the rival insert never ran"
+    row = await session.get(RefreshSession, sid, populate_existing=True)
+    assert row.previous_jti == t0_jti
+    assert row.current_jti == _jti(out["refresh_token"]) != "rival"
+
+
 async def test_ending_one_session_leaves_the_others(session):
     user = await _user(session)
     phone = security.issue_refresh(user.id, gen=0)
