@@ -35,15 +35,30 @@ final class Account {
 
   /// Writes a human account with [handle] into [gateway]'s database, with the
   /// columns a sign-up fills and the rest at their schema defaults
-  /// (generation 0, not banned).
-  factory Account.seed(PythonGateway gateway, String handle) {
+  /// (generation 0, not banned, no handle change yet).
+  ///
+  /// [handleAssigned] is what `register/finish` stores for the handle it made
+  /// up (alembic 0030): `handle_auto` reads it, and the first change away from
+  /// it doesn't start the cooldown. False is an account whose handle was chosen.
+  factory Account.seed(
+    PythonGateway gateway,
+    String handle, {
+    bool handleAssigned = false,
+  }) {
     final account = Account._(_ulidLike(), handle);
     final db = sqlite3.open(gateway.database);
     try {
       db.execute(
-        'INSERT INTO users (id, username, display_name, aiko_username, created_at) '
-        'VALUES (?, ?, ?, ?, ?)',
-        [account.id, handle, handle, handle, _stored(DateTime.now().toUtc())],
+        'INSERT INTO users (id, username, display_name, aiko_username, '
+        'created_at, handle_assigned) VALUES (?, ?, ?, ?, ?, ?)',
+        [
+          account.id,
+          handle,
+          handle,
+          handle,
+          _stored(DateTime.now().toUtc()),
+          handleAssigned ? 1 : 0,
+        ],
       );
     } finally {
       db.close();

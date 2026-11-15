@@ -29,14 +29,9 @@ void main() {
   late Minter mint;
   var accounts = 0;
 
-  // The refresh door is rate-limited per client IP (20 a minute), keyed on the
-  // rightmost X-Forwarded-For, the entry production's one Caddy appends
-  // (`domain/rate_limit.py` `client_ip`). The harness plays that Caddy and gives
-  // each test a client of its own, so the limiter stays on, as in production,
-  // and no test spends another's budget.
-  var client_ = 0;
+  // The refresh door is rate-limited per client IP: one client per test.
   late String forwardedFor;
-  setUp(() => forwardedFor = '198.51.100.${++client_}');
+  setUp(() => forwardedFor = gateway.newClient());
 
   setUpAll(() async {
     gateway = await PythonGateway.start(repoRoot);

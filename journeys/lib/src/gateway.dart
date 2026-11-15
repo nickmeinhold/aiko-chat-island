@@ -38,6 +38,22 @@ final class PythonGateway {
 
   /// Its SQLite file.
   final String database;
+
+  var _clients = 0;
+
+  /// An `X-Forwarded-For` value naming a client no earlier call named.
+  ///
+  /// Production's gateway sits behind exactly one Caddy, which appends the
+  /// client's IP, and the per-IP rate limits key on that rightmost entry
+  /// (`domain/rate_limit.py` `client_ip`). Every journey request comes from
+  /// 127.0.0.1, so without this they would all share one budget (20 a minute
+  /// per door). The harness plays that Caddy instead and gives each test a
+  /// client of its own, so the limiter stays on, as in production.
+  String newClient() {
+    final n = ++_clients;
+    return '10.${n >> 16 & 255}.${n >> 8 & 255}.${n & 255}';
+  }
+
   final Process _process;
   final Directory _dir;
   final StringBuffer _log;

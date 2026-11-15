@@ -1,0 +1,18 @@
+{
+  "GET /v1/me": {
+    "aiko_username": "string",
+    "display_name": "string",
+    "handle_auto": "bool",
+    "is_moderator": "bool",
+    "user_id": "string",
+    "username": "string"
+  },
+  "PATCH /v1/me": {
+    "aiko_username": "string",
+    "display_name": "string",
+    "handle_auto": "bool",
+    "is_moderator": "bool",
+    "user_id": "string",
+    "username": "string"
+  }
+}
