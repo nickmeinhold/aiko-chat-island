@@ -9,8 +9,10 @@
 /// that generation (`domain/security.py`, `auth_session.resolve_session_user`).
 /// The harness chose the secret, so it can mint what a sign-in would have.
 ///
-/// This is the one place a journey reaches past the wire: the row is written to
-/// the table alembic built, so the harness depends on that table's layout. The
+/// This is one of the two places a journey reaches past the wire (the other is
+/// `communities.dart`, for the same reason: no production door is on the
+/// wire). The row is written to the table alembic built, so the harness
+/// depends on that table's layout. The
 /// Dart gateway must read that same layout anyway (DESIGN.md, "Stored bytes"),
 /// and a journey that mints for an UNSEEDED id is refused, which proves the
 /// gateway really reads the row rather than trusting any well-signed token.
@@ -45,7 +47,7 @@ final class Account {
     String handle, {
     bool handleAssigned = false,
   }) {
-    final account = Account._(_ulidLike(), handle);
+    final account = Account._(ulidLike(), handle);
     final db = sqlite3.open(gateway.database);
     try {
       db.execute(
@@ -56,7 +58,7 @@ final class Account {
           handle,
           handle,
           handle,
-          _stored(DateTime.now().toUtc()),
+          storedTime(DateTime.now().toUtc()),
           handleAssigned ? 1 : 0,
         ],
       );
@@ -67,7 +69,7 @@ final class Account {
   }
 
   /// An id of the right length that no seeded row holds.
-  static String unseededId() => _ulidLike();
+  static String unseededId() => ulidLike();
 }
 
 /// Mints tokens the way `domain/security.py` does, under [secret].
@@ -133,7 +135,7 @@ String _b64(List<int> bytes) => base64Url.encode(bytes).replaceAll('=', '');
 
 /// SQLAlchemy's SQLite DATETIME text, UTC with the zone dropped
 /// (`domain/types.py` `UtcDateTime`).
-String _stored(DateTime utc) {
+String storedTime(DateTime utc) {
   String two(int n) => '$n'.padLeft(2, '0');
   return '${utc.year}-${two(utc.month)}-${two(utc.day)} '
       '${two(utc.hour)}:${two(utc.minute)}:${two(utc.second)}'
@@ -144,7 +146,7 @@ const _crockford = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
 
 /// A ULID's spelling (its first character is at most `7`: 128 bits in 26
 /// base-32 digits), random throughout rather than time-ordered.
-String _ulidLike() => [
+String ulidLike() => [
   _crockford[_random.nextInt(8)],
   for (var i = 1; i < 26; i++) _crockford[_random.nextInt(32)],
 ].join();

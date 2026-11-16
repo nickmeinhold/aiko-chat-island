@@ -1,0 +1,88 @@
+{
+  "GET /v1/communities": {
+    "communities": {
+      "list of": [
+        {
+          "category": "string",
+          "default_channel_id": "string",
+          "description": "null",
+          "icon_url": "null",
+          "id": "string",
+          "last_activity_at": "null",
+          "member_count": "number",
+          "name": "string",
+          "owner_id": "null",
+          "visibility": "string"
+        }
+      ]
+    }
+  },
+  "GET /v1/communities/discover": {
+    "communities": {
+      "list of": [
+        {
+          "category": "string",
+          "default_channel_id": "string",
+          "description": "null",
+          "icon_url": "null",
+          "id": "string",
+          "last_activity_at": "null",
+          "member_count": "number",
+          "name": "string",
+          "owner_id": "null",
+          "visibility": "string"
+        }
+      ]
+    },
+    "next_cursor": "null"
+  },
+  "GET /v1/communities/{community_id}": {
+    "category": "string",
+    "channels": {
+      "list of": [
+        {
+          "aiko_channel": "string",
+          "community_id": "string",
+          "id": "string",
+          "kind": "string",
+          "name": "string"
+        }
+      ]
+    },
+    "default_channel_id": "string",
+    "description": "null",
+    "icon_url": "null",
+    "id": "string",
+    "last_activity_at": "null",
+    "member_count": "number",
+    "name": "string",
+    "owner_id": "null",
+    "visibility": "string"
+  },
+  "POST /v1/communities/{community_id}/join": {
+    "channels": {
+      "list of": [
+        {
+          "aiko_channel": "string",
+          "community_id": "string",
+          "id": "string",
+          "kind": "string",
+          "name": "string"
+        }
+      ]
+    },
+    "community": {
+      "category": "string",
+      "default_channel_id": "string",
+      "description": "null",
+      "icon_url": "null",
+      "id": "string",
+      "last_activity_at": "null",
+      "member_count": "number",
+      "name": "string",
+      "owner_id": "null",
+      "visibility": "string"
+    },
+    "joined": "bool"
+  }
+}
