@@ -1,0 +1,28 @@
+{
+  "GET /v1/read-positions": {
+    "positions": {
+      "map of": [
+        {
+          "last_read": "string",
+          "seq": "number"
+        }
+      ]
+    }
+  },
+  "PUT /v1/read-positions": {
+    "positions": {
+      "map of": [
+        {
+          "last_read": "string",
+          "seq": "number",
+          "status": "string"
+        }
+      ]
+    }
+  },
+  "PUT /v1/read-positions 422": {
+    "channel_id": "string",
+    "detail": "string",
+    "error": "string"
+  }
+}

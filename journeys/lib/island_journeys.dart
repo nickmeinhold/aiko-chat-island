@@ -17,6 +17,7 @@ export 'src/accounts.dart';
 export 'src/contract.dart';
 export 'src/gateway.dart';
 export 'src/journey_map.dart';
+export 'src/messages.dart';
 export 'src/shape.dart';
 
 /// The checkout under test: the nearest directory, from here upward, holding
