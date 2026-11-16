@@ -1,0 +1,22 @@
+{
+  "GET /v1/keys": {
+    "list of": [
+      {
+        "first_seen_at": "string",
+        "key_version": "number",
+        "last_seen_at": "string",
+        "pubkey": "string"
+      }
+    ]
+  },
+  "POST /v1/keys": {
+    "key_version": "number",
+    "pubkey": "string"
+  },
+  "POST /v1/keys 400": {
+    "detail": "string"
+  },
+  "POST /v1/keys 429": {
+    "detail": "string"
+  }
+}
