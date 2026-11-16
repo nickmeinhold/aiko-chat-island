@@ -56,6 +56,19 @@ jobs:
           sudo apt-get install -y mosquitto
           mosquitto -h | head -1 || true
 
+      # Ubuntu 26.04's apparmor package confines /usr/sbin/mosquitto to configs
+      # under /etc/mosquitto, so devstack's spike/mosquitto.conf is refused
+      # ("Unable to open config file"). Grant that one file through the
+      # profile's own site-override hook, then reload. No-op where there is no
+      # profile (24.04, macOS).
+      - name: Let the confined broker read the devstack config
+        run: |
+          if [ -f /etc/apparmor.d/mosquitto ]; then
+            echo "file $GITHUB_WORKSPACE/gateway/spike/mosquitto.conf r," \
+              | sudo tee /etc/apparmor.d/local/mosquitto
+            sudo apparmor_parser -r /etc/apparmor.d/mosquitto
+          fi
+
       # Order: the two libs the gateway imports first, then the gateway[dev].
       # Not declared deps (not on PyPI), so installed explicitly from checkouts.
       - name: Install gateway + bus libs (editable)

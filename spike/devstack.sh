@@ -33,8 +33,22 @@ up() {
 
   echo "[devstack] mosquitto :1884"
   "$MOSQUITTO_BIN" -c "$SPIKE_DIR/mosquitto.conf" >"$LOGS/mosquitto.log" 2>&1 &
-  echo $! >> "$PIDFILE"
-  until nc -z localhost 1884 2>/dev/null; do sleep 0.3; done
+  local broker=$!
+  echo $broker >> "$PIDFILE"
+  # Bounded, and watch the broker itself: an unbounded wait here spun until
+  # pytest's 120 s timeout and threw the broker log away (ubuntu-26.04 runner).
+  local waited=0
+  until nc -z localhost 1884 2>/dev/null; do
+    if ! kill -0 "$broker" 2>/dev/null || [ $waited -ge 50 ]; then
+      kill -0 "$broker" 2>/dev/null && why="not listening after 15s" || why="exited"
+      echo "[devstack] FATAL: mosquitto $why. $("$MOSQUITTO_BIN" -h 2>&1 | head -1)"
+      echo "[devstack] --- mosquitto.log"; cat "$LOGS/mosquitto.log"
+      echo "[devstack] --- nc: $(command -v nc || echo MISSING); listeners:"
+      ss -ltnp 2>/dev/null || netstat -an 2>/dev/null | grep LISTEN
+      down; exit 1
+    fi
+    sleep 0.3; waited=$((waited + 1))
+  done
 
   echo "[devstack] aiko_registrar"
   aiko_registrar >"$LOGS/registrar.log" 2>&1 &
