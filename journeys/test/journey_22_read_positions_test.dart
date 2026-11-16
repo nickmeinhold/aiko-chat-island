@@ -7,11 +7,11 @@
 // The channels are DMs, opened and filled through public doors (`messages.dart`):
 // no route makes a public channel without the bus.
 //
-// NOT covered, named so nobody reads this file as the whole row: the bound's
-// "your own stored value" arm, which lets a watermark naming a since-HIDDEN
-// message (soft-deleted, or its author blocked) be re-sent. Reaching it needs a
-// delete or a block, which are journey 18's doors; until then the stored value
-// is never above the newest visible item, so a mutant dropping the arm survives.
+// Covered in journey 18, not here: the bound's "your own stored value" arm,
+// which lets a watermark naming a since-HIDDEN message (soft-deleted, or its
+// author blocked) be re-sent. Only a delete or a block can put the stored value
+// above the newest visible item, and the block is journey 18's door
+// (`journey_18_blocks_test.dart`, the read-position test at its end).
 //
 // A CONTRACT GAP this journey pins rather than hides: openapi.json declares
 // FastAPI's validation shape for the PUT's 422 (`detail` an array), but the

@@ -1,0 +1,13 @@
+{
+  "GET /v1/blocks": {
+    "blocks": {
+      "list of": [
+        {
+          "created_at": "string",
+          "display_name": "string",
+          "user_id": "string"
+        }
+      ]
+    }
+  }
+}

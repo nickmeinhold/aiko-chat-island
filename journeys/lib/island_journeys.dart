@@ -20,6 +20,7 @@ export 'src/journey_map.dart';
 export 'src/keys.dart';
 export 'src/messages.dart';
 export 'src/shape.dart';
+export 'src/socket.dart';
 
 /// The checkout under test: the nearest directory, from here upward, holding
 /// the frozen contract.
