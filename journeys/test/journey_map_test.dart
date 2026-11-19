@@ -131,6 +131,50 @@ void main() {
       );
     });
 
+    test('a named dictionary drops its keys, not its values\' shapes', () {
+      Object positions(String body) =>
+          shapeOf(jsonDecode(body), dictionaries: {'positions'});
+      final one = positions('{"positions": {"A": {"seq": 1}}}');
+      expect(one, {
+        'positions': {
+          'map of': [
+            {'seq': 'number'},
+          ],
+        },
+      });
+      expect(
+        one,
+        positions('{"positions": {"B": {"seq": 2}, "C": {"seq": 3}}}'),
+      );
+      expect(one, isNot(positions('{"positions": {"A": {"seq": "1"}}}')));
+      // Unnamed, the same body records its keys as fields.
+      expect(shapeOf(jsonDecode('{"positions": {"A": {"seq": 1}}}')), {
+        'positions': {
+          'A': {'seq': 'number'},
+        },
+      });
+    });
+
+    test('a path under a dictionary spells its keys as *', () {
+      expect(
+        shapeOf(
+          jsonDecode('{"m": {"x": {"inner": {"k1": 1}}}}'),
+          dictionaries: {'m', 'm.*.inner'},
+        ),
+        {
+          'm': {
+            'map of': [
+              {
+                'inner': {
+                  'map of': ['number'],
+                },
+              },
+            ],
+          },
+        },
+      );
+    });
+
     test('a renamed field changes the shape', () {
       expect(
         shapeOf(jsonDecode('{"user_id": "x"}')),

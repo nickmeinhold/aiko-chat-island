@@ -20,21 +20,41 @@ import 'dart:io';
 ///   order, so a page of ten messages and a page of two have the same shape.
 ///   An empty list is `{"list of": []}`: a journey that needs to see the element
 ///   shape has to make the list non-empty, and its golden shows whether it did.
-Object shapeOf(Object? json) => switch (json) {
-  null => 'null',
-  bool() => 'bool',
-  num() => 'number',
-  String() => 'string',
-  List<Object?>() => {
-    'list of': (json.map(shapeOf).map(_canonical).toSet().toList()..sort())
-        .map(jsonDecode)
-        .toList(),
-  },
-  Map<String, Object?>() => {
-    for (final key in json.keys.toList()..sort()) key: shapeOf(json[key]),
-  },
-  _ => throw ArgumentError('not a decoded JSON value: ${json.runtimeType}'),
-};
+/// - an object at a path named in [dictionaries] is `{"map of": [shapes]}`, the
+///   distinct value shapes, as for a list: its KEYS are data (`{channel_id:
+///   position}`), so recording them would pin one run's random ids. A path is
+///   the keys from the root joined by `.`, with `*` standing for any key of a
+///   dictionary above it (`positions.*.reactions`). The journey names them;
+///   nothing here can tell a key that is data from one that is a field.
+Object shapeOf(Object? json, {Set<String> dictionaries = const {}}) =>
+    _shape(json, '', dictionaries);
+
+Object _shape(Object? json, String path, Set<String> dictionaries) {
+  String at(String key) => path.isEmpty ? key : '$path.$key';
+  Object distinct(Iterable<Object> shapes) =>
+      (shapes.map(_canonical).toSet().toList()..sort())
+          .map(jsonDecode)
+          .toList();
+  return switch (json) {
+    null => 'null',
+    bool() => 'bool',
+    num() => 'number',
+    String() => 'string',
+    List<Object?>() => {
+      'list of': distinct(json.map((e) => _shape(e, path, dictionaries))),
+    },
+    Map<String, Object?>() when dictionaries.contains(path) => {
+      'map of': distinct(
+        json.values.map((v) => _shape(v, at('*'), dictionaries)),
+      ),
+    },
+    Map<String, Object?>() => {
+      for (final key in json.keys.toList()..sort())
+        key: _shape(json[key], at(key), dictionaries),
+    },
+    _ => throw ArgumentError('not a decoded JSON value: ${json.runtimeType}'),
+  };
+}
 
 String _canonical(Object? shape) => jsonEncode(shape);
 
@@ -56,9 +76,13 @@ final class Golden {
   final _seen = <String, Object>{};
 
   /// The difference between [body]'s shape and the recorded one, or null when
-  /// they match (or when recording).
-  String? expect(String key, String body) {
-    final shape = shapeOf(jsonDecode(body));
+  /// they match (or when recording). [dictionaries] as for [shapeOf].
+  String? expect(
+    String key,
+    String body, {
+    Set<String> dictionaries = const {},
+  }) {
+    final shape = shapeOf(jsonDecode(body), dictionaries: dictionaries);
     _seen[key] = shape;
     if (_recording) return null;
     if (!_stored.containsKey(key)) {
